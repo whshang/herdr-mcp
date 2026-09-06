@@ -9,11 +9,14 @@ class GeminiAdapter extends BaseAdapter {
   getConversationKey() {
     try {
       if (location.origin !== "https://gemini.google.com") return null;
-      const match = location.pathname.match(/^\/app\/([^/?#]+)\/?$/);
-      if (!match) return null;
-      const nativeId = decodeURIComponent(match[1]);
+      const appMatch = location.pathname.match(/^\/app\/([^/?#]+)\/?$/);
+      const sparkMatch = location.pathname.match(/^\/u\/([0-9]{1,3})\/spark\/chat\/([^/?#]+)\/?$/);
+      const encodedId = appMatch?.[1] || sparkMatch?.[2] || null;
+      if (!encodedId) return null;
+      const nativeId = decodeURIComponent(encodedId);
       if (!nativeId || nativeId.length > 512 || /[\u0000-\u001f\u007f]/.test(nativeId)) return null;
-      return `${location.origin}/app/${encodeURIComponent(nativeId)}`;
+      if (appMatch) return `${location.origin}/app/${encodeURIComponent(nativeId)}`;
+      return `${location.origin}/u/${sparkMatch[1]}/spark/chat/${encodeURIComponent(nativeId)}`;
     } catch (_) {
       return null;
     }
@@ -23,8 +26,11 @@ class GeminiAdapter extends BaseAdapter {
     const key = this.getConversationKey();
     if (!key) return null;
     try {
-      const match = new URL(key).pathname.match(/^\/app\/([^/?#]+)$/);
-      return match ? decodeURIComponent(match[1]) : null;
+      const pathname = new URL(key).pathname;
+      const appMatch = pathname.match(/^\/app\/([^/?#]+)$/);
+      const sparkMatch = pathname.match(/^\/u\/[0-9]{1,3}\/spark\/chat\/([^/?#]+)$/);
+      const encodedId = appMatch?.[1] || sparkMatch?.[1] || null;
+      return encodedId ? decodeURIComponent(encodedId) : null;
     } catch (_) {
       return null;
     }

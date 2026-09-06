@@ -52,16 +52,31 @@ function harness(url = "https://gemini.google.com/app/abc123") {
   };
 }
 
-test("Gemini adapter exposes only concrete /app session identity", () => {
+test("Gemini adapter exposes concrete classic and Spark session identity", () => {
   const h = harness("https://gemini.google.com/app/abc_123-XYZ?hl=en");
   assert.equal(h.adapter.name, "gemini");
   assert.equal(h.adapter.getConversationKey(), "https://gemini.google.com/app/abc_123-XYZ");
   assert.equal(h.adapter.getNativeSessionIdentity(), "abc_123-XYZ");
   assert.equal(h.adapter.getCanonicalConversationUrl(), "https://gemini.google.com/app/abc_123-XYZ");
 
+  h.location.pathname = "/u/1/spark/chat/d1c8ad1fe3276888";
+  h.location.search = "?pageId=none";
+  assert.equal(
+    h.adapter.getConversationKey(),
+    "https://gemini.google.com/u/1/spark/chat/d1c8ad1fe3276888",
+  );
+  assert.equal(h.adapter.getNativeSessionIdentity(), "d1c8ad1fe3276888");
+  assert.equal(
+    h.adapter.getCanonicalConversationUrl(),
+    "https://gemini.google.com/u/1/spark/chat/d1c8ad1fe3276888",
+  );
+
   h.location.pathname = "/app";
   assert.equal(h.adapter.getConversationKey(), null);
   assert.equal(h.adapter.getNativeSessionIdentity(), null);
+
+  h.location.pathname = "/u/account/spark/chat/abc";
+  assert.equal(h.adapter.getConversationKey(), null);
 
   h.location.pathname = "/gem/abc";
   assert.equal(h.adapter.getConversationKey(), null);

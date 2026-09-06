@@ -703,11 +703,12 @@ console.log("\n[Gemini optional-origin registration]");
 console.log("\n[Gemini browser registry observation]");
 {
   const before = browserRegistryRequests.length;
-  const geminiUrl = "https://gemini.google.com/app/gemini-session-1";
+  const geminiUrl = "https://gemini.google.com/u/1/spark/chat/gemini-session-1?pageId=none";
+  const canonicalGeminiUrl = "https://gemini.google.com/u/1/spark/chat/gemini-session-1";
   const registered = await dispatchMessage({
     type: "h2w_register",
     site: "gemini",
-    convKey: geminiUrl,
+    convKey: canonicalGeminiUrl,
     url: geminiUrl,
     accountNativeIdentity: `google-account-sha256:${"a".repeat(64)}`,
   }, { tab: { id: 91, url: geminiUrl } });
@@ -726,8 +727,9 @@ console.log("\n[Gemini browser registry observation]");
       && observed[2]?.operation === "resource.observe"
       && observed[2]?.kind === "session"
       && observed[2]?.parent_ref === "bra_gemini_account"
+      && observed[2]?.native_identity === "gemini-session-1"
       && !observed.some((request) => request?.kind === "space"),
-    "Gemini observes account -> session without fabricating a space resource",
+    "Gemini Spark observes account -> session without fabricating a space resource",
     JSON.stringify(observed));
 
   const beforeUnsupported = browserRegistryRequests.length;

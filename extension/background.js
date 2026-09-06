@@ -1335,15 +1335,20 @@ function geminiConversationInfo(rawUrl) {
   try {
     const url = new URL(String(rawUrl || ""));
     if (url.origin !== "https://gemini.google.com") return null;
-    const match = url.pathname.match(/^\/app\/([^/?#]+)\/?$/);
-    if (!match) return null;
-    const conversationId = decodeURIComponent(match[1]);
+    const appMatch = url.pathname.match(/^\/app\/([^/?#]+)\/?$/);
+    const sparkMatch = url.pathname.match(/^\/u\/([0-9]{1,3})\/spark\/chat\/([^/?#]+)\/?$/);
+    const encodedId = appMatch?.[1] || sparkMatch?.[2] || null;
+    if (!encodedId) return null;
+    const conversationId = decodeURIComponent(encodedId);
     if (!conversationId || conversationId.length > 512 || /[\u0000-\u001f\u007f]/.test(conversationId)) return null;
+    const convKey = appMatch
+      ? `${url.origin}/app/${encodeURIComponent(conversationId)}`
+      : `${url.origin}/u/${sparkMatch[1]}/spark/chat/${encodeURIComponent(conversationId)}`;
     return {
       site: "gemini",
       conversation_id: conversationId,
       project_id: null,
-      convKey: `${url.origin}/app/${encodeURIComponent(conversationId)}`,
+      convKey,
     };
   } catch (_) {
     return null;
