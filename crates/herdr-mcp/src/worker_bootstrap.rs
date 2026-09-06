@@ -1343,32 +1343,87 @@ fn edge_devices_with_operator(
     edge_origin: &str,
     operator: &SecretBytes,
 ) -> Result<Vec<Value>, String> {
-    let response = edge_http
-        .client
-        .get(format!("{edge_origin}/devices"))
-        .bearer_auth(operator.expose()?)
-        .send()
-        .map_err(|error| {
-            sanitize_error(
-                &format!("cannot inspect first-fleet registry: {error}"),
-                operator,
-            )
-        })?;
-    let status = response.status();
-    let payload: Value = response.json().map_err(|_| {
-        format!(
-            "device inventory returned non-JSON HTTP {}",
+    let delays = [
+        Duration::ZERO,
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+    ];
+    let authorization = operator.expose()?;
+    let mut last_retryable_error = None;
+    let attempts = delays.len();
+    for (attempt, delay) in delays.into_iter().enumerate() {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let response = match edge_http
+            .client
+            .get(format!("{edge_origin}/devices"))
+            .bearer_auth(authorization)
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_retryable_error = Some(sanitize_error(
+                    &format!("cannot inspect first-fleet registry: {error}"),
+                    operator,
+                ));
+                if attempt + 1 < attempts {
+                    continue;
+                }
+                break;
+            }
+        };
+        let status = response.status();
+        let payload: Value = match response.json() {
+            Ok(payload) => payload,
+            Err(_) if operator_registry_status_is_retryable(status) => {
+                last_retryable_error = Some(format!(
+                    "temporary operator is not ready yet (HTTP {})",
+                    status.as_u16()
+                ));
+                if attempt + 1 < attempts {
+                    continue;
+                }
+                break;
+            }
+            Err(_) => {
+                return Err(format!(
+                    "device inventory returned non-JSON HTTP {}",
+                    status.as_u16()
+                ));
+            }
+        };
+        if status.is_success() && payload.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(payload
+                .get("devices")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default());
+        }
+        if operator_registry_status_is_retryable(status) {
+            last_retryable_error = Some(format!(
+                "temporary operator is not ready yet (HTTP {})",
+                status.as_u16()
+            ));
+            if attempt + 1 < attempts {
+                continue;
+            }
+            break;
+        }
+        return Err(format!(
+            "temporary operator could not read the Worker device registry (HTTP {})",
             status.as_u16()
-        )
-    })?;
-    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err("temporary operator could not read the Worker device registry".to_owned());
+        ));
     }
-    Ok(payload
-        .get("devices")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default())
+    Err(last_retryable_error.unwrap_or_else(|| {
+        "temporary operator could not read the Worker device registry".to_owned()
+    }))
+}
+
+fn operator_registry_status_is_retryable(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403) || status.is_server_error()
 }
 
 fn verify_device_fleet_admin(
@@ -2026,6 +2081,20 @@ mod tests {
             ]
         );
         assert!(parse_trusted_dns_ipv4_answers(&json!({"Status": 2})).is_empty());
+    }
+
+    #[test]
+    fn operator_registry_retry_is_limited_to_readiness_failures() {
+        for status in [401, 403, 500, 502, 503] {
+            assert!(operator_registry_status_is_retryable(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+        for status in [400, 404, 409, 429] {
+            assert!(!operator_registry_status_is_retryable(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
     }
 
     #[test]
