@@ -307,7 +307,7 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
   assert.equal(delegatedConnector.connector.approved_by, "device:owner");
 });
 
-test("connector approval resume token is independent, one-use, and cannot be substituted", async () => {
+test("connector approval resume token is independent, idempotent until expiry, and cannot be substituted", async () => {
   const h = harness();
   await h.post("/internal/oauth/approval/put", {
     request_id: "req-resume",
@@ -343,7 +343,75 @@ test("connector approval resume token is independent, one-use, and cannot be sub
     resume_hash: "resume-good",
     now_ms: 302,
   });
-  assert.equal(replay.status, 404);
+  assert.equal(replay.status, 200);
+  assert.equal((await body(replay)).record.connector_id, first.record.connector_id);
+
+  const expired = await h.post("/internal/oauth/approval/consume", {
+    request_id: "req-resume",
+    resume_hash: "resume-good",
+    now_ms: 100001,
+  });
+  assert.equal(expired.status, 404);
+  const orphan = await h.post("/internal/oauth/connector/get", {
+    connector_id: first.record.connector_id,
+  });
+  assert.equal(orphan.status, 404);
+});
+
+test("connector approval cancel removes pending or unused approved state but refuses a used connector", async () => {
+  const h = harness();
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-cancel-pending",
+    record: approval(),
+    now_ms: 100,
+  });
+  const pendingCancel = await h.post("/internal/oauth/approval/cancel", {
+    request_id: "req-cancel-pending",
+  });
+  assert.equal(pendingCancel.status, 200);
+  assert.equal((await body(pendingCancel)).connector_deleted, false);
+  assert.equal(h.storage.map.has("approval:req-cancel-pending"), false);
+
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-cancel-approved",
+    record: approval({ approval_code_hash: "cancel-good" }),
+    now_ms: 100,
+  });
+  const approved = await body(await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-cancel-approved",
+    code_hash: "cancel-good",
+    approver: "device:owner",
+    now_ms: 200,
+  }));
+  const unusedId = approved.record.connector_id;
+  const unusedCancel = await h.post("/internal/oauth/approval/cancel", {
+    request_id: "req-cancel-approved",
+  });
+  assert.equal(unusedCancel.status, 200);
+  assert.equal((await body(unusedCancel)).connector_deleted, true);
+  assert.equal(h.storage.map.has(`connector:${unusedId}`), false);
+
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-cancel-used",
+    record: approval({ approval_code_hash: "used-good" }),
+    now_ms: 100,
+  });
+  const used = await body(await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-cancel-used",
+    code_hash: "used-good",
+    approver: "device:owner",
+    now_ms: 200,
+  }));
+  const usedId = used.record.connector_id;
+  const usedConnector = h.storage.map.get(`connector:${usedId}`);
+  await h.storage.put(`connector:${usedId}`, { ...usedConnector, token_issue_count: 1 });
+  const usedCancel = await h.post("/internal/oauth/approval/cancel", {
+    request_id: "req-cancel-used",
+  });
+  assert.equal(usedCancel.status, 409);
+  assert.equal((await body(usedCancel)).code, "already_used");
+  assert.equal(h.storage.map.has("approval:req-cancel-used"), true);
+  assert.equal(h.storage.map.has(`connector:${usedId}`), true);
 });
 
 test("connector grant revoke fences current and legacy JWT/refresh credentials with a durable tombstone", async () => {

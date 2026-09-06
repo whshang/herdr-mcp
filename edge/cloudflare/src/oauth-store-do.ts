@@ -409,6 +409,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/put") return this.putApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/get") return this.getApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/approve") return this.approveApproval(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/approval/cancel") return this.cancelApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/consume") return this.consumeApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
@@ -576,6 +577,15 @@ export class OAuthStoreDO {
     let clientPending = 0;
     for (const [existingKey, raw] of rows) {
       if (!record(raw) || !finiteEpoch(raw.expires_at_ms) || raw.expires_at_ms <= nowMs) {
+        const connectorId = record(raw) && boundedString(raw.connector_id, 256) ? raw.connector_id : undefined;
+        if (connectorId) {
+          const connector = normalizeConnector(
+            await this.state.storage.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + connectorId),
+          );
+          if (connector?.token_issue_count === 0) {
+            await this.state.storage.delete(CONNECTOR_PREFIX + connectorId);
+          }
+        }
         await this.state.storage.delete(existingKey);
         continue;
       }
@@ -619,6 +629,14 @@ export class OAuthStoreDO {
     const current = await this.state.storage.get<OAuthApprovalRecord>(key);
     if (!current) return json({ ok: false, code: "not_found" }, 404);
     if (current.expires_at_ms <= nowMs) {
+      if (current.connector_id) {
+        const connector = normalizeConnector(
+          await this.state.storage.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + current.connector_id),
+        );
+        if (connector?.token_issue_count === 0) {
+          await this.state.storage.delete(CONNECTOR_PREFIX + current.connector_id);
+        }
+      }
       await this.state.storage.delete(key);
       return json({ ok: false, code: "expired" }, 404);
     }
@@ -640,6 +658,14 @@ export class OAuthStoreDO {
       const current = await txn.get<OAuthApprovalRecord>(key);
       if (!current) return;
       if (current.expires_at_ms <= nowMs) {
+        if (current.connector_id) {
+          const connector = normalizeConnector(
+            await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + current.connector_id),
+          );
+          if (connector?.token_issue_count === 0) {
+            await txn.delete(CONNECTOR_PREFIX + current.connector_id);
+          }
+        }
         await txn.delete(key);
         result = { ok: false, code: "expired" };
         return;
@@ -694,6 +720,44 @@ export class OAuthStoreDO {
     return json({ ok: true, record: result.record });
   }
 
+  private async cancelApproval(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const requestId = body?.request_id;
+    if (!boundedString(requestId, 256)) return json({ ok: false, code: "bad_request" }, 400);
+    const key = APPROVAL_PREFIX + requestId;
+    let result: { ok: boolean; code?: string; connector_deleted?: boolean } = {
+      ok: false,
+      code: "not_found",
+    };
+    await this.state.storage.transaction(async (txn) => {
+      const current = await txn.get<OAuthApprovalRecord>(key);
+      if (!current) return;
+      let connectorDeleted = false;
+      if (current.connector_id) {
+        const connector = normalizeConnector(
+          await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + current.connector_id),
+        );
+        if (connector && (connector.token_issue_count ?? 0) > 0) {
+          result = { ok: false, code: "already_used" };
+          return;
+        }
+        if (connector) {
+          await txn.delete(CONNECTOR_PREFIX + current.connector_id);
+          connectorDeleted = true;
+        }
+      }
+      await txn.delete(key);
+      result = { ok: true, connector_deleted: connectorDeleted };
+    });
+    if (!result.ok) {
+      return json(
+        { ok: false, code: result.code },
+        result.code === "already_used" ? 409 : 404,
+      );
+    }
+    return json({ ok: true, connector_deleted: result.connector_deleted === true });
+  }
+
   private async consumeApproval(request: Request): Promise<Response> {
     const body = await this.body(request);
     const requestId = body?.request_id;
@@ -706,6 +770,14 @@ export class OAuthStoreDO {
       const current = await txn.get<OAuthApprovalRecord>(key);
       if (!current) return;
       if (current.expires_at_ms <= nowMs) {
+        if (current.connector_id) {
+          const connector = normalizeConnector(
+            await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + current.connector_id),
+          );
+          if (connector?.token_issue_count === 0) {
+            await txn.delete(CONNECTOR_PREFIX + current.connector_id);
+          }
+        }
         await txn.delete(key);
         result = { ok: false, code: "expired" };
         return;
@@ -722,8 +794,15 @@ export class OAuthStoreDO {
         result = { ok: false, code: "locked" };
         return;
       }
-      await txn.delete(key);
-      result = { ok: true, record: current };
+      if (current.status === "approved") {
+        // Keep approved requests replayable by the same resume token until
+        // expiry. Multiple browser tabs may poll concurrently; deleting the
+        // record on the first successful poll lets a stale tab steal the
+        // completion from the visible tab.
+        result = { ok: true, record: current };
+        return;
+      }
+      result = { ok: false, code: "not_found" };
     });
     if (!result.ok) {
       const status = result.code === "pending" ? 202
@@ -865,16 +944,32 @@ export class OAuthStoreDO {
     }
     connectors.sort((a, b) => Number(b.approved_at_ms ?? 0) - Number(a.approved_at_ms ?? 0));
 
+    const attributedAccessByClient = new Map<string, number>();
+    const attributedRefreshByClient = new Map<string, number>();
+    for (const connector of connectors) {
+      const clientId = String(connector.client_id ?? "");
+      if (!clientId) continue;
+      attributedAccessByClient.set(
+        clientId,
+        (attributedAccessByClient.get(clientId) ?? 0) + Number(connector.active_access_tokens ?? 0),
+      );
+      attributedRefreshByClient.set(
+        clientId,
+        (attributedRefreshByClient.get(clientId) ?? 0) + Number(connector.active_refresh_tokens ?? 0),
+      );
+    }
+
     const legacyClients: Array<Record<string, unknown>> = [];
+    const listedLegacyClients = new Set<string>();
     for (const [key, rawClient] of clientRows) {
       const clientId = key.slice(CLIENT_PREFIX.length);
-      if (representedClients.has(clientId)) continue;
       const client = normalizeOAuthClient(rawClient);
       if (!client) continue;
       const grant = normalizeConnectorGrant(grantRows.get(GRANT_PREFIX + clientId));
       if (grant?.principal_type === "automation") continue;
-      const access = activeAccessByClient.get(clientId) ?? 0;
-      const refresh = activeRefreshByClient.get(clientId) ?? 0;
+      const access = Math.max(0, (activeAccessByClient.get(clientId) ?? 0) - (attributedAccessByClient.get(clientId) ?? 0));
+      const refresh = Math.max(0, (activeRefreshByClient.get(clientId) ?? 0) - (attributedRefreshByClient.get(clientId) ?? 0));
+      if (representedClients.has(clientId) && access === 0 && refresh === 0) continue;
       const grantStatus = grant?.status ?? null;
       const registrationState = grantStatus === "revoked"
         ? "revoked"
@@ -895,7 +990,33 @@ export class OAuthStoreDO {
         active_access_tokens: access,
         active_refresh_tokens: refresh,
       });
+      listedLegacyClients.add(clientId);
       if (legacyClients.length >= 256) break;
+    }
+
+    const tokenClientIds = new Set<string>([
+      ...activeAccessByClient.keys(),
+      ...activeRefreshByClient.keys(),
+    ]);
+    for (const clientId of tokenClientIds) {
+      if (listedLegacyClients.has(clientId)) continue;
+      const access = Math.max(0, (activeAccessByClient.get(clientId) ?? 0) - (attributedAccessByClient.get(clientId) ?? 0));
+      const refresh = Math.max(0, (activeRefreshByClient.get(clientId) ?? 0) - (attributedRefreshByClient.get(clientId) ?? 0));
+      if (access === 0 && refresh === 0) continue;
+      if (legacyClients.length >= 256) break;
+      legacyClients.push({
+        client_id: clientId,
+        client_name: null,
+        issued_at: null,
+        created_at_ms: null,
+        last_used_at_ms: null,
+        grant_origin: "unattributed_existing_credentials",
+        grant_status: null,
+        registration_state: "active_credentials",
+        active_access_tokens: access,
+        active_refresh_tokens: refresh,
+      });
+      listedLegacyClients.add(clientId);
     }
     legacyClients.sort((a, b) => Number(b.issued_at ?? 0) - Number(a.issued_at ?? 0));
 

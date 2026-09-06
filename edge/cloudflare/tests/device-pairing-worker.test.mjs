@@ -437,6 +437,24 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(redirect.searchParams.get("state"), "state-connector");
   assert.ok(redirect.searchParams.get("code"));
 
+  const cancelAuthorize = new URL(authorize);
+  cancelAuthorize.searchParams.set("state", "state-cancel");
+  const cancelPage = await worker.fetch(new Request(cancelAuthorize), h.env);
+  assert.equal(cancelPage.status, 200);
+  const cancelHtml = await cancelPage.text();
+  const cancelRequestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(cancelHtml)?.[1];
+  const cancelResumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(cancelHtml)?.[1];
+  assert.ok(cancelRequestId && cancelResumeToken);
+  const unauthCancel = await worker.fetch(post("/connectors/cancel", { request_id: cancelRequestId }), h.env);
+  assert.equal(unauthCancel.status, 401);
+  const cancelled = await worker.fetch(post("/connectors/cancel", { request_id: cancelRequestId }, "owner-secret"), h.env);
+  assert.equal(cancelled.status, 200);
+  assert.equal((await cancelled.json()).request_id, cancelRequestId);
+  const cancelledPoll = new URL("https://edge.example/oauth/authorize/poll");
+  cancelledPoll.searchParams.set("request_id", cancelRequestId);
+  cancelledPoll.searchParams.set("resume_token", cancelResumeToken);
+  assert.equal((await worker.fetch(new Request(cancelledPoll), h.env)).status, 410);
+
   const nowSec = Math.floor(Date.now() / 1000);
   await oauthStorage.put("client:https://legacy.example/oauth/client-metadata.json", {
     client_secret_hash: "must-never-be-returned",
@@ -459,6 +477,12 @@ test("new Connector requires Worker fleet-admin approval and operator credential
     scope: "mcp",
     expires_at: nowSec + 7200,
   });
+  await oauthStorage.put("refresh:unattributed-live", {
+    client_id: "https://missing.example/oauth/client-metadata.json",
+    resource: "https://edge.example/mcp",
+    scope: "mcp",
+    expires_at: nowSec + 7200,
+  });
 
   const inventory = await worker.fetch(new Request("https://edge.example/connectors", {
     headers: { authorization: "Bearer owner-secret" },
@@ -468,8 +492,9 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(inventoryBody.connectors.length, 1);
   const connectorId = inventoryBody.connectors[0].connector_id;
   assert.match(connectorId, /^conn_[A-Za-z0-9_-]+$/);
-  assert.equal(inventoryBody.legacy_clients.length, 1);
-  assert.deepEqual(inventoryBody.legacy_clients[0], {
+  assert.equal(inventoryBody.legacy_clients.length, 2);
+  const legacy = inventoryBody.legacy_clients.find((entry) => entry.client_id === "https://legacy.example/oauth/client-metadata.json");
+  assert.deepEqual(legacy, {
     client_id: "https://legacy.example/oauth/client-metadata.json",
     client_name: "Legacy WebChat",
     issued_at: nowSec - 60,
@@ -481,9 +506,26 @@ test("new Connector requires Worker fleet-admin approval and operator credential
     active_access_tokens: 1,
     active_refresh_tokens: 1,
   });
-  assert.equal(inventoryBody.legacy_clients[0].client_secret_hash, undefined);
+  const unattributed = inventoryBody.legacy_clients.find((entry) => entry.client_id === "https://missing.example/oauth/client-metadata.json");
+  assert.deepEqual(unattributed, {
+    client_id: "https://missing.example/oauth/client-metadata.json",
+    client_name: null,
+    issued_at: null,
+    created_at_ms: null,
+    last_used_at_ms: null,
+    grant_origin: "unattributed_existing_credentials",
+    grant_status: null,
+    registration_state: "active_credentials",
+    active_access_tokens: 0,
+    active_refresh_tokens: 1,
+  });
+  assert.equal(legacy.client_secret_hash, undefined);
   assert.equal(inventoryBody.token_counts.active_access, 1);
-  assert.equal(inventoryBody.token_counts.active_refresh, 1);
+  assert.equal(inventoryBody.token_counts.active_refresh, 2);
+  assert.equal(
+    inventoryBody.legacy_clients.reduce((sum, entry) => sum + entry.active_refresh_tokens, 0),
+    inventoryBody.token_counts.active_refresh,
+  );
 
   const revokeInstance = await worker.fetch(
     post("/connectors/revoke", { connector_id: connectorId }, "owner-secret"),
@@ -849,6 +891,50 @@ test("legacy default device takes its first Link device name and reconnect never
   list = await registry.fetch(new Request("https://registry.internal/internal/devices"));
   legacy = (await list.json()).devices.find((device) => device.workstation_id === "prod-real-runtime");
   assert.equal(legacy.name, "qingxian-macbookair");
+});
+
+test("legacy shared-secret fleet approval is attributed to the canonical enrolled device", async () => {
+  const h = makeEnv();
+  const oauthStorage = new FakeStorage();
+  const oauth = new OAuthStoreDO({ storage: oauthStorage }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+
+  const registration = await worker.fetch(new Request("https://edge.example/oauth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      redirect_uris: ["https://client.example/callback"],
+      token_endpoint_auth_method: "none",
+      client_name: "Legacy Approver Test",
+    }),
+  }), h.env);
+  const client = await registration.json();
+  const authorize = new URL("https://edge.example/oauth/authorize");
+  authorize.searchParams.set("client_id", client.client_id);
+  authorize.searchParams.set("redirect_uri", "https://client.example/callback");
+  authorize.searchParams.set("response_type", "code");
+  authorize.searchParams.set("code_challenge", "B".repeat(43));
+  authorize.searchParams.set("code_challenge_method", "S256");
+  const page = await worker.fetch(new Request(authorize), h.env);
+  const html = await page.text();
+  const requestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const approvalCode = /<div class="approval-code">(\d{6})<\/div>/.exec(html)?.[1];
+  assert.ok(requestId && approvalCode);
+
+  const approved = await worker.fetch(postAsWorkstation(
+    "/connectors/approve",
+    { request_id: requestId, code: approvalCode },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(approved.status, 200);
+
+  const connector = [...oauthStorage.map.entries()]
+    .find(([key]) => key.startsWith("connector:"))?.[1];
+  assert.ok(connector);
+  assert.match(connector.approved_by, /^device:dev_/);
+  assert.doesNotMatch(connector.approved_by, /^legacy-link:/);
 });
 
 test("legacy shared secret is compatibility-only for the default workstation and revoke blocks reconnect", async () => {

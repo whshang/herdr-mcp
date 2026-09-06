@@ -230,6 +230,24 @@ export default {
         : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "invalid_code" ? 403 : result.code === "locked" ? 423 : 404);
     }
 
+    if (request.method === "POST" && url.pathname === "/connectors/cancel") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.request_id !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const requestId = parsed.value.request_id.trim();
+      if (!requestId || requestId.length > 256) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_connector_approval" }, 400);
+      }
+      const result = await cancelConnectorRequest(env, requestId);
+      return result.ok
+        ? noStoreJsonResponse({ action: "connector_cancel", request_id: requestId, ...result })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "already_used" ? 409 : 404);
+    }
+
     if (request.method === "POST" && url.pathname === "/connectors/revoke") {
       const fleetAdmin = await authenticateFleetAdmin(request, env);
       if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
@@ -917,9 +935,13 @@ async function authenticateFleetDevice(request: Request, env: Env): Promise<stri
   // secret fallback only for the configured default workstation. Once a
   // device record exists, the per-device credential is authoritative.
   const legacy = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
-  return legacy.authenticate(request, workstationId, Date.now()).ok
-    ? `legacy-link:${workstationId}`
-    : null;
+  if (!legacy.authenticate(request, workstationId, Date.now()).ok) return null;
+  try {
+    const registered = await ensureLegacyDeviceRegistration(registry, workstationId);
+    return `device:${registered.device_id}`;
+  } catch {
+    return null;
+  }
 }
 
 async function oauthInternal(env: Env, path: string, body: Record<string, unknown>): Promise<Response> {
@@ -1041,6 +1063,21 @@ async function approveConnectorRequest(
     client_id: result.record.client_id,
     approved_at_ms: result.record.approved_at_ms ?? null,
   };
+}
+
+async function cancelConnectorRequest(
+  env: Env,
+  requestId: string,
+): Promise<{ ok: true; connector_deleted: boolean } | { ok: false; code: string }> {
+  const response = await oauthInternal(env, "/internal/oauth/approval/cancel", {
+    request_id: requestId,
+  });
+  const payload = await response.json().catch(() => null) as {
+    code?: string;
+    connector_deleted?: boolean;
+  } | null;
+  if (!response.ok) return { ok: false, code: payload?.code ?? "connector_cancel_failed" };
+  return { ok: true, connector_deleted: payload?.connector_deleted === true };
 }
 
 async function inspectConnectorRequest(

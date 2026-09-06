@@ -370,7 +370,7 @@ summary{cursor:pointer;font-size:13px;font-weight:700;color:#4d5562;user-select:
       <code id="approval-command">${escapeHtml(approvalCommand)}</code>
       <button class="copy" type="button" id="copy-command" aria-label="Copy approval command">Copy</button>
     </div>
-    <p class="helper">Requires herdr-mcp v0.4.6 or newer. Then enter the six-digit code above at the visible CLI prompt. The code is intentionally not included in the command or shell history. If the CLI says <code>unknown command 'connector'</code>, update herdr-mcp first and retry while keeping this page open.</p>
+    <p class="helper">Requires herdr-mcp v0.4.6 or newer. Then enter the six-digit code above at the visible CLI prompt. The code is intentionally not included in the command or shell history. Keep this page open and do not refresh it while approval is pending. If the CLI says <code>unknown command 'connector'</code>, update herdr-mcp first and retry while keeping this page open.</p>
   </div>
 </div>
 
@@ -423,13 +423,19 @@ async function copyApprovalCommand(){
 }
 copyButton.addEventListener('click',copyApprovalCommand);
 async function poll(){
+  poll.failures=poll.failures||0;
   try{
     const u=new URL(endpoint);u.searchParams.set('request_id',requestId);u.searchParams.set('resume_token',resumeToken);
     const r=await fetch(u.toString(),{cache:'no-store'});const p=await r.json();
+    poll.failures=0;
     if(p.status==='approved'&&p.redirect){setStatus('Approved. Returning to the Connector…','success');location.replace(p.redirect);return;}
     if(p.status==='pending'){setTimeout(poll,1500);return;}
     setStatus(p.message||'Approval failed or expired.','error');
-  }catch{setTimeout(poll,2500)}
+  }catch{
+    poll.failures++;
+    if(poll.failures>=5){setStatus('Approval status could not be checked. Reload the original Connector flow and try again.','error');return;}
+    setTimeout(poll,2500)
+  }
 }poll();
 </script></body></html>`;
   return new Response(html, {
@@ -437,7 +443,7 @@ async function poll(){
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+      "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
       "x-frame-options": "DENY",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
@@ -466,7 +472,7 @@ function pendingApprovalPage(input: {
 <section class="card"><div class="main">
 <h1>Approval already pending</h1>
 <p class="lead"><strong>${escapeHtml(clientLabel)}</strong> retried the same OAuth authorization request while its first Herdr approval page is still active.</p>
-<div class="notice" id="status" role="status">Use the original approval page if it is still open. If that page was closed, keep this page open; it will retry automatically after the old request expires.</div>
+<div class="notice" id="status" role="status">Use the original approval page if it is still open. If that page was closed and the enrolled computer has herdr-mcp v0.4.7 or newer, run <code>herdr-mcp connector cancel ${escapeHtml(input.requestId)}</code>, then restart the Connector authorization. Older runtimes can leave this page open; it will retry automatically after the old request expires.</div>
 <div class="details"><span>Request ID</span><code>${escapeHtml(input.requestId)}</code><span>Expires</span><code>${escapeHtml(expiresAt)}</code><span>Retry</span><span id="countdown">after expiry</span></div>
 </div><div class="footer">No approval code, resume token, access token or client secret is recovered or exposed on this page.</div></section></main>
 <script>
@@ -482,7 +488,7 @@ tick();setTimeout(()=>location.reload(),retryAfterMs);
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
       "retry-after": String(retryAfterSec),
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+      "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
       "x-frame-options": "DENY",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
