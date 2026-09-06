@@ -70,6 +70,7 @@ test("offline forward returns a self-describing bounded recovery policy", async 
   assert.equal(body.status, "error");
   assert.equal(body.error.code, "workstation_offline");
   assert.equal(body.error.retryable, true);
+  assert.equal(body.error.requires_human, false);
   assert.equal(body.error.delivery_state, "not_delivered");
   assert.equal(body.error.retry_after_ms, 5_000);
   assert.deepEqual(body.error.recovery, {

@@ -3,7 +3,7 @@
 import { PUBLIC_CONTRACT } from "./contracts/public.js";
 import { RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 import { MCP_SERVER_VERSION } from "./version.js";
-import type { RelayErrorResult } from "./errors.js";
+import { relayErrorRequiresHuman, type RelayErrorResult } from "./errors.js";
 import { classifyOp, type EdgeLimits } from "./limits.js";
 import { checkArgsBudget } from "./payload.js";
 import { newRequestId } from "./pending.js";
@@ -149,6 +149,7 @@ function relayErrorToolResult(error: RelayErrorResult, requestId: string, workst
       ok: false,
       code: error.code,
       retryable: error.retryable,
+      requires_human: error.requires_human ?? relayErrorRequiresHuman(error.code),
       delivery_state: error.delivery_state,
       retry_after_ms: error.retry_after_ms
         ?? (supersededDetails ? GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS : undefined),

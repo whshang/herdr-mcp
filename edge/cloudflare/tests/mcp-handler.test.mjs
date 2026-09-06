@@ -799,6 +799,11 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
   assert.equal(r.body.result.isError, true);
   assert.equal(r.body.result.structuredContent.code, "workstation_offline");
   assert.equal(r.body.result.structuredContent.retryable, true);
+  assert.equal(
+    r.body.result.structuredContent.requires_human,
+    false,
+    "MCP normalizes transient relay errors as non-human even when an older internal envelope omits the field",
+  );
   assert.equal(r.body.result.structuredContent.delivery_state, "not_delivered");
   assert.equal(r.body.result.structuredContent.retry_after_ms, 5000);
   assert.deepEqual(r.body.result.structuredContent.details, { source: "edge-test" });
