@@ -621,7 +621,9 @@ pub struct WorkMemoryResumeRecord {
     pub retention_policy: String,
     pub checkpoint: Option<WorkMemoryCheckpointRecord>,
     pub turns: Vec<WorkMemoryTurnRecord>,
+    pub turns_truncated: bool,
     pub evidence: Vec<WorkMemoryEvidenceRecord>,
+    pub evidence_truncated: bool,
     pub evidence_refs: Vec<WorkMemoryPortableEvidenceRef>,
     pub updated_at: i64,
 }
@@ -631,6 +633,30 @@ pub struct WorkMemorySearchHit {
     pub source_kind: String,
     pub source_id: String,
     pub excerpt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemorySearchBoundary {
+    pub continuity_id: String,
+    pub checkpoint_revision: i64,
+    pub through_evidence_id: Option<String>,
+    pub max_fts_rowid: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemorySearchPage {
+    pub hits: Vec<WorkMemorySearchHit>,
+    pub boundary: WorkMemorySearchBoundary,
+    pub next_offset: usize,
+    pub has_more: bool,
+    pub has_portable_source_claims: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkMemorySearchPageOptions<'a> {
+    pub limit: usize,
+    pub offset: usize,
+    pub expected_boundary: Option<&'a WorkMemorySearchBoundary>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2084,7 +2110,8 @@ impl StateStore {
                 return Err("work_memory_checkpoint_corrupt".to_owned());
             }
         }
-        let limit = i64::try_from(max_turns.clamp(1, 64)).unwrap_or(64);
+        let requested_turns = max_turns.clamp(1, 64);
+        let limit = i64::try_from(requested_turns.saturating_add(1)).unwrap_or(65);
         let mut turn_stmt = self
             .conn
             .prepare(
@@ -2112,9 +2139,14 @@ impl StateStore {
         let mut turns = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot decode work memory turn: {error}"))?;
+        let mut turns_truncated = turns.len() > requested_turns;
+        if turns_truncated {
+            turns.truncate(requested_turns);
+        }
         turns.reverse();
         let mut turn_bytes = turns.iter().map(|turn| turn.text.len()).sum::<usize>();
         while turns.len() > 1 && turn_bytes > 64 * 1024 {
+            turns_truncated = true;
             turn_bytes = turn_bytes.saturating_sub(turns[0].text.len());
             turns.remove(0);
         }
@@ -2125,7 +2157,7 @@ impl StateStore {
                         portable_repo_id, portable_commit_sha, portable_path,
                         portable_line_start, portable_line_end, created_at
                  FROM continuity_evidence WHERE continuity_id = ?1
-                 ORDER BY created_at DESC LIMIT 24",
+                 ORDER BY created_at DESC LIMIT 25",
             )
             .map_err(|error| format!("cannot prepare work memory evidence: {error}"))?;
         let evidence_rows = evidence_stmt
@@ -2146,9 +2178,13 @@ impl StateStore {
                 ))
             })
             .map_err(|error| format!("cannot query work memory evidence: {error}"))?;
-        let raw_evidence = evidence_rows
+        let mut raw_evidence = evidence_rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot decode work memory evidence: {error}"))?;
+        let mut evidence_truncated = raw_evidence.len() > 24;
+        if evidence_truncated {
+            raw_evidence.truncate(24);
+        }
         let mut evidence = Vec::with_capacity(raw_evidence.len());
         for (
             evidence_id,
@@ -2190,6 +2226,7 @@ impl StateStore {
             .map(|item| item.content.len())
             .sum::<usize>();
         while evidence.len() > 1 && evidence_bytes > 64 * 1024 {
+            evidence_truncated = true;
             evidence_bytes = evidence_bytes.saturating_sub(evidence[0].content.len());
             evidence.remove(0);
         }
@@ -2206,7 +2243,9 @@ impl StateStore {
             retention_policy,
             checkpoint,
             turns,
+            turns_truncated,
             evidence,
+            evidence_truncated,
             evidence_refs,
             updated_at,
         }))
@@ -2259,6 +2298,185 @@ impl StateStore {
             .map_err(|error| format!("cannot query work memory search: {error}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot decode work memory search: {error}"))
+    }
+
+    pub fn work_memory_search_page(
+        &self,
+        project_ref: &str,
+        repo_id: &str,
+        work_chain_id: &str,
+        query: &str,
+        options: WorkMemorySearchPageOptions<'_>,
+    ) -> Result<Option<WorkMemorySearchPage>, String> {
+        validate_work_memory_partition_identity(project_ref, repo_id, work_chain_id)?;
+        let query = work_memory_fts_query(query)?;
+        let partition = self
+            .conn
+            .query_row(
+                "SELECT continuity_id, checkpoint_revision FROM continuity_chains
+                 WHERE project_ref = ?1 AND repo_id = ?2 AND work_chain_id = ?3
+                   AND status = 'active'",
+                params![project_ref, repo_id, work_chain_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve work memory partition: {error}"))?;
+        let Some((continuity_id, current_checkpoint_revision)) = partition else {
+            return Ok(None);
+        };
+
+        let current_max_fts_rowid = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM continuity_memory_fts
+                 WHERE continuity_id = ?1",
+                [&continuity_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("cannot read work memory search boundary: {error}"))?;
+
+        let boundary = match options.expected_boundary {
+            Some(boundary) => {
+                if boundary.continuity_id != continuity_id {
+                    return Err("work_memory_cursor_partition_mismatch".to_owned());
+                }
+                if boundary.max_fts_rowid < 0 || current_max_fts_rowid < boundary.max_fts_rowid {
+                    return Err("work_memory_cursor_boundary_unavailable".to_owned());
+                }
+                if boundary.checkpoint_revision > 0 {
+                    let checkpoint_exists = self
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM continuity_checkpoints
+                             WHERE continuity_id = ?1 AND checkpoint_revision = ?2
+                               AND verified = 1",
+                            params![continuity_id, boundary.checkpoint_revision],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("cannot validate work memory cursor checkpoint: {error}")
+                        })?;
+                    if checkpoint_exists.is_none() {
+                        return Err("work_memory_cursor_boundary_unavailable".to_owned());
+                    }
+                }
+                if let Some(evidence_id) = boundary.through_evidence_id.as_deref() {
+                    let evidence_exists = self
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM continuity_memory_fts
+                             WHERE continuity_id = ?1 AND source_kind = 'evidence'
+                               AND source_id = ?2 AND rowid <= ?3",
+                            params![continuity_id, evidence_id, boundary.max_fts_rowid],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("cannot validate work memory cursor evidence: {error}")
+                        })?;
+                    if evidence_exists.is_none() {
+                        return Err("work_memory_cursor_boundary_unavailable".to_owned());
+                    }
+                }
+                boundary.clone()
+            }
+            None => {
+                let through_evidence_id = self
+                    .conn
+                    .query_row(
+                        "SELECT source_id FROM continuity_memory_fts
+                         WHERE continuity_id = ?1 AND source_kind = 'evidence'
+                           AND rowid <= ?2
+                         ORDER BY rowid DESC LIMIT 1",
+                        params![continuity_id, current_max_fts_rowid],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("cannot read work memory evidence boundary: {error}")
+                    })?;
+                WorkMemorySearchBoundary {
+                    continuity_id: continuity_id.clone(),
+                    checkpoint_revision: current_checkpoint_revision,
+                    through_evidence_id,
+                    max_fts_rowid: current_max_fts_rowid,
+                }
+            }
+        };
+
+        let limit = options.limit.clamp(1, 20);
+        let sql_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(21);
+        let sql_offset =
+            i64::try_from(options.offset).map_err(|_| "work_memory_cursor_invalid".to_owned())?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_kind, source_id,
+                        snippet(continuity_memory_fts, 3, '', '', '…', 24)
+                 FROM continuity_memory_fts
+                 WHERE continuity_memory_fts MATCH ?1 AND continuity_id = ?2
+                   AND rowid <= ?3
+                 ORDER BY rowid DESC
+                 LIMIT ?4 OFFSET ?5",
+            )
+            .map_err(|error| format!("cannot prepare stable work memory search: {error}"))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    query,
+                    continuity_id,
+                    boundary.max_fts_rowid,
+                    sql_limit,
+                    sql_offset
+                ],
+                |row| {
+                    Ok(WorkMemorySearchHit {
+                        source_kind: row.get(0)?,
+                        source_id: row.get(1)?,
+                        excerpt: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("cannot query stable work memory search: {error}"))?;
+        let mut hits = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode stable work memory search: {error}"))?;
+        let has_more = hits.len() > limit;
+        if has_more {
+            hits.truncate(limit);
+        }
+
+        let has_portable_source_claims = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM continuity_memory_fts AS f
+                    JOIN continuity_evidence AS e
+                      ON e.continuity_id = f.continuity_id
+                     AND e.evidence_id = f.source_id
+                    WHERE continuity_memory_fts MATCH ?1
+                      AND f.continuity_id = ?2
+                      AND f.source_kind = 'evidence'
+                      AND f.rowid <= ?3
+                      AND e.portable_repo_id IS NOT NULL
+                      AND e.portable_commit_sha IS NOT NULL
+                      AND e.portable_path IS NOT NULL
+                 )",
+                params![query, continuity_id, boundary.max_fts_rowid],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("cannot inspect work memory source coverage: {error}"))?
+            != 0;
+
+        Ok(Some(WorkMemorySearchPage {
+            next_offset: options.offset.saturating_add(hits.len()),
+            hits,
+            boundary,
+            has_more,
+            has_portable_source_claims,
+        }))
     }
 
     pub fn register_browser_endpoint(

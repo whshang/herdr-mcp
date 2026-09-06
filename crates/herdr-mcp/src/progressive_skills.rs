@@ -249,7 +249,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
         json!({
             "method": WORK_MEMORY_SEARCH_METHOD,
             "source": "herdr_mcp_local",
-            "schema_version": 1,
+            "schema_version": 2,
             "params": {
                 "properties": {
                     "project_ref": {"type": "string", "maxLength": 512},
@@ -257,8 +257,13 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "work_chain_id": {"type": "string", "maxLength": 128},
                     "query": {"type": "string", "maxLength": 512},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "cursor": {"type": "string", "maxLength": 4096},
                 },
-                "required": ["project_ref", "repo_id", "work_chain_id", "query"],
+                "required": [],
+                "oneOf": [
+                    {"required": ["project_ref", "repo_id", "work_chain_id", "query"]},
+                    {"required": ["cursor"]},
+                ],
                 "empty": false,
             },
         }),
@@ -2330,6 +2335,13 @@ mod tests {
             json!(["project_ref", "repo_id", "work_chain_id"])
         );
         assert_eq!(methods[5]["method"], WORK_MEMORY_SEARCH_METHOD);
+        assert_eq!(methods[5]["schema_version"], 2);
+        assert_eq!(methods[5]["params"]["required"], json!([]));
+        assert_eq!(
+            methods[5]["params"]["properties"]["cursor"]["maxLength"],
+            4096
+        );
+        assert_eq!(methods[5]["params"]["oneOf"].as_array().unwrap().len(), 2);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
         assert_eq!(methods.len(), 17);

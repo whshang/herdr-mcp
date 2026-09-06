@@ -14,10 +14,13 @@ use crate::state_store::{
     BrowserDeliveryState, BrowserDispatchReservation, BrowserDispatchReserveInput,
     BrowserDispatchUpdateInput, BrowserResourceResolveInput, ContinuitySearchInput, StateStore,
     WorkMemoryBindingInput, WorkMemoryCheckpointInput, WorkMemoryEvidenceInput,
-    WorkMemoryPortableSourceInput, WorkMemoryTurnInput,
+    WorkMemoryPortableSourceInput, WorkMemorySearchBoundary, WorkMemorySearchPage,
+    WorkMemorySearchPageOptions, WorkMemoryTurnInput,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -541,6 +544,181 @@ fn continuity_call(
     }
 }
 
+const WORK_MEMORY_CURSOR_PREFIX: &str = "wmc1";
+const WORK_MEMORY_CURSOR_MAX_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkMemoryCursorV1 {
+    version: u8,
+    kind: String,
+    continuity_id: String,
+    project_ref: String,
+    repo_id: String,
+    work_chain_id: String,
+    query: String,
+    query_sha256: String,
+    checkpoint_revision: i64,
+    through_evidence_id: Option<String>,
+    max_fts_rowid: i64,
+    page_size: u64,
+    offset: u64,
+}
+
+impl WorkMemoryCursorV1 {
+    fn boundary(&self) -> WorkMemorySearchBoundary {
+        WorkMemorySearchBoundary {
+            continuity_id: self.continuity_id.clone(),
+            checkpoint_revision: self.checkpoint_revision,
+            through_evidence_id: self.through_evidence_id.clone(),
+            max_fts_rowid: self.max_fts_rowid,
+        }
+    }
+}
+
+fn work_memory_cursor_sha256(value: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(value))
+}
+
+fn encode_work_memory_cursor(cursor: &WorkMemoryCursorV1) -> Result<String, &'static str> {
+    let payload = serde_json::to_vec(cursor).map_err(|_| "work_memory_cursor_invalid")?;
+    let encoded = URL_SAFE_NO_PAD.encode(&payload);
+    let digest = work_memory_cursor_sha256(&payload);
+    let token = format!("{WORK_MEMORY_CURSOR_PREFIX}.{encoded}.{digest}");
+    if token.len() > WORK_MEMORY_CURSOR_MAX_BYTES {
+        return Err("work_memory_cursor_invalid");
+    }
+    Ok(token)
+}
+
+fn decode_work_memory_cursor(value: &str) -> Result<WorkMemoryCursorV1, &'static str> {
+    if value.is_empty() || value.len() > WORK_MEMORY_CURSOR_MAX_BYTES {
+        return Err("work_memory_cursor_invalid");
+    }
+    let mut parts = value.split('.');
+    let Some(prefix) = parts.next() else {
+        return Err("work_memory_cursor_invalid");
+    };
+    if prefix != WORK_MEMORY_CURSOR_PREFIX {
+        return if prefix.starts_with("wmc") {
+            Err("work_memory_cursor_version_unsupported")
+        } else {
+            Err("work_memory_cursor_invalid")
+        };
+    }
+    let (Some(encoded), Some(expected_digest)) = (parts.next(), parts.next()) else {
+        return Err("work_memory_cursor_invalid");
+    };
+    if parts.next().is_some() {
+        return Err("work_memory_cursor_invalid");
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "work_memory_cursor_invalid")?;
+    if expected_digest != work_memory_cursor_sha256(&payload) {
+        return Err("work_memory_cursor_invalid");
+    }
+    let cursor: WorkMemoryCursorV1 =
+        serde_json::from_slice(&payload).map_err(|_| "work_memory_cursor_invalid")?;
+    if cursor.version != 1 || cursor.kind != "work_memory.search" {
+        return Err("work_memory_cursor_version_unsupported");
+    }
+    if cursor.query.is_empty()
+        || cursor.query.len() > 512
+        || cursor.query_sha256 != work_memory_cursor_sha256(cursor.query.as_bytes())
+        || cursor.checkpoint_revision < 0
+        || cursor.max_fts_rowid < 0
+        || !(1..=20).contains(&cursor.page_size)
+        || cursor.offset > 1_000_000
+    {
+        return Err("work_memory_cursor_invalid");
+    }
+    Ok(cursor)
+}
+
+fn work_memory_coverage(
+    checkpoint_revision: i64,
+    through_evidence_id: Option<&str>,
+    has_portable_source_claims: bool,
+    display_page_truncated: bool,
+    display_excerpt_truncated: bool,
+) -> Value {
+    let mut limitations = Vec::new();
+    if display_page_truncated {
+        limitations.push("display_page_truncated");
+    }
+    if display_excerpt_truncated {
+        limitations.push("display_excerpt_truncated");
+    }
+    if has_portable_source_claims {
+        limitations.push("source_revision_unverified");
+    }
+    json!({
+        "boundary": {
+            "checkpoint_revision": checkpoint_revision,
+            "through_evidence_id": through_evidence_id,
+        },
+        "result_completeness": "complete",
+        "source_verification": if has_portable_source_claims { "unverified" } else { "not_applicable" },
+        "display_truncated": display_page_truncated || display_excerpt_truncated,
+        "limitations": limitations,
+    })
+}
+
+fn work_memory_search_page_json(
+    project_ref: &str,
+    repo_id: &str,
+    work_chain_id: &str,
+    query: &str,
+    page_size: usize,
+    page: WorkMemorySearchPage,
+) -> Value {
+    let display_excerpt_truncated = page.hits.iter().any(|hit| hit.excerpt.contains('…'));
+    let coverage = work_memory_coverage(
+        page.boundary.checkpoint_revision,
+        page.boundary.through_evidence_id.as_deref(),
+        page.has_portable_source_claims,
+        page.has_more,
+        display_excerpt_truncated,
+    );
+    let next_cursor = if page.has_more {
+        let cursor = WorkMemoryCursorV1 {
+            version: 1,
+            kind: "work_memory.search".to_owned(),
+            continuity_id: page.boundary.continuity_id.clone(),
+            project_ref: project_ref.to_owned(),
+            repo_id: repo_id.to_owned(),
+            work_chain_id: work_chain_id.to_owned(),
+            query: query.to_owned(),
+            query_sha256: work_memory_cursor_sha256(query.as_bytes()),
+            checkpoint_revision: page.boundary.checkpoint_revision,
+            through_evidence_id: page.boundary.through_evidence_id.clone(),
+            max_fts_rowid: page.boundary.max_fts_rowid,
+            page_size: page_size as u64,
+            offset: page.next_offset as u64,
+        };
+        match encode_work_memory_cursor(&cursor) {
+            Ok(value) => Some(value),
+            Err(code) => return json!({"ok": false, "code": code}),
+        }
+    } else {
+        None
+    };
+    json!({
+        "ok": true,
+        "continuity_id": page.boundary.continuity_id,
+        "project_ref": project_ref,
+        "repo_id": repo_id,
+        "work_chain_id": work_chain_id,
+        "hits": page.hits.into_iter().map(|hit| json!({
+            "source_kind": hit.source_kind,
+            "source_id": hit.source_id,
+            "excerpt": hit.excerpt,
+        })).collect::<Vec<_>>(),
+        "cursor": next_cursor,
+        "coverage": coverage,
+    })
+}
+
 fn work_memory_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
@@ -956,7 +1134,18 @@ fn work_memory_call(
                 work_chain_id,
                 max_turns,
             ) {
-                Ok(Some(record)) => json!({
+                Ok(Some(record)) => {
+                    let coverage = work_memory_coverage(
+                        record.checkpoint_revision,
+                        record
+                            .checkpoint
+                            .as_ref()
+                            .and_then(|checkpoint| checkpoint.through_evidence_id.as_deref()),
+                        !record.evidence_refs.is_empty(),
+                        record.turns_truncated || record.evidence_truncated,
+                        false,
+                    );
+                    json!({
                     "ok": true,
                     "continuity_id": record.continuity_id,
                     "project_ref": record.project_ref,
@@ -1011,9 +1200,11 @@ fn work_memory_call(
                         "line_end": reference.line_end,
                         "evidence_sha256": reference.evidence_sha256,
                     })).collect::<Vec<_>>(),
+                    "coverage": coverage,
                     "updated_at": record.updated_at,
                     "instruction": "Treat Work Memory as persisted project context. Re-check live Herdr/runtime/Git state before mutation.",
-                }),
+                    })
+                }
                 Ok(None) => json!({"ok": false, "code": "work_memory_not_found"}),
                 Err(error) => work_memory_store_error(error),
             }
@@ -1021,9 +1212,60 @@ fn work_memory_call(
         "work_memory.search" => {
             if let Some(error) = work_memory_reject_unknown(
                 object,
-                &["project_ref", "repo_id", "work_chain_id", "query", "limit"],
+                &[
+                    "project_ref",
+                    "repo_id",
+                    "work_chain_id",
+                    "query",
+                    "limit",
+                    "cursor",
+                ],
             ) {
                 return error;
+            }
+            if let Some(cursor_value) = params.get("cursor") {
+                if object.len() != 1 {
+                    return json!({"ok": false, "code": "work_memory_cursor_conflict"});
+                }
+                let Some(cursor_text) = cursor_value.as_str() else {
+                    return json!({"ok": false, "code": "work_memory_cursor_invalid"});
+                };
+                let cursor = match decode_work_memory_cursor(cursor_text) {
+                    Ok(cursor) => cursor,
+                    Err(code) => return json!({"ok": false, "code": code}),
+                };
+                let offset = match usize::try_from(cursor.offset) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return json!({"ok": false, "code": "work_memory_cursor_invalid"});
+                    }
+                };
+                let page_size = cursor.page_size as usize;
+                let boundary = cursor.boundary();
+                return match store.work_memory_search_page(
+                    &cursor.project_ref,
+                    &cursor.repo_id,
+                    &cursor.work_chain_id,
+                    &cursor.query,
+                    WorkMemorySearchPageOptions {
+                        limit: page_size,
+                        offset,
+                        expected_boundary: Some(&boundary),
+                    },
+                ) {
+                    Ok(Some(page)) => work_memory_search_page_json(
+                        &cursor.project_ref,
+                        &cursor.repo_id,
+                        &cursor.work_chain_id,
+                        &cursor.query,
+                        page_size,
+                        page,
+                    ),
+                    Ok(None) => {
+                        json!({"ok": false, "code": "work_memory_cursor_partition_mismatch"})
+                    }
+                    Err(error) => work_memory_store_error(error),
+                };
             }
             let project_ref = match work_memory_required_string(params, "project_ref", 512) {
                 Ok(value) => value,
@@ -1048,18 +1290,26 @@ fn work_memory_call(
                     _ => return json!({"ok": false, "code": "work_memory_limit_invalid"}),
                 },
             };
-            match store.work_memory_search(project_ref, repo_id, work_chain_id, query, limit) {
-                Ok(hits) => json!({
-                    "ok": true,
-                    "project_ref": project_ref,
-                    "repo_id": repo_id,
-                    "work_chain_id": work_chain_id,
-                    "hits": hits.into_iter().map(|hit| json!({
-                        "source_kind": hit.source_kind,
-                        "source_id": hit.source_id,
-                        "excerpt": hit.excerpt,
-                    })).collect::<Vec<_>>()
-                }),
+            match store.work_memory_search_page(
+                project_ref,
+                repo_id,
+                work_chain_id,
+                query,
+                WorkMemorySearchPageOptions {
+                    limit,
+                    offset: 0,
+                    expected_boundary: None,
+                },
+            ) {
+                Ok(Some(page)) => work_memory_search_page_json(
+                    project_ref,
+                    repo_id,
+                    work_chain_id,
+                    query,
+                    limit,
+                    page,
+                ),
+                Ok(None) => json!({"ok": false, "code": "work_memory_not_found"}),
                 Err(error) => work_memory_store_error(error),
             }
         }
@@ -3275,6 +3525,38 @@ mod tests {
         assert_eq!(resumed["turns"].as_array().unwrap().len(), 2);
         assert_eq!(resumed["turns"][0]["provider"], "chatgpt");
         assert_eq!(resumed["turns"][1]["provider"], "gemini");
+        assert_eq!(resumed["coverage"]["result_completeness"], "complete");
+        assert_eq!(resumed["coverage"]["source_verification"], "unverified");
+        assert_eq!(resumed["coverage"]["display_truncated"], false);
+        assert!(
+            resumed["coverage"]["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "source_revision_unverified")
+        );
+
+        let tight_resume = work_memory_call(
+            &store,
+            "work_memory.resume",
+            &json!({
+                "project_ref": "project:herdr-mcp",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_cccccccccccccccccccccccccccccccc",
+                "max_turns": 1
+            }),
+        );
+        assert_eq!(tight_resume["ok"], true);
+        assert_eq!(tight_resume["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(tight_resume["coverage"]["result_completeness"], "complete");
+        assert_eq!(tight_resume["coverage"]["display_truncated"], true);
+        assert!(
+            tight_resume["coverage"]["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "display_page_truncated")
+        );
 
         let searched = work_memory_call(
             &store,
@@ -3289,6 +3571,124 @@ mod tests {
         assert_eq!(searched["ok"], true);
         assert_eq!(searched["hits"].as_array().unwrap().len(), 1);
         assert_eq!(searched["hits"][0]["source_kind"], "evidence");
+        assert_eq!(searched["coverage"]["result_completeness"], "complete");
+        assert_eq!(searched["coverage"]["source_verification"], "unverified");
+    }
+
+    #[test]
+    fn work_memory_search_cursor_freezes_boundary_and_rejects_tampering() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let bound = work_memory_call(
+            &store,
+            "work_memory.bind",
+            &json!({
+                "continuity_id": "wm:cursor",
+                "project_ref": "project:cursor",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "provider": "chatgpt",
+                "session_ref": "cursor-session",
+                "bound_at": 1,
+            }),
+        );
+        assert_eq!(bound["ok"], true);
+
+        for index in 1..=3 {
+            let appended = work_memory_call(
+                &store,
+                "work_memory.append_evidence",
+                &json!({
+                    "continuity_id": "wm:cursor",
+                    "kind": "result",
+                    "content": format!("stable-cursor-keyword evidence-{index}"),
+                    "created_at": 10 + index,
+                }),
+            );
+            assert_eq!(appended["ok"], true);
+        }
+
+        let first = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({
+                "project_ref": "project:cursor",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "query": "stable-cursor-keyword",
+                "limit": 2
+            }),
+        );
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["hits"].as_array().unwrap().len(), 2);
+        assert_eq!(first["coverage"]["result_completeness"], "complete");
+        assert_eq!(first["coverage"]["display_truncated"], true);
+        let cursor = first["cursor"].as_str().unwrap().to_owned();
+
+        let appended_later = work_memory_call(
+            &store,
+            "work_memory.append_evidence",
+            &json!({
+                "continuity_id": "wm:cursor",
+                "kind": "result",
+                "content": "stable-cursor-keyword evidence-4-later",
+                "created_at": 20,
+            }),
+        );
+        assert_eq!(appended_later["ok"], true);
+
+        let continued = work_memory_call(&store, "work_memory.search", &json!({"cursor": cursor}));
+        assert_eq!(continued["ok"], true);
+        assert_eq!(continued["hits"].as_array().unwrap().len(), 1);
+        assert!(
+            continued["hits"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("evidence-1")
+        );
+        assert!(!continued.to_string().contains("evidence-4-later"));
+        assert!(continued["cursor"].is_null());
+
+        let replay = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({"cursor": first["cursor"]}),
+        );
+        assert_eq!(replay, continued);
+
+        let fresh = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({
+                "project_ref": "project:cursor",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "query": "stable-cursor-keyword",
+                "limit": 1
+            }),
+        );
+        assert_eq!(fresh["ok"], true);
+        assert!(
+            fresh["hits"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("evidence-4-later")
+        );
+
+        let conflict = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({"cursor": first["cursor"], "limit": 1}),
+        );
+        assert_eq!(conflict["code"], "work_memory_cursor_conflict");
+
+        let mut tampered = first["cursor"].as_str().unwrap().to_owned();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == '0' { '1' } else { '0' });
+        let tampered_result =
+            work_memory_call(&store, "work_memory.search", &json!({"cursor": tampered}));
+        assert_eq!(tampered_result["code"], "work_memory_cursor_invalid");
     }
 
     #[test]
