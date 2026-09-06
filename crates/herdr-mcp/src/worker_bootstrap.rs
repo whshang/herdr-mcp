@@ -1285,26 +1285,47 @@ fn create_and_consume_first_pairing(
     if let Some(name) = name {
         body["name"] = Value::String(name.to_owned());
     }
-    let response = edge_http
-        .client
-        .post(format!("{edge_origin}/devices/pairings"))
-        .bearer_auth(operator.expose()?)
-        .json(&body)
-        .send()
-        .map_err(|error| {
-            sanitize_error(&format!("cannot create first pairing: {error}"), operator)
-        })?;
-    let status = response.status();
-    let pairing: Value = response
-        .json()
-        .map_err(|_| format!("first pairing returned non-JSON HTTP {}", status.as_u16()))?;
-    if !status.is_success() || pairing.get("ok").and_then(Value::as_bool) != Some(true) {
+    let authorization = operator.expose()?;
+    let delays = [
+        Duration::ZERO,
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+    ];
+    let attempts = delays.len();
+    let mut ready_pairing = None;
+    for (attempt, delay) in delays.into_iter().enumerate() {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let response = edge_http
+            .client
+            .post(format!("{edge_origin}/devices/pairings"))
+            .bearer_auth(authorization)
+            .json(&body)
+            .send()
+            .map_err(|error| {
+                sanitize_error(&format!("cannot create first pairing: {error}"), operator)
+            })?;
+        let status = response.status();
+        let pairing: Value = response
+            .json()
+            .map_err(|_| format!("first pairing returned non-JSON HTTP {}", status.as_u16()))?;
+        if status.is_success() && pairing.get("ok").and_then(Value::as_bool) == Some(true) {
+            ready_pairing = Some(pairing);
+            break;
+        }
         let code = pairing
             .get("code")
             .and_then(Value::as_str)
             .unwrap_or("pairing_create_failed");
+        if first_pairing_create_is_retryable(status, &pairing) && attempt + 1 < attempts {
+            continue;
+        }
         return Err(format!("first pairing refused: {code}"));
     }
+    let pairing = ready_pairing.ok_or_else(|| "first pairing did not become ready".to_owned())?;
     let pairing_id = required_string(&pairing, "pairing_id")?;
     let code = required_string(&pairing, "code")?;
     let mut consume = json!({ "pairing_id": pairing_id, "code": code });
@@ -1336,6 +1357,11 @@ fn create_and_consume_first_pairing(
         workstation_id: required_string(&payload, "workstation_id")?,
         device_secret: required_string(&payload, "device_secret")?,
     })
+}
+
+fn first_pairing_create_is_retryable(status: reqwest::StatusCode, payload: &Value) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && payload.get("code").and_then(Value::as_str) == Some("pairing_unavailable")
 }
 
 fn edge_devices_with_operator(
@@ -2095,6 +2121,26 @@ mod tests {
                 reqwest::StatusCode::from_u16(status).unwrap()
             ));
         }
+    }
+
+    #[test]
+    fn first_pairing_retry_is_only_for_pre_mutation_pepper_readiness() {
+        assert!(first_pairing_create_is_retryable(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"ok": false, "code": "pairing_unavailable"})
+        ));
+        assert!(!first_pairing_create_is_retryable(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"ok": false, "code": "internal_error"})
+        ));
+        assert!(!first_pairing_create_is_retryable(
+            reqwest::StatusCode::CONFLICT,
+            &json!({"ok": false, "code": "first_fleet_not_empty"})
+        ));
+        assert!(!first_pairing_create_is_retryable(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &json!({"ok": false, "code": "pairing_unavailable"})
+        ));
     }
 
     #[test]
