@@ -308,16 +308,7 @@ pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, St
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn extension_fleet_snapshot_with_proxy(
-    paths: &RuntimePaths,
-    proxy_url: Option<&str>,
-) -> Result<Value, String> {
-    let client = client_with_proxy(proxy_url)?;
-    extension_fleet_snapshot_with_client(paths, &client)
-}
-
-#[cfg(target_os = "macos")]
-fn extension_fleet_snapshot_with_client(
+pub(crate) fn extension_fleet_snapshot_with_client(
     paths: &RuntimePaths,
     client: &Client,
 ) -> Result<Value, String> {
@@ -1484,22 +1475,6 @@ fn client() -> Result<Client, String> {
     Client::builder()
         .timeout(HTTP_TIMEOUT)
         .redirect(Policy::none())
-        .build()
-        .map_err(|error| format!("cannot initialize Worker HTTP client: {error}"))
-}
-
-#[cfg(target_os = "macos")]
-fn client_with_proxy(proxy_url: Option<&str>) -> Result<Client, String> {
-    let mut builder = Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .redirect(Policy::none())
-        .no_proxy();
-    if let Some(proxy_url) = proxy_url {
-        let proxy = reqwest::Proxy::all(proxy_url)
-            .map_err(|error| format!("cannot configure Worker HTTP proxy: {error}"))?;
-        builder = builder.proxy(proxy);
-    }
-    builder
         .build()
         .map_err(|error| format!("cannot initialize Worker HTTP client: {error}"))
 }
