@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -173,19 +174,39 @@ impl MutationGate {
 #[derive(Debug, Clone)]
 struct EdgeHttpClient {
     client: reqwest::blocking::Client,
-    proxy_url: Option<String>,
 }
 
 impl EdgeHttpClient {
     fn direct() -> Result<Self, String> {
-        Self::build(None)
+        Self::build(None, None)
     }
 
     fn via_proxy(proxy: &crate::link::proxy::ResolvedProxy) -> Result<Self, String> {
-        Self::build(Some(proxy.url.as_str()))
+        Self::build(Some(proxy.url.as_str()), None)
     }
 
-    fn build(proxy_url: Option<&str>) -> Result<Self, String> {
+    fn via_socks_resolved(
+        proxy: &crate::link::proxy::ResolvedProxy,
+        host: &str,
+        ips: &[IpAddr],
+    ) -> Result<Self, String> {
+        let mut url = proxy
+            .url
+            .parse::<url::Url>()
+            .map_err(|_| "cannot parse bootstrap SOCKS proxy URL".to_owned())?;
+        if !matches!(url.scheme(), "socks5" | "socks5h") {
+            return Err("trusted-DNS bootstrap fallback requires a SOCKS5 proxy".to_owned());
+        }
+        url.set_scheme("socks5")
+            .map_err(|_| "cannot configure local-DNS SOCKS5 proxy".to_owned())?;
+        let proxy_url = url.to_string();
+        Self::build(Some(&proxy_url), Some((host, ips)))
+    }
+
+    fn build(
+        proxy_url: Option<&str>,
+        resolved_host: Option<(&str, &[IpAddr])>,
+    ) -> Result<Self, String> {
         let mut builder = reqwest::blocking::Client::builder().timeout(HTTP_TIMEOUT);
         if proxy_url.is_none() {
             builder = builder.no_proxy();
@@ -195,17 +216,21 @@ impl EdgeHttpClient {
                 .map_err(|error| format!("cannot configure bootstrap Edge proxy: {error}"))?;
             builder = builder.proxy(proxy);
         }
+        if let Some((host, ips)) = resolved_host {
+            if ips.is_empty() {
+                return Err("trusted DNS returned no usable Worker address".to_owned());
+            }
+            let addrs = ips
+                .iter()
+                .copied()
+                .map(|ip| SocketAddr::new(ip, 443))
+                .collect::<Vec<_>>();
+            builder = builder.resolve_to_addrs(host, &addrs);
+        }
         let client = builder
             .build()
             .map_err(|error| format!("cannot create bootstrap Edge client: {error}"))?;
-        Ok(Self {
-            client,
-            proxy_url: proxy_url.map(str::to_owned),
-        })
-    }
-
-    fn proxy_url(&self) -> Option<&str> {
-        self.proxy_url.as_deref()
+        Ok(Self { client })
     }
 }
 
@@ -724,11 +749,7 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
     drop(token);
 
     verify_public_oauth(&edge_http, &edge_origin)?;
-    verify_current_device_inventory(
-        paths,
-        journal.canonical_device_id.as_deref(),
-        edge_http.proxy_url(),
-    )?;
+    verify_current_device_inventory(paths, journal.canonical_device_id.as_deref(), &edge_http)?;
     let link = crate::link::ownership::status_report()?;
     if link.get("operational_ready").and_then(Value::as_bool) != Some(true) {
         let safe = crate::status::sanitize_probe_token(&link.to_string());
@@ -1384,9 +1405,12 @@ fn verify_device_fleet_admin(
 fn verify_current_device_inventory(
     paths: &RuntimePaths,
     expected: Option<&str>,
-    proxy_url: Option<&str>,
+    _edge_http: &EdgeHttpClient,
 ) -> Result<(), String> {
-    let payload = crate::worker::extension_fleet_snapshot_with_proxy(paths, proxy_url)?;
+    #[cfg(target_os = "macos")]
+    let payload = crate::worker::extension_fleet_snapshot_with_client(paths, &_edge_http.client)?;
+    #[cfg(not(target_os = "macos"))]
+    let payload = crate::worker::extension_fleet_snapshot_with_proxy(paths, None)?;
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err("authenticated device inventory is unavailable after bootstrap".to_owned());
     }
@@ -1415,11 +1439,100 @@ fn verify_health(
                 return Err(direct_error);
             };
             let proxied = EdgeHttpClient::via_proxy(&proxy)?;
-            probe_health(&proxied, edge_origin, worker_name, expected_version)
-                .map_err(EdgeHealthProbeError::into_message)?;
-            Ok(proxied)
+            match probe_health(&proxied, edge_origin, worker_name, expected_version) {
+                Ok(()) => Ok(proxied),
+                Err(error) if !error.may_retry_via_proxy() => Err(error.into_message()),
+                Err(error) => {
+                    let proxy_error = error.into_message();
+                    let Some(socks) = crate::link::proxy::resolve_link_socks_proxy() else {
+                        return Err(proxy_error);
+                    };
+                    let host = edge_origin_host(edge_origin)?;
+                    let ips = resolve_trusted_worker_ips(&proxied, &host).map_err(|error| {
+                        format!("{proxy_error}; trusted DNS fallback unavailable: {error}")
+                    })?;
+                    let resolved = EdgeHttpClient::via_socks_resolved(&socks, &host, &ips)?;
+                    probe_health(&resolved, edge_origin, worker_name, expected_version)
+                        .map_err(EdgeHealthProbeError::into_message)?;
+                    Ok(resolved)
+                }
+            }
         }
     }
+}
+
+fn edge_origin_host(edge_origin: &str) -> Result<String, String> {
+    let parsed = edge_origin
+        .parse::<url::Url>()
+        .map_err(|_| "bootstrap Edge origin is not a valid URL".to_owned())?;
+    if parsed.scheme() != "https" {
+        return Err("bootstrap Edge origin must use HTTPS".to_owned());
+    }
+    parsed
+        .host_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "bootstrap Edge origin has no hostname".to_owned())
+}
+
+fn resolve_trusted_worker_ips(
+    edge_http: &EdgeHttpClient,
+    host: &str,
+) -> Result<Vec<IpAddr>, String> {
+    let mut doh_url = "https://cloudflare-dns.com/dns-query"
+        .parse::<url::Url>()
+        .map_err(|_| "trusted DNS endpoint is invalid".to_owned())?;
+    doh_url
+        .query_pairs_mut()
+        .append_pair("name", host)
+        .append_pair("type", "A");
+    let response = edge_http
+        .client
+        .get(doh_url)
+        .header(reqwest::header::ACCEPT, "application/dns-json")
+        .send()
+        .map_err(|error| format!("trusted DNS query failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "trusted DNS query returned HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let payload: Value = response
+        .json()
+        .map_err(|_| "trusted DNS query returned non-JSON".to_owned())?;
+    let ips = parse_trusted_dns_ipv4_answers(&payload);
+    if ips.is_empty() {
+        return Err("trusted DNS returned no IPv4 address for Worker hostname".to_owned());
+    }
+    Ok(ips)
+}
+
+fn parse_trusted_dns_ipv4_answers(payload: &Value) -> Vec<IpAddr> {
+    if payload.get("Status").and_then(Value::as_i64) != Some(0) {
+        return Vec::new();
+    }
+    let mut ips = Vec::new();
+    let Some(answers) = payload.get("Answer").and_then(Value::as_array) else {
+        return ips;
+    };
+    for answer in answers {
+        if answer.get("type").and_then(Value::as_i64) != Some(1) {
+            continue;
+        }
+        let Some(value) = answer.get("data").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(ip) = value.parse::<IpAddr>() else {
+            continue;
+        };
+        if ip.is_ipv4() && !ips.contains(&ip) {
+            ips.push(ip);
+        }
+        if ips.len() >= 8 {
+            break;
+        }
+    }
+    ips
 }
 
 fn probe_health(
@@ -1891,6 +2004,28 @@ mod tests {
         assert!(
             !EdgeHealthProbeError::Validation("wrong contract".to_owned()).may_retry_via_proxy()
         );
+    }
+
+    #[test]
+    fn trusted_dns_parser_accepts_only_unique_ipv4_answers() {
+        let payload = json!({
+            "Status": 0,
+            "Answer": [
+                {"type": 1, "data": "104.21.75.107"},
+                {"type": 28, "data": "2606:4700:3030::6815:4b6b"},
+                {"type": 1, "data": "172.67.221.89"},
+                {"type": 1, "data": "104.21.75.107"},
+                {"type": 5, "data": "example.invalid"}
+            ]
+        });
+        assert_eq!(
+            parse_trusted_dns_ipv4_answers(&payload),
+            vec![
+                "104.21.75.107".parse::<IpAddr>().unwrap(),
+                "172.67.221.89".parse::<IpAddr>().unwrap()
+            ]
+        );
+        assert!(parse_trusted_dns_ipv4_answers(&json!({"Status": 2})).is_empty());
     }
 
     #[test]
