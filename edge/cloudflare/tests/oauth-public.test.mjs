@@ -168,18 +168,6 @@ async function approvePending(opts, pending, approver = "device:dev_owner") {
 
 /** Authorize for a client through the explicit fleet-approval flow. */
 async function makeAuthCode(opts, client_id, redirect_uri = "https://app.example/cb") {
-  const grant = await opts.store.getGrant(client_id);
-  if (grant?.status === "active") {
-    const verifier = "E".repeat(43) + "zZ-._";
-    const challenge = await s256Challenge(verifier);
-    const qs = new URLSearchParams({
-      client_id, redirect_uri, response_type: "code",
-      code_challenge: challenge, code_challenge_method: "S256", state: "st",
-    });
-    const resp = await GET(`/oauth/authorize?${qs}`, opts);
-    assert.equal(resp.status, 302, "an already approved active connector grant should not require approval again");
-    return { code: new URL(resp.headers.get("location")).searchParams.get("code"), verifier };
-  }
   const pending = await pendingAuthorization(opts, client_id, redirect_uri);
   const approved = await approvePending(opts, pending);
   return { code: approved.code, verifier: pending.verifier };

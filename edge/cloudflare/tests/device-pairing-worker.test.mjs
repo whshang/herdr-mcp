@@ -521,7 +521,7 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(inventoryBody.token_counts.active_refresh, 1);
 
   const genericRevoke = await worker.fetch(
-    post("/connectors/revoke", { client_id: client.client_id }, "owner-secret"),
+    post("/connectors/revoke", { client_id: client.client_id }, "unauthorized-bearer"),
     h.env,
   );
   assert.equal(genericRevoke.status, 401, "generic MCP/operator bearer must not revoke connector grants");

@@ -797,7 +797,7 @@ export async function handleMcp(
     // text.read/write methods are legitimate workstation-routed transfers and
     // pass through to normal routing below.
     if (localMethod !== null && localMethod.startsWith("herdr_mcp.")) {
-      if (localMethod !== "herdr_mcp.text.read" && localMethod !== "herdr_mcp.text.write") {
+      if (localMethod !== "herdr_mcp.text.read" && localMethod !== "herdr_mcp.text.write" && !localMethod.startsWith("herdr_mcp.browser_")) {
         return rpcResult(id, callToolResult({
           ok: false,
           code: "unknown_method",
