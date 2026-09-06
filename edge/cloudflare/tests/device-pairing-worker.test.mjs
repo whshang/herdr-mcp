@@ -181,6 +181,41 @@ test("new Connector requires explicit exact owner-device approval; generic owner
   assert.equal(approved.status, 200);
   assert.equal((await approved.json()).client_id, client.client_id);
 
+  const target = await pair(h.env, "webchat-grant-target");
+  const grantInput = {
+    client_id: client.client_id,
+    device_id: target.device_id,
+    endpoint_ref: `be_${"a".repeat(64)}`,
+    provider: "chatgpt",
+    account_ref: `br_${"b".repeat(64)}`,
+    allowed: true,
+  };
+  const genericGrant = await worker.fetch(post("/connectors/webchat-control", grantInput, "owner-secret"), h.env);
+  assert.equal(genericGrant.status, 401, "generic MCP/operator bearer cannot widen WebChat Control");
+  const ownerGrant = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control",
+    grantInput,
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(ownerGrant.status, 200);
+  const ownerGrantBody = await ownerGrant.json();
+  assert.equal(ownerGrantBody.action, "connector_webchat_control_set");
+  assert.deepEqual(ownerGrantBody.grants, [{
+    device_id: target.device_id,
+    endpoint_ref: grantInput.endpoint_ref,
+    provider: "chatgpt",
+    account_ref: grantInput.account_ref,
+  }]);
+
+  const storedGrant = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: client.client_id }),
+  }));
+  assert.equal(storedGrant.status, 200);
+  assert.deepEqual((await storedGrant.json()).record.webchat_control, ownerGrantBody.grants);
+
   const poll = new URL("https://edge.example/oauth/authorize/poll");
   poll.searchParams.set("request_id", requestId);
   poll.searchParams.set("resume_token", resumeToken);
@@ -192,6 +227,33 @@ test("new Connector requires explicit exact owner-device approval; generic owner
   assert.equal(redirect.origin + redirect.pathname, "https://client.example/callback");
   assert.equal(redirect.searchParams.get("state"), "state-connector");
   assert.ok(redirect.searchParams.get("code"));
+
+  const genericRevoke = await worker.fetch(
+    post("/connectors/revoke", { client_id: client.client_id }, "owner-secret"),
+    h.env,
+  );
+  assert.equal(genericRevoke.status, 401, "generic MCP/operator bearer must not revoke connector grants");
+
+  const revoked = await worker.fetch(postAsWorkstation(
+    "/connectors/revoke",
+    { client_id: client.client_id },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(revoked.status, 200);
+  const revokedBody = await revoked.json();
+  assert.equal(revokedBody.ok, true);
+  assert.equal(revokedBody.action, "connector_revoke");
+  assert.equal(revokedBody.client_id, client.client_id);
+
+  const storedRevokedGrant = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: client.client_id }),
+  }));
+  assert.equal(storedRevokedGrant.status, 200);
+  const storedRevokedGrantBody = await storedRevokedGrant.json();
+  assert.equal(storedRevokedGrantBody.record.status, "revoked");
 });
 
 test("pairing creation requires owner auth and returns one-time material with worker origin metadata", async () => {

@@ -119,6 +119,15 @@ export interface OAuthPublicStore {
   approveApproval(requestId: string, codeHash: string, approver: string, nowMs: number): Promise<ApproveApprovalResult>;
   consumeApproval(requestId: string, resumeHash: string, nowMs: number): Promise<ConsumeApprovalResult>;
   getGrant(clientId: string): Promise<OAuthConnectorGrantRecord | null>;
+  setWebChatControlGrant(input: {
+    client_id: string;
+    device_id: string;
+    endpoint_ref: string;
+    provider: string;
+    account_ref: string;
+    allowed: boolean;
+    changed_by: string;
+  }): Promise<OAuthConnectorGrantRecord | null>;
   revokeGrant(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   issueTokens(input: TokenIssueInput): Promise<IssuedTokenPair | null>;
   exchangeRefresh(input: RefreshExchangeInput): Promise<IssuedTokenPair | null>;
@@ -1174,6 +1183,12 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
     },
     async getGrant(clientId) {
       const resp = await internal("/internal/oauth/grant/get", { client_id: clientId });
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as { ok?: boolean; record?: OAuthConnectorGrantRecord };
+      return data.record ?? null;
+    },
+    async setWebChatControlGrant(input) {
+      const resp = await internal("/internal/oauth/grant/webchat-control", input);
       if (!resp.ok) return null;
       const data = (await resp.json()) as { ok?: boolean; record?: OAuthConnectorGrantRecord };
       return data.record ?? null;

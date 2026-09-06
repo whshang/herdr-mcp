@@ -73,6 +73,7 @@ const ALLOWED_PROXY_PATHS: &[&str] = &[
     "/extension/control/action",
     "/extension/fleet",
     "/extension/browser/registry",
+    "/extension/browser/actuation",
     "/extension/continuity/turn",
     "/extension/continuity/resolve",
 ];
@@ -861,6 +862,10 @@ mod tests {
         assert_eq!(
             validate_proxy_path(Some(&json!("/extension/browser/registry"))).unwrap(),
             "/extension/browser/registry"
+        );
+        assert_eq!(
+            validate_proxy_path(Some(&json!("/extension/browser/actuation"))).unwrap(),
+            "/extension/browser/actuation"
         );
         assert_eq!(
             validate_proxy_path(Some(&json!("/extension/continuity/turn"))).unwrap(),

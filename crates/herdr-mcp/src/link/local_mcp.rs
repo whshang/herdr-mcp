@@ -10,6 +10,7 @@
 //! production cutover.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
@@ -18,6 +19,19 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::{Map, Number, Value, json};
 use tokio::sync::watch;
 use url::Url;
+
+#[cfg(unix)]
+use http_body_util::{BodyExt, Full};
+#[cfg(unix)]
+use hyper::body::Bytes;
+#[cfg(unix)]
+use hyper::client::conn::http1;
+#[cfg(unix)]
+use hyper::header::HOST;
+#[cfg(unix)]
+use hyper_util::rt::TokioIo;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 use super::request_core::RuntimeRequest;
 use crate::relay::protocol::RuntimeContractInfo;
@@ -29,6 +43,8 @@ pub const LOCAL_MCP_MAX_TIMEOUT_MS: u64 = 120_000;
 pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 2;
 
 const LOCAL_MCP_RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
+const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
+const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const LOCAL_MCP_MIN_FRAME_BYTES: usize = 64;
 const LOCAL_MCP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -75,6 +91,7 @@ pub struct LocalMcpConfig {
     pub max_frame_bytes: usize,
     pub health_method: String,
     pub health_params: Value,
+    pub trusted_ipc_socket: Option<PathBuf>,
 }
 
 impl LocalMcpConfig {
@@ -95,6 +112,9 @@ impl LocalMcpConfig {
             max_frame_bytes: LOCAL_MCP_DEFAULT_MAX_FRAME_BYTES,
             health_method: "server/discover".to_owned(),
             health_params: Value::Object(Map::new()),
+            trusted_ipc_socket: crate::paths::RuntimePaths::discover()
+                .ok()
+                .map(|paths| paths.config_dir.join("extension.sock")),
         }
     }
 }
@@ -183,6 +203,7 @@ pub struct LocalMcpTransport {
     max_frame_bytes: usize,
     health_method: String,
     health_params: Value,
+    trusted_ipc_socket: Option<PathBuf>,
     client: reqwest::Client,
     discovered_version: RwLock<Option<String>>,
     in_flight: Mutex<BTreeMap<String, AbortEntry>>,
@@ -244,6 +265,7 @@ impl LocalMcpTransport {
             max_frame_bytes,
             health_method,
             health_params: config.health_params,
+            trusted_ipc_socket: config.trusted_ipc_socket,
             client,
             discovered_version: RwLock::new(None),
             in_flight: Mutex::new(BTreeMap::new()),
@@ -301,6 +323,53 @@ impl LocalMcpTransport {
         }
     }
 
+    fn webchat_control_grants_header(
+        trace: Option<&Map<String, Value>>,
+    ) -> Result<Option<String>, ()> {
+        let Some(value) = trace.and_then(|trace| trace.get("webchat_control_grants")) else {
+            return Ok(None);
+        };
+        let items = value.as_array().ok_or(())?;
+        if items.is_empty() {
+            return Ok(None);
+        }
+        if items.len() > 32 {
+            return Err(());
+        }
+        let mut normalized = Vec::with_capacity(items.len());
+        for item in items {
+            let object = item.as_object().ok_or(())?;
+            if object.len() != 3
+                || !object.contains_key("endpoint_ref")
+                || !object.contains_key("provider")
+                || !object.contains_key("account_ref")
+            {
+                return Err(());
+            }
+            let endpoint_ref = object
+                .get("endpoint_ref")
+                .and_then(Value::as_str)
+                .ok_or(())?;
+            let provider = object.get("provider").and_then(Value::as_str).ok_or(())?;
+            let account_ref = object
+                .get("account_ref")
+                .and_then(Value::as_str)
+                .ok_or(())?;
+            if !valid_grant_ref(endpoint_ref, 96)
+                || !valid_grant_provider(provider)
+                || !valid_grant_ref(account_ref, 96)
+            {
+                return Err(());
+            }
+            normalized.push(json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": provider,
+                "account_ref": account_ref,
+            }));
+        }
+        serde_json::to_string(&normalized).map(Some).map_err(|_| ())
+    }
+
     fn failure(
         &self,
         code: &str,
@@ -353,14 +422,169 @@ impl LocalMcpTransport {
             }
             Err(_) => unreachable!("send_json only returns unreachable"),
         };
-        if let (Some(expected), Some(observed)) = (
-            self.runtime_generation.as_deref(),
-            response
-                .headers()
-                .get(LOCAL_MCP_RUNTIME_GENERATION_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .filter(|value| !value.is_empty()),
-        ) && expected != observed
+        let observed_generation = response
+            .headers()
+            .get(LOCAL_MCP_RUNTIME_GENERATION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let (status, text) = match self.read_bounded_body(response).await {
+            Ok(value) => value,
+            Err(error) => return self.body_failure(error),
+        };
+        self.interpret_http_response(status, observed_generation.as_deref(), &text, &rpc_id)
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_trusted_ipc(
+        &self,
+        body: String,
+        rpc_id: String,
+        grants_header: &str,
+    ) -> RuntimeToolResult {
+        let Some(expected_generation) = self.runtime_generation.as_deref() else {
+            return self.failure(
+                code::RUNTIME_GENERATION_MISMATCH,
+                false,
+                "trusted caller grant dispatch requires a reserved runtime generation",
+                None,
+            );
+        };
+        let Some(socket_path) = self.trusted_ipc_socket.as_ref() else {
+            return self.failure(
+                code::UNREACHABLE,
+                true,
+                "trusted local runtime IPC is unavailable",
+                None,
+            );
+        };
+        let stream = match UnixStream::connect(socket_path).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                return self.failure(
+                    code::UNREACHABLE,
+                    true,
+                    "trusted local runtime IPC is unavailable",
+                    None,
+                );
+            }
+        };
+        let io = TokioIo::new(stream);
+        let (mut sender, connection) = match http1::handshake(io).await {
+            Ok(value) => value,
+            Err(_) => {
+                return self.failure(
+                    code::UNREACHABLE,
+                    true,
+                    "trusted local runtime IPC is unavailable",
+                    None,
+                );
+            }
+        };
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let request = match hyper::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(HOST, "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, grants_header)
+            .header(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER, expected_generation)
+            .body(Full::new(Bytes::from(body)))
+        {
+            Ok(request) => request,
+            Err(_) => {
+                return self.failure(
+                    code::BAD_REQUEST,
+                    false,
+                    "invalid trusted caller grant context",
+                    None,
+                );
+            }
+        };
+        let mut response = match sender.send_request(request).await {
+            Ok(response) => response,
+            Err(_) => {
+                return self.failure(
+                    code::UNREACHABLE,
+                    true,
+                    "trusted local runtime IPC is unavailable",
+                    None,
+                );
+            }
+        };
+        let status = response.status().as_u16();
+        let observed_generation = response
+            .headers()
+            .get(LOCAL_MCP_RUNTIME_GENERATION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let mut bytes = Vec::new();
+        while let Some(frame) = response.body_mut().frame().await {
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(_) => return self.body_failure(HttpFailure::BodyRead),
+            };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            if bytes.len().saturating_add(data.len()) > self.max_frame_bytes {
+                return self.body_failure(HttpFailure::ResponseTooLarge);
+            }
+            bytes.extend_from_slice(&data);
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        self.interpret_http_response(status, observed_generation.as_deref(), &text, &rpc_id)
+    }
+
+    #[cfg(not(unix))]
+    async fn dispatch_trusted_ipc(
+        &self,
+        _body: String,
+        _rpc_id: String,
+        _grants_header: &str,
+    ) -> RuntimeToolResult {
+        self.failure(
+            code::UNREACHABLE,
+            false,
+            "trusted local runtime IPC is unavailable on this platform",
+            None,
+        )
+    }
+
+    fn body_failure(&self, error: HttpFailure) -> RuntimeToolResult {
+        match error {
+            HttpFailure::ResponseTooLarge => self.failure(
+                code::RESPONSE_TOO_LARGE,
+                false,
+                "response exceeds maxFrameBytes",
+                Some(json!({"max_bytes": self.max_frame_bytes})),
+            ),
+            HttpFailure::BodyRead => self.failure(
+                code::MALFORMED_RESPONSE,
+                false,
+                "malformed MCP response",
+                None,
+            ),
+            HttpFailure::Unreachable => {
+                self.failure(code::UNREACHABLE, true, "local runtime unreachable", None)
+            }
+        }
+    }
+
+    fn interpret_http_response(
+        &self,
+        status: u16,
+        observed_generation: Option<&str>,
+        text: &str,
+        rpc_id: &str,
+    ) -> RuntimeToolResult {
+        if let (Some(expected), Some(observed)) =
+            (self.runtime_generation.as_deref(), observed_generation)
+            && expected != observed
         {
             return self.failure(
                 code::RUNTIME_GENERATION_MISMATCH,
@@ -372,29 +596,8 @@ impl LocalMcpTransport {
                 })),
             );
         }
-        let (status, text) = match self.read_bounded_body(response).await {
-            Ok(value) => value,
-            Err(HttpFailure::ResponseTooLarge) => {
-                return self.failure(
-                    code::RESPONSE_TOO_LARGE,
-                    false,
-                    "response exceeds maxFrameBytes",
-                    Some(json!({"max_bytes": self.max_frame_bytes})),
-                );
-            }
-            Err(HttpFailure::BodyRead) => {
-                return self.failure(
-                    code::MALFORMED_RESPONSE,
-                    false,
-                    "malformed MCP response",
-                    None,
-                );
-            }
-            Err(HttpFailure::Unreachable) => unreachable!("bounded body has a response"),
-        };
-
-        let expected_id = Value::String(rpc_id);
-        let parsed = parse_mcp_body(&text, &expected_id);
+        let expected_id = Value::String(rpc_id.to_owned());
+        let parsed = parse_mcp_body(text, &expected_id);
         if let ParsedBody::RpcError { code: rpc_code } = parsed {
             return self.failure(
                 code::JSONRPC_ERROR,
@@ -429,6 +632,20 @@ impl LocalMcpTransport {
         }
     }
 
+    async fn dispatch_routed(
+        &self,
+        body: String,
+        rpc_id: String,
+        grants_header: Option<String>,
+    ) -> RuntimeToolResult {
+        if let Some(grants_header) = grants_header {
+            self.dispatch_trusted_ipc(body, rpc_id, &grants_header)
+                .await
+        } else {
+            self.dispatch_http(body, rpc_id).await
+        }
+    }
+
     async fn dispatch_inner(&self, request: RuntimeRequest) -> RuntimeToolResult {
         if request.request_id.is_empty() {
             return self.failure(code::BAD_REQUEST, false, "invalid tool request frame", None);
@@ -444,6 +661,17 @@ impl LocalMcpTransport {
 
         let rpc_id = self.next_rpc_id();
         let timeout_hint_ms = request.timeout_hint_ms();
+        let grants_header = match Self::webchat_control_grants_header(request.trace.as_ref()) {
+            Ok(value) => value,
+            Err(()) => {
+                return self.failure(
+                    code::BAD_REQUEST,
+                    false,
+                    "invalid trusted caller grant context",
+                    None,
+                );
+            }
+        };
         let body = match serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -507,7 +735,7 @@ impl LocalMcpTransport {
                     None,
                 )
             },
-            result = self.dispatch_http(body, rpc_id) => result,
+            result = self.dispatch_routed(body, rpc_id, grants_header) => result,
         };
 
         let mut in_flight = self.lock_in_flight();
@@ -665,6 +893,24 @@ pub(crate) enum ParsedBody {
 enum ScanOutcome {
     Messages(Vec<Value>),
     Malformed,
+}
+
+fn valid_grant_ref(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+fn valid_grant_provider(value: &str) -> bool {
+    if value.is_empty() || value.len() > 32 {
+        return false;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
 }
 
 pub fn is_loopback_host(hostname: &str) -> bool {
@@ -828,6 +1074,8 @@ mod tests {
     use serde_json::{Number, Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
     use tokio::sync::oneshot;
 
     use super::{
@@ -921,6 +1169,62 @@ mod tests {
             let _ = stream.shutdown().await;
         });
         (format!("http://{address}/mcp"), request_rx)
+    }
+
+    #[cfg(unix)]
+    async fn spawn_unix_server(
+        body: String,
+        runtime_generation: &str,
+    ) -> (std::path::PathBuf, oneshot::Receiver<String>) {
+        let runtime_generation = runtime_generation.to_owned();
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-mcp-local-mcp-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end + 4]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&bytes).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Herdr-Runtime-Generation: {runtime_generation}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        (socket, request_rx)
     }
 
     async fn spawn_disconnect_observer() -> (String, oneshot::Receiver<()>, oneshot::Receiver<()>) {
@@ -1099,6 +1403,56 @@ mod tests {
         assert_eq!(value["method"], "tools/call");
         assert_eq!(value["params"]["name"], "herdr_inspect");
         assert_eq!(value["params"]["arguments"], json!({"query": "ping"}));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn webchat_grant_trace_uses_trusted_unix_ipc_without_bearer_fallback() {
+        let response = json!({"jsonrpc": "2.0", "id": "local-1", "result": {"ok": true}});
+        let (socket, request_rx) = spawn_unix_server(response.to_string(), "rust-test").await;
+        let mut config = LocalMcpConfig::new("token-test", "sha256:test");
+        config.trusted_ipc_socket = Some(socket.clone());
+        config.runtime_generation = Some("rust-test".to_owned());
+        let transport = LocalMcpTransport::new(config).unwrap();
+        let mut grant_request = request("grant-r1");
+        grant_request.trace = Some(serde_json::Map::from_iter([(
+            "webchat_control_grants".to_owned(),
+            json!([{
+                "endpoint_ref": "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provider": "chatgpt",
+                "account_ref": "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }]),
+        )]));
+        let outcome = transport.dispatch_request(grant_request).await;
+        assert_eq!(
+            outcome,
+            RuntimeToolResult::Success {
+                result: Some(json!({"ok": true}))
+            }
+        );
+        let raw_request = request_rx.await.unwrap();
+        let lowered = raw_request.to_ascii_lowercase();
+        assert!(lowered.starts_with("post /mcp http/1.1"));
+        assert!(lowered.contains("x-herdr-edge-webchat-control-grants:"));
+        assert!(lowered.contains("x-herdr-edge-expected-runtime-generation: rust-test"));
+        assert!(!lowered.contains("authorization:"));
+        assert!(raw_request.contains("\"provider\":\"chatgpt\""));
+        let _ = std::fs::remove_file(socket);
+
+        let mut malformed = request("grant-bad");
+        malformed.trace = Some(serde_json::Map::from_iter([(
+            "webchat_control_grants".to_owned(),
+            json!([{"endpoint_ref": "be_only"}]),
+        )]));
+        let outcome = transport.dispatch_request(malformed).await;
+        assert!(matches!(
+            outcome,
+            RuntimeToolResult::Failure {
+                ref code,
+                retryable: false,
+                ..
+            } if code == super::code::BAD_REQUEST
+        ));
     }
 
     #[tokio::test]

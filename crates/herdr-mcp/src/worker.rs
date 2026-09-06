@@ -108,6 +108,22 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
         WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
         WorkerCommand::ConnectorRevoke { client_id } => revoke_connector(&paths, &client_id),
+        WorkerCommand::ConnectorWebChatControl {
+            client_id,
+            device_id,
+            endpoint_ref,
+            provider,
+            account_ref,
+            allowed,
+        } => set_connector_webchat_control(
+            &paths,
+            &client_id,
+            &device_id,
+            &endpoint_ref,
+            &provider,
+            &account_ref,
+            allowed,
+        ),
     }
 }
 
@@ -448,6 +464,104 @@ fn revoke_connector(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, S
             "client_id": payload.get("client_id").cloned().unwrap_or(Value::String(client_id.to_owned())),
         }))
         .map_err(|error| format!("cannot encode connector revoke result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_connector_webchat_control(
+    _paths: &RuntimePaths,
+    _client_id: &str,
+    _device_id: &str,
+    _endpoint_ref: &str,
+    _provider: &str,
+    _account_ref: &str,
+    _allowed: bool,
+) -> Result<ExitCode, String> {
+    Err(
+        "connector WebChat Control currently requires the macOS enrolled-owner credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn set_connector_webchat_control(
+    paths: &RuntimePaths,
+    client_id: &str,
+    device_id: &str,
+    endpoint_ref: &str,
+    provider: &str,
+    account_ref: &str,
+    allowed: bool,
+) -> Result<ExitCode, String> {
+    let client_id = client_id.trim();
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let endpoint_ref = endpoint_ref.trim();
+    let provider = provider.trim();
+    let account_ref = account_ref.trim();
+    if client_id.is_empty() || client_id.len() > 4096 {
+        return Err("connector client id is invalid".to_owned());
+    }
+    if endpoint_ref.is_empty()
+        || endpoint_ref.len() > 96
+        || endpoint_ref.chars().any(char::is_control)
+    {
+        return Err("browser endpoint ref is invalid".to_owned());
+    }
+    if account_ref.is_empty() || account_ref.len() > 96 || account_ref.chars().any(char::is_control)
+    {
+        return Err("browser account ref is invalid".to_owned());
+    }
+    if provider.is_empty()
+        || provider.len() > 32
+        || !provider.chars().enumerate().all(|(index, ch)| {
+            if index == 0 {
+                ch.is_ascii_lowercase() || ch.is_ascii_digit()
+            } else {
+                ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+            }
+        })
+    {
+        return Err("browser provider is invalid".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/webchat-control",
+        )?)
+        .headers(headers)
+        .json(&json!({
+            "client_id": client_id,
+            "device_id": device_id,
+            "endpoint_ref": endpoint_ref,
+            "provider": provider,
+            "account_ref": account_ref,
+            "allowed": allowed,
+        }))
+        .send()
+        .map_err(|error| format!("cannot change Connector WebChat Control grant: {error}"))?;
+    let payload = parse_json_response(response, "connector WebChat Control")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_webchat_control_set",
+            "client_id": client_id,
+            "device_id": device_id,
+            "endpoint_ref": endpoint_ref,
+            "provider": provider,
+            "account_ref": account_ref,
+            "allowed": payload.get("allowed").cloned().unwrap_or(Value::Bool(allowed)),
+        }))
+        .map_err(|error| format!("cannot encode Connector WebChat Control result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }

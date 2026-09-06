@@ -61,10 +61,18 @@ export interface OAuthConnectorGrantRecord {
   scope: string;
   status: "active" | "revoked";
   can_approve_connectors: boolean;
+  webchat_control: OAuthWebChatControlGrant[];
   approved_at_ms: number;
   approved_by: string;
   revoked_at_ms?: number;
   revoked_by?: string;
+}
+
+export interface OAuthWebChatControlGrant {
+  device_id: string;
+  endpoint_ref: string;
+  provider: string;
+  account_ref: string;
 }
 
 type StoredJwk = JsonWebKey & { kid?: string; alg?: string; use?: string };
@@ -216,6 +224,8 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
   if (typeof value.scope !== "string" || value.scope.length === 0 || value.scope.length > 512) return null;
   if (value.status !== "active" && value.status !== "revoked") return null;
   if (typeof value.can_approve_connectors !== "boolean") return null;
+  const webchatControl = normalizeWebChatControlGrants(value.webchat_control);
+  if (!webchatControl) return null;
   if (!finiteEpoch(value.approved_at_ms) || !boundedString(value.approved_by, 4096)) return null;
   const revokedAt = finiteEpoch(value.revoked_at_ms) ? value.revoked_at_ms as number : undefined;
   const revokedBy = typeof value.revoked_by === "string" && value.revoked_by.length <= 4096 ? value.revoked_by : undefined;
@@ -225,11 +235,37 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
     scope: value.scope,
     status: value.status,
     can_approve_connectors: value.can_approve_connectors,
+    webchat_control: webchatControl,
     approved_at_ms: value.approved_at_ms,
     approved_by: value.approved_by,
     ...(revokedAt !== undefined ? { revoked_at_ms: revokedAt } : {}),
     ...(revokedBy !== undefined ? { revoked_by: revokedBy } : {}),
   };
+}
+
+function normalizeWebChatControlGrants(value: unknown): OAuthWebChatControlGrant[] | null {
+  // Existing grants predate Alpha 4. Missing means explicitly no WebChat Control.
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 32) return null;
+  const grants: OAuthWebChatControlGrant[] = [];
+  for (const item of value) {
+    if (!record(item)) return null;
+    if (!boundedString(item.device_id, 64)) return null;
+    if (!boundedString(item.endpoint_ref, 96) || !boundedString(item.account_ref, 96)) return null;
+    if (!boundedString(item.provider, 32) || !/^[a-z0-9][a-z0-9._-]*$/.test(item.provider)) return null;
+    grants.push({
+      device_id: item.device_id,
+      endpoint_ref: item.endpoint_ref,
+      provider: item.provider,
+      account_ref: item.account_ref,
+    });
+  }
+  grants.sort((a, b) =>
+    a.device_id.localeCompare(b.device_id)
+    || a.endpoint_ref.localeCompare(b.endpoint_ref)
+    || a.provider.localeCompare(b.provider)
+    || a.account_ref.localeCompare(b.account_ref));
+  return grants;
 }
 
 async function boundedJson(request: Request): Promise<{ ok: true; value: unknown } | { ok: false; status: number }> {
@@ -271,6 +307,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/approve") return this.approveApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/consume") return this.consumeApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/webchat-control") return this.setWebChatControlGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/signing/ensure") return this.signingPublicKey();
     if (request.method === "POST" && url.pathname === "/internal/oauth/access/verify") return this.verifyAccess(request);
@@ -440,6 +477,7 @@ export class OAuthStoreDO {
         scope: current.scope,
         status: "active",
         can_approve_connectors: true,
+        webchat_control: [],
         approved_at_ms: nowMs,
         approved_by: approver,
       };
@@ -502,7 +540,81 @@ export class OAuthStoreDO {
     const clientId = body?.client_id;
     if (!boundedString(clientId, 4096)) return json({ ok: false, code: "bad_request" }, 400);
     const value = await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId);
-    return value ? json({ ok: true, record: value }) : json({ ok: false, code: "not_found" }, 404);
+    if (!value) return json({ ok: false, code: "not_found" }, 404);
+    const normalized = normalizeConnectorGrant(value);
+    return normalized
+      ? json({ ok: true, record: normalized })
+      : json({ ok: false, code: "invalid_record" }, 500);
+  }
+
+  private async setWebChatControlGrant(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    const deviceId = body?.device_id;
+    const endpointRef = body?.endpoint_ref;
+    const provider = body?.provider;
+    const accountRef = body?.account_ref;
+    const allowed = body?.allowed;
+    const changedBy = body?.changed_by;
+    if (
+      !boundedString(clientId, 4096)
+      || !boundedString(deviceId, 64)
+      || !boundedString(endpointRef, 96)
+      || !boundedString(accountRef, 96)
+      || !boundedString(provider, 32)
+      || !/^[a-z0-9][a-z0-9._-]*$/.test(provider)
+      || typeof allowed !== "boolean"
+      || !boundedString(changedBy, 4096)
+    ) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const key = GRANT_PREFIX + clientId;
+    let result: { ok: boolean; code?: string; record?: OAuthConnectorGrantRecord } = { ok: false, code: "not_found" };
+    await this.state.storage.transaction(async (txn) => {
+      const raw = await txn.get<OAuthConnectorGrantRecord>(key);
+      if (!raw) return;
+      const current = normalizeConnectorGrant(raw);
+      if (!current) {
+        result = { ok: false, code: "invalid_record" };
+        return;
+      }
+      if (current.status !== "active") {
+        result = { ok: false, code: "revoked" };
+        return;
+      }
+      const same = (item: OAuthWebChatControlGrant) =>
+        item.device_id === deviceId
+        && item.endpoint_ref === endpointRef
+        && item.provider === provider
+        && item.account_ref === accountRef;
+      const next = current.webchat_control.filter((item) => !same(item));
+      if (allowed) {
+        if (next.length >= 32) {
+          result = { ok: false, code: "capacity" };
+          return;
+        }
+        next.push({ device_id: deviceId, endpoint_ref: endpointRef, provider, account_ref: accountRef });
+      }
+      const normalized = normalizeWebChatControlGrants(next);
+      if (!normalized) {
+        result = { ok: false, code: "invalid_record" };
+        return;
+      }
+      const updated: OAuthConnectorGrantRecord = {
+        ...current,
+        webchat_control: normalized,
+      };
+      await txn.put(key, updated);
+      void changedBy;
+      result = { ok: true, record: updated };
+    });
+    if (!result.ok) {
+      const status = result.code === "not_found" ? 404
+        : result.code === "invalid_record" ? 500
+          : 409;
+      return json({ ok: false, code: result.code }, status);
+    }
+    return json({ ok: true, record: result.record });
   }
 
   private async revokeGrant(request: Request): Promise<Response> {
@@ -512,8 +624,10 @@ export class OAuthStoreDO {
     const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
     if (!boundedString(clientId, 4096) || !boundedString(revokedBy, 4096)) return json({ ok: false, code: "bad_request" }, 400);
     const key = GRANT_PREFIX + clientId;
-    const current = await this.state.storage.get<OAuthConnectorGrantRecord>(key);
-    if (!current) return json({ ok: false, code: "not_found" }, 404);
+    const raw = await this.state.storage.get<OAuthConnectorGrantRecord>(key);
+    if (!raw) return json({ ok: false, code: "not_found" }, 404);
+    const current = normalizeConnectorGrant(raw);
+    if (!current) return json({ ok: false, code: "invalid_record" }, 500);
     const revoked: OAuthConnectorGrantRecord = {
       ...current,
       status: "revoked",

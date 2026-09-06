@@ -100,6 +100,14 @@ pub enum WorkerCommand {
     ConnectorRevoke {
         client_id: String,
     },
+    ConnectorWebChatControl {
+        client_id: String,
+        device_id: String,
+        endpoint_ref: String,
+        provider: String,
+        account_ref: String,
+        allowed: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -563,10 +571,63 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 client_id: client_id.clone(),
             }))
         }
+        Some("webchat-control") => {
+            let [
+                action,
+                client_id,
+                device_id,
+                endpoint_ref,
+                provider,
+                account_ref,
+                confirm,
+            ] = &args[1..]
+            else {
+                return Err("connector webchat-control requires: <allow|deny> <client-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm".to_owned());
+            };
+            let allowed = match action.as_str() {
+                "allow" => true,
+                "deny" => false,
+                _ => {
+                    return Err("connector webchat-control action must be allow or deny".to_owned());
+                }
+            };
+            if client_id.starts_with('-') || client_id.trim().is_empty() || client_id.len() > 4096 {
+                return Err("connector webchat-control requires a valid client id".to_owned());
+            }
+            if device_id.starts_with('-') || device_id.trim().is_empty() || device_id.len() > 64 {
+                return Err("connector webchat-control requires a valid device id".to_owned());
+            }
+            if endpoint_ref.starts_with('-')
+                || endpoint_ref.trim().is_empty()
+                || endpoint_ref.len() > 96
+            {
+                return Err("connector webchat-control requires a valid endpoint ref".to_owned());
+            }
+            if provider.starts_with('-') || provider.trim().is_empty() || provider.len() > 32 {
+                return Err("connector webchat-control requires a valid provider".to_owned());
+            }
+            if account_ref.starts_with('-')
+                || account_ref.trim().is_empty()
+                || account_ref.len() > 96
+            {
+                return Err("connector webchat-control requires a valid account ref".to_owned());
+            }
+            if confirm != "--confirm" {
+                return Err("connector webchat-control requires --confirm".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::ConnectorWebChatControl {
+                client_id: client_id.clone(),
+                device_id: device_id.clone(),
+                endpoint_ref: endpoint_ref.clone(),
+                provider: provider.clone(),
+                account_ref: account_ref.clone(),
+                allowed,
+            }))
+        }
         Some(value) => Err(format!(
-            "unknown connector command '{value}' (expected approve or revoke)"
+            "unknown connector command '{value}' (expected approve, revoke, or webchat-control)"
         )),
-        None => Err("connector requires approve or revoke".to_owned()),
+        None => Err("connector requires approve, revoke, or webchat-control".to_owned()),
     }
 }
 
@@ -1052,6 +1113,7 @@ User path:\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code from an interactive or stdin prompt, never argv)\n\
   herdr-mcp connector approve <approval-request-id>  (macOS owner device; reads the 6-digit code interactively, never argv)\n\
   herdr-mcp connector revoke <client-id> --confirm\n\
+  herdr-mcp connector webchat-control <allow|deny> <client-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm  (macOS owner device only)\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
@@ -1730,9 +1792,47 @@ mod tests {
                 client_id: "dcr-client".to_owned(),
             })
         );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "webchat-control",
+                "allow",
+                "dcr-client",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "chatgpt",
+                "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "--confirm"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorWebChatControl {
+                client_id: "dcr-client".to_owned(),
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                provider: "chatgpt".to_owned(),
+                account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+                allowed: true,
+            })
+        );
         assert!(parse(args(&["connector", "approve", "req_abc", "123456"])).is_err());
         assert!(parse(args(&["connector", "approve", "--code", "123456"])).is_err());
         assert!(parse(args(&["connector", "revoke", "dcr-client"])).is_err());
+        assert!(
+            parse(args(&[
+                "connector",
+                "webchat-control",
+                "allow",
+                "dcr-client",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "chatgpt",
+                "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1767,6 +1867,7 @@ mod tests {
             "herdr-mcp scan",
             "herdr-mcp connector approve",
             "herdr-mcp connector revoke",
+            "herdr-mcp connector webchat-control",
             "herdr-mcp update",
             "herdr-mcp rollback",
             "herdr-mcp uninstall",

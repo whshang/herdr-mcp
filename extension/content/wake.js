@@ -1285,9 +1285,109 @@ const H2W_CONTENT_VERSION = "0.1.90";
     return true;
   }
 
+  function browserActuationEvidence(expectedGeneration) {
+    return {
+      observed_generation: expectedGeneration,
+      command_accepted: false,
+      browser_online: true,
+      resource_available: true,
+      rejected: false,
+      stable_resource_ref_observed: true,
+      lifecycle_observed: true,
+      canonical_url_observed: Boolean(chatGptConversationId()),
+      accepted_message_observed: false,
+      message_baseline_advanced: false,
+      reasoning_effort_readback: null,
+      required_apps_readback: [],
+      generation_owner: null,
+      generation_status_observed: false,
+      generation_stopped: false,
+    };
+  }
+
+  async function performBrowserActuationCommand(command) {
+    const expectedGeneration = Number(command?.expected_generation || 0);
+    const evidence = browserActuationEvidence(expectedGeneration);
+    if (ADAPTER.name !== "chatgpt" || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
+      return { ...evidence, resource_available: false };
+    }
+    if (command?.expectedConvKey && command.expectedConvKey !== ADAPTER.getConversationKey()) {
+      return { ...evidence, resource_available: false };
+    }
+    if (command?.operation !== "herdr_mcp.browser_dispatch.submit") {
+      return { ...evidence, rejected: true };
+    }
+    const params = command?.params && typeof command.params === "object" ? command.params : {};
+    const message = typeof params.message === "string" ? params.message.trim() : "";
+    const reasoning = params.reasoning_effort;
+    const requiredApps = Array.isArray(params.required_apps) ? params.required_apps : [];
+    if (!message || reasoning != null || requiredApps.length > 0) {
+      return { ...evidence, rejected: true };
+    }
+    if (isTurnInProgress() || ADAPTER.inputHasContent()) {
+      return { ...evidence, rejected: true };
+    }
+
+    const beforeServer = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+    const beforeDom = latestDomMessageSnapshot("user");
+    const result = await performWake({
+      template: message,
+      autoAllow: false,
+      browserActuation: true,
+    });
+    if (!result?.ok) {
+      return { ...evidence, rejected: true };
+    }
+    evidence.command_accepted = true;
+
+    const deadline = Date.now() + 6000;
+    do {
+      const afterServer = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
+      const afterDom = latestDomMessageSnapshot("user");
+      const serverAdvanced = Boolean(
+        afterServer?.ok
+        && afterServer.userMessageId
+        && afterServer.userMessageId !== beforeServer?.userMessageId,
+      );
+      const domAdvanced = Boolean(
+        afterDom?.messageId
+        && afterDom.messageId !== beforeDom?.messageId,
+      ) || Boolean(
+        afterDom?.text
+        && afterDom.text !== beforeDom?.text
+        && (afterDom.text.includes(message.slice(0, 120)) || message.includes(afterDom.text.slice(0, 120))),
+      );
+      evidence.accepted_message_observed = serverAdvanced || domAdvanced;
+      evidence.message_baseline_advanced = domAdvanced;
+      evidence.canonical_url_observed = Boolean(chatGptConversationId());
+      evidence.generation_status_observed = Boolean(
+        isTurnInProgress()
+        || (afterServer?.ok && ["user", "assistant"].includes(afterServer.currentNodeRole)),
+      );
+      if (evidence.accepted_message_observed && evidence.generation_status_observed) {
+        evidence.generation_owner = expectedGeneration;
+        return evidence;
+      }
+      await wait(200);
+    } while (Date.now() < deadline);
+    return evidence;
+  }
+
   // ---- Message listener ----
   try {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (msg?.type === "h2w_browser_actuation") {
+        void performBrowserActuationCommand(msg.command || {})
+          .then((evidence) => sendResponse({ ok: true, evidence }))
+          .catch(() => sendResponse({
+            ok: false,
+            evidence: {
+              ...browserActuationEvidence(Number(msg?.command?.expected_generation || 0)),
+              command_accepted: true,
+            },
+          }));
+        return true;
+      }
       if (msg?.type === "h2w_get_convkey") {
         sendResponse({ convKey: ADAPTER.getConversationKey(), url: location.href, site: ADAPTER.name });
         return;
@@ -1592,11 +1692,36 @@ const H2W_CONTENT_VERSION = "0.1.90";
     }
   }
 
+  async function chatGptAccountNativeIdentity() {
+    if (ADAPTER.name !== "chatgpt") return null;
+    try {
+      const response = await fetch("/backend-api/me", {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
+      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   async function registerCurrentConversation(reason = "startup") {
     if (!runtimeAlive()) return null;
     const convKey = ADAPTER.getConversationKey();
     if (!convKey) return null;
-    const response = await sendBg({ type: "h2w_register", convKey, url: location.href, site: ADAPTER.name });
+    const accountNativeIdentity = await chatGptAccountNativeIdentity();
+    const response = await sendBg({
+      type: "h2w_register",
+      convKey,
+      url: location.href,
+      site: ADAPTER.name,
+      accountNativeIdentity,
+    });
     if (response !== null) {
       const changed = registeredConvKey !== null && registeredConvKey !== convKey;
       registeredConvKey = convKey;

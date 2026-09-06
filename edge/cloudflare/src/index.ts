@@ -50,6 +50,7 @@ import {
   revokeRegisteredDevice,
   resolveDeviceRoute,
 } from "./device-directory.js";
+import { normalizeDeviceId } from "./device-model.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity, hashOAuthApprovalCode } from "./oauth-edge.js";
 import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
@@ -232,6 +233,60 @@ export default {
       return result.ok
         ? noStoreJsonResponse({ ok: true, action: "connector_revoke", client_id: clientId })
         : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "connector_grant_not_found" ? 404 : 500);
+    }
+
+    if (request.method === "POST" && url.pathname === "/connectors/webchat-control") {
+      const ownerDevice = await authenticateOwnerDevice(request, env);
+      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const allowedKeys = new Set(["client_id", "device_id", "endpoint_ref", "provider", "account_ref", "allowed"]);
+      if (Object.keys(parsed.value).some((key) => !allowedKeys.has(key))) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const clientId = typeof parsed.value.client_id === "string" ? parsed.value.client_id.trim() : "";
+      const deviceId = typeof parsed.value.device_id === "string" ? parsed.value.device_id.trim() : "";
+      const endpointRef = typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "";
+      const provider = typeof parsed.value.provider === "string" ? parsed.value.provider.trim() : "";
+      const accountRef = typeof parsed.value.account_ref === "string" ? parsed.value.account_ref.trim() : "";
+      const normalizedDeviceId = normalizeDeviceId(deviceId);
+      if (
+        !clientId || clientId.length > 4096
+        || !normalizedDeviceId || normalizedDeviceId !== deviceId
+        || !endpointRef || endpointRef.length > 96
+        || !accountRef || accountRef.length > 96
+        || !provider || provider.length > 32 || !/^[a-z0-9][a-z0-9._-]*$/.test(provider)
+        || typeof parsed.value.allowed !== "boolean"
+      ) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_webchat_control_grant" }, 400);
+      }
+      const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+      const store = createOAuthPublicStore(stub);
+      const record = await store.setWebChatControlGrant({
+        client_id: clientId,
+        device_id: deviceId,
+        endpoint_ref: endpointRef,
+        provider,
+        account_ref: accountRef,
+        allowed: parsed.value.allowed,
+        changed_by: `device:${ownerDevice}`,
+      });
+      return record
+        ? noStoreJsonResponse({
+          ok: true,
+          action: "connector_webchat_control_set",
+          client_id: clientId,
+          device_id: deviceId,
+          endpoint_ref: endpointRef,
+          provider,
+          account_ref: accountRef,
+          allowed: parsed.value.allowed,
+          grants: record.webchat_control,
+        })
+        : noStoreJsonResponse({ ok: false, code: "webchat_control_grant_update_failed" }, 409);
     }
 
     // ---- Device pairing control plane. Pairing creation requires
@@ -518,12 +573,14 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
       ));
     }
     const workstationId = resolveWorkstation(request, env);
+    const webchatControlGrants = await oauthClientWebChatControlGrants(env, devAuth.clientId);
     const dev = await handleMcp(parsed.value, workstationId, {
       limits,
       client: {
         userAgent: request.headers.get("user-agent"),
         oauthClientId: devAuth.clientId ?? null,
         authSource: devAuth.source,
+        webchatControlGrants,
       },
       forward: async (stub: unknown, body: string) => {
         const internal = new Request("https://do.internal/internal/forward", {
@@ -805,6 +862,14 @@ async function oauthClientCanApproveConnectors(env: Env, clientId: string | unde
   const store = createOAuthPublicStore(stub);
   const grant = await store.getGrant(clientId);
   return grant?.status === "active" && grant.can_approve_connectors === true;
+}
+
+async function oauthClientWebChatControlGrants(env: Env, clientId: string | undefined) {
+  if (!clientId) return [];
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  const grant = await store.getGrant(clientId);
+  return grant?.status === "active" ? grant.webchat_control : [];
 }
 
 function fleetControllerAuthority(auth: { source: string; clientId?: string }): { principal: string; can_force_takeover: boolean } | null {
