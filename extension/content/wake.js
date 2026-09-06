@@ -1227,6 +1227,11 @@ const H2W_CONTENT_VERSION = "0.1.90";
     return [...scope.querySelectorAll("button, [role=button]")].filter(explicitStopControl);
   }
   function assistantStreaming() {
+    try {
+      if (typeof ADAPTER.isGenerationInProgress === "function" && ADAPTER.isGenerationInProgress()) {
+        return true;
+      }
+    } catch (_) {}
     const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
     const last = nodes[nodes.length - 1];
     if (!last) return false;
@@ -1286,6 +1291,12 @@ const H2W_CONTENT_VERSION = "0.1.90";
   }
 
   function browserActuationEvidence(expectedGeneration) {
+    let canonicalUrlObserved = false;
+    try {
+      canonicalUrlObserved = typeof ADAPTER.getCanonicalConversationUrl === "function"
+        ? Boolean(ADAPTER.getCanonicalConversationUrl())
+        : Boolean(chatGptConversationId());
+    } catch (_) {}
     return {
       observed_generation: expectedGeneration,
       command_accepted: false,
@@ -1294,7 +1305,7 @@ const H2W_CONTENT_VERSION = "0.1.90";
       rejected: false,
       stable_resource_ref_observed: true,
       lifecycle_observed: true,
-      canonical_url_observed: Boolean(chatGptConversationId()),
+      canonical_url_observed: canonicalUrlObserved,
       accepted_message_observed: false,
       message_baseline_advanced: false,
       reasoning_effort_readback: null,
@@ -1305,10 +1316,39 @@ const H2W_CONTENT_VERSION = "0.1.90";
     };
   }
 
+  function providerMessageSnapshot(role) {
+    try {
+      if (typeof ADAPTER.getMessageSnapshot === "function") {
+        const snapshot = ADAPTER.getMessageSnapshot(role) || {};
+        return {
+          messageId: typeof snapshot.messageId === "string" && snapshot.messageId ? snapshot.messageId : null,
+          text: String(snapshot.text || "").replace(/\s+/g, " ").trim(),
+          count: Number.isSafeInteger(snapshot.count) && snapshot.count >= 0 ? snapshot.count : 0,
+        };
+      }
+    } catch (_) {}
+    const snapshot = latestDomMessageSnapshot(role);
+    return {
+      ...snapshot,
+      count: document.querySelectorAll(`[data-message-author-role="${role}"]`).length,
+    };
+  }
+
+  function providerCanonicalConversationObserved() {
+    try {
+      if (typeof ADAPTER.getCanonicalConversationUrl === "function") {
+        return Boolean(ADAPTER.getCanonicalConversationUrl());
+      }
+    } catch (_) {}
+    return Boolean(chatGptConversationId());
+  }
+
   async function performBrowserActuationCommand(command) {
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
-    if (ADAPTER.name !== "chatgpt" || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
+    if (!["chatgpt", "gemini"].includes(ADAPTER.name)
+        || !Number.isSafeInteger(expectedGeneration)
+        || expectedGeneration < 1) {
       return { ...evidence, resource_available: false };
     }
     if (command?.expectedConvKey && command.expectedConvKey !== ADAPTER.getConversationKey()) {
@@ -1328,8 +1368,11 @@ const H2W_CONTENT_VERSION = "0.1.90";
       return { ...evidence, rejected: true };
     }
 
-    const beforeServer = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
-    const beforeDom = latestDomMessageSnapshot("user");
+    const beforeServer = ADAPTER.name === "chatgpt"
+      ? await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }))
+      : { ok: false };
+    const beforeDom = providerMessageSnapshot("user");
+    const beforeAssistant = providerMessageSnapshot("assistant");
     const result = await performWake({
       template: message,
       autoAllow: false,
@@ -1342,8 +1385,11 @@ const H2W_CONTENT_VERSION = "0.1.90";
 
     const deadline = Date.now() + 6000;
     do {
-      const afterServer = await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }));
-      const afterDom = latestDomMessageSnapshot("user");
+      const afterServer = ADAPTER.name === "chatgpt"
+        ? await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }))
+        : { ok: false };
+      const afterDom = providerMessageSnapshot("user");
+      const afterAssistant = providerMessageSnapshot("assistant");
       const serverAdvanced = Boolean(
         afterServer?.ok
         && afterServer.userMessageId
@@ -1353,15 +1399,27 @@ const H2W_CONTENT_VERSION = "0.1.90";
         afterDom?.messageId
         && afterDom.messageId !== beforeDom?.messageId,
       ) || Boolean(
+        afterDom.count > beforeDom.count,
+      ) || Boolean(
         afterDom?.text
         && afterDom.text !== beforeDom?.text
         && (afterDom.text.includes(message.slice(0, 120)) || message.includes(afterDom.text.slice(0, 120))),
       );
       evidence.accepted_message_observed = serverAdvanced || domAdvanced;
       evidence.message_baseline_advanced = domAdvanced;
-      evidence.canonical_url_observed = Boolean(chatGptConversationId());
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      const assistantAdvanced = Boolean(
+        afterAssistant?.messageId
+        && afterAssistant.messageId !== beforeAssistant?.messageId,
+      ) || Boolean(
+        afterAssistant.count > beforeAssistant.count,
+      ) || Boolean(
+        afterAssistant.text
+        && afterAssistant.text !== beforeAssistant.text,
+      );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
+        || assistantAdvanced
         || (afterServer?.ok && ["user", "assistant"].includes(afterServer.currentNodeRole)),
       );
       if (evidence.accepted_message_observed && evidence.generation_status_observed) {
@@ -1692,29 +1750,39 @@ const H2W_CONTENT_VERSION = "0.1.90";
     }
   }
 
-  async function chatGptAccountNativeIdentity() {
-    if (ADAPTER.name !== "chatgpt") return null;
-    try {
-      const response = await fetch("/backend-api/me", {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: { accept: "application/json" },
-      });
-      if (!response.ok) return null;
-      const payload = await response.json();
-      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-    } catch (_) {
-      return null;
+  async function browserAccountNativeIdentity() {
+    if (ADAPTER.name === "chatgpt") {
+      try {
+        const response = await fetch("/backend-api/me", {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers: { accept: "application/json" },
+        });
+        if (!response.ok) return null;
+        const payload = await response.json();
+        const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
+        return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+      } catch (_) {
+        return null;
+      }
     }
+    if (ADAPTER.name === "gemini" && typeof ADAPTER.getAccountNativeIdentity === "function") {
+      try {
+        const value = await ADAPTER.getAccountNativeIdentity();
+        return typeof value === "string" && value.trim() ? value.trim() : null;
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
   }
 
   async function registerCurrentConversation(reason = "startup") {
     if (!runtimeAlive()) return null;
     const convKey = ADAPTER.getConversationKey();
     if (!convKey) return null;
-    const accountNativeIdentity = await chatGptAccountNativeIdentity();
+    const accountNativeIdentity = await browserAccountNativeIdentity();
     const response = await sendBg({
       type: "h2w_register",
       convKey,

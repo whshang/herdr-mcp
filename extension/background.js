@@ -1315,6 +1315,31 @@ function browserActuationUrl() {
   return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/browser/actuation`;
 }
 
+function geminiConversationInfo(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.origin !== "https://gemini.google.com") return null;
+    const match = url.pathname.match(/^\/app\/([^/?#]+)\/?$/);
+    if (!match) return null;
+    const conversationId = decodeURIComponent(match[1]);
+    if (!conversationId || conversationId.length > 512 || /[\u0000-\u001f\u007f]/.test(conversationId)) return null;
+    return {
+      site: "gemini",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey: `${url.origin}/app/${encodeURIComponent(conversationId)}`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserConversationInfo(provider, rawUrl) {
+  if (provider === "chatgpt") return chatGptConversationInfo(rawUrl);
+  if (provider === "gemini") return geminiConversationInfo(rawUrl);
+  return null;
+}
+
 async function getBrowserObservationGeneration() {
   if (Number.isSafeInteger(browserObservationGeneration) && browserObservationGeneration > 0) {
     return browserObservationGeneration;
@@ -1344,8 +1369,9 @@ async function postBrowserRegistry(payload) {
   return parsed;
 }
 
-async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNativeIdentity }) {
+async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, accountNativeIdentity }) {
   if (!tabId || !pageInfo?.conversation_id || !accountNativeIdentity) return null;
+  if (!["chatgpt", "gemini"].includes(provider)) return null;
   const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
   if (!endpoint?.endpoint_ref) return null;
   const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -1354,7 +1380,7 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
     operation: "provider.observe",
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
-    provider: "chatgpt",
+    provider,
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
     capabilities: { operations: ["composer.submit", "generation.status", "session.inspect"] },
@@ -1364,7 +1390,7 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
     operation: "resource.observe",
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
-    provider: "chatgpt",
+    provider,
     kind: "account",
     parent_ref: null,
     native_identity: accountNativeIdentity,
@@ -1379,7 +1405,7 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
       operation: "resource.observe",
       profile_seed: profileSeed,
       endpoint_ref: endpoint.endpoint_ref,
-      provider: "chatgpt",
+      provider,
       kind: "space",
       parent_ref: parentRef,
       native_identity: pageInfo.project_id,
@@ -1395,7 +1421,7 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
     operation: "resource.observe",
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
-    provider: "chatgpt",
+    provider,
     kind: "session",
     parent_ref: parentRef,
     native_identity: pageInfo.conversation_id,
@@ -1406,6 +1432,7 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
   const sessionRef = session.resource?.resource_ref || null;
   if (!sessionRef) return null;
   browserSessionTargets.set(sessionRef, {
+    provider,
     tabId,
     convKey,
     conversationId: pageInfo.conversation_id,
@@ -2097,7 +2124,8 @@ async function handleBrowserActuation(command) {
   }
   let tab = null;
   try { tab = await chrome.tabs.get(target.tabId); } catch (_) {}
-  const live = chatGptConversationInfo(tab?.url || "");
+  const targetProvider = target.provider || "chatgpt";
+  const live = browserConversationInfo(targetProvider, tab?.url || "");
   if (!tab || live?.conversation_id !== target.conversationId) {
     browserSessionTargets.delete(sessionRef);
     await postBrowserActuationEvidence(
@@ -4448,13 +4476,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       const bindings = await loadBindings();
       const pageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
+      const browserPageInfo = pageInfo?.site === "chatgpt"
+        ? pageInfo
+        : (registeringSite === "gemini" ? geminiConversationInfo(msg.url || msg.convKey) : null);
       let browserObservation = null;
-      if (pageInfo?.site === "chatgpt" && pageInfo.conversation_id && sender.tab?.id) {
+      if (browserPageInfo?.conversation_id && sender.tab?.id) {
         try {
-          browserObservation = await observeChatGptConversation({
+          browserObservation = await observeBrowserConversation({
+            provider: browserPageInfo.site,
             tabId: sender.tab.id,
             convKey: String(msg.convKey || ""),
-            pageInfo,
+            pageInfo: browserPageInfo,
             accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
           });
         } catch (error) {
@@ -4471,7 +4503,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sender.tab.id,
           );
           if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
-        } else {
+        } else if (registeringSite !== "gemini") {
           const migration = await migrateZaiRootConversationState(
             bindings,
             String(msg.convKey || ""),
