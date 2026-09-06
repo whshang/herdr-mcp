@@ -48,7 +48,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true };
 const listeners = {
   onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
-  onSidePanelOpened: [], onSidePanelClosed: [],
+  onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [],
 };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -89,6 +89,7 @@ const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
 const continuityResolveRequests = [];
 const browserRegistryRequests = [];
+let failNextBrowserEndpointRegistration = true;
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
@@ -271,6 +272,17 @@ globalThis.chrome = {
       if (message.path === "/extension/browser/registry") {
         const body = JSON.parse(message.body || "{}");
         browserRegistryRequests.push(body);
+        if (body.operation === "endpoint.register" && failNextBrowserEndpointRegistration) {
+          failNextBrowserEndpointRegistration = false;
+          callback({
+            ok: true,
+            transport: "ipc",
+            status: 503,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, code: "browser_registry_test_unavailable" }),
+          });
+          return;
+        }
         const result = body.operation === "endpoint.register"
           ? {
             ok: true,
@@ -506,7 +518,7 @@ globalThis.chrome = {
       for (const id of ids || []) registeredContentScripts.delete(id);
     },
   },
-  alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
+  alarms: { create: () => {}, onAlarm: { addListener: (fn) => listeners.onAlarm.push(fn) } },
 };
 
 // Content-script stub for wake.js h2w_get_convkey responses.
@@ -580,7 +592,7 @@ ok(coldHud?.ok === true
 
 console.log("\n[browser endpoint registry bootstrap]");
 ok(await waitForTest(() => browserRegistryRequests.length === 1),
-  "service-worker startup registers one browser endpoint through Native Messaging");
+  "service-worker startup attempts browser endpoint registration through Native Messaging");
 const browserRegister = browserRegistryRequests[0] || {};
 ok(browserRegister.operation === "endpoint.register"
     && browserRegister.browser_family === "chrome"
@@ -595,9 +607,16 @@ ok(!Object.prototype.hasOwnProperty.call(browserRegister, "device_id")
 const storedBrowserSeed = storage.herdrBrowserProfileSeedV1;
 ok(storedBrowserSeed === browserRegister.profile_seed,
   "browser profile seed persists only in extension local storage");
+const keepaliveAlarm = listeners.onAlarm[0];
+ok(!!keepaliveAlarm, "browser keepalive alarm listener registered");
+keepaliveAlarm({ name: "h2w-keepalive" });
+ok(await waitForTest(() => browserRegistryRequests.length === 2),
+  "keepalive retries endpoint bootstrap after the initial runtime failure");
+ok(browserRegistryRequests[1]?.profile_seed === storedBrowserSeed,
+  "endpoint bootstrap retry reuses the stable browser profile seed");
 for (const startup of listeners.onStartup) startup();
 await new Promise((resolve) => setTimeout(resolve, 0));
-ok(browserRegistryRequests.length === 1 && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
+ok(browserRegistryRequests.length === 2 && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
   "browser startup does not create a second endpoint registration loop or rotate the profile seed");
 
 const actionClick = listeners.onActionClicked[0];

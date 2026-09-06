@@ -1495,8 +1495,13 @@ async function registerLocalBrowserEndpoint() {
       await getBrowserObservationGeneration();
       return browserEndpoint;
     }
+    callLog(
+      "browser endpoint registration failed:",
+      parsed?.code || parsed?.error || `HTTP ${response.status}`,
+    );
     return null;
-  } catch (_) {
+  } catch (error) {
+    callLog("browser endpoint registration failed:", error?.message || String(error));
     return null;
   }
 }
@@ -5480,6 +5485,10 @@ async function ensureAlive(preloaded) {
     reconcileProgressTimers({});
     return;
   }
+  // Endpoint bootstrap can legitimately fail when the extension starts before
+  // a runtime that exposes Browser Registry is active. Reuse the existing
+  // keepalive instead of introducing another retry timer/state owner.
+  if (!browserEndpoint) await registerLocalBrowserEndpoint();
   const bindings = preloaded || await loadBindings();
   ensurePushStream(bindings);
   if (progressTickSecMs() <= 0) return;
