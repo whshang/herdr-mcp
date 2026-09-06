@@ -44,24 +44,17 @@ Edge does not store your Git repositories or replace Herdr. Code, shell commands
 
 ## Bootstrap deployment: workers.dev
 
-Copy the user template:
+Ordinary first-device installation uses the installed runtime:
 
 ```bash
-cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
+herdr-mcp worker bootstrap
 ```
 
-The user file is deployment-local and should not become a repository source of workstation identity or local deployment values.
+No repository checkout, Node.js, npm, Wrangler download, local Worker build, or `wrangler.user.toml` is required on the user's computer. Release CI builds `herdr-edge-<version>.mjs` once from the gated Edge source. Bootstrap downloads the exact release manifest and bundle, requires the release source commit to match the running runtime, verifies size/SHA-256 plus GitHub artifact attestation, then uploads the module directly through Cloudflare's Worker APIs.
 
 ### Generate a valid Worker name
 
-Do not copy a machine hostname verbatim. Hostnames commonly contain dots or other characters unsuitable for a Worker DNS label.
-
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-printf '%s\n' "$WORKER_NAME"
-```
-
-A `workers.dev` Worker name is a DNS label. A Custom Domain is a full hostname; they follow different naming rules.
+Bootstrap derives a bounded DNS-label Worker name internally from the local computer name. A `workers.dev` Worker name remains separate from the canonical `dev_<ULID>` device identity; enrolling the first device therefore does not require a second Worker deployment.
 
 ### Public origin
 
@@ -81,16 +74,11 @@ During bootstrap this hostname proves that the Worker code is healthy. Do not re
 
 ### Deploy
 
-Deploy the core Worker directly. The ordinary user template leaves R2 disabled, so the core path does not require an R2 subscription or payment method.
-
-```bash
-cd edge/cloudflare
-npx wrangler deploy --config wrangler.user.toml
-```
-
-The private R2 artifact relay is optional. If explicitly enabled, add the `ARTIFACT_BUCKET` binding, provision it with `node provision-r2.mjs --config wrangler.user.toml`, and keep the bucket Worker-only with no public r2.dev hostname.
+`herdr-mcp worker bootstrap` directly creates/updates the Worker script, Durable Object bindings and first-use migrations, non-secret variables, `workers.dev` exposure, cron trigger, bootstrap secrets, first canonical device enrollment, and production Link readiness. The core path contains no R2 binding and requires no R2 subscription or payment method. Optional private artifact relay provisioning remains a separate operator action after the core installation is healthy.
 
 A successful Worker deployment proves only that public code exists. Before client registration, select the final public origin; the workstation link still needs to be online.
+
+The repository's `wrangler.user.example.toml` and Wrangler commands remain available for maintainers, Edge contributors, and deep operational recovery. They are not the ordinary installation path.
 
 ## Finalize the public origin before OAuth/MCP clients attach
 

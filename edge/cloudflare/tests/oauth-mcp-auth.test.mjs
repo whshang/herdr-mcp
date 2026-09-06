@@ -53,6 +53,31 @@ test("static bearer preserves the current runtime operator/curl auth contract", 
   );
 });
 
+test("temporary static bearer fails closed after its bounded expiry", async () => {
+  const token = "bootstrap-static";
+  assert.deepEqual(
+    await authenticateMcpRequest(request(token), {
+      STATIC_MCP_BEARER_SECRET: token,
+      STATIC_MCP_BEARER_EXPIRES_AT_MS: String(Date.now() - 1),
+    }),
+    { ok: false, code: "mcp_auth_failed" },
+  );
+  assert.deepEqual(
+    await authenticateMcpRequest(request(token), {
+      STATIC_MCP_BEARER_SECRET: token,
+      STATIC_MCP_BEARER_EXPIRES_AT_MS: String(Date.now() + 60_000),
+    }),
+    { ok: true, source: "static_bearer" },
+  );
+  assert.deepEqual(
+    await authenticateMcpRequest(request(token), {
+      STATIC_MCP_BEARER_SECRET: token,
+      STATIC_MCP_BEARER_EXPIRES_AT_MS: "not-a-timestamp",
+    }),
+    { ok: false, code: "mcp_auth_failed" },
+  );
+});
+
 test("production issuer RS256 JWT validates with migrated public PEM", async () => {
   const kp = await keyPair();
   const pem = await publicPem(kp.publicKey);

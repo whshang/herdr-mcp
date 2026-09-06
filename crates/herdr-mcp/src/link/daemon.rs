@@ -126,7 +126,7 @@ pub fn read_link_daemon_config(
     let poll_raw = optional_trimmed(env_map, "HERDR_RUNTIME_CONTROL_POLL_MS")
         .and_then(|raw| raw.parse::<u64>().ok());
     let runtime_control_poll_ms = match poll_raw {
-        Some(value) if (100..=60_000).contains(&value) => value,
+        Some(value) if (100..=65_000).contains(&value) => value,
         _ => 1_000,
     };
 

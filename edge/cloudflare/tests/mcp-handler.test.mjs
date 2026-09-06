@@ -170,6 +170,17 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(d.calls[0].deadlineMs, 31_000);
 });
 
+test("tool timeout gets transport settlement grace instead of racing the Edge deadline", async () => {
+  const d = deps();
+  const r = await handleMcp(req(8, "tools/call", {
+    name: "herdr_exec",
+    arguments: { workspace: "w2", command: "git status", timeout_ms: 60_000 },
+  }), "w1", d.value);
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].deadlineMs, 66_000);
+});
+
 test("read-only call retries across a stale generation window after supersede proved not delivered", async () => {
   let forwards = 0;
   const d = deps({
@@ -799,6 +810,11 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
   assert.equal(r.body.result.isError, true);
   assert.equal(r.body.result.structuredContent.code, "workstation_offline");
   assert.equal(r.body.result.structuredContent.retryable, true);
+  assert.equal(
+    r.body.result.structuredContent.requires_human,
+    false,
+    "MCP normalizes transient relay errors as non-human even when an older internal envelope omits the field",
+  );
   assert.equal(r.body.result.structuredContent.delivery_state, "not_delivered");
   assert.equal(r.body.result.structuredContent.retry_after_ms, 5000);
   assert.deepEqual(r.body.result.structuredContent.details, { source: "edge-test" });

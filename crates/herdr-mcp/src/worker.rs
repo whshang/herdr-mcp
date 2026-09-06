@@ -56,12 +56,11 @@ struct FleetLinkIdentity {
     credential: String,
 }
 
-#[cfg(any(target_os = "macos", test))]
-#[derive(Debug)]
-struct EnrolledCredential {
-    device_id: String,
-    workstation_id: String,
-    device_secret: String,
+#[derive(Clone, Debug)]
+pub(crate) struct EnrolledCredential {
+    pub(crate) device_id: String,
+    pub(crate) workstation_id: String,
+    pub(crate) device_secret: String,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -240,6 +239,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     }
     match command {
         WorkerCommand::List => list_devices(&paths),
+        WorkerCommand::Bootstrap => crate::worker_bootstrap::run(&paths),
         WorkerCommand::Pair { ttl_seconds, name } => {
             create_pairing(&paths, ttl_seconds, name.as_deref())
         }
@@ -293,8 +293,34 @@ pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_js
     }))
 }
 
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn extension_fleet_snapshot_with_proxy(
+    paths: &RuntimePaths,
+    _proxy_url: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    extension_fleet_snapshot(paths)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
+    let client = client()?;
+    extension_fleet_snapshot_with_client(paths, &client)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn extension_fleet_snapshot_with_proxy(
+    paths: &RuntimePaths,
+    proxy_url: Option<&str>,
+) -> Result<Value, String> {
+    let client = client_with_proxy(proxy_url)?;
+    extension_fleet_snapshot_with_client(paths, &client)
+}
+
+#[cfg(target_os = "macos")]
+fn extension_fleet_snapshot_with_client(
+    paths: &RuntimePaths,
+    client: &Client,
+) -> Result<Value, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let owner = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&owner.credential)?;
@@ -303,7 +329,7 @@ pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, St
         HeaderValue::from_str(&owner.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client
         .get(endpoint(&owner.edge_origin, "/devices")?)
         .headers(headers)
         .send()
@@ -459,6 +485,38 @@ fn connect_existing_worker(
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
     )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn adopt_bootstrap_enrollment(
+    paths: &RuntimePaths,
+    edge_origin: &str,
+    enrolled: EnrolledCredential,
+) -> Result<ExitCode, String> {
+    connect_macos_inner(
+        paths,
+        edge_origin,
+        "bootstrap-enrollment",
+        "000000",
+        None,
+        crate::macos_credential_helper::store,
+        Config::load_for_instance,
+        write_config_atomic,
+        revoke_self,
+        crate::macos_credential_helper::delete,
+        activate_connected_runtime,
+        crate::link::reconcile_after_service_generation_change,
+        move |_, _, _, _| Ok(enrolled.clone()),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn adopt_bootstrap_enrollment(
+    _paths: &RuntimePaths,
+    _edge_origin: &str,
+    _enrolled: EnrolledCredential,
+) -> Result<ExitCode, String> {
+    Err("first-Worker enrollment activation requires macOS Keychain".to_owned())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1426,6 +1484,22 @@ fn client() -> Result<Client, String> {
     Client::builder()
         .timeout(HTTP_TIMEOUT)
         .redirect(Policy::none())
+        .build()
+        .map_err(|error| format!("cannot initialize Worker HTTP client: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn client_with_proxy(proxy_url: Option<&str>) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(Policy::none())
+        .no_proxy();
+    if let Some(proxy_url) = proxy_url {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .map_err(|error| format!("cannot configure Worker HTTP proxy: {error}"))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
         .build()
         .map_err(|error| format!("cannot initialize Worker HTTP client: {error}"))
 }

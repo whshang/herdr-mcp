@@ -33,7 +33,7 @@ export type DeviceCredentialAuthResult =
 
 export async function createPairingSession(
   registry: FetchStub,
-  input: { ttl_seconds?: number; name?: string; worker_context: string },
+  input: { ttl_seconds?: number; name?: string; worker_context: string; require_empty_fleet?: boolean },
 ): Promise<{ ok: true; pairing: PairingSession } | { ok: false; code: string; status: number }> {
   const response = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
     method: "POST",

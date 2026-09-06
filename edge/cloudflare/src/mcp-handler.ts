@@ -3,8 +3,13 @@
 import { PUBLIC_CONTRACT } from "./contracts/public.js";
 import { RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 import { MCP_SERVER_VERSION } from "./version.js";
-import type { RelayErrorResult } from "./errors.js";
-import { classifyOp, type EdgeLimits } from "./limits.js";
+import { relayErrorRequiresHuman, type RelayErrorResult } from "./errors.js";
+import {
+  classifyOp,
+  MAX_REQUEST_TIMEOUT_MS,
+  REQUEST_SETTLEMENT_GRACE_MS,
+  type EdgeLimits,
+} from "./limits.js";
 import { checkArgsBudget } from "./payload.js";
 import { newRequestId } from "./pending.js";
 import type { DeviceRouteResult } from "./device-directory.js";
@@ -149,6 +154,7 @@ function relayErrorToolResult(error: RelayErrorResult, requestId: string, workst
       ok: false,
       code: error.code,
       retryable: error.retryable,
+      requires_human: error.requires_human ?? relayErrorRequiresHuman(error.code),
       delivery_state: error.delivery_state,
       retry_after_ms: error.retry_after_ms
         ?? (supersededDetails ? GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS : undefined),
@@ -847,13 +853,23 @@ export async function handleMcp(
       typeof runtimeArgs.idempotency_key === "string" && runtimeArgs.idempotency_key.length > 0
         ? runtimeArgs.idempotency_key
         : undefined;
+    const requestedToolTimeoutMs =
+      typeof runtimeArgs.timeout_ms === "number" && Number.isFinite(runtimeArgs.timeout_ms)
+        ? Math.max(1, runtimeArgs.timeout_ms)
+        : undefined;
+    const requestBudgetMs = requestedToolTimeoutMs === undefined
+      ? deps.limits.requestTimeoutMs
+      : Math.min(
+          MAX_REQUEST_TIMEOUT_MS,
+          Math.max(deps.limits.requestTimeoutMs, requestedToolTimeoutMs + REQUEST_SETTLEMENT_GRACE_MS),
+        );
     const internal: InternalForwardRequest = {
       kind: "request",
       requestId,
       op: name,
       opClass,
       args: runtimeArgs,
-      deadlineMs: now + deps.limits.requestTimeoutMs,
+      deadlineMs: now + requestBudgetMs,
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
       contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
       idempotencyKey,

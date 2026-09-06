@@ -192,7 +192,7 @@ fn compact_exec_session_views(views: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-fn redact_command_summary(command: &str) -> String {
+pub(crate) fn redact_command_summary(command: &str) -> String {
     const SECRET_FLAGS: &[&str] = &[
         "--api-key",
         "--token",

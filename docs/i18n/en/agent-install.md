@@ -59,7 +59,7 @@ herdr-mcp doctor
 
 Treat a `doctor` permission result of `needs_setup`, `denied`, `unknown`, or `timeout` as a pause-and-fix point now, not as healthy. Completing Full Disk Access for the stable TCC broker once, up front, is what avoids repeated path-by-path permission prompts later during runtime, Herdr socket, and project access. Do not substitute `sudo` for the broker approval.
 
-Node.js is required only for temporary Cloudflare Worker bootstrap (`npx wrangler`) and optional contributor tooling. It is **not** required to run the local MCP runtime.
+Node.js is **not required for ordinary installation or first-Worker bootstrap**. The release already contains a CI-built Edge artifact, and `herdr-mcp worker bootstrap` deploys it directly through Cloudflare API. Node/Wrangler remain contributor and maintainer tooling only.
 
 Canonical public MCP URL examples:
 
@@ -93,13 +93,7 @@ Generate in Agent memory: `HERDR_MCP_TOKEN` and `LINK_SHARED_SECRET`. Do **not**
 
 The human-readable computer name (for example the macOS Computer Name) is a separate display name. It is used as the default `--name` for `worker connect`, may be renamed later with `worker rename`, and never changes the immutable `device_id`.
 
-Generate `WORKER_NAME` only through the repository helper when a temporary Edge checkout is available; the Agent must not invent its own hostname slug:
-
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-```
-
-The helper lowercases the hostname, safely handles every character outside `[a-z0-9-]` (including `.`, `_`, whitespace, and non-ASCII input), collapses/trims `-`, and keeps the complete Worker name at or below 63 characters. The result must match `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`; for example `MacBook.local` becomes `herdr-edge-macbook-local`. `WORKER_NAME` (Cloudflare Worker naming) and the `dev_<ULID>` device identity intentionally use different grammars. Use strong randomness such as `openssl rand -hex 32` for secrets; never include secrets in the final report.
+`herdr-mcp worker bootstrap` derives the Worker name internally from the local computer name using the same bounded DNS-label rules as the repository helper. The Agent does not need a source checkout, Node.js, or a separate `WORKER_NAME` command. Cloudflare Worker naming and the canonical `dev_<ULID>` device identity remain separate grammars, and bootstrap-generated secrets never appear in normal output.
 
 ## 4. Cloudflare authorization
 
@@ -113,7 +107,7 @@ The user may paste the Token into this Agent session to continue. The Agent must
 
 ## 5. Cloudflare preflight after the Token arrives
 
-Inject it only as temporary `CLOUDFLARE_API_TOKEN`, never as a literal command-line argument. Verify `GET https://api.cloudflare.com/client/v4/user/tokens/verify`, then run `npx wrangler whoami` against a temporary Edge working directory.
+Keep an API-token fallback only in the current process environment or the bootstrap hidden-input prompt, never as a literal command-line argument. `herdr-mcp worker bootstrap` verifies `/user/tokens/verify`, resolves the account and `workers.dev` subdomain, classifies existing Worker scripts, and performs the deployment directly through Cloudflare API. Do not run Wrangler as an onboarding prerequisite.
 
 - one Account → select automatically;
 - multiple Accounts → ask only which Account name to use;
@@ -122,71 +116,32 @@ Inject it only as temporary `CLOUDFLARE_API_TOKEN`, never as a literal command-l
 A token can verify as **valid** (`/user/tokens/verify` returns active) and still get `403` on a specific call — that means a missing permission, not a bad token. Map the failing call to the permission instead of recreating a broader token blindly:
 
 - `GET .../workers/subdomain` returns 403 → **Account Settings → Read** is missing;
-- `wrangler deploy` / Workers Scripts calls fail → **Workers Scripts → Edit** is missing;
+- Worker Script upload / Workers Scripts calls fail → **Workers Scripts → Edit** is missing;
 - R2 bucket provisioning fails → the optional **Workers R2 Storage → Edit** permission was not granted (expected on a core install; only an error if the user explicitly enabled the artifact relay).
 
 Diagnose by permission, do not inflate scope speculatively, and never retry the mutation before the missing permission is granted.
 
 **Existing-Worker detection before deploy.** With `ACCOUNT_ID`, list `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts`. If an existing Herdr Worker is visible there, stop the deploy path and switch to the existing-fleet flow in [Multi-device control](existing-worker-connect.md) (create a pairing from any enrolled device, then `worker connect` here). Never run `worker pair` on this fresh machine as a detection probe. Deploy a new Worker only after the explicit first-fleet answer from §0.
 
-After selection, keep the account ID only in the current deployment process environment:
+After account selection, bootstrap keeps the account id and Cloudflare credential in process memory only. It reads or creates the account `workers.dev` subdomain through Cloudflare API and never renames an existing subdomain. The canonical `workers.dev` origin is `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`.
+
+## 6. Deploy Edge through the installed runtime
+
+Run the installed command:
 
 ```bash
-export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
+herdr-mcp worker bootstrap
 ```
 
-Do not write a personal `account_id` into tracked Wrangler config. Subsequent `wrangler deploy` and `wrangler secret put` inherit this temporary environment.
+The normal first-Worker path has no source checkout, `wrangler.user.toml`, Node.js, npm, or user-side Wrangler step. The release pipeline has already built `herdr-edge-<version>.mjs`. Bootstrap downloads the exact matching release manifest and Edge artifact, requires the release source commit to match the running release, verifies size/SHA-256 and the GitHub artifact attestation, then uploads the module directly through Cloudflare Worker APIs.
 
-With `ACCOUNT_ID`, fetch `GET /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain`. Reuse an existing account subdomain and **never rename it**. `ACCOUNT_SUBDOMAIN` is the selected Cloudflare Account's `workers.dev` subdomain returned by the Cloudflare API. The Worker origin always combines two independent values as `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`.
+For a genuinely empty Herdr setup the same command owns the rest of the state machine: configure the three Durable Object bindings and first-use migrations, set the non-secret Worker variables, enable the Worker `workers.dev` subdomain, configure the cron trigger, provision bootstrap secrets, create and consume the first pairing, persist the canonical `dev_<ULID>` credential locally, remove the temporary operator credential, install/reconcile the production Link, and require the final readiness checks to pass. It deploys the Worker code once; canonical device enrollment does not cause a second Worker deployment.
 
-**Origin selection.** Enumerate the active zones visible to the token before the public identity is finalized. This is discovery, not permission to mutate arbitrary DNS.
+**R2 remains optional and off by default.** The core Worker upload contains no `ARTIFACT_BUCKET` binding and requires no R2 subscription or payment method. Optional artifact-relay enablement is a separate operator action after the core installation is healthy. No Zone/DNS mutation is required for the core `workers.dev` bootstrap.
 
-- **No active zone:** use `workers.dev` directly. Do not ask for a domain. Record `workers.dev` as the canonical origin and continue with no degraded-install warning: Relay fallback covers workstation transport, while the public MCP/OAuth endpoint remains the user's own Worker.
-- **Exactly one obvious active zone:** recommend/auto-select the dedicated hostname `herdr-mcp.<zone>` (or a user-selected dedicated hostname), check it is not already occupied by an incompatible DNS record/Worker, and prefer it for the final public MCP/OAuth identity.
-- **Several materially different zones:** ask once which zone to use.
+Bootstrap proves the `workers.dev` origin first. When the selected Cloudflare account has a suitable active zone and the user wants a stable Custom Domain, finalize that public origin using the documented Cloudflare Custom Domain flow before creating the ChatGPT Connector. Worker code deployment and public-origin/DNS changes remain separate operations; do not register a Connector against one origin and silently migrate it later.
 
-If no account subdomain exists, create one only because there is no old value; use `herdr-<short-account-id>` plus a random suffix on collision. Only after GET explicitly confirms that no subdomain exists, create one with:
-
-```text
-PUT /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain
-Content-Type: application/json
-
-{"subdomain":"<candidate>"}
-```
-
-GET it again afterward and require the returned value to match before deploying the Worker.
-
-## 6. Deploy Edge without requiring a permanent repo checkout
-
-Obtain the Edge Worker sources needed for deploy (temporary shallow clone or Release-adjacent docs package is acceptable for this Edge step only). Generate ignored `wrangler.user.toml` from the published user example, then set `name` and `DEFAULT_WORKSTATION_ID`. Keep `workers_dev = true` so `https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev` remains the zero-domain bootstrap/diagnostic origin.
-
-Deploy once on `workers.dev` and prove `/health` before binding the long-lived OAuth identity. Then finalize exactly one public origin **before** creating the ChatGPT Connector:
-
-- **Recommended when an active Cloudflare zone is available:** add `[[routes]]`, set `pattern = "herdr-mcp.<zone>"` (or the user-selected dedicated hostname) and `custom_domain = true`, set `OAUTH_ISSUER=https://<custom-host>`, redeploy, and require `/health`, unauthenticated `/mcp`, and OAuth discovery to succeed on that hostname. Cloudflare creates the DNS record and certificate for a Custom Domain automatically.
-- **No suitable zone / user declines:** leave `routes = []`, set `OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`, and keep that `workers.dev` origin as the canonical public identity.
-
-Do not register the Connector against the bootstrap hostname and then silently migrate it later. Once OAuth clients attach, public-origin changes are a deliberate migration operation.
-
-**R2 is optional and off by default.** Keep the `[[r2_buckets]]` binding in `wrangler.user.toml` commented out for a core install; the published user example ships it that way. The Edge code treats `ARTIFACT_BUCKET` as optional, and the core deploy must succeed on Workers Free without R2 or a bound payment card. Only when the user explicitly enables the optional artifact relay: uncomment the binding, ensure the token has **Workers R2 Storage → Edit** (plus any Cloudflare R2 billing step), and run the provisioning step before deploy. `wrangler deploy` fails closed when a bound bucket is missing — which is exactly why the default path ships without the binding. When R2 stays disabled, skip provisioning and deploy directly:
-
-```bash
-npx wrangler deploy --config wrangler.user.toml
-```
-
-Artifact-relay enablement (optional path only):
-
-```bash
-node provision-r2.mjs --config wrangler.user.toml
-npx wrangler deploy --config wrangler.user.toml
-```
-
-Never overwrite a pre-existing Worker unless this install can prove it owns it. If the intended name already exists, stop and determine whether it is the user's existing Herdr Worker; do **not** evade that ownership check by creating a random-suffixed Worker. Only an explicitly confirmed first-fleet install may choose a new unique Worker name after proving the existing Worker is unrelated. Then store the WSS shared secret as a Cloudflare Worker secret:
-
-```bash
-printf '%s' "$LINK_SHARED_SECRET" | npx wrangler secret put LINK_SHARED_SECRET --config wrangler.user.toml
-```
-
-No Zone/DNS mutation is required. A temporary checkout used only for Edge deploy must not become the production PATH for `herdr-mcp`.
+Never overwrite an unrelated pre-existing Worker. Existing scripts are classified before the mutation gate opens; an owned incomplete bootstrap is resumed, an existing Herdr fleet switches to the pairing/connect path, and ambiguous ownership fails closed.
 
 ## 7. macOS local MCP service ownership
 

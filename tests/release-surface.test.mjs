@@ -356,6 +356,9 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /release manifest repository identity mismatch/);
   assert.match(recovery, /release manifest provenance identity mismatch/);
   assert.match(recovery, /release manifest targets do not match tagged target contract/);
+  assert.match(recovery, /edge = manifest\.get\("edge"\)/);
+  assert.match(recovery, /herdr-edge-\{source_version\}\.mjs/);
+  assert.match(recovery, /Edge sha256 mismatch/);
   assert.doesNotMatch(recovery, /herdr-mcp-extension-/);
   assert.match(recovery, /release_asset_count=/);
   assert.match(recovery, /steps\.verify\.outputs\.release_asset_count/);

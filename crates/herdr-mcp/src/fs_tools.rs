@@ -373,6 +373,34 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
     grep_with_backend(snapshot, args, discover_rg())
 }
 
+pub(crate) fn grep_prefers_in_process(args: &Value) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::path::Component;
+
+        let Ok(root) = required_str(args, "root") else {
+            return false;
+        };
+        let root = Path::new(root);
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return false;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            return false;
+        };
+        root.starts_with(Path::new(&home).join(".herdr/worktrees"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        false
+    }
+}
+
 fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Value {
     let started = Instant::now();
     let started_at_ms = now_ms();
@@ -431,7 +459,9 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
         LineMatcher::Literal(pattern.to_owned())
     };
 
-    if let Some(rg_path) = rg.as_deref() {
+    if should_try_rg(&managed.root)
+        && let Some(rg_path) = rg.as_deref()
+    {
         match try_grep_rg(&GrepRgOptions {
             rg: rg_path,
             search_root: &managed.real,
@@ -490,6 +520,24 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
         started_at_ms,
         started.elapsed().as_millis() as u64,
     )
+}
+
+/// A linked worktree stores its real Git metadata outside the checkout. On
+/// macOS that target can live under a TCC-protected directory (for example
+/// `~/Documents`) even when the checkout itself is under `~/.herdr/worktrees`.
+/// ripgrep discovers Git/ignore metadata and can then block on that protected
+/// target from a launchd runtime. The in-process Rust walker only needs the
+/// already-authorized checkout files, so prefer it for this exact shape.
+fn should_try_rg(managed_root: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        !managed_root.join(".git").is_file()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = managed_root;
+        true
+    }
 }
 
 fn finish_grep_result(
@@ -1293,6 +1341,64 @@ mod tests {
         let result = finish_grep_result(Path::new("/repo"), vec![], true, "rust", 0, 1);
         assert_eq!(result["ok"], false);
         assert_eq!(result["code"], "grep_incomplete");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn herdr_worktree_grep_prefers_in_process_without_touching_git_metadata() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let worktree = home.join(".herdr/worktrees/project/crates/herdr-mcp/src");
+        let outside = home.join("Documents/project");
+        let parent_escape = home.join(".herdr/worktrees/../Documents/project");
+
+        assert!(grep_prefers_in_process(&json!({"root": worktree})));
+        assert!(!grep_prefers_in_process(&json!({"root": outside})));
+        assert!(!grep_prefers_in_process(&json!({"root": parent_escape})));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn linked_worktree_uses_rust_grep_without_spawning_rg() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-linked-worktree-grep-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join(".git"),
+            "gitdir: /Users/example/Documents/repo/.git/worktrees/uat\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "needle\n").unwrap();
+
+        let marker = root.join("fake-rg-ran");
+        let fake_rg = root.join("fake-rg");
+        fs::write(
+            &fake_rg,
+            format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_rg, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let snapshot = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": []
+        });
+        let args = json!({"root": root, "pattern": "needle", "glob": "*.rs"});
+        let result = grep_with_backend(&snapshot, &args, Some(fake_rg));
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["engine"], "rust");
+        assert_eq!(result["count"], 1);
+        assert!(!marker.exists(), "linked worktree unexpectedly spawned rg");
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

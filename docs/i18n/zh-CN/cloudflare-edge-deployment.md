@@ -53,24 +53,17 @@ Edge **不保存你的 Git 仓库**，也不代替本机 Herdr。代码、shell 
 
 ## Bootstrap 部署：workers.dev
 
-从用户配置模板开始：
+普通第一台设备安装直接使用已安装 runtime：
 
 ```bash
-cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
+herdr-mcp worker bootstrap
 ```
 
-`wrangler.user.toml` 是个人部署配置，不应提交包含 workstation identity 等本地部署信息的用户文件。
+用户电脑不需要仓库 checkout、Node.js、npm、下载 Wrangler、本地编译 Worker 或生成 `wrangler.user.toml`。Release CI 会从已经通过 Edge gate 的源码一次性构建 `herdr-edge-<version>.mjs`。bootstrap 下载精确匹配的 release manifest 与 bundle，要求 release source commit 与当前 runtime 一致，校验大小、SHA-256 和 GitHub artifact attestation，然后直接通过 Cloudflare Worker API 上传。
 
 ### 生成 Worker name
 
-不要直接拿 `hostname` 当 Worker name。机器名里常有点号或其它不适合作为 DNS label 的字符。
-
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-printf '%s\n' "$WORKER_NAME"
-```
-
-`workers.dev` 的 Worker name 是一个 DNS label；Custom Domain 是完整域名，两者规则不同。
+bootstrap 会在 runtime 内部从本机电脑名派生有界 DNS-label Worker name。`workers.dev` Worker name 与 canonical `dev_<ULID>` 设备身份继续分离，因此第一台设备 enrollment 不需要第二次 Worker 部署。
 
 ### 配置 public origin
 
@@ -96,16 +89,11 @@ https://<worker>.<account-subdomain>.workers.dev
 
 ### 部署
 
-直接部署核心 Worker。普通 user template 默认关闭 R2，因此核心路径不要求开通 R2 订阅或支付方式。
-
-```bash
-cd edge/cloudflare
-npx wrangler deploy --config wrangler.user.toml
-```
-
-私有 R2 artifact 中继是可选能力。只有明确启用时才增加 `ARTIFACT_BUCKET` binding，并执行 `node provision-r2.mjs --config wrangler.user.toml` 进行 provision；该桶必须只通过 Worker binding 访问，不能挂 public r2.dev 域名。
+`herdr-mcp worker bootstrap` 会直接创建/更新 Worker script、Durable Object bindings 与首次 migrations、非秘密变量、`workers.dev` 暴露、cron trigger、bootstrap secrets、第一台 canonical device enrollment 和 production Link readiness。核心路径不包含 R2 binding，也不要求 R2 subscription 或支付方式。可选私有 artifact relay 在核心安装健康后作为独立 operator 操作处理。
 
 部署 Worker 成功只代表公网代码存在。下一步先确定最终 public origin，再验证 workstation link。
+
+仓库里的 `wrangler.user.example.toml` 与 Wrangler 命令继续保留给维护者、Edge 贡献者和深度恢复场景，不再属于普通安装路径。
 
 ## 在 OAuth/MCP 客户端接入前确定最终公网入口
 

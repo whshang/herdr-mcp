@@ -8,6 +8,7 @@ import {
   RUST_RELEASE_PROVENANCE,
   RUST_RELEASE_TARGETS,
   buildRustReleaseManifest,
+  edgeReleaseAssetName,
   parseCargoPackageVersion,
   parseRustStateSchema,
   releaseAssetName,
@@ -29,6 +30,7 @@ test("Rust release manifest is target-complete, hashed, and contract-pinned", as
   for (const target of RUST_RELEASE_TARGETS) {
     await writeFile(join(assetsDir, releaseAssetName("1.2.3-alpha.4", target)), `binary-${target}`);
   }
+  await writeFile(join(assetsDir, edgeReleaseAssetName("1.2.3-alpha.4")), "export default { fetch() {} };\n");
   try {
     const manifest = await buildRustReleaseManifest({
       root,
@@ -74,6 +76,10 @@ test("Rust release manifest is target-complete, hashed, and contract-pinned", as
     assert.ok(manifest.assets.every((asset) => /^[a-f0-9]{64}$/.test(asset.sha256)));
     assert.ok(manifest.assets.every((asset) => asset.size > 0));
     assert.ok(manifest.assets.every((asset) => asset.url.includes("/releases/download/v1.2.3-alpha.4/")));
+    assert.equal(manifest.edge.name, "herdr-edge-1.2.3-alpha.4.mjs");
+    assert.ok(/^[a-f0-9]{64}$/.test(manifest.edge.sha256));
+    assert.ok(manifest.edge.size > 0);
+    assert.ok(manifest.edge.url.endsWith("/releases/download/v1.2.3-alpha.4/herdr-edge-1.2.3-alpha.4.mjs"));
 
     const rehearsal = await buildRustReleaseManifest({
       root,
@@ -126,6 +132,21 @@ test("Rust release manifest refuses incomplete assets and tag/version drift", as
         sourceRef: "refs/tags/v1.0.0",
       }),
       /missing Rust release asset/,
+    );
+    for (const target of RUST_RELEASE_TARGETS) {
+      await writeFile(join(assetsDir, releaseAssetName("1.0.0", target)), `binary-${target}`);
+    }
+    await assert.rejects(
+      buildRustReleaseManifest({
+        root,
+        assetsDir,
+        repo: "o/r",
+        tag: "v1.0.0",
+        repositoryId: "123",
+        sourceCommit: "a".repeat(40),
+        sourceRef: "refs/tags/v1.0.0",
+      }),
+      /missing Edge release asset/,
     );
     await assert.rejects(
       buildRustReleaseManifest({

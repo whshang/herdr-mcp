@@ -217,6 +217,10 @@ export class DeviceRegistryDO {
       ? body.worker_context
       : null;
     if (workerContext === null) return json({ ok: false, code: "bad_request" }, 400);
+    if (body.require_empty_fleet === true) {
+      const existing = await this.state.storage.list<DeviceRecord>({ prefix: DEVICE_PREFIX, limit: 1 });
+      if (existing.size > 0) return json({ ok: false, code: "first_fleet_not_empty" }, 409);
+    }
 
     const pepper = getPairingPepper(this.env);
     if (pepper === null) return json({ ok: false, code: "pairing_unavailable" }, 503);

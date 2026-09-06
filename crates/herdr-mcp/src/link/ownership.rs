@@ -805,10 +805,14 @@ pub fn production_ready_gate_catalog() -> Value {
     })
 }
 
-pub fn run_status() -> Result<ExitCode, String> {
+pub fn status_report() -> Result<Value, String> {
     let home = home_dir().ok_or_else(|| "HOME is required for link status".to_owned())?;
     let config_dir = home.join(".config").join("herdr-mcp");
-    let report = collect_status_report(&home, &config_dir);
+    Ok(collect_status_report(&home, &config_dir))
+}
+
+pub fn run_status() -> Result<ExitCode, String> {
+    let report = status_report()?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
