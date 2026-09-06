@@ -30,7 +30,7 @@ Cloudflare Edge
 ### 推奨：Agent に一文だけ渡す
 
 ```text
-Herdr と herdr-mcp をインストールして設定してください。https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md を最後まで読み、現在の Stable GitHub Release を使って Cloudflare と ChatGPT まで設定してください。Cloudflare account に適切な active zone がある場合は専用 Custom Domain を優先し、ない場合は workers.dev を維持してください。workstation の network/fallback path を自動検証し、私自身のログインや認可が必要な場面だけ停止し、最後に接続全体を実際の MCP リクエストで検証してください。
+Herdr と herdr-mcp をインストールしてください。https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md を最後まで読み、現在の Stable GitHub Release を使って Cloudflare と ChatGPT まで設定してください。Cloudflare account に適切な active zone がある場合は専用 Custom Domain を優先し、ない場合は workers.dev を維持してください。R2 は任意のままにし、workstation の network path を自動検証し、私自身のログイン・Cloudflare Token 作成・ChatGPT 認可が必要な場面だけ停止してください。
 ```
 
 Agent は `workers.dev` で Worker を bootstrap し、適切な Cloudflare zone があれば OAuth/Connector を固定する前に Custom Domain を推奨・設定します。その後 workstation Link と ChatGPT 認可を進め、実際の network path と MCP request を検証します。domain がなくてもインストールは停止せず、必要なら Link が direct `workers.dev` → 既存 local proxy → qualified shared Relay の順で自動 fallback します。
@@ -73,13 +73,13 @@ Web AI は private workstation method を使い、登録済みコンピュータ
 
 ### 新しいコンピュータを既存のデバイス群へ追加する
 
-推奨は、すでに認可済みの ChatGPT 会話で次のように依頼することです。
+登録済みの任意のコンピュータで、次を実行します。
 
 ```text
-新しいコンピュータ用に、10 分間有効な Herdr pairing link を生成してください。
+herdr-mcp worker pair
 ```
 
-Herdr は Edge 上で直接 pairing を作成するため、古い workstation が online である必要はありません。ChatGPT は pairing address、単回使用の 6 桁 code、正確な expiry、コピー可能な `herdr-mcp worker connect "<pairing-address>"` をまとめて返します。認可済み Mac 上の `herdr-mcp worker pair` は CLI fallback として残ります。
+Herdr は Worker control plane で pairing を作成するため、その操作自体を特定の workstation へ route する必要はありません。pairing は device/operator が管理する fleet アクションであり、登録済みの任意のコンピュータで `herdr-mcp worker pair` を実行します。新規コンピュータで `worker pair` を検出目的に実行してはいけません。最初の Worker なら先に Cloudflare bootstrap を完了します。pairing result には address、単回使用の 6 桁 code、正確な expiry、コピー可能な `herdr-mcp worker connect "<pairing-address>"` が含まれます。
 
 新しいコンピュータ上の Coding Agent に次の一文を渡します。
 

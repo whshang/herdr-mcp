@@ -493,6 +493,7 @@ fn rollback() -> Result<ExitCode, String> {
         );
     }
 
+    unsafe { std::env::set_var("HERDR_MCP_GENERATION_TRIGGER", "dev_rollback") };
     let install_code = crate::service_lifecycle::run_install_from_payload(
         false,
         Path::new(&state.prod_snapshot_binary),
@@ -644,6 +645,7 @@ fn run_service_install(binary: &Path) -> Result<(), String> {
     let output = Command::new(binary)
         .args(["service", "install"])
         .env_remove("HERDR_MCP_EXEC_ID")
+        .env("HERDR_MCP_GENERATION_TRIGGER", "dev_sync")
         .output()
         .map_err(|error| format!("cannot execute transactional service install: {error}"))?;
     if !output.status.success() {
@@ -660,6 +662,8 @@ fn run_service_rollback(binary: &Path) -> Result<(), String> {
     let output = Command::new(binary)
         .args(["service", "rollback"])
         .env_remove("HERDR_MCP_EXEC_ID")
+        .env("HERDR_MCP_GENERATION_TRIGGER", "dev_sync_compensation")
+        .env("HERDR_MCP_INTERNAL_GENERATION_RECOVERY", "1")
         .output()
         .map_err(|error| format!("cannot execute transactional service rollback: {error}"))?;
     if !output.status.success() {
@@ -939,9 +943,13 @@ fn validate_dev_activation_evidence(
         .get("runtime_control_active_matches_current")
         .and_then(Value::as_bool)
         == Some(true);
-    if current != generation || active != generation || !control_matches {
+    let loaded_matches = alignment
+        .get("loaded_matches_current")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if current != generation || active != generation || !control_matches || !loaded_matches {
         return Err(format!(
-            "production Link generation mismatch after DEV activation: expected={generation} current={current} active={active} control_matches={control_matches}"
+            "production Link generation mismatch after DEV activation: expected={generation} current={current} active={active} control_matches={control_matches} loaded_matches={loaded_matches}"
         ));
     }
 
@@ -1415,15 +1423,14 @@ mod tests {
                 "current_generation": generation,
                 "active_generation": generation,
                 "runtime_control_active_matches_current": true,
+                "loaded_matches_current": false,
                 "loaded_environment_stale": true,
             }
         });
         let native = json!({ "ok": true, "runtime_matches_current": true });
-        let evidence =
-            validate_dev_activation_evidence(generation, &service, &link, Some(&native)).unwrap();
-        assert_eq!(evidence["server_link_generation_reconciled"], true);
-        assert_eq!(evidence["link_loaded_environment_stale"], true);
-        assert_eq!(evidence["native_host"], "current");
+        let error = validate_dev_activation_evidence(generation, &service, &link, Some(&native))
+            .unwrap_err();
+        assert!(error.contains("loaded_matches=false"));
 
         let stale = json!({
             "ok": true,
@@ -1466,6 +1473,7 @@ mod tests {
                 "current_generation": generation,
                 "active_generation": generation,
                 "runtime_control_active_matches_current": true,
+                "loaded_matches_current": true,
             }
         });
         let absent = json!({
@@ -1697,6 +1705,7 @@ mod tests {
                 "current_generation": generation,
                 "active_generation": generation,
                 "runtime_control_active_matches_current": true,
+                "loaded_matches_current": true,
             }
         });
         let native = json!({ "ok": true, "runtime_matches_current": true });

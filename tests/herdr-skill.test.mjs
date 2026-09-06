@@ -41,7 +41,11 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /5 seconds.*10 seconds.*20 seconds/s);
     assert.match(r.content, /roughly.*35 seconds/s);
     assert.match(r.content, /exactly three.*read-only.*reconnect attempts/s);
-    assert.match(r.content, /bounded three-retry recovery window/s);
+    assert.match(r.content, /not a human-escalation threshold/);
+    assert.match(r.content, /requires_human=false.*no-escalation signal/s);
+    assert.match(r.content, /delivery_uncertain.*automatically inspect.*request\/resource evidence/s);
+    assert.match(r.content, /Do not ask the operator to restart Herdr merely because the probe window elapsed/);
+    assert.match(r.content, /macOS permission\/TCC prompt.*browser\/account\/OAuth.*irreversible action.*automatic recovery is genuinely exhausted/s);
     assert.match(r.content, /agent_status_wait_timeout.*not.*offline/s);
     assert.match(r.content, /boot_id.*herdr_since\(cursor=0\)/s);
     assert.match(r.content, /never blindly resend it/s);
@@ -60,6 +64,15 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /Do not wait for the user to notice accumulated panes/);
     assert.match(r.content, /settled Agent.*does not need to remain open.*preserve task history/s);
     assert.match(r.content, /canonical reusable `herdr-mcp:utility` pane/);
+    assert.match(r.content, /Automation Client/);
+    assert.match(r.content, /grant_type=client_credentials/);
+    assert.match(r.content, /maximum one hour, no refresh token/);
+    assert.match(r.content, /ordinary MCP principals bound to exactly one enrolled device, not fleet administrators/);
+    assert.match(r.content, /Automation administration remains an enrolled-device\/operator CLI\/REST action/);
+    assert.doesNotMatch(r.content, /herdr_mcp\.automation\.(?:list|revoke)/);
+    assert.match(r.content, /127\.0\.0\.1:8772\/mcp.*still requires its local bearer/s);
+    assert.match(r.content, /trusted Unix-IPC listener is deliberately tokenless/);
+    assert.match(r.content, /browser never receives or stores `HERDR_MCP_TOKEN`/);
     assert.equal(r.runtime.contract_profile, process.env.HERDR_MCP_CONTRACT_PROFILE || "current");
     assert.equal(r.runtime.build_commit, process.env.HERDR_MCP_BUILD_COMMIT || null);
     assert.equal(r.runtime.active_runtime.source_commit, process.env.HERDR_MCP_BUILD_COMMIT || null);

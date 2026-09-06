@@ -117,7 +117,14 @@ fn next_event_until(
 
         let mut chunk = [0_u8; 8192];
         match stream.stream.read(&mut chunk) {
-            Ok(0) => return Ok(None),
+            Ok(0) => {
+                // EOF is a disconnected peer, not a no-event timeout. Callers
+                // use this error to leave the live loop and enter reconnect.
+                return Err(HerdrError {
+                    code: "event_stream_closed".to_owned(),
+                    message: "events.subscribe peer closed the stream".to_owned(),
+                });
+            }
             Ok(count) => {
                 if stream.buffer.len().saturating_add(count) > MAX_EVENT_LINE_BYTES {
                     return Err(HerdrError {
@@ -293,6 +300,40 @@ mod tests {
         assert_eq!(first["event"], "pane_updated");
         assert_eq!(first["pane"]["pane_id"], "p1");
         assert_eq!(second["event"], "pane_closed");
+
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn peer_eof_returns_distinct_closed_error_not_timeout() {
+        let socket = socket_path();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(peer.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            writeln!(
+                peer,
+                "{}",
+                json!({ "id": serde_json::from_str::<Value>(&request).unwrap()["id"], "result": {"ok": true} })
+            )
+            .unwrap();
+            // Peer closes the stream *long before* the 6h subscribe deadline.
+            drop(peer);
+        });
+
+        let client = HerdrClient::new(&socket);
+        let mut stream = EventStream::subscribe(
+            &client,
+            vec![json!({"type": "pane.updated"})],
+            Duration::from_secs(6 * 60 * 60),
+        )
+        .unwrap();
+        let error = stream.poll_event(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.code, "event_stream_closed");
 
         server.join().unwrap();
         std::fs::remove_file(socket).unwrap();

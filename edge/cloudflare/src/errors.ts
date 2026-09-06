@@ -30,6 +30,8 @@ export interface RelayErrorResult {
   ok: false;
   code: RelayErrorCode;
   retryable: boolean;
+  /** False means this error alone must not be escalated to a human. */
+  requires_human?: boolean;
   message?: string;
   requestId?: string;
   workstationId?: string;
@@ -49,6 +51,28 @@ export interface RecoveryPolicy {
 }
 
 export const WORKSTATION_OFFLINE_RETRY_BACKOFF_MS = [5_000, 10_000, 20_000] as const;
+export const EDGE_CAPACITY_RETRY_AFTER_MS = 1_000;
+
+/**
+ * Recovery/transient errors are handled by Herdr itself or verified by the
+ * planner before replay. They are not, by themselves, a reason to ask the
+ * operator to restart services or inspect delivery state manually.
+ */
+export function relayErrorRequiresHuman(code: RelayErrorCode): false | undefined {
+  switch (code) {
+    case "workstation_offline":
+    case "workstation_reconnecting":
+    case "workstation_draining":
+    case "runtime_generation_superseded_before_dispatch":
+    case "runtime_unavailable":
+    case "request_timeout":
+    case "delivery_uncertain":
+    case "edge_capacity_exceeded":
+      return false;
+    default:
+      return undefined;
+  }
+}
 
 function workstationOfflineRecovery(): RecoveryPolicy {
   return {
@@ -64,6 +88,7 @@ export function errorResult(
   code: RelayErrorCode,
   opts: {
     retryable?: boolean;
+    requires_human?: boolean;
     message?: string;
     requestId?: string;
     workstationId?: string;
@@ -73,10 +98,12 @@ export function errorResult(
     recovery?: RecoveryPolicy;
   } = {},
 ): RelayErrorResult {
+  const requiresHuman = opts.requires_human ?? relayErrorRequiresHuman(code);
   return {
     ok: false,
     code,
     retryable: opts.retryable ?? false,
+    ...(requiresHuman !== undefined ? { requires_human: requiresHuman } : {}),
     ...(opts.message !== undefined ? { message: opts.message } : {}),
     ...(opts.requestId !== undefined ? { requestId: opts.requestId } : {}),
     ...(opts.workstationId !== undefined ? { workstationId: opts.workstationId } : {}),
@@ -127,11 +154,14 @@ export function drainingResult(opts: { requestId?: string; workstationId?: strin
  */
 export function timeoutResult(opts: { requestId?: string; workstationId?: string; atMs?: number; opClass?: OpClass } = {}) {
   const retryable = opts.opClass === "read";
+  const message = opts.opClass === "read"
+    ? "request exceeded its deadline; retrying a read is safe"
+    : opts.opClass === "mutating"
+      ? "request exceeded its deadline; outcome unknown — do not blindly retry a mutating operation"
+      : "request exceeded its deadline; outcome unknown — verify live state before replay";
   return errorResult("request_timeout", {
     retryable,
-    message: retryable
-      ? "request exceeded its deadline; retrying a read is safe"
-      : "request exceeded its deadline; outcome unknown — do not blindly retry a mutating op",
+    message,
     ...opts,
   });
 }
@@ -153,7 +183,9 @@ export function uncertainResult(opts: { requestId?: string; workstationId?: stri
 export function capacityResult(opts: { requestId?: string; workstationId?: string; atMs?: number } = {}) {
   return errorResult("edge_capacity_exceeded", {
     retryable: true,
-    message: "edge pending-request capacity exceeded; retry later",
+    delivery_state: "not_delivered",
+    retry_after_ms: EDGE_CAPACITY_RETRY_AFTER_MS,
+    message: "edge pending-request capacity exceeded; request was not delivered, retry after backpressure",
     ...opts,
   });
 }

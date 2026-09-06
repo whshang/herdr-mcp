@@ -157,6 +157,27 @@ pub fn resolve_link_proxy() -> Option<ResolvedProxy> {
     }
 }
 
+/// Resolve an explicit SOCKS endpoint for callers that must perform trusted
+/// local DNS resolution before tunneling. This is a fallback capability only;
+/// normal Link proxy precedence remains unchanged.
+pub fn resolve_link_socks_proxy() -> Option<ResolvedProxy> {
+    for (source, value) in proxy_env_candidates() {
+        let Ok(proxy) = normalize_proxy_url(&value, source) else {
+            continue;
+        };
+        if proxy_is_socks(&proxy) {
+            return Some(proxy);
+        }
+    }
+    macos_system_socks_proxy()
+}
+
+fn proxy_is_socks(proxy: &ResolvedProxy) -> bool {
+    Url::parse(&proxy.url)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "socks5" | "socks5h"))
+}
+
 fn proxy_env_candidates() -> Vec<(ProxySource, String)> {
     [
         (ProxySource::HerdrLinkProxy, ENV_HERDR_LINK_PROXY),
@@ -241,6 +262,20 @@ fn macos_system_proxy() -> Option<ResolvedProxy> {
 
 #[cfg(not(target_os = "macos"))]
 fn macos_system_proxy() -> Option<ResolvedProxy> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_socks_proxy() -> Option<ResolvedProxy> {
+    let output = Command::new("scutil").arg("--proxy").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    macos_socks_from_scutil(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_system_socks_proxy() -> Option<ResolvedProxy> {
     None
 }
 
@@ -694,6 +729,11 @@ mod tests {
             "socks5h://127.0.0.1:1080"
         );
         assert_eq!(socks5h.source, ProxySource::AllProxy);
+        assert!(proxy_is_socks(&socks5));
+        assert!(proxy_is_socks(&socks5h));
+        let http = normalize_proxy_url("http://127.0.0.1:7890", ProxySource::HttpProxy)
+            .expect("http proxy");
+        assert!(!proxy_is_socks(&http));
     }
 
     #[tokio::test]

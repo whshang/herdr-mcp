@@ -331,7 +331,7 @@
   "cc_devices_observed": "状态读取于 {value}",
   "cc_devices_empty": "没有已注册设备。",
   "cc_devices_not_available": "设备列表暂不可用",
-  "cc_devices_owner_required": "当前电脑没有 Worker owner 权限，无法读取完整设备列表。",
+  "cc_devices_owner_required": "当前电脑没有可用的 Worker fleet 凭据，无法读取完整设备列表。",
   "cc_devices_runtime_unavailable": "当前本机 Runtime 尚未提供 0.4.5 设备视图。",
   "cc_devices_unavailable": "读取 Worker 设备失败：{error}",
   "cc_device_this": "本机",

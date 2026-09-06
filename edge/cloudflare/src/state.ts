@@ -34,6 +34,12 @@ export interface WorkstationSession {
   connectedAtMs?: number;
   lastSeenAtMs?: number;
   disconnectedAtMs?: number;
+  /** Most recent successful recovery after an observed disconnect. */
+  lastRecoveredAtMs?: number;
+  /** Wall time between the observed disconnect and the next validated hello. */
+  lastReconnectDurationMs?: number;
+  /** Count of observed disconnect -> validated hello recoveries. */
+  reconnectCount?: number;
   drainNoticeAtMs?: number;
   /** Allowlist notifications from the link (no free-form strings). */
   runtimeStatus?: {
@@ -216,6 +222,11 @@ export function parseSession(raw: string): ParseSessionResult {
     ...(typeof s.connectedAtMs === "number" ? { connectedAtMs: s.connectedAtMs } : {}),
     ...(typeof s.lastSeenAtMs === "number" ? { lastSeenAtMs: s.lastSeenAtMs } : {}),
     ...(typeof s.disconnectedAtMs === "number" ? { disconnectedAtMs: s.disconnectedAtMs } : {}),
+    ...(typeof s.lastRecoveredAtMs === "number" ? { lastRecoveredAtMs: s.lastRecoveredAtMs } : {}),
+    ...(typeof s.lastReconnectDurationMs === "number" ? { lastReconnectDurationMs: s.lastReconnectDurationMs } : {}),
+    ...(typeof s.reconnectCount === "number" && Number.isSafeInteger(s.reconnectCount) && s.reconnectCount >= 0
+      ? { reconnectCount: s.reconnectCount }
+      : {}),
     ...(typeof s.drainNoticeAtMs === "number" ? { drainNoticeAtMs: s.drainNoticeAtMs } : {}),
     ...(runtimeStatus !== undefined ? { runtimeStatus } : {}),
   };
@@ -260,6 +271,18 @@ export function sessionSummary(
     contractEpoch: session.hello?.contractEpoch,
     lastSeenAtMs,
     lastSeenAgoMs: lastSeenAtMs !== undefined ? opts.now - lastSeenAtMs : undefined,
+    reconnectingSinceMs: session.status === "offline" ? session.disconnectedAtMs : undefined,
+    lastRecoveredAtMs: session.lastRecoveredAtMs,
+    lastReconnectDurationMs: session.lastReconnectDurationMs,
+    reconnectCount: session.reconnectCount ?? 0,
+    // The production Link recycles itself after five minutes continuously
+    // offline. Crossing this threshold is useful evidence, but is deliberately
+    // not called a launchd restart because Edge cannot prove which process
+    // performed the recovery without a separate Link-process identity.
+    lastReconnectCrossedRecycleThreshold:
+      session.lastReconnectDurationMs !== undefined
+        ? session.lastReconnectDurationMs >= 300_000
+        : undefined,
     activeRequests: opts.activeRequests,
     edgeVersion: opts.edgeVersion,
     atMs: opts.now,

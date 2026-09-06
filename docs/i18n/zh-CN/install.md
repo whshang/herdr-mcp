@@ -76,21 +76,23 @@ herdr-mcp status
 
 自动化安装时由 Agent 按 [Agent 安装](agent-install.md) / [Agent 安装合同](agent-install.md) 直接执行这段；协议负责 Token 最小权限、Worker 命名、secret 注入、Account 选择和网络 blocker 的处理边界。
 
-手动执行时，至少遵守：
+手动/operator 安装同样直接运行已安装 runtime：
+
+```bash
+herdr-mcp worker bootstrap
+```
+
+该命令负责 Worker 命名、Release artifact 校验、Cloudflare API 直接上传、secret、第一台设备 enrollment 与 readiness 验证。普通手动安装不需要源码 checkout、Node.js、npm、Wrangler 或 `wrangler.user.toml`。
+
+同时遵守：
 
 - Cloudflare API Token 只作为临时进程环境变量；
 - 不把 Token 写进仓库、日志、截图或 shell history；
-- 保持 `workers_dev = true`；`routes = []` 只是零域名 bootstrap 状态，不是已有合适 active zone 时的优先最终身份；最终 hostname 优先走 Worker Custom Domain，不申请通用 DNS Write；
-- Worker 名使用仓库 helper：
-
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-```
-
+- 保持 `workers.dev` 作为零域名 bootstrap origin；已有合适 active zone 时，在 Connector 授权前固化 Worker Custom Domain，不申请通用 DNS Write；
 - `LINK_SHARED_SECRET` 作为 Worker secret 保存；
 - 工作站只主动建立出站 WSS，不暴露本机公网端口。
 
-详细手动协议见 [Agent 协助安装](agent-install.md) 与 [Cloudflare Edge 部署](cloudflare-edge-deployment.md)。
+普通 bootstrap 合同见 [Agent 协助安装](agent-install.md)。[Cloudflare Edge 部署](cloudflare-edge-deployment.md) 中的源码/Wrangler 流程只保留给维护者与深度运维。
 
 ## 第四步：安装并验证 Herdr Link
 
