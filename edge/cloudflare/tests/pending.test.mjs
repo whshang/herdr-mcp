@@ -229,7 +229,7 @@ test("limits: defaults + request timeout clamp", () => {
   assert.equal(l.linkReconnectGraceMs, 15_000);
   assert.equal(makeLimits({ LINK_RECONNECT_GRACE_MS: "750" }).linkReconnectGraceMs, 750);
   const clamped = makeLimits({ DEFAULT_REQUEST_TIMEOUT_MS: "999999" });
-  assert.equal(clamped.requestTimeoutMs, 60_000);
+  assert.equal(clamped.requestTimeoutMs, 65_000);
   const min = makeLimits({ DEFAULT_REQUEST_TIMEOUT_MS: "1" });
   assert.equal(min.requestTimeoutMs, 1_000);
 });
