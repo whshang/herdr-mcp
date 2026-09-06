@@ -47,10 +47,12 @@ const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
   deepseek: "*://chat.deepseek.com/*",
+  gemini: "*://gemini.google.com/*",
 };
 const EXPERIMENTAL_SITE_PERMISSION_PATTERNS = {
   "z.ai": "https://chat.z.ai/*",
   deepseek: "https://chat.deepseek.com/*",
+  gemini: "https://gemini.google.com/*",
 };
 const EXPERIMENTAL_CONTENT_SCRIPTS = [
   {
@@ -73,6 +75,18 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
     js: [
       "content/base.js", "content/injector/deepseek.js", "content/webmcp/speaks-json.js",
       "content/webmcp/json-bridge-core.js", "content/webmcp/json-bridge.js", "performance-core.js",
+      "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
+      "content/hud/hud.js", "content/wake.js",
+    ],
+    runAt: "document_idle",
+    persistAcrossSessions: true,
+  },
+  {
+    id: "herdr-experimental-gemini",
+    site: "gemini",
+    matches: ["https://gemini.google.com/*"],
+    js: [
+      "content/base.js", "content/injector/gemini.js", "performance-core.js",
       "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
       "content/hud/hud.js", "content/wake.js",
     ],
@@ -206,9 +220,10 @@ let CFG = {
   llmJudgeModel: "",
   llmJudgePromptTemplate: "",
   llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-  // z.ai and DeepSeek stay opt-in until the next compatibility/UAT cycle.
+  // Experimental Web AI origins stay opt-in until their compatibility/UAT gate passes.
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
+  experimentalGeminiEnabled: false,
 };
 let PROJECT_AUTOMATION = {};
 let CONVERSATION_AUTOMATION = {};
@@ -238,6 +253,7 @@ function isJsonBridgeConversation(convKey) {
 function experimentalSiteEnabled(site) {
   if (site === "z.ai") return CFG.experimentalZAiEnabled === true;
   if (site === "deepseek") return CFG.experimentalDeepSeekEnabled === true;
+  if (site === "gemini") return CFG.experimentalGeminiEnabled === true;
   return true;
 }
 
@@ -4470,7 +4486,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     void (async () => {
       await configReady;
       const registeringSite = String(msg.site || "").trim();
-      if (["z.ai", "deepseek"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
+      if (["z.ai", "deepseek", "gemini"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
         sendResponse({ ok: false, error: "experimental-site-disabled" });
         return;
       }

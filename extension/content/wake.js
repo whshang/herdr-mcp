@@ -55,7 +55,9 @@ const H2W_CONTENT_VERSION = "0.1.90";
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
   const experimentalFlag = ADAPTER.name === "z.ai"
     ? "experimentalZAiEnabled"
-    : (ADAPTER.name === "deepseek" ? "experimentalDeepSeekEnabled" : null);
+    : (ADAPTER.name === "deepseek"
+      ? "experimentalDeepSeekEnabled"
+      : (ADAPTER.name === "gemini" ? "experimentalGeminiEnabled" : null));
   if (experimentalFlag) {
     try {
       const cfg = await chrome.storage.local.get([experimentalFlag]);

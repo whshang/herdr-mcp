@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true };
 const listeners = {
   onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
   onSidePanelOpened: [], onSidePanelClosed: [],
@@ -89,6 +89,7 @@ const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
 const continuityResolveRequests = [];
 const browserRegistryRequests = [];
+const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
 let initialLocaleReadSeen = false;
@@ -489,7 +490,22 @@ globalThis.chrome = {
     onOpened: { addListener: (fn) => listeners.onSidePanelOpened.push(fn) },
     onClosed: { addListener: (fn) => listeners.onSidePanelClosed.push(fn) },
   },
-  scripting: { executeScript: async () => [{ result: { ok: true } }] },
+  scripting: {
+    executeScript: async () => [{ result: { ok: true } }],
+    async getRegisteredContentScripts({ ids } = {}) {
+      const rows = [...registeredContentScripts.values()];
+      return Array.isArray(ids) ? rows.filter((row) => ids.includes(row.id)) : rows;
+    },
+    async registerContentScripts(specs) {
+      for (const spec of specs || []) registeredContentScripts.set(spec.id, { ...spec });
+    },
+    async updateContentScripts(specs) {
+      for (const spec of specs || []) registeredContentScripts.set(spec.id, { ...spec });
+    },
+    async unregisterContentScripts({ ids } = {}) {
+      for (const id of ids || []) registeredContentScripts.delete(id);
+    },
+  },
   alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
 };
 
@@ -627,6 +643,42 @@ function dispatchMessage(msg, sender = {}) {
     onMsg(msg, sender, done);
     setTimeout(() => done(undefined), 1000);
   });
+}
+
+console.log("\n[Gemini optional-origin registration]");
+{
+  ok(await waitForTest(() => registeredContentScripts.has("herdr-experimental-gemini")),
+    "Gemini opt-in registers one dynamic content script after explicit site permission");
+  const script = registeredContentScripts.get("herdr-experimental-gemini") || {};
+  ok(script.matches?.[0] === "https://gemini.google.com/*"
+      && script.js?.includes("content/injector/gemini.js")
+      && script.js?.includes("content/wake.js")
+      && !script.js?.includes("content/webmcp/json-bridge.js"),
+    "Gemini dynamic script is origin-scoped and does not inherit the JSON bridge",
+    JSON.stringify(script));
+
+  const disabled = await dispatchMessage({
+    type: "h2w_set_config",
+    config: { experimentalGeminiEnabled: false },
+  });
+  ok(disabled?.ok === true && !registeredContentScripts.has("herdr-experimental-gemini"),
+    "disabling Gemini unregisters its dynamic content script");
+  const blocked = await dispatchMessage({
+    type: "h2w_register",
+    site: "gemini",
+    convKey: "https://gemini.google.com/app/disabled-test",
+    url: "https://gemini.google.com/app/disabled-test",
+  }, { tab: { id: 900, url: "https://gemini.google.com/app/disabled-test" } });
+  ok(blocked?.ok === false && blocked?.error === "experimental-site-disabled",
+    "disabled Gemini registration fails closed before Browser Registry mutation",
+    JSON.stringify(blocked));
+
+  const enabled = await dispatchMessage({
+    type: "h2w_set_config",
+    config: { experimentalGeminiEnabled: true },
+  });
+  ok(enabled?.ok === true && registeredContentScripts.has("herdr-experimental-gemini"),
+    "re-enabling Gemini re-registers the dynamic content script");
 }
 
 console.log("\n[Gemini browser registry observation]");

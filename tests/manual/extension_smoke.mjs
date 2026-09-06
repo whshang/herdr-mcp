@@ -103,8 +103,9 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
     && manifest.optional_host_permissions?.includes("http://*/*"),
   "broad network access is optional and the always-on host permission stays loopback-only");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
+    && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
-  "experimental content-script registration requires an explicitly granted site permission");
+  "experimental content-script registration, including Gemini, requires an explicitly granted site permission");
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";
@@ -791,22 +792,29 @@ ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
   "Options exposes one Project-automation checkbox and no independent permission toggle");
 ok(optionsHtml.includes('id="experimentalZAiEnabled"')
     && optionsHtml.includes('id="experimentalDeepSeekEnabled"')
-    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled"')
+    && optionsHtml.includes('id="experimentalGeminiEnabled"')
+    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled"')
     && optionsSource.includes('experimentalZAiEnabled: $("experimentalZAiEnabled").checked')
-    && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked'),
-  "Options exposes separate experimental z.ai and DeepSeek switches");
+    && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked')
+    && optionsSource.includes('experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked'),
+  "Options exposes separate experimental z.ai, DeepSeek, and Gemini switches");
 ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md")
     && optionsSource.includes("setConnectionFailure")
     && [enLocale, zhLocale, jaLocale].every((locale) => locale.open_github_setup_guide),
   "failed local connection tests link to a localized GitHub setup path");
 ok(backgroundSource.includes('experimentalZAiEnabled: false')
     && backgroundSource.includes('experimentalDeepSeekEnabled: false')
+    && backgroundSource.includes('experimentalGeminiEnabled: false')
+    && backgroundSource.includes('site: "gemini"')
+    && backgroundSource.includes('matches: ["https://gemini.google.com/*"]')
+    && backgroundSource.includes('"content/injector/gemini.js"')
     && backgroundSource.includes('error: "experimental-site-disabled"')
     && wakeSource.includes("experimentalZAiEnabled")
     && wakeSource.includes("experimentalDeepSeekEnabled")
+    && wakeSource.includes("experimentalGeminiEnabled")
     && jsonBridgeSource.includes("experimentalZAiEnabled")
     && jsonBridgeSource.includes("experimentalDeepSeekEnabled"),
-  "experimental site integrations fail closed in both background and content layers");
+  "experimental site integrations fail closed in background/content while Gemini stays outside JSON bridge");
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation is folded into effective Project automation");
@@ -988,7 +996,7 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
 
 // ---- 2. JavaScript syntax for the fixed file list ----
 const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js",
-  "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/claude.js",
+  "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/gemini.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {
   const p = path.join(EXT, f);

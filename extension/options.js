@@ -10,7 +10,7 @@ const KEYS = [
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
-  "experimentalZAiEnabled", "experimentalDeepSeekEnabled",
+  "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
 ];
 let loadedHostPermissionOrigins = [];
 
@@ -31,6 +31,7 @@ function configuredHostPermissionOrigins(config) {
   const origins = [];
   if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
   if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
+  if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
   const llmOrigin = hostPermissionPatternForUrl(config.llmJudgeBaseUrl);
   if (llmOrigin) origins.push(llmOrigin);
   return [...new Set(origins)];
@@ -107,6 +108,8 @@ function applyI18n() {
   $("hint_experimental_zai").textContent = t("hint_experimental_zai");
   $("lab_experimental_deepseek").textContent = t("label_experimental_deepseek");
   $("hint_experimental_deepseek").textContent = t("hint_experimental_deepseek");
+  $("lab_experimental_gemini").textContent = t("label_experimental_gemini");
+  $("hint_experimental_gemini").textContent = t("hint_experimental_gemini");
   $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
   $("llmJudgeModel").placeholder = t("placeholder_llm_model");
   $("save").textContent = t("save");
@@ -144,6 +147,7 @@ async function loadForm() {
     || (cfg.automationMode == null && cfg.enabled === true);
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
+  $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
   try { loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg); } catch (_) { loadedHostPermissionOrigins = []; }
 }
 
@@ -194,6 +198,7 @@ $("save").addEventListener("click", async () => {
     llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
+    experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
     uiLocale: getLocale(),
   };
   let nextPermissionOrigins;

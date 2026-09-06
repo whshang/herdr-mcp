@@ -85,6 +85,7 @@ test("Options requests optional host access only from explicit user settings", (
   assert.match(optionsJs, /chrome\.permissions\?\.request/);
   assert.match(optionsJs, /https:\/\/chat\.z\.ai\/\*/);
   assert.match(optionsJs, /https:\/\/chat\.deepseek\.com\/\*/);
+  assert.match(optionsJs, /https:\/\/gemini\.google\.com\/\*/);
   assert.match(optionsJs, /removeHostPermissions/);
   assert.equal(typeof zh.host_permission_denied, "string");
   assert.equal(typeof zh.host_permission_invalid_url, "string");
