@@ -373,6 +373,24 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
     grep_with_backend(snapshot, args, discover_rg())
 }
 
+pub(crate) fn grep_prefers_in_process(snapshot: &Value, args: &Value) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(root) = required_str(args, "root") else {
+            return false;
+        };
+        let Ok(managed) = fs_security::validate_existing(snapshot, root) else {
+            return false;
+        };
+        !should_try_rg(&managed.root)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (snapshot, args);
+        false
+    }
+}
+
 fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Value {
     let started = Instant::now();
     let started_at_ms = now_ms();
@@ -1350,11 +1368,9 @@ mod tests {
             "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
             "agents": []
         });
-        let result = grep_with_backend(
-            &snapshot,
-            &json!({"root": root, "pattern": "needle", "glob": "*.rs"}),
-            Some(fake_rg),
-        );
+        let args = json!({"root": root, "pattern": "needle", "glob": "*.rs"});
+        assert!(grep_prefers_in_process(&snapshot, &args));
+        let result = grep_with_backend(&snapshot, &args, Some(fake_rg));
         assert_eq!(result["ok"], true);
         assert_eq!(result["engine"], "rust");
         assert_eq!(result["count"], 1);
