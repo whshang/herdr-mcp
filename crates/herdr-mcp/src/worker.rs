@@ -293,8 +293,34 @@ pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_js
     }))
 }
 
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn extension_fleet_snapshot_with_proxy(
+    paths: &RuntimePaths,
+    _proxy_url: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    extension_fleet_snapshot(paths)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
+    let client = client()?;
+    extension_fleet_snapshot_with_client(paths, &client)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn extension_fleet_snapshot_with_proxy(
+    paths: &RuntimePaths,
+    proxy_url: Option<&str>,
+) -> Result<Value, String> {
+    let client = client_with_proxy(proxy_url)?;
+    extension_fleet_snapshot_with_client(paths, &client)
+}
+
+#[cfg(target_os = "macos")]
+fn extension_fleet_snapshot_with_client(
+    paths: &RuntimePaths,
+    client: &Client,
+) -> Result<Value, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let owner = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&owner.credential)?;
@@ -303,7 +329,7 @@ pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, St
         HeaderValue::from_str(&owner.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client
         .get(endpoint(&owner.edge_origin, "/devices")?)
         .headers(headers)
         .send()
@@ -1458,6 +1484,22 @@ fn client() -> Result<Client, String> {
     Client::builder()
         .timeout(HTTP_TIMEOUT)
         .redirect(Policy::none())
+        .build()
+        .map_err(|error| format!("cannot initialize Worker HTTP client: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn client_with_proxy(proxy_url: Option<&str>) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(Policy::none())
+        .no_proxy();
+    if let Some(proxy_url) = proxy_url {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .map_err(|error| format!("cannot configure Worker HTTP proxy: {error}"))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
         .build()
         .map_err(|error| format!("cannot initialize Worker HTTP client: {error}"))
 }

@@ -170,6 +170,63 @@ impl MutationGate {
     }
 }
 
+#[derive(Debug, Clone)]
+struct EdgeHttpClient {
+    client: reqwest::blocking::Client,
+    proxy_url: Option<String>,
+}
+
+impl EdgeHttpClient {
+    fn direct() -> Result<Self, String> {
+        Self::build(None)
+    }
+
+    fn via_proxy(proxy: &crate::link::proxy::ResolvedProxy) -> Result<Self, String> {
+        Self::build(Some(proxy.url.as_str()))
+    }
+
+    fn build(proxy_url: Option<&str>) -> Result<Self, String> {
+        let mut builder = reqwest::blocking::Client::builder().timeout(HTTP_TIMEOUT);
+        if proxy_url.is_none() {
+            builder = builder.no_proxy();
+        }
+        if let Some(proxy_url) = proxy_url {
+            let proxy = reqwest::Proxy::all(proxy_url)
+                .map_err(|error| format!("cannot configure bootstrap Edge proxy: {error}"))?;
+            builder = builder.proxy(proxy);
+        }
+        let client = builder
+            .build()
+            .map_err(|error| format!("cannot create bootstrap Edge client: {error}"))?;
+        Ok(Self {
+            client,
+            proxy_url: proxy_url.map(str::to_owned),
+        })
+    }
+
+    fn proxy_url(&self) -> Option<&str> {
+        self.proxy_url.as_deref()
+    }
+}
+
+#[derive(Debug)]
+enum EdgeHealthProbeError {
+    Transport(String),
+    Validation(String),
+}
+
+impl EdgeHealthProbeError {
+    fn may_retry_via_proxy(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Transport(message) | Self::Validation(message) => message,
+        }
+    }
+}
+
 struct Cloudflare<'a> {
     client: reqwest::blocking::Client,
     token: &'a SecretBytes,
@@ -558,7 +615,7 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
     write_journal(&journal_path, &journal)?;
 
     let script_exists = scripts.iter().any(|script| script.name == worker_name);
-    if !script_exists || journal.phase < Phase::WorkerDeployed {
+    let edge_http = if !script_exists || journal.phase < Phase::WorkerDeployed {
         journal.advance(Phase::WorkerDeploying);
         write_journal(&journal_path, &journal)?;
         let bundle = prepare_edge_bundle(&source_commit, &runtime_version)?;
@@ -567,13 +624,15 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
         cloudflare.upload_worker(&gate, &account.id, &worker_name, &bundle.bytes, &metadata)?;
         cloudflare.enable_worker_subdomain(&gate, &account.id, &worker_name)?;
         cloudflare.set_worker_schedule(&gate, &account.id, &worker_name)?;
-        verify_health(&edge_origin, &worker_name, Some(&runtime_version))?;
+        let edge_http = verify_health(&edge_origin, &worker_name, Some(&runtime_version))?;
         journal.advance(Phase::WorkerDeployed);
         write_journal(&journal_path, &journal)?;
+        edge_http
     } else {
-        verify_health(&edge_origin, &worker_name, None)?;
+        let edge_http = verify_health(&edge_origin, &worker_name, None)?;
         println!("Existing Herdr Worker verified; resuming configuration.");
-    }
+        edge_http
+    };
     println!("[4/7] Worker — release-matched Worker is healthy at {edge_origin}.");
 
     if journal.phase < Phase::DeviceEnrolled {
@@ -614,13 +673,14 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
         journal.advance(Phase::SecretsProvisioned);
         write_journal(&journal_path, &journal)?;
 
-        let current_devices = edge_devices_with_operator(&edge_origin, &operator)?;
+        let current_devices = edge_devices_with_operator(&edge_http, &edge_origin, &operator)?;
         if !current_devices.is_empty() {
             return Err("first-fleet enrollment refused because the Worker device registry is no longer empty; switch to the existing-Worker pairing flow".to_owned());
         }
         let name = crate::device_name::system_device_display_name();
-        let enrolled = create_and_consume_first_pairing(&edge_origin, &operator, name.as_deref())?;
-        verify_device_fleet_admin(&edge_origin, &enrolled)?;
+        let enrolled =
+            create_and_consume_first_pairing(&edge_http, &edge_origin, &operator, name.as_deref())?;
+        verify_device_fleet_admin(&edge_http, &edge_origin, &enrolled)?;
         let code =
             crate::worker::adopt_bootstrap_enrollment(paths, &edge_origin, enrolled.clone())?;
         if code != ExitCode::SUCCESS {
@@ -645,8 +705,12 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
     drop(refresh_token);
     drop(token);
 
-    verify_public_oauth(&edge_origin)?;
-    verify_current_device_inventory(paths, journal.canonical_device_id.as_deref())?;
+    verify_public_oauth(&edge_http, &edge_origin)?;
+    verify_current_device_inventory(
+        paths,
+        journal.canonical_device_id.as_deref(),
+        edge_http.proxy_url(),
+    )?;
     let link = crate::link::ownership::status_report()?;
     if link.get("operational_ready").and_then(Value::as_bool) != Some(true) {
         let safe = crate::status::sanitize_probe_token(&link.to_string());
@@ -1173,19 +1237,17 @@ fn worker_upload_metadata(
 }
 
 fn create_and_consume_first_pairing(
+    edge_http: &EdgeHttpClient,
     edge_origin: &str,
     operator: &SecretBytes,
     name: Option<&str>,
 ) -> Result<crate::worker::EnrolledCredential, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| format!("cannot create first-enrollment client: {error}"))?;
     let mut body = json!({ "ttl_seconds": 600, "require_empty_fleet": true });
     if let Some(name) = name {
         body["name"] = Value::String(name.to_owned());
     }
-    let response = client
+    let response = edge_http
+        .client
         .post(format!("{edge_origin}/devices/pairings"))
         .bearer_auth(operator.expose()?)
         .json(&body)
@@ -1210,7 +1272,8 @@ fn create_and_consume_first_pairing(
     if let Some(name) = name {
         consume["name"] = Value::String(name.to_owned());
     }
-    let response = client
+    let response = edge_http
+        .client
         .post(format!("{edge_origin}/devices/pairings/consume"))
         .json(&consume)
         .send()
@@ -1237,13 +1300,12 @@ fn create_and_consume_first_pairing(
 }
 
 fn edge_devices_with_operator(
+    edge_http: &EdgeHttpClient,
     edge_origin: &str,
     operator: &SecretBytes,
 ) -> Result<Vec<Value>, String> {
-    let response = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())?
+    let response = edge_http
+        .client
         .get(format!("{edge_origin}/devices"))
         .bearer_auth(operator.expose()?)
         .send()
@@ -1271,13 +1333,12 @@ fn edge_devices_with_operator(
 }
 
 fn verify_device_fleet_admin(
+    edge_http: &EdgeHttpClient,
     edge_origin: &str,
     enrolled: &crate::worker::EnrolledCredential,
 ) -> Result<(), String> {
-    let response = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())?
+    let response = edge_http
+        .client
         .get(format!("{edge_origin}/devices"))
         .bearer_auth(&enrolled.device_secret)
         .header("x-herdr-workstation", &enrolled.workstation_id)
@@ -1305,8 +1366,9 @@ fn verify_device_fleet_admin(
 fn verify_current_device_inventory(
     paths: &RuntimePaths,
     expected: Option<&str>,
+    proxy_url: Option<&str>,
 ) -> Result<(), String> {
-    let payload = crate::worker::extension_fleet_snapshot(paths)?;
+    let payload = crate::worker::extension_fleet_snapshot_with_proxy(paths, proxy_url)?;
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err("authenticated device inventory is unavailable after bootstrap".to_owned());
     }
@@ -1324,28 +1386,64 @@ fn verify_health(
     edge_origin: &str,
     worker_name: &str,
     expected_version: Option<&str>,
-) -> Result<(), String> {
-    let response = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())?
+) -> Result<EdgeHttpClient, String> {
+    let direct = EdgeHttpClient::direct()?;
+    match probe_health(&direct, edge_origin, worker_name, expected_version) {
+        Ok(()) => Ok(direct),
+        Err(error) if !error.may_retry_via_proxy() => Err(error.into_message()),
+        Err(error) => {
+            let direct_error = error.into_message();
+            let Some(proxy) = crate::link::proxy::resolve_link_proxy() else {
+                return Err(direct_error);
+            };
+            let proxied = EdgeHttpClient::via_proxy(&proxy)?;
+            probe_health(&proxied, edge_origin, worker_name, expected_version)
+                .map_err(EdgeHealthProbeError::into_message)?;
+            Ok(proxied)
+        }
+    }
+}
+
+fn probe_health(
+    edge_http: &EdgeHttpClient,
+    edge_origin: &str,
+    worker_name: &str,
+    expected_version: Option<&str>,
+) -> Result<(), EdgeHealthProbeError> {
+    let response = edge_http
+        .client
         .get(format!("{edge_origin}/health"))
         .send()
-        .map_err(|error| format!("Worker health probe failed: {error}"))?;
+        .map_err(|error| {
+            EdgeHealthProbeError::Transport(format!("Worker health probe failed: {error}"))
+        })?;
     if !response.status().is_success() {
-        return Err(format!(
+        return Err(EdgeHealthProbeError::Validation(format!(
             "Worker health probe returned HTTP {}",
             response.status().as_u16()
-        ));
+        )));
     }
-    let payload: Value = response
-        .json()
-        .map_err(|_| "Worker health returned non-JSON".to_owned())?;
+    let payload: Value = response.json().map_err(|_| {
+        EdgeHealthProbeError::Validation("Worker health returned non-JSON".to_owned())
+    })?;
+    validate_health_payload(&payload, worker_name, expected_version)
+        .map_err(EdgeHealthProbeError::Validation)
+}
+
+fn validate_health_payload(
+    payload: &Value,
+    worker_name: &str,
+    expected_version: Option<&str>,
+) -> Result<(), String> {
     if payload.get("ok").and_then(Value::as_bool) != Some(true)
         || payload.get("service").and_then(Value::as_str) != Some(worker_name)
-        || payload.get("contractEpoch").and_then(Value::as_u64) != Some(2)
     {
-        return Err("Worker health does not prove Herdr ownership/epoch-2 identity".to_owned());
+        return Err("Worker health does not prove Herdr ownership".to_owned());
+    }
+    let contract = crate::link::edge_contract::parse_edge_health_contract(&payload.to_string())
+        .map_err(|error| format!("Worker health runtime contract is invalid: {error}"))?;
+    if !crate::link::edge_contract::rust_link_accepts_edge_contract(&contract) {
+        return Err(crate::link::edge_contract::refuse_edge_for_rust_link(&contract).to_string());
     }
     if let Some(expected) = expected_version
         && payload.get("edgeVersion").and_then(Value::as_str) != Some(expected)
@@ -1357,16 +1455,13 @@ fn verify_health(
     Ok(())
 }
 
-fn verify_public_oauth(edge_origin: &str) -> Result<(), String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())?;
+fn verify_public_oauth(edge_http: &EdgeHttpClient, edge_origin: &str) -> Result<(), String> {
     for path in [
         "/.well-known/oauth-authorization-server",
         "/.well-known/oauth-protected-resource",
     ] {
-        let response = client
+        let response = edge_http
+            .client
             .get(format!("{edge_origin}{path}"))
             .send()
             .map_err(|error| format!("OAuth discovery probe failed for {path}: {error}"))?;
@@ -1377,7 +1472,8 @@ fn verify_public_oauth(edge_origin: &str) -> Result<(), String> {
             ));
         }
     }
-    let response = client
+    let response = edge_http
+        .client
         .get(format!("{edge_origin}/mcp"))
         .send()
         .map_err(|error| format!("unauthenticated MCP probe failed: {error}"))?;
@@ -1739,6 +1835,28 @@ mod tests {
         assert!(resumable_target_observation(true, false, true));
         assert!(!resumable_target_observation(true, false, false));
         assert!(!resumable_target_observation(false, false, true));
+    }
+
+    #[test]
+    fn health_contract_accepts_public_epoch_three_with_runtime_epoch_two() {
+        let payload = json!({
+            "ok": true,
+            "service": "herdr-edge-mac",
+            "edgeVersion": "0.4.6-dev",
+            "contractEpoch": 3,
+            "contractHash": "sha256:public-v3",
+            "runtimeContractEpoch": 2,
+            "runtimeContractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
+        });
+        assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_ok());
+    }
+
+    #[test]
+    fn only_transport_health_failure_may_fall_back_to_proxy() {
+        assert!(EdgeHealthProbeError::Transport("timeout".to_owned()).may_retry_via_proxy());
+        assert!(
+            !EdgeHealthProbeError::Validation("wrong contract".to_owned()).may_retry_via_proxy()
+        );
     }
 
     #[test]
