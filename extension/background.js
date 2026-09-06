@@ -1826,6 +1826,13 @@ async function sendChatGptTabMessage(tabId, message) {
   }
 }
 
+async function sendBrowserActuationTabMessage(tabId, message) {
+  // Browser dispatch is a single fenced Alpha 4/5 attempt. Missing receivers,
+  // reload recovery, and stale-view reconciliation belong to beta.1, so this
+  // path must never reuse the handoff helper's reload/retry behavior.
+  return chrome.tabs.sendMessage(tabId, message);
+}
+
 async function sendHandoffTabMessage(tabId, site, message) {
   if (site === "chatgpt") return sendChatGptTabMessage(tabId, message);
   let lastError = null;
@@ -2100,7 +2107,7 @@ async function handleBrowserActuation(command) {
     return;
   }
   try {
-    const response = await sendChatGptTabMessage(target.tabId, {
+    const response = await sendBrowserActuationTabMessage(target.tabId, {
       type: "h2w_browser_actuation",
       command: {
         operation,
