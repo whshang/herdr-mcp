@@ -777,7 +777,7 @@ pub fn image_tool_result_from_broker(value: &Value) -> Result<Value, String> {
 /// through an older stable broker implementation. The broker is otherwise
 /// spawned as a one-shot child of the current executable's stable broker path.
 pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<Value, String>> {
-    if op == "fs_grep" && fs_tools::grep_prefers_in_process(snapshot, args) {
+    if op == "fs_grep" && fs_tools::grep_prefers_in_process(args) {
         return None;
     }
     if std::env::var("HERDR_MCP_TCC_BROKER").ok().as_deref() != Some("1") {
