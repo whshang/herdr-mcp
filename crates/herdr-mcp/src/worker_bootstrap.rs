@@ -242,12 +242,12 @@ impl<'a> Cloudflare<'a> {
         Ok(Self { client, token })
     }
 
-    fn request(
+    fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<(reqwest::StatusCode, Value), String> {
         let url = format!("{CLOUDFLARE_API}/{path}");
         let mut request = self
             .client
@@ -263,6 +263,10 @@ impl<'a> Cloudflare<'a> {
         let payload: Value = response
             .json()
             .map_err(|_| format!("Cloudflare returned non-JSON HTTP {}", status.as_u16()))?;
+        Ok((status, payload))
+    }
+
+    fn result(&self, status: reqwest::StatusCode, payload: Value) -> Result<Value, String> {
         let success = payload
             .get("success")
             .and_then(Value::as_bool)
@@ -275,6 +279,16 @@ impl<'a> Cloudflare<'a> {
             ));
         }
         Ok(payload.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, String> {
+        let (status, payload) = self.send(method, path, body)?;
+        self.result(status, payload)
     }
 
     fn accounts(&self) -> Result<Vec<Account>, String> {
@@ -326,11 +340,15 @@ impl<'a> Cloudflare<'a> {
     }
 
     fn workers_subdomain(&self, account_id: &str) -> Result<Option<String>, String> {
-        let result = self.request(
+        let (status, payload) = self.send(
             reqwest::Method::GET,
             &format!("accounts/{account_id}/workers/subdomain"),
             None,
         )?;
+        if workers_subdomain_is_absent(status, &payload) {
+            return Ok(None);
+        }
+        let result = self.result(status, payload)?;
         Ok(result
             .get("subdomain")
             .and_then(Value::as_str)
@@ -1674,6 +1692,22 @@ fn cloudflare_error_summary(payload: &Value) -> String {
     }
 }
 
+fn workers_subdomain_is_absent(status: reqwest::StatusCode, payload: &Value) -> bool {
+    let success = payload
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(status.is_success());
+    if status.is_success() && success {
+        return false;
+    }
+    payload
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|error| error.get("code").and_then(Value::as_i64) == Some(10007))
+}
+
 fn sanitize_error(value: &str, token: &SecretBytes) -> String {
     let without_exact = token
         .expose()
@@ -1877,6 +1911,32 @@ mod tests {
             Err("Cloudflare API HTTP 403: missing Workers Scripts -> Edit permission".to_owned());
         assert!(preflight.is_err());
         assert!(gate.require("deploy Worker").is_err());
+    }
+
+    #[test]
+    fn fresh_account_missing_workers_subdomain_is_createable_state() {
+        let missing = json!({
+            "success": false,
+            "errors": [{
+                "code": 10007,
+                "message": "You do not have a workers.dev subdomain."
+            }],
+            "result": null
+        });
+        assert!(workers_subdomain_is_absent(
+            reqwest::StatusCode::NOT_FOUND,
+            &missing
+        ));
+
+        let forbidden = json!({
+            "success": false,
+            "errors": [{"code": 10000, "message": "Authentication error"}],
+            "result": null
+        });
+        assert!(!workers_subdomain_is_absent(
+            reqwest::StatusCode::FORBIDDEN,
+            &forbidden
+        ));
     }
 
     #[test]
