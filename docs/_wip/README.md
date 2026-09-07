@@ -18,4 +18,5 @@ Current active WIP includes the v0.4.5 follow-up maintenance plan (planner effic
 - alpha.1 spec: [`v1.0-phase1-fleet-control-kernel.md`](v1.0-phase1-fleet-control-kernel.md)
 - alpha.2 spec: [`v1.0-alpha2-work-memory.md`](v1.0-alpha2-work-memory.md)
 - alpha.3 spec: [`v1.0-alpha3-browser-registry.md`](v1.0-alpha3-browser-registry.md) — merged in PR #315.
+- Cross-cutting compile/memory efficiency plan: [`v1.0-performance-resource-plan.md`](v1.0-performance-resource-plan.md) — measurement-driven constraints applied inside the existing milestones; no new stage or scheduler.
 - Stage progress ledger: [`v1.0-status.md`](v1.0-status.md) (engineering-stage progress only; release status remains owned by `docs/release-model.md`).

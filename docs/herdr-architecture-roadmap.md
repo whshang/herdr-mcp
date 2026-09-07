@@ -52,6 +52,8 @@ beta.2   multi-device / multi-endpoint / multi-account reservation + failover
 rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 ```
 
+编译加速与内存/资源治理不是额外里程碑，也不引入第二调度器或状态权威。它们作为 1.0 横向工程约束随上述阶段验证：保持 Runtime / production Link / Supervisor 的可靠性边界；以 Work Memory 的 checkpoint + bounded raw tail、轻量 browser/provider resource state、aggregate byte admission、beta.2 Fleet Control resource evidence 为核心；crate/linker/allocator/Cargo profile 等优化只按 Herdr 自身 touched-file、CI、RSS/PSS 与 burst-to-idle 基准决定。活动方案见 [`_wip/v1.0-performance-resource-plan.md`](./_wip/v1.0-performance-resource-plan.md)。
+
 **序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）§16.2 的表格写于 alpha.5 追加之前，只覆盖 alpha.1–4 → beta.1 → beta.2 → rc.1、不含 alpha.5。自 alpha.5 追加起，该表格不再是里程碑序列的权威，上表（本文件）才是唯一正式序列。alpha.5 存在的原因正是冻结 plan §17 WebChat gate 的 "at least two providers prove the semantic adapter seam"：单一 ChatGPT vertical（alpha.4）无法证明 adapter seam 是 provider-neutral 的，因此必须在 beta.1 reliability/postcondition 之前增加第二个 Provider（Gemini）纵向阶段。
 
 1.0 以 v0.4.6 的 pre-1.0 stabilization 合同为基础，不复制其 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、planner tool-integrity、multi-device/Relay、Native Messaging local-auth、browser continuity/target-fencing 等实现。若 v0.4.6 的发布分支尚未回并 `main`，只在集成阶段吸收其已验证提交；1.0 feature branches 不另写同类机制。
