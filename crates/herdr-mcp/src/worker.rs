@@ -199,8 +199,13 @@ fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn render_connector_inventory(mut payload: Value, now_ms: u64) -> Value {
+fn render_connector_inventory(mut payload: Value, now_ms: u64, include_all: bool) -> Value {
     if let Some(connectors) = payload.get_mut("connectors").and_then(Value::as_array_mut) {
+        if !include_all {
+            connectors.retain(|connector| {
+                connector.get("status").and_then(Value::as_str) != Some("revoked")
+            });
+        }
         for connector in connectors {
             let created = connector.get("created_at_ms").and_then(Value::as_u64);
             let last_used = connector.get("last_used_at_ms").and_then(Value::as_u64);
@@ -211,13 +216,63 @@ fn render_connector_inventory(mut payload: Value, now_ms: u64) -> Value {
         .get_mut("legacy_clients")
         .and_then(Value::as_array_mut)
     {
+        if !include_all {
+            legacy.retain(|client| {
+                client.get("registration_state").and_then(Value::as_str) != Some("revoked")
+            });
+        }
         for client in legacy {
             let created = client.get("created_at_ms").and_then(Value::as_u64);
             let last_used = client.get("last_used_at_ms").and_then(Value::as_u64);
             annotate_inventory_entry(client, created, last_used, now_ms, true);
         }
     }
+
+    let listed_counts = displayed_connector_token_counts(&payload);
+    if let Some(object) = payload.as_object_mut() {
+        // Preserve the Edge aggregate for backward compatibility, but make its
+        // scope explicit because the default CLI view intentionally hides
+        // revoked/history rows. The displayed-record aggregate is always
+        // directly reconcilable with the rows the operator can see.
+        object.insert(
+            "inventory_filter".to_owned(),
+            json!(if include_all { "all" } else { "actionable" }),
+        );
+        if object.contains_key("token_counts") {
+            object.insert("token_counts_scope".to_owned(), json!("all_stored"));
+        }
+        object.insert("listed_token_counts".to_owned(), listed_counts);
+        object.insert(
+            "listed_token_counts_scope".to_owned(),
+            json!("displayed_records"),
+        );
+    }
     payload
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn displayed_connector_token_counts(payload: &Value) -> Value {
+    let mut active_access = 0_u64;
+    let mut active_refresh = 0_u64;
+    for key in ["connectors", "legacy_clients"] {
+        if let Some(entries) = payload.get(key).and_then(Value::as_array) {
+            for entry in entries {
+                active_access = active_access.saturating_add(
+                    entry
+                        .get("active_access_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+                active_refresh = active_refresh.saturating_add(
+                    entry
+                        .get("active_refresh_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+            }
+        }
+    }
+    json!({"active_access": active_access, "active_refresh": active_refresh})
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -254,7 +309,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
         WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
         WorkerCommand::ConnectorCancel { request_id } => cancel_connector(&paths, &request_id),
-        WorkerCommand::ConnectorList => list_connectors(&paths),
+        WorkerCommand::ConnectorList { include_all } => list_connectors(&paths, include_all),
         WorkerCommand::ConnectorRevoke { connector_id } => revoke_connector(&paths, &connector_id),
         WorkerCommand::ConnectorClientRevoke { client_id } => {
             revoke_connector_client(&paths, &client_id)
@@ -760,7 +815,7 @@ fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<Exit
 }
 
 #[cfg(not(target_os = "macos"))]
-fn list_connectors(_paths: &RuntimePaths) -> Result<ExitCode, String> {
+fn list_connectors(_paths: &RuntimePaths, _include_all: bool) -> Result<ExitCode, String> {
     Err(
         "connector inventory currently requires the macOS enrolled-device credential backend"
             .to_owned(),
@@ -768,7 +823,7 @@ fn list_connectors(_paths: &RuntimePaths) -> Result<ExitCode, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn list_connectors(paths: &RuntimePaths) -> Result<ExitCode, String> {
+fn list_connectors(paths: &RuntimePaths, include_all: bool) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
@@ -785,6 +840,7 @@ fn list_connectors(paths: &RuntimePaths) -> Result<ExitCode, String> {
     let payload = render_connector_inventory(
         parse_json_response(response, "connector inventory")?,
         inventory_now_ms(),
+        include_all,
     );
     println!(
         "{}",
@@ -1864,17 +1920,20 @@ mod tests {
                     "scope": "mcp",
                     "created_at_ms": two_days_ago,
                     "last_used_at_ms": null,
-                    "grant_origin": "explicit_approval"
+                    "grant_origin": "explicit_approval",
+                    "status": "active"
                 }],
                 "legacy_clients": [{
                     "client_id": "legacy-1",
                     "client_name": "Old client",
                     "created_at_ms": two_days_ago,
                     "last_used_at_ms": null,
-                    "grant_origin": "pre_v0_4_6_legacy"
+                    "grant_origin": "pre_v0_4_6_legacy",
+                    "registration_state": "active_credentials"
                 }]
             }),
             now,
+            false,
         );
         assert_eq!(connectors["connectors"][0]["age"], "2d");
         assert_eq!(connectors["connectors"][0]["last_used"], "never used");
@@ -1887,6 +1946,35 @@ mod tests {
             connectors["legacy_clients"][0]["usage_state"],
             "unknown_legacy"
         );
+
+        let inventory = json!({
+            "token_counts": {"active_access": 6, "active_refresh": 10},
+            "connectors": [
+                {"connector_id": "conn_active123", "status": "active", "active_access_tokens": 1, "active_refresh_tokens": 2},
+                {"connector_id": "conn_revoked123", "status": "revoked", "active_access_tokens": 2, "active_refresh_tokens": 3}
+            ],
+            "legacy_clients": [
+                {"client_id": "legacy-active", "registration_state": "active_credentials", "active_access_tokens": 1, "active_refresh_tokens": 1},
+                {"client_id": "legacy-revoked", "registration_state": "revoked", "active_access_tokens": 2, "active_refresh_tokens": 4}
+            ]
+        });
+        let filtered = render_connector_inventory(inventory.clone(), now, false);
+        assert_eq!(filtered["connectors"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["legacy_clients"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["inventory_filter"], "actionable");
+        assert_eq!(filtered["token_counts_scope"], "all_stored");
+        assert_eq!(filtered["token_counts"]["active_access"], 6);
+        assert_eq!(filtered["token_counts"]["active_refresh"], 10);
+        assert_eq!(filtered["listed_token_counts"]["active_access"], 2);
+        assert_eq!(filtered["listed_token_counts"]["active_refresh"], 3);
+        assert_eq!(filtered["listed_token_counts_scope"], "displayed_records");
+
+        let all = render_connector_inventory(inventory, now, true);
+        assert_eq!(all["connectors"].as_array().unwrap().len(), 2);
+        assert_eq!(all["legacy_clients"].as_array().unwrap().len(), 2);
+        assert_eq!(all["inventory_filter"], "all");
+        assert_eq!(all["listed_token_counts"]["active_access"], 6);
+        assert_eq!(all["listed_token_counts"]["active_refresh"], 10);
 
         let automations = render_automation_inventory(
             json!({

@@ -116,7 +116,9 @@ pub enum WorkerCommand {
     ConnectorCancel {
         request_id: String,
     },
-    ConnectorList,
+    ConnectorList {
+        include_all: bool,
+    },
     ConnectorRevoke {
         connector_id: String,
     },
@@ -656,7 +658,18 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
         Some("--help" | "-h") => Ok(Command::Help {
             section: HelpSection::Connector,
         }),
-        Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::ConnectorList)),
+        Some("list") => match &args[1..] {
+            [] => Ok(Command::Worker(WorkerCommand::ConnectorList {
+                include_all: false,
+            })),
+            [flag] if flag == "--all" => Ok(Command::Worker(WorkerCommand::ConnectorList {
+                include_all: true,
+            })),
+            [flag] if flag == "--help" || flag == "-h" => Ok(Command::Help {
+                section: HelpSection::Connector,
+            }),
+            _ => Err("connector list accepts only --all or --help".to_owned()),
+        },
         Some("approve") => {
             let [request_id] = &args[1..] else {
                 return Err("connector approve requires exactly one approval request id; the 6-digit code is entered interactively".to_owned());
@@ -1319,7 +1332,7 @@ pub fn help() -> &'static str {
 User path:\n\
   herdr-mcp install\n\
   herdr-mcp status\n\
-  herdr-mcp doctor\n\
+  herdr-mcp doctor  (exit 0 = no known failure in probed layers; E2E readiness is DOCTOR_JSON.overall)\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
@@ -1406,7 +1419,7 @@ commands require an enrolled-device credential.\n\n\
 pub fn connector_help() -> &'static str {
     "Herdr MCP connector management (OAuth connectors registered against the fleet)\n\n\
 All of these require the credential of a device already enrolled in the fleet;\nthere is no WebChat delegated admin path. Secrets are never echoed or written\nto argv.\n\n\
-  herdr-mcp connector list\n      Lists current connector instances plus non-secret legacy client/grant\n      inventory and token counts as returned by the Edge.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes a connector by its connector_id (begins with conn_).\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Revokes every Connector/grant for a legacy OAuth client and invalidates\n      its issued access/refresh credentials.\n"
+  herdr-mcp connector list [--all]\n      Lists current/actionable Connector state by default. --all also includes\n      revoked Connector instances and legacy client/grant tombstones retained\n      for audit and credential fencing.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes only that Connector instance and its attributed credentials.\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Client-level kill switch: revokes every Connector/grant for that OAuth client\n      and invalidates its issued access/refresh credentials.\n"
 }
 
 pub fn automation_help() -> &'static str {
@@ -2050,7 +2063,13 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["connector", "list"])).unwrap().command,
-            Command::Worker(WorkerCommand::ConnectorList)
+            Command::Worker(WorkerCommand::ConnectorList { include_all: false })
+        );
+        assert_eq!(
+            parse(args(&["connector", "list", "--all"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorList { include_all: true })
         );
         assert_eq!(
             parse(args(&["connector", "cancel", "req_abc"]))
@@ -2101,6 +2120,7 @@ mod tests {
         assert!(parse(args(&["connector", "revoke", "conn_abc", "--nope"])).is_err());
         assert!(parse(args(&["connector", "revoke", "conn_abc"])).is_err());
         assert!(parse(args(&["connector", "revoke-client", "legacy"])).is_err());
+        assert!(parse(args(&["connector", "list", "--unknown"])).is_err());
     }
 
     #[test]
@@ -2113,6 +2133,14 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["connector", "-h"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Connector,
+            }
+        );
+        assert_eq!(
+            parse(args(&["connector", "list", "--help"]))
+                .unwrap()
+                .command,
             Command::Help {
                 section: HelpSection::Connector,
             }
@@ -2298,6 +2326,7 @@ mod tests {
                 "help missing user-path command: {needle}"
             );
         }
+        assert!(text.contains("E2E readiness is DOCTOR_JSON.overall"));
         assert!(text.contains("User path:"));
         assert!(text.contains("Advanced / internal:"));
         assert!(text.contains("herdr-mcp link status"));
