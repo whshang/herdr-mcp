@@ -114,6 +114,34 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
     }
 }
 
+/// Return the active local runtime bearer only for an in-process doctor probe.
+/// The caller must never print, serialize, or otherwise expose this value.
+pub(crate) fn doctor_runtime_token() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    let managed_token = macos::doctor_runtime_token();
+
+    #[cfg(target_os = "macos")]
+    if let Ok(Some(token)) = &managed_token {
+        return Ok(Some(token.clone()));
+    }
+
+    if let Ok(token) = std::env::var("HERDR_MCP_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return Ok(Some(token));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        managed_token
+    }
+}
+
 /// How to compensate a committed service install when a post-commit step fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
@@ -2589,6 +2617,17 @@ mod macos {
     pub(super) fn doctor_status() -> Result<Value, String> {
         let paths = ServicePaths::discover()?;
         status(&paths)
+    }
+
+    pub(super) fn doctor_runtime_token() -> Result<Option<String>, String> {
+        let paths = ServicePaths::discover()?;
+        let bytes = read_optional_bounded(&paths.plist, 256 * 1024)?;
+        let descriptor = describe_service(bytes.as_deref(), &paths)?;
+        Ok(descriptor
+            .env
+            .get("HERDR_MCP_TOKEN")
+            .cloned()
+            .filter(|value| !value.trim().is_empty()))
     }
 
     fn status(paths: &ServicePaths) -> Result<Value, String> {

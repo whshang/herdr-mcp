@@ -78,9 +78,32 @@ mod worker;
 mod worker_bootstrap;
 mod workstation;
 
-use std::process::ExitCode;
+use std::{any::Any, panic, process::ExitCode};
 
 fn main() -> ExitCode {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if !panic_payload_is_broken_pipe(info.payload()) {
+            default_hook(info);
+        }
+    }));
+    match panic::catch_unwind(main_inner) {
+        Ok(code) => code,
+        Err(payload) if panic_payload_is_broken_pipe(payload.as_ref()) => ExitCode::SUCCESS,
+        Err(payload) => panic::resume_unwind(payload),
+    }
+}
+
+fn panic_payload_is_broken_pipe(payload: &(dyn Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied());
+    message
+        .is_some_and(|message| message.contains("Broken pipe") || message.contains("os error 32"))
+}
+
+fn main_inner() -> ExitCode {
     // Pin runtime start evidence at process entry so later cursor-reset
     // attribution is measured against the actual process lifetime, not the
     // first diagnostics call that happens to request build metadata.
@@ -260,5 +283,18 @@ fn run() -> Result<ExitCode, String> {
                 link::run_link_migrate_runtime_control(mode)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod broken_pipe_tests {
+    use super::panic_payload_is_broken_pipe;
+
+    #[test]
+    fn broken_pipe_detection_is_narrow() {
+        let broken = "failed printing to stdout: Broken pipe (os error 32)".to_owned();
+        let ordinary = "ordinary panic".to_owned();
+        assert!(panic_payload_is_broken_pipe(&broken));
+        assert!(!panic_payload_is_broken_pipe(&ordinary));
     }
 }
