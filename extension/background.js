@@ -655,12 +655,12 @@ async function conversationInfoForTab(tabId) {
 }
 
 // ---- Content-script version synchronization ----
-async function sweepStaleTabs() {
+async function sweepStaleTabs(force = false) {
   try {
     const tabs = await chrome.tabs.query({ url: activeH2WTabUrls() });
     for (const t of tabs) {
       if (t.status !== "complete" || reloadedTabs.has(t.id)) continue;
-      if (tabVersions.get(t.id) === H2W_SCRIPT_VERSION) continue;
+      if (!force && tabVersions.get(t.id) === H2W_SCRIPT_VERSION) continue;
       reloadedTabs.add(t.id);
       callLog(`tab ${t.id} ${t.url} content script ${tabVersions.get(t.id) || "old/unreported"}; reloading`);
       chrome.tabs.reload(t.id);
@@ -5600,8 +5600,16 @@ async function ensureAlive(preloaded) {
 // ---- Install, browser startup, and every service-worker startup ----
 // MV3 can restart the worker without onInstalled/onStartup, so rebuild at module scope.
 chrome.runtime.onStartup.addListener(() => { void rebuildStreams(); });
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   void rebuildStreams();
+  // Chrome treats a Developer Mode Reload of an unpacked extension as an
+  // update. Existing documents can still hold the prior extension context even
+  // when the dynamic content-script registration itself survives the reload.
+  // Force the existing bounded stale-tab sweep once for install/update only;
+  // ordinary MV3 service-worker wakes must never reload user tabs.
+  if (details?.reason === "install" || details?.reason === "update") {
+    void configReady.then(() => sweepStaleTabs(true));
+  }
   chrome.storage.local.get(["herdrMcpUrl"], (cfg) => {
     if (!cfg.herdrMcpUrl) chrome.storage.local.set({
       herdrMcpUrl: "http://127.0.0.1:8772",

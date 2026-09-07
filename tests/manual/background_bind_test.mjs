@@ -796,6 +796,18 @@ console.log("\n[Gemini optional-origin registration]");
     "first Gemini dynamic-script registration reloads an already-open complete Gemini tab once",
     JSON.stringify(reloadCalls.slice(reloadsBeforeEnable)));
 
+  const extensionReloadTabId = 903;
+  tabs.set(extensionReloadTabId, { id: extensionReloadTabId, url: GEMINI_SPARK_URL, status: "complete", listener: null });
+  const reloadsBeforeExtensionUpdate = reloadCalls.length;
+  for (const installed of listeners.onInstalled) installed({ reason: "update", previousVersion: "0.1.90" });
+  const extensionUpdateRecovered = await waitForTest(
+    () => reloadCalls.slice(reloadsBeforeExtensionUpdate).some((call) => call.tabId === extensionReloadTabId),
+    500,
+  );
+  ok(extensionUpdateRecovered,
+    "same-version unpacked extension reload recovers already-open Gemini tabs once",
+    JSON.stringify(reloadCalls.slice(reloadsBeforeExtensionUpdate)));
+
   const fallbackTabId = 902;
   tabs.set(fallbackTabId, { id: fallbackTabId, url: GEMINI_SPARK_URL, status: "complete", listener: null });
   const reloadsBeforeFallback = reloadCalls.length;
