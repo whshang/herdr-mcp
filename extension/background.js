@@ -604,6 +604,8 @@ function clearActionBadge() {
 function browserConversationInfoFromSupportedUrl(rawUrl) {
   const core = conversationInfoFromSupportedUrl(rawUrl);
   if (core) return core;
+  const claude = claudeConversationInfo(rawUrl);
+  if (claude) return claude;
   if (experimentalSiteEnabled("gemini")) return geminiConversationInfo(rawUrl);
   return null;
 }
@@ -627,7 +629,7 @@ async function conversationInfoForTab(tabId) {
   // an already-open supported tab without a live listener. Never re-inject the manifest-managed classic-script bundle
   // or a dynamically registered classic-script bundle into the same document:
   // top-level declarations can collide. One bounded page reload gives Chrome a fresh document and one load.
-  if (fallback.site === "chatgpt" || fallback.site === "gemini") {
+  if (["chatgpt", "gemini", "claude"].includes(fallback.site)) {
     try {
       const last = tabRecoveryAttemptAt.get(tabId) || 0;
       if (Date.now() - last >= TAB_RECOVERY_COOLDOWN_MS) {
@@ -1387,9 +1389,28 @@ function geminiConversationInfo(rawUrl) {
   }
 }
 
+function claudeConversationInfo(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.origin !== "https://claude.ai") return null;
+    const match = url.pathname.match(/^\/chat\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+    if (!match) return null;
+    const conversationId = match[1].toLowerCase();
+    return {
+      site: "claude",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey: `${url.origin}/chat/${conversationId}`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 function browserConversationInfo(provider, rawUrl) {
   if (provider === "chatgpt") return chatGptConversationInfo(rawUrl);
   if (provider === "gemini") return geminiConversationInfo(rawUrl);
+  if (provider === "claude") return claudeConversationInfo(rawUrl);
   return null;
 }
 
@@ -1424,7 +1445,7 @@ async function postBrowserRegistry(payload) {
 
 async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, accountNativeIdentity }) {
   if (!tabId || !pageInfo?.conversation_id || !accountNativeIdentity) return null;
-  if (!["chatgpt", "gemini"].includes(provider)) return null;
+  if (!["chatgpt", "gemini", "claude"].includes(provider)) return null;
   const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
   if (!endpoint?.endpoint_ref) return null;
   const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -4569,7 +4590,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_register") {
     void (async () => {
       await configReady;
-      const registeringSite = String(msg.site || "").trim();
+      const rawRegisteringSite = String(msg.site || "").trim();
+      const registeringSite = rawRegisteringSite === "claude.ai" ? "claude" : rawRegisteringSite;
       if (["z.ai", "deepseek", "gemini"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
         sendResponse({ ok: false, error: "experimental-site-disabled" });
         return;
@@ -4578,7 +4600,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const pageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
       const browserPageInfo = pageInfo?.site === "chatgpt"
         ? pageInfo
-        : (registeringSite === "gemini" ? geminiConversationInfo(msg.url || msg.convKey) : null);
+        : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       let browserObservation = null;
       if (browserPageInfo?.conversation_id && sender.tab?.id) {
         try {
@@ -4603,7 +4625,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sender.tab.id,
           );
           if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
-        } else if (registeringSite !== "gemini") {
+        } else if (!["gemini", "claude"].includes(registeringSite)) {
           const migration = await migrateZaiRootConversationState(
             bindings,
             String(msg.convKey || ""),

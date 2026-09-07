@@ -1348,7 +1348,7 @@ const H2W_CONTENT_VERSION = "0.1.90";
   async function performBrowserActuationCommand(command) {
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
-    if (!["chatgpt", "gemini"].includes(ADAPTER.name)
+    if (!["chatgpt", "gemini", "claude"].includes(ADAPTER.name)
         || !Number.isSafeInteger(expectedGeneration)
         || expectedGeneration < 1) {
       return { ...evidence, resource_available: false };
@@ -1769,7 +1769,8 @@ const H2W_CONTENT_VERSION = "0.1.90";
         return null;
       }
     }
-    if (ADAPTER.name === "gemini" && typeof ADAPTER.getAccountNativeIdentity === "function") {
+    if (["gemini", "claude"].includes(ADAPTER.name)
+        && typeof ADAPTER.getAccountNativeIdentity === "function") {
       try {
         const value = await ADAPTER.getAccountNativeIdentity();
         return typeof value === "string" && value.trim() ? value.trim() : null;

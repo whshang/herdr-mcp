@@ -30,6 +30,9 @@ const ZAI_SOURCE = "https://chat.z.ai/c/handoff-source";
 const ZAI_TARGET = "https://chat.z.ai/c/handoff-target";
 const GEMINI_SPARK_URL = "https://gemini.google.com/u/1/spark/chat/gemini-recovery-session?pageId=none";
 const GEMINI_SPARK_KEY = "https://gemini.google.com/u/1/spark/chat/gemini-recovery-session";
+const CLAUDE_CHAT_ID = "123e4567-e89b-12d3-a456-426614174000";
+const CLAUDE_CHAT_URL = `https://claude.ai/chat/${CLAUDE_CHAT_ID}?from=history`;
+const CLAUDE_CHAT_KEY = `https://claude.ai/chat/${CLAUDE_CHAT_ID}`;
 
 let failures = 0;
 function ok(cond, label, detail = "") {
@@ -145,6 +148,18 @@ function targetListener(tab) {
           convKey: GEMINI_SPARK_KEY,
           url: tab.url,
           site: "gemini",
+        });
+        return;
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+    if (String(tab.url || "").startsWith("https://claude.ai/")) {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({
+          convKey: CLAUDE_CHAT_KEY,
+          url: tab.url,
+          site: "claude",
         });
         return;
       }
@@ -335,7 +350,9 @@ globalThis.chrome = {
             ? {
               ok: true,
               resource: {
-                resource_ref: body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session",
+                resource_ref: body.provider === "claude"
+                  ? (body.kind === "account" ? "bra_claude_account" : "brs_claude_session")
+                  : (body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session"),
                 kind: body.kind,
               },
             }
@@ -533,6 +550,8 @@ globalThis.chrome = {
       const tab = tabs.get(tabId);
       if (tab?.url?.startsWith("https://gemini.google.com/")
         && registeredContentScripts.has("herdr-experimental-gemini")) {
+        tab.listener = targetListener(tab);
+      } else if (tab?.url?.startsWith("https://claude.ai/")) {
         tab.listener = targetListener(tab);
       }
     },
@@ -819,6 +838,19 @@ console.log("\n[Gemini optional-origin registration]");
     JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
 }
 
+console.log("\n[Claude listener-less recovery]");
+{
+  const fallbackTabId = 904;
+  tabs.set(fallbackTabId, { id: fallbackTabId, url: CLAUDE_CHAT_URL, status: "complete", listener: null });
+  const reloadsBeforeFallback = reloadCalls.length;
+  const fallbackState = await dispatchMessage({ type: "h2w_state", tabId: fallbackTabId });
+  ok(fallbackState?.convInfo?.site === "claude"
+      && fallbackState?.convInfo?.convKey === CLAUDE_CHAT_KEY
+      && reloadCalls.slice(reloadsBeforeFallback).some((call) => call.tabId === fallbackTabId),
+    "Control Center recovers a listener-less Claude chat from its bounded URL identity",
+    JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
+}
+
 console.log("\n[Gemini browser registry observation]");
 {
   const before = browserRegistryRequests.length;
@@ -865,6 +897,52 @@ console.log("\n[Gemini browser registry observation]");
       && browserRegistryRequests.length === beforeUnsupported,
     "Gemini unsupported URL shapes fail closed without creating browser resources",
     JSON.stringify(unsupported));
+}
+
+console.log("\n[Claude browser registry observation]");
+{
+  const before = browserRegistryRequests.length;
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "claude",
+    convKey: CLAUDE_CHAT_KEY,
+    url: CLAUDE_CHAT_URL,
+    accountNativeIdentity: `claude-account-sha256:${"c".repeat(64)}`,
+  }, { tab: { id: 93, url: CLAUDE_CHAT_URL } });
+  const observed = browserRegistryRequests.slice(before);
+  ok(registered?.bound === false
+      && registered?.browser_session_ref === "brs_claude_session"
+      && Number.isSafeInteger(registered?.browser_generation),
+    "Claude registration returns the opaque browser session and capability generation",
+    JSON.stringify(registered));
+  ok(observed.length === 3
+      && observed[0]?.operation === "provider.observe"
+      && observed[0]?.provider === "claude"
+      && observed[1]?.operation === "resource.observe"
+      && observed[1]?.kind === "account"
+      && observed[1]?.parent_ref === null
+      && observed[2]?.operation === "resource.observe"
+      && observed[2]?.kind === "session"
+      && observed[2]?.parent_ref === "bra_claude_account"
+      && observed[2]?.native_identity === CLAUDE_CHAT_ID
+      && !observed.some((request) => request?.kind === "space"),
+    "Claude observes account -> session without fabricating a project space",
+    JSON.stringify(observed));
+
+  const beforeLegacyToken = browserRegistryRequests.length;
+  const legacyTokenRegistration = await dispatchMessage({
+    type: "h2w_register",
+    site: "claude.ai",
+    convKey: CLAUDE_CHAT_KEY,
+    url: CLAUDE_CHAT_URL,
+    accountNativeIdentity: `claude-account-sha256:${"d".repeat(64)}`,
+  }, { tab: { id: 94, url: CLAUDE_CHAT_URL } });
+  const legacyTokenObserved = browserRegistryRequests.slice(beforeLegacyToken);
+  ok(legacyTokenRegistration?.browser_session_ref === "brs_claude_session"
+      && legacyTokenObserved.length === 3
+      && legacyTokenObserved[0]?.provider === "claude",
+    "legacy claude.ai page token normalizes to Claude Browser Registry without entering another provider migration",
+    JSON.stringify({ registration: legacyTokenRegistration, observed: legacyTokenObserved }));
 }
 
 console.log("\n[trusted browser control action]");

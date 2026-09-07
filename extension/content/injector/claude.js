@@ -1,55 +1,78 @@
-// injector/claude.js — claude.ai wake-up adapter
-// Selectors are defensive because signed-in behavior has not been verified locally.
-// Claude uses a contenteditable rich-text editor, requiring MAIN-world insertion.
+// injector/claude.js — claude.ai Browser Registry adapter
+// Keep provider-specific URL/DOM/account details here. Browser Registry, consent,
+// dispatch fencing, and idempotency remain provider-neutral in background/runtime.
 class ClaudeAdapter extends BaseAdapter {
-  get name() { return "claude.ai"; }
+  get name() { return "claude"; }
   get needsMainWorldInsert() { return true; }
 
-  // Defensive composer chain: ProseMirror, Quill, or generic contenteditable textbox.
+  getSessionIdentity() {
+    try {
+      const url = new URL(location.href);
+      if (url.origin !== "https://claude.ai") return null;
+      const match = url.pathname.match(/^\/chat\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+      return match ? match[1].toLowerCase() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  getConversationKey() {
+    const sessionId = this.getSessionIdentity();
+    return sessionId ? `https://claude.ai/chat/${sessionId}` : null;
+  }
+
+  getNativeSessionIdentity() {
+    return this.getSessionIdentity();
+  }
+
+  getCanonicalConversationUrl() {
+    return this.getConversationKey();
+  }
+
   getInputEl() {
     const chains = [
+      '[data-testid="chat-input"][contenteditable="true"]',
       'div[contenteditable="true"][role="textbox"]',
       '.ProseMirror[contenteditable="true"]',
       '.ql-editor[contenteditable="true"]',
     ];
-    for (const sel of chains) {
-      const el = document.querySelector(sel);
-      if (el && el.offsetParent !== null) return el;
+    for (const selector of chains) {
+      const element = document.querySelector(selector);
+      if (element && this.elementVisible(element)) return element;
     }
-    // Fallback to the first visible contenteditable element.
-    const all = [...document.querySelectorAll('[contenteditable="true"]')];
-    return all.find((el) => el.offsetParent !== null) || all[0] || null;
+    return null;
   }
 
   getWatchMainWorldSelector() {
-    const el = this.getInputEl();
-    if (!el) return null;
-    // Prefer an exact id; otherwise return the matched chain selector.
-    if (el.id) return `#${CSS.escape(el.id)}[contenteditable="true"]`;
+    const element = this.getInputEl();
+    if (!element) return null;
+    if (element.id) return `#${CSS.escape(element.id)}[contenteditable="true"]`;
     const chains = [
+      '[data-testid="chat-input"][contenteditable="true"]',
       'div[contenteditable="true"][role="textbox"]',
       '.ProseMirror[contenteditable="true"]',
       '.ql-editor[contenteditable="true"]',
     ];
-    for (const sel of chains) {
-      if (document.querySelector(sel) === el) return sel;
+    for (const selector of chains) {
+      if (document.querySelector(selector) === element) return selector;
     }
-    return 'div[contenteditable="true"][role="textbox"]';
+    return null;
   }
 
-  // Send button chain; wake.js falls back to Enter when none matches.
   getSendButtonCandidates() {
     const chains = [
+      'button[aria-label="Send message"]',
       'button[data-testid="send-button"]',
       'button[aria-label*="Send" i]',
-      'button[aria-label*="发送"]',
       'button[type="submit"]',
     ];
     const seen = new Set();
     const out = [];
-    for (const sel of chains) {
-      for (const el of document.querySelectorAll(sel)) {
-        if (!seen.has(el)) { seen.add(el); out.push(el); }
+    for (const selector of chains) {
+      for (const element of document.querySelectorAll(selector)) {
+        if (!this.elementVisible(element) || seen.has(element)) continue;
+        seen.add(element);
+        out.push(element);
       }
     }
     return out;
@@ -59,7 +82,86 @@ class ClaudeAdapter extends BaseAdapter {
     return this.getSendButtonCandidates()[0] || null;
   }
 
-  // Conversation identity uses host plus pathname for chat and project chat URLs.
+  getStopButtonCandidates() {
+    const chains = [
+      'button[aria-label*="Stop" i]',
+      'button[data-testid="stop-button"]',
+    ];
+    const seen = new Set();
+    const out = [];
+    for (const selector of chains) {
+      for (const element of document.querySelectorAll(selector)) {
+        if (!this.elementVisible(element) || seen.has(element)) continue;
+        seen.add(element);
+        out.push(element);
+      }
+    }
+    return out;
+  }
+
+  getMessageSnapshot(role) {
+    const selectors = role === "user"
+      ? ['[data-testid="user-message"]', '[data-testid="human-message"]', '.font-user-message']
+      : role === "assistant"
+        ? ['.font-claude-response', '[data-testid="assistant-message"]', '.font-claude-message']
+        : [];
+    const seen = new Set();
+    const nodes = [];
+    for (const selector of selectors) {
+      for (const element of document.querySelectorAll(selector)) {
+        if (!this.elementVisible(element) || seen.has(element)) continue;
+        seen.add(element);
+        nodes.push(element);
+      }
+      if (nodes.length > 0) break;
+    }
+    const element = nodes.at(-1) || null;
+    if (!element) return { messageId: null, text: "", count: 0 };
+    return {
+      messageId: element.getAttribute?.("data-message-id")
+        || element.getAttribute?.("data-message-uuid")
+        || null,
+      text: String(element.innerText || element.textContent || "").replace(/\s+/g, " ").trim(),
+      count: nodes.length,
+    };
+  }
+
+  getLastMessageText(role) {
+    return this.getMessageSnapshot(role).text;
+  }
+
+  isGenerationInProgress() {
+    if (this.getStopButtonCandidates().length > 0) return true;
+    const selectors = ['[data-is-streaming="true"]', '[aria-busy="true"]'];
+    return selectors.some((selector) => [...document.querySelectorAll(selector)]
+      .some((element) => this.elementVisible(element)));
+  }
+
+  async getAccountNativeIdentity() {
+    try {
+      const response = await fetch("/api/auth/current_account", {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      const rawEmail = payload?.account?.email_address || payload?.email_address || null;
+      const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !globalThis.crypto?.subtle) return null;
+      const digest = await globalThis.crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(email),
+      );
+      const hex = [...new Uint8Array(digest)]
+        .map((value) => value.toString(16).padStart(2, "0"))
+        .join("");
+      return `claude-account-sha256:${hex}`;
+    } catch (_) {
+      return null;
+    }
+  }
 }
 
 window.__H2W_ADAPTER__ = new ClaudeAdapter();
