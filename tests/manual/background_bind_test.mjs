@@ -36,6 +36,10 @@ const CLAUDE_CHAT_KEY = `https://claude.ai/chat/${CLAUDE_CHAT_ID}`;
 const GROK_CHAT_ID = "223e4567-e89b-12d3-a456-426614174001";
 const GROK_CHAT_URL = `https://grok.com/c/${GROK_CHAT_ID}?rid=ignored`;
 const GROK_CHAT_KEY = `https://grok.com/c/${GROK_CHAT_ID}`;
+const GROK_PROJECT_ID = "323e4567-e89b-42d3-a456-426614174002";
+const GROK_PROJECT_CHAT_ID = "423e4567-e89b-42d3-a456-426614174003";
+const GROK_PROJECT_URL = `https://grok.com/project/${GROK_PROJECT_ID}?ignored=1&chat=${GROK_PROJECT_CHAT_ID}`;
+const GROK_PROJECT_KEY = `https://grok.com/project/${GROK_PROJECT_ID}?chat=${GROK_PROJECT_CHAT_ID}`;
 
 let failures = 0;
 function ok(cond, label, detail = "") {
@@ -369,7 +373,11 @@ globalThis.chrome = {
                 resource_ref: body.provider === "claude"
                   ? (body.kind === "account" ? "bra_claude_account" : "brs_claude_session")
                   : body.provider === "grok"
-                    ? (body.kind === "account" ? "bra_grok_account" : "brs_grok_session")
+                    ? (body.kind === "account"
+                      ? "bra_grok_account"
+                      : body.kind === "space"
+                        ? "brsp_grok_project"
+                        : "brs_grok_session")
                     : (body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session"),
                 kind: body.kind,
               },
@@ -942,6 +950,26 @@ console.log("\n[Grok optional-origin registration and recovery]");
       && reloadCalls.slice(reloadsBeforeFallback).some((call) => call.tabId === fallbackTabId),
     "Control Center recovers a listener-less Grok chat from its bounded URL identity",
     JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
+
+  const projectFallbackTabId = 907;
+  tabs.set(projectFallbackTabId, {
+    id: projectFallbackTabId,
+    url: GROK_PROJECT_URL,
+    status: "complete",
+    listener: null,
+  });
+  const projectReloadsBeforeFallback = reloadCalls.length;
+  const projectFallbackState = await dispatchMessage({ type: "h2w_state", tabId: projectFallbackTabId });
+  ok(projectFallbackState?.convInfo?.site === "grok"
+      && projectFallbackState?.convInfo?.project_id === GROK_PROJECT_ID
+      && projectFallbackState?.convInfo?.conversation_id === GROK_PROJECT_CHAT_ID
+      && projectFallbackState?.convInfo?.convKey === GROK_PROJECT_KEY
+      && reloadCalls.slice(projectReloadsBeforeFallback).some((call) => call.tabId === projectFallbackTabId),
+    "Control Center recovers a listener-less Grok project chat from project + chat URL identity",
+    JSON.stringify({
+      convInfo: projectFallbackState?.convInfo,
+      reloads: reloadCalls.slice(projectReloadsBeforeFallback),
+    }));
 }
 
 console.log("\n[Gemini browser registry observation]");
@@ -1067,6 +1095,37 @@ console.log("\n[Grok browser registry observation]");
       && !observed.some((request) => request?.kind === "space"),
     "Grok observes account -> session without fabricating a space resource",
     JSON.stringify(observed));
+
+  const beforeProject = browserRegistryRequests.length;
+  const projectRegistered = await dispatchMessage({
+    type: "h2w_register",
+    site: "grok",
+    convKey: GROK_PROJECT_KEY,
+    url: GROK_PROJECT_URL,
+    accountNativeIdentity: `grok-account-sha256:${"9".repeat(64)}`,
+  }, { tab: { id: 96, url: GROK_PROJECT_URL } });
+  const projectObserved = browserRegistryRequests.slice(beforeProject);
+  ok(projectRegistered?.bound === false
+      && projectRegistered?.browser_session_ref === "brs_grok_session"
+      && Number.isSafeInteger(projectRegistered?.browser_generation),
+    "Grok project registration returns the opaque browser session and capability generation",
+    JSON.stringify(projectRegistered));
+  ok(projectObserved.length === 4
+      && projectObserved[0]?.operation === "provider.observe"
+      && projectObserved[0]?.provider === "grok"
+      && projectObserved[1]?.operation === "resource.observe"
+      && projectObserved[1]?.kind === "account"
+      && projectObserved[1]?.parent_ref === null
+      && projectObserved[2]?.operation === "resource.observe"
+      && projectObserved[2]?.kind === "space"
+      && projectObserved[2]?.parent_ref === "bra_grok_account"
+      && projectObserved[2]?.native_identity === GROK_PROJECT_ID
+      && projectObserved[3]?.operation === "resource.observe"
+      && projectObserved[3]?.kind === "session"
+      && projectObserved[3]?.parent_ref === "brsp_grok_project"
+      && projectObserved[3]?.native_identity === GROK_PROJECT_CHAT_ID,
+    "Grok project chat observes account -> space(project) -> session(chat)",
+    JSON.stringify(projectObserved));
 }
 
 console.log("\n[trusted browser control action]");

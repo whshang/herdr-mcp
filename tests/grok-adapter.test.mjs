@@ -68,7 +68,7 @@ function harness(url = "https://grok.com/c/123e4567-e89b-12d3-a456-426614174000"
   };
 }
 
-test("Grok adapter exposes only concrete /c UUID session identity", () => {
+test("Grok adapter exposes concrete direct and project chat session identity", () => {
   const h = harness("https://grok.com/c/123e4567-e89b-12d3-a456-426614174000?rid=ignored");
   assert.equal(h.adapter.name, "grok");
   assert.equal(
@@ -81,12 +81,36 @@ test("Grok adapter exposes only concrete /c UUID session identity", () => {
     "https://grok.com/c/123e4567-e89b-12d3-a456-426614174000",
   );
 
+  const project = harness(
+    "https://grok.com/project/223e4567-e89b-42d3-a456-426614174001?ignored=1&chat=323e4567-e89b-42d3-a456-426614174002",
+  );
+  assert.equal(
+    project.adapter.getConversationKey(),
+    "https://grok.com/project/223e4567-e89b-42d3-a456-426614174001?chat=323e4567-e89b-42d3-a456-426614174002",
+  );
+  assert.equal(project.adapter.getNativeSessionIdentity(), "323e4567-e89b-42d3-a456-426614174002");
+  assert.equal(
+    project.adapter.getCanonicalConversationUrl(),
+    "https://grok.com/project/223e4567-e89b-42d3-a456-426614174001?chat=323e4567-e89b-42d3-a456-426614174002",
+  );
+
   h.location.pathname = "/";
   assert.equal(h.adapter.getConversationKey(), null);
   h.location.pathname = "/imagine";
   assert.equal(h.adapter.getConversationKey(), null);
   h.location.pathname = "/c/not-a-uuid";
   assert.equal(h.adapter.getConversationKey(), null);
+
+  const missingProjectChat = harness("https://grok.com/project/223e4567-e89b-42d3-a456-426614174001");
+  assert.equal(missingProjectChat.adapter.getConversationKey(), null);
+  const invalidProject = harness(
+    "https://grok.com/project/not-a-uuid?chat=323e4567-e89b-42d3-a456-426614174002",
+  );
+  assert.equal(invalidProject.adapter.getConversationKey(), null);
+  const invalidProjectChat = harness(
+    "https://grok.com/project/223e4567-e89b-42d3-a456-426614174001?chat=not-a-uuid",
+  );
+  assert.equal(invalidProjectChat.adapter.getConversationKey(), null);
 });
 
 test("Grok adapter uses bounded semantic composer, turn, and generation selectors", () => {
