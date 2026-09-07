@@ -131,6 +131,9 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.ok(approvalCode, "approval page should expose the one-time six-digit code");
   assert.ok(html.includes(`herdr-mcp connector approve ${requestId}`));
   assert.match(html, /id="copy-command"/);
+  assert.match(html, /id="continue-link"/);
+  assert.match(html, /Continue to ChatGPT/);
+  assert.match(html, /window\.location\.assign\(approvedRedirect\)/);
   assert.match(html, /navigator\.clipboard/);
   assert.match(html, /document\.execCommand\('copy'\)/);
   assert.match(html, /Requires herdr-mcp v0\.4\.6 or newer\./);
@@ -168,20 +171,9 @@ async function approvePending(opts, pending, approver = "device:dev_owner") {
 }
 
 /** Authorize for a client through the explicit fleet-approval flow. */
+let authSequence = 0;
 async function makeAuthCode(opts, client_id, redirect_uri = "https://app.example/cb") {
-  const grant = await opts.store.getGrant(client_id);
-  if (grant?.status === "active") {
-    const verifier = "E".repeat(43) + "zZ-._";
-    const challenge = await s256Challenge(verifier);
-    const qs = new URLSearchParams({
-      client_id, redirect_uri, response_type: "code",
-      code_challenge: challenge, code_challenge_method: "S256", state: "st",
-    });
-    const resp = await GET(`/oauth/authorize?${qs}`, opts);
-    assert.equal(resp.status, 302, "an already approved active connector grant should not require approval again");
-    return { code: new URL(resp.headers.get("location")).searchParams.get("code"), verifier };
-  }
-  const pending = await pendingAuthorization(opts, client_id, redirect_uri);
+  const pending = await pendingAuthorization(opts, client_id, redirect_uri, `auth-${++authSequence}`);
   const approved = await approvePending(opts, pending);
   return { code: approved.code, verifier: pending.verifier };
 }
@@ -401,7 +393,7 @@ test("authorize: first use requires fleet approval, then issues RFC9207 one-use 
   assert.equal((await replay.json()).error, "invalid_grant");
 });
 
-test("authorize: identical pending retry renders safe recovery page instead of JSON", async () => {
+test("authorize: identical pending retry gets an independently pollable page and shares only the exact attempt", async () => {
   const opts = makeOptions();
   const { client_id } = await registerClient(opts, {
     token_endpoint_auth_method: "none",
@@ -424,20 +416,30 @@ test("authorize: identical pending retry renders safe recovery page instead of J
   assert.match(retry.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
   assert.match(retry.headers.get("content-security-policy") ?? "", /script-src 'self' 'unsafe-inline'/);
   assert.match(retry.headers.get("content-security-policy") ?? "", /connect-src 'self'/);
-  assert.ok(Number(retry.headers.get("retry-after")) > 0);
   const html = await retry.text();
-  assert.match(html, /Approval already pending/);
-  assert.match(html, /Use the original approval page if it is still open/);
-  assert.match(html, new RegExp(`herdr-mcp connector cancel ${pending.requestId}`));
-  assert.match(html, /retry automatically after the old request expires/);
-  assert.ok(html.includes(pending.requestId));
-  assert.match(html, /location\.reload\(\)/);
-  assert.doesNotMatch(html, /class="approval-code"/);
-  assert.doesNotMatch(html, /const resumeToken=/);
-  assert.doesNotMatch(html, /authorization_pending/);
+  const retryRequestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const retryResumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  assert.ok(retryRequestId);
+  assert.ok(retryResumeToken);
+  assert.notEqual(retryRequestId, pending.requestId, "retry owns a distinct resumable request");
+  assert.match(html, /class="approval-code"/);
+  assert.match(html, /Continue to ChatGPT/);
 
   const approvals = await opts.store.getApproval(pending.requestId, NOW_MS);
   assert.ok(approvals, "the original pending approval must remain authoritative");
+
+  await opts.store.approveApproval(
+    pending.requestId,
+    await hashOAuthApprovalCode(APPROVAL_SECRET, pending.requestId, pending.approvalCode),
+    "device:owner",
+    NOW_MS,
+  );
+  const retryPoll = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: retryRequestId,
+    resume_token: retryResumeToken,
+  })}`, opts);
+  assert.equal(retryPoll.status, 200, "approving either exact-attempt page completes its sibling without a second approval");
+  assert.equal((await retryPoll.json()).status, "approved");
 });
 
 test("authorize: unknown client returns 400 JSON, no redirect", async () => {
@@ -1134,7 +1136,7 @@ test("non-owned routes return null", async () => {
     assert.equal(resp, null, `expected null for ${method} ${path}`);
   }
 });
-test("regression: first authorize -> approve -> authorize URL retried/reloaded before original browser completes", async () => {
+test("regression: exact authorize retry after approval reuses only that request-bound approval", async () => {
   const opts = makeOptions();
   const { client_id, client_secret } = await registerClient(opts);
 
@@ -1155,25 +1157,33 @@ test("regression: first authorize -> approve -> authorize URL retried/reloaded b
   assert.equal(connectors.length, 1);
   const connectorId = connectors[0].connector_id;
 
-  // 3. User refreshes/retries /oauth/authorize with a NEW request (new state, new PKCE verifier)
-  const verifier2 = "F".repeat(43) + "aA-._";
-  const challenge2 = await s256Challenge(verifier2);
+  // 3. Browser retries the exact same authorization attempt after owner approval.
+  const verifier2 = pending1.verifier;
+  const challenge2 = pending1.challenge;
   const retryQs = new URLSearchParams({
     client_id,
     redirect_uri: "https://app.example/cb",
     response_type: "code",
     code_challenge: challenge2,
     code_challenge_method: "S256",
-    state: "state-retry-2",
+    state: pending1.state,
   });
   const retryResp = await GET(`/oauth/authorize?${retryQs}`, opts);
-
-  // Must NOT require a second approval page (status 200); must 302 redirect with a fresh code
-  assert.equal(retryResp.status, 302, "retry after active grant approval must redirect immediately without second approval");
-  const redirectLoc = new URL(retryResp.headers.get("location"));
-  assert.equal(redirectLoc.searchParams.get("state"), "state-retry-2");
+  assert.equal(retryResp.status, 200, "retry receives its own resumable completion page");
+  const retryHtml = await retryResp.text();
+  const retryRequestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(retryHtml)?.[1];
+  const retryResumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(retryHtml)?.[1];
+  assert.ok(retryRequestId);
+  assert.ok(retryResumeToken);
+  const retryPoll = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: retryRequestId,
+    resume_token: retryResumeToken,
+  })}`, opts);
+  assert.equal(retryPoll.status, 200, "exact retry is already approved without a second owner action");
+  const redirectLoc = new URL((await retryPoll.json()).redirect);
+  assert.equal(redirectLoc.searchParams.get("state"), pending1.state);
   const code2 = redirectLoc.searchParams.get("code");
-  assert.ok(code2, "retry redirect carries a fresh authorization code");
+  assert.ok(code2);
 
   // connectors count must STILL be 1 (no duplicate conn_* created!)
   connectors = await opts.store.listConnectors();
@@ -1231,7 +1241,7 @@ test("regression: first authorize -> approve -> authorize URL retried/reloaded b
   assert.equal(afterRevokeCheck.status, 404, "revocation fences refresh token");
 });
 
-test("regression: authorize A -> reload before approve creates B with different state/PKCE -> approve only A -> B poll and token exchange succeed", async () => {
+test("regression: distinct state/PKCE requests sharing a public client_id require independent owner approvals", async () => {
   const opts = makeOptions();
   const { client_id, client_secret } = await registerClient(opts);
 
@@ -1258,6 +1268,8 @@ test("regression: authorize A -> reload before approve creates B with different 
   assert.ok(requestIdB);
   assert.ok(resumeTokenB);
   assert.notEqual(requestIdB, pendingA.requestId, "B has its own request id");
+  const storedBBeforeA = await opts.store.getApproval(requestIdB, NOW_MS);
+  assert.equal(storedBBeforeA?.status, "pending", "B is independently pending before A approval");
 
   // 3. Owner approves ONLY request A
   const approvedA = await opts.store.approveApproval(
@@ -1267,19 +1279,36 @@ test("regression: authorize A -> reload before approve creates B with different 
     NOW_MS,
   );
   assert.equal(approvedA.ok, true, "owner approval of A succeeds");
+  const storedBAfterA = await opts.store.getApproval(requestIdB, NOW_MS);
+  assert.equal(storedBAfterA?.status, "pending", "A approval must not consume, delete, or approve B");
 
-  // Verify only ONE logical conn_* identity exists
+  // Only A exists after approving A.
   let connectors = await opts.store.listConnectors();
-  assert.equal(connectors.length, 1, "exactly one logical connector created");
-  const connectorId = connectors[0].connector_id;
+  assert.equal(connectors.length, 1, "only A's logical connector exists");
+  const connectorIdA = connectors[0].connector_id;
 
-  // 4. B's existing browser poll/resume completes without a second 6-digit approval
+  // 4. B remains pending: shared client_id is application identity, not account identity.
   const pollB = await GET(`/oauth/authorize/poll?${new URLSearchParams({
     request_id: requestIdB,
     resume_token: resumeTokenB,
   })}`, opts);
-  assert.equal(pollB.status, 200, "B poll succeeds after only A was approved");
-  const pollBBody = await pollB.json();
+  assert.equal(pollB.status, 202, "B is not authorized by A's approval");
+  assert.equal((await pollB.json()).status, "pending");
+
+  // B receives its own owner approval and then completes using its own state/PKCE.
+  const approvedB = await opts.store.approveApproval(
+    requestIdB,
+    await hashOAuthApprovalCode(APPROVAL_SECRET, requestIdB, approvalCodeB),
+    "device:owner",
+    NOW_MS + 1,
+  );
+  assert.equal(approvedB.ok, true);
+  const completedB = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: requestIdB,
+    resume_token: resumeTokenB,
+  })}`, opts);
+  assert.equal(completedB.status, 200);
+  const pollBBody = await completedB.json();
   assert.equal(pollBBody.status, "approved");
   const locB = new URL(pollBBody.redirect);
   assert.equal(locB.searchParams.get("state"), "state-B", "B redirect is bound to B's own state");
@@ -1300,10 +1329,11 @@ test("regression: authorize A -> reload before approve creates B with different 
   assert.ok(codeA);
   assert.notEqual(codeA, codeB, "A and B receive distinct authorization codes");
 
-  // Connectors count still strictly 1
+  // Distinct authorization attempts have distinct Connector identities.
   connectors = await opts.store.listConnectors();
-  assert.equal(connectors.length, 1);
-  assert.equal(connectors[0].connector_id, connectorId);
+  assert.equal(connectors.length, 2);
+  assert.ok(connectors.some((connector) => connector.connector_id === connectorIdA));
+  assert.equal(new Set(connectors.map((connector) => connector.connector_id)).size, 2);
 
   // 5. Token exchange for B succeeds using B's own code and PKCE verifier
   const tokenRespB = await POST("/oauth/token", tokenBody(client_id, codeB, verifierB, { client_secret }), opts);

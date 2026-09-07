@@ -487,13 +487,15 @@ test("connector grant revoke fences current and legacy JWT/refresh credentials w
 
 test("connector instance revoke is isolated while client kill-switch fences every instance and unknown legacy client", async () => {
   const h = harness();
-  const approve = async (requestId, codeHash) => {
+  const approve = async (requestId, codeHash, state, codeChallenge) => {
     await h.post("/internal/oauth/approval/put", {
       request_id: requestId,
       record: approval({
         client_id: "shared-client",
         approval_code_hash: codeHash,
         resume_hash: `resume-${requestId}`,
+        state,
+        code_challenge: codeChallenge,
       }),
       now_ms: 100,
     });
@@ -504,8 +506,8 @@ test("connector instance revoke is isolated while client kill-switch fences ever
       now_ms: 200,
     }));
   };
-  const first = await approve("req-inst-1", "good-1");
-  const second = await approve("req-inst-2", "good-2");
+  const first = await approve("req-inst-1", "good-1", "state-1", "challenge-1");
+  const second = await approve("req-inst-2", "good-2", "state-2", "challenge-2");
   assert.notEqual(first.record.connector_id, second.record.connector_id);
 
   const issueFor = async (record) => body(await h.post("/internal/oauth/token/issue", {

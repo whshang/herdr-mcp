@@ -338,6 +338,7 @@ h1{margin:0;font-size:clamp(27px,5vw,38px);line-height:1.12;letter-spacing:-.035
 .status-dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:0 0 auto;animation:pulse 1.8s ease-in-out infinite}
 .status.success{background:var(--goodSoft);color:var(--good)}
 .status.error{background:#fff0ef;color:#a43228}
+.continue-row{margin-top:12px;display:flex;align-items:center;gap:10px}.continue-row[hidden]{display:none!important}.continue-link{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:11px;background:var(--accent);color:var(--accentText);font-weight:750;text-decoration:none}.continue-help{color:var(--muted);font-size:12px}
 details{margin-top:20px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted)}
 summary{cursor:pointer;font-size:13px;font-weight:700;color:#4d5562;user-select:none}
 .details-grid{display:grid;grid-template-columns:110px minmax(0,1fr);gap:7px 14px;margin-top:12px;font-size:12px}
@@ -376,6 +377,7 @@ summary{cursor:pointer;font-size:13px;font-weight:700;color:#4d5562;user-select:
 </div>
 
 <div class="status" id="status-wrap" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="status">Waiting for approval…</span></div>
+<div class="continue-row" id="continue-row" hidden><a class="continue-link" id="continue-link" href="#">Continue to ChatGPT</a><span class="continue-help">Use this if automatic return is blocked.</span></div>
 
 <details>
   <summary>Request details</summary>
@@ -399,6 +401,9 @@ const copyButton=document.getElementById('copy-command');
 const statusWrap=document.getElementById('status-wrap');
 const statusText=document.getElementById('status');
 const statusPill=document.getElementById('status-pill');
+const continueRow=document.getElementById('continue-row');
+const continueLink=document.getElementById('continue-link');
+let approvedRedirect=null;
 function setStatus(message,state){
   statusText.textContent=message;
   statusWrap.className='status'+(state?' '+state:'');
@@ -423,13 +428,19 @@ async function copyApprovalCommand(){
   setTimeout(()=>{copyButton.textContent='Copy'},1600);
 }
 copyButton.addEventListener('click',copyApprovalCommand);
+continueLink.addEventListener('click',(event)=>{if(!approvedRedirect)event.preventDefault()});
 async function poll(){
   poll.failures=poll.failures||0;
   try{
     const u=new URL(endpoint);u.searchParams.set('request_id',requestId);u.searchParams.set('resume_token',resumeToken);
     const r=await fetch(u.toString(),{cache:'no-store'});const p=await r.json();
     poll.failures=0;
-    if(p.status==='approved'&&p.redirect){setStatus('Approved. Returning to the Connector…','success');location.replace(p.redirect);return;}
+    if(p.status==='approved'&&p.redirect){
+      approvedRedirect=p.redirect;continueLink.href=approvedRedirect;continueRow.hidden=false;
+      setStatus('Approved. Returning to ChatGPT…','success');
+      try{window.location.assign(approvedRedirect)}catch{}
+      return;
+    }
     if(p.status==='pending'){setTimeout(poll,1500);return;}
     setStatus(p.message||'Approval failed or expired.','error');
   }catch{
@@ -956,59 +967,16 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
   }
 
   const existingGrant = await ctx.store.getGrant(clientId);
-  if (existingGrant) {
-    if (existingGrant.status === "revoked") {
-      return redirectError("access_denied", "client grant is revoked");
-    }
-    if (existingGrant.status === "active") {
-      if (
-        (existingGrant.principal_type === undefined || existingGrant.principal_type === "connector") &&
-        existingGrant.resource === resource &&
-        (existingGrant.scope === undefined || existingGrant.scope === OAUTH_SCOPE) &&
-        existingGrant.connector_id
-      ) {
-        const connector = await ctx.store.getConnector(existingGrant.connector_id);
-        if (
-          connector &&
-          connector.status === "active" &&
-          connector.client_id === clientId &&
-          (existingGrant.grant_generation === undefined || connector.grant_generation === existingGrant.grant_generation)
-        ) {
-          return issueAuthorizationRedirect(ctx, {
-            clientId,
-            connectorId: connector.connector_id,
-            grantGeneration: connector.grant_generation,
-            redirectUri,
-            codeChallenge,
-            resource,
-            state,
-            nowMs,
-          });
-        }
-        return redirectError("access_denied", "approved Connector grant is invalid or revoked");
-      }
-      return redirectError("access_denied", "approved Connector grant is invalid for this target");
-    }
-  } else {
-    const activeConnector = await ctx.store.findActiveConnectorByClient(clientId);
-    if (
-      activeConnector &&
-      activeConnector.status === "active" &&
-      activeConnector.resource === resource &&
-      activeConnector.scope === OAUTH_SCOPE
-    ) {
-      return issueAuthorizationRedirect(ctx, {
-        clientId,
-        connectorId: activeConnector.connector_id,
-        grantGeneration: activeConnector.grant_generation,
-        redirectUri,
-        codeChallenge,
-        resource,
-        state,
-        nowMs,
-      });
-    }
+  if (existingGrant?.status === "revoked") {
+    // Revoked grant rows are client-wide kill switches. Older rows predate the
+    // explicit revocation_scope field, so keep treating them conservatively as
+    // client revocations. Connector-instance revoke never writes this row.
+    return redirectError("access_denied", "client grant is revoked");
   }
+
+  // A public OAuth client_id identifies an application, not a ChatGPT account.
+  // Every fresh authorization request therefore enters owner approval. Exact
+  // request retries are reconciled only by request-bound state/PKCE identity.
 
   const requestId = randomBase64UrlToken();
   const connectorId = `conn_${randomBase64UrlToken().slice(0, 22)}`;
@@ -1490,14 +1458,18 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
         resume_hash: resumeHash,
         now_ms: nowMs,
       });
-      if (!resp.ok) {
-        const data = (await resp.json().catch(() => null)) as { code?: string } | null;
-        const allowed = new Set(["expired", "pending", "locked", "invalid_resume"]);
-        const code = data?.code && allowed.has(data.code) ? data.code : "not_found";
-        return { ok: false, code } as ConsumeApprovalResult;
-      }
-      const data = (await resp.json()) as { ok?: boolean; record?: OAuthApprovalRecord };
-      return data.record ? { ok: true, record: data.record } : { ok: false, code: "not_found" };
+      const data = (await resp.json().catch(() => null)) as {
+        ok?: boolean;
+        code?: string;
+        record?: OAuthApprovalRecord;
+      } | null;
+      if (data?.record) return { ok: true, record: data.record };
+      // 202 is intentionally used by the DO for a still-pending approval, but
+      // Fetch classifies every 2xx response as ok=true. Preserve the semantic
+      // status instead of accidentally collapsing 202 into not_found/410.
+      const allowed = new Set(["expired", "pending", "locked", "invalid_resume"]);
+      const code = data?.code && allowed.has(data.code) ? data.code : "not_found";
+      return { ok: false, code } as ConsumeApprovalResult;
     },
     async getGrant(clientId) {
       const resp = await internal("/internal/oauth/grant/get", { client_id: clientId });

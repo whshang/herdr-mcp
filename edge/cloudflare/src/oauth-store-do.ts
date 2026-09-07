@@ -92,6 +92,8 @@ export interface OAuthConnectorRecord {
 export interface OAuthConnectorGrantRecord {
   client_id: string;
   status: "active" | "revoked";
+  /** Explicit client-wide kill switch. Missing on older records for compatibility. */
+  revocation_scope?: "client";
   principal_type?: "connector" | "automation";
   resource?: string;
   scope?: string;
@@ -360,9 +362,11 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
     : undefined;
   const revokedAt = finiteEpoch(value.revoked_at_ms) ? value.revoked_at_ms as number : undefined;
   const revokedBy = typeof value.revoked_by === "string" && value.revoked_by.length <= 4096 ? value.revoked_by : undefined;
+  const revocationScope = value.revocation_scope === "client" ? "client" as const : undefined;
   return {
     client_id: value.client_id,
     status: value.status,
+    ...(revocationScope !== undefined ? { revocation_scope: revocationScope } : {}),
     ...(connectorId !== undefined ? { connector_id: connectorId } : {}),
     ...(grantGeneration !== undefined ? { grant_generation: grantGeneration } : {}),
     ...(principalType !== undefined ? { principal_type: principalType } : {}),
@@ -586,7 +590,6 @@ export class OAuthStoreDO {
     const rows = await this.state.storage.list<OAuthApprovalRecord>({ prefix: APPROVAL_PREFIX });
     let totalPending = 0;
     let clientPending = 0;
-    let reusableConnectorId: string | undefined;
     for (const [existingKey, raw] of rows) {
       if (!record(raw) || !finiteEpoch(raw.expires_at_ms) || raw.expires_at_ms <= nowMs) {
         const connectorId = record(raw) && boundedString(raw.connector_id, 256) ? raw.connector_id : undefined;
@@ -601,29 +604,36 @@ export class OAuthStoreDO {
         await this.state.storage.delete(existingKey);
         continue;
       }
-      if (raw.status !== "pending" && raw.status !== "locked") continue;
-      totalPending += 1;
-      if (raw.client_id === normalized.client_id) {
-        clientPending += 1;
-        if (raw.connector_id && !reusableConnectorId) {
-          reusableConnectorId = raw.connector_id;
-        }
-      }
-      if (
-        raw.status === "pending" &&
+      const sameAuthorizationAttempt =
         raw.client_id === normalized.client_id &&
         raw.redirect_uri === normalized.redirect_uri &&
         raw.code_challenge === normalized.code_challenge &&
         raw.resource === normalized.resource &&
         raw.scope === normalized.scope &&
-        raw.state === normalized.state
-      ) {
-        return json({
-          ok: false,
-          code: "duplicate_pending",
-          existing_request_id: existingKey.slice(APPROVAL_PREFIX.length),
-          expires_at_ms: raw.expires_at_ms,
-        }, 409);
+        raw.state === normalized.state &&
+        (raw.auth_source ?? "legacy") === (normalized.auth_source ?? "legacy");
+      if (sameAuthorizationAttempt && boundedString(raw.connector_id, 256)) {
+        // A retry of the exact same OAuth request gets its own resume token/page,
+        // but may share the request-bound Connector identity. Never reuse an
+        // identity merely because a public client_id matches: ChatGPT shares
+        // one application client_id across user accounts.
+        normalized.connector_id = raw.connector_id;
+        if (
+          raw.status === "approved" &&
+          finiteEpoch(raw.approved_at_ms) &&
+          boundedString(raw.approved_by, 4096)
+        ) {
+          normalized.status = "approved";
+          normalized.approved_at_ms = raw.approved_at_ms;
+          normalized.approved_by = raw.approved_by;
+          await this.state.storage.put(key, normalized);
+          return json({ ok: true, reused_approval: true });
+        }
+      }
+      if (raw.status !== "pending" && raw.status !== "locked") continue;
+      totalPending += 1;
+      if (raw.client_id === normalized.client_id) {
+        clientPending += 1;
       }
     }
     if (clientPending >= MAX_ACTIVE_PENDING_PER_CLIENT) {
@@ -631,10 +641,6 @@ export class OAuthStoreDO {
     }
     if (totalPending >= MAX_ACTIVE_PENDING_TOTAL) {
       return json({ ok: false, code: "pending_capacity_reached", retryable: true }, 429);
-    }
-
-    if (reusableConnectorId && normalized.connector_id !== reusableConnectorId) {
-      normalized.connector_id = reusableConnectorId;
     }
 
     await this.state.storage.put(key, normalized);
@@ -756,8 +762,10 @@ export class OAuthStoreDO {
           sibling.status === "pending" &&
           sibling.client_id === current.client_id &&
           sibling.redirect_uri === current.redirect_uri &&
+          sibling.code_challenge === current.code_challenge &&
           sibling.resource === current.resource &&
           sibling.scope === current.scope &&
+          sibling.state === current.state &&
           (sibling.auth_source ?? "legacy") === (current.auth_source ?? "legacy") &&
           sibling.connector_id === connectorId
         ) {
@@ -936,6 +944,7 @@ export class OAuthStoreDO {
     const revoked: OAuthConnectorGrantRecord = {
       ...(current ?? { client_id: clientId }),
       status: "revoked",
+      revocation_scope: "client",
       revoked_at_ms: nowMs,
       revoked_by: revokedBy,
     };
@@ -1159,19 +1168,6 @@ export class OAuthStoreDO {
       outcome = revoked;
     });
     if (!outcome) return json({ ok: false, code: "not_found" }, 404);
-    const currentGrant = normalizeConnectorGrant(
-      await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + (outcome as OAuthConnectorRecord).client_id),
-    );
-    if (currentGrant && currentGrant.connector_id === connectorId) {
-      await this.state.storage.put(GRANT_PREFIX + (outcome as OAuthConnectorRecord).client_id, {
-        ...currentGrant,
-        status: "revoked",
-        grant_generation: (currentGrant.grant_generation ?? 1) + 1,
-        revoked_at_ms: nowMs,
-        revoked_by: revokedBy,
-      } satisfies OAuthConnectorGrantRecord);
-    }
-
     const [refresh, access] = await Promise.all([
       this.state.storage.list<OAuthTokenRecord>({ prefix: REFRESH_PREFIX }),
       this.state.storage.list<OAuthTokenRecord>({ prefix: ACCESS_PREFIX }),
@@ -1211,6 +1207,7 @@ export class OAuthStoreDO {
     await this.state.storage.put(GRANT_PREFIX + clientId, {
       ...(currentGrant ?? { client_id: clientId }),
       status: "revoked",
+      revocation_scope: "client",
       revoked_at_ms: nowMs,
       revoked_by: revokedBy,
     } satisfies OAuthConnectorGrantRecord);
