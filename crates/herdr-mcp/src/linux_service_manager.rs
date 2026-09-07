@@ -354,7 +354,7 @@ fn install() -> Result<(), String> {
         )?;
         if reconcile_active_link {
             link_reconcile_attempted = true;
-            ensure_link_installed_with_restart(true)?;
+            reconcile_link()?;
         }
         Ok(())
     })();
@@ -388,7 +388,7 @@ fn install() -> Result<(), String> {
             && previous_link_active
             && restore_service_error.is_none()
         {
-            ensure_link_installed_with_restart(true).err()
+            reconcile_link().err()
         } else {
             None
         };
