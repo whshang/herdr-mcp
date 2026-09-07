@@ -10,7 +10,7 @@ const KEYS = [
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
-  "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
+  "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled",
 ];
 let loadedHostPermissionOrigins = [];
 
@@ -32,6 +32,7 @@ function configuredHostPermissionOrigins(config) {
   if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
   if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
   if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
+  if (config.experimentalGrokEnabled === true) origins.push("https://grok.com/*");
   const llmOrigin = hostPermissionPatternForUrl(config.llmJudgeBaseUrl);
   if (llmOrigin) origins.push(llmOrigin);
   return [...new Set(origins)];
@@ -110,6 +111,8 @@ function applyI18n() {
   $("hint_experimental_deepseek").textContent = t("hint_experimental_deepseek");
   $("lab_experimental_gemini").textContent = t("label_experimental_gemini");
   $("hint_experimental_gemini").textContent = t("hint_experimental_gemini");
+  $("lab_experimental_grok").textContent = t("label_experimental_grok");
+  $("hint_experimental_grok").textContent = t("hint_experimental_grok");
   $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
   $("llmJudgeModel").placeholder = t("placeholder_llm_model");
   $("save").textContent = t("save");
@@ -148,6 +151,7 @@ async function loadForm() {
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
   $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
+  $("experimentalGrokEnabled").checked = cfg.experimentalGrokEnabled === true;
   try { loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg); } catch (_) { loadedHostPermissionOrigins = []; }
 }
 
@@ -199,6 +203,7 @@ $("save").addEventListener("click", async () => {
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
+    experimentalGrokEnabled: $("experimentalGrokEnabled").checked,
     uiLocale: getLocale(),
   };
   let nextPermissionOrigins;

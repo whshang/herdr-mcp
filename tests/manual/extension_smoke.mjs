@@ -104,8 +104,9 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
   "broad network access is optional and the always-on host permission stays loopback-only");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
+    && backgroundSource.includes('grok: "https://grok.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
-  "experimental content-script registration, including Gemini, requires an explicitly granted site permission");
+  "experimental content-script registration, including Gemini and Grok, requires an explicitly granted site permission");
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";
@@ -793,11 +794,13 @@ ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
 ok(optionsHtml.includes('id="experimentalZAiEnabled"')
     && optionsHtml.includes('id="experimentalDeepSeekEnabled"')
     && optionsHtml.includes('id="experimentalGeminiEnabled"')
-    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled"')
+    && optionsHtml.includes('id="experimentalGrokEnabled"')
+    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled"')
     && optionsSource.includes('experimentalZAiEnabled: $("experimentalZAiEnabled").checked')
     && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked')
-    && optionsSource.includes('experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked'),
-  "Options exposes separate experimental z.ai, DeepSeek, and Gemini switches");
+    && optionsSource.includes('experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked')
+    && optionsSource.includes('experimentalGrokEnabled: $("experimentalGrokEnabled").checked'),
+  "Options exposes separate experimental z.ai, DeepSeek, Gemini, and Grok switches");
 ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md")
     && optionsSource.includes("setConnectionFailure")
     && [enLocale, zhLocale, jaLocale].every((locale) => locale.open_github_setup_guide),
@@ -805,16 +808,21 @@ ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/a
 ok(backgroundSource.includes('experimentalZAiEnabled: false')
     && backgroundSource.includes('experimentalDeepSeekEnabled: false')
     && backgroundSource.includes('experimentalGeminiEnabled: false')
+    && backgroundSource.includes('experimentalGrokEnabled: false')
     && backgroundSource.includes('site: "gemini"')
     && backgroundSource.includes('matches: ["https://gemini.google.com/*"]')
     && backgroundSource.includes('"content/injector/gemini.js"')
+    && backgroundSource.includes('site: "grok"')
+    && backgroundSource.includes('matches: ["https://grok.com/*"]')
+    && backgroundSource.includes('"content/injector/grok.js"')
     && backgroundSource.includes('error: "experimental-site-disabled"')
     && wakeSource.includes("experimentalZAiEnabled")
     && wakeSource.includes("experimentalDeepSeekEnabled")
     && wakeSource.includes("experimentalGeminiEnabled")
+    && wakeSource.includes("experimentalGrokEnabled")
     && jsonBridgeSource.includes("experimentalZAiEnabled")
     && jsonBridgeSource.includes("experimentalDeepSeekEnabled"),
-  "experimental site integrations fail closed in background/content while Gemini stays outside JSON bridge");
+  "experimental site integrations fail closed in background/content while Gemini and Grok stay outside JSON bridge");
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation is folded into effective Project automation");

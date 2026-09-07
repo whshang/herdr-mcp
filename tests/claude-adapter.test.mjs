@@ -133,12 +133,13 @@ test("Claude reuses the provider-neutral account and single-attempt browser actu
   const accountStart = wakeSource.indexOf("async function browserAccountNativeIdentity()");
   const accountEnd = wakeSource.indexOf("async function registerCurrentConversation", accountStart);
   const accountSource = wakeSource.slice(accountStart, accountEnd);
-  assert.match(accountSource, /\["gemini",\s*"claude"\]\.includes\(ADAPTER\.name\)/);
+  assert.match(accountSource, /\[[^\]]*"claude"[^\]]*\]\.includes\(ADAPTER\.name\)/);
   assert.match(accountSource, /ADAPTER\.getAccountNativeIdentity/);
+  assert.doesNotMatch(accountSource, /ADAPTER\.name\s*===\s*"claude"/);
 
   const actuationStart = wakeSource.indexOf("async function performBrowserActuationCommand(command)");
   const actuationEnd = wakeSource.indexOf("chrome.runtime.onMessage.addListener", actuationStart);
   const actuationSource = wakeSource.slice(actuationStart, actuationEnd);
-  assert.match(actuationSource, /\["chatgpt",\s*"gemini",\s*"claude"\]\.includes\(ADAPTER\.name\)/);
+  assert.match(actuationSource, /\[[^\]]*"claude"[^\]]*\]\.includes\(ADAPTER\.name\)/);
   assert.doesNotMatch(actuationSource, /ADAPTER\.name\s*===\s*"claude"/);
 });
