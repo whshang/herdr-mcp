@@ -139,6 +139,7 @@ export interface OAuthPublicStore {
   getGrant(clientId: string): Promise<OAuthConnectorGrantRecord | null>;
   revokeGrant(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   getConnector(connectorId: string): Promise<OAuthConnectorRecord | null>;
+  findActiveConnectorByClient(clientId: string): Promise<OAuthConnectorRecord | null>;
   listConnectors(): Promise<OAuthConnectorRecord[]>;
   connectorInventory(): Promise<Record<string, unknown>>;
   revokeConnector(connectorId: string, revokedBy: string, nowMs: number): Promise<boolean>;
@@ -954,6 +955,61 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
     return redirectError("invalid_target", "unsupported resource");
   }
 
+  const existingGrant = await ctx.store.getGrant(clientId);
+  if (existingGrant) {
+    if (existingGrant.status === "revoked") {
+      return redirectError("access_denied", "client grant is revoked");
+    }
+    if (existingGrant.status === "active") {
+      if (
+        (existingGrant.principal_type === undefined || existingGrant.principal_type === "connector") &&
+        existingGrant.resource === resource &&
+        (existingGrant.scope === undefined || existingGrant.scope === OAUTH_SCOPE) &&
+        existingGrant.connector_id
+      ) {
+        const connector = await ctx.store.getConnector(existingGrant.connector_id);
+        if (
+          connector &&
+          connector.status === "active" &&
+          connector.client_id === clientId &&
+          (existingGrant.grant_generation === undefined || connector.grant_generation === existingGrant.grant_generation)
+        ) {
+          return issueAuthorizationRedirect(ctx, {
+            clientId,
+            connectorId: connector.connector_id,
+            grantGeneration: connector.grant_generation,
+            redirectUri,
+            codeChallenge,
+            resource,
+            state,
+            nowMs,
+          });
+        }
+        return redirectError("access_denied", "approved Connector grant is invalid or revoked");
+      }
+      return redirectError("access_denied", "approved Connector grant is invalid for this target");
+    }
+  } else {
+    const activeConnector = await ctx.store.findActiveConnectorByClient(clientId);
+    if (
+      activeConnector &&
+      activeConnector.status === "active" &&
+      activeConnector.resource === resource &&
+      activeConnector.scope === OAUTH_SCOPE
+    ) {
+      return issueAuthorizationRedirect(ctx, {
+        clientId,
+        connectorId: activeConnector.connector_id,
+        grantGeneration: activeConnector.grant_generation,
+        redirectUri,
+        codeChallenge,
+        resource,
+        state,
+        nowMs,
+      });
+    }
+  }
+
   const requestId = randomBase64UrlToken();
   const connectorId = `conn_${randomBase64UrlToken().slice(0, 22)}`;
   const authSource = isChatgptOAuthClientId(clientId)
@@ -1459,6 +1515,12 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
     },
     async getConnector(connectorId) {
       const resp = await internal("/internal/oauth/connector/get", { connector_id: connectorId });
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as { connector?: OAuthConnectorRecord };
+      return data.connector ?? null;
+    },
+    async findActiveConnectorByClient(clientId) {
+      const resp = await internal("/internal/oauth/connector/find-active", { client_id: clientId });
       if (!resp.ok) return null;
       const data = (await resp.json()) as { connector?: OAuthConnectorRecord };
       return data.connector ?? null;

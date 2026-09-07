@@ -95,6 +95,8 @@ export interface OAuthConnectorGrantRecord {
   principal_type?: "connector" | "automation";
   resource?: string;
   scope?: string;
+  connector_id?: string;
+  grant_generation?: number;
   /** Bound device_id for automation grants; validated as canonical dev_<26-char> ULID. */
   device_id?: string;
   device_name?: string;
@@ -350,11 +352,19 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
     if (!deviceId) return null;
     if (deviceName === undefined) return null;
   }
+  const connectorId = typeof value.connector_id === "string" && /^conn_[A-Za-z0-9_-]{8,128}$/.test(value.connector_id)
+    ? value.connector_id
+    : undefined;
+  const grantGeneration = Number.isSafeInteger(value.grant_generation) && (value.grant_generation as number) > 0
+    ? value.grant_generation as number
+    : undefined;
   const revokedAt = finiteEpoch(value.revoked_at_ms) ? value.revoked_at_ms as number : undefined;
   const revokedBy = typeof value.revoked_by === "string" && value.revoked_by.length <= 4096 ? value.revoked_by : undefined;
   return {
     client_id: value.client_id,
     status: value.status,
+    ...(connectorId !== undefined ? { connector_id: connectorId } : {}),
+    ...(grantGeneration !== undefined ? { grant_generation: grantGeneration } : {}),
     ...(principalType !== undefined ? { principal_type: principalType } : {}),
     ...(resource !== undefined ? { resource } : {}),
     ...(scope !== undefined ? { scope } : {}),
@@ -414,6 +424,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/connector/find-active") return this.findActiveConnectorByClient(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/list") return this.listConnectors();
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/inventory") return this.connectorInventory();
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/revoke") return this.revokeConnector(request);
@@ -575,6 +586,7 @@ export class OAuthStoreDO {
     const rows = await this.state.storage.list<OAuthApprovalRecord>({ prefix: APPROVAL_PREFIX });
     let totalPending = 0;
     let clientPending = 0;
+    let reusableConnectorId: string | undefined;
     for (const [existingKey, raw] of rows) {
       if (!record(raw) || !finiteEpoch(raw.expires_at_ms) || raw.expires_at_ms <= nowMs) {
         const connectorId = record(raw) && boundedString(raw.connector_id, 256) ? raw.connector_id : undefined;
@@ -591,7 +603,12 @@ export class OAuthStoreDO {
       }
       if (raw.status !== "pending" && raw.status !== "locked") continue;
       totalPending += 1;
-      if (raw.client_id === normalized.client_id) clientPending += 1;
+      if (raw.client_id === normalized.client_id) {
+        clientPending += 1;
+        if (raw.connector_id && !reusableConnectorId) {
+          reusableConnectorId = raw.connector_id;
+        }
+      }
       if (
         raw.status === "pending" &&
         raw.client_id === normalized.client_id &&
@@ -614,6 +631,10 @@ export class OAuthStoreDO {
     }
     if (totalPending >= MAX_ACTIVE_PENDING_TOTAL) {
       return json({ ok: false, code: "pending_capacity_reached", retryable: true }, 429);
+    }
+
+    if (reusableConnectorId && normalized.connector_id !== reusableConnectorId) {
+      normalized.connector_id = reusableConnectorId;
     }
 
     await this.state.storage.put(key, normalized);
@@ -707,8 +728,50 @@ export class OAuthStoreDO {
         approved_by: approver,
         token_issue_count: 0,
       };
+      const grant: OAuthConnectorGrantRecord = {
+        client_id: current.client_id,
+        status: "active",
+        principal_type: "connector",
+        resource: current.resource,
+        scope: current.scope,
+        connector_id: connectorId,
+        grant_generation: 1,
+        approved_at_ms: nowMs,
+        approved_by: approver,
+        token_issue_count: 0,
+      };
       await txn.put(key, approved);
       await txn.put(CONNECTOR_PREFIX + connectorId, connector);
+      await txn.put(GRANT_PREFIX + current.client_id, grant);
+
+      // Propagate approval to still-pending sibling approvals that share the same
+      // logical connector/client/redirect/resource/scope/auth_source context,
+      // preserving each sibling approval's own request-bound state, challenge, and resume hash.
+      const allApprovals = await txn.list<OAuthApprovalRecord>({ prefix: APPROVAL_PREFIX });
+      for (const [siblingKey, rawSibling] of allApprovals) {
+        if (siblingKey === key) continue;
+        const sibling = normalizeOAuthApproval(rawSibling, nowMs);
+        if (
+          sibling &&
+          sibling.status === "pending" &&
+          sibling.client_id === current.client_id &&
+          sibling.redirect_uri === current.redirect_uri &&
+          sibling.resource === current.resource &&
+          sibling.scope === current.scope &&
+          (sibling.auth_source ?? "legacy") === (current.auth_source ?? "legacy") &&
+          sibling.connector_id === connectorId
+        ) {
+          const siblingApproved: OAuthApprovalRecord = {
+            ...sibling,
+            connector_id: connectorId,
+            status: "approved",
+            approved_at_ms: nowMs,
+            approved_by: approver,
+          };
+          await txn.put(siblingKey, siblingApproved);
+        }
+      }
+
       result = { ok: true, record: approved };
     });
     if (!result.ok) {
@@ -819,7 +882,30 @@ export class OAuthStoreDO {
     const clientId = body?.client_id;
     if (!boundedString(clientId, 4096)) return json({ ok: false, code: "bad_request" }, 400);
     const value = await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId);
-    return value ? json({ ok: true, record: value }) : json({ ok: false, code: "not_found" }, 404);
+    if (value) {
+      const grant = normalizeConnectorGrant(value);
+      return grant ? json({ ok: true, record: grant }) : json({ ok: false, code: "not_found" }, 404);
+    }
+    const connectors = await this.state.storage.list<OAuthConnectorRecord>({ prefix: CONNECTOR_PREFIX });
+    for (const raw of connectors.values()) {
+      const conn = normalizeConnector(raw);
+      if (conn && conn.client_id === clientId && conn.status === "active") {
+        const syntheticGrant: OAuthConnectorGrantRecord = {
+          client_id: clientId,
+          status: "active",
+          principal_type: "connector",
+          resource: conn.resource,
+          scope: conn.scope,
+          connector_id: conn.connector_id,
+          grant_generation: conn.grant_generation,
+          approved_at_ms: conn.approved_at_ms,
+          approved_by: conn.approved_by,
+          token_issue_count: conn.token_issue_count,
+        };
+        return json({ ok: true, record: syntheticGrant });
+      }
+    }
+    return json({ ok: false, code: "not_found" }, 404);
   }
 
   private async revokeGrant(request: Request): Promise<Response> {
@@ -880,6 +966,20 @@ export class OAuthStoreDO {
         client_name: client?.client_name ?? null,
       },
     });
+  }
+
+  private async findActiveConnectorByClient(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    if (!boundedString(clientId, 4096)) return json({ ok: false, code: "bad_request" }, 400);
+    const rows = await this.state.storage.list<OAuthConnectorRecord>({ prefix: CONNECTOR_PREFIX });
+    for (const raw of rows.values()) {
+      const connector = normalizeConnector(raw);
+      if (connector && connector.client_id === clientId && connector.status === "active") {
+        return json({ ok: true, connector });
+      }
+    }
+    return json({ ok: false, code: "not_found" }, 404);
   }
 
   private async listConnectors(): Promise<Response> {
@@ -1059,6 +1159,18 @@ export class OAuthStoreDO {
       outcome = revoked;
     });
     if (!outcome) return json({ ok: false, code: "not_found" }, 404);
+    const currentGrant = normalizeConnectorGrant(
+      await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + (outcome as OAuthConnectorRecord).client_id),
+    );
+    if (currentGrant && currentGrant.connector_id === connectorId) {
+      await this.state.storage.put(GRANT_PREFIX + (outcome as OAuthConnectorRecord).client_id, {
+        ...currentGrant,
+        status: "revoked",
+        grant_generation: (currentGrant.grant_generation ?? 1) + 1,
+        revoked_at_ms: nowMs,
+        revoked_by: revokedBy,
+      } satisfies OAuthConnectorGrantRecord);
+    }
 
     const [refresh, access] = await Promise.all([
       this.state.storage.list<OAuthTokenRecord>({ prefix: REFRESH_PREFIX }),
@@ -1539,6 +1651,26 @@ export class OAuthStoreDO {
     if (!input) return json({ ok: false, code: "bad_request" }, 400);
     if (!(await this.connectorAllowsAccess(input.client_id, input.connector_id, input.grant_generation))) {
       return json({ ok: false, code: "invalid_grant" }, 400);
+    }
+    if (input.connector_id) {
+      const [refreshRows, accessRows] = await Promise.all([
+        this.state.storage.list<OAuthTokenRecord>({ prefix: REFRESH_PREFIX }),
+        this.state.storage.list<OAuthTokenRecord>({ prefix: ACCESS_PREFIX }),
+      ]);
+      const deletes: string[] = [];
+      for (const [key, token] of refreshRows) {
+        if (token.connector_id === input.connector_id) {
+          deletes.push(key);
+        }
+      }
+      for (const [key, token] of accessRows) {
+        if (token.connector_id === input.connector_id) {
+          deletes.push(key);
+        }
+      }
+      if (deletes.length > 0) {
+        await Promise.all(deletes.map((key) => this.state.storage.delete(key)));
+      }
     }
     return json({ ok: true, token: await this.createPair(input) });
   }

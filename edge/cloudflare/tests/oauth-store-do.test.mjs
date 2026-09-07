@@ -924,3 +924,83 @@ test("signing key errors never echo kid, private modulus, or private exponent", 
   assert.equal(text.includes(pair.private_jwk.d), false);
   assert.equal(text.includes(pair.public_jwk.n), false);
 });
+
+test("issuing fresh tokens for a connector fences older refresh tokens of that connector while siblings remain untouched", async () => {
+  const h = harness();
+  const pair = await generateJwkPair("test-kid");
+  await h.post("/internal/oauth/import", { now_sec: 100, overwrite: true, signing_key: pair });
+
+  const approve = async (requestId, clientId, codeHash) => {
+    await h.post("/internal/oauth/approval/put", {
+      request_id: requestId,
+      record: approval({
+        client_id: clientId,
+        approval_code_hash: codeHash,
+        resume_hash: `resume-${requestId}`,
+      }),
+      now_ms: 100,
+    });
+    return body(await h.post("/internal/oauth/approval/approve", {
+      request_id: requestId,
+      code_hash: codeHash,
+      approver: "device:owner",
+      now_ms: 200,
+    }));
+  };
+
+  const app1 = await approve("req-f1", "c-f1", "good-1");
+  const app2 = await approve("req-f2", "c-f2", "good-2");
+  const conn1 = app1.record.connector_id;
+  const conn2 = app2.record.connector_id;
+
+  // Issue tokens for conn1
+  const t1 = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "c-f1",
+    connector_id: conn1,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    now_sec: 100,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 86400,
+  }));
+  assert.equal(t1.ok, true);
+
+  // Issue tokens for sibling conn2
+  const t2 = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "c-f2",
+    connector_id: conn2,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    now_sec: 100,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 86400,
+  }));
+  assert.equal(t2.ok, true);
+
+  const t1RefreshHash = await hashOpaqueToken(t1.token.refresh_token);
+  const t2RefreshHash = await hashOpaqueToken(t2.token.refresh_token);
+
+  // Verify both refresh tokens exist
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t1RefreshHash, now_sec: 101 })).status, 200);
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t2RefreshHash, now_sec: 101 })).status, 200);
+
+  // Re-authorize/re-issue tokens for conn1
+  const t1_fresh = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "c-f1",
+    connector_id: conn1,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    now_sec: 105,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 86400,
+  }));
+  assert.equal(t1_fresh.ok, true);
+  const t1FreshRefreshHash = await hashOpaqueToken(t1_fresh.token.refresh_token);
+
+  // conn1 old refresh must be gone (fenced)
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t1RefreshHash, now_sec: 106 })).status, 404);
+  // conn1 fresh refresh must exist
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t1FreshRefreshHash, now_sec: 106 })).status, 200);
+  // sibling conn2 refresh must still exist untouched
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t2RefreshHash, now_sec: 106 })).status, 200);
+});
