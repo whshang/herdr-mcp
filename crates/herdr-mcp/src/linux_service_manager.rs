@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1052,14 +1052,45 @@ fn switch_current(link: &Path, target: &Path) -> Result<(), String> {
     let parent = link
         .parent()
         .ok_or_else(|| "runtime/current has no parent".to_owned())?;
+    let target = normalize_owned_current_target(parent, target)?;
     let temp = parent.join(format!(".current-{}", std::process::id()));
     let _ = fs::remove_file(&temp);
-    symlink(target, &temp)
+    symlink(&target, &temp)
         .map_err(|error| format!("cannot stage Linux runtime/current symlink: {error}"))?;
     fs::rename(&temp, link).map_err(|error| {
         let _ = fs::remove_file(&temp);
         format!("cannot switch Linux runtime/current: {error}")
     })
+}
+
+fn normalize_owned_current_target(runtime_root: &Path, target: &Path) -> Result<PathBuf, String> {
+    let relative = if target.is_absolute() {
+        target.strip_prefix(runtime_root).map_err(|_| {
+            format!(
+                "runtime/current target must stay inside managed runtime root {}: got {}",
+                runtime_root.display(),
+                target.display()
+            )
+        })?
+    } else {
+        target
+    };
+
+    let mut components = relative.components();
+    let valid = matches!(
+        components.next(),
+        Some(Component::Normal(value)) if value == "generations"
+    ) && matches!(
+        components.next(),
+        Some(Component::Normal(value)) if value.to_string_lossy().starts_with("rust-")
+    ) && components.next().is_none();
+    if !valid {
+        return Err(format!(
+            "runtime/current target must be generations/rust-*: got {}",
+            target.display()
+        ));
+    }
+    Ok(relative.to_path_buf())
 }
 
 fn restore_current(link: &Path, target: Option<&Path>) {
@@ -1284,6 +1315,35 @@ mod tests {
         assert!(!should_reconcile_link_after_install(true, false));
         assert!(!should_reconcile_link_after_install(false, true));
         assert!(!should_reconcile_link_after_install(false, false));
+    }
+
+    #[test]
+    fn current_target_normalizes_owned_absolute_generation_to_relative_layout() {
+        let runtime_root = Path::new("/home/tester/.config/herdr-mcp/runtime");
+        let absolute = runtime_root.join("generations/rust-0123456789abcdef");
+        assert_eq!(
+            normalize_owned_current_target(runtime_root, &absolute).unwrap(),
+            PathBuf::from("generations/rust-0123456789abcdef")
+        );
+        assert_eq!(
+            normalize_owned_current_target(
+                runtime_root,
+                Path::new("generations/rust-fedcba9876543210")
+            )
+            .unwrap(),
+            PathBuf::from("generations/rust-fedcba9876543210")
+        );
+        assert!(
+            normalize_owned_current_target(
+                runtime_root,
+                Path::new("/tmp/generations/rust-0123456789abcdef")
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_owned_current_target(runtime_root, Path::new("generations/not-rust"))
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
