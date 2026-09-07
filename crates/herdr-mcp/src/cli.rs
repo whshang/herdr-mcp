@@ -113,6 +113,9 @@ pub enum WorkerCommand {
     ConnectorApprove {
         request_id: String,
     },
+    ConnectorCancel {
+        request_id: String,
+    },
     ConnectorList,
     ConnectorRevoke {
         connector_id: String,
@@ -666,6 +669,18 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 request_id: request_id.clone(),
             }))
         }
+        Some("cancel") => {
+            let [request_id] = &args[1..] else {
+                return Err("connector cancel requires exactly one approval request id".to_owned());
+            };
+            if request_id.starts_with('-') || request_id.trim().is_empty() || request_id.len() > 256
+            {
+                return Err("connector cancel requires a valid approval request id".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::ConnectorCancel {
+                request_id: request_id.clone(),
+            }))
+        }
         Some("revoke") => {
             let [connector_id, confirm] = &args[1..] else {
                 return Err(
@@ -697,9 +712,11 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some(value) => Err(format!(
-            "unknown connector command '{value}' (expected list, approve, revoke, or revoke-client)"
+            "unknown connector command '{value}' (expected list, approve, cancel, revoke, or revoke-client)"
         )),
-        None => Err("connector requires list, approve, revoke, or revoke-client".to_owned()),
+        None => {
+            Err("connector requires list, approve, cancel, revoke, or revoke-client".to_owned())
+        }
     }
 }
 
@@ -1389,7 +1406,7 @@ commands require an enrolled-device credential.\n\n\
 pub fn connector_help() -> &'static str {
     "Herdr MCP connector management (OAuth connectors registered against the fleet)\n\n\
 All of these require the credential of a device already enrolled in the fleet;\nthere is no WebChat delegated admin path. Secrets are never echoed or written\nto argv.\n\n\
-  herdr-mcp connector list\n      Lists current connector instances plus non-secret legacy client/grant\n      inventory and token counts as returned by the Edge.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes a connector by its connector_id (begins with conn_).\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Revokes every Connector/grant for a legacy OAuth client and invalidates\n      its issued access/refresh credentials.\n"
+  herdr-mcp connector list\n      Lists current connector instances plus non-secret legacy client/grant\n      inventory and token counts as returned by the Edge.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes a connector by its connector_id (begins with conn_).\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Revokes every Connector/grant for a legacy OAuth client and invalidates\n      its issued access/refresh credentials.\n"
 }
 
 pub fn automation_help() -> &'static str {
@@ -2034,6 +2051,14 @@ mod tests {
         assert_eq!(
             parse(args(&["connector", "list"])).unwrap().command,
             Command::Worker(WorkerCommand::ConnectorList)
+        );
+        assert_eq!(
+            parse(args(&["connector", "cancel", "req_abc"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorCancel {
+                request_id: "req_abc".to_owned(),
+            })
         );
         assert_eq!(
             parse(args(&[

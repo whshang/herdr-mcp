@@ -135,6 +135,7 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.match(html, /document\.execCommand\('copy'\)/);
   assert.match(html, /Requires herdr-mcp v0\.4\.6 or newer\./);
   assert.match(html, /visible CLI prompt/);
+  assert.match(html, /do not refresh it while approval is pending/);
   assert.doesNotMatch(html, /no-echo prompt/);
   assert.match(html, /unknown command 'connector'/);
   assert.match(html, /computer that is already enrolled in this Worker/);
@@ -142,7 +143,7 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.doesNotMatch(html, /another Herdr WebChat/);
   assert.match(resp.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
   assert.match(resp.headers.get("content-security-policy") ?? "", /style-src 'unsafe-inline'/);
-  assert.match(resp.headers.get("content-security-policy") ?? "", /script-src 'unsafe-inline'/);
+  assert.match(resp.headers.get("content-security-policy") ?? "", /script-src 'self' 'unsafe-inline'/);
   assert.equal(resp.headers.get("x-frame-options"), "DENY");
   return { requestId, resumeToken, approvalCode, verifier, challenge, state };
 }
@@ -421,10 +422,13 @@ test("authorize: identical pending retry renders safe recovery page instead of J
   assert.match(retry.headers.get("content-type") ?? "", /^text\/html/);
   assert.equal(retry.headers.get("cache-control"), "no-store");
   assert.match(retry.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.match(retry.headers.get("content-security-policy") ?? "", /script-src 'self' 'unsafe-inline'/);
+  assert.match(retry.headers.get("content-security-policy") ?? "", /connect-src 'self'/);
   assert.ok(Number(retry.headers.get("retry-after")) > 0);
   const html = await retry.text();
   assert.match(html, /Approval already pending/);
   assert.match(html, /Use the original approval page if it is still open/);
+  assert.match(html, new RegExp(`herdr-mcp connector cancel ${pending.requestId}`));
   assert.match(html, /retry automatically after the old request expires/);
   assert.ok(html.includes(pending.requestId));
   assert.match(html, /location\.reload\(\)/);

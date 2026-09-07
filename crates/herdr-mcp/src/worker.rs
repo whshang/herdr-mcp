@@ -253,6 +253,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
         WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
+        WorkerCommand::ConnectorCancel { request_id } => cancel_connector(&paths, &request_id),
         WorkerCommand::ConnectorList => list_connectors(&paths),
         WorkerCommand::ConnectorRevoke { connector_id } => revoke_connector(&paths, &connector_id),
         WorkerCommand::ConnectorClientRevoke { client_id } => {
@@ -630,6 +631,48 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
             "approved_at_ms": payload.get("approved_at_ms").cloned().unwrap_or(Value::Null),
         }))
         .map_err(|error| format!("cannot encode connector approval result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cancel_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "connector approval cancel currently requires the macOS enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn cancel_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, String> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() || request_id.len() > 256 {
+        return Err("connector approval request id is invalid".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .post(endpoint(&identity.edge_origin, "/connectors/cancel")?)
+        .headers(headers)
+        .json(&json!({ "request_id": request_id }))
+        .send()
+        .map_err(|error| format!("cannot cancel Connector approval: {error}"))?;
+    let payload = parse_json_response(response, "connector approval cancel")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_cancel",
+            "request_id": request_id,
+            "connector_deleted": payload.get("connector_deleted").cloned().unwrap_or(Value::Bool(false)),
+        }))
+        .map_err(|error| format!("cannot encode connector cancel result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }

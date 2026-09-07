@@ -1,9 +1,8 @@
 use crate::exec_compact;
-use crate::exec_sessions::{enriched_exec_path, resolve_exec_shell};
+use crate::exec_sessions::{ExecRegistry, enriched_exec_path, resolve_exec_shell};
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
 use crate::projects;
-use regex::Regex;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::env;
@@ -29,7 +28,6 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 const PRE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: usize = 8_000;
-const PARTIAL_OUTPUT_LIMIT: usize = 4_000;
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static NEXT_EXEC: AtomicU64 = AtomicU64::new(0);
 static UTILITY_PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -70,7 +68,12 @@ struct LocalResult {
     truncated: bool,
 }
 
-pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
+pub fn run_durable(
+    client: &HerdrClient,
+    snapshot: &Value,
+    registry: &ExecRegistry,
+    args: &Value,
+) -> Value {
     let workspace_target = match required_str(args, "workspace") {
         Ok(value) => value,
         Err(error) => return error,
@@ -92,7 +95,6 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
-
     let Some(workspace) = resolve_workspace(snapshot, workspace_target) else {
         return json!({
             "ok": false,
@@ -100,14 +102,12 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
             "workspace": workspace_target,
         });
     };
-
     let topology = projects::derive_routing(snapshot);
     let current_projects = projects::projects_for_workspace(&topology, &workspace.id);
     let roots = current_projects
         .iter()
         .map(|project| project.root.clone())
         .collect::<Vec<_>>();
-
     let effective_root = match select_project_root(project_root, &roots) {
         Ok(Some(root)) => root,
         Ok(None) if roots.is_empty() => {
@@ -142,7 +142,6 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
             });
         }
     };
-
     let working =
         match mutation::check_with_topology(snapshot, &topology, &effective_root, confirm_busy) {
             Ok(working) => working,
@@ -153,7 +152,7 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
     #[cfg(windows)]
     {
         let _ = client;
-        let _ = timeout_ms;
+        let _ = registry;
         return json!({
             "ok": false,
             "code": "unsupported_platform",
@@ -166,11 +165,11 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
     }
 
     #[cfg(unix)]
-    run_unix(
+    run_unix_durable(
         client,
         snapshot,
-        &workspace.id,
-        &effective_root,
+        registry,
+        (&workspace.id, &effective_root),
         command,
         timeout_ms,
         &working,
@@ -178,17 +177,18 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
 }
 
 #[cfg(unix)]
-fn run_unix(
+fn run_unix_durable(
     client: &HerdrClient,
     snapshot: &Value,
-    workspace_id: &str,
-    effective_root: &Path,
+    registry: &ExecRegistry,
+    target: (&str, &Path),
     command: &str,
     timeout_ms: u64,
     working: &[Value],
 ) -> Value {
-    let started_at_ms = now_ms();
-    let (mut pane_id, mut created) =
+    let (workspace_id, effective_root) = target;
+    let started = Instant::now();
+    let (pane_id, created) =
         match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
             Ok(value) => value,
             Err(PrepareError::ControlPlane(message)) => {
@@ -236,230 +236,102 @@ fn run_unix(
         }
     }
 
-    let sequence = NEXT_EXEC.fetch_add(1, Ordering::Relaxed);
-    let exec_id = format!("utility-{}-{sequence}", std::process::id());
-    let marker = format!("__HM_EXEC_RUST_{}_{}_EXIT_", std::process::id(), sequence);
-    let exec_shell = resolve_exec_shell();
-    let script_path = temp_script_path(sequence);
-    let script_body = build_utility_exec_script(&exec_shell, effective_root, command, &exec_id);
-    if let Err(error) = write_executable_script(&script_path, &script_body) {
-        return json!({
-            "ok": false,
-            "reason": "script_write_failed",
-            "message": error,
-            "workspace": workspace_id,
-            "pane_id": pane_id,
-            "command": command,
-        });
-    }
-    let cmdline = utility_launch_line(&exec_shell, &script_path, &marker);
-
-    let send_result = client.call_with_timeout(
-        "pane.send_text",
-        json!({"pane_id": pane_id, "text": format!("{cmdline}\n")}),
-        PRE_SEND_TIMEOUT,
-    );
-    if let Err(error) = send_result {
-        if matches!(error.code.as_str(), "pane_not_found" | "unknown_pane") {
-            match recover_utility_pane(client, snapshot, workspace_id, effective_root, &pane_id) {
-                Ok((next_id, next_created)) => {
-                    pane_id = next_id;
-                    created |= next_created;
-                    match client.call_with_timeout(
-                        "pane.send_text",
-                        json!({"pane_id": pane_id, "text": format!("{cmdline}\n")}),
-                        PRE_SEND_TIMEOUT,
-                    ) {
-                        Ok(_) => {}
-                        Err(second)
-                            if matches!(
-                                second.code.as_str(),
-                                "pane_not_found" | "unknown_pane"
-                            ) =>
-                        {
-                            let _ = fs::remove_file(&script_path);
-                            return local_fallback(
-                                command,
-                                effective_root,
-                                workspace_id,
-                                timeout_ms,
-                                &format!("pane_recover_failed:{}", second.code),
-                                working,
-                                None,
-                            );
-                        }
-                        Err(second) => {
-                            return post_send_uncertain(
-                                workspace_id,
-                                &pane_id,
-                                command,
-                                working,
-                                &second,
-                                "recovered pane send was not acknowledged; command may or may not have run — inspect the utility pane and do not blind-retry",
-                            );
-                        }
-                    }
-                }
-                Err(PrepareError::ControlPlane(message)) => {
-                    let _ = fs::remove_file(&script_path);
-                    return local_fallback(
-                        command,
-                        effective_root,
-                        workspace_id,
-                        timeout_ms,
-                        "control_plane_taskgroup_pane_recover",
-                        working,
-                        Some(message),
-                    );
-                }
-                Err(PrepareError::Other { code, .. }) => {
-                    let _ = fs::remove_file(&script_path);
-                    return local_fallback(
-                        command,
-                        effective_root,
-                        workspace_id,
-                        timeout_ms,
-                        &format!("pane_recover_failed:{code}"),
-                        working,
-                        None,
-                    );
-                }
-            }
-        } else {
-            return post_send_uncertain(
-                workspace_id,
-                &pane_id,
-                command,
-                working,
-                &error,
-                if is_control_plane_taskgroup(&error.message) {
-                    "pane.send_text hit a control-plane TaskGroup — command may or may not have run; inspect utility pane or herdr_since, do not re-send the same command"
-                } else {
-                    "pane.send_text did not return delivery confirmation — inspect the utility pane before retrying"
-                },
-            );
-        }
-    }
-
-    let wait_timeout = Duration::from_millis(timeout_ms.saturating_add(10_000).min(MAX_TIMEOUT_MS));
-    let wait_result = client.call_with_timeout(
-        "pane.wait_for_output",
-        json!({
-            "pane_id": pane_id,
-            "source": "recent_unwrapped",
-            "match": {"type": "regex", "value": format!("{marker}\\d+__")},
-            "timeout_ms": timeout_ms,
-        }),
-        wait_timeout,
-    );
-    if let Err(error) = wait_result {
-        let partial = read_pane_text(client, &pane_id, 80)
-            .map(|text| {
-                let (_, segment) = extract_command_result(&text, &cmdline, &marker);
-                tail_chars(clean_terminal_output(&segment).trim(), PARTIAL_OUTPUT_LIMIT)
-            })
-            .unwrap_or_default();
-        let timed_out = error.code == "timeout";
-        let mut result = Map::new();
-        result.insert("ok".to_owned(), json!(false));
-        result.insert(
-            "code".to_owned(),
-            json!(if timed_out {
-                "exec_timeout"
-            } else {
-                error.code.as_str()
-            }),
-        );
-        if !timed_out {
-            result.insert(
-                "message".to_owned(),
-                json!(if is_control_plane_taskgroup(&error.message) {
-                    unwrap_control_plane_message(&error.message)
-                } else {
-                    error.message
-                }),
-            );
-        }
-        result.insert("backend".to_owned(), json!("utility_pane"));
-        result.insert("workspace".to_owned(), json!(workspace_id));
-        result.insert("pane_id".to_owned(), json!(pane_id));
-        result.insert("command".to_owned(), json!(command));
-        result.insert(
-            "effective_cwd".to_owned(),
-            json!(effective_root.to_string_lossy()),
-        );
-        result.insert(
-            "project_root".to_owned(),
-            json!(effective_root.to_string_lossy()),
-        );
-        result.insert("partial_output".to_owned(), json!(partial));
-        add_working_warning(&mut result, working);
-        result.insert(
-            "hint".to_owned(),
-            json!(if timed_out {
-                "command may still be running in the utility pane — inspect it via pane.read"
-            } else {
-                "wait_for_output failed after command delivery — inspect pane output and do not re-send the command"
-            }),
-        );
-        return Value::Object(result);
-    }
-
-    let raw = match read_pane_text(client, &pane_id, 200) {
+    let start = match registry.start_in_existing_pane(effective_root, command, &pane_id) {
         Ok(value) => value,
-        Err(error) => {
-            let mut result = json!({
+        Err(message) => {
+            return json!({
                 "ok": false,
-                "code": "pane_read_failed",
-                "message": if is_control_plane_taskgroup(&error.message) {
-                    unwrap_control_plane_message(&error.message)
-                } else {
-                    error.message
-                },
+                "code": "exec_start_failed",
+                "message": message,
                 "backend": "utility_pane",
                 "workspace": workspace_id,
                 "pane_id": pane_id,
                 "command": command,
-                "hint": "command was sent; use herdr_call pane.read on this pane_id — do not re-run herdr_exec with the same command",
+                "delivery_state": "unknown",
+                "hint": "utility command start did not complete cleanly; inspect pane/process state before retrying",
             });
-            if let Some(object) = result.as_object_mut() {
-                add_working_warning(object, working);
-            }
-            return result;
         }
     };
-
-    let (exit_code, segment) = extract_command_result(&raw, &cmdline, &marker);
-    let cleaned = clean_terminal_output(&segment);
-    let trimmed = cleaned.trim();
-    let truncated = trimmed.chars().count() > OUTPUT_LIMIT;
-    let output = tail_chars(trimmed, OUTPUT_LIMIT);
-    let mut result = Map::new();
-    result.insert("ok".to_owned(), json!(exit_code == Some(0)));
-    result.insert("backend".to_owned(), json!("utility_pane"));
-    result.insert("workspace".to_owned(), json!(workspace_id));
-    result.insert("pane_id".to_owned(), json!(pane_id));
-    result.insert("created_utility_pane".to_owned(), json!(created));
-    result.insert("command".to_owned(), json!(command));
-    result.insert("exit_code".to_owned(), json!(exit_code));
-    result.insert(
-        "effective_cwd".to_owned(),
-        json!(effective_root.to_string_lossy()),
-    );
-    result.insert(
-        "project_root".to_owned(),
-        json!(effective_root.to_string_lossy()),
-    );
-    result.insert("truncated".to_owned(), json!(truncated));
-    exec_compact::insert_compacted_or_raw(
-        &mut result,
-        "output",
-        &output,
-        exit_code == Some(0) && !truncated,
-    );
-    insert_sync_completion(&mut result, started_at_ms, output.len());
-    add_working_warning(&mut result, working);
-    Value::Object(result)
+    let Some(session_id) = start.get("session_id").and_then(Value::as_str) else {
+        return json!({"ok": false, "code": "exec_start_failed", "message": "durable exec start returned no session_id"});
+    };
+    let deadline = Duration::from_millis(timeout_ms);
+    loop {
+        let read = registry.read(session_id, "both", 0, 65_536);
+        let completed = read.get("phase").and_then(Value::as_str) == Some("completed");
+        if completed {
+            let exit_code = read.get("exit_code").cloned().unwrap_or(Value::Null);
+            let ok = exit_code.as_i64() == Some(0);
+            let output = read.get("text").cloned().unwrap_or_else(|| json!(""));
+            let mut result = Map::new();
+            result.insert("ok".to_owned(), json!(ok));
+            result.insert("backend".to_owned(), json!("utility_pane"));
+            result.insert("workspace".to_owned(), json!(workspace_id));
+            result.insert("pane_id".to_owned(), json!(pane_id));
+            result.insert("created_utility_pane".to_owned(), json!(created));
+            result.insert("command".to_owned(), json!(command));
+            result.insert("session_id".to_owned(), json!(session_id));
+            result.insert("op_id".to_owned(), json!(session_id));
+            result.insert("phase".to_owned(), json!("completed"));
+            result.insert("exit_code".to_owned(), exit_code);
+            result.insert("output".to_owned(), output);
+            result.insert(
+                "effective_cwd".to_owned(),
+                json!(effective_root.to_string_lossy()),
+            );
+            result.insert(
+                "project_root".to_owned(),
+                json!(effective_root.to_string_lossy()),
+            );
+            if let Some(progress) = read.get("progress") {
+                result.insert("progress".to_owned(), progress.clone());
+            }
+            if let Some(truncated) = read.get("truncated") {
+                result.insert("truncated".to_owned(), truncated.clone());
+            }
+            if let Some(compacted) = read.get("compacted") {
+                result.insert("compacted".to_owned(), compacted.clone());
+            }
+            if let Some(counts) = read.get("counts") {
+                result.insert("counts".to_owned(), counts.clone());
+            }
+            add_working_warning(&mut result, working);
+            return Value::Object(result);
+        }
+        if started.elapsed() >= deadline {
+            let partial = read.get("text").cloned().unwrap_or_else(|| json!(""));
+            let mut result = Map::new();
+            result.insert("ok".to_owned(), json!(false));
+            result.insert("code".to_owned(), json!("exec_timeout"));
+            result.insert("backend".to_owned(), json!("utility_pane"));
+            result.insert("workspace".to_owned(), json!(workspace_id));
+            result.insert("pane_id".to_owned(), json!(pane_id));
+            result.insert("created_utility_pane".to_owned(), json!(created));
+            result.insert("command".to_owned(), json!(command));
+            result.insert("session_id".to_owned(), json!(session_id));
+            result.insert("op_id".to_owned(), json!(session_id));
+            result.insert("phase".to_owned(), json!("running"));
+            result.insert("partial_output".to_owned(), partial);
+            result.insert(
+                "effective_cwd".to_owned(),
+                json!(effective_root.to_string_lossy()),
+            );
+            result.insert(
+                "project_root".to_owned(),
+                json!(effective_root.to_string_lossy()),
+            );
+            if let Some(progress) = read.get("progress") {
+                result.insert("progress".to_owned(), progress.clone());
+            }
+            add_working_warning(&mut result, working);
+            result.insert(
+                "hint".to_owned(),
+                json!("command is still tracked; call herdr_exec_read with this session_id for final status/output and do not re-send it"),
+            );
+            return Value::Object(result);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn resolve_workspace(snapshot: &Value, target: &str) -> Option<WorkspaceRecord> {
@@ -601,65 +473,6 @@ fn prepare_utility_pane(
     Err(PrepareError::ControlPlane(last_taskgroup.unwrap_or_else(
         || "utility pane unavailable before send".to_owned(),
     )))
-}
-
-#[cfg(unix)]
-fn recover_utility_pane(
-    client: &HerdrClient,
-    snapshot: &Value,
-    workspace_id: &str,
-    cwd: &Path,
-    stale_id: &str,
-) -> Result<(String, bool), PrepareError> {
-    let _guard = UTILITY_PREPARE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    forget_utility_pane(workspace_id, Some(stale_id));
-    let panes = fresh_panes(client, workspace_id).map_err(|error| {
-        if is_control_plane_taskgroup(&error.message) {
-            PrepareError::ControlPlane(error.message)
-        } else {
-            PrepareError::Other {
-                code: error.code,
-                message: error.message,
-            }
-        }
-    })?;
-    if let Some(pane) = panes
-        .iter()
-        .find(|pane| pane.id != stale_id && pane.label.as_deref() == Some(UTILITY_LABEL))
-    {
-        remember_utility_pane(workspace_id, &pane.id);
-        return Ok((pane.id.clone(), false));
-    }
-    let cached = panes_from_snapshot(snapshot, workspace_id);
-    let seed = panes
-        .iter()
-        .find(|pane| pane.id != stale_id)
-        .or_else(|| panes.first())
-        .map(|pane| pane.id.clone())
-        .or_else(|| {
-            cached
-                .iter()
-                .find(|pane| pane.id != stale_id)
-                .map(|pane| pane.id.clone())
-        });
-    split_utility_pane(client, workspace_id, seed.as_deref(), cwd)
-        .map(|pane| {
-            remember_utility_pane(workspace_id, &pane);
-            (pane, true)
-        })
-        .map_err(|error| {
-            if is_control_plane_taskgroup(&error.message) {
-                PrepareError::ControlPlane(error.message)
-            } else {
-                PrepareError::Other {
-                    code: error.code,
-                    message: error.message,
-                }
-            }
-        })
 }
 
 fn choose_utility_pane<'a>(
@@ -863,27 +676,6 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[cfg(unix)]
-fn utility_launch_line(exec_shell: &Path, script_path: &Path, marker: &str) -> String {
-    format!(
-        "{} {}; ec=$?; rm -f -- {}; printf '\\n{}%s__' \"$ec\"",
-        shell_quote(exec_shell.to_string_lossy().as_ref()),
-        shell_quote(script_path.to_string_lossy().as_ref()),
-        shell_quote(script_path.to_string_lossy().as_ref()),
-        marker,
-    )
-}
-
-fn temp_script_path(sequence: u64) -> PathBuf {
-    let base = env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
-    base.join(format!(
-        "herdr-mcp-exec-{}-{sequence}.sh",
-        std::process::id()
-    ))
-}
-
-#[cfg(unix)]
 fn write_executable_script(path: &Path, body: &str) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -927,62 +719,6 @@ fn cleanup_stale_scripts() -> usize {
         }
     }
     removed
-}
-
-fn read_pane_text(client: &HerdrClient, pane_id: &str, lines: u64) -> Result<String, HerdrError> {
-    let result = client.call_with_timeout(
-        "pane.read",
-        json!({
-            "pane_id": pane_id,
-            "source": "recent_unwrapped",
-            "lines": lines,
-            "strip_ansi": true,
-        }),
-        PRE_SEND_TIMEOUT,
-    )?;
-    let read = result.get("read").unwrap_or(&result);
-    Ok(read
-        .get("content")
-        .and_then(Value::as_str)
-        .or_else(|| read.get("text").and_then(Value::as_str))
-        .or_else(|| read.get("output").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_owned())
-}
-
-fn extract_command_result(raw: &str, cmdline: &str, marker: &str) -> (Option<i32>, String) {
-    let segment_start = raw.rfind(cmdline).map_or(0, |index| index + cmdline.len());
-    let after_echo = &raw[segment_start..];
-    let marker_index = after_echo.find(marker).unwrap_or(after_echo.len());
-    let segment = after_echo[..marker_index].to_owned();
-    let exit_code = raw.match_indices(marker).find_map(|(index, _)| {
-        let suffix = &raw[index + marker.len()..];
-        let digits = suffix
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        (!digits.is_empty() && suffix[digits.len()..].starts_with("__"))
-            .then(|| digits.parse::<i32>().ok())
-            .flatten()
-    });
-    (exit_code, segment)
-}
-
-fn clean_terminal_output(text: &str) -> String {
-    static ANSI: OnceLock<Regex> = OnceLock::new();
-    let ansi =
-        ANSI.get_or_init(|| Regex::new(r"\x1b\[\??[0-9;]*[A-Za-z]").expect("valid ansi regex"));
-    let stripped = ansi.replace_all(text, "");
-    stripped
-        .lines()
-        .filter(|line| !line.chars().any(|ch| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch)))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn tail_chars(text: &str, limit: usize) -> String {
-    let count = text.chars().count();
-    text.chars().skip(count.saturating_sub(limit)).collect()
 }
 
 fn is_control_plane_taskgroup(message: &str) -> bool {
@@ -1210,42 +946,6 @@ fn signal_name(signal: i32) -> String {
     }
 }
 
-fn post_send_uncertain(
-    workspace_id: &str,
-    pane_id: &str,
-    command: &str,
-    working: &[Value],
-    error: &HerdrError,
-    hint: &str,
-) -> Value {
-    let mut result = Map::new();
-    result.insert("ok".to_owned(), json!(false));
-    result.insert(
-        "code".to_owned(),
-        json!(if is_control_plane_taskgroup(&error.message) {
-            "delivery_uncertain"
-        } else {
-            error.code.as_str()
-        }),
-    );
-    result.insert("failure".to_owned(), json!("herdr_internal"));
-    result.insert(
-        "message".to_owned(),
-        json!(if is_control_plane_taskgroup(&error.message) {
-            unwrap_control_plane_message(&error.message)
-        } else {
-            error.message.clone()
-        }),
-    );
-    result.insert("workspace".to_owned(), json!(workspace_id));
-    result.insert("pane_id".to_owned(), json!(pane_id));
-    result.insert("command".to_owned(), json!(command));
-    result.insert("delivery".to_owned(), json!("uncertain"));
-    result.insert("hint".to_owned(), json!(hint));
-    add_working_warning(&mut result, working);
-    Value::Object(result)
-}
-
 fn add_working_warning(result: &mut Map<String, Value>, working: &[Value]) {
     if !working.is_empty() {
         result.insert("warnings".to_owned(), json!({"working": working}));
@@ -1393,26 +1093,6 @@ mod tests {
             assert!(script.contains("cd -- '/tmp/a'\\''b' || exit 127"));
             assert!(script.ends_with("git log -1\n"));
         }
-    }
-
-    #[test]
-    fn command_result_uses_last_echo_and_real_marker() {
-        let marker = "MARK";
-        let cmd = "'/bin/sh' '/tmp/x'; ec=$?; printf 'MARK%s__' \"$ec\"";
-        let raw = format!("old\n{cmd}\nhello\n{marker}42__\nprompt");
-        let (code, segment) = extract_command_result(&raw, cmd, marker);
-        assert_eq!(code, Some(42));
-        assert_eq!(segment.trim(), "hello");
-    }
-
-    #[test]
-    fn partial_segment_never_includes_prior_pane_history() {
-        let marker = "MARK";
-        let cmd = "'/bin/sh' '/tmp/x'; ec=$?; printf 'MARK%s__' \"$ec\"";
-        let raw = format!("SECRET_FROM_OLD_HISTORY\n{cmd}\ncurrent-only\n");
-        let (_, segment) = extract_command_result(&raw, cmd, marker);
-        assert_eq!(segment.trim(), "current-only");
-        assert!(!segment.contains("SECRET_FROM_OLD_HISTORY"));
     }
 
     #[test]

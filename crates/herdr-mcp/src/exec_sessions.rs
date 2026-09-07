@@ -73,6 +73,7 @@ enum SessionBackend {
         spool: PaneSpoolPaths,
         stdout_offset: Mutex<u64>,
         stderr_offset: Mutex<u64>,
+        close_on_complete: bool,
     },
     Completed,
 }
@@ -553,6 +554,7 @@ impl ExecRegistry {
                 spool,
                 stdout_offset: Mutex::new(0),
                 stderr_offset: Mutex::new(0),
+                close_on_complete: true,
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
@@ -583,6 +585,93 @@ impl ExecRegistry {
             "started_at": iso_from_ms(started_at_ms),
             "pid": Value::Null,
             "backend": "herdr_pane",
+            "pane_id": pane_id,
+            "phase": "started",
+            "progress": {
+                "bytes_read": 0,
+                "bytes_total": 0,
+                "elapsed_ms": 0,
+            },
+        }))
+    }
+
+    pub fn start_in_existing_pane(
+        &self,
+        cwd: &Path,
+        command: &str,
+        pane_id: &str,
+    ) -> Result<Value, String> {
+        self.prune();
+        if command.is_empty() {
+            return Err("command must not be empty".to_owned());
+        }
+        let client = self
+            .inner
+            .client
+            .clone()
+            .ok_or_else(|| "Herdr pane backend is unavailable".to_owned())?;
+        let id = new_session_id();
+        let script_path = pane_script_path(&id);
+        let spool = pane_spool_paths(&id);
+        write_pane_script(&script_path, cwd, command, &spool)?;
+        let launch_line = format!(
+            "{} {}",
+            shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
+            shell_quote(script_path.to_string_lossy().as_ref()),
+        );
+        if let Err(error) = client.call_with_timeout(
+            "pane.send_text",
+            json!({"pane_id": pane_id, "text": format!("{launch_line}\n")}),
+            PANE_RPC_TIMEOUT,
+        ) {
+            cleanup_pane_files(&script_path, &spool);
+            return Err(format!("cannot start utility pane command: {error}"));
+        }
+        let started_at_ms = now_ms();
+        let session = Arc::new(Session {
+            id: id.clone(),
+            cwd: cwd.to_path_buf(),
+            command: command.to_owned(),
+            started_at_ms,
+            pid: None,
+            backend: SessionBackend::Pane {
+                client,
+                pane_id: pane_id.to_owned(),
+                script_path,
+                spool,
+                stdout_offset: Mutex::new(0),
+                stderr_offset: Mutex::new(0),
+                close_on_complete: false,
+            },
+            buffers: Mutex::new(Buffers::default()),
+            status: Mutex::new(SessionStatus::default()),
+        });
+        if let Err(error) = self
+            .inner
+            .state_store
+            .lock()
+            .map_err(|_| "exec state store lock poisoned".to_owned())
+            .and_then(|store| store.record_pane_exec_running(&id, started_at_ms))
+        {
+            terminate_session(&session, true, None);
+            return Err(format!(
+                "cannot durably register utility exec session; utility pane was closed before return: {error}"
+            ));
+        }
+        self.inner
+            .sessions
+            .lock()
+            .map_err(|_| "exec registry lock poisoned".to_owned())?
+            .insert(id.clone(), Arc::clone(&session));
+        spawn_monitor(Arc::clone(&session), Arc::downgrade(&self.inner));
+        Ok(json!({
+            "ok": true,
+            "session_id": id,
+            "cwd": cwd.to_string_lossy(),
+            "command": command,
+            "started_at": iso_from_ms(started_at_ms),
+            "pid": Value::Null,
+            "backend": "utility_pane",
             "pane_id": pane_id,
             "phase": "started",
             "progress": {
@@ -1227,6 +1316,7 @@ fn refresh_pane_session(session: &Arc<Session>, registry: Option<&RegistryInner>
         spool,
         stdout_offset,
         stderr_offset,
+        close_on_complete,
     } = &session.backend
     else {
         return false;
@@ -1239,8 +1329,13 @@ fn refresh_pane_session(session: &Arc<Session>, registry: Option<&RegistryInner>
     let transitioned = complete_session(session, registry, Some(exit_code), None);
     if transitioned {
         cleanup_pane_files(script_path, spool);
-        let _ =
-            client.call_with_timeout("pane.close", json!({"pane_id": pane_id}), PANE_RPC_TIMEOUT);
+        if *close_on_complete {
+            let _ = client.call_with_timeout(
+                "pane.close",
+                json!({"pane_id": pane_id}),
+                PANE_RPC_TIMEOUT,
+            );
+        }
     }
     true
 }
@@ -1725,6 +1820,11 @@ mod tests {
 
     #[cfg(unix)]
     fn pane_session(id: &str) -> (Arc<Session>, PathBuf) {
+        pane_session_with_close(id, true)
+    }
+
+    #[cfg(unix)]
+    fn pane_session_with_close(id: &str, close_on_complete: bool) -> (Arc<Session>, PathBuf) {
         let socket = env::temp_dir().join(format!(
             "herdr-mcp-pane-monitor-{}-{}.sock",
             std::process::id(),
@@ -1746,11 +1846,47 @@ mod tests {
                 spool,
                 stdout_offset: Mutex::new(0),
                 stderr_offset: Mutex::new(0),
+                close_on_complete,
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
         });
         (session, socket)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_utility_pane_session_keeps_operation_output_and_does_not_close_pane() {
+        let id = format!(
+            "es_utility_owned_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (session, socket) = pane_session_with_close(&id, false);
+        let registry = registry();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_pane_exec_running(&id, session.started_at_ms)
+            .unwrap();
+        let spool = pane_spool(&session).clone();
+        fs::write(&spool.stdout, "current-command-only").unwrap();
+        fs::write(&spool.status, "0\n").unwrap();
+
+        assert!(refresh_pane_session(&session, Some(&registry.inner)));
+        let status = session_status(&session);
+        assert!(status.closed);
+        assert_eq!(status.exit_code, Some(0));
+        let buffers = session.buffers.lock().unwrap();
+        let (output, _) = read_buffer_slice(&buffers, None, 0, usize::MAX);
+        assert_eq!(output, b"current-command-only");
+        assert!(!spool.status.exists());
+        assert!(
+            !socket.exists(),
+            "utility completion must not call pane.close"
+        );
     }
 
     #[cfg(unix)]

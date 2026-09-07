@@ -41,6 +41,11 @@ pub fn since(
 
 pub fn methods(query: &str) -> Value {
     let mut local = crate::progressive_skills::local_method_schemas(query);
+    for method in &mut local {
+        if let Some(object) = method.as_object_mut() {
+            object.insert("route".to_owned(), json!("workstation_local"));
+        }
+    }
     match schema::list_methods(query) {
         Ok(methods) => {
             let mut combined = methods.iter().map(method_json).collect::<Vec<_>>();
@@ -129,6 +134,9 @@ pub fn call_with_local(
     method: &str,
     params: Value,
 ) -> Value {
+    if let Some(error) = target_kind_preflight(snapshot, method, &params) {
+        return error;
+    }
     if method.starts_with("herdr_mcp.") {
         return skill.local_call(method, &params, snapshot).unwrap_or_else(|| {
             json!({
@@ -147,6 +155,36 @@ pub fn call_with_local(
         return reconcile_historical_linked_worktree_remove(client, snapshot, &params, result);
     }
     result
+}
+
+fn target_kind_preflight(snapshot: &Value, method: &str, params: &Value) -> Option<Value> {
+    if method != "agent.read" {
+        return None;
+    }
+    let target = params.get("target").and_then(Value::as_str)?;
+    let pane = snapshot
+        .get("panes")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|pane| pane.get("pane_id").and_then(Value::as_str) == Some(target))?;
+    let has_agent = pane
+        .get("agent")
+        .and_then(Value::as_str)
+        .is_some_and(|agent| !agent.trim().is_empty());
+    if has_agent {
+        return None;
+    }
+    Some(json!({
+        "ok": false,
+        "code": "target_kind_mismatch",
+        "method": method,
+        "target": target,
+        "target_kind": "utility_pane",
+        "correct_method": "pane.read",
+        "message": format!(
+            "agent.read target {target} is a pane without an Agent; use pane.read with pane_id={target}"
+        ),
+    }))
 }
 
 fn reconcile_historical_linked_worktree_remove(
@@ -265,15 +303,30 @@ where
 }
 
 fn method_json(method: &MethodSchema) -> Value {
-    json!({
+    let target_kind = if method.method.starts_with("agent.") {
+        Some("agent")
+    } else if method.method.starts_with("pane.") {
+        Some("pane")
+    } else {
+        None
+    };
+    let mut value = json!({
         "method": method.method,
         "source": "herdr_socket",
+        "route": "workstation_routed",
         "params": {
             "properties": method.properties,
             "required": method.required,
             "empty": method.empty,
         },
-    })
+    });
+    if let Some(target_kind) = target_kind {
+        value
+            .as_object_mut()
+            .expect("method schema is an object")
+            .insert("target_kind".to_owned(), json!(target_kind));
+    }
+    value
 }
 
 fn issue_json(issue: &ValidationIssue) -> Value {
@@ -410,6 +463,54 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_REPO: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn agent_read_utility_pane_preflight_names_pane_read_surface() {
+        let snapshot = json!({
+            "panes": [
+                {
+                    "pane_id": "w1:p2",
+                    "workspace_id": "w1",
+                    "terminal_title": "herdr-mcp:utility"
+                },
+                {
+                    "pane_id": "w1:p3",
+                    "workspace_id": "w1",
+                    "agent": "pi"
+                }
+            ]
+        });
+        let error = target_kind_preflight(
+            &snapshot,
+            "agent.read",
+            &json!({"target": "w1:p2", "source": "recent_unwrapped"}),
+        )
+        .expect("utility pane must be rejected before socket delivery");
+        assert_eq!(error["code"], "target_kind_mismatch");
+        assert_eq!(error["target_kind"], "utility_pane");
+        assert_eq!(error["correct_method"], "pane.read");
+        assert!(
+            target_kind_preflight(
+                &snapshot,
+                "agent.read",
+                &json!({"target": "w1:p3", "source": "recent_unwrapped"}),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn method_schema_exposes_route_and_target_kind() {
+        let method = MethodSchema {
+            method: "agent.read".to_owned(),
+            properties: serde_json::Map::new(),
+            required: Vec::new(),
+            empty: false,
+        };
+        let value = method_json(&method);
+        assert_eq!(value["route"], "workstation_routed");
+        assert_eq!(value["target_kind"], "agent");
+    }
 
     fn temp_repo() -> std::path::PathBuf {
         let unique = SystemTime::now()

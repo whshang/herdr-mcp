@@ -136,6 +136,41 @@ function callToolResult(structured: Record<string, unknown>, isError = false): R
   };
 }
 
+const PRIVATE_METHOD_ROUTES = [
+  { method: "herdr_mcp.device.pair", route: "edge_local", next_surface: "herdr_call" },
+  { method: "herdr_mcp.device.revoke", route: "edge_local", next_surface: "herdr_call" },
+  { method: "herdr_mcp.connector.approve", route: "edge_local", next_surface: "herdr_call" },
+  { method: "herdr_mcp.connector.revoke", route: "edge_local", next_surface: "herdr_call" },
+  { method: "herdr_mcp.text.read", route: "workstation_routed", next_surface: "herdr_call" },
+  { method: "herdr_mcp.text.write", route: "workstation_routed", next_surface: "herdr_call" },
+  { method: "herdr_mcp.skill.list", route: "unsupported", available_on: "local_runtime" },
+  { method: "herdr_mcp.skill.describe", route: "unsupported", available_on: "local_runtime" },
+  { method: "herdr_mcp.skill.load", route: "unsupported", available_on: "local_runtime" },
+  { method: "herdr_mcp.planning.advise", route: "unsupported", available_on: "local_runtime" },
+  { method: "herdr_mcp.github.status", route: "unsupported", available_on: "local_runtime" },
+] as const;
+
+function privateMethodRoutePreflight(query: unknown): Record<string, unknown> | null {
+  if (typeof query !== "string") return null;
+  const normalized = query.trim().toLowerCase();
+  if (!normalized.startsWith("herdr_mcp.")) return null;
+  const methods = PRIVATE_METHOD_ROUTES.filter((entry) => entry.method.toLowerCase().includes(normalized));
+  if (methods.length > 0) {
+    return { ok: true, count: methods.length, methods, source: "edge_route_preflight" };
+  }
+  return {
+    ok: true,
+    count: 1,
+    methods: [{
+      method: query.trim(),
+      route: "unsupported",
+      available_on: null,
+      next_surface: "herdr_methods",
+    }],
+    source: "edge_route_preflight",
+  };
+}
+
 /** Preserve a complete local MCP CallToolResult, including image/audio content. */
 function isMcpCallToolResult(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && Array.isArray(value.content);
@@ -330,6 +365,11 @@ export async function handleMcp(
         bytes: budget.bytes,
         maxBytes: budget.maxBytes,
       });
+    }
+
+    if (name === "herdr_methods") {
+      const preflight = privateMethodRoutePreflight(args.query);
+      if (preflight) return rpcResult(id, callToolResult(preflight));
     }
 
     if (name === "herdr_devices") {
@@ -739,6 +779,8 @@ export async function handleMcp(
           retryable: false,
           delivery_state: "not_delivered",
           failure_layer: "edge_routing",
+          route: "unsupported",
+          next_surface: "herdr_methods",
         }, true));
       }
     }
