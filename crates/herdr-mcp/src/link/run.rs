@@ -185,8 +185,7 @@ fn load_link_token_from_keychain(
             let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
             let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
                 .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
-            return crate::credential_store::load(&service, &username)
-                .map_err(DaemonConfigError::Message);
+            crate::credential_store::load(&service, &username).map_err(DaemonConfigError::Message)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -230,8 +229,8 @@ fn load_runtime_token_from_server_plist(
         #[cfg(target_os = "linux")]
         {
             let _ = env_map;
-            return crate::linux_service_manager::runtime_token_for_link()
-                .map_err(DaemonConfigError::Message);
+            crate::linux_service_manager::runtime_token_for_link()
+                .map_err(DaemonConfigError::Message)
         }
 
         #[cfg(not(target_os = "linux"))]

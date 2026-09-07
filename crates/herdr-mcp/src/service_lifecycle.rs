@@ -42,7 +42,7 @@ where
 pub(crate) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
-        return service_manager::run(command);
+        service_manager::run(command)
     }
 
     #[cfg(not(target_os = "linux"))]

@@ -17,7 +17,7 @@ use std::process::ExitCode;
 pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
-        return crate::linux_service_manager::run(command);
+        crate::linux_service_manager::run(command)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -107,7 +107,7 @@ pub fn rollback_target_runtime_binary() -> Result<Option<std::path::PathBuf>, St
 pub fn doctor_status() -> Result<serde_json::Value, String> {
     #[cfg(target_os = "linux")]
     {
-        return crate::linux_service_manager::doctor_status();
+        crate::linux_service_manager::doctor_status()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
