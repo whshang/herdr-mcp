@@ -291,8 +291,32 @@ globalThis.chrome = {
               device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
               browser_family: "chrome",
               extension_version: body.extension_version,
+              consent: {
+                webchat_control: false,
+                tool_bridge: false,
+                tool_bridge_workstation_mutation: false,
+                revision: 0,
+              },
+              consent_revision: 0,
             },
           }
+          : body.operation === "endpoint.consent"
+            ? {
+              ok: true,
+              endpoint: {
+                endpoint_ref: "bep_test",
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                browser_family: "chrome",
+                extension_version: "0.1.90",
+                consent: {
+                  webchat_control: body.webchat_control_allowed === true,
+                  tool_bridge: body.tool_bridge_allowed === true,
+                  tool_bridge_workstation_mutation: body.tool_bridge_mutation_allowed === true,
+                  revision: body.expected_consent_revision + 1,
+                },
+                consent_revision: body.expected_consent_revision + 1,
+              },
+            }
           : body.operation === "resource.observe"
             ? {
               ok: true,
@@ -618,6 +642,44 @@ for (const startup of listeners.onStartup) startup();
 await new Promise((resolve) => setTimeout(resolve, 0));
 ok(browserRegistryRequests.length === 2 && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
   "browser startup does not create a second endpoint registration loop or rotate the profile seed");
+
+const deniedConsent = await dispatchMessage({
+  type: "h2w_browser_webchat_control_set",
+  allowed: true,
+}, { url: "https://gemini.google.com/app/not-a-user-gesture" });
+ok(deniedConsent?.ok === false && deniedConsent?.error === "browser-consent-user-gesture-required",
+  "browser consent rejects messages that do not originate from the Control Center",
+  JSON.stringify(deniedConsent));
+
+const consentBefore = browserRegistryRequests.length;
+const allowedConsent = await dispatchMessage({
+  type: "h2w_browser_webchat_control_set",
+  allowed: true,
+}, { url: "chrome-extension://test-ext/control-center.html" });
+const consentRequests = browserRegistryRequests.slice(consentBefore);
+ok(allowedConsent?.ok === true
+    && allowedConsent?.browserEndpoint?.consent?.webchat_control === true
+    && allowedConsent?.browserEndpoint?.consent_revision === 1,
+  "Control Center user gesture enables only local WebChat Control consent",
+  JSON.stringify(allowedConsent));
+ok(consentRequests.length === 1
+    && consentRequests[0]?.operation === "endpoint.consent"
+    && consentRequests[0]?.expected_consent_revision === 0
+    && consentRequests[0]?.webchat_control_allowed === true
+    && consentRequests[0]?.tool_bridge_allowed === false
+    && consentRequests[0]?.tool_bridge_mutation_allowed === false,
+  "WebChat Control consent preserves both Tool Bridge gates as disabled",
+  JSON.stringify(consentRequests));
+
+const disabledConsent = await dispatchMessage({
+  type: "h2w_browser_webchat_control_set",
+  allowed: false,
+}, { url: "chrome-extension://test-ext/control-center.html" });
+ok(disabledConsent?.ok === true
+    && disabledConsent?.browserEndpoint?.consent?.webchat_control === false
+    && disabledConsent?.browserEndpoint?.consent_revision === 2,
+  "Control Center can narrow WebChat Control consent without affecting Tool Bridge",
+  JSON.stringify(disabledConsent));
 
 const actionClick = listeners.onActionClicked[0];
 ok(!!actionClick, "toolbar action click listener registered");

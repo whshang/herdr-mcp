@@ -69,6 +69,12 @@ button.danger { border-color: color-mix(in srgb, var(--danger) 62%, var(--border
 .page-context-strip { display: flex; align-items: center; gap: 5px; margin: 6px 8px 0; padding: 4px 7px; color: var(--muted); font-size: 10px; }
 .page-context-strip[hidden] { display: none; }
 .page-context-strip strong { color: var(--text); font-size: 10.5px; }
+.page-context-spacer { flex: 1 1 auto; }
+.webchat-control-consent { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.webchat-control-consent[hidden] { display: none; }
+.webchat-control-consent input { margin: 0; width: 12px; height: 12px; }
+.webchat-control-consent.enabled { color: var(--text); }
+.webchat-control-consent.busy { cursor: progress; opacity: .65; }
 .context-separator { opacity: .55; }
 .context-error { color: var(--danger); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace.context-bound { border-color: var(--accent); box-shadow: inset 2px 0 0 var(--accent); }

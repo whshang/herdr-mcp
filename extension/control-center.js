@@ -30,6 +30,7 @@ let fleetContext = { loading: true, response: null, error: null, updatedAt: 0 };
 let devicePanelCollapsed = false;
 let bindingMutationWorkspaceId = null;
 let actionInFlight = false;
+let browserConsentInFlight = false;
 
 const $ = (id) => document.getElementById(id);
 const runtimeDot = $("runtimeDot");
@@ -47,6 +48,8 @@ const pageContextCard = $("pageContextCard");
 const pageContextTitle = $("pageContextTitle");
 const pageContextMeta = $("pageContextMeta");
 const pageContextHelp = $("pageContextHelp");
+const webchatControlConsent = $("webchatControlConsent");
+const webchatControlCheckbox = $("webchatControlCheckbox");
 const targetCard = $("targetCard");
 const targetTitle = $("targetTitle");
 const targetKindBadge = $("targetKindBadge");
@@ -350,6 +353,15 @@ function renderPageContext(state) {
   pageContextMeta.title = identity.join(" · ");
   pageContextHelp.hidden = !pageContext.error;
   pageContextHelp.textContent = pageContext.error || "";
+  const endpoint = pageContext.response?.browserEndpoint || null;
+  const hasBrowserEndpoint = Boolean(endpoint?.endpoint_ref);
+  const webchatControlAllowed = endpoint?.consent?.webchat_control === true;
+  webchatControlConsent.hidden = !hasBrowserEndpoint;
+  webchatControlConsent.classList.toggle("enabled", webchatControlAllowed);
+  webchatControlConsent.classList.toggle("busy", browserConsentInFlight);
+  webchatControlConsent.title = hasBrowserEndpoint ? t("cc_webchat_control_help") : "";
+  webchatControlCheckbox.checked = webchatControlAllowed;
+  webchatControlCheckbox.disabled = browserConsentInFlight || !hasBrowserEndpoint;
 }
 
 async function refreshPageContext() {
@@ -899,6 +911,31 @@ deviceToggleButton.addEventListener("click", () => {
   devicePanelCollapsed = !devicePanelCollapsed;
   void persistDevicePanelCollapse();
   renderDevicePanelCollapse();
+});
+webchatControlCheckbox.addEventListener("change", async () => {
+  if (browserConsentInFlight) return;
+  const desired = webchatControlCheckbox.checked;
+  if (desired && !confirm(t("cc_webchat_control_confirm"))) {
+    webchatControlCheckbox.checked = false;
+    return;
+  }
+  browserConsentInFlight = true;
+  renderPageContext(store.get());
+  const response = await bg({ type: "h2w_browser_webchat_control_set", allowed: desired });
+  if (response?.ok && response.browserEndpoint) {
+    pageContext = {
+      ...pageContext,
+      response: { ...(pageContext.response || {}), browserEndpoint: response.browserEndpoint },
+      error: null,
+    };
+  } else {
+    pageContext = {
+      ...pageContext,
+      error: t("cc_webchat_control_update_failed", { error: response?.error || "unknown" }),
+    };
+  }
+  browserConsentInFlight = false;
+  renderAll();
 });
 $("settingsButton").addEventListener("click", () => chrome.runtime.openOptionsPage());
 unpinButton.addEventListener("click", async () => {
