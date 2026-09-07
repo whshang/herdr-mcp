@@ -75,6 +75,7 @@ const llmHandoffRequests = [];
 const reloadCalls = [];
 const sidePanelOpenCalls = [];
 const sidePanelCloseCalls = [];
+const executeScriptCalls = [];
 let projectNavigationReadyAfter = 0;
 let projectNavigationPollCount = 0;
 let sourceProbeLooksSeeded = false;
@@ -575,7 +576,27 @@ globalThis.chrome = {
     onClosed: { addListener: (fn) => listeners.onSidePanelClosed.push(fn) },
   },
   scripting: {
-    executeScript: async () => [{ result: { ok: true } }],
+    async executeScript(args) {
+      executeScriptCalls.push(args);
+      const tabId = args?.target?.tabId;
+      const tab = tabs.get(tabId);
+      if (tab) {
+        tab.listener = (msg, _sender, sendResponse) => {
+          if (msg?.type === "h2w_page_assist") {
+            if (msg.action === "inspect") {
+              sendResponse({ ok: true, generation: "gen_test_1", elements: [{ ref: "ref_gen_test_1_0" }] });
+              return;
+            }
+            if (msg.action === "click") {
+              sendResponse({ ok: true, ref: msg.ref, generation: msg.generation });
+              return;
+            }
+          }
+          sendResponse({ ok: false });
+        };
+      }
+      return [{ result: { ok: true } }];
+    },
     async getRegisteredContentScripts({ ids } = {}) {
       const rows = [...registeredContentScripts.values()];
       return Array.isArray(ids) ? rows.filter((row) => ids.includes(row.id)) : rows;
@@ -2767,6 +2788,83 @@ console.log("\n[project hard-limit handoff LLM fallback]");
     llmJudgeModel: "",
   } }, {}, (r) => resolveClearConfig(r));
   await clearConfigP;
+}
+
+console.log("\n[page-assist injection idempotency]");
+{
+  const paTabId = 991;
+  const paOrigin = "https://example.com";
+  const paUrl = "https://example.com/app";
+  tabs.set(paTabId, { id: paTabId, url: paUrl, status: "complete", active: true, listener: null });
+
+  const trustedExtSender = { id: "test-ext", url: "chrome-extension://test-ext/control-center.html" };
+  const contentScriptSender = { id: "test-ext", tab: { id: paTabId }, url: paUrl };
+
+  let resolvePaConfig;
+  const paConfigP = new Promise((resolve) => { resolvePaConfig = resolve; });
+  onMsg({ type: "h2w_set_config", config: { pageAssistOrigins: [paOrigin] } }, {}, (response) => resolvePaConfig(response));
+  await paConfigP;
+
+  const scriptCallsBefore = executeScriptCalls.length;
+
+  let resolveDenied;
+  const deniedP = new Promise((resolve) => { resolveDenied = resolve; });
+  onMsg({ type: "h2w_page_assist", action: "inspect", targetOrigin: paOrigin, tabId: paTabId }, contentScriptSender, (response) => resolveDenied(response));
+  const deniedRes = await deniedP;
+  ok(deniedRes?.ok === false && deniedRes?.error === "page_assist_sender_denied",
+    "untrusted content-script sender receives page_assist_sender_denied",
+    JSON.stringify(deniedRes));
+  ok(executeScriptCalls.length === scriptCallsBefore,
+    "denied content-script sender cannot trigger script injection");
+
+  let resolveInspect;
+  const inspectP = new Promise((resolve) => { resolveInspect = resolve; });
+  onMsg({ type: "h2w_page_assist", action: "inspect", targetOrigin: paOrigin, tabId: paTabId }, trustedExtSender, (response) => resolveInspect(response));
+  const inspectRes = await inspectP;
+  ok(inspectRes?.ok === true && inspectRes?.generation === "gen_test_1",
+    "inspect dynamically injects page-assist when listener is absent and returns inspect result",
+    JSON.stringify(inspectRes));
+  ok(executeScriptCalls.length === scriptCallsBefore + 1,
+    "inspect triggers exactly one script injection call");
+
+  let resolveClick;
+  const clickP = new Promise((resolve) => { resolveClick = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "click",
+    targetOrigin: paOrigin,
+    tabId: paTabId,
+    ref: "ref_gen_test_1_0",
+    generation: "gen_test_1",
+  }, trustedExtSender, (response) => resolveClick(response));
+  const clickRes = await clickP;
+  ok(clickRes?.ok === true && clickRes?.ref === "ref_gen_test_1_0",
+    "click succeeds using existing listener without reinjecting page-assist",
+    JSON.stringify(clickRes));
+  ok(executeScriptCalls.length === scriptCallsBefore + 1,
+    "subsequent click does not reinject page-assist");
+
+  const noListenerTabId = 992;
+  tabs.set(noListenerTabId, { id: noListenerTabId, url: paUrl, status: "complete", active: true, listener: null });
+  let resolveClickNoListener;
+  const clickNoListenerP = new Promise((resolve) => { resolveClickNoListener = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "click",
+    targetOrigin: paOrigin,
+    tabId: noListenerTabId,
+    ref: "ref_gen_test_1_0",
+    generation: "gen_test_1",
+  }, trustedExtSender, (response) => resolveClickNoListener(response));
+  const clickNoListenerRes = await clickNoListenerP;
+  ok(clickNoListenerRes?.ok === false && clickNoListenerRes?.error === "page_assist_unavailable",
+    "click with no listener fails closed as page_assist_unavailable without reinjecting",
+    JSON.stringify(clickNoListenerRes));
+  ok(executeScriptCalls.length === scriptCallsBefore + 1,
+    "failed click with absent listener did not trigger script injection");
+
+  tabs.delete(paTabId);
+  tabs.delete(noListenerTabId);
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

@@ -77,6 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
+const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
+const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
+const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
 ok(manifest.version === "0.1.90", "manifest version stays aligned with the browser product build");
 ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.90"'), "background version matches manifest");
 ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.90"'), "content version matches manifest");
@@ -102,6 +105,26 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
     && manifest.optional_host_permissions?.includes("https://*/*")
     && manifest.optional_host_permissions?.includes("http://*/*"),
   "broad network access is optional and the always-on host permission stays loopback-only");
+ok(!manifest.content_scripts.some((entry) => (entry.js || []).includes("content/page-assist.js"))
+    && backgroundSource.includes("pageAssistOrigins: []")
+    && optionsHtml.includes('id="pageAssistOrigins"')
+    && optionsSource.includes('for (const origin of config.pageAssistOrigins || [])')
+    && optionsSource.includes('pageAssistOrigins: cleanPa'),
+  "Page Assist is default-off, is never statically injected, and requests only origins explicitly saved in Options");
+const pageAssistDispatchSource = backgroundSource.match(
+  /async function performPageAssistRequest\(msg\) \{[\s\S]*?\n}\n/,
+)?.[0] || "";
+ok(pageAssistDispatchSource.includes('validation.action !== "inspect"')
+    && pageAssistDispatchSource.includes('files: ["content/page-assist.js"]')
+    && pageAssistDispatchSource.indexOf('validation.action !== "inspect"') < pageAssistDispatchSource.indexOf("chrome.scripting.executeScript")
+    && pageAssistDispatchSource.includes("tabOrigin !== validation.targetOrigin"),
+  "Page Assist may inject only for inspect recovery; click/fill fail closed and the live tab origin is rechecked");
+ok(!/\beval\s*\(/.test(pageAssistSource)
+    && !/new\s+Function\b/.test(pageAssistSource)
+    && !/document\.cookie/.test(pageAssistSource)
+    && !/localStorage|sessionStorage/.test(pageAssistSource)
+    && !/XPath|evaluate\s*\(/.test(pageAssistSource),
+  "Page Assist content code does not expose script evaluation, cookies/storage, or XPath control");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
@@ -489,7 +512,6 @@ ok(
     && backgroundSource.includes("native-transport-failed"),
   "local Herdr failures surface Native Messaging errors instead of browser loopback permission state",
 );
-const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 ok(
   optionsSource.includes('type: "h2w_agents"')
     && optionsSource.includes("native_host_help")
@@ -774,7 +796,6 @@ ok(!wakeSource.includes("Wake on") && !wakeSource.includes("Wake off") && !wakeS
   "HUD source has no legacy English wake/automation labels");
 ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake + LLM nudge"),
   "Options source no longer exposes the legacy wake+nudge switch name");
-const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 ok(optionsHtml.includes('id="manualContinueMessage"')
     && optionsSource.includes('"progressTemplate", "manualContinueMessage", "automationMode"')
     && optionsSource.includes('manualContinueMessage: $("manualContinueMessage").value.trim() || t("manual_continue_message")')

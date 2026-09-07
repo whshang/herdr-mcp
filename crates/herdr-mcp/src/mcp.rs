@@ -46,6 +46,11 @@ pub struct BrowserCallerGrant {
     pub account_ref: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageAssistCallerGrant {
+    pub endpoint_ref: String,
+}
+
 pub struct RuntimeContext<'a> {
     pub client: &'a HerdrClient,
     pub cache: &'a EventCache,
@@ -54,6 +59,7 @@ pub struct RuntimeContext<'a> {
     pub skill: &'a SkillService,
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
     pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
+    pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::Mutex<()>>,
 }
@@ -221,6 +227,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if method == "herdr_mcp.page_assist" {
+                page_assist_call(
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
             } else if BrowserOperation::parse(method).is_some() {
                 browser_operation_call_with_grants(
                     context.state_store,
@@ -1416,6 +1428,7 @@ pub struct BrowserPostconditionEvidence {
     pub generation_owner: Option<i64>,
     pub generation_status_observed: bool,
     pub generation_stopped: bool,
+    pub result: Option<Value>,
 }
 
 impl BrowserPostconditionEvidence {
@@ -1436,6 +1449,7 @@ impl BrowserPostconditionEvidence {
             generation_owner: None,
             generation_status_observed: false,
             generation_stopped: false,
+            result: None,
         }
     }
 }
@@ -3009,6 +3023,202 @@ fn continuity_search_string<'a>(
     }
 }
 
+fn page_assist_call(
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "page assist params must be an object"});
+    };
+    const ALLOWED_KEYS: &[&str] = &[
+        "endpoint_ref",
+        "action",
+        "target_origin",
+        "tab_id",
+        "max_chars",
+        "generation",
+        "ref",
+        "value",
+    ];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({"ok": false, "code": "invalid_params", "message": format!("unknown page assist parameter '{key}'")});
+    }
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+    let action = match object.get("action").and_then(Value::as_str) {
+        Some(value @ ("inspect" | "click" | "fill")) => value,
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "action must be inspect, click, or fill"});
+        }
+    };
+    let target_origin_raw = match object
+        .get("target_origin")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value) if !value.is_empty() && value.len() <= 4096 => value,
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "target_origin is required"});
+        }
+    };
+    let target_url = match url::Url::parse(target_origin_raw) {
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.host_str().is_some() =>
+        {
+            url
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "target_origin must be a valid http or https origin"});
+        }
+    };
+    let target_origin = target_url.origin().ascii_serialization();
+    let tab_id = match object.get("tab_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => match value.as_i64() {
+            Some(value) if value > 0 && value <= i64::from(i32::MAX) => Some(value),
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "tab_id must be a positive integer"});
+            }
+        },
+        Some(_) => {
+            return json!({"ok": false, "code": "invalid_params", "message": "tab_id must be a positive integer"});
+        }
+    };
+    let max_chars = match object.get("max_chars") {
+        None | Some(Value::Null) => 16_384_u64,
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(value) if (1..=16_384).contains(&value) => value,
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be between 1 and 16384"});
+            }
+        },
+        Some(_) => {
+            return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be an integer"});
+        }
+    };
+    let bounded_string = |key: &str, max_chars: usize| -> Result<String, Value> {
+        match object.get(key).and_then(Value::as_str) {
+            Some(value) if !value.is_empty() && value.chars().count() <= max_chars => {
+                Ok(value.to_owned())
+            }
+            _ => Err(
+                json!({"ok": false, "code": "invalid_params", "message": format!("{key} is required and must be at most {max_chars} characters")}),
+            ),
+        }
+    };
+    let mut bridge_params = json!({
+        "endpoint_ref": endpoint_ref,
+        "action": action,
+        "target_origin": target_origin,
+    });
+    if let Some(tab_id) = tab_id {
+        bridge_params["tab_id"] = json!(tab_id);
+    }
+    match action {
+        "inspect" => {
+            bridge_params["max_chars"] = json!(max_chars);
+        }
+        "click" => {
+            let generation = match bounded_string("generation", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let element_ref = match bounded_string("ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            bridge_params["generation"] = json!(generation);
+            bridge_params["ref"] = json!(element_ref);
+        }
+        "fill" => {
+            let generation = match bounded_string("generation", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let element_ref = match bounded_string("ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let value = match object.get("value").and_then(Value::as_str) {
+                Some(value) if value.chars().count() <= 10_000 => value.to_owned(),
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "value is required and must be at most 10000 characters"});
+                }
+            };
+            bridge_params["generation"] = json!(generation);
+            bridge_params["ref"] = json!(element_ref);
+            bridge_params["value"] = json!(value);
+        }
+        _ => unreachable!(),
+    }
+    let Some(actuator) = browser_actuator else {
+        return json!({
+            "ok": false,
+            "code": "page_assist_unavailable",
+            "retryable": true,
+            "delivery_state": "not_delivered",
+        });
+    };
+    match actuator.actuate("herdr_mcp.page_assist", &bridge_params, 1) {
+        Ok(evidence) => {
+            if let Some(result) = evidence.result {
+                return result;
+            }
+            if !evidence.browser_online || !evidence.command_accepted {
+                return json!({
+                    "ok": false,
+                    "code": "page_assist_unavailable",
+                    "retryable": true,
+                    "delivery_state": "not_delivered",
+                });
+            }
+            json!({
+                "ok": false,
+                "code": "page_assist_delivery_unknown",
+                "retryable": false,
+                "delivery_state": "delivery_unknown",
+            })
+        }
+        Err(error) => json!({
+            "ok": false,
+            "code": "page_assist_unavailable",
+            "message": error,
+            "retryable": true,
+            "delivery_state": "not_delivered",
+        }),
+    }
+}
+
 fn config_dir() -> std::path::PathBuf {
     crate::paths::RuntimePaths::discover()
         .map(|paths| paths.config_dir)
@@ -4241,6 +4451,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    result: None,
                 })
             }
         }
@@ -4369,6 +4580,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    result: None,
                 })
             }
         }
@@ -5144,5 +5356,62 @@ mod tests {
 
         std::fs::remove_dir_all(&config_dir).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn page_assist_requires_exact_caller_grant_and_returns_extension_result() {
+        struct PanicActuator;
+        impl BrowserActuator for PanicActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("caller grant rejection must happen before browser actuation")
+            }
+        }
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "action": "inspect",
+            "target_origin": "https://example.com",
+            "max_chars": 4096
+        });
+        let denied = page_assist_call(&params, &[], Some(&PanicActuator));
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["code"], "caller_grant_missing");
+        assert_eq!(denied["delivery_state"], "not_delivered");
+
+        struct ResultActuator;
+        impl BrowserActuator for ResultActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, "herdr_mcp.page_assist");
+                assert_eq!(params["target_origin"], "https://example.com");
+                assert_eq!(params["max_chars"], 4096);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "generation": "pa:test",
+                    "text": "visible page text"
+                }));
+                Ok(evidence)
+            }
+        }
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let allowed = page_assist_call(&params, &grants, Some(&ResultActuator));
+        assert_eq!(allowed["ok"], true);
+        assert_eq!(allowed["generation"], "pa:test");
+        assert_eq!(allowed["text"], "visible page text");
     }
 }

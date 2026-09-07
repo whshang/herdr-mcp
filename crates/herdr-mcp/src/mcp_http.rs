@@ -4,7 +4,8 @@ use crate::exec_sessions::ExecRegistry;
 use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{
-    self, BrowserActuator, BrowserCallerGrant, BrowserPostconditionEvidence, RuntimeContext,
+    self, BrowserActuator, BrowserCallerGrant, BrowserPostconditionEvidence, PageAssistCallerGrant,
+    RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -43,8 +44,10 @@ const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(2);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
+const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
+const MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -134,6 +137,7 @@ impl BrowserActuator for BrowserActuationBroker {
                 generation_owner: None,
                 generation_status_observed: false,
                 generation_stopped: false,
+                result: None,
             });
         }
         state.pending.insert(actuation_id.clone());
@@ -177,6 +181,7 @@ impl BrowserActuator for BrowserActuationBroker {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    result: None,
                 });
             }
             let timeout = deadline.saturating_duration_since(now);
@@ -592,6 +597,7 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
             "generation_owner",
             "generation_status_observed",
             "generation_stopped",
+            "result",
         ],
     ) {
         return browser_registry_http_store_error(&code);
@@ -640,6 +646,11 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
                 _ => return Err("browser_generation_owner_invalid".to_owned()),
             },
         };
+        let actuation_result = match payload.get("result") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(_)) => payload.get("result").cloned(),
+            Some(_) => return Err("browser_actuation_result_invalid".to_owned()),
+        };
         state.browser_actuation.complete(
             actuation_id,
             BrowserPostconditionEvidence {
@@ -670,6 +681,7 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
                     "generation_status_observed",
                 )?,
                 generation_stopped: browser_registry_bool(&payload, "generation_stopped")?,
+                result: actuation_result,
             },
         )
     })();
@@ -2082,6 +2094,19 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     };
+    let caller_page_assist_grants = match trusted_edge_page_assist_grants(&state, &headers) {
+        Ok(grants) => grants,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid trusted caller grant context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -2135,6 +2160,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // The workstation bearer authenticates only TCP transport. Browser business
             // authority is admitted exclusively from the trusted Unix IPC handoff above.
             caller_webchat_control_grants: &caller_webchat_control_grants,
+            caller_page_assist_grants: &caller_page_assist_grants,
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
         };
@@ -2318,8 +2344,50 @@ fn trusted_edge_webchat_control_grants(
     Ok(grants)
 }
 
+fn trusted_edge_page_assist_grants(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Vec<PageAssistCallerGrant>, ()> {
+    if !state.trusted_extension_ipc {
+        return Ok(Vec::new());
+    }
+    let Some(raw) = headers.get(EDGE_PAGE_ASSIST_GRANTS_HEADER) else {
+        return Ok(Vec::new());
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES {
+        return Err(());
+    }
+    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
+    let items = value.as_array().ok_or(())?;
+    if items.len() > 32 {
+        return Err(());
+    }
+    let mut grants = Vec::with_capacity(items.len());
+    for item in items {
+        let object = item.as_object().ok_or(())?;
+        if object.len() != 1 || !object.contains_key("endpoint_ref") {
+            return Err(());
+        }
+        let endpoint_ref = object
+            .get("endpoint_ref")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        if !valid_browser_grant_ref(endpoint_ref, 96) {
+            return Err(());
+        }
+        grants.push(PageAssistCallerGrant {
+            endpoint_ref: endpoint_ref.to_owned(),
+        });
+    }
+    Ok(grants)
+}
+
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
-    if !state.trusted_extension_ipc || !headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER) {
+    if !state.trusted_extension_ipc
+        || (!headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER)
+            && !headers.contains_key(EDGE_PAGE_ASSIST_GRANTS_HEADER))
+    {
         return Ok(());
     }
     let expected = headers
@@ -3157,6 +3225,47 @@ mod tests {
             trusted_edge_runtime_generation_fence(&trusted_state, &headers),
             Err(()),
             "grant-bearing trusted IPC without a reserved generation fails closed"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn page_assist_grant_header_is_trusted_ipc_only_and_shape_validated() {
+        let root = test_root("page-assist-caller-grant-boundary");
+        let tcp_state = test_state(&root.join("tcp"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            EDGE_PAGE_ASSIST_GRANTS_HEADER,
+            HeaderValue::from_static(
+                r#"[{"endpoint_ref":"be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+            ),
+        );
+        assert_eq!(
+            trusted_edge_page_assist_grants(&tcp_state, &headers),
+            Ok(Vec::new()),
+            "ordinary bearer-authenticated TCP cannot opt into Page Assist caller authority"
+        );
+
+        let mut trusted_state = test_state(&root.join("trusted"));
+        trusted_state.trusted_extension_ipc = true;
+        assert_eq!(
+            trusted_edge_page_assist_grants(&trusted_state, &headers),
+            Ok(vec![PageAssistCallerGrant {
+                endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+            }])
+        );
+
+        headers.insert(
+            EDGE_PAGE_ASSIST_GRANTS_HEADER,
+            HeaderValue::from_static(
+                r#"[{"endpoint_ref":"be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","origin":"https://example.com"}]"#,
+            ),
+        );
+        assert_eq!(
+            trusted_edge_page_assist_grants(&trusted_state, &headers),
+            Err(()),
+            "reserved caller authority accepts only the exact endpoint_ref tuple"
         );
         std::fs::remove_dir_all(root).ok();
     }

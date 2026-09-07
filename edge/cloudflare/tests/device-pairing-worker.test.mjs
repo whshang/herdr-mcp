@@ -460,6 +460,45 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(storedGrant.status, 200);
   assert.deepEqual((await storedGrant.json()).record.webchat_control, ownerGrantBody.grants);
 
+  const pageAssistInput = {
+    client_id: client.client_id,
+    device_id: target.device_id,
+    endpoint_ref: `be_${"c".repeat(64)}`,
+    allowed: true,
+  };
+  const genericPageAssist = await worker.fetch(post("/connectors/page-assist", pageAssistInput, "owner-secret"), h.env);
+  assert.equal(genericPageAssist.status, 401, "generic MCP/operator bearer cannot widen Page Assist");
+  const ownerPageAssist = await worker.fetch(postAsWorkstation(
+    "/connectors/page-assist",
+    pageAssistInput,
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(ownerPageAssist.status, 200);
+  const ownerPageAssistBody = await ownerPageAssist.json();
+  assert.equal(ownerPageAssistBody.action, "connector_page_assist_set");
+  assert.deepEqual(ownerPageAssistBody.grants, [{
+    device_id: target.device_id,
+    endpoint_ref: pageAssistInput.endpoint_ref,
+  }]);
+
+  const storedPageAssist = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: client.client_id }),
+  }));
+  assert.equal(storedPageAssist.status, 200);
+  assert.deepEqual((await storedPageAssist.json()).record.page_assist, ownerPageAssistBody.grants);
+
+  const ownerPageAssistDeny = await worker.fetch(postAsWorkstation(
+    "/connectors/page-assist",
+    { ...pageAssistInput, allowed: false },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(ownerPageAssistDeny.status, 200);
+  assert.deepEqual((await ownerPageAssistDeny.json()).grants, [], "owner revoke removes the exact Page Assist tuple immediately");
+
   const poll = new URL("https://edge.example/oauth/authorize/poll");
   poll.searchParams.set("request_id", requestId);
   poll.searchParams.set("resume_token", resumeToken);

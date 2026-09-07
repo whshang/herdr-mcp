@@ -370,6 +370,52 @@ export default {
         : noStoreJsonResponse({ ok: false, code: "webchat_control_grant_update_failed" }, 409);
     }
 
+    if (request.method === "POST" && url.pathname === "/connectors/page-assist") {
+      const ownerDevice = await authenticateOwnerDevice(request, env);
+      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const allowedKeys = new Set(["client_id", "device_id", "endpoint_ref", "allowed"]);
+      if (Object.keys(parsed.value).some((key) => !allowedKeys.has(key))) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const clientId = typeof parsed.value.client_id === "string" ? parsed.value.client_id.trim() : "";
+      const deviceId = typeof parsed.value.device_id === "string" ? parsed.value.device_id.trim() : "";
+      const endpointRef = typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "";
+      const normalizedDeviceId = normalizeDeviceId(deviceId);
+      if (
+        !clientId || clientId.length > 4096
+        || !normalizedDeviceId || normalizedDeviceId !== deviceId
+        || !endpointRef || endpointRef.length > 96 || /[\u0000-\u001f\u007f]/.test(endpointRef)
+        || typeof parsed.value.allowed !== "boolean"
+      ) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_page_assist_grant" }, 400);
+      }
+      const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+      const store = createOAuthPublicStore(stub);
+      const record = await store.setPageAssistGrant({
+        client_id: clientId,
+        device_id: deviceId,
+        endpoint_ref: endpointRef,
+        allowed: parsed.value.allowed,
+        changed_by: `device:${ownerDevice}`,
+      });
+      return record
+        ? noStoreJsonResponse({
+          ok: true,
+          action: "connector_page_assist_set",
+          client_id: clientId,
+          device_id: deviceId,
+          endpoint_ref: endpointRef,
+          allowed: parsed.value.allowed,
+          grants: record.page_assist,
+        })
+        : noStoreJsonResponse({ ok: false, code: "page_assist_grant_update_failed" }, 409);
+    }
+
     if (request.method === "POST" && url.pathname === "/automations/revoke") {
       const fleetAdmin = await authenticateFleetAdmin(request, env);
       if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
@@ -674,6 +720,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
     }
     const workstationId = resolveWorkstation(request, env);
     const webchatControlGrants = await oauthClientWebChatControlGrants(env, devAuth.clientId);
+    const pageAssistGrants = await oauthClientPageAssistGrants(env, devAuth.clientId);
     const dev = await handleMcp(parsed.value, workstationId, {
       limits,
       client: {
@@ -681,6 +728,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         oauthClientId: devAuth.clientId ?? null,
         authSource: devAuth.source,
         webchatControlGrants,
+        pageAssistGrants,
         automationDeviceId: devAuth.principalType === "automation" ? (devAuth.deviceId ?? null) : null,
       },
       forward: async (stub: unknown, body: string) => {
@@ -1115,6 +1163,14 @@ async function oauthClientWebChatControlGrants(env: Env, clientId: string | unde
   const store = createOAuthPublicStore(stub);
   const grant = await store.getGrant(clientId);
   return grant?.status === "active" ? grant.webchat_control : [];
+}
+
+async function oauthClientPageAssistGrants(env: Env, clientId: string | undefined) {
+  if (!clientId) return [];
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  const grant = await store.getGrant(clientId);
+  return grant?.status === "active" ? grant.page_assist : [];
 }
 
 function fleetControllerAuthority(auth: { source: string; clientId?: string }): { principal: string; can_force_takeover: boolean } | null {

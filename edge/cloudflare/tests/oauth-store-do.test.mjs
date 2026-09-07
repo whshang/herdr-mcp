@@ -292,6 +292,7 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
   assert.equal(grant.record.can_approve_connectors, true);
   assert.equal(grant.record.can_control_fleet, undefined, "ordinary connector approval must not grant Fleet Control authority");
   assert.deepEqual(grant.record.webchat_control, [], "new connector approval starts with WebChat Control disabled");
+  assert.deepEqual(grant.record.page_assist, [], "new connector approval starts with Page Assist disabled");
   assert.equal(grant.record.approved_by, "device:owner");
 
   await h.post("/internal/oauth/approval/put", {
@@ -353,6 +354,44 @@ test("WebChat Control grants normalize legacy records and add/remove one exact t
   const disabled = await body(await h.post("/internal/oauth/grant/webchat-control", { ...tuple, allowed: false }));
   assert.equal(disabled.ok, true);
   assert.deepEqual(disabled.record.webchat_control, []);
+});
+
+test("Page Assist grants normalize legacy records and add/remove one exact endpoint tuple without duplicates", async () => {
+  const h = harness();
+  h.storage.map.set("grant:legacy-page-client", {
+    client_id: "legacy-page-client",
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    status: "active",
+    can_approve_connectors: true,
+    approved_at_ms: 100,
+    approved_by: "device:owner",
+  });
+
+  const legacy = await body(await h.post("/internal/oauth/grant/get", { client_id: "legacy-page-client" }));
+  assert.equal(legacy.ok, true);
+  assert.deepEqual(legacy.record.page_assist, [], "legacy grants fail closed instead of inheriting Page Assist");
+
+  const tuple = {
+    client_id: "legacy-page-client",
+    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    endpoint_ref: `be_${"c".repeat(64)}`,
+    changed_by: "device:owner",
+  };
+  const enabled = await body(await h.post("/internal/oauth/grant/page-assist", { ...tuple, allowed: true }));
+  assert.equal(enabled.ok, true);
+  assert.deepEqual(enabled.record.page_assist, [{
+    device_id: tuple.device_id,
+    endpoint_ref: tuple.endpoint_ref,
+  }]);
+
+  const replay = await body(await h.post("/internal/oauth/grant/page-assist", { ...tuple, allowed: true }));
+  assert.equal(replay.ok, true);
+  assert.equal(replay.record.page_assist.length, 1, "idempotent enable must not duplicate the endpoint tuple");
+
+  const disabled = await body(await h.post("/internal/oauth/grant/page-assist", { ...tuple, allowed: false }));
+  assert.equal(disabled.ok, true);
+  assert.deepEqual(disabled.record.page_assist, []);
 });
 
 test("connector approval resume token is independent, one-use, and cannot be substituted", async () => {

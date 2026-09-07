@@ -274,6 +274,12 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             &account_ref,
             allowed,
         ),
+        WorkerCommand::ConnectorPageAssist {
+            client_id,
+            device_id,
+            endpoint_ref,
+            allowed,
+        } => set_connector_page_assist(&paths, &client_id, &device_id, &endpoint_ref, allowed),
         WorkerCommand::AutomationCreate { name, device } => {
             create_automation(&paths, &name, &device)
         }
@@ -826,6 +832,75 @@ fn set_connector_webchat_control(
             "allowed": payload.get("allowed").cloned().unwrap_or(Value::Bool(allowed)),
         }))
         .map_err(|error| format!("cannot encode Connector WebChat Control result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_connector_page_assist(
+    _paths: &RuntimePaths,
+    _client_id: &str,
+    _device_id: &str,
+    _endpoint_ref: &str,
+    _allowed: bool,
+) -> Result<ExitCode, String> {
+    Err(
+        "connector Page Assist currently requires the macOS enrolled-owner credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn set_connector_page_assist(
+    paths: &RuntimePaths,
+    client_id: &str,
+    device_id: &str,
+    endpoint_ref: &str,
+    allowed: bool,
+) -> Result<ExitCode, String> {
+    let client_id = client_id.trim();
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let endpoint_ref = endpoint_ref.trim();
+    if client_id.is_empty() || client_id.len() > 4096 {
+        return Err("connector client id is invalid".to_owned());
+    }
+    if endpoint_ref.is_empty()
+        || endpoint_ref.len() > 96
+        || endpoint_ref.chars().any(char::is_control)
+    {
+        return Err("browser endpoint ref is invalid".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .post(endpoint(&identity.edge_origin, "/connectors/page-assist")?)
+        .headers(headers)
+        .json(&json!({
+            "client_id": client_id,
+            "device_id": device_id,
+            "endpoint_ref": endpoint_ref,
+            "allowed": allowed,
+        }))
+        .send()
+        .map_err(|error| format!("cannot change Connector Page Assist grant: {error}"))?;
+    let payload = parse_json_response(response, "connector Page Assist")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_page_assist_set",
+            "client_id": client_id,
+            "device_id": device_id,
+            "endpoint_ref": endpoint_ref,
+            "allowed": payload.get("allowed").cloned().unwrap_or(Value::Bool(allowed)),
+        }))
+        .map_err(|error| format!("cannot encode Connector Page Assist result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }

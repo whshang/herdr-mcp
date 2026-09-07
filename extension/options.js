@@ -11,6 +11,7 @@ const KEYS = [
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
+  "pageAssistOrigins",
 ];
 let loadedHostPermissionOrigins = [];
 
@@ -34,6 +35,10 @@ function configuredHostPermissionOrigins(config) {
   if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
   const llmOrigin = hostPermissionPatternForUrl(config.llmJudgeBaseUrl);
   if (llmOrigin) origins.push(llmOrigin);
+  for (const origin of config.pageAssistOrigins || []) {
+    const pattern = hostPermissionPatternForUrl(origin);
+    if (pattern) origins.push(pattern);
+  }
   return [...new Set(origins)];
 }
 
@@ -110,6 +115,10 @@ function applyI18n() {
   $("hint_experimental_deepseek").textContent = t("hint_experimental_deepseek");
   $("lab_experimental_gemini").textContent = t("label_experimental_gemini");
   $("hint_experimental_gemini").textContent = t("hint_experimental_gemini");
+  $("title_page_assist").textContent = t("options_page_assist_section");
+  $("hint_page_assist").textContent = t("options_page_assist_hint");
+  $("lab_page_assist_origins").textContent = t("label_page_assist_origins");
+  $("hint_page_assist_origins").textContent = t("hint_page_assist_origins");
   $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
   $("llmJudgeModel").placeholder = t("placeholder_llm_model");
   $("save").textContent = t("save");
@@ -148,6 +157,8 @@ async function loadForm() {
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
   $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
+  const pa = cfg.pageAssistOrigins;
+  $("pageAssistOrigins").value = Array.isArray(pa) ? pa.join("\n") : (pa || "");
   try { loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg); } catch (_) { loadedHostPermissionOrigins = []; }
 }
 
@@ -183,6 +194,19 @@ $("uiLocale").addEventListener("change", async () => {
 });
 
 $("save").addEventListener("click", async () => {
+  const rawPa = $("pageAssistOrigins").value.split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean);
+  const cleanPa = [];
+  for (const raw of rawPa) {
+    try {
+      const pat = hostPermissionPatternForUrl(raw);
+      if (!pat) throw new Error("invalid_url");
+      const o = new URL(raw).origin;
+      if (!cleanPa.includes(o)) cleanPa.push(o);
+    } catch (_) {
+      setStatus(`${t("save_failed")}: ${t("host_permission_invalid_url")}`, "err");
+      return;
+    }
+  }
   const config = {
     herdrMcpUrl: $("url").value.trim(),
     wakeTemplate: $("template").value,
@@ -199,6 +223,7 @@ $("save").addEventListener("click", async () => {
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
+    pageAssistOrigins: cleanPa,
     uiLocale: getLocale(),
   };
   let nextPermissionOrigins;

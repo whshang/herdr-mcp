@@ -94,6 +94,7 @@ export interface OAuthConnectorGrantRecord {
   status: "active" | "revoked";
   can_approve_connectors?: boolean;
   webchat_control?: OAuthWebChatControlGrant[];
+  page_assist?: OAuthPageAssistGrant[];
   principal_type?: "connector" | "automation";
   resource?: string;
   scope?: string;
@@ -116,6 +117,11 @@ export interface OAuthWebChatControlGrant {
   endpoint_ref: string;
   provider: string;
   account_ref: string;
+}
+
+export interface OAuthPageAssistGrant {
+  device_id: string;
+  endpoint_ref: string;
 }
 
 type StoredJwk = JsonWebKey & { kid?: string; alg?: string; use?: string };
@@ -337,6 +343,8 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
   if (value.status !== "active" && value.status !== "revoked") return null;
   const webchatControl = normalizeWebChatControlGrants(value.webchat_control);
   if (!webchatControl) return null;
+  const pageAssist = normalizePageAssistGrants(value.page_assist);
+  if (!pageAssist) return null;
   const canApproveConnectors = typeof value.can_approve_connectors === "boolean"
     ? value.can_approve_connectors
     : false;
@@ -371,6 +379,7 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
     status: value.status,
     can_approve_connectors: canApproveConnectors,
     webchat_control: webchatControl,
+    page_assist: pageAssist,
     ...(principalType !== undefined ? { principal_type: principalType } : {}),
     ...(resource !== undefined ? { resource } : {}),
     ...(scope !== undefined ? { scope } : {}),
@@ -410,6 +419,23 @@ function normalizeWebChatControlGrants(value: unknown): OAuthWebChatControlGrant
     || a.endpoint_ref.localeCompare(b.endpoint_ref)
     || a.provider.localeCompare(b.provider)
     || a.account_ref.localeCompare(b.account_ref));
+  return grants;
+}
+
+function normalizePageAssistGrants(value: unknown): OAuthPageAssistGrant[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 32) return null;
+  const grants: OAuthPageAssistGrant[] = [];
+  for (const item of value) {
+    if (!record(item)) return null;
+    if (Object.keys(item).some((key) => key !== "device_id" && key !== "endpoint_ref")) return null;
+    if (!boundedString(item.device_id, 64) || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(item.device_id)) return null;
+    if (!boundedString(item.endpoint_ref, 96)) return null;
+    if (!grants.some((grant) => grant.device_id === item.device_id && grant.endpoint_ref === item.endpoint_ref)) {
+      grants.push({ device_id: item.device_id, endpoint_ref: item.endpoint_ref });
+    }
+  }
+  grants.sort((a, b) => a.device_id.localeCompare(b.device_id) || a.endpoint_ref.localeCompare(b.endpoint_ref));
   return grants;
 }
 
@@ -453,6 +479,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/consume") return this.consumeApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/webchat-control") return this.setWebChatControlGrant(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist") return this.setPageAssistGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/list") return this.listConnectors();
@@ -858,6 +885,66 @@ export class OAuthStoreDO {
         ...current,
         webchat_control: normalized,
       };
+      await txn.put(key, updated);
+      void changedBy;
+      result = { ok: true, record: updated };
+    });
+    if (!result.ok) {
+      const status = result.code === "not_found" ? 404
+        : result.code === "invalid_record" ? 500
+          : 409;
+      return json({ ok: false, code: result.code }, status);
+    }
+    return json({ ok: true, record: result.record });
+  }
+
+  private async setPageAssistGrant(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    const deviceId = body?.device_id;
+    const endpointRef = body?.endpoint_ref;
+    const allowed = body?.allowed;
+    const changedBy = body?.changed_by;
+    if (
+      !boundedString(clientId, 4096)
+      || !boundedString(deviceId, 64)
+      || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)
+      || !boundedString(endpointRef, 96)
+      || typeof allowed !== "boolean"
+      || !boundedString(changedBy, 4096)
+    ) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const key = GRANT_PREFIX + clientId;
+    let result: { ok: boolean; code?: string; record?: OAuthConnectorGrantRecord } = { ok: false, code: "not_found" };
+    await this.state.storage.transaction(async (txn) => {
+      const raw = await txn.get<OAuthConnectorGrantRecord>(key);
+      if (!raw) return;
+      const current = normalizeConnectorGrant(raw);
+      if (!current) {
+        result = { ok: false, code: "invalid_record" };
+        return;
+      }
+      if (current.status !== "active") {
+        result = { ok: false, code: "revoked" };
+        return;
+      }
+      const next = (current.page_assist ?? []).filter(
+        (item) => item.device_id !== deviceId || item.endpoint_ref !== endpointRef,
+      );
+      if (allowed) {
+        if (next.length >= 32) {
+          result = { ok: false, code: "capacity" };
+          return;
+        }
+        next.push({ device_id: deviceId, endpoint_ref: endpointRef });
+      }
+      const normalized = normalizePageAssistGrants(next);
+      if (!normalized) {
+        result = { ok: false, code: "invalid_record" };
+        return;
+      }
+      const updated: OAuthConnectorGrantRecord = { ...current, page_assist: normalized };
       await txn.put(key, updated);
       void changedBy;
       result = { ok: true, record: updated };

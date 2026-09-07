@@ -128,6 +128,12 @@ pub enum WorkerCommand {
         account_ref: String,
         allowed: bool,
     },
+    ConnectorPageAssist {
+        client_id: String,
+        device_id: String,
+        endpoint_ref: String,
+        allowed: bool,
+    },
     AutomationCreate {
         name: String,
         device: String,
@@ -757,11 +763,39 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 allowed,
             }))
         }
+        Some("page-assist") => {
+            let [action, client_id, device_id, endpoint_ref, confirm] = &args[1..] else {
+                return Err("connector page-assist requires: <allow|deny> <client-id> <device-id> <endpoint-ref> --confirm".to_owned());
+            };
+            let allowed = match action.as_str() {
+                "allow" => true,
+                "deny" => false,
+                _ => return Err("connector page-assist action must be allow or deny".to_owned()),
+            };
+            if client_id.starts_with('-') || client_id.trim().is_empty() || client_id.len() > 4096 {
+                return Err("connector page-assist requires a valid client id".to_owned());
+            }
+            if device_id.starts_with('-') || device_id.trim().is_empty() || device_id.len() > 64 {
+                return Err("connector page-assist requires a valid device id".to_owned());
+            }
+            if endpoint_ref.starts_with('-') || endpoint_ref.trim().is_empty() || endpoint_ref.len() > 96 {
+                return Err("connector page-assist requires a valid endpoint ref".to_owned());
+            }
+            if confirm != "--confirm" {
+                return Err("connector page-assist requires --confirm".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::ConnectorPageAssist {
+                client_id: client_id.clone(),
+                device_id: device_id.clone(),
+                endpoint_ref: endpoint_ref.clone(),
+                allowed,
+            }))
+        }
         Some(value) => Err(format!(
-            "unknown connector command '{value}' (expected list, approve, revoke, revoke-client, or webchat-control)"
+            "unknown connector command '{value}' (expected list, approve, revoke, revoke-client, webchat-control, or page-assist)"
         )),
         None => Err(
-            "connector requires list, approve, revoke, revoke-client, or webchat-control"
+            "connector requires list, approve, revoke, revoke-client, webchat-control, or page-assist"
                 .to_owned(),
         ),
     }
@@ -2152,6 +2186,26 @@ mod tests {
             })
         );
         assert_eq!(
+            parse(args(&[
+                "connector",
+                "page-assist",
+                "allow",
+                "dcr-client",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--confirm"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorPageAssist {
+                client_id: "dcr-client".to_owned(),
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                allowed: true,
+            })
+        );
+        assert_eq!(
             parse(args(&["device", "list"])).unwrap().command,
             Command::Worker(WorkerCommand::List)
         );
@@ -2288,6 +2342,17 @@ mod tests {
                 "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "chatgpt",
                 "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "connector",
+                "page-assist",
+                "allow",
+                "dcr-client",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ]))
             .is_err()
         );

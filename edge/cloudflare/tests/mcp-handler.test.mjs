@@ -703,6 +703,27 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
   assert.equal(remoteGrant.body.result.structuredContent.code, "connector_owner_device_required");
   assert.equal(d.calls.length, 0, "OAuth MCP callers cannot self-authorize WebChat Control");
 
+  const remotePageAssistGrant = await handleMcp(
+    req(7392, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.connector.page_assist.set",
+        device: DEVICE_A,
+        params: {
+          client_id: "dcr-abc",
+          endpoint_ref: `be_${"c".repeat(64)}`,
+          allowed: true,
+          confirm: true,
+        },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(remotePageAssistGrant.body.result.isError, true);
+  assert.equal(remotePageAssistGrant.body.result.structuredContent.code, "connector_owner_device_required");
+  assert.equal(d.calls.length, 0, "OAuth MCP callers cannot self-authorize Page Assist");
+
   const listed = await handleMcp(req(740, "tools/list", {}), "legacy-default", d.value);
   assert.equal(listed.body.result.tools.some((tool) => tool.name.includes("connector")), false);
 });
@@ -924,7 +945,7 @@ test("JSON-RPC request validation and method errors preserve ids", async () => {
   assert.equal(notification.body, null);
 });
 
-test("browser private methods require explicit enrolled device selector before forwarding", async () => {
+test("browser and Page Assist private methods require explicit enrolled device selector before forwarding", async () => {
   const d = deps({
     client: {
       webchatControlGrants: [
@@ -941,6 +962,16 @@ test("browser private methods require explicit enrolled device selector before f
           account_ref: "br_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         },
       ],
+      pageAssistGrants: [
+        {
+          device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        },
+        {
+          device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          endpoint_ref: "be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        },
+      ],
     },
     resolveDevice: async (selector) => {
       if (selector === "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV") {
@@ -951,7 +982,7 @@ test("browser private methods require explicit enrolled device selector before f
   });
 
   // Missing device selector fails before forward
-  for (const method of ["herdr_mcp.browser_endpoint.list", "herdr_mcp.browser_resource.resolve"]) {
+  for (const method of ["herdr_mcp.browser_endpoint.list", "herdr_mcp.browser_resource.resolve", "herdr_mcp.page_assist"]) {
     const missing = await handleMcp(
       req(1, "tools/call", { name: "herdr_call", arguments: { method, params: JSON.stringify({ limit: 10 }) } }),
       "w1",
@@ -1001,4 +1032,29 @@ test("browser private methods require explicit enrolled device selector before f
       account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     }],
   }, "only grants for the routed device cross the Edge -> Link handoff");
+
+  const pageAssist = await handleMcp(
+    req(4, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.page_assist",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          action: "inspect",
+          target_origin: "https://example.com",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(pageAssist.body.result.isError, undefined);
+  assert.equal(d.calls.length, 2, "Page Assist request forwards to the selected workstation");
+  assert.equal(d.calls[1].args.method, "herdr_mcp.page_assist");
+  assert.deepEqual(d.calls[1].trace, {
+    page_assist_grants: [{
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    }],
+  }, "Page Assist receives only endpoint grants for the routed device and no WebChat grant tuple");
 });

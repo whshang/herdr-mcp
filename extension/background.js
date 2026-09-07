@@ -32,6 +32,11 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
+  originToMatchPattern,
+  parseAllowedOrigins,
+  validatePageAssistRequest,
+} from "./page-assist-core.js";
+import {
   QUEUED_INSERT_STORAGE_KEY,
   ackQueuedInsertBatch,
   clearQueuedInserts,
@@ -224,6 +229,7 @@ let CFG = {
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
   experimentalGeminiEnabled: false,
+  pageAssistOrigins: [],
 };
 let PROJECT_AUTOMATION = {};
 let CONVERSATION_AUTOMATION = {};
@@ -2225,6 +2231,40 @@ async function handleBrowserActuation(command) {
       || !/^ba_[0-9a-f]{16}$/.test(actuationId)
       || !Number.isSafeInteger(expectedGeneration)
       || expectedGeneration < 1) {
+    return;
+  }
+  if (operation === "herdr_mcp.page_assist") {
+    let result;
+    try {
+      const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+      const current = browserEndpointView(endpoint);
+      const endpointRef = String(params.endpoint_ref || "");
+      if (!current?.endpoint_ref || endpointRef !== current.endpoint_ref) {
+        result = { ok: false, error: "page_assist_endpoint_mismatch" };
+      } else {
+        result = await performPageAssistRequest({
+          type: "h2w_page_assist",
+          action: params.action,
+          targetOrigin: params.target_origin,
+          tabId: params.tab_id,
+          maxChars: params.max_chars,
+          generation: params.generation,
+          ref: params.ref,
+          value: params.value,
+        });
+      }
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = { ok: false, error: "page_assist_invalid_result" };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
     return;
   }
   const sessionRef = String(params.session_ref || "");
@@ -4431,8 +4471,97 @@ async function handleWebArtifactCapture(msg, sender) {
     : { ok: false, error: "artifact-capture-native-empty" };
 }
 
+async function performPageAssistRequest(msg) {
+  await configReady;
+  const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
+  const validation = validatePageAssistRequest(msg, allowed);
+  if (!validation.ok) return validation;
+
+  const pattern = originToMatchPattern(validation.targetOrigin);
+  const hasPerm = await hasHostPermission(pattern);
+  if (!hasPerm) return { ok: false, error: "origin_permission_missing" };
+
+  let tabId = Number(msg.tabId);
+  if (!Number.isInteger(tabId) || tabId <= 0) {
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({ url: pattern });
+    } catch (_) {}
+    const activeTab = tabs.find((tab) => tab.active) || tabs[0];
+    if (!activeTab?.id) return { ok: false, error: "target_tab_not_found" };
+    tabId = activeTab.id;
+  }
+
+  let targetTab = null;
+  try {
+    targetTab = await chrome.tabs.get(tabId);
+  } catch (_) {}
+  if (!targetTab?.url) return { ok: false, error: "tab_unavailable" };
+
+  try {
+    const tabOrigin = new URL(targetTab.url).origin.toLowerCase();
+    if (tabOrigin !== validation.targetOrigin) return { ok: false, error: "tab_origin_mismatch" };
+  } catch (_) {
+    return { ok: false, error: "tab_origin_invalid" };
+  }
+
+  const payload = {
+    type: "h2w_page_assist",
+    ...validation,
+    expectedOrigin: validation.targetOrigin,
+  };
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, payload);
+    return response || { ok: false, error: "empty_content_response" };
+  } catch (error) {
+    if (validation.action !== "inspect") {
+      return { ok: false, error: "page_assist_unavailable", detail: error?.message || String(error) };
+    }
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/page-assist.js"],
+      world: "ISOLATED",
+    });
+  } catch (error) {
+    return { ok: false, error: "script_injection_failed", detail: error?.message || String(error) };
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, payload);
+    return response || { ok: false, error: "empty_content_response" };
+  } catch (error) {
+    return { ok: false, error: error?.message || "content_script_message_failed" };
+  }
+}
+
 // ---- Message handling ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "h2w_page_assist") {
+    const extensionBaseUrl = chrome.runtime?.getURL ? chrome.runtime.getURL("") : "";
+    const senderUrl = String(sender?.url || "");
+    const isTrustedSender = Boolean(
+      sender?.id
+      && chrome.runtime?.id
+      && sender.id === chrome.runtime.id
+      && !sender.tab
+      && extensionBaseUrl
+      && senderUrl.startsWith(extensionBaseUrl)
+    );
+    if (!isTrustedSender) {
+      sendResponse({ ok: false, error: "page_assist_sender_denied" });
+      return false;
+    }
+
+    void performPageAssistRequest(msg)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
   if (msg?.type === "h2w_extension_owner_status") {
     void getNativeExtensionOwnerStatus()
       .then((status) => sendResponse(status || { ok: false, error: "native-owner-status-unavailable" }))

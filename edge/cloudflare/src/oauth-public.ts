@@ -146,6 +146,13 @@ export interface OAuthPublicStore {
     allowed: boolean;
     changed_by: string;
   }): Promise<OAuthConnectorGrantRecord | null>;
+  setPageAssistGrant(input: {
+    client_id: string;
+    device_id: string;
+    endpoint_ref: string;
+    allowed: boolean;
+    changed_by: string;
+  }): Promise<OAuthConnectorGrantRecord | null>;
   revokeGrant(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   getConnector(connectorId: string): Promise<OAuthConnectorRecord | null>;
   listConnectors(): Promise<OAuthConnectorRecord[]>;
@@ -1454,6 +1461,12 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
     },
     async setWebChatControlGrant(input) {
       const resp = await internal("/internal/oauth/grant/webchat-control", input);
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as { ok?: boolean; record?: OAuthConnectorGrantRecord };
+      return data.record ?? null;
+    },
+    async setPageAssistGrant(input) {
+      const resp = await internal("/internal/oauth/grant/page-assist", input);
       if (!resp.ok) return null;
       const data = (await resp.json()) as { ok?: boolean; record?: OAuthConnectorGrantRecord };
       return data.record ?? null;

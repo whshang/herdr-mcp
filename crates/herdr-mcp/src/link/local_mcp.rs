@@ -44,6 +44,7 @@ pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 2;
 
 const LOCAL_MCP_RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
+const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const LOCAL_MCP_MIN_FRAME_BYTES: usize = 64;
 const LOCAL_MCP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -370,6 +371,35 @@ impl LocalMcpTransport {
         serde_json::to_string(&normalized).map(Some).map_err(|_| ())
     }
 
+    fn page_assist_grants_header(trace: Option<&Map<String, Value>>) -> Result<Option<String>, ()> {
+        let Some(value) = trace.and_then(|trace| trace.get("page_assist_grants")) else {
+            return Ok(None);
+        };
+        let items = value.as_array().ok_or(())?;
+        if items.is_empty() {
+            return Ok(None);
+        }
+        if items.len() > 32 {
+            return Err(());
+        }
+        let mut normalized = Vec::with_capacity(items.len());
+        for item in items {
+            let object = item.as_object().ok_or(())?;
+            if object.len() != 1 || !object.contains_key("endpoint_ref") {
+                return Err(());
+            }
+            let endpoint_ref = object
+                .get("endpoint_ref")
+                .and_then(Value::as_str)
+                .ok_or(())?;
+            if !valid_grant_ref(endpoint_ref, 96) {
+                return Err(());
+            }
+            normalized.push(json!({ "endpoint_ref": endpoint_ref }));
+        }
+        serde_json::to_string(&normalized).map(Some).map_err(|_| ())
+    }
+
     fn failure(
         &self,
         code: &str,
@@ -440,7 +470,8 @@ impl LocalMcpTransport {
         &self,
         body: String,
         rpc_id: String,
-        grants_header: &str,
+        webchat_grants_header: Option<&str>,
+        page_assist_grants_header: Option<&str>,
     ) -> RuntimeToolResult {
         let Some(expected_generation) = self.runtime_generation.as_deref() else {
             return self.failure(
@@ -484,13 +515,19 @@ impl LocalMcpTransport {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        let request = match hyper::Request::builder()
+        let mut request_builder = hyper::Request::builder()
             .method("POST")
             .uri("/mcp")
             .header(HOST, "localhost")
             .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .header(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, grants_header)
+            .header("accept", "application/json, text/event-stream");
+        if let Some(value) = webchat_grants_header {
+            request_builder = request_builder.header(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, value);
+        }
+        if let Some(value) = page_assist_grants_header {
+            request_builder = request_builder.header(EDGE_PAGE_ASSIST_GRANTS_HEADER, value);
+        }
+        let request = match request_builder
             .header(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER, expected_generation)
             .body(Full::new(Bytes::from(body)))
         {
@@ -545,7 +582,8 @@ impl LocalMcpTransport {
         &self,
         _body: String,
         _rpc_id: String,
-        _grants_header: &str,
+        _webchat_grants_header: Option<&str>,
+        _page_assist_grants_header: Option<&str>,
     ) -> RuntimeToolResult {
         self.failure(
             code::UNREACHABLE,
@@ -636,11 +674,17 @@ impl LocalMcpTransport {
         &self,
         body: String,
         rpc_id: String,
-        grants_header: Option<String>,
+        webchat_grants_header: Option<String>,
+        page_assist_grants_header: Option<String>,
     ) -> RuntimeToolResult {
-        if let Some(grants_header) = grants_header {
-            self.dispatch_trusted_ipc(body, rpc_id, &grants_header)
-                .await
+        if webchat_grants_header.is_some() || page_assist_grants_header.is_some() {
+            self.dispatch_trusted_ipc(
+                body,
+                rpc_id,
+                webchat_grants_header.as_deref(),
+                page_assist_grants_header.as_deref(),
+            )
+            .await
         } else {
             self.dispatch_http(body, rpc_id).await
         }
@@ -661,17 +705,30 @@ impl LocalMcpTransport {
 
         let rpc_id = self.next_rpc_id();
         let timeout_hint_ms = request.timeout_hint_ms();
-        let grants_header = match Self::webchat_control_grants_header(request.trace.as_ref()) {
-            Ok(value) => value,
-            Err(()) => {
-                return self.failure(
-                    code::BAD_REQUEST,
-                    false,
-                    "invalid trusted caller grant context",
-                    None,
-                );
-            }
-        };
+        let webchat_grants_header =
+            match Self::webchat_control_grants_header(request.trace.as_ref()) {
+                Ok(value) => value,
+                Err(()) => {
+                    return self.failure(
+                        code::BAD_REQUEST,
+                        false,
+                        "invalid trusted caller grant context",
+                        None,
+                    );
+                }
+            };
+        let page_assist_grants_header =
+            match Self::page_assist_grants_header(request.trace.as_ref()) {
+                Ok(value) => value,
+                Err(()) => {
+                    return self.failure(
+                        code::BAD_REQUEST,
+                        false,
+                        "invalid trusted caller grant context",
+                        None,
+                    );
+                }
+            };
         let body = match serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -735,7 +792,7 @@ impl LocalMcpTransport {
                     None,
                 )
             },
-            result = self.dispatch_routed(body, rpc_id, grants_header) => result,
+            result = self.dispatch_routed(body, rpc_id, webchat_grants_header, page_assist_grants_header) => result,
         };
 
         let mut in_flight = self.lock_in_flight();
@@ -1415,14 +1472,22 @@ mod tests {
         config.runtime_generation = Some("rust-test".to_owned());
         let transport = LocalMcpTransport::new(config).unwrap();
         let mut grant_request = request("grant-r1");
-        grant_request.trace = Some(serde_json::Map::from_iter([(
-            "webchat_control_grants".to_owned(),
-            json!([{
-                "endpoint_ref": "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "provider": "chatgpt",
-                "account_ref": "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            }]),
-        )]));
+        grant_request.trace = Some(serde_json::Map::from_iter([
+            (
+                "webchat_control_grants".to_owned(),
+                json!([{
+                    "endpoint_ref": "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "provider": "chatgpt",
+                    "account_ref": "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }]),
+            ),
+            (
+                "page_assist_grants".to_owned(),
+                json!([{
+                    "endpoint_ref": "be_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                }]),
+            ),
+        ]));
         let outcome = transport.dispatch_request(grant_request).await;
         assert_eq!(
             outcome,
@@ -1434,9 +1499,14 @@ mod tests {
         let lowered = raw_request.to_ascii_lowercase();
         assert!(lowered.starts_with("post /mcp http/1.1"));
         assert!(lowered.contains("x-herdr-edge-webchat-control-grants:"));
+        assert!(lowered.contains("x-herdr-edge-page-assist-grants:"));
         assert!(lowered.contains("x-herdr-edge-expected-runtime-generation: rust-test"));
         assert!(!lowered.contains("authorization:"));
         assert!(raw_request.contains("\"provider\":\"chatgpt\""));
+        assert!(
+            raw_request
+                .contains("be_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
         let _ = std::fs::remove_file(socket);
 
         let mut malformed = request("grant-bad");

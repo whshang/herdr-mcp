@@ -54,11 +54,17 @@ export interface WebChatControlGrant {
   account_ref: string;
 }
 
+export interface PageAssistGrant {
+  device_id: string;
+  endpoint_ref: string;
+}
+
 export interface McpClientContext {
   userAgent?: string | null;
   oauthClientId?: string | null;
   authSource?: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge" | null;
   webchatControlGrants?: readonly WebChatControlGrant[];
+  pageAssistGrants?: readonly PageAssistGrant[];
   /** Bound device_id for an automation principal; forces routing to that device. */
   automationDeviceId?: string | null;
 }
@@ -790,6 +796,16 @@ export async function handleMcp(
       }, true));
     }
 
+    if (localMethod === "herdr_mcp.connector.page_assist.set") {
+      return rpcResult(id, callToolResult({
+        ok: false,
+        code: "connector_owner_device_required",
+        message: "Page Assist grants can be changed only by an enrolled owner device.",
+        retryable: false,
+        delivery_state: "not_delivered",
+      }, true));
+    }
+
     // Unknown Edge-private namespaces fail closed rather than routing to a
     // workstation. A removed or mistyped herdr_mcp.* private method must never
     // be forwarded as ordinary MCP work, so a WebChat Connector cannot use an
@@ -797,7 +813,10 @@ export async function handleMcp(
     // text.read/write methods are legitimate workstation-routed transfers and
     // pass through to normal routing below.
     if (localMethod !== null && localMethod.startsWith("herdr_mcp.")) {
-      if (localMethod !== "herdr_mcp.text.read" && localMethod !== "herdr_mcp.text.write" && !localMethod.startsWith("herdr_mcp.browser_")) {
+      if (localMethod !== "herdr_mcp.text.read"
+          && localMethod !== "herdr_mcp.text.write"
+          && localMethod !== "herdr_mcp.page_assist"
+          && !localMethod.startsWith("herdr_mcp.browser_")) {
         return rpcResult(id, callToolResult({
           ok: false,
           code: "unknown_method",
@@ -815,7 +834,8 @@ export async function handleMcp(
     }
     const isBrowserPrivateMethod = typeof localMethod === "string"
       && localMethod.startsWith("herdr_mcp.browser_");
-    if (isBrowserPrivateMethod) {
+    const isPageAssistPrivateMethod = localMethod === "herdr_mcp.page_assist";
+    if (isBrowserPrivateMethod || isPageAssistPrivateMethod) {
       if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {
         return rpcResult(id, callToolResult({
           ok: false,
@@ -823,7 +843,7 @@ export async function handleMcp(
           retryable: false,
           delivery_state: "not_delivered",
           failure_layer: "edge_routing",
-          next_action: "retry the browser registry query with an explicit enrolled device selector",
+          next_action: "retry the browser operation with an explicit enrolled device selector",
         }, true));
       }
     }
@@ -943,6 +963,11 @@ export async function handleMcp(
           account_ref: grant.account_ref,
         }))
       : [];
+    const pageAssistGrants = isPageAssistPrivateMethod && route.device_id
+      ? (deps.client?.pageAssistGrants ?? [])
+        .filter((grant) => grant.device_id === route.device_id)
+        .map((grant) => ({ endpoint_ref: grant.endpoint_ref }))
+      : [];
     const requestedToolTimeoutMs =
       typeof runtimeArgs.timeout_ms === "number" && Number.isFinite(runtimeArgs.timeout_ms)
         ? Math.max(1, runtimeArgs.timeout_ms)
@@ -963,8 +988,13 @@ export async function handleMcp(
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
       contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
       idempotencyKey,
-      ...(webchatControlGrants.length > 0
-        ? { trace: { webchat_control_grants: webchatControlGrants } }
+      ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0
+        ? {
+          trace: {
+            ...(webchatControlGrants.length > 0 ? { webchat_control_grants: webchatControlGrants } : {}),
+            ...(pageAssistGrants.length > 0 ? { page_assist_grants: pageAssistGrants } : {}),
+          },
+        }
         : {}),
     };
 
