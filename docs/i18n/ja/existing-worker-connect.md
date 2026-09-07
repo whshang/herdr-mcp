@@ -2,7 +2,7 @@
 
 これは**新しいコンピュータを既存の herdr-mcp Worker/Connector に接続する**ための権威ある Agent 実行契約です。**新規 Worker デプロイではありません**。
 
-> **v0.4.3 では macOS のみ。** 安全な新規デバイス接続（ペアリング）は macOS Keychain の資格情報バックエンドを必要とします。Linux/Windows では `worker pair` / `worker connect` 経路は**利用不可で fail closed** です。runtime 自体はこれらのプラットフォームでもサポートされています。
+> **v0.4.8 では macOS と x86_64 Linux/Debian をサポートします。** macOS は最終デバイス資格情報を Keychain に保存し、Linux はユーザー専用の credential store（ディレクトリ `0700`、通常ファイル `0600`）に保存します。Windows の `worker pair` / `worker connect` は引き続き利用不可で fail closed です。
 
 ## 始める前に
 
@@ -28,17 +28,17 @@
 
    CLI は**6 桁のコードの入力を求めます**。対話端末では入力した数字を通常どおり表示するため、打ち間違いを確認できます。コードは**コマンドライン引数にはならない**ため、shell history には残りません。
 
-   デフォルトでは、参加するコンピュータの macOS **Computer Name** が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
+   デフォルトでは、参加するコンピュータがプラットフォームから取得したコンピュータ名/hostname が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
 
-   ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。ローカル service が healthy で、`link-prod` が managed runtime と新しい device identity を使用していることを確認できた場合のみ成功を返します。失敗時は既存の revoke / Keychain / config 補償経路を使用します。
+   ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。macOS は launchd、Linux は `systemd --user` が lifecycle を管理します。ローカル service が healthy で、production Link が新しい device identity を使用していることを確認できた場合のみ成功を返します。失敗時は remote revoke とローカル credential / config の補償を実行します。
 
-3. 成功すると、一時的なペアリングが既存の高エントロピー毎デバイス秘密情報と交換されます。最終的なデバイス秘密情報は**macOS Keychain のみ**に保存されます。ペアリングコード/セッションは即座に使用不能になります。参加デバイスでは、Cloudflare デプロイ資格情報も旧来の `LINK_SHARED_SECRET` も使用されません。
+3. 成功すると、一時的なペアリングが高エントロピーのデバイス単位資格情報と交換されます。macOS は最終資格情報を Keychain に、Linux は上記のユーザー専用 credential store に保存します。ペアリングコード/セッションは即座に使用不能になります。参加デバイスでは、Cloudflare デプロイ資格情報も旧来の `LINK_SHARED_SECRET` も使用されません。
 
 ## セキュリティ規則
 
 - 6 桁のコードは、意図された短時間有効なペアリング資格情報です。単回使用で、10 分で期限切れになり、**誤った試行が 5 回**を超えるとセッションは永久にロックされます。
 - ペアリング id は高エントロピーで推測不可能であり、ペアリングアドレス（URL フラグメント）に含まれます。HTTP アクセスログのパスには含まれません。最終的なデバイス秘密情報はペアリングアドレスには決して含まれません。
-- 最終的なデバイス資格情報は macOS Keychain に属します。印刷またはログ記録しないでください。
+- 最終的なデバイス資格情報は OS の安全なローカル credential store に属します。印刷またはログ記録しないでください。
 
 ## 検証
 

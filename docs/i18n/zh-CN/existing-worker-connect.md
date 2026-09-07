@@ -4,7 +4,7 @@
 
 Herdr 的多设备模型是：一个公网 Worker/Connector，后面连接多台拥有独立身份的电脑。ChatGPT 可以查看设备列表、为任务选择目标设备，并让后续操作继续绑定到同一台设备。新电脑通过短期配对加入现有 Worker，不会重新部署 Worker，也不会获得一份全局共享密钥。
 
-> 安全配对目前使用 macOS Keychain 保存设备凭据，因此新设备配对流程当前仅支持 macOS。
+> v0.4.8 的安全新设备配对支持 macOS 与 x86_64 Linux/Debian。macOS 最终凭据仍进入 Keychain；Linux 使用用户私有 credential store，目录权限为 `0700`、常规凭据文件为 `0600`。Windows 配对仍不可用并 fail closed。
 
 ## 在 ChatGPT 查看设备组
 
@@ -54,9 +54,9 @@ herdr-mcp worker connect "<pairing-address>"
 
 随后 CLI 会要求输入 6 位验证码，输入的数字会正常显示，便于核对。验证码不会作为普通命令行参数传入，因此不会进入 shell history。
 
-默认情况下，新加入电脑会自动使用 macOS 的**电脑名称（Computer Name）**作为 device display name。只有用户明确希望使用其他名字时，才传 `--name "<device-name>"`。如果创建配对时显式使用了 `worker pair --name ...`，它同样属于用户覆盖，并优先于新电脑自动读取的名称。
+默认情况下，新加入电脑会自动使用平台报告的电脑名/hostname 作为 device display name。只有用户明确希望使用其他名字时，才传 `--name "<device-name>"`。如果创建配对时显式使用了 `worker pair --name ...`，它同样属于用户覆盖，并优先于新电脑自动读取的名称。
 
-配对被消费后，`worker connect` 会自动安装/启动本机 `herdr-mcp` 服务，并确保当前设备对应的 Rust production Link 已创建并加载。只有本机 service 健康、`link-prod` 已由 managed runtime 持有且设备身份正确时命令才返回成功；启动失败会进入既有的远端 revoke、Keychain 清理和 config 恢复补偿流程。
+配对被消费后，`worker connect` 会自动安装/启动本机 `herdr-mcp` 服务，并确保当前设备对应的 Rust production Link 已创建并加载。macOS 由 launchd 管理这两个生命周期，Linux 由 `systemd --user` 管理。只有本机 service 健康、production Link 使用新的设备身份时命令才返回成功；启动失败会执行远端 revoke，并补偿清理本地 credential / config。
 
 使用 Agent 安装时，可以直接把这一句话发给新电脑上的 Coding Agent：
 
@@ -96,7 +96,7 @@ revoke 对该设备身份和凭据是永久操作：在线 Link 会立即断开�
 
 ## 配对实际做了什么
 
-短期配对会换取新的单设备凭据。最终凭据写入 macOS Keychain，Worker 只保存验证该设备所需的 verifier；成功消费后，原配对立即失效。
+短期配对会换取新的单设备凭据。macOS 最终凭据写入 Keychain；Linux 写入上面描述的用户私有 credential store。Worker 只保存验证该设备所需的 verifier；成功消费后，原配对立即失效。
 
 新电脑不需要：
 
