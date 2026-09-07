@@ -236,6 +236,7 @@ export async function verifyChatgptPrivateKeyJwt(
   oauthIssuer: string,
   nowSec: number,
   fetchFn: typeof globalThis.fetch,
+  additionalAudiences: readonly string[] = [],
 ): Promise<AssertionVerdict> {
   // 1. Parse the compact JWT header
   const parts = assertion.split(".");
@@ -328,12 +329,13 @@ export async function verifyChatgptPrivateKeyJwt(
   // 9. Claims: iss must equal clientId exactly
   if (payload.iss !== clientId) return { ok: false, code: "bad_issuer" };
 
-  // 10. aud: must be a string or array containing `${oauthIssuer}/oauth/token` or oauthIssuer
+  // 10. aud: token endpoint/issuer by default; callers may add another same-AS endpoint.
   const aud = payload.aud;
   const tokenUrl = `${oauthIssuer}/oauth/token`;
+  const acceptedAudiences = new Set([tokenUrl, oauthIssuer, ...additionalAudiences]);
   const audOk = Array.isArray(aud)
-    ? aud.includes(tokenUrl) || aud.includes(oauthIssuer)
-    : aud === tokenUrl || aud === oauthIssuer;
+    ? aud.some((value) => typeof value === "string" && acceptedAudiences.has(value))
+    : typeof aud === "string" && acceptedAudiences.has(aud);
   if (!audOk) return { ok: false, code: "bad_audience" };
 
   // 11. sub: if present, must equal clientId

@@ -144,6 +144,7 @@ export interface OAuthPublicStore {
   connectorInventory(): Promise<Record<string, unknown>>;
   revokeConnector(connectorId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   revokeClientConnectors(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
+  revokeToken(token: string, clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   issueTokens(input: TokenIssueInput): Promise<IssuedTokenPair | null>;
   issueAutomationAccess(input: Omit<TokenIssueInput, "refresh_ttl_sec" | "connector_id" | "grant_generation">): Promise<IssuedAccessToken | null>;
   exchangeRefresh(input: RefreshExchangeInput): Promise<IssuedTokenPair | null>;
@@ -216,6 +217,7 @@ const MCP_JSON_PATH = "/.well-known/mcp.json";
 const AUTHORIZE_PATH = "/oauth/authorize";
 const AUTHORIZE_POLL_PATH = "/oauth/authorize/poll";
 const TOKEN_PATH = "/oauth/token";
+const REVOKE_PATH = "/oauth/revoke";
 
 function isOwnedPath(path: string): boolean {
   return (
@@ -225,7 +227,8 @@ function isOwnedPath(path: string): boolean {
     path === MCP_JSON_PATH ||
     path === AUTHORIZE_PATH ||
     path === AUTHORIZE_POLL_PATH ||
-    path === TOKEN_PATH
+    path === TOKEN_PATH ||
+    path === REVOKE_PATH
   );
 }
 
@@ -1249,6 +1252,75 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
   return tokenError(ctx, "unsupported_grant_type", `unsupported grant_type '${grantType}'`);
 }
 
+/** RFC 7009 token revocation. Token possession identifies the exact Connector instance. */
+async function handleRevoke(request: Request, ctx: HandlerCtx): Promise<Response> {
+  const bodyResult = await readRequestBody(request, ctx.maxBodyBytes);
+  if (!bodyResult.ok) {
+    return ctx.json(
+      {
+        error: "invalid_request",
+        error_description: bodyResult.code === "payload_too_large" ? "request body too large" : "invalid request body",
+      },
+      bodyResult.code === "payload_too_large" ? 413 : 400,
+      { "cache-control": "no-store" },
+    );
+  }
+
+  const first = (k: string): string => firstOf(bodyResult.value[k]);
+  const token = first("token");
+  const clientId = first("client_id");
+  if (!token || !clientId || token.length > 16384 || clientId.length > ctx.maxParamBytes) {
+    return ctx.json(
+      { error: "invalid_request", error_description: "token and client_id are required" },
+      400,
+      { "cache-control": "no-store" },
+    );
+  }
+
+  if (clientId) {
+    const nowSec = Math.floor(ctx.nowMs() / 1000);
+    const client = await resolveClient(clientId, ctx.store, nowSec, ctx.fetchFn, ctx.maxParamBytes);
+    if (!client) {
+      return ctx.json({ error: "invalid_client" }, 401, { "cache-control": "no-store" });
+    }
+    const assertion = first("client_assertion");
+    const assertionType = first("client_assertion_type");
+    if (assertion) {
+      if (
+        (assertionType && assertionType !== JWT_BEARER) ||
+        !isChatgptOAuthClientId(clientId) ||
+        assertion.length > ctx.maxParamBytes
+      ) {
+        return ctx.json({ error: "invalid_client" }, 401, { "cache-control": "no-store" });
+      }
+      const verdict = await verifyChatgptPrivateKeyJwt(
+        assertion,
+        clientId,
+        ctx.identity.issuer,
+        nowSec,
+        ctx.fetchFn,
+        [`${ctx.identity.issuer}/oauth/revoke`],
+      );
+      if (!verdict.ok) {
+        return ctx.json({ error: "invalid_client" }, 401, { "cache-control": "no-store" });
+      }
+    } else if (!(await authenticateClient(client, first("client_secret")))) {
+      return ctx.json({ error: "invalid_client" }, 401, { "cache-control": "no-store" });
+    }
+  }
+
+  // RFC 7009 requires unknown/already-revoked tokens to be indistinguishable
+  // from successful revocation. The DO verifies client_id against token
+  // ownership before mutating anything.
+  await ctx.store.revokeToken(
+    token,
+    clientId,
+    `oauth:revocation:${clientId}`,
+    ctx.nowMs(),
+  );
+  return ctx.json({}, 200, { "cache-control": "no-store" });
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -1332,6 +1404,9 @@ export async function handleOAuthPublic(
     }
     if (path === TOKEN_PATH) {
       return handleToken(request, hctx);
+    }
+    if (path === REVOKE_PATH) {
+      return handleRevoke(request, hctx);
     }
     return null;
   }
@@ -1519,6 +1594,15 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
     async revokeClientConnectors(clientId, revokedBy, nowMs) {
       const resp = await internal("/internal/oauth/connector/revoke-client", {
         client_id: clientId,
+        revoked_by: revokedBy,
+        now_ms: nowMs,
+      });
+      return resp.ok;
+    },
+    async revokeToken(token, clientId, revokedBy, nowMs) {
+      const resp = await internal("/internal/oauth/token/revoke", {
+        token,
+        ...(clientId ? { client_id: clientId } : {}),
         revoked_by: revokedBy,
         now_ms: nowMs,
       });

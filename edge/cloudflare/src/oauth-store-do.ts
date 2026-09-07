@@ -440,6 +440,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/signing/ensure") return this.signingPublicKey();
     if (request.method === "POST" && url.pathname === "/internal/oauth/access/verify") return this.verifyAccess(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/token/issue") return this.issuePair(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/token/revoke") return this.revokePresentedToken(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/refresh/exchange") return this.exchangeRefresh(request);
     return json({ ok: false, code: "not_found" }, 404);
   }
@@ -1568,6 +1569,74 @@ export class OAuthStoreDO {
       grant_generation: legacy.grant_generation ?? null,
       source: "opaque",
     });
+  }
+
+  private async revokePresentedToken(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const token = body?.token;
+    const clientId = body?.client_id;
+    const revokedBy = body?.revoked_by;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
+    if (
+      !boundedString(token, 16384) ||
+      !boundedString(clientId, 4096) ||
+      !boundedString(revokedBy, 4096)
+    ) return json({ ok: false, code: "bad_request" }, 400);
+
+    let ownerClientId: string | undefined;
+    let connectorId: string | undefined;
+    let opaqueKey: string | undefined;
+
+    if (token.includes(".")) {
+      const verified = await this.verifyAccess(new Request("https://oauth.internal/internal/oauth/access/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, now_sec: nowSec }),
+      }));
+      if (verified.ok) {
+        const data = await verified.json() as { client_id?: unknown; connector_id?: unknown };
+        if (boundedString(data.client_id, 4096)) ownerClientId = data.client_id;
+        if (typeof data.connector_id === "string" && /^conn_[A-Za-z0-9_-]{8,128}$/.test(data.connector_id)) {
+          connectorId = data.connector_id;
+        }
+      }
+    } else {
+      const hash = await hashOpaqueToken(token);
+      for (const prefix of [REFRESH_PREFIX, ACCESS_PREFIX]) {
+        const key = prefix + hash;
+        const record = await this.state.storage.get<OAuthTokenRecord>(key);
+        if (!record) continue;
+        if (record.expires_at <= nowSec) {
+          await this.state.storage.delete(key);
+          continue;
+        }
+        ownerClientId = record.client_id;
+        connectorId = record.connector_id;
+        opaqueKey = key;
+        break;
+      }
+    }
+
+    // RFC 7009: unknown tokens and tokens owned by another client are
+    // intentionally indistinguishable from successful revocation.
+    if (!ownerClientId || (typeof clientId === "string" && ownerClientId !== clientId)) {
+      return json({ ok: true, revoked: false });
+    }
+
+    if (connectorId) {
+      const revoked = await this.revokeConnector(new Request("https://oauth.internal/internal/oauth/connector/revoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ connector_id: connectorId, revoked_by: revokedBy, now_ms: nowMs }),
+      }));
+      return json({ ok: true, revoked: revoked.ok });
+    }
+
+    // Pre-v0.4.6 credentials have no connector identity. Revoke only the
+    // presented opaque credential; never infer a client-wide kill switch.
+    if (opaqueKey) await this.state.storage.delete(opaqueKey);
+    return json({ ok: true, revoked: Boolean(opaqueKey) });
   }
 
   private parseIssueInput(body: Record<string, unknown> | null): ParsedIssuePairInput | null {

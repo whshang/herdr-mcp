@@ -207,7 +207,7 @@ async function doVerifier(opts) {
 
 test("OPTIONS on any owned path returns 204 with exact CORS headers", async () => {
   const opts = makeOptions();
-  for (const path of ["/.well-known/oauth-authorization-server", "/oauth/register", "/oauth/token", "/.well-known/mcp.json"]) {
+  for (const path of ["/.well-known/oauth-authorization-server", "/oauth/register", "/oauth/token", "/oauth/revoke", "/.well-known/mcp.json"]) {
     const resp = await handleOAuthPublic(new Request(`https://x.example${path}`, { method: "OPTIONS" }), opts);
     assert.equal(resp.status, 204);
     assert.equal(resp.headers.get("access-control-allow-origin"), "*");
@@ -256,8 +256,10 @@ test("metadata document is RFC8414 OAuth (no OIDC-only claims)", async () => {
   const doc = await (await GET("/.well-known/openid-configuration", opts)).json();
   assert.equal(doc.issuer, ISSUER);
   assert.equal(doc.token_endpoint, `${ISSUER}/oauth/token`);
+  assert.equal(doc.revocation_endpoint, `${ISSUER}/oauth/revoke`);
   assert.deepEqual(doc.scopes_supported, ["mcp"]);
   assert.deepEqual(doc.token_endpoint_auth_methods_supported, ["none", "private_key_jwt", "client_secret_post"]);
+  assert.deepEqual(doc.revocation_endpoint_auth_methods_supported, ["none", "private_key_jwt", "client_secret_post"]);
   assert.equal(doc.authorization_response_iss_parameter_supported, true);
   assert.equal(doc.client_id_metadata_document_supported, true);
   assert.equal("userinfo_endpoint" in doc, false);
@@ -977,7 +979,121 @@ test("refresh_token: wrong client for an active refresh is rejected", async () =
 });
 
 // ---------------------------------------------------------------------------
-// 10. ChatGPT CIMD private_key_jwt (real RS256, injected JWKS fetch)
+// 10. RFC 7009 Connector-instance revocation
+// ---------------------------------------------------------------------------
+
+test("revoke endpoint retires only the Connector owning the presented refresh token", async () => {
+  const opts = makeOptions();
+  const { client_id } = await registerClient(opts, { token_endpoint_auth_method: "none" });
+
+  const firstAuth = await makeAuthCode(opts, client_id);
+  const firstToken = await POST("/oauth/token", tokenBody(client_id, firstAuth.code, firstAuth.verifier), opts);
+  assert.equal(firstToken.status, 200);
+  const firstPair = await firstToken.json();
+  const firstConnector = (await opts.store.listConnectors()).find((c) => c.status === "active");
+  assert.ok(firstConnector);
+
+  const missingClient = await POST(
+    "/oauth/revoke",
+    { token: firstPair.refresh_token, token_type_hint: "refresh_token" },
+    opts,
+    { form: true },
+  );
+  assert.equal(missingClient.status, 400);
+  assert.equal((await missingClient.json()).error, "invalid_request");
+  assert.equal((await opts.store.getConnector(firstConnector.connector_id)).status, "active");
+
+  const secondAuth = await makeAuthCode(opts, client_id);
+  const secondToken = await POST("/oauth/token", tokenBody(client_id, secondAuth.code, secondAuth.verifier), opts);
+  assert.equal(secondToken.status, 200);
+  const secondPair = await secondToken.json();
+  const activeBefore = (await opts.store.listConnectors()).filter((c) => c.status === "active");
+  assert.equal(activeBefore.length, 2);
+  const secondConnector = activeBefore.find((c) => c.connector_id !== firstConnector.connector_id);
+  assert.ok(secondConnector);
+
+  const other = await registerClient(opts, { token_endpoint_auth_method: "none" });
+  const wrongOwner = await POST(
+    "/oauth/revoke",
+    { token: firstPair.refresh_token, token_type_hint: "refresh_token", client_id: other.client_id },
+    opts,
+    { form: true },
+  );
+  assert.equal(wrongOwner.status, 200);
+  assert.deepEqual(await wrongOwner.json(), {});
+  assert.equal((await opts.store.getConnector(firstConnector.connector_id)).status, "active");
+
+  const revoked = await POST(
+    "/oauth/revoke",
+    { token: firstPair.refresh_token, token_type_hint: "refresh_token", client_id },
+    opts,
+    { form: true },
+  );
+  assert.equal(revoked.status, 200);
+  assert.equal(revoked.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await revoked.json(), {});
+
+  assert.equal((await opts.store.getConnector(firstConnector.connector_id)).status, "revoked");
+  assert.equal((await opts.store.getConnector(secondConnector.connector_id)).status, "active");
+
+  const oldRefresh = await POST(
+    "/oauth/token",
+    { grant_type: "refresh_token", refresh_token: firstPair.refresh_token, client_id, resource: IDENTITY.resource },
+    opts,
+  );
+  assert.equal(oldRefresh.status, 400);
+  assert.equal((await oldRefresh.json()).error, "invalid_grant");
+
+  const siblingRefresh = await POST(
+    "/oauth/token",
+    { grant_type: "refresh_token", refresh_token: secondPair.refresh_token, client_id, resource: IDENTITY.resource },
+    opts,
+  );
+  assert.equal(siblingRefresh.status, 200);
+
+  const unknown = await POST(
+    "/oauth/revoke",
+    { token: "unknown-token-that-does-not-exist", client_id },
+    opts,
+    { form: true },
+  );
+  assert.equal(unknown.status, 200);
+  assert.deepEqual(await unknown.json(), {});
+  assert.equal((await opts.store.getConnector(secondConnector.connector_id)).status, "active");
+});
+
+test("revoke endpoint authenticates confidential clients before token retirement", async () => {
+  const opts = makeOptions();
+  const { client_id, client_secret } = await registerClient(opts);
+  const { code, verifier } = await makeAuthCode(opts, client_id);
+  const issued = await POST("/oauth/token", tokenBody(client_id, code, verifier, { client_secret }), opts);
+  assert.equal(issued.status, 200);
+  const pair = await issued.json();
+  const connector = (await opts.store.listConnectors()).find((c) => c.status === "active");
+  assert.ok(connector);
+
+  const missingSecret = await POST(
+    "/oauth/revoke",
+    { token: pair.refresh_token, client_id },
+    opts,
+    { form: true },
+  );
+  assert.equal(missingSecret.status, 401);
+  assert.equal((await missingSecret.json()).error, "invalid_client");
+  assert.equal((await opts.store.getConnector(connector.connector_id)).status, "active");
+
+  const revoked = await POST(
+    "/oauth/revoke",
+    { token: pair.refresh_token, client_id, client_secret },
+    opts,
+    { form: true },
+  );
+  assert.equal(revoked.status, 200);
+  assert.equal((await opts.store.getConnector(connector.connector_id)).status, "revoked");
+});
+
+// ---------------------------------------------------------------------------
+// 11. ChatGPT CIMD private_key_jwt (real RS256, injected JWKS fetch)
 // ---------------------------------------------------------------------------
 
 async function generateJwk(kid) {
@@ -1029,6 +1145,50 @@ test("token: ChatGPT CIMD private_key_jwt verified via injected fetch; no global
   assert.equal(resp.status, 200);
   assert.ok((await resp.json()).access_token);
   assert.equal(fetched, 1, "JWKS fetched exactly once via injected fetchFn");
+});
+
+test("revoke: ChatGPT private_key_jwt accepts the revocation endpoint audience", async () => {
+  const kid = "cimd-revoke-key";
+  const { jwk, privateKey } = await generateJwk(kid);
+  let fetched = 0;
+  const fetchFn = async (url) => {
+    fetched++;
+    assert.ok(String(url).endsWith("/oauth/jwks.json"), `jwks url: ${url}`);
+    return new Response(JSON.stringify({ keys: [jwk] }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const cimd = "https://chatgpt.com/oauth/client.json";
+  const opts = makeOptions({ fetchFn });
+  const { code, verifier } = await makeAuthCode(opts, cimd, "https://chatgpt.com/connector_platform_oauth_redirect");
+  const tokenAssertion = await signAssertion(
+    { iss: cimd, aud: `${ISSUER}/oauth/token`, sub: cimd, iat: NOW_SEC, exp: NOW_SEC + 300 },
+    privateKey, kid,
+  );
+  const issued = await POST("/oauth/token", cimdAssertionBody(cimd, tokenAssertion, { code, code_verifier: verifier }), opts);
+  assert.equal(issued.status, 200);
+  const pair = await issued.json();
+  const connector = (await opts.store.listConnectors()).find((c) => c.status === "active");
+  assert.ok(connector);
+
+  const revokeAssertion = await signAssertion(
+    { iss: cimd, aud: `${ISSUER}/oauth/revoke`, sub: cimd, iat: NOW_SEC, exp: NOW_SEC + 300 },
+    privateKey, kid,
+  );
+  const revoked = await POST(
+    "/oauth/revoke",
+    {
+      token: pair.refresh_token,
+      token_type_hint: "refresh_token",
+      client_id: cimd,
+      client_assertion: revokeAssertion,
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    },
+    opts,
+    { form: true },
+  );
+  assert.equal(revoked.status, 200);
+  assert.deepEqual(await revoked.json(), {});
+  assert.equal((await opts.store.getConnector(connector.connector_id)).status, "revoked");
+  assert.equal(fetched, 2, "token and revocation assertions each verify against ChatGPT JWKS");
 });
 
 test("token: CIMD assertion failure maps to invalid_client", async () => {
