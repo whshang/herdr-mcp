@@ -124,6 +124,18 @@ mod linux {
         Ok(())
     }
 
+    pub(super) fn ensure_private_file_mode(path: &Path, meta: &fs::Metadata) -> Result<(), String> {
+        if meta.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+                format!(
+                    "cannot repair Linux device credential permissions on {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     pub(super) fn load(service: &str, account: &str) -> Result<String, String> {
         let (dir, path) = paths(service, account)?;
         ensure_dir(&dir)?;
@@ -136,12 +148,7 @@ mod linux {
         if meta.file_type().is_symlink() || !meta.is_file() {
             return Err("Linux device credential must be a regular non-symlink file".to_owned());
         }
-        if meta.permissions().mode() & 0o077 != 0 {
-            return Err(format!(
-                "Linux device credential {} is too permissive; expected mode 0600",
-                path.display()
-            ));
-        }
+        ensure_private_file_mode(&path, &meta)?;
         if meta.len() == 0 || meta.len() > 4096 {
             return Err("Linux device credential has an invalid size".to_owned());
         }
@@ -248,5 +255,35 @@ mod tests {
         assert!(validate_key("service\n", "account").is_err());
         assert!(validate_secret("").is_err());
         assert!(validate_secret("secret").is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_credential_permissions_are_repaired_to_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-credential-mode-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("device.cred");
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+
+        linux::ensure_private_file_mode(&path, &meta).unwrap();
+
+        let mode = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

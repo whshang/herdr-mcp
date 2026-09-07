@@ -944,9 +944,12 @@ fn read_runtime_token(path: &Path) -> Result<String, String> {
         return Err("Linux runtime token file must be a regular non-symlink file".to_owned());
     }
     if meta.permissions().mode() & 0o077 != 0 {
-        return Err(
-            "Linux runtime token file must not be accessible by group or other users".to_owned(),
-        );
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            format!(
+                "cannot repair Linux runtime token permissions on {}: {error}",
+                path.display()
+            )
+        })?;
     }
     if meta.len() > 8192 {
         return Err("Linux runtime token file is unexpectedly large".to_owned());
@@ -1344,6 +1347,27 @@ mod tests {
             normalize_owned_current_target(runtime_root, Path::new("generations/not-rust"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_token_permissions_are_repaired_before_read() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "herdr-runtime-token-mode-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime.env");
+        fs::write(&path, b"HERDR_MCP_TOKEN=test-token\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(read_runtime_token(&path).unwrap(), "test-token");
+        let mode = fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]
