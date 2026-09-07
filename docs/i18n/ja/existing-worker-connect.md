@@ -30,7 +30,7 @@
 
    デフォルトでは、参加するコンピュータがプラットフォームから取得したコンピュータ名/hostname が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
 
-   ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。macOS は launchd、Linux は `systemd --user` が lifecycle を管理します。ローカル service が healthy で、production Link が新しい device identity を使用していることを確認できた場合のみ成功を返します。失敗時は remote revoke とローカル credential / config の補償を実行します。
+   ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。macOS は launchd、通常の Linux login/server 環境は `systemd --user` を優先します。user systemd manager/bus が存在しない init-less container などでは、PID と Linux `/proc` start time で所有プロセスを厳密に識別する detached user-process backend にフォールバックします。この fallback は host/container が動作している間は shell/SSH 終了後も継続しますが、systemd の crash restart や boot/container restart 後の自動起動は提供しません。長期常駐が必要な場合は systemd または外側の supervisor を使用してください。ローカル service が healthy で、production Link が新しい device identity を使用していることを確認できた場合のみ成功を返し、失敗時は remote revoke とローカル credential / config の補償を実行します。
 
 3. 成功すると、一時的なペアリングが高エントロピーのデバイス単位資格情報と交換されます。macOS は最終資格情報を Keychain に、Linux は上記のユーザー専用 credential store に保存します。ペアリングコード/セッションは即座に使用不能になります。参加デバイスでは、Cloudflare デプロイ資格情報も旧来の `LINK_SHARED_SECRET` も使用されません。
 
