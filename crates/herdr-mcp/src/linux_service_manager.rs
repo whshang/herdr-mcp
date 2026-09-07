@@ -187,6 +187,8 @@ fn ensure_link_installed_with_restart(restart_existing: bool) -> Result<(), Stri
                 .to_owned(),
         );
     }
+    let generation = current_generation(&paths)
+        .ok_or_else(|| "Linux runtime/current is missing before Link activation".to_owned())?;
     let config_path = RuntimePaths::discover()?.config_file;
     let config = Config::load(&config_path)?;
     let device_id = config
@@ -206,7 +208,7 @@ fn ensure_link_installed_with_restart(restart_existing: bool) -> Result<(), Stri
             ensure_secure_dir(&paths.systemd_dir, 0o700)?;
             atomic_write(
                 &paths.link_unit,
-                link_unit_contents(&paths)?.as_bytes(),
+                link_unit_contents(&paths, &generation)?.as_bytes(),
                 0o600,
             )?;
             systemctl(&["daemon-reload"])?;
@@ -495,15 +497,16 @@ fn service_unit_contents(paths: &LinuxPaths, generation_id: &str) -> Result<Stri
     ))
 }
 
-fn link_unit_contents(paths: &LinuxPaths) -> Result<String, String> {
+fn link_unit_contents(paths: &LinuxPaths, generation_id: &str) -> Result<String, String> {
     let current = quote(&paths.current_binary)?;
     let config_dir = quote(&paths.config_dir)?;
     Ok(format!(
-        "[Unit]\nDescription=Herdr MCP Edge Link\nAfter=network-online.target {SERVICE_UNIT}\nWants=network-online.target\nRequires={SERVICE_UNIT}\n\n[Service]\nType=simple\nExecStart={current} link run\nWorkingDirectory={config_dir}\nEnvironment=\"HOME={}\"\nEnvironment=\"HERDR_MCP_CONFIG_DIR={}\"\nEnvironment=\"HERDR_MCP_STATE_DIR={}\"\nEnvironment=\"HERDR_SOCKET_PATH={}\"\nEnvironment=\"PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin\"\nRestart=always\nRestartSec=5\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Herdr MCP Edge Link\nAfter=network-online.target {SERVICE_UNIT}\nWants=network-online.target\nRequires={SERVICE_UNIT}\n\n[Service]\nType=simple\nExecStart={current} link run\nWorkingDirectory={config_dir}\nEnvironment=\"HOME={}\"\nEnvironment=\"HERDR_MCP_CONFIG_DIR={}\"\nEnvironment=\"HERDR_MCP_STATE_DIR={}\"\nEnvironment=\"HERDR_SOCKET_PATH={}\"\nEnvironment=\"HERDR_RUNTIME_GENERATION={}\"\nEnvironment=\"PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin\"\nRestart=always\nRestartSec=5\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         systemd_env_value(&paths.home)?,
         systemd_env_value(&paths.config_dir)?,
         systemd_env_value(&paths.config_dir)?,
         systemd_env_value(&paths.herdr_socket)?,
+        generation_id,
         systemd_env_value(&paths.home)?,
     ))
 }
@@ -660,23 +663,9 @@ fn start_link_process(paths: &LinuxPaths) -> Result<(), String> {
     if !health_once(paths.port) {
         return Err("Linux Link process requires a healthy local herdr-mcp service".to_owned());
     }
-    let mut command = Command::new(&paths.current_binary);
-    command
-        .arg("link")
-        .arg("run")
-        .current_dir(&paths.config_dir)
-        .env("HOME", &paths.home)
-        .env("HERDR_MCP_CONFIG_DIR", &paths.config_dir)
-        .env("HERDR_MCP_STATE_DIR", &paths.config_dir)
-        .env("HERDR_SOCKET_PATH", &paths.herdr_socket)
-        .env("HERDR_MCP_SERVICE_IMPL", PROCESS_BACKEND)
-        .env(
-            "PATH",
-            format!(
-                "{}/.local/bin:/usr/local/bin:/usr/bin:/bin",
-                paths.home.to_string_lossy()
-            ),
-        );
+    let generation = current_generation(paths)
+        .ok_or_else(|| "Linux runtime/current is missing before Link activation".to_owned())?;
+    let mut command = link_process_command(paths, &generation);
     let mut child = spawn_managed_process(&mut command, &paths.link_process, "link")?;
     let deadline = Instant::now() + Duration::from_millis(750);
     while Instant::now() < deadline {
@@ -692,6 +681,28 @@ fn start_link_process(paths: &LinuxPaths) -> Result<(), String> {
         thread::sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+fn link_process_command(paths: &LinuxPaths, generation: &str) -> Command {
+    let mut command = Command::new(&paths.current_binary);
+    command
+        .arg("link")
+        .arg("run")
+        .current_dir(&paths.config_dir)
+        .env("HOME", &paths.home)
+        .env("HERDR_MCP_CONFIG_DIR", &paths.config_dir)
+        .env("HERDR_MCP_STATE_DIR", &paths.config_dir)
+        .env("HERDR_SOCKET_PATH", &paths.herdr_socket)
+        .env("HERDR_RUNTIME_GENERATION", generation)
+        .env("HERDR_MCP_SERVICE_IMPL", PROCESS_BACKEND)
+        .env(
+            "PATH",
+            format!(
+                "{}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+                paths.home.to_string_lossy()
+            ),
+        );
+    command
 }
 
 fn spawn_managed_process(
@@ -1209,12 +1220,42 @@ mod tests {
             herdr_socket: home.join(".config/herdr/herdr.sock"),
         };
         let server = service_unit_contents(&paths, "rust-deadbeef").unwrap();
-        let link = link_unit_contents(&paths).unwrap();
+        let link = link_unit_contents(&paths, "rust-deadbeef").unwrap();
         assert!(server.contains("EnvironmentFile=\"/home/tester/.config/herdr-mcp/runtime.env\""));
         assert!(!server.contains("HERDR_MCP_TOKEN="));
         assert!(!link.contains("devsec_"));
         assert!(link.contains(" link run"));
+        assert!(link.contains("Environment=\"HERDR_RUNTIME_GENERATION=rust-deadbeef\""));
         assert!(server.contains(" candidate --port 8772"));
+    }
+
+    #[test]
+    fn detached_link_command_overrides_inherited_runtime_generation() {
+        let home = PathBuf::from("/home/tester");
+        let paths = LinuxPaths {
+            home: home.clone(),
+            config_dir: home.join(".config/herdr-mcp"),
+            runtime_root: home.join(".config/herdr-mcp/runtime"),
+            generations_dir: home.join(".config/herdr-mcp/runtime/generations"),
+            current_link: home.join(".config/herdr-mcp/runtime/current"),
+            current_binary: home.join(".config/herdr-mcp/runtime/current/herdr-mcp"),
+            runtime_env: home.join(".config/herdr-mcp/runtime.env"),
+            backend_file: home.join(".config/herdr-mcp/runtime/linux-service-backend"),
+            service_process: home.join(".config/herdr-mcp/runtime/service-process.json"),
+            link_process: home.join(".config/herdr-mcp/runtime/link-process.json"),
+            systemd_dir: home.join(".config/systemd/user"),
+            service_unit: home.join(".config/systemd/user/herdr-mcp.service"),
+            link_unit: home.join(".config/systemd/user/herdr-mcp-link.service"),
+            port: 8772,
+            herdr_socket: home.join(".config/herdr/herdr.sock"),
+        };
+        let command = link_process_command(&paths, "rust-current123");
+        let generation = command
+            .get_envs()
+            .find(|(key, _)| *key == "HERDR_RUNTIME_GENERATION")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str());
+        assert_eq!(generation, Some("rust-current123"));
     }
 
     #[test]
