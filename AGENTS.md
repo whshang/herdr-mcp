@@ -4,6 +4,8 @@ Release planes and publication boundaries: [`docs/release-model.md`](docs/releas
 
 Documentation retention: do not classify a document as disposable solely because its filename or origin says `research`, `benchmark`, `UAT`, or `history`. Delete raw execution evidence, one-off repro logs, and superseded process records when appropriate; retain distilled articles that contain reusable architecture comparisons, product positioning, design trade-offs, or long-lived constraints, and update/consolidate them instead of deleting them.
 
+GitHub write fallback: if the GitHub App returns HTTP 403 / `Resource not accessible by integration` while creating a pull request, do not keep retrying GitHub App write mutations in that task. Route all subsequent GitHub write operations through the workstation's already-authenticated `gh` CLI (`gh pr ...`, `gh issue ...`, and other write-capable `gh` commands). GitHub reads may continue through either available read surface. This fallback does not relax confirmation requirements for merges, releases, tags, deployments, or any other irreversible operation.
+
 Do not bump the Rust runtime version solely to ship an extension-only UI/DOM/browser-compatibility change. If the current release tooling cannot publish the extension independently, fix or add the extension release path instead of manufacturing a runtime patch release with no runtime change.
 
 ## Binary and runtime ownership
