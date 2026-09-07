@@ -10,7 +10,7 @@ const KEYS = [
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
-  "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
+  "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled",
   "pageAssistOrigins",
 ];
 let loadedHostPermissionOrigins = [];
@@ -33,6 +33,7 @@ function configuredHostPermissionOrigins(config) {
   if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
   if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
   if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
+  if (config.experimentalGrokEnabled === true) origins.push("https://grok.com/*");
   const llmOrigin = hostPermissionPatternForUrl(config.llmJudgeBaseUrl);
   if (llmOrigin) origins.push(llmOrigin);
   for (const origin of config.pageAssistOrigins || []) {
@@ -115,6 +116,8 @@ function applyI18n() {
   $("hint_experimental_deepseek").textContent = t("hint_experimental_deepseek");
   $("lab_experimental_gemini").textContent = t("label_experimental_gemini");
   $("hint_experimental_gemini").textContent = t("hint_experimental_gemini");
+  $("lab_experimental_grok").textContent = t("label_experimental_grok");
+  $("hint_experimental_grok").textContent = t("hint_experimental_grok");
   $("title_page_assist").textContent = t("options_page_assist_section");
   $("hint_page_assist").textContent = t("options_page_assist_hint");
   $("lab_page_assist_origins").textContent = t("label_page_assist_origins");
@@ -157,6 +160,7 @@ async function loadForm() {
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
   $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
+  $("experimentalGrokEnabled").checked = cfg.experimentalGrokEnabled === true;
   const pa = cfg.pageAssistOrigins;
   $("pageAssistOrigins").value = Array.isArray(pa) ? pa.join("\n") : (pa || "");
   try { loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg); } catch (_) { loadedHostPermissionOrigins = []; }
@@ -223,6 +227,7 @@ $("save").addEventListener("click", async () => {
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
+    experimentalGrokEnabled: $("experimentalGrokEnabled").checked,
     pageAssistOrigins: cleanPa,
     uiLocale: getLocale(),
   };

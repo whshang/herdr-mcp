@@ -33,6 +33,9 @@ const GEMINI_SPARK_KEY = "https://gemini.google.com/u/1/spark/chat/gemini-recove
 const CLAUDE_CHAT_ID = "123e4567-e89b-12d3-a456-426614174000";
 const CLAUDE_CHAT_URL = `https://claude.ai/chat/${CLAUDE_CHAT_ID}?from=history`;
 const CLAUDE_CHAT_KEY = `https://claude.ai/chat/${CLAUDE_CHAT_ID}`;
+const GROK_CHAT_ID = "223e4567-e89b-12d3-a456-426614174001";
+const GROK_CHAT_URL = `https://grok.com/c/${GROK_CHAT_ID}?rid=ignored`;
+const GROK_CHAT_KEY = `https://grok.com/c/${GROK_CHAT_ID}`;
 
 let failures = 0;
 function ok(cond, label, detail = "") {
@@ -50,7 +53,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true, experimentalGrokEnabled: true };
 const listeners = {
   onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
   onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [],
@@ -161,6 +164,18 @@ function targetListener(tab) {
           convKey: CLAUDE_CHAT_KEY,
           url: tab.url,
           site: "claude",
+        });
+        return;
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+    if (String(tab.url || "").startsWith("https://grok.com/")) {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({
+          convKey: GROK_CHAT_KEY,
+          url: tab.url,
+          site: "grok",
         });
         return;
       }
@@ -353,7 +368,9 @@ globalThis.chrome = {
               resource: {
                 resource_ref: body.provider === "claude"
                   ? (body.kind === "account" ? "bra_claude_account" : "brs_claude_session")
-                  : (body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session"),
+                  : body.provider === "grok"
+                    ? (body.kind === "account" ? "bra_grok_account" : "brs_grok_session")
+                    : (body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session"),
                 kind: body.kind,
               },
             }
@@ -551,6 +568,9 @@ globalThis.chrome = {
       const tab = tabs.get(tabId);
       if (tab?.url?.startsWith("https://gemini.google.com/")
         && registeredContentScripts.has("herdr-experimental-gemini")) {
+        tab.listener = targetListener(tab);
+      } else if (tab?.url?.startsWith("https://grok.com/")
+        && registeredContentScripts.has("herdr-experimental-grok")) {
         tab.listener = targetListener(tab);
       } else if (tab?.url?.startsWith("https://claude.ai/")) {
         tab.listener = targetListener(tab);
@@ -872,6 +892,58 @@ console.log("\n[Claude listener-less recovery]");
     JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
 }
 
+console.log("\n[Grok optional-origin registration and recovery]");
+{
+  ok(await waitForTest(() => registeredContentScripts.has("herdr-experimental-grok")),
+    "Grok opt-in registers one dynamic content script after explicit site permission");
+  const script = registeredContentScripts.get("herdr-experimental-grok") || {};
+  ok(script.matches?.[0] === "https://grok.com/*"
+      && script.js?.includes("content/injector/grok.js")
+      && script.js?.includes("content/wake.js")
+      && !script.js?.includes("content/webmcp/json-bridge.js"),
+    "Grok dynamic script is exact-origin scoped and does not inherit the JSON bridge",
+    JSON.stringify(script));
+
+  const disabled = await dispatchMessage({
+    type: "h2w_set_config",
+    config: { experimentalGrokEnabled: false },
+  });
+  ok(disabled?.ok === true && !registeredContentScripts.has("herdr-experimental-grok"),
+    "disabling Grok unregisters its dynamic content script");
+  const blocked = await dispatchMessage({
+    type: "h2w_register",
+    site: "grok",
+    convKey: GROK_CHAT_KEY,
+    url: GROK_CHAT_URL,
+    accountNativeIdentity: `grok-account-sha256:${"e".repeat(64)}`,
+  }, { tab: { id: 905, url: GROK_CHAT_URL } });
+  ok(blocked?.ok === false && blocked?.error === "experimental-site-disabled",
+    "disabled Grok registration fails closed before Browser Registry mutation",
+    JSON.stringify(blocked));
+
+  const fallbackTabId = 906;
+  tabs.set(fallbackTabId, { id: fallbackTabId, url: GROK_CHAT_URL, status: "complete", listener: null });
+  const reloadsBeforeEnable = reloadCalls.length;
+  const enabled = await dispatchMessage({
+    type: "h2w_set_config",
+    config: { experimentalGrokEnabled: true },
+  });
+  ok(enabled?.ok === true && registeredContentScripts.has("herdr-experimental-grok"),
+    "re-enabling Grok re-registers the dynamic content script");
+  ok(reloadCalls.slice(reloadsBeforeEnable).some((call) => call.tabId === fallbackTabId),
+    "first Grok dynamic-script registration reloads an already-open complete Grok tab once",
+    JSON.stringify(reloadCalls.slice(reloadsBeforeEnable)));
+
+  tabs.get(fallbackTabId).listener = null;
+  const reloadsBeforeFallback = reloadCalls.length;
+  const fallbackState = await dispatchMessage({ type: "h2w_state", tabId: fallbackTabId });
+  ok(fallbackState?.convInfo?.site === "grok"
+      && fallbackState?.convInfo?.convKey === GROK_CHAT_KEY
+      && reloadCalls.slice(reloadsBeforeFallback).some((call) => call.tabId === fallbackTabId),
+    "Control Center recovers a listener-less Grok chat from its bounded URL identity",
+    JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
+}
+
 console.log("\n[Gemini browser registry observation]");
 {
   const before = browserRegistryRequests.length;
@@ -964,6 +1036,37 @@ console.log("\n[Claude browser registry observation]");
       && legacyTokenObserved[0]?.provider === "claude",
     "legacy claude.ai page token normalizes to Claude Browser Registry without entering another provider migration",
     JSON.stringify({ registration: legacyTokenRegistration, observed: legacyTokenObserved }));
+}
+
+console.log("\n[Grok browser registry observation]");
+{
+  const before = browserRegistryRequests.length;
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "grok",
+    convKey: GROK_CHAT_KEY,
+    url: GROK_CHAT_URL,
+    accountNativeIdentity: `grok-account-sha256:${"f".repeat(64)}`,
+  }, { tab: { id: 95, url: GROK_CHAT_URL } });
+  const observed = browserRegistryRequests.slice(before);
+  ok(registered?.bound === false
+      && registered?.browser_session_ref === "brs_grok_session"
+      && Number.isSafeInteger(registered?.browser_generation),
+    "Grok registration returns the opaque browser session and capability generation",
+    JSON.stringify(registered));
+  ok(observed.length === 3
+      && observed[0]?.operation === "provider.observe"
+      && observed[0]?.provider === "grok"
+      && observed[1]?.operation === "resource.observe"
+      && observed[1]?.kind === "account"
+      && observed[1]?.parent_ref === null
+      && observed[2]?.operation === "resource.observe"
+      && observed[2]?.kind === "session"
+      && observed[2]?.parent_ref === "bra_grok_account"
+      && observed[2]?.native_identity === GROK_CHAT_ID
+      && !observed.some((request) => request?.kind === "space"),
+    "Grok observes account -> session without fabricating a space resource",
+    JSON.stringify(observed));
 }
 
 console.log("\n[trusted browser control action]");

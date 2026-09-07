@@ -53,11 +53,13 @@ const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
   deepseek: "*://chat.deepseek.com/*",
   gemini: "*://gemini.google.com/*",
+  grok: "*://grok.com/*",
 };
 const EXPERIMENTAL_SITE_PERMISSION_PATTERNS = {
   "z.ai": "https://chat.z.ai/*",
   deepseek: "https://chat.deepseek.com/*",
   gemini: "https://gemini.google.com/*",
+  grok: "https://grok.com/*",
 };
 const EXPERIMENTAL_CONTENT_SCRIPTS = [
   {
@@ -92,6 +94,18 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
     matches: ["https://gemini.google.com/*"],
     js: [
       "content/base.js", "content/injector/gemini.js", "performance-core.js",
+      "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
+      "content/hud/hud.js", "content/wake.js",
+    ],
+    runAt: "document_idle",
+    persistAcrossSessions: true,
+  },
+  {
+    id: "herdr-experimental-grok",
+    site: "grok",
+    matches: ["https://grok.com/*"],
+    js: [
+      "content/base.js", "content/injector/grok.js", "performance-core.js",
       "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
       "content/hud/hud.js", "content/wake.js",
     ],
@@ -229,6 +243,7 @@ let CFG = {
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
   experimentalGeminiEnabled: false,
+  experimentalGrokEnabled: false,
   pageAssistOrigins: [],
 };
 let PROJECT_AUTOMATION = {};
@@ -260,6 +275,7 @@ function experimentalSiteEnabled(site) {
   if (site === "z.ai") return CFG.experimentalZAiEnabled === true;
   if (site === "deepseek") return CFG.experimentalDeepSeekEnabled === true;
   if (site === "gemini") return CFG.experimentalGeminiEnabled === true;
+  if (site === "grok") return CFG.experimentalGrokEnabled === true;
   return true;
 }
 
@@ -612,7 +628,14 @@ function browserConversationInfoFromSupportedUrl(rawUrl) {
   if (core) return core;
   const claude = claudeConversationInfo(rawUrl);
   if (claude) return claude;
-  if (experimentalSiteEnabled("gemini")) return geminiConversationInfo(rawUrl);
+  if (experimentalSiteEnabled("gemini")) {
+    const gemini = geminiConversationInfo(rawUrl);
+    if (gemini) return gemini;
+  }
+  if (experimentalSiteEnabled("grok")) {
+    const grok = grokConversationInfo(rawUrl);
+    if (grok) return grok;
+  }
   return null;
 }
 
@@ -635,7 +658,7 @@ async function conversationInfoForTab(tabId) {
   // an already-open supported tab without a live listener. Never re-inject the manifest-managed classic-script bundle
   // or a dynamically registered classic-script bundle into the same document:
   // top-level declarations can collide. One bounded page reload gives Chrome a fresh document and one load.
-  if (["chatgpt", "gemini", "claude"].includes(fallback.site)) {
+  if (["chatgpt", "gemini", "claude", "grok"].includes(fallback.site)) {
     try {
       const last = tabRecoveryAttemptAt.get(tabId) || 0;
       if (Date.now() - last >= TAB_RECOVERY_COOLDOWN_MS) {
@@ -1413,10 +1436,29 @@ function claudeConversationInfo(rawUrl) {
   }
 }
 
+function grokConversationInfo(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.origin !== "https://grok.com") return null;
+    const match = url.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+    if (!match) return null;
+    const conversationId = match[1].toLowerCase();
+    return {
+      site: "grok",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey: `${url.origin}/c/${conversationId}`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 function browserConversationInfo(provider, rawUrl) {
   if (provider === "chatgpt") return chatGptConversationInfo(rawUrl);
   if (provider === "gemini") return geminiConversationInfo(rawUrl);
   if (provider === "claude") return claudeConversationInfo(rawUrl);
+  if (provider === "grok") return grokConversationInfo(rawUrl);
   return null;
 }
 
@@ -1451,7 +1493,7 @@ async function postBrowserRegistry(payload) {
 
 async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, accountNativeIdentity }) {
   if (!tabId || !pageInfo?.conversation_id || !accountNativeIdentity) return null;
-  if (!["chatgpt", "gemini", "claude"].includes(provider)) return null;
+  if (!["chatgpt", "gemini", "claude", "grok"].includes(provider)) return null;
   const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
   if (!endpoint?.endpoint_ref) return null;
   const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -4721,7 +4763,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await configReady;
       const rawRegisteringSite = String(msg.site || "").trim();
       const registeringSite = rawRegisteringSite === "claude.ai" ? "claude" : rawRegisteringSite;
-      if (["z.ai", "deepseek", "gemini"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
+      if (["z.ai", "deepseek", "gemini", "grok"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
         sendResponse({ ok: false, error: "experimental-site-disabled" });
         return;
       }
@@ -4754,7 +4796,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sender.tab.id,
           );
           if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
-        } else if (!["gemini", "claude"].includes(registeringSite)) {
+        } else if (!["gemini", "claude", "grok"].includes(registeringSite)) {
           const migration = await migrateZaiRootConversationState(
             bindings,
             String(msg.convKey || ""),
