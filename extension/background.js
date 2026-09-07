@@ -1434,14 +1434,28 @@ function grokConversationInfo(rawUrl) {
   try {
     const url = new URL(String(rawUrl || ""));
     if (url.origin !== "https://grok.com") return null;
-    const match = url.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
-    if (!match) return null;
-    const conversationId = match[1].toLowerCase();
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const directMatch = url.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+    if (directMatch) {
+      const conversationId = directMatch[1].toLowerCase();
+      return {
+        site: "grok",
+        conversation_id: conversationId,
+        project_id: null,
+        convKey: `${url.origin}/c/${conversationId}`,
+      };
+    }
+
+    const projectMatch = url.pathname.match(/^\/project\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+    const chatValues = url.searchParams.getAll("chat");
+    if (!projectMatch || chatValues.length !== 1 || !uuid.test(chatValues[0])) return null;
+    const projectId = projectMatch[1].toLowerCase();
+    const conversationId = chatValues[0].toLowerCase();
     return {
       site: "grok",
       conversation_id: conversationId,
-      project_id: null,
-      convKey: `${url.origin}/c/${conversationId}`,
+      project_id: projectId,
+      convKey: `${url.origin}/project/${projectId}?chat=${conversationId}`,
     };
   } catch (_) {
     return null;

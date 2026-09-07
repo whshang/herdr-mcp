@@ -5,20 +5,42 @@ class GrokAdapter extends BaseAdapter {
   get name() { return "grok"; }
   get needsMainWorldInsert() { return true; }
 
-  getSessionIdentity() {
+  getConversationIdentity() {
     try {
       const url = new URL(location.href);
       if (url.origin !== "https://grok.com") return null;
-      const match = url.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
-      return match ? match[1].toLowerCase() : null;
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const directMatch = url.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+      if (directMatch) {
+        const sessionId = directMatch[1].toLowerCase();
+        return {
+          projectId: null,
+          sessionId,
+          convKey: `${url.origin}/c/${sessionId}`,
+        };
+      }
+
+      const projectMatch = url.pathname.match(/^\/project\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+      const chatValues = url.searchParams.getAll("chat");
+      if (!projectMatch || chatValues.length !== 1 || !uuid.test(chatValues[0])) return null;
+      const projectId = projectMatch[1].toLowerCase();
+      const sessionId = chatValues[0].toLowerCase();
+      return {
+        projectId,
+        sessionId,
+        convKey: `${url.origin}/project/${projectId}?chat=${sessionId}`,
+      };
     } catch (_) {
       return null;
     }
   }
 
+  getSessionIdentity() {
+    return this.getConversationIdentity()?.sessionId || null;
+  }
+
   getConversationKey() {
-    const sessionId = this.getSessionIdentity();
-    return sessionId ? `https://grok.com/c/${sessionId}` : null;
+    return this.getConversationIdentity()?.convKey || null;
   }
 
   getNativeSessionIdentity() {
