@@ -1190,11 +1190,15 @@ fn loopback_host(host: Option<&str>) -> bool {
 }
 
 fn current_target() -> Result<&'static str, String> {
-    match (env::consts::OS, env::consts::ARCH) {
+    target_for_platform(env::consts::OS, env::consts::ARCH)
+}
+
+fn target_for_platform(os: &str, arch: &str) -> Result<&'static str, String> {
+    match (os, arch) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
         ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         (os, arch) => Err(format!("unsupported update target {os}/{arch}")),
     }
@@ -1414,6 +1418,22 @@ mod tests {
                 "url": format!("https://github.com/whshang/herdr-mcp/releases/download/v{version}/herdr-mcp-{version}-{target}")
             }]
         })
+    }
+
+    #[test]
+    fn release_target_mapping_uses_portable_musl_for_linux_x86_64() {
+        assert_eq!(
+            target_for_platform("linux", "x86_64").unwrap(),
+            "x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            target_for_platform("macos", "aarch64").unwrap(),
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(
+            target_for_platform("windows", "x86_64").unwrap(),
+            "x86_64-pc-windows-msvc"
+        );
     }
 
     #[test]
