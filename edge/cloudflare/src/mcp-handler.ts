@@ -51,6 +51,8 @@ export interface McpClientContext {
   oauthClientId?: string | null;
   /** Bound device_id for an automation principal; forces routing to that device. */
   automationDeviceId?: string | null;
+  /** True only when the authenticated MCP principal may perform fleet-admin mutations. */
+  fleetAdmin?: boolean;
 }
 
 export interface McpDeps {
@@ -150,11 +152,45 @@ const PRIVATE_METHOD_ROUTES = [
   { method: "herdr_mcp.github.status", route: "unsupported", available_on: "local_runtime" },
 ] as const;
 
-function privateMethodRoutePreflight(query: unknown): Record<string, unknown> | null {
+function privateMethodCapability(
+  entry: (typeof PRIVATE_METHOD_ROUTES)[number],
+  client?: McpClientContext,
+): Record<string, unknown> {
+  if (entry.route === "unsupported") {
+    return {
+      ...entry,
+      implemented_local: entry.available_on === "local_runtime" ? true : "unknown",
+      available_local: "unknown",
+      edge_route_deployed: false,
+      caller_routable: false,
+      scope: entry.available_on === "local_runtime" ? "workstation_local_only" : "unknown",
+      reason: entry.available_on === "local_runtime" ? "workstation_local_only" : "edge_route_not_deployed",
+    };
+  }
+  const requiresFleetAdmin = entry.route === "edge_local";
+  const callerRoutable = requiresFleetAdmin ? client?.fleetAdmin === true : true;
+  return {
+    ...entry,
+    implemented_local: entry.route === "workstation_routed" ? "unknown" : false,
+    available_local: "unknown",
+    edge_route_deployed: true,
+    caller_routable: callerRoutable,
+    owner_device_only: requiresFleetAdmin,
+    scope: entry.route === "edge_local" ? "edge_local" : "edge_to_workstation",
+    reason: callerRoutable ? "route_deployed" : "caller_not_authorized",
+  };
+}
+
+function privateMethodRoutePreflight(
+  query: unknown,
+  client?: McpClientContext,
+): Record<string, unknown> | null {
   if (typeof query !== "string") return null;
   const normalized = query.trim().toLowerCase();
   if (!normalized.startsWith("herdr_mcp.")) return null;
-  const methods = PRIVATE_METHOD_ROUTES.filter((entry) => entry.method.toLowerCase().includes(normalized));
+  const methods = PRIVATE_METHOD_ROUTES
+    .filter((entry) => entry.method.toLowerCase().includes(normalized))
+    .map((entry) => privateMethodCapability(entry, client));
   if (methods.length > 0) {
     return { ok: true, count: methods.length, methods, source: "edge_route_preflight" };
   }
@@ -166,6 +202,12 @@ function privateMethodRoutePreflight(query: unknown): Record<string, unknown> | 
       route: "unsupported",
       available_on: null,
       next_surface: "herdr_methods",
+      implemented_local: "unknown",
+      available_local: "unknown",
+      edge_route_deployed: false,
+      caller_routable: false,
+      scope: "unknown",
+      reason: "edge_route_not_deployed",
     }],
     source: "edge_route_preflight",
   };
@@ -368,7 +410,7 @@ export async function handleMcp(
     }
 
     if (name === "herdr_methods") {
-      const preflight = privateMethodRoutePreflight(args.query);
+      const preflight = privateMethodRoutePreflight(args.query, deps.client);
       if (preflight) return rpcResult(id, callToolResult(preflight));
     }
 

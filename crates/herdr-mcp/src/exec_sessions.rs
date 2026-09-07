@@ -165,6 +165,101 @@ fn extract_stream_tail(buffers: &Buffers, stream: StreamKind, max_bytes: usize) 
     }
 }
 
+fn parse_summary_count(line: &str, labels: &[&str]) -> Option<u64> {
+    let trimmed = line.trim();
+    labels.iter().find_map(|label| {
+        trimmed
+            .strip_prefix(label)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+    })
+}
+
+fn release_gate_phase(command: &str, output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("[release-gate] PASS phase=")
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            let marker = "scripts/release-gate.sh";
+            let suffix = command.split_once(marker)?.1.trim();
+            Some(
+                suffix
+                    .split_whitespace()
+                    .next()
+                    .filter(|value| matches!(*value, "rust" | "node" | "hygiene" | "full"))
+                    .unwrap_or("full")
+                    .to_owned(),
+            )
+        })
+}
+
+fn completion_evidence(session: &Session, status: &SessionStatus) -> Value {
+    let (output, bytes_total) = session
+        .buffers
+        .lock()
+        .map(|buffers| {
+            let mut ordered = Vec::with_capacity(buffers.stdout_bytes + buffers.stderr_bytes);
+            for chunk in &buffers.chunks {
+                ordered.extend_from_slice(&chunk.data);
+            }
+            (
+                String::from_utf8_lossy(&ordered).into_owned(),
+                buffers.stdout_bytes.saturating_add(buffers.stderr_bytes),
+            )
+        })
+        .unwrap_or_default();
+
+    let passed = output
+        .lines()
+        .filter_map(|line| parse_summary_count(line, &["# pass ", "ℹ pass "]))
+        .sum::<u64>();
+    let failed = output
+        .lines()
+        .filter_map(|line| parse_summary_count(line, &["# fail ", "ℹ fail "]))
+        .sum::<u64>();
+    let tests = output
+        .lines()
+        .filter_map(|line| parse_summary_count(line, &["# tests ", "ℹ tests "]))
+        .sum::<u64>();
+    let first_failure = if status.exit_code == Some(0) {
+        None
+    } else {
+        output.lines().find(|line| {
+            let line = line.trim();
+            line.contains("FAILED")
+                || line.starts_with("not ok")
+                || line.contains("[release-gate] ERROR:")
+        })
+    };
+
+    let mut result = json!({
+        "phase": "completed",
+        "exit_code": status.exit_code,
+        "full_log_available": bytes_total > 0,
+        "log_session_id": session.id,
+    });
+    if let Some(object) = result.as_object_mut() {
+        if let Some(gate_phase) = release_gate_phase(&session.command, &output) {
+            object.insert("gate_phase".to_owned(), json!(gate_phase));
+        }
+        if tests > 0 || passed > 0 || failed > 0 {
+            object.insert(
+                "tests".to_owned(),
+                json!({"total": tests, "passed": passed, "failed": failed}),
+            );
+        }
+        if let Some(first_failure) = first_failure {
+            object.insert("first_failure".to_owned(), json!(first_failure.trim()));
+        }
+    }
+    result
+}
+
 fn write_session_spool(state_dir: &Path, session: &Session) -> Result<(), String> {
     let spool_dir = exec_spool_dir(state_dir);
     fs::create_dir_all(&spool_dir).map_err(|error| {
@@ -745,6 +840,12 @@ impl ExecRegistry {
                 "elapsed_ms": elapsed_ms,
             }),
         );
+        if status.closed {
+            result.insert(
+                "completion".to_owned(),
+                completion_evidence(&session, &status),
+            );
+        }
         exec_compact::insert_compacted_or_raw(
             &mut result,
             "text",
@@ -2043,17 +2144,47 @@ mod tests {
     }
 
     #[test]
+    fn completed_incremental_read_exposes_compact_completion_evidence() {
+        let registry = registry();
+        let started = registry
+            .start(
+                Path::new("/tmp"),
+                "printf '[release-gate] Node tests\\n# tests 12\\n# pass 12\\n# fail 0\\n[release-gate] PASS phase=node\\n'",
+            )
+            .unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let full = wait_until_closed(&registry, &id, "stdout", 65536);
+        let total = full["bytes_total"].as_u64().unwrap() as usize;
+        let incremental = registry.read(&id, "stdout", total, 1024);
+
+        assert_eq!(incremental["next_offset"], total);
+        assert_eq!(incremental["completion"]["phase"], "completed");
+        assert_eq!(incremental["completion"]["exit_code"], 0);
+        assert_eq!(incremental["completion"]["gate_phase"], "node");
+        assert_eq!(incremental["completion"]["tests"]["passed"], 12);
+        assert_eq!(incremental["completion"]["tests"]["failed"], 0);
+        assert_eq!(incremental["completion"]["full_log_available"], true);
+        assert_eq!(incremental["completion"]["log_session_id"], id);
+    }
+
+    #[test]
     fn failure_keeps_full_diagnostic_output() {
         let registry = registry();
         let started = registry
             .start(
                 Path::new("/tmp"),
-                "awk 'BEGIN{for(i=0;i<90;i++) print \"fail-\" i}'; exit 3",
+                "printf 'FAILED test_release_gate\\n'; awk 'BEGIN{for(i=0;i<90;i++) print \"fail-\" i}'; exit 3",
             )
             .unwrap();
         let id = started["session_id"].as_str().unwrap().to_owned();
         let view = wait_until_closed(&registry, &id, "stdout", 65536);
         assert_eq!(view["exit_code"], 3);
+        assert_eq!(view["completion"]["exit_code"], 3);
+        assert_eq!(
+            view["completion"]["first_failure"],
+            "FAILED test_release_gate"
+        );
+        assert_eq!(view["completion"]["full_log_available"], true);
         assert!(view.get("compacted").is_none());
         let text = view["text"].as_str().unwrap();
         assert!(text.contains("fail-0\n"));

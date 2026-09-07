@@ -642,6 +642,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         userAgent: request.headers.get("user-agent"),
         oauthClientId: devAuth.clientId ?? null,
         automationDeviceId: devAuth.principalType === "automation" ? (devAuth.deviceId ?? null) : null,
+        fleetAdmin: Boolean(mcpFleetPrincipal),
       },
       forward: async (stub: unknown, body: string) => {
         const internal = new Request("https://do.internal/internal/forward", {
