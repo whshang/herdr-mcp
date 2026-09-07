@@ -85,20 +85,12 @@ pub fn migration_status() -> Value {
         .copied()
         .filter(|name| !MIGRATED_TOOLS.contains(name))
         .collect::<Vec<_>>();
-    let sealed = env::var_os("HOME")
-        .map(|home| {
-            crate::link::seal::production_ready_from_seal(
-                &std::path::PathBuf::from(home)
-                    .join(".config")
-                    .join("herdr-mcp"),
-            )
-        })
-        .unwrap_or(false);
+    let (production_ready, link_cutover) = migration_cutover_status();
     json!({
-        "phase": if sealed { "production" } else { "candidate" },
+        "phase": if production_ready { "production" } else { "candidate" },
         "native_parity_ready": pending.is_empty(),
-        "production_ready": sealed,
-        "link_cutover": crate::link::production_ready_gate_catalog(),
+        "production_ready": production_ready,
+        "link_cutover": link_cutover,
         "contract_epoch": contract::identity().ok().map(|identity| identity.epoch),
         "tool_count": all.len(),
         "migrated_tool_count": MIGRATED_TOOLS.len(),
@@ -106,6 +98,40 @@ pub fn migration_status() -> Value {
         "migrated_tools": MIGRATED_TOOLS,
         "pending_tools": pending,
     })
+}
+
+fn migration_cutover_status() -> (bool, Value) {
+    #[cfg(target_os = "macos")]
+    {
+        let sealed = env::var_os("HOME")
+            .map(|home| {
+                crate::link::seal::production_ready_from_seal(
+                    &std::path::PathBuf::from(home)
+                        .join(".config")
+                        .join("herdr-mcp"),
+                )
+            })
+            .unwrap_or(false);
+        (sealed, crate::link::production_ready_gate_catalog())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        non_macos_migration_cutover_status()
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn non_macos_migration_cutover_status() -> (bool, Value) {
+    (
+        true,
+        json!({
+            "production_ready": true,
+            "requires_all": [],
+            "cutover_doc": Value::Null,
+            "note": "macOS launchd migration cutover gates are not applicable on this platform",
+        }),
+    )
 }
 
 pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>, exec: Option<&ExecRegistry>) {
@@ -356,18 +382,40 @@ mod tests {
             assert_eq!(status["migrated_tool_count"], 18);
             assert_eq!(status["pending_tool_count"], 0);
             assert_eq!(status["native_parity_ready"], true);
-            assert_eq!(status["production_ready"], false);
-            assert_eq!(status["link_cutover"]["production_ready"], false);
-            assert!(
-                status["link_cutover"]["requires_all"]
-                    .as_array()
-                    .is_some_and(|gates| !gates.is_empty())
-            );
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(status["production_ready"], false);
+                assert_eq!(status["link_cutover"]["production_ready"], false);
+                assert!(
+                    status["link_cutover"]["requires_all"]
+                        .as_array()
+                        .is_some_and(|gates| !gates.is_empty())
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                assert_eq!(status["phase"], "production");
+                assert_eq!(status["production_ready"], true);
+                assert_eq!(status["link_cutover"]["production_ready"], true);
+                assert_eq!(status["link_cutover"]["requires_all"], json!([]));
+            }
             assert_eq!(status["pending_tools"], json!([]));
             for name in MIGRATED_TOOLS {
                 assert!(contract::tool_names().contains(&name));
             }
         });
+    }
+
+    #[test]
+    fn non_macos_migration_status_does_not_expose_launchd_cutover_gates() {
+        let (production_ready, cutover) = non_macos_migration_cutover_status();
+        assert!(production_ready);
+        assert_eq!(cutover["production_ready"], true);
+        assert_eq!(cutover["requires_all"], json!([]));
+        assert_eq!(cutover["cutover_doc"], Value::Null);
+        let serialized = serde_json::to_string(&cutover).unwrap();
+        assert!(!serialized.contains("launchd_prod_program_is_rust_runtime"));
+        assert!(!serialized.contains("launchd_not_repo_checkout"));
     }
 
     #[test]
