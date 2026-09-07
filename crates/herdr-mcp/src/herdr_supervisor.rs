@@ -112,6 +112,7 @@ pub(crate) fn restore_install_state_for_service(state: InstallState) -> Result<(
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn runtime_binary_supports_supervisor(binary: &std::path::Path) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {

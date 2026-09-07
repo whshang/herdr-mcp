@@ -90,6 +90,7 @@ pub(crate) fn run_install_from_payload(
 /// Return the managed Rust binary targeted by the current ready rollback.
 /// This is read-only preflight data; `rollback()` independently revalidates the
 /// ledger and target immediately before mutation.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn rollback_target_runtime_binary() -> Result<Option<std::path::PathBuf>, String> {
     #[cfg(not(target_os = "macos"))]
     {

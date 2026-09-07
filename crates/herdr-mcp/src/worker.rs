@@ -29,7 +29,7 @@ use std::io::BufRead;
 use std::io::Write;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::path::Path;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::process::ExitCode;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -341,7 +341,7 @@ fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "ok": false,
@@ -349,11 +349,64 @@ pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_js
     }))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn extension_fleet_snapshot_with_proxy(
     paths: &RuntimePaths,
     _proxy_url: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    extension_fleet_snapshot(paths)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&owner.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&owner.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .get(endpoint(&owner.edge_origin, "/devices")?)
+        .headers(headers)
+        .send()
+        .map_err(|error| format!("cannot read Worker device inventory: {error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .map_err(|_| format!("Worker device inventory returned non-JSON HTTP {status}"))?;
+    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("device_inventory_unavailable");
+        return Ok(json!({
+            "ok": false,
+            "code": code,
+            "http_status": status.as_u16(),
+        }));
+    }
+    let service = crate::linux_service_manager::doctor_status().unwrap_or_else(|_| json!({}));
+    Ok(json!({
+        "ok": true,
+        "devices": payload.get("devices").cloned().unwrap_or_else(|| json!([])),
+        "observed_at_ms": payload.get("observed_at_ms").cloned().unwrap_or(Value::Null),
+        "local": {
+            "device_id": config.edge_device_id,
+            "runtime_version": crate::runtime_meta::runtime_version(),
+            "runtime_generation": service.get("generation").cloned().unwrap_or(Value::Null),
+            "link_loaded": service.get("link_loaded").cloned().unwrap_or(Value::Null),
+            "service_healthy": service.get("healthy").cloned().unwrap_or(Value::Null),
+        },
+    }))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn extension_fleet_snapshot_with_proxy(
+    paths: &RuntimePaths,
+    _proxy_url: Option<&str>,
+) -> Result<Value, String> {
     extension_fleet_snapshot(paths)
 }
 
@@ -526,7 +579,7 @@ fn connect_existing_worker(
         revoke_self,
         crate::credential_store::delete,
         activate_connected_runtime,
-        crate::linux_service_manager::reconcile_link,
+        |_paths| crate::linux_service_manager::reconcile_link(),
         consume_pairing,
     )
 }
@@ -574,7 +627,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
         revoke_self,
         crate::credential_store::delete,
         activate_connected_runtime,
-        crate::linux_service_manager::reconcile_link,
+        |_paths| crate::linux_service_manager::reconcile_link(),
         move |_, _, _, _| Ok(enrolled.clone()),
     )
 }
@@ -1814,7 +1867,7 @@ fn read_pairing_code_from<R: BufRead>(reader: &mut R) -> Result<String, String> 
     Ok(code.to_owned())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_pairing_code_tty() -> Result<String, String> {
     use std::io::IsTerminal;
     let stdin = io::stdin();

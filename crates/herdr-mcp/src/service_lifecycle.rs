@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "linux", allow(dead_code))]
+
 use crate::cli::ServiceCommand;
 #[cfg(target_os = "macos")]
 use crate::native_host_install;
