@@ -489,10 +489,9 @@ fn status_value() -> Result<Value, String> {
 
 fn service_unit_contents(paths: &LinuxPaths, generation_id: &str) -> Result<String, String> {
     let current = quote(&paths.current_binary)?;
-    let config_dir = quote(&paths.config_dir)?;
-    let env_file = quote(&paths.runtime_env)?;
+    let env_file = systemd_env_value(&paths.runtime_env)?;
     Ok(format!(
-        "[Unit]\nDescription=Herdr MCP Runtime\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={current} candidate --port {}\nWorkingDirectory={config_dir}\nEnvironmentFile={env_file}\nEnvironment=\"HOME={}\"\nEnvironment=\"HERDR_MCP_HOST=127.0.0.1\"\nEnvironment=\"HERDR_MCP_PORT={}\"\nEnvironment=\"HERDR_MCP_STATE_DIR={}\"\nEnvironment=\"HERDR_MCP_CONFIG_DIR={}\"\nEnvironment=\"HERDR_MCP_CONTRACT_PROFILE=epoch2\"\nEnvironment=\"HERDR_SKILL_NETWORK=1\"\nEnvironment=\"HERDR_SOCKET_PATH={}\"\nEnvironment=\"HERDR_MCP_RUNTIME_GENERATION={}\"\nEnvironment=\"HERDR_MCP_SERVICE_IMPL=rust-systemd-user\"\nEnvironment=\"PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin\"\nRestart=always\nRestartSec=3\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Herdr MCP Runtime\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={current} candidate --port {}\nEnvironmentFile={env_file}\nEnvironment=\"HOME={}\"\nEnvironment=\"HERDR_MCP_HOST=127.0.0.1\"\nEnvironment=\"HERDR_MCP_PORT={}\"\nEnvironment=\"HERDR_MCP_STATE_DIR={}\"\nEnvironment=\"HERDR_MCP_CONFIG_DIR={}\"\nEnvironment=\"HERDR_MCP_CONTRACT_PROFILE=epoch2\"\nEnvironment=\"HERDR_SKILL_NETWORK=1\"\nEnvironment=\"HERDR_SOCKET_PATH={}\"\nEnvironment=\"HERDR_MCP_RUNTIME_GENERATION={}\"\nEnvironment=\"HERDR_MCP_SERVICE_IMPL=rust-systemd-user\"\nEnvironment=\"PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin\"\nRestart=always\nRestartSec=3\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         paths.port,
         systemd_env_value(&paths.home)?,
         paths.port,
@@ -506,9 +505,8 @@ fn service_unit_contents(paths: &LinuxPaths, generation_id: &str) -> Result<Stri
 
 fn link_unit_contents(paths: &LinuxPaths, generation_id: &str) -> Result<String, String> {
     let current = quote(&paths.current_binary)?;
-    let config_dir = quote(&paths.config_dir)?;
     Ok(format!(
-        "[Unit]\nDescription=Herdr MCP Edge Link\nAfter=network-online.target {SERVICE_UNIT}\nWants=network-online.target\nRequires={SERVICE_UNIT}\n\n[Service]\nType=simple\nExecStart={current} link run\nWorkingDirectory={config_dir}\nEnvironment=\"HOME={}\"\nEnvironment=\"HERDR_MCP_CONFIG_DIR={}\"\nEnvironment=\"HERDR_MCP_STATE_DIR={}\"\nEnvironment=\"HERDR_SOCKET_PATH={}\"\nEnvironment=\"HERDR_RUNTIME_GENERATION={}\"\nEnvironment=\"PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin\"\nRestart=always\nRestartSec=5\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Herdr MCP Edge Link\nAfter=network-online.target {SERVICE_UNIT}\nWants=network-online.target\nRequires={SERVICE_UNIT}\n\n[Service]\nType=simple\nExecStart={current} link run\nEnvironment=\"HOME={}\"\nEnvironment=\"HERDR_MCP_CONFIG_DIR={}\"\nEnvironment=\"HERDR_MCP_STATE_DIR={}\"\nEnvironment=\"HERDR_SOCKET_PATH={}\"\nEnvironment=\"HERDR_RUNTIME_GENERATION={}\"\nEnvironment=\"PATH={}/.local/bin:/usr/local/bin:/usr/bin:/bin\"\nRestart=always\nRestartSec=5\nUMask=0077\n\n[Install]\nWantedBy=default.target\n",
         systemd_env_value(&paths.home)?,
         systemd_env_value(&paths.config_dir)?,
         systemd_env_value(&paths.config_dir)?,
@@ -1262,7 +1260,9 @@ mod tests {
         };
         let server = service_unit_contents(&paths, "rust-deadbeef").unwrap();
         let link = link_unit_contents(&paths, "rust-deadbeef").unwrap();
-        assert!(server.contains("EnvironmentFile=\"/home/tester/.config/herdr-mcp/runtime.env\""));
+        assert!(server.contains("EnvironmentFile=/home/tester/.config/herdr-mcp/runtime.env"));
+        assert!(!server.contains("WorkingDirectory="));
+        assert!(!link.contains("WorkingDirectory="));
         assert!(!server.contains("HERDR_MCP_TOKEN="));
         assert!(!link.contains("devsec_"));
         assert!(link.contains(" link run"));
