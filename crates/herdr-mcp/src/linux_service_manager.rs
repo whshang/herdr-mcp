@@ -234,14 +234,21 @@ fn ensure_link_installed_with_restart(restart_existing: bool) -> Result<(), Stri
 }
 
 pub fn reconcile_link() -> Result<(), String> {
-    let config = Config::load(&RuntimePaths::discover()?.config_file)?;
+    let paths = LinuxPaths::discover()?;
+    let runtime_paths = RuntimePaths::discover()?;
+    let config = Config::load(&runtime_paths.config_file)?;
     if config.edge_device_id.is_none() {
         return Ok(());
     }
-    // A service install can move runtime/current while an already-running Link
-    // still advertises the previous generation to Edge. Reconciliation must
-    // replace that Link process/job so subsequent routed requests reserve the
-    // same generation that the local service is actually serving.
+    // A service install can move runtime/current while both the durable
+    // runtime-control document and an already-running Link still point at the
+    // previous generation. Reconcile the control document first: otherwise a
+    // freshly restarted Link consumes the stale desired_active value and
+    // advertises the superseded generation back to Edge again.
+    crate::link::migrate_runtime_control::reconcile_current_generation(
+        &paths.home,
+        &runtime_paths.config_dir,
+    )?;
     ensure_link_installed_with_restart(true)
 }
 
