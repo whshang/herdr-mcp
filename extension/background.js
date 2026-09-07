@@ -288,6 +288,27 @@ async function hasLlmHostPermission(cfg) {
   return hasHostPermission(hostPermissionPatternForUrl(cfg?.llmJudgeBaseUrl));
 }
 
+async function reloadOpenTabsAfterExperimentalRegistration(site, matches) {
+  if (!chrome.tabs?.query || !chrome.tabs?.reload || !Array.isArray(matches) || matches.length === 0) return;
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: matches });
+  } catch (error) {
+    callLog(`experimental content script recovery scan failed for ${site}:`, error?.message || String(error));
+    return;
+  }
+  for (const tab of tabs) {
+    if (!tab?.id || tab.status !== "complete" || reloadedTabs.has(tab.id)) continue;
+    reloadedTabs.add(tab.id);
+    try {
+      await chrome.tabs.reload(tab.id);
+    } catch (error) {
+      reloadedTabs.delete(tab.id);
+      callLog(`experimental content script recovery reload failed for ${site}:`, error?.message || String(error));
+    }
+  }
+}
+
 async function syncExperimentalContentScripts() {
   if (!chrome.scripting?.getRegisteredContentScripts
     || !chrome.scripting?.registerContentScripts
@@ -306,15 +327,19 @@ async function syncExperimentalContentScripts() {
       }
       continue;
     }
+    let newlyRegistered = false;
     try {
       if (registered.has(spec.id) && chrome.scripting?.updateContentScripts) {
         await chrome.scripting.updateContentScripts([registration]);
       } else if (!registered.has(spec.id)) {
         await chrome.scripting.registerContentScripts([registration]);
+        newlyRegistered = true;
       }
     } catch (error) {
       callLog(`experimental content script sync failed for ${site}:`, error?.message || String(error));
+      continue;
     }
+    if (newlyRegistered) await reloadOpenTabsAfterExperimentalRegistration(site, registration.matches);
   }
 }
 
@@ -576,26 +601,33 @@ function clearActionBadge() {
   try { chrome.action.setBadgeText({ text: "" }); } catch (e) {}
 }
 
+function browserConversationInfoFromSupportedUrl(rawUrl) {
+  const core = conversationInfoFromSupportedUrl(rawUrl);
+  if (core) return core;
+  if (experimentalSiteEnabled("gemini")) return geminiConversationInfo(rawUrl);
+  return null;
+}
+
 async function conversationInfoForTab(tabId) {
   if (!tabId) return null;
   try {
     const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
     if (live?.convKey) {
-      const parsed = conversationInfoFromSupportedUrl(live.url || live.convKey);
+      const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
       return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
     }
   } catch (_) {}
 
   let tab = null;
   try { tab = await chrome.tabs.get(tabId); } catch (_) {}
-  const fallback = conversationInfoFromSupportedUrl(tab?.url);
+  const fallback = browserConversationInfoFromSupportedUrl(tab?.url);
   if (!fallback) return null;
 
-  // A manual MV3 extension reload can leave an already-open ChatGPT tab without
-  // a live listener. Never re-inject the manifest-managed classic-script bundle
-  // into the same document: top-level class/const declarations would collide.
-  // One bounded page reload gives Chrome a fresh document and one manifest load.
-  if (fallback.site === "chatgpt") {
+  // A manual MV3 extension reload or first dynamic-script registration can leave
+  // an already-open supported tab without a live listener. Never re-inject the manifest-managed classic-script bundle
+  // or a dynamically registered classic-script bundle into the same document:
+  // top-level declarations can collide. One bounded page reload gives Chrome a fresh document and one load.
+  if (fallback.site === "chatgpt" || fallback.site === "gemini") {
     try {
       const last = tabRecoveryAttemptAt.get(tabId) || 0;
       if (Date.now() - last >= TAB_RECOVERY_COOLDOWN_MS) {
@@ -607,7 +639,7 @@ async function conversationInfoForTab(tabId) {
         try {
           const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
           if (live?.convKey) {
-            const parsed = conversationInfoFromSupportedUrl(live.url || live.convKey);
+            const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
             return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
           }
         } catch (error) {

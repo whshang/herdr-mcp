@@ -28,6 +28,8 @@ const ZAI_NEW = "https://chat.z.ai/c/new-chat-123";
 const ZAI_OTHER = "https://chat.z.ai/c/history-chat-456";
 const ZAI_SOURCE = "https://chat.z.ai/c/handoff-source";
 const ZAI_TARGET = "https://chat.z.ai/c/handoff-target";
+const GEMINI_SPARK_URL = "https://gemini.google.com/u/1/spark/chat/gemini-recovery-session?pageId=none";
+const GEMINI_SPARK_KEY = "https://gemini.google.com/u/1/spark/chat/gemini-recovery-session";
 
 let failures = 0;
 function ok(cond, label, detail = "") {
@@ -137,6 +139,18 @@ globalThis.fetch = async (input, init) => {
 
 function targetListener(tab) {
   return (msg, _sender, sendResponse) => {
+    if (String(tab.url || "").startsWith("https://gemini.google.com/")) {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({
+          convKey: GEMINI_SPARK_KEY,
+          url: tab.url,
+          site: "gemini",
+        });
+        return;
+      }
+      sendResponse({ ok: true });
+      return;
+    }
     if (String(tab.url || "").startsWith("https://chat.z.ai")) {
       if (msg?.type === "h2w_get_convkey") {
         sendResponse({
@@ -443,8 +457,16 @@ globalThis.chrome = {
   },
   tabs: {
     async query({ url }) {
-      const glob = url.replace("*", "");
-      return [...tabs.values()].filter((t) => t.url.startsWith(glob)).map((t) => ({ id: t.id, url: t.url }));
+      const patterns = (Array.isArray(url) ? url : [url]).filter(Boolean);
+      const matchesPattern = (value, pattern) => {
+        const escaped = String(pattern).split("*")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join(".*");
+        return new RegExp(`^${escaped}$`).test(String(value || ""));
+      };
+      return [...tabs.values()]
+        .filter((t) => patterns.some((pattern) => matchesPattern(t.url, pattern)))
+        .map((t) => ({ id: t.id, url: t.url, status: t.status || "complete" }));
     },
     async sendMessage(tabId, msg) {
       if (hangAutomationNotifications && msg?.type === "h2w_automation_changed") {
@@ -506,7 +528,14 @@ globalThis.chrome = {
       tab.status = "complete";
       return { id: tab.id, url: tab.url, status: tab.status, active: tab.active };
     },
-    async reload(tabId, options) { reloadCalls.push({ tabId, options }); },
+    async reload(tabId, options) {
+      reloadCalls.push({ tabId, options });
+      const tab = tabs.get(tabId);
+      if (tab?.url?.startsWith("https://gemini.google.com/")
+        && registeredContentScripts.has("herdr-experimental-gemini")) {
+        tab.listener = targetListener(tab);
+      }
+    },
     onActivated: { addListener: (fn) => listeners.onActivated.push(fn) },
   },
   action: {
@@ -754,12 +783,28 @@ console.log("\n[Gemini optional-origin registration]");
     "disabled Gemini registration fails closed before Browser Registry mutation",
     JSON.stringify(blocked));
 
+  const recoveryTabId = 901;
+  tabs.set(recoveryTabId, { id: recoveryTabId, url: GEMINI_SPARK_URL, status: "complete", listener: null });
+  const reloadsBeforeEnable = reloadCalls.length;
   const enabled = await dispatchMessage({
     type: "h2w_set_config",
     config: { experimentalGeminiEnabled: true },
   });
   ok(enabled?.ok === true && registeredContentScripts.has("herdr-experimental-gemini"),
     "re-enabling Gemini re-registers the dynamic content script");
+  ok(reloadCalls.slice(reloadsBeforeEnable).some((call) => call.tabId === recoveryTabId),
+    "first Gemini dynamic-script registration reloads an already-open complete Gemini tab once",
+    JSON.stringify(reloadCalls.slice(reloadsBeforeEnable)));
+
+  const fallbackTabId = 902;
+  tabs.set(fallbackTabId, { id: fallbackTabId, url: GEMINI_SPARK_URL, status: "complete", listener: null });
+  const reloadsBeforeFallback = reloadCalls.length;
+  const fallbackState = await dispatchMessage({ type: "h2w_state", tabId: fallbackTabId });
+  ok(fallbackState?.convInfo?.site === "gemini"
+      && fallbackState?.convInfo?.convKey === GEMINI_SPARK_KEY
+      && reloadCalls.slice(reloadsBeforeFallback).some((call) => call.tabId === fallbackTabId),
+    "Control Center recovers a listener-less Gemini Spark tab from its bounded URL identity",
+    JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
 }
 
 console.log("\n[Gemini browser registry observation]");
