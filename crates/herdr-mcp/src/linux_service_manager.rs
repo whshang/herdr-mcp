@@ -176,6 +176,10 @@ pub fn doctor_runtime_token() -> Result<Option<String>, String> {
 }
 
 pub fn ensure_link_installed() -> Result<(), String> {
+    ensure_link_installed_with_restart(false)
+}
+
+fn ensure_link_installed_with_restart(restart_existing: bool) -> Result<(), String> {
     let paths = LinuxPaths::discover()?;
     if !paths.current_binary.exists() {
         return Err(
@@ -206,13 +210,23 @@ pub fn ensure_link_installed() -> Result<(), String> {
                 0o600,
             )?;
             systemctl(&["daemon-reload"])?;
-            systemctl(&["enable", "--now", LINK_UNIT])?;
+            if restart_existing {
+                systemctl(&["enable", LINK_UNIT])?;
+                systemctl(&["restart", LINK_UNIT])?;
+            } else {
+                systemctl(&["enable", "--now", LINK_UNIT])?;
+            }
             wait_for_unit_active(LINK_UNIT, Duration::from_secs(10)).map_err(|error| {
                 let detail = journal_tail(LINK_UNIT);
                 format!("{error}; recent journal: {detail}")
             })?;
         }
-        LinuxBackend::DetachedProcess => start_link_process(&paths)?,
+        LinuxBackend::DetachedProcess => {
+            if restart_existing {
+                stop_managed_process(&paths.link_process, "link")?;
+            }
+            start_link_process(&paths)?;
+        }
     }
     Ok(())
 }
@@ -222,7 +236,11 @@ pub fn reconcile_link() -> Result<(), String> {
     if config.edge_device_id.is_none() {
         return Ok(());
     }
-    ensure_link_installed()
+    // A service install can move runtime/current while an already-running Link
+    // still advertises the previous generation to Edge. Reconciliation must
+    // replace that Link process/job so subsequent routed requests reserve the
+    // same generation that the local service is actually serving.
+    ensure_link_installed_with_restart(true)
 }
 
 pub fn runtime_token_for_link() -> Result<String, String> {
