@@ -10,6 +10,7 @@ mod child_process;
 mod cli;
 mod config;
 mod contract;
+mod credential_store;
 mod dev;
 pub mod development_orchestration;
 mod device_name;
@@ -30,6 +31,8 @@ mod inspect;
 mod instance;
 mod instance_admin;
 mod link;
+#[cfg(any(target_os = "linux", test))]
+mod linux_service_manager;
 mod local_skills;
 mod macos_credential_helper;
 mod macos_keychain;
@@ -69,8 +72,9 @@ mod text_transfer;
 mod update_scheduler;
 mod updater;
 mod updater_store;
-// Wired only from the macOS service manager; keep unit tests compiling on Linux CI.
-#[cfg(any(target_os = "macos", test))]
+// The stable PATH link is a Unix ownership primitive shared by launchd and
+// systemd-user installations.
+#[cfg(any(unix, test))]
 mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;

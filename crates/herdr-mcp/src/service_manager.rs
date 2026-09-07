@@ -15,10 +15,15 @@ use serde_json::Value;
 use std::process::ExitCode;
 
 pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        return crate::linux_service_manager::run(command);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = command;
-        Err("service_manager_currently_requires_macos".to_owned())
+        Err("service manager is currently supported on macOS and Linux".to_owned())
     }
 
     #[cfg(target_os = "macos")]
@@ -99,12 +104,17 @@ pub fn rollback_target_runtime_binary() -> Result<Option<std::path::PathBuf>, St
 
 /// Read-only service ownership snapshot for `doctor`. Never mutates launchd.
 pub fn doctor_status() -> Result<serde_json::Value, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        return crate::linux_service_manager::doctor_status();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Ok(serde_json::json!({
             "ok": false,
             "implementation": "unsupported",
-            "detail": "service manager currently requires macOS",
+            "detail": "service manager is currently supported on macOS and Linux",
         }))
     }
 
@@ -120,7 +130,10 @@ pub(crate) fn doctor_runtime_token() -> Result<Option<String>, String> {
     #[cfg(target_os = "macos")]
     let managed_token = macos::doctor_runtime_token();
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "linux")]
+    let managed_token = crate::linux_service_manager::doctor_runtime_token();
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Ok(Some(token)) = &managed_token {
         return Ok(Some(token.clone()));
     }
@@ -131,12 +144,12 @@ pub(crate) fn doctor_runtime_token() -> Result<Option<String>, String> {
         return Ok(Some(token));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Ok(None)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         managed_token
     }
