@@ -38,6 +38,7 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
     "2024-11-05",
     "2024-10-07",
 ];
+const BROWSER_ADAPTER_PROTOCOL_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserCallerGrant {
@@ -64,7 +65,16 @@ pub trait BrowserActuator: Send + Sync {
         operation: &str,
         params: &Value,
         expected_generation: i64,
+        dispatch_id: Option<&str>,
     ) -> Result<BrowserPostconditionEvidence, String>;
+
+    fn reconcile_dispatch(
+        &self,
+        _dispatch_id: &str,
+        _expected_generation: i64,
+    ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+        Ok(None)
+    }
 }
 
 pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
@@ -1616,6 +1626,7 @@ fn browser_dispatch_submit(
             BrowserOperation::DispatchSubmit.method(),
             params,
             expected_generation,
+            Some(&reserved.dispatch_id),
         ) {
             Ok(evidence) => evidence,
             Err(error) => return browser_store_error(error),
@@ -1655,6 +1666,107 @@ fn browser_dispatch_submit(
         "dispatch": browser_dispatch_json(dispatch),
         "replayed": false,
         "work_memory_writeback": work_memory_writeback,
+    })
+}
+
+fn browser_dispatch_status(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    dispatch_id: &str,
+    actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let dispatch = {
+        let Ok(store) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match store.browser_dispatch(dispatch_id) {
+            Ok(Some(dispatch)) => dispatch,
+            Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
+            Err(error) => return browser_store_error(error),
+        }
+    };
+
+    if dispatch.delivery_state == BrowserDeliveryState::Uncertain
+        && let Some(actuator) = actuator
+    {
+        let evidence = match actuator
+            .reconcile_dispatch(&dispatch.dispatch_id, dispatch.expected_generation)
+        {
+            Ok(Some(evidence)) => Some(evidence),
+            Ok(None) => None,
+            Err(error) => return browser_store_error(error),
+        };
+        if let Some(evidence) = evidence {
+            let delivery_state = match browser_delivery_state_from_postcondition(
+                BrowserOperation::DispatchSubmit,
+                &json!({}),
+                dispatch.expected_generation,
+                &evidence,
+            ) {
+                Ok(state) => state,
+                Err(code) => {
+                    return json!({
+                        "ok": true,
+                        "dispatch": browser_dispatch_json(dispatch),
+                        "reconciled": false,
+                        "reconciliation_code": code,
+                    });
+                }
+            };
+            if delivery_state != BrowserDeliveryState::Uncertain {
+                let Ok(mut store) = store.lock() else {
+                    return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+                };
+                let settled = match store.settle_uncertain_browser_dispatch(
+                    BrowserDispatchUpdateInput {
+                        dispatch_id: &dispatch.dispatch_id,
+                        expected_generation: dispatch.expected_generation,
+                        delivery_state,
+                        generation_owner: evidence.generation_owner,
+                        updated_at: browser_epoch_ms(),
+                    },
+                ) {
+                    Ok(record) => record,
+                    Err(error)
+                        if matches!(
+                            error.as_str(),
+                            "browser_dispatch_already_settled"
+                                | "browser_dispatch_settlement_raced"
+                        ) =>
+                    {
+                        match store.browser_dispatch(&dispatch.dispatch_id) {
+                            Ok(Some(record)) => record,
+                            Ok(None) => {
+                                return json!({"ok": false, "code": "browser_dispatch_not_found"});
+                            }
+                            Err(error) => return browser_store_error(error),
+                        }
+                    }
+                    Err(error) => return browser_store_error(error),
+                };
+                let work_memory_writeback =
+                    browser_dispatch_work_memory_writeback(&mut store, &settled);
+                return json!({
+                    "ok": true,
+                    "dispatch": browser_dispatch_json(settled),
+                    "reconciled": true,
+                    "reconciliation_code": Value::Null,
+                    "work_memory_writeback": work_memory_writeback,
+                });
+            }
+            return json!({
+                "ok": true,
+                "dispatch": browser_dispatch_json(dispatch),
+                "reconciled": false,
+                "reconciliation_code": "uncertain",
+            });
+        }
+    }
+
+    json!({
+        "ok": true,
+        "dispatch": browser_dispatch_json(dispatch),
+        "reconciled": false,
+        "reconciliation_code": Value::Null,
     })
 }
 
@@ -1871,17 +1983,7 @@ fn browser_operation_call_with_grants(
         }
         BrowserOperation::DispatchStatus => {
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
-            let Ok(store) = store.lock() else {
-                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
-            };
-            match store.browser_dispatch(dispatch_id) {
-                Ok(Some(dispatch)) => json!({
-                    "ok": true,
-                    "dispatch": browser_dispatch_json(dispatch),
-                }),
-                Ok(None) => json!({"ok": false, "code": "browser_dispatch_not_found"}),
-                Err(error) => browser_store_error(error),
-            }
+            browser_dispatch_status(store, dispatch_id, browser_actuator)
         }
         _ => {
             let expected_generation = params
@@ -1890,7 +1992,7 @@ fn browser_operation_call_with_grants(
                 .unwrap();
             let evidence = match browser_actuator {
                 Some(actuator) => {
-                    match actuator.actuate(operation.method(), params, expected_generation) {
+                    match actuator.actuate(operation.method(), params, expected_generation, None) {
                         Ok(evidence) => evidence,
                         Err(error) => return browser_store_error(error),
                     }
@@ -2287,6 +2389,9 @@ fn browser_resource_actuation_decision(
         || resource.observation_generation != provider_state.observation_generation
     {
         return Ok((false, Some("stale_capability_generation")));
+    }
+    if provider_state.adapter_protocol_version != BROWSER_ADAPTER_PROTOCOL_VERSION {
+        return Ok((false, Some("browser_adapter_protocol_unsupported")));
     }
 
     let Some(allowed) =
@@ -4217,6 +4322,111 @@ mod tests {
         assert_eq!(status["dispatch"]["delivery_state"], "resource_unavailable");
         assert!(!status.to_string().contains("delivery-session-hidden"));
 
+        struct UncertainThenReconcileActuator {
+            reconcile_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl BrowserActuator for UncertainThenReconcileActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert!(dispatch_id.is_some());
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                Ok(evidence)
+            }
+
+            fn reconcile_dispatch(
+                &self,
+                dispatch_id: &str,
+                expected_generation: i64,
+            ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+                assert!(dispatch_id.starts_with("bd_"));
+                self.reconcile_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                }))
+            }
+        }
+        let reconcile_actuator = UncertainThenReconcileActuator {
+            reconcile_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let reconcile_params = json!({
+            "session_ref": session_ref,
+            "message": "dispatch with delayed evidence",
+            "expected_generation": 7,
+            "idempotency_key": "delivery-reconcile-idempotency-key"
+        });
+        let uncertain = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &reconcile_params,
+            true,
+            Some(&reconcile_actuator),
+        );
+        assert_eq!(uncertain["ok"], false);
+        assert_eq!(uncertain["code"], "uncertain");
+        assert_eq!(uncertain["dispatch"]["delivery_state"], "uncertain");
+        let reconcile_dispatch_id = uncertain["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let reconciled = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.status",
+            &json!({"dispatch_id": reconcile_dispatch_id}),
+            &[],
+            Some(&reconcile_actuator),
+            None,
+        );
+        assert_eq!(reconciled["ok"], true);
+        assert_eq!(reconciled["reconciled"], true);
+        assert_eq!(reconciled["dispatch"]["delivery_state"], "applied");
+        assert_eq!(
+            reconcile_actuator
+                .reconcile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let settled_status = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.status",
+            &json!({"dispatch_id": reconcile_dispatch_id}),
+            &[],
+            Some(&reconcile_actuator),
+            None,
+        );
+        assert_eq!(settled_status["dispatch"]["delivery_state"], "applied");
+        assert_eq!(settled_status["reconciled"], false);
+        assert_eq!(
+            reconcile_actuator
+                .reconcile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "terminal status must not consume or request a second reconciliation"
+        );
+
         struct AppliedActuator;
         impl BrowserActuator for AppliedActuator {
             fn actuate(
@@ -4224,6 +4434,7 @@ mod tests {
                 _operation: &str,
                 _params: &Value,
                 expected_generation: i64,
+                _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 Ok(BrowserPostconditionEvidence {
                     observed_generation: expected_generation,
@@ -4351,6 +4562,7 @@ mod tests {
                 _operation: &str,
                 _params: &Value,
                 expected_generation: i64,
+                _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(BrowserPostconditionEvidence {
@@ -4794,6 +5006,7 @@ mod tests {
                 _operation: &str,
                 _params: &Value,
                 expected_generation: i64,
+                _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 assert!(
                     self.gate.try_lock().is_err(),
@@ -4811,6 +5024,7 @@ mod tests {
                 _operation: &str,
                 _params: &Value,
                 _expected_generation: i64,
+                _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 panic!("explicit unsupported mutations must not reach browser actuation")
             }
@@ -4929,6 +5143,97 @@ mod tests {
             None,
         );
         assert_eq!(stale["code"], "stale_capability_generation");
+    }
+
+    #[test]
+    fn browser_adapter_protocol_skew_fails_closed_after_generation_fence() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceRecord,
+        };
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed: "beta1-protocol-skew-profile",
+                browser_family: "chrome",
+                extension_version: "0.1.90",
+                observed_at: 10,
+            })
+            .unwrap();
+        store
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                expected_revision: 0,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: false,
+                tool_bridge_mutation_allowed: false,
+                observed_at: 11,
+            })
+            .unwrap();
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 2,
+                observation_generation: 7,
+                capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                observed_at: 12,
+            })
+            .unwrap();
+        let account_ref = format!("br_{}", "9".repeat(64));
+        let resource = BrowserResourceRecord {
+            resource_ref: account_ref.clone(),
+            endpoint_ref: endpoint.endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            kind: "account".to_owned(),
+            parent_ref: None,
+            native_identity_sha256: "a".repeat(64),
+            display_label: None,
+            observation_generation: 7,
+            first_observed_at: 12,
+            last_observed_at: 12,
+        };
+        let grants = [BrowserCallerGrant {
+            endpoint_ref: endpoint.endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref,
+        }];
+        assert_eq!(
+            browser_resource_actuation_decision(
+                &store,
+                "composer.submit",
+                &resource,
+                &grants,
+                Some(7),
+            )
+            .unwrap(),
+            (false, Some("browser_adapter_protocol_unsupported"))
+        );
+
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 3,
+                observation_generation: 8,
+                capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                observed_at: 13,
+            })
+            .unwrap();
+        assert_eq!(
+            browser_resource_actuation_decision(
+                &store,
+                "composer.submit",
+                &resource,
+                &grants,
+                Some(7),
+            )
+            .unwrap(),
+            (false, Some("stale_capability_generation")),
+            "generation mismatch remains the primary pre-dispatch fence"
+        );
     }
 
     #[test]

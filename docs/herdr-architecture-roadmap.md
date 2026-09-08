@@ -47,16 +47,20 @@ alpha.2  Project Work Memory
 alpha.3  Browser Endpoint / Resource Registry
 alpha.4  ChatGPT Web adapter vertical
 alpha.5  Gemini second-provider vertical
+alpha.6  Claude provider vertical
+alpha.7  Grok provider vertical
 beta.1   reliability / postcondition（reload/stale-view 恢复、uncertain delivery 结算）
-beta.2   multi-device / multi-endpoint / multi-account reservation + failover
+beta.2   WebChat orchestration / reservation / failover（先 ChatGPT→ChatGPT fan-out，再跨 Provider）
 rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 ```
 
-**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）§16.2 的表格写于 alpha.5 追加之前，只覆盖 alpha.1–4 → beta.1 → beta.2 → rc.1、不含 alpha.5。自 alpha.5 追加起，该表格不再是里程碑序列的权威，上表（本文件）才是唯一正式序列。alpha.5 存在的原因正是冻结 plan §17 WebChat gate 的 "at least two providers prove the semantic adapter seam"：单一 ChatGPT vertical（alpha.4）无法证明 adapter seam 是 provider-neutral 的，因此必须在 beta.1 reliability/postcondition 之前增加第二个 Provider（Gemini）纵向阶段。
+**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）§16.2 的表格写于 provider vertical 扩展之前，只覆盖 alpha.1–4 → beta.1 → beta.2 → rc.1。自 alpha.5 追加起，该表格不再是里程碑序列的权威，上表（本文件）才是主依赖序列。alpha.5–7 用 Gemini、Claude、Grok 逐步证明 provider seam，但 beta.1 仍基于已验证的 WebChat dispatch lineage，不依赖所有 provider 完成生产 Edge UAT。
+
+**Parallel capability lane**：Alpha 8 Page Assist 是独立浏览器能力纵向，不是 beta.1 的前置基线。它复用 Browser Endpoint/authority 边界，但在 v0.4.8 caller-grant/Edge authority 基线稳定后再集成；不得为了推进 reliability 或 WebChat orchestration 把 Page Assist 的独立授权面混入 beta.1/beta.2。
 
 1.0 以 v0.4.6 的 pre-1.0 stabilization 合同为基础，不复制其 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、planner tool-integrity、multi-device/Relay、Native Messaging local-auth、browser continuity/target-fencing 等实现。若 v0.4.6 的发布分支尚未回并 `main`，只在集成阶段吸收其已验证提交；1.0 feature branches 不另写同类机制。
 
-阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)，已随 PR #315 合并。alpha.4 起尚未合并实现。alpha.5 明确位于 ChatGPT adapter 后、beta.1 reliability/postcondition 前；在 alpha.5 完成真实双 Provider UAT 以前，Work Memory 可以作为跨 Provider 状态合同实现，但不能宣称 ChatGPT/Gemini WebChat 已具备生产级跨 Provider 调度。
+阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)；alpha.4 见 [`_wip/v1.0-alpha4-chatgpt-adapter.md`](./_wip/v1.0-alpha4-chatgpt-adapter.md)；alpha.5–7 分别见 Gemini / Claude / Grok provider specs；beta.1 见 [`_wip/v1.0-beta1-reliability-postcondition.md`](./_wip/v1.0-beta1-reliability-postcondition.md)；beta.2 见 [`_wip/v1.0-beta2-webchat-orchestration.md`](./_wip/v1.0-beta2-webchat-orchestration.md)。
 
 1.0 的两个正式跨 Provider 验收场景固定为：
 
@@ -64,6 +68,8 @@ rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 2. **Cross-WebChat Delegation**：ChatGPT 保持 Planner Lease，把有界任务委派给 Gemini Web Chat execution lane，Gemini 结果回写同一 Work Chain，Gemini 不成为第二 Planner。
 
 Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint 状态合同；Gemini DOM adapter、Browser Endpoint Registry 与 External Dispatch 均留到后续阶段。
+
+beta.2 在跨 Provider 验收前先完成一个更窄的同 Provider 证明：**ChatGPT Planner → 多个 ChatGPT execution lanes → 各自独立 ChatGPT session → 结果回同一 Work Chain → Planner 汇总**。这个顺序用于先证明 Herdr-MCP 拥有任务、记忆、接力和 worker topology，而不是把 provider 差异、reservation/failover 与基本 orchestration 语义同时引入。
 
 ## 已完成并验收
 

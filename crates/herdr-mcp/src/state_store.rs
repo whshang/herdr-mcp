@@ -3173,6 +3173,76 @@ impl StateStore {
             .map_err(|error| format!("cannot commit browser dispatch update: {error}"))?;
         Ok(record)
     }
+
+    pub fn settle_uncertain_browser_dispatch(
+        &mut self,
+        input: BrowserDispatchUpdateInput<'_>,
+    ) -> Result<BrowserDispatchRecord, String> {
+        validate_browser_dispatch_id(input.dispatch_id)?;
+        if input.expected_generation < 1 {
+            return Err("browser_expected_generation_invalid".to_owned());
+        }
+        if input.delivery_state == BrowserDeliveryState::Uncertain {
+            return Err("browser_dispatch_settlement_not_terminal".to_owned());
+        }
+        if input
+            .generation_owner
+            .is_some_and(|owner| owner != input.expected_generation)
+        {
+            return Err("browser_generation_owner_mismatch".to_owned());
+        }
+        if input.updated_at < 0 {
+            return Err("browser_updated_at_invalid".to_owned());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser dispatch settlement: {error}"))?;
+        let current = read_browser_dispatch_by_ref(&tx, input.dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())?;
+        if current.expected_generation != input.expected_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        let current_record = decode_browser_dispatch(current)?;
+        if current_record.delivery_state != BrowserDeliveryState::Uncertain {
+            if current_record.delivery_state == input.delivery_state
+                && current_record.generation_owner == input.generation_owner
+            {
+                tx.commit().map_err(|error| {
+                    format!("cannot commit existing browser dispatch settlement: {error}")
+                })?;
+                return Ok(current_record);
+            }
+            return Err("browser_dispatch_already_settled".to_owned());
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE browser_dispatches
+                 SET delivery_state = ?2, generation_owner = ?3,
+                     updated_at = MAX(updated_at, ?4)
+                 WHERE dispatch_id = ?1 AND expected_generation = ?5
+                   AND delivery_state = 'uncertain'",
+                params![
+                    input.dispatch_id,
+                    input.delivery_state.as_str(),
+                    input.generation_owner,
+                    input.updated_at,
+                    input.expected_generation,
+                ],
+            )
+            .map_err(|error| format!("cannot settle browser dispatch: {error}"))?;
+        if changed != 1 {
+            return Err("browser_dispatch_settlement_raced".to_owned());
+        }
+        let record = read_browser_dispatch_by_ref(&tx, input.dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())
+            .and_then(decode_browser_dispatch)?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser dispatch settlement: {error}"))?;
+        Ok(record)
+    }
 }
 
 #[derive(Debug)]
@@ -7100,6 +7170,106 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn late_dispatch_settlement_is_exact_generation_scoped_and_row_isolated() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, session_ref, _) =
+            browser_dispatch_fixture(&mut store, 7, "late-settlement-native");
+        let request_digest = sha256_text("late-request");
+        let message_digest = sha256_text("late-message");
+        let required_apps: [&str; 0] = [];
+        let reserve = |store: &mut StateStore, key: &str| {
+            let key_digest = sha256_text(key);
+            let BrowserDispatchReservation::Reserved(record) = store
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session_ref,
+                    request_digest: &request_digest,
+                    message_digest: &message_digest,
+                    reasoning_effort: None,
+                    required_apps: &required_apps,
+                    expected_generation: 7,
+                    idempotency_key_digest: &key_digest,
+                    work_chain_id: None,
+                    lane_id: None,
+                    created_at: 10,
+                })
+                .unwrap()
+            else {
+                panic!("expected a new browser dispatch");
+            };
+            store
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &record.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Uncertain,
+                    generation_owner: None,
+                    updated_at: 11,
+                })
+                .unwrap()
+        };
+        let first = reserve(&mut store, "late-key-1");
+        let second = reserve(&mut store, "late-key-2");
+
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 8,
+                capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                observed_at: 20,
+            })
+            .unwrap();
+
+        let settled = store
+            .settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &first.dispatch_id,
+                expected_generation: 7,
+                delivery_state: BrowserDeliveryState::Applied,
+                generation_owner: Some(7),
+                updated_at: 21,
+            })
+            .unwrap();
+        assert_eq!(settled.delivery_state, BrowserDeliveryState::Applied);
+        assert_eq!(settled.generation_owner, Some(7));
+        assert_eq!(
+            store
+                .browser_dispatch(&second.dispatch_id)
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain,
+            "late evidence may settle only its original dispatch row"
+        );
+        assert_eq!(
+            store
+                .settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &second.dispatch_id,
+                    expected_generation: 8,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(8),
+                    updated_at: 22,
+                })
+                .unwrap_err(),
+            "stale_capability_generation"
+        );
+        assert_eq!(
+            store
+                .settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &first.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::ResourceUnavailable,
+                    generation_owner: None,
+                    updated_at: 23,
+                })
+                .unwrap_err(),
+            "browser_dispatch_already_settled"
+        );
     }
 
     #[test]

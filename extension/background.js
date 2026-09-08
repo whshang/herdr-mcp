@@ -2272,25 +2272,77 @@ function unavailableBrowserActuationEvidence(expectedGeneration, observedGenerat
   };
 }
 
+async function recoverBrowserSessionTarget(sessionRef, expectedGeneration) {
+  let observedGeneration = expectedGeneration;
+  let exactTarget = null;
+  try {
+    const candidates = await chrome.tabs.query({ url: activeH2WTabUrls() });
+    for (const tab of candidates) {
+      if (!tab?.id || tab.status !== "complete") continue;
+      let live = null;
+      try {
+        live = await chrome.tabs.sendMessage(tab.id, { type: "h2w_get_convkey" });
+      } catch (_) {
+        continue;
+      }
+      if (live?.browserSessionRef !== sessionRef) continue;
+      const liveGeneration = Number(live?.browserGeneration || 0);
+      if (Number.isSafeInteger(liveGeneration) && liveGeneration > 0) {
+        observedGeneration = liveGeneration;
+      }
+      if (liveGeneration !== expectedGeneration) continue;
+      const pageInfo = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
+      if (!pageInfo?.conversation_id) continue;
+      const target = {
+        provider: pageInfo.site,
+        tabId: tab.id,
+        convKey: pageInfo.convKey,
+        conversationId: pageInfo.conversation_id,
+        projectId: pageInfo.project_id || null,
+        observationGeneration: liveGeneration,
+        spaceRef: null,
+        lastSeenAt: Date.now(),
+      };
+      // The same logical browser session may be visible in multiple tabs. Do
+      // not guess which physical view owns actuation after service-worker loss.
+      if (exactTarget) return { target: null, observedGeneration, ambiguous: true };
+      exactTarget = target;
+    }
+  } catch (_) {}
+  if (exactTarget) browserSessionTargets.set(sessionRef, exactTarget);
+  return { target: exactTarget, observedGeneration, ambiguous: false };
+}
+
 async function handleBrowserActuation(command) {
   const actuationId = String(command?.actuation_id || "");
   const operation = String(command?.operation || "");
   const expectedGeneration = Number(command?.expected_generation || 0);
   const params = command?.params && typeof command.params === "object" ? command.params : {};
-  if (command?.protocol !== "herdr-browser-actuation/v1"
-      || !/^ba_[0-9a-f]{16}$/.test(actuationId)
+  if (!/^ba_[0-9a-f]{16}$/.test(actuationId)
       || !Number.isSafeInteger(expectedGeneration)
       || expectedGeneration < 1) {
     return;
   }
-  const sessionRef = String(params.session_ref || "");
-  const target = browserSessionTargets.get(sessionRef);
-  if (!target) {
-    await postBrowserActuationEvidence(
-      actuationId,
-      unavailableBrowserActuationEvidence(expectedGeneration),
-    );
+  if (command?.protocol !== "herdr-browser-actuation/v1") {
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration),
+      resource_available: true,
+      rejected: true,
+    }).catch(() => {});
     return;
+  }
+  const sessionRef = String(params.session_ref || "");
+  let target = browserSessionTargets.get(sessionRef);
+  if (!target) {
+    const recovered = await recoverBrowserSessionTarget(sessionRef, expectedGeneration);
+    target = recovered.target;
+    if (!target) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+      );
+      return;
+    }
   }
   if (target.observationGeneration !== expectedGeneration) {
     await postBrowserActuationEvidence(
