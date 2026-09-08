@@ -30,7 +30,7 @@ herdr-mcp uninstall
 
 `update auto` 是后台调度入口。默认 macOS PROD 实例执行 `service install` 时会 reconcile 归属明确的 `dev.herdr-mcp.auto-update` LaunchAgent；任务在加载时先执行一次，随后每天触发。自动安装严格限制为 **PROD runtime + Stable Release**：编译为 DEV 的 runtime、`[update] check = false`、named instance、`preview` 都会在访问网络前直接跳过。发现严格更高的 Stable Release 后，继续复用正常的 provenance 验签、detached worker 和 rollback-safe 更新事务，不新增第二套下载器，也不绕过回滚门槛。`service uninstall` 会先写入归属明确的持久 update fence 并移除 scheduler；detached worker 在真正 activation 前会再次检查该 fence，因此已经排队的静默更新不能在卸载后复活服务。显式成功的 install 才会解除 fence。
 
-`reinstall` 是产品级修复 / 重装入口：重新执行 managed Rust service lifecycle，并保留配置与凭据；runtime generations 继续遵循正常 service GC，仅承诺 active / rollback-safe 保留集合。`uninstall` 会完整清理**经过强 ownership 校验的 herdr-mcp runtime/config 状态**。默认实例负责自己的 service、归属明确的 auto-update scheduler、Link/watchdog、Native Messaging host、managed user CLI 和 config root；named instance 则严格限定为自己的 service/watchdog/config，不取得默认 scheduler、Link、Native Host 或 user CLI 的 ownership。默认 product uninstall 会在 config 删除后保留一个很小的用户 cache update-fence tombstone，防止此前 detached 的 updater 复活 service；只有显式且成功的 install/reinstall 才清除它。两者都明确**不会**卸载或修改独立的 `herdr` executable、Herdr service/socket/config，也不会删除浏览器扩展账号状态、Cloudflare 资源、macOS Keychain 项或 TCC 授权。`service uninstall` 仍然只是更窄的高级 service primitive。
+macOS 上，`reinstall` 是产品级修复 / 重装入口；Linux 的 runtime 修复使用 `herdr-mcp install`，显式服务移除使用 `herdr-mcp service uninstall`，下述完整 ownership-checked product-uninstall 事务仍属于 macOS lifecycle 集成。macOS 的 `reinstall` 会：重新执行 managed Rust service lifecycle，并保留配置与凭据；runtime generations 继续遵循正常 service GC，仅承诺 active / rollback-safe 保留集合。`uninstall` 会完整清理**经过强 ownership 校验的 herdr-mcp runtime/config 状态**。默认实例负责自己的 service、归属明确的 auto-update scheduler、Link/watchdog、Native Messaging host、managed user CLI 和 config root；named instance 则严格限定为自己的 service/watchdog/config，不取得默认 scheduler、Link、Native Host 或 user CLI 的 ownership。默认 product uninstall 会在 config 删除后保留一个很小的用户 cache update-fence tombstone，防止此前 detached 的 updater 复活 service；只有显式且成功的 install/reinstall 才清除它。两者都明确**不会**卸载或修改独立的 `herdr` executable、Herdr service/socket/config，也不会删除浏览器扩展账号状态、Cloudflare 资源、macOS Keychain 项或 TCC 授权。`service uninstall` 仍然只是更窄的高级 service primitive。
 
 `service ...`、`link ...`、`native-host ...`、`candidate` 属于高级/内部命令；`dev` 是下面单独说明的**源码开发**入口。正常安装本机 runtime 不需要仓库 checkout、Node.js、npm，也不应把 `service install` 当作普通用户入口。
 
@@ -128,15 +128,30 @@ herdr_call(
 
 传入 `pr_number` 后会返回 PR state、merge state、Auto-merge request、required checks，以及 Deno Deploy 等 supplemental status。每次结果都有确定性的 `fingerprint`；继续监控时把它作为 `previous_fingerprint` 传回，如果状态没有变化，下一次只返回精简 summary 和 `changed=false`，不会重新输出整张检查表。因此 planner 应优先使用该方法，而不是会反复打印完整 job snapshot 的 `gh run watch`。
 
-## Connector 信息
+## Connector 与 Automation 凭据
+
+交互式 Connector 通过已登记 Device/operator 控制通道批准和撤销。批准只授予普通 MCP 访问，不会把 Connector 变成 fleet principal：
 
 ```bash
-herdr-mcp connector
+herdr-mcp connector approve <approval-request-id>
+herdr-mcp connector list
+herdr-mcp connector revoke <connector-id> --confirm
 ```
 
-用于查看当前 Connector / 公网入口相关信息。
+批准命令会交互式读取 6 位授权码，不要把授权码放进 argv 或 shell history。所有已登记 Device 都是平等的 Worker 管理通道，不存在 owner/member 设备层级。
 
-本机静态 bearer 和公网 ChatGPT OAuth 是两套边界。不要因为 CLI 能显示本地连接信息，就把 `HERDR_MCP_TOKEN` 复制进 ChatGPT。
+GitLab CI 等无人值守调用方使用可独立 revoke 的 Automation Client：
+
+```bash
+herdr-mcp automation create --name "gitlab:group/project:prod" --device <device-id-or-unique-name>
+herdr-mcp automation list
+herdr-mcp automation rotate <svc_client_id> --confirm
+herdr-mcp automation revoke <svc_client_id> --confirm
+```
+
+`create` 必须显式指定目标设备并保存 Worker 解析后的不可变 `device_id`，不会在 fleet 中静默替用户选机器。`create` 和 `rotate` 只显示一次 `client_secret`，应直接存进 CI secret manager；`list` 永远不返回 secret，只返回绑定设备和有限的签发统计。Automation Client 用 OAuth `client_credentials` 通过 `client_id + client_secret` 换短期 access token，只拥有绑定设备上的普通 MCP 权限，不拥有 fleet-admin 权限。
+
+本机静态 bearer、公网 OAuth Connector 与 Automation Client 是三套边界。`HERDR_MCP_TOKEN` 只服务本机 TCP runtime，不要复制进 ChatGPT 或 GitLab CI。
 
 完整接入见 [ChatGPT Connector](chatgpt-connector.md)。
 
@@ -157,6 +172,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 herdr-mcp status
 herdr-mcp logs
 ```
+
+即使是 loopback，`http://127.0.0.1:8772/mcp` 也故意保持鉴权。第一方本机客户端可以从受保护的本地状态自动取得 runtime credential，让用户无需手工粘贴；裸 `curl` 或第三方 TCP client 必须显式带 bearer。官方浏览器插件不使用这个 TCP token，而是通过 Chromium Native Messaging 进入 mode-`0600` 的 `extension.sock` trusted IPC；这条通道本身 tokenless，并会剥离网页传入的 `Authorization`。
 
 本机 HTTP 返回 `200` 或 `401` 都说明 runtime 在监听；连接失败才说明进程/端口层有问题。
 

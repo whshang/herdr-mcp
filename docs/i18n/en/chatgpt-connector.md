@@ -49,7 +49,7 @@ The exact ChatGPT UI evolves. The general flow is:
 https://<your-edge-origin>/mcp
 ```
 
-4. Complete OAuth in the browser.
+4. Complete OAuth in the browser. On first authorization, Herdr shows a short-lived approval request instead of silently granting access; approve it from any computer already enrolled in this Worker with `herdr-mcp connector approve <approval-request-id>`. An approved WebChat Connector remains ordinary MCP only and cannot approve another Connector.
 5. Create a new conversation for validation.
 
 Never paste `HERDR_MCP_TOKEN` into ChatGPT. Public ChatGPT access uses OAuth. Static bearer is for local clients such as curl or Cursor.
@@ -73,16 +73,24 @@ Keep the Edge origin stable. Local runtime generations can upgrade behind it wit
 
 ## OAuth flow
 
-The Edge handles the OAuth boundary:
+The Edge handles the OAuth boundary. Dynamic Client Registration (DCR) only registers client metadata; it is **not** authorization. Since v0.4.6, a new Connector cannot exchange for a token until an enrolled-device/operator control channel records an explicit approval:
 
 ```text
-ChatGPT
-  │ metadata discovery
+Connector
+  │ metadata discovery + DCR
   │ authorize + PKCE
-  │ token
   ▼
-MCP request
+Herdr pending approval page
+  │ request id + short-lived 6-digit code
+  └─ any enrolled computer:
+       herdr-mcp connector approve <request-id>
+  ▼
+authorization code → token → MCP request
 ```
+
+Devices enrolled in the same Worker have no owner/member hierarchy for this control plane. Worker/operator credentials administer the fleet; an approved Connector receives ordinary MCP access only and cannot approve/revoke other Connectors or pair/revoke devices. A pre-v0.4.6 OAuth token that was issued before explicit approval remains usable for ordinary MCP compatibility until an operator explicitly revokes its client grant. Use `herdr-mcp connector list` to inspect each current Connector by immutable `connector_id`; the inventory retains a stable Connector name, authorization time, and throttled last real MCP-use time. Use `herdr-mcp connector revoke <connector-id> --confirm` to revoke one instance independently. Legacy clients that predate Connector-instance records remain revocable through the compatibility grant tombstone.
+
+The approval code is single-purpose, short-lived, attempt-bounded, and is entered interactively rather than accepted on CLI argv. Real ChatGPT UAT on 2026-09-08 confirmed that removing/Disconnecting a custom Connector in ChatGPT does not currently send a reliable RFC 7009 revocation request to Herdr. Therefore provider-side Disconnect is not treated as a server-side revocation signal. Operators can revoke a specific `conn_*` manually at any time, and the Worker automatically revokes active Connector instances after 30 days without Connector activity. Automatic cleanup deletes only that instance's active access/refresh credentials and retains the non-secret audit row, including Connector name, authorization time, last-use time, revocation time, and `inactive_30d` reason. Real MCP use updates `last_used_at` at most once per 24 hours to avoid unnecessary Durable Object writes.
 
 Troubleshoot:
 

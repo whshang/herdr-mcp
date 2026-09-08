@@ -4,7 +4,9 @@
 
 A Herdr fleet has one public Worker/Connector and multiple independently identified computers behind it. ChatGPT can discover the fleet, choose a device for a task, and keep follow-up operations attached to that device. New computers join the existing Worker through short-lived pairing; they do not deploy another Worker or receive a shared global secret.
 
-> Secure new-device pairing currently uses the macOS Keychain credential backend, so the pairing workflow is currently macOS-only.
+Herdr 0.9 also has its own saved SSH-machine layer for a multi-machine TUI. That layer can coexist with this Edge fleet, including on the same physical computer, but it does not replace `device_id` routing. See [Herdr 0.9 multi-machine and dual-path control](multi-machine-control.md) for the identity, routing, and failover rules.
+
+> v0.4.8 supports secure new-device pairing on macOS and x86_64 Linux/Debian. macOS keeps the final device credential in Keychain; Linux uses a private per-user credential store with a `0700` directory and `0600` regular credential files. Windows pairing remains unavailable and fails closed.
 
 ## See the fleet from ChatGPT
 
@@ -27,24 +29,22 @@ Each enrolled computer has its own credential and immutable `device_id`. Device 
 
 ## Add a new computer
 
-### 1. Preferred: create the pairing directly in ChatGPT
+### 1. Create the pairing from an enrolled device
 
-In an already-authorized Herdr conversation, simply ask:
+On any computer already enrolled in the fleet, run:
 
-```text
-Generate a Herdr pairing link for my new computer, valid for 10 minutes.
+```bash
+herdr-mcp worker pair
 ```
 
-ChatGPT can create the pairing directly at Edge; no enrolled workstation has to be online. The response should show together:
+`worker pair` is a device/operator fleet action: it requires credentials proving that this machine is already enrolled in the target Worker. It creates the pairing at the Worker control plane without routing the operation through a workstation. The response should show together:
 
 - the pairing address containing a high-entropy pairing id;
 - the single-use 6-digit verification code;
 - the exact expiry time; and
 - the copyable `herdr-mcp worker connect "<pairing-address>"` command.
 
-The normal maximum TTL is 600 seconds. Use the pairing immediately instead of treating it as a durable invitation.
-
-CLI fallback: on any authorized macOS computer in the fleet, `herdr-mcp worker pair` creates the same short-lived pairing and now prints the exact UTC expiry as well as the relative validity window.
+The normal maximum TTL is 600 seconds. Use the pairing immediately instead of treating it as a durable invitation. Never run `worker pair` on the fresh computer as a detection probe. If this is the first Herdr Worker and no enrolled device exists yet, complete first-Worker Cloudflare bootstrap before pairing.
 
 ### 2. Connect the new computer
 
@@ -54,11 +54,11 @@ On the new computer, the Agent runs:
 herdr-mcp worker connect "<pairing-address>"
 ```
 
-The CLI then prompts for the 6-digit code using a no-echo input. The code is intentionally not accepted as a normal command-line argument.
+The CLI then prompts for the 6-digit code as normal visible terminal input so you can verify what you typed. The code is intentionally not accepted as a normal command-line argument, so it stays out of shell history.
 
-By default, the joining computer registers its macOS **Computer Name** as the device display name. Use `--name "<device-name>"` only when the user explicitly wants a different initial name. An owner-supplied `worker pair --name ...` is also an explicit override and takes precedence.
+By default, the joining computer registers the platform-reported computer/host name as the device display name. Use `--name "<device-name>"` only when the user explicitly wants a different initial name. A `worker pair --name ...` value supplied by the pairing creator is also an explicit override and takes precedence.
 
-After the pairing is consumed, `worker connect` installs/starts the local `herdr-mcp` service and ensures the enrolled Rust production Link is created and loaded. The command reports success only after the local service is healthy and `link-prod` is owned by the managed runtime with the new device identity; a failure triggers the existing revoke/Keychain/config compensation path.
+After the pairing is consumed, `worker connect` installs/starts the local `herdr-mcp` service and ensures the enrolled Rust production Link is created and loaded. On macOS that lifecycle is owned by launchd. On a normal Linux login/server environment Herdr prefers `systemd --user`; when no user systemd manager/bus exists (for example an init-less development container), it falls back to a detached per-user process backend with PID plus `/proc` start-time identity checks so lifecycle commands never kill an unrelated reused PID. The fallback survives the invoking shell exiting, but it cannot provide systemd-style restart-on-crash or boot/container-restart persistence; use the surrounding container/host supervisor if that persistence is required. The command still reports success only after the local service is healthy and the production Link uses the new device identity; any activation failure triggers remote revoke plus local credential/config compensation.
 
 For an Agent-assisted setup, paste this sentence on the new computer:
 
@@ -86,23 +86,19 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` is an equivalent alias. Rename changes only the human-facing display name; the immutable `device_id`, workstation identity, credential, authorization and scheduling state stay unchanged. Link reconnects do not overwrite an explicit rename. The default/legacy workstation likewise records its local Computer Name when it is first registered.
 
-To permanently remove authorization from another enrolled device, prefer the already-authorized ChatGPT/Herdr conversation: ask ChatGPT to list devices, select the exact immutable `device_id`, and permanently revoke that device. The Edge-local action is equivalent to:
-
-```text
-herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
-```
-
-This path does not require any workstation to be online and never accepts a display name. CLI fallback: first get the immutable `device_id` from `herdr_devices`, then run this on the owner workstation:
+To permanently remove authorization from another enrolled device, run this on any enrolled workstation. First get the immutable `device_id` from `herdr_devices`, then:
 
 ```bash
 herdr-mcp worker revoke "<device-id>" --confirm
 ```
 
+The device/operator owns fleet administration. This action never accepts a display name; you must use the immutable `device_id`. An approved WebChat Connector is ordinary MCP only and cannot revoke devices. All enrolled devices are peers under a single operator-owned control plane: there is no owner/member hierarchy among devices.
+
 Revocation is permanent for that device identity and credential: the live Link is disconnected, the old credential can never reconnect, and the revoked tombstone is retained internally to prevent resurrection. Revoked tombstones are hidden from normal fleet/device lists. To add that computer again later, create a new pairing and enroll it as a new device identity.
 
 ## What pairing changes
 
-The short-lived pairing is exchanged for a new per-device credential. The final credential is stored in macOS Keychain, and the Worker stores only the verifier needed to authenticate that device. The pairing session becomes unusable after successful consumption.
+The short-lived pairing is exchanged for a new per-device credential. macOS stores the final credential in Keychain; Linux stores it in the private user credential store described above. The Worker stores only the verifier needed to authenticate that device. The pairing session becomes unusable after successful consumption.
 
 The joining computer does **not** need:
 
@@ -116,7 +112,6 @@ The joining computer does **not** need:
 - The 6-digit code is single-use and short-lived.
 - Five wrong code attempts permanently lock that pairing session; create a new one instead of retrying indefinitely.
 - The pairing id is high-entropy and stays in the URL fragment so it is not placed in normal HTTP access-log paths.
-- The OAuth-authorized owner conversation may display the one-time code when the user explicitly creates a pairing there. Outside that narrow flow, never persist the code in argv, shell history, Git, ordinary logs, copied transcripts, or unattended automation.
 - Never print or copy the final per-device credential; it belongs in the OS credential store.
 
 ## Recovery
