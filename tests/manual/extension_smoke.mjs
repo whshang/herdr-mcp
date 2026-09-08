@@ -1209,6 +1209,9 @@ console.log("\n[permission auto-allow decisions]");
   ok(fn("isAllowButtonText('允许')") === true, "accepts Chinese Allow");
   ok(fn("isAllowButtonText('Allow')") === true, "accepts English Allow");
   ok(fn("isAllowButtonText('同意并继续')") === true, "accepts Chinese Agree and continue");
+  ok(fn("isPersistentAllowButtonText('始终允许')") === true, "recognizes Chinese persistent Allow");
+  ok(fn("isPersistentAllowButtonText('Always allow')") === true, "recognizes English persistent Allow");
+  ok(fn("isPersistentAllowButtonText('允许一次')") === false, "does not confuse one-time Allow with persistent Allow");
   ok(fn("isAllowButtonText('拒绝')") === false, "rejects Chinese Deny");
   ok(fn("isAllowButtonText('取消')") === false, "rejects Chinese Cancel");
   ok(fn("isAllowButtonText('Deny')") === false, "rejects English Deny");
@@ -1300,6 +1303,40 @@ console.log("\n[tool-action permission-card auto-allow]");
   vm.runInContext(code, ctx);
   const P = vm.runInContext("window.__H2W_PERMISSION__", ctx);
 
+  // 0) Herdr's ChatGPT card prefers persistent Allow over one-time Allow.
+  {
+    const alwaysAllow = btn("始终允许", { "data-state": "closed" });
+    const deny = btn("拒绝");
+    const allowOnce = btn("允许一次");
+    const drop = btn("", { "aria-haspopup": "menu", "aria-label": "Allow herdr for this conversation" });
+    const card = el("div", { class: "tool-action-card" },
+      el("div", {}, "herdr"),
+      el("h2", {}, "允许 ChatGPT 使用 herdr？"),
+      el("p", {}, "ChatGPT 请求权限以使用工具"),
+      el("div", { class: "btn-area", "data-testid": "tool-action-buttons" }, alwaysAllow, deny, allowOnce, drop));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === true && r.button === alwaysAllow, "Herdr permission card prefers persistent Allow");
+    ok(alwaysAllow.clickCount === 1 && allowOnce.clickCount === 0, "persistent Allow wins over one-time Allow");
+    ok(deny.clickCount === 0 && drop.clickCount === 0, "Herdr persistent Allow leaves deny and dropdown untouched");
+  }
+  // 0b) Other apps keep the existing one-time Allow behavior.
+  {
+    const alwaysAllow = btn("始终允许", { "data-state": "closed" });
+    const deny = btn("拒绝");
+    const allowOnce = btn("允许一次");
+    const card = el("div", { class: "tool-action-card" },
+      el("div", {}, "other-app"),
+      el("h2", {}, "允许 ChatGPT 使用 other-app？"),
+      el("p", {}, "ChatGPT 请求权限以使用工具"),
+      el("div", { class: "btn-area", "data-testid": "tool-action-buttons" }, alwaysAllow, deny, allowOnce));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === true && r.button === allowOnce, "non-Herdr card keeps one-time Allow behavior");
+    ok(alwaysAllow.clickCount === 0 && allowOnce.clickCount === 1, "non-Herdr card does not gain persistent authorization");
+  }
   // 1) A new tool-action card clicks the primary Allow exactly once.
   {
     const allow = btn("允许");
