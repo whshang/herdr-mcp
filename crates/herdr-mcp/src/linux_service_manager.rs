@@ -268,9 +268,11 @@ fn reconcile_runtime_control(
     paths: &LinuxPaths,
     runtime_paths: &RuntimePaths,
 ) -> Result<(), String> {
-    crate::link::migrate_runtime_control::reconcile_current_generation(
+    crate::link::migrate_runtime_control::reconcile_current_generation_at(
         &paths.home,
         &runtime_paths.config_dir,
+        &runtime_paths.config_dir.join("runtime-control.json"),
+        &runtime_paths.config_dir.join("runtime-status.json"),
     )
     .map(|_| ())
 }

@@ -203,7 +203,37 @@ fn apply_live(home: &Path, config_dir: &Path) -> Result<Value, String> {
 /// `runtime/current`. Production is already Rust-owned here, so the live
 /// control document must follow the exact managed generation automatically.
 pub(crate) fn reconcile_current_generation(home: &Path, config_dir: &Path) -> Result<bool, String> {
-    let plan = plan_migrate(home, config_dir, MigrateMode::Apply)?;
+    reconcile_current_generation_with_paths(home, config_dir, None, None)
+}
+
+/// Reconcile the exact control/status files consumed by a non-launchd Link.
+///
+/// macOS migration intentionally prefers the historical `*-prod.json` files,
+/// while the native Linux Link uses the plain `runtime-control.json` /
+/// `runtime-status.json` pair.  Callers that already own the active file paths
+/// must not let an unrelated prod sibling steal reconciliation precedence.
+pub(crate) fn reconcile_current_generation_at(
+    home: &Path,
+    config_dir: &Path,
+    control_path: &Path,
+    status_path: &Path,
+) -> Result<bool, String> {
+    reconcile_current_generation_with_paths(home, config_dir, Some(control_path), Some(status_path))
+}
+
+fn reconcile_current_generation_with_paths(
+    home: &Path,
+    config_dir: &Path,
+    control_path: Option<&Path>,
+    status_path: Option<&Path>,
+) -> Result<bool, String> {
+    let plan = plan_migrate_with_paths(
+        home,
+        config_dir,
+        MigrateMode::Apply,
+        control_path,
+        status_path,
+    )?;
     if plan.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(format!("runtime-control reconcile plan failed: {plan}"));
     }
@@ -224,6 +254,16 @@ pub(crate) fn reconcile_current_generation(home: &Path, config_dir: &Path) -> Re
 
 /// Build the migration plan without writing files.
 pub fn plan_migrate(home: &Path, config_dir: &Path, mode: MigrateMode) -> Result<Value, String> {
+    plan_migrate_with_paths(home, config_dir, mode, None, None)
+}
+
+fn plan_migrate_with_paths(
+    home: &Path,
+    config_dir: &Path,
+    mode: MigrateMode,
+    control_path_override: Option<&Path>,
+    status_path_override: Option<&Path>,
+) -> Result<Value, String> {
     // Touch managed runtime so we refuse planning against a missing/broken install.
     let _binary = resolve_managed_runtime_binary(home)?;
     let generation_id = active_rust_generation_id(home)?;
@@ -233,15 +273,23 @@ pub fn plan_migrate(home: &Path, config_dir: &Path, mode: MigrateMode) -> Result
         ));
     }
 
-    let control_path = prefer_existing(&[
-        config_dir.join("runtime-control-prod.json"),
-        config_dir.join("runtime-control.json"),
-    ])
-    .unwrap_or_else(|| config_dir.join("runtime-control-prod.json"));
-    let status_path = prefer_existing(&[
-        config_dir.join("runtime-status-prod.json"),
-        config_dir.join("runtime-status.json"),
-    ]);
+    let control_path = control_path_override
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            prefer_existing(&[
+                config_dir.join("runtime-control-prod.json"),
+                config_dir.join("runtime-control.json"),
+            ])
+        })
+        .unwrap_or_else(|| config_dir.join("runtime-control-prod.json"));
+    let status_path = match status_path_override {
+        Some(path) if path.is_file() => Some(path.to_path_buf()),
+        Some(_) => None,
+        None => prefer_existing(&[
+            config_dir.join("runtime-status-prod.json"),
+            config_dir.join("runtime-status.json"),
+        ]),
+    };
     let staging_path = staging_path_for(&control_path);
 
     let current = read_optional_json(&control_path)?;
@@ -696,6 +744,44 @@ mod tests {
         let live: Value = serde_json::from_slice(&fs::read(&live_path).unwrap()).unwrap();
         assert_eq!(live["desired_active"], "rust-currentmigrate04");
         assert!(!reconcile_current_generation(&home, &config_dir).unwrap());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_plain_reconcile_does_not_update_prod_sibling() {
+        let home = test_home();
+        setup_managed_runtime(&home, "rust-currentlinux06");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let prod_control = config_dir.join("runtime-control-prod.json");
+        let plain_control = config_dir.join("runtime-control.json");
+        let plain_status = config_dir.join("runtime-status.json");
+        fs::write(
+            &prod_control,
+            r#"{"schema_version":1,"revision":9,"desired_active":"rust-oldprodlinux06","generations":[{"generation":"rust-oldprodlinux06","endpoint":"http://127.0.0.1:8772/mcp"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &plain_control,
+            r#"{"schema_version":1,"revision":1,"desired_active":"rust-oldplainlinux06","generations":[{"generation":"rust-oldplainlinux06","endpoint":"http://127.0.0.1:8772/mcp"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &plain_status,
+            r#"{"schema_version":1,"processed_revision":1,"manager":{"active_generation":"rust-oldplainlinux06"}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            reconcile_current_generation_at(&home, &config_dir, &plain_control, &plain_status,)
+                .unwrap()
+        );
+
+        let plain: Value = serde_json::from_slice(&fs::read(&plain_control).unwrap()).unwrap();
+        assert_eq!(plain["desired_active"], "rust-currentlinux06");
+        assert_eq!(plain["revision"], 2);
+        let prod: Value = serde_json::from_slice(&fs::read(&prod_control).unwrap()).unwrap();
+        assert_eq!(prod["desired_active"], "rust-oldprodlinux06");
+        assert_eq!(prod["revision"], 9);
         let _ = fs::remove_dir_all(&home);
     }
 
