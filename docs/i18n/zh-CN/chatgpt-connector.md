@@ -92,9 +92,9 @@ Herdr pending approval 页面
 authorization code → token → /mcp
 ```
 
-同一个 Worker 内的已登记设备在这条控制面上没有 owner/member 高下之分；Device/operator 负责 fleet 管理。已批准 Connector 只获得普通 MCP 访问，不能批准/撤销其它 Connector，也不能创建 pairing 或 revoke Device。v0.4.6 之前、在没有明确批准步骤时签发的 OAuth token 可以继续做普通 MCP 兼容访问，直到 operator 显式撤销其 client grant。v0.4.6 的当前 Connector 实例用 `herdr-mcp connector list` 取得不可变 `connector_id`，再用 `herdr-mcp connector revoke <connector-id> --confirm` 单独撤销；更早、还没有 Connector-instance 记录的 legacy client 仍可通过兼容 grant tombstone 被彻底封禁。
+同一个 Worker 内的已登记设备在这条控制面上没有 owner/member 高下之分；Device/operator 负责 fleet 管理。已批准 Connector 只获得普通 MCP 访问，不能批准/撤销其它 Connector，也不能创建 pairing 或 revoke Device。v0.4.6 之前、在没有明确批准步骤时签发的 OAuth token 可以继续做普通 MCP 兼容访问，直到 operator 显式撤销其 client grant。当前 Connector 实例用 `herdr-mcp connector list` 查看不可变 `connector_id`；清单会保留稳定的 Connector 名称、授权时间和节流后的最后一次真实 MCP 使用时间。用 `herdr-mcp connector revoke <connector-id> --confirm` 可以精确撤销单个实例；更早、还没有 Connector-instance 记录的 legacy client 仍可通过兼容 grant tombstone 被彻底封禁。
 
-批准码是单用途、短时、限制错误次数的交互凭据，不接受普通 CLI argv 传入。若目的是取消 Herdr 授权，仅在 Web AI 的 UI 中 Disconnect 并不能替代 Worker 端 revoke。
+批准码是单用途、短时、限制错误次数的交互凭据，不接受普通 CLI argv 传入。2026-09-08 的真实 ChatGPT UAT 已确认：在 ChatGPT 中删除/Disconnect 自定义 Connector，目前不会可靠地向 Herdr 发送 RFC 7009 revoke 请求。因此不能把 provider UI 的 Disconnect 当成 Worker 端 revoke 事件。operator 随时可以手动精确 revoke 某个 `conn_*`；Worker 还会自动回收连续 30 天没有 Connector 活动的 active 实例。自动清理只删除该实例自己的 access/refresh credential，并保留非敏感审计记录，包括 Connector 名称、授权时间、最后使用时间、撤销时间，以及 `inactive_30d` 原因。真实 MCP 使用最多每 24 小时更新一次 `last_used_at`，避免不必要的 Durable Object 写入。
 
 实现兼容 Client ID Metadata Document、PKCE、JWT access token 和当前 ChatGPT MCP 客户端行为。
 
