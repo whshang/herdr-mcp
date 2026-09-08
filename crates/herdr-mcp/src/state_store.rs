@@ -33,7 +33,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -396,6 +396,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_dispatches_idempotency
     ON browser_dispatches(endpoint_ref, provider, operation, idempotency_key_digest);
 "#;
 
+/// Migration 9: local-only browser lifecycle locators and pending session
+/// reservations for beta.2 WebChat orchestration.
+///
+/// Browser Registry resource identity remains unchanged: canonical URLs are
+/// explicitly disposable local locators, not provider identity. A pending
+/// session reservation exists only until the provider exposes a stable native
+/// session identity after the first real assignment is submitted.
+const MIGRATION_V9: &str = r#"
+CREATE TABLE IF NOT EXISTS browser_resource_locators (
+    resource_ref            TEXT PRIMARY KEY NOT NULL,
+    canonical_url           TEXT NOT NULL,
+    observation_generation  INTEGER NOT NULL,
+    observed_at             INTEGER NOT NULL,
+    FOREIGN KEY (resource_ref) REFERENCES browser_resources(resource_ref) ON DELETE CASCADE,
+    CHECK (observation_generation > 0)
+);
+
+CREATE TABLE IF NOT EXISTS browser_session_reservations (
+    reservation_ref         TEXT PRIMARY KEY NOT NULL,
+    endpoint_ref            TEXT NOT NULL,
+    provider                TEXT NOT NULL,
+    account_ref             TEXT NOT NULL,
+    space_ref               TEXT,
+    display_label           TEXT NOT NULL,
+    expected_generation     INTEGER NOT NULL,
+    idempotency_key_digest  TEXT NOT NULL,
+    state                   TEXT NOT NULL,
+    session_ref             TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL,
+    expires_at              INTEGER NOT NULL,
+    FOREIGN KEY (endpoint_ref) REFERENCES browser_endpoints(endpoint_ref) ON DELETE CASCADE,
+    FOREIGN KEY (account_ref) REFERENCES browser_resources(resource_ref),
+    FOREIGN KEY (space_ref) REFERENCES browser_resources(resource_ref),
+    FOREIGN KEY (session_ref) REFERENCES browser_resources(resource_ref),
+    CHECK (expected_generation > 0),
+    CHECK (expires_at > created_at),
+    CHECK (state IN ('pending', 'materialized', 'cancelled', 'expired')),
+    CHECK ((state = 'materialized' AND session_ref IS NOT NULL)
+        OR (state != 'materialized' AND session_ref IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_session_reservations_idempotency
+    ON browser_session_reservations(endpoint_ref, provider, idempotency_key_digest);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -407,6 +452,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V6,
     MIGRATION_V7,
     MIGRATION_V8,
+    MIGRATION_V9,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -6077,18 +6123,18 @@ mod tests {
     }
 
     #[test]
-    fn schema_seven_binary_refuses_v8_and_requires_compatible_rollback_state() {
+    fn schema_eight_binary_refuses_v9_and_requires_compatible_rollback_state() {
         let path = temp_db_path();
         {
             let store = StateStore::open(&path).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 8);
+            assert_eq!(store.schema_version().unwrap(), 9);
         }
-        let mut schema_seven_connection = open_connection(Some(&path)).unwrap();
-        let error = migrate_to(&mut schema_seven_connection, 7, &MIGRATIONS[..7]).unwrap_err();
-        assert!(error.contains("newer than this binary supports (7)"));
-        assert!(error.contains("schema-7 database backup"));
-        assert!(error.contains("schema-8-capable binary"));
-        drop(schema_seven_connection);
+        let mut schema_eight_connection = open_connection(Some(&path)).unwrap();
+        let error = migrate_to(&mut schema_eight_connection, 8, &MIGRATIONS[..8]).unwrap_err();
+        assert!(error.contains("newer than this binary supports (8)"));
+        assert!(error.contains("schema-8 database backup"));
+        assert!(error.contains("schema-9-capable binary"));
+        drop(schema_eight_connection);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
@@ -6824,7 +6870,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_upgrades_through_v6_v7_v8_without_losing_continuity() {
+    fn schema_v5_upgrades_through_v6_v7_v8_v9_without_losing_continuity() {
         let path = temp_db_path();
         {
             let conn = Connection::open(&path).unwrap();
@@ -6855,7 +6901,7 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
             store
                 .scalar_i64(
@@ -6880,6 +6926,8 @@ mod tests {
             "browser_provider_state",
             "browser_resources",
             "browser_dispatches",
+            "browser_resource_locators",
+            "browser_session_reservations",
         ] {
             assert!(tables.contains(&table.to_owned()), "missing {table}");
         }
@@ -6891,7 +6939,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_upgrades_through_browser_registry_without_losing_continuity() {
+    fn schema_v6_upgrades_through_browser_lifecycle_state_without_losing_continuity() {
         let path = temp_db_path();
         {
             let conn = Connection::open(&path).unwrap();
@@ -6935,13 +6983,11 @@ mod tests {
             "browser_provider_state",
             "browser_resources",
             "browser_dispatches",
+            "browser_resource_locators",
+            "browser_session_reservations",
         ] {
             assert!(tables.contains(&table.to_owned()), "missing {table}");
         }
-        assert!(
-            !tables.iter().any(|table| table.contains("reservation")),
-            "browser reservation remains out of scope"
-        );
         drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
@@ -7011,7 +7057,12 @@ mod tests {
             .unwrap();
         }
 
-        let store = StateStore::open(&path).unwrap();
+        let mut conn = open_connection(Some(&path)).unwrap();
+        migrate_to(&mut conn, 8, &MIGRATIONS[..8]).unwrap();
+        let store = StateStore {
+            path: Some(path.clone()),
+            conn,
+        };
         assert_eq!(store.schema_version().unwrap(), 8);
         assert!(store.browser_endpoint(&endpoint_ref).unwrap().is_some());
         assert!(store.browser_resource(&session_ref).unwrap().is_some());
@@ -7023,6 +7074,77 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(new_tables, vec!["browser_dispatches"]);
         assert!(!tables_after.contains(&"browser_delivery_events".to_owned()));
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn schema_v8_to_v9_adds_local_browser_lifecycle_state_without_losing_registry() {
+        let path = temp_db_path();
+        let endpoint_ref;
+        let session_ref;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(8) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '8')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            endpoint_ref =
+                browser_opaque_ref("bep_", &["browser-endpoint-v1", "device-v8", "profile-v8"]);
+            session_ref = browser_opaque_ref(
+                "br_",
+                &[
+                    "browser-resource-v1",
+                    &endpoint_ref,
+                    "chatgpt",
+                    "session",
+                    "",
+                    "native-v8",
+                ],
+            );
+            conn.execute(
+                "INSERT INTO browser_endpoints(
+                    endpoint_ref, device_id, browser_family, extension_version,
+                    first_observed_at, last_observed_at
+                 ) VALUES (?1, 'device-v8', 'chrome', '0.1.90', 1, 1)",
+                [&endpoint_ref],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_provider_state(
+                    endpoint_ref, provider, adapter_protocol_version,
+                    observation_generation, capabilities_json, observed_at
+                 ) VALUES (?1, 'chatgpt', 1, 8, '{\"operations\":[]}', 1)",
+                [&endpoint_ref],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_resources(
+                    resource_ref, endpoint_ref, provider, kind, parent_ref,
+                    native_identity_sha256, observation_generation,
+                    first_observed_at, last_observed_at
+                 ) VALUES (?1, ?2, 'chatgpt', 'session', '', ?3, 8, 1, 1)",
+                params![session_ref, endpoint_ref, sha256_text("native-v8")],
+            )
+            .unwrap();
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 9);
+        assert!(store.browser_endpoint(&endpoint_ref).unwrap().is_some());
+        assert!(store.browser_resource(&session_ref).unwrap().is_some());
+        let tables = store.table_names().unwrap();
+        assert!(tables.contains(&"browser_resource_locators".to_owned()));
+        assert!(tables.contains(&"browser_session_reservations".to_owned()));
+        assert!(tables.contains(&"browser_dispatches".to_owned()));
         drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
