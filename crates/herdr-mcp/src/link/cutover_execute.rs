@@ -82,7 +82,7 @@ impl LaunchdOps for RealLaunchd {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Err("link cutover --execute is macOS-only".to_owned())
+            Err("link cutover --execute is a macOS launchd migration primitive; Linux Link ownership is managed directly by the Linux service manager".to_owned())
         }
     }
 
@@ -113,7 +113,7 @@ impl LaunchdOps for RealLaunchd {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = plist;
-            Err("link cutover --execute is macOS-only".to_owned())
+            Err("link cutover --execute is a macOS launchd migration primitive; Linux Link ownership is managed directly by the Linux service manager".to_owned())
         }
     }
 
@@ -134,7 +134,7 @@ impl LaunchdOps for RealLaunchd {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = label;
-            Err("link cutover --execute is macOS-only".to_owned())
+            Err("link cutover --execute is a macOS launchd migration primitive; Linux Link ownership is managed directly by the Linux service manager".to_owned())
         }
     }
 
@@ -146,7 +146,7 @@ impl LaunchdOps for RealLaunchd {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = label;
-            Err("link cutover --execute is macOS-only".to_owned())
+            Err("link cutover --execute is a macOS launchd migration primitive; Linux Link ownership is managed directly by the Linux service manager".to_owned())
         }
     }
 }

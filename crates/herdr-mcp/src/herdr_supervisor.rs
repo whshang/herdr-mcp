@@ -46,7 +46,7 @@ pub(crate) fn run(command: HerdrSupervisorCommand) -> Result<ExitCode, String> {
                 );
                 Ok(ExitCode::SUCCESS)
             }
-            _ => Err("Herdr dependency supervisor is currently macOS-only".to_owned()),
+            _ => Err("the managed Herdr dependency supervisor is a macOS launchd integration; Linux herdr-mcp service lifecycle does not use this supervisor".to_owned()),
         }
     }
 }

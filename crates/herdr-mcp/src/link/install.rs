@@ -75,7 +75,7 @@ pub fn install() -> Result<ExitCode, String> {
 pub fn uninstall() -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        Err("herdr-mcp link uninstall is macOS-only (LaunchAgent candidate soak)".to_owned())
+        Err("link uninstall removes the macOS LaunchAgent candidate-soak job only; Linux production Link lifecycle is owned by the Linux service manager".to_owned())
     }
     #[cfg(target_os = "macos")]
     {

@@ -487,7 +487,7 @@ fn create_pairing(
     _ttl_seconds: u64,
     _name: Option<&str>,
 ) -> Result<ExitCode, String> {
-    Err("worker pair currently requires macOS Keychain; refusing to create a pairing on this platform"
+    Err("worker pair is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
         .to_owned())
 }
 
@@ -667,7 +667,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn revoke_device(_paths: &RuntimePaths, _device_id: &str) -> Result<ExitCode, String> {
     Err(
-        "worker revoke currently requires macOS Keychain; refusing to revoke on this platform"
+        "worker revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }
@@ -707,7 +707,7 @@ fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, Stri
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn approve_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
     Err(
-        "connector approval currently requires the macOS enrolled-device credential backend"
+        "connector approval is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }
@@ -791,7 +791,7 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn cancel_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
     Err(
-        "connector approval cancel currently requires the macOS enrolled-device credential backend"
+        "connector approval cancel is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }
@@ -833,7 +833,7 @@ fn cancel_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn revoke_connector(_paths: &RuntimePaths, _connector_id: &str) -> Result<ExitCode, String> {
     Err(
-        "connector revoke currently requires the macOS enrolled-device credential backend"
+        "connector revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }
@@ -874,7 +874,7 @@ fn revoke_connector(paths: &RuntimePaths, connector_id: &str) -> Result<ExitCode
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn revoke_connector_client(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
     Err(
-        "connector client revoke currently requires the macOS enrolled-device credential backend"
+        "connector client revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }
@@ -915,7 +915,7 @@ fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<Exit
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn list_connectors(_paths: &RuntimePaths, _include_all: bool) -> Result<ExitCode, String> {
     Err(
-        "connector inventory currently requires the macOS enrolled-device credential backend"
+        "connector inventory is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }
@@ -954,7 +954,7 @@ fn create_automation(
     _name: &str,
     _device: &str,
 ) -> Result<ExitCode, String> {
-    Err("automation credential provisioning currently requires the macOS enrolled-device credential backend".to_owned())
+    Err("automation credential provisioning is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1005,7 +1005,7 @@ fn create_automation(paths: &RuntimePaths, name: &str, device: &str) -> Result<E
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn list_automations(_paths: &RuntimePaths) -> Result<ExitCode, String> {
-    Err("automation credential inventory currently requires the macOS enrolled-device credential backend".to_owned())
+    Err("automation credential inventory is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1037,7 +1037,7 @@ fn list_automations(paths: &RuntimePaths) -> Result<ExitCode, String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn rotate_automation(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
-    Err("automation credential rotation currently requires the macOS enrolled-device credential backend".to_owned())
+    Err("automation credential rotation is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1075,7 +1075,7 @@ fn rotate_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, 
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn revoke_automation(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
-    Err("automation credential revoke currently requires the macOS enrolled-device credential backend".to_owned())
+    Err("automation credential revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1110,7 +1110,7 @@ fn revoke_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn rename_current_device(_paths: &RuntimePaths, _name: &str) -> Result<ExitCode, String> {
     Err(
-        "worker rename currently requires macOS Keychain; refusing to rename on this platform"
+        "worker rename is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }

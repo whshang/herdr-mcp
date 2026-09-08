@@ -1,7 +1,9 @@
-//! macOS service manager for the Rust local runtime.
+//! Platform service manager for the Rust local runtime.
 //!
-//! The default (production) launchd label stays `dev.herdr-mcp.server` so
-//! callers and the browser extension keep a single primary service identity.
+//! macOS uses launchd; Linux uses `systemd --user` when available and an
+//! ownership-checked detached user-process fallback in init-less environments.
+//! On macOS, the default production launchd label stays `dev.herdr-mcp.server`
+//! so callers and the browser extension keep a single primary service identity.
 //! Named instances (`HERDR_MCP_INSTANCE` / `--instance`) suffix labels and ports
 //! for same-uid UAT and never rewrite `~/.local/bin/herdr-mcp`.
 //! A Rust install is content-addressed under `runtime/generations/` and launchd
