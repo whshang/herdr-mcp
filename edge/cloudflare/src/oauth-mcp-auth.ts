@@ -14,11 +14,11 @@ export interface OAuthMcpAuthEnv {
 }
 
 export type McpAuthResult =
-  | { ok: true; source: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge"; clientId?: string; principalType?: string; deviceId?: string }
+  | { ok: true; source: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge"; clientId?: string; connectorId?: string; grantGeneration?: number; principalType?: string; deviceId?: string }
   | { ok: false; code: "mcp_auth_failed" };
 
 export interface OAuthMcpAuthDeps {
-  verifyEdgeToken?: (token: string) => Promise<{ ok: boolean; clientId?: string; principalType?: string; deviceId?: string }>;
+  verifyEdgeToken?: (token: string) => Promise<{ ok: boolean; clientId?: string; connectorId?: string; grantGeneration?: number; principalType?: string; deviceId?: string }>;
   verifyLegacyClient?: (clientId: string) => Promise<boolean>;
 }
 
@@ -149,6 +149,9 @@ export async function authenticateMcpRequest(
           ok: true,
           source: "oauth_edge",
           clientId: edge.clientId,
+          ...(edge.connectorId
+            ? { connectorId: edge.connectorId, grantGeneration: edge.grantGeneration }
+            : {}),
           ...(edge.principalType ? { principalType: edge.principalType } : {}),
           ...(edge.deviceId ? { deviceId: edge.deviceId } : {}),
         };

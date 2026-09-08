@@ -113,6 +113,8 @@ export interface OAuthConnectorGrantRecord {
 }
 
 export interface OAuthWebChatControlGrant {
+  connector_id: string;
+  grant_generation: number;
   device_id: string;
   endpoint_ref: string;
   provider: string;
@@ -120,6 +122,8 @@ export interface OAuthWebChatControlGrant {
 }
 
 export interface OAuthPageAssistGrant {
+  connector_id: string;
+  grant_generation: number;
   device_id: string;
   endpoint_ref: string;
 }
@@ -404,10 +408,21 @@ function normalizeWebChatControlGrants(value: unknown): OAuthWebChatControlGrant
   const grants: OAuthWebChatControlGrant[] = [];
   for (const item of value) {
     if (!record(item)) return null;
+    const hasConnectorId = item.connector_id !== undefined;
+    const hasGrantGeneration = item.grant_generation !== undefined;
+    // Pre exact-Connector browser grants carried no Connector generation.
+    // They cannot be attributed safely, so discard only that authority while
+    // keeping the surrounding ordinary MCP grant usable for explicit re-grant.
+    if (!hasConnectorId && !hasGrantGeneration) continue;
+    if (hasConnectorId !== hasGrantGeneration) return null;
+    if (typeof item.connector_id !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(item.connector_id)) return null;
+    if (!Number.isSafeInteger(item.grant_generation) || (item.grant_generation as number) <= 0) return null;
     if (!boundedString(item.device_id, 64)) return null;
     if (!boundedString(item.endpoint_ref, 96) || !boundedString(item.account_ref, 96)) return null;
     if (!boundedString(item.provider, 32) || !/^[a-z0-9][a-z0-9._-]*$/.test(item.provider)) return null;
     grants.push({
+      connector_id: item.connector_id,
+      grant_generation: item.grant_generation as number,
       device_id: item.device_id,
       endpoint_ref: item.endpoint_ref,
       provider: item.provider,
@@ -415,7 +430,9 @@ function normalizeWebChatControlGrants(value: unknown): OAuthWebChatControlGrant
     });
   }
   grants.sort((a, b) =>
-    a.device_id.localeCompare(b.device_id)
+    a.connector_id.localeCompare(b.connector_id)
+    || a.grant_generation - b.grant_generation
+    || a.device_id.localeCompare(b.device_id)
     || a.endpoint_ref.localeCompare(b.endpoint_ref)
     || a.provider.localeCompare(b.provider)
     || a.account_ref.localeCompare(b.account_ref));
@@ -428,14 +445,33 @@ function normalizePageAssistGrants(value: unknown): OAuthPageAssistGrant[] | nul
   const grants: OAuthPageAssistGrant[] = [];
   for (const item of value) {
     if (!record(item)) return null;
-    if (Object.keys(item).some((key) => key !== "device_id" && key !== "endpoint_ref")) return null;
+    const hasConnectorId = item.connector_id !== undefined;
+    const hasGrantGeneration = item.grant_generation !== undefined;
+    if (!hasConnectorId && !hasGrantGeneration) continue;
+    if (hasConnectorId !== hasGrantGeneration) return null;
+    if (Object.keys(item).some((key) => !["connector_id", "grant_generation", "device_id", "endpoint_ref"].includes(key))) return null;
+    if (typeof item.connector_id !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(item.connector_id)) return null;
+    if (!Number.isSafeInteger(item.grant_generation) || (item.grant_generation as number) <= 0) return null;
     if (!boundedString(item.device_id, 64) || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(item.device_id)) return null;
     if (!boundedString(item.endpoint_ref, 96)) return null;
-    if (!grants.some((grant) => grant.device_id === item.device_id && grant.endpoint_ref === item.endpoint_ref)) {
-      grants.push({ device_id: item.device_id, endpoint_ref: item.endpoint_ref });
+    if (!grants.some((grant) =>
+      grant.connector_id === item.connector_id
+      && grant.grant_generation === item.grant_generation
+      && grant.device_id === item.device_id
+      && grant.endpoint_ref === item.endpoint_ref)) {
+      grants.push({
+        connector_id: item.connector_id,
+        grant_generation: item.grant_generation as number,
+        device_id: item.device_id,
+        endpoint_ref: item.endpoint_ref,
+      });
     }
   }
-  grants.sort((a, b) => a.device_id.localeCompare(b.device_id) || a.endpoint_ref.localeCompare(b.endpoint_ref));
+  grants.sort((a, b) =>
+    a.connector_id.localeCompare(b.connector_id)
+    || a.grant_generation - b.grant_generation
+    || a.device_id.localeCompare(b.device_id)
+    || a.endpoint_ref.localeCompare(b.endpoint_ref));
   return grants;
 }
 
@@ -750,12 +786,17 @@ export class OAuthStoreDO {
         approved_by: approver,
         token_issue_count: 0,
       };
+      const previousGrant = normalizeConnectorGrant(
+        await txn.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + current.client_id),
+      );
+      const previousBrowserAuthority = previousGrant?.status === "active" ? previousGrant : null;
       const grant: OAuthConnectorGrantRecord = {
         client_id: current.client_id,
         status: "active",
         principal_type: "connector",
         can_approve_connectors: true,
-        webchat_control: [],
+        webchat_control: previousBrowserAuthority?.webchat_control ?? [],
+        page_assist: previousBrowserAuthority?.page_assist ?? [],
         resource: current.resource,
         scope: current.scope,
         approved_at_ms: nowMs,
@@ -830,7 +871,7 @@ export class OAuthStoreDO {
 
   private async setWebChatControlGrant(request: Request): Promise<Response> {
     const body = await this.body(request);
-    const clientId = body?.client_id;
+    const connectorId = body?.connector_id;
     const deviceId = body?.device_id;
     const endpointRef = body?.endpoint_ref;
     const provider = body?.provider;
@@ -838,7 +879,7 @@ export class OAuthStoreDO {
     const allowed = body?.allowed;
     const changedBy = body?.changed_by;
     if (
-      !boundedString(clientId, 4096)
+      typeof connectorId !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
       || !boundedString(deviceId, 64)
       || !boundedString(endpointRef, 96)
       || !boundedString(accountRef, 96)
@@ -849,9 +890,17 @@ export class OAuthStoreDO {
     ) {
       return json({ ok: false, code: "bad_request" }, 400);
     }
-    const key = GRANT_PREFIX + clientId;
     let result: { ok: boolean; code?: string; record?: OAuthConnectorGrantRecord } = { ok: false, code: "not_found" };
     await this.state.storage.transaction(async (txn) => {
+      const connector = normalizeConnector(
+        await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + connectorId),
+      );
+      if (!connector) return;
+      if (connector.status !== "active") {
+        result = { ok: false, code: "revoked" };
+        return;
+      }
+      const key = GRANT_PREFIX + connector.client_id;
       const raw = await txn.get<OAuthConnectorGrantRecord>(key);
       if (!raw) return;
       const current = normalizeConnectorGrant(raw);
@@ -864,7 +913,9 @@ export class OAuthStoreDO {
         return;
       }
       const same = (item: OAuthWebChatControlGrant) =>
-        item.device_id === deviceId
+        item.connector_id === connector.connector_id
+        && item.grant_generation === connector.grant_generation
+        && item.device_id === deviceId
         && item.endpoint_ref === endpointRef
         && item.provider === provider
         && item.account_ref === accountRef;
@@ -874,7 +925,14 @@ export class OAuthStoreDO {
           result = { ok: false, code: "capacity" };
           return;
         }
-        next.push({ device_id: deviceId, endpoint_ref: endpointRef, provider, account_ref: accountRef });
+        next.push({
+          connector_id: connector.connector_id,
+          grant_generation: connector.grant_generation,
+          device_id: deviceId,
+          endpoint_ref: endpointRef,
+          provider,
+          account_ref: accountRef,
+        });
       }
       const normalized = normalizeWebChatControlGrants(next);
       if (!normalized) {
@@ -900,13 +958,13 @@ export class OAuthStoreDO {
 
   private async setPageAssistGrant(request: Request): Promise<Response> {
     const body = await this.body(request);
-    const clientId = body?.client_id;
+    const connectorId = body?.connector_id;
     const deviceId = body?.device_id;
     const endpointRef = body?.endpoint_ref;
     const allowed = body?.allowed;
     const changedBy = body?.changed_by;
     if (
-      !boundedString(clientId, 4096)
+      typeof connectorId !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
       || !boundedString(deviceId, 64)
       || !/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(deviceId)
       || !boundedString(endpointRef, 96)
@@ -915,9 +973,17 @@ export class OAuthStoreDO {
     ) {
       return json({ ok: false, code: "bad_request" }, 400);
     }
-    const key = GRANT_PREFIX + clientId;
     let result: { ok: boolean; code?: string; record?: OAuthConnectorGrantRecord } = { ok: false, code: "not_found" };
     await this.state.storage.transaction(async (txn) => {
+      const connector = normalizeConnector(
+        await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + connectorId),
+      );
+      if (!connector) return;
+      if (connector.status !== "active") {
+        result = { ok: false, code: "revoked" };
+        return;
+      }
+      const key = GRANT_PREFIX + connector.client_id;
       const raw = await txn.get<OAuthConnectorGrantRecord>(key);
       if (!raw) return;
       const current = normalizeConnectorGrant(raw);
@@ -930,14 +996,22 @@ export class OAuthStoreDO {
         return;
       }
       const next = (current.page_assist ?? []).filter(
-        (item) => item.device_id !== deviceId || item.endpoint_ref !== endpointRef,
+        (item) => item.connector_id !== connector.connector_id
+          || item.grant_generation !== connector.grant_generation
+          || item.device_id !== deviceId
+          || item.endpoint_ref !== endpointRef,
       );
       if (allowed) {
         if (next.length >= 32) {
           result = { ok: false, code: "capacity" };
           return;
         }
-        next.push({ device_id: deviceId, endpoint_ref: endpointRef });
+        next.push({
+          connector_id: connector.connector_id,
+          grant_generation: connector.grant_generation,
+          device_id: deviceId,
+          endpoint_ref: endpointRef,
+        });
       }
       const normalized = normalizePageAssistGrants(next);
       if (!normalized) {

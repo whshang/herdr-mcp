@@ -259,7 +259,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             revoke_connector_client(&paths, &client_id)
         }
         WorkerCommand::ConnectorWebChatControl {
-            client_id,
+            connector_id,
             device_id,
             endpoint_ref,
             provider,
@@ -267,7 +267,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             allowed,
         } => set_connector_webchat_control(
             &paths,
-            &client_id,
+            &connector_id,
             &device_id,
             &endpoint_ref,
             &provider,
@@ -275,11 +275,11 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             allowed,
         ),
         WorkerCommand::ConnectorPageAssist {
-            client_id,
+            connector_id,
             device_id,
             endpoint_ref,
             allowed,
-        } => set_connector_page_assist(&paths, &client_id, &device_id, &endpoint_ref, allowed),
+        } => set_connector_page_assist(&paths, &connector_id, &device_id, &endpoint_ref, allowed),
         WorkerCommand::AutomationCreate { name, device } => {
             create_automation(&paths, &name, &device)
         }
@@ -741,7 +741,7 @@ fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<Exit
 #[cfg(not(target_os = "macos"))]
 fn set_connector_webchat_control(
     _paths: &RuntimePaths,
-    _client_id: &str,
+    _connector_id: &str,
     _device_id: &str,
     _endpoint_ref: &str,
     _provider: &str,
@@ -757,20 +757,27 @@ fn set_connector_webchat_control(
 #[cfg(target_os = "macos")]
 fn set_connector_webchat_control(
     paths: &RuntimePaths,
-    client_id: &str,
+    connector_id: &str,
     device_id: &str,
     endpoint_ref: &str,
     provider: &str,
     account_ref: &str,
     allowed: bool,
 ) -> Result<ExitCode, String> {
-    let client_id = client_id.trim();
+    let connector_id = connector_id.trim();
     let device_id = crate::config::normalize_device_id(device_id)?;
     let endpoint_ref = endpoint_ref.trim();
     let provider = provider.trim();
     let account_ref = account_ref.trim();
-    if client_id.is_empty() || client_id.len() > 4096 {
-        return Err("connector client id is invalid".to_owned());
+    if !connector_id.starts_with("conn_")
+        || connector_id.len() < 13
+        || connector_id.len() > 133
+        || !connector_id
+            .chars()
+            .skip(5)
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err("connector id is invalid".to_owned());
     }
     if endpoint_ref.is_empty()
         || endpoint_ref.len() > 96
@@ -809,7 +816,7 @@ fn set_connector_webchat_control(
         )?)
         .headers(headers)
         .json(&json!({
-            "client_id": client_id,
+            "connector_id": connector_id,
             "device_id": device_id,
             "endpoint_ref": endpoint_ref,
             "provider": provider,
@@ -824,7 +831,7 @@ fn set_connector_webchat_control(
         serde_json::to_string_pretty(&json!({
             "ok": true,
             "action": "connector_webchat_control_set",
-            "client_id": client_id,
+            "connector_id": connector_id,
             "device_id": device_id,
             "endpoint_ref": endpoint_ref,
             "provider": provider,
@@ -839,7 +846,7 @@ fn set_connector_webchat_control(
 #[cfg(not(target_os = "macos"))]
 fn set_connector_page_assist(
     _paths: &RuntimePaths,
-    _client_id: &str,
+    _connector_id: &str,
     _device_id: &str,
     _endpoint_ref: &str,
     _allowed: bool,
@@ -853,16 +860,23 @@ fn set_connector_page_assist(
 #[cfg(target_os = "macos")]
 fn set_connector_page_assist(
     paths: &RuntimePaths,
-    client_id: &str,
+    connector_id: &str,
     device_id: &str,
     endpoint_ref: &str,
     allowed: bool,
 ) -> Result<ExitCode, String> {
-    let client_id = client_id.trim();
+    let connector_id = connector_id.trim();
     let device_id = crate::config::normalize_device_id(device_id)?;
     let endpoint_ref = endpoint_ref.trim();
-    if client_id.is_empty() || client_id.len() > 4096 {
-        return Err("connector client id is invalid".to_owned());
+    if !connector_id.starts_with("conn_")
+        || connector_id.len() < 13
+        || connector_id.len() > 133
+        || !connector_id
+            .chars()
+            .skip(5)
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err("connector id is invalid".to_owned());
     }
     if endpoint_ref.is_empty()
         || endpoint_ref.len() > 96
@@ -882,7 +896,7 @@ fn set_connector_page_assist(
         .post(endpoint(&identity.edge_origin, "/connectors/page-assist")?)
         .headers(headers)
         .json(&json!({
-            "client_id": client_id,
+            "connector_id": connector_id,
             "device_id": device_id,
             "endpoint_ref": endpoint_ref,
             "allowed": allowed,
@@ -895,7 +909,7 @@ fn set_connector_page_assist(
         serde_json::to_string_pretty(&json!({
             "ok": true,
             "action": "connector_page_assist_set",
-            "client_id": client_id,
+            "connector_id": connector_id,
             "device_id": device_id,
             "endpoint_ref": endpoint_ref,
             "allowed": payload.get("allowed").cloned().unwrap_or(Value::Bool(allowed)),

@@ -121,7 +121,7 @@ pub enum WorkerCommand {
         client_id: String,
     },
     ConnectorWebChatControl {
-        client_id: String,
+        connector_id: String,
         device_id: String,
         endpoint_ref: String,
         provider: String,
@@ -129,7 +129,7 @@ pub enum WorkerCommand {
         allowed: bool,
     },
     ConnectorPageAssist {
-        client_id: String,
+        connector_id: String,
         device_id: String,
         endpoint_ref: String,
         allowed: bool,
@@ -713,7 +713,7 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
         Some("webchat-control") => {
             let [
                 action,
-                client_id,
+                connector_id,
                 device_id,
                 endpoint_ref,
                 provider,
@@ -721,7 +721,7 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 confirm,
             ] = &args[1..]
             else {
-                return Err("connector webchat-control requires: <allow|deny> <client-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm".to_owned());
+                return Err("connector webchat-control requires: <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm".to_owned());
             };
             let allowed = match action.as_str() {
                 "allow" => true,
@@ -730,8 +730,15 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                     return Err("connector webchat-control action must be allow or deny".to_owned());
                 }
             };
-            if client_id.starts_with('-') || client_id.trim().is_empty() || client_id.len() > 4096 {
-                return Err("connector webchat-control requires a valid client id".to_owned());
+            if !connector_id.starts_with("conn_")
+                || connector_id.len() < 13
+                || connector_id.len() > 133
+                || !connector_id
+                    .chars()
+                    .skip(5)
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            {
+                return Err("connector webchat-control requires a valid connector id".to_owned());
             }
             if device_id.starts_with('-') || device_id.trim().is_empty() || device_id.len() > 64 {
                 return Err("connector webchat-control requires a valid device id".to_owned());
@@ -755,7 +762,7 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 return Err("connector webchat-control requires --confirm".to_owned());
             }
             Ok(Command::Worker(WorkerCommand::ConnectorWebChatControl {
-                client_id: client_id.clone(),
+                connector_id: connector_id.clone(),
                 device_id: device_id.clone(),
                 endpoint_ref: endpoint_ref.clone(),
                 provider: provider.clone(),
@@ -764,16 +771,23 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some("page-assist") => {
-            let [action, client_id, device_id, endpoint_ref, confirm] = &args[1..] else {
-                return Err("connector page-assist requires: <allow|deny> <client-id> <device-id> <endpoint-ref> --confirm".to_owned());
+            let [action, connector_id, device_id, endpoint_ref, confirm] = &args[1..] else {
+                return Err("connector page-assist requires: <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm".to_owned());
             };
             let allowed = match action.as_str() {
                 "allow" => true,
                 "deny" => false,
                 _ => return Err("connector page-assist action must be allow or deny".to_owned()),
             };
-            if client_id.starts_with('-') || client_id.trim().is_empty() || client_id.len() > 4096 {
-                return Err("connector page-assist requires a valid client id".to_owned());
+            if !connector_id.starts_with("conn_")
+                || connector_id.len() < 13
+                || connector_id.len() > 133
+                || !connector_id
+                    .chars()
+                    .skip(5)
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            {
+                return Err("connector page-assist requires a valid connector id".to_owned());
             }
             if device_id.starts_with('-') || device_id.trim().is_empty() || device_id.len() > 64 {
                 return Err("connector page-assist requires a valid device id".to_owned());
@@ -785,7 +799,7 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 return Err("connector page-assist requires --confirm".to_owned());
             }
             Ok(Command::Worker(WorkerCommand::ConnectorPageAssist {
-                client_id: client_id.clone(),
+                connector_id: connector_id.clone(),
                 device_id: device_id.clone(),
                 endpoint_ref: endpoint_ref.clone(),
                 allowed,
@@ -1414,7 +1428,8 @@ User path:\n\
   herdr-mcp connector approve <approval-request-id>  (macOS enrolled device; reads the 6-digit code interactively, never argv)\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
   herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
-  herdr-mcp connector webchat-control <allow|deny> <client-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm  (macOS owner device only)\n\
+  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm  (macOS owner device only)\n\
+  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS owner device only)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\
   herdr-mcp automation rotate <client-id> --confirm\n\
@@ -2165,7 +2180,7 @@ mod tests {
                 "connector",
                 "webchat-control",
                 "allow",
-                "dcr-client",
+                "conn_webchat_test_1",
                 "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "chatgpt",
@@ -2175,7 +2190,7 @@ mod tests {
             .unwrap()
             .command,
             Command::Worker(WorkerCommand::ConnectorWebChatControl {
-                client_id: "dcr-client".to_owned(),
+                connector_id: "conn_webchat_test_1".to_owned(),
                 device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_owned(),
@@ -2190,7 +2205,7 @@ mod tests {
                 "connector",
                 "page-assist",
                 "allow",
-                "dcr-client",
+                "conn_pageassist_test_1",
                 "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "--confirm"
@@ -2198,7 +2213,7 @@ mod tests {
             .unwrap()
             .command,
             Command::Worker(WorkerCommand::ConnectorPageAssist {
-                client_id: "dcr-client".to_owned(),
+                connector_id: "conn_pageassist_test_1".to_owned(),
                 device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                 endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_owned(),
@@ -2337,7 +2352,7 @@ mod tests {
                 "connector",
                 "webchat-control",
                 "allow",
-                "dcr-client",
+                "conn_webchat_test_1",
                 "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "chatgpt",
@@ -2350,7 +2365,7 @@ mod tests {
                 "connector",
                 "page-assist",
                 "allow",
-                "dcr-client",
+                "conn_pageassist_test_1",
                 "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ]))
@@ -2432,6 +2447,7 @@ mod tests {
             "herdr-mcp connector approve",
             "herdr-mcp connector revoke",
             "herdr-mcp connector webchat-control",
+            "herdr-mcp connector page-assist",
             "herdr-mcp automation create",
             "herdr-mcp automation list",
             "herdr-mcp connector revoke <connector-id> --confirm",

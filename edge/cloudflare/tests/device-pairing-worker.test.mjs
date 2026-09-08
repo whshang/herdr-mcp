@@ -425,9 +425,16 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(approved.status, 200);
   assert.equal((await approved.json()).client_id, client.client_id);
 
+  const approvedInventory = await worker.fetch(new Request("https://edge.example/connectors", {
+    headers: { authorization: "Bearer owner-secret" },
+  }), h.env);
+  assert.equal(approvedInventory.status, 200);
+  const connectorId = (await approvedInventory.json()).connectors[0].connector_id;
+  assert.match(connectorId, /^conn_[A-Za-z0-9_-]+$/);
+
   const target = await pair(h.env, "webchat-grant-target");
   const grantInput = {
-    client_id: client.client_id,
+    connector_id: connectorId,
     device_id: target.device_id,
     endpoint_ref: `be_${"a".repeat(64)}`,
     provider: "chatgpt",
@@ -446,6 +453,8 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   const ownerGrantBody = await ownerGrant.json();
   assert.equal(ownerGrantBody.action, "connector_webchat_control_set");
   assert.deepEqual(ownerGrantBody.grants, [{
+    connector_id: connectorId,
+    grant_generation: 1,
     device_id: target.device_id,
     endpoint_ref: grantInput.endpoint_ref,
     provider: "chatgpt",
@@ -461,7 +470,7 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.deepEqual((await storedGrant.json()).record.webchat_control, ownerGrantBody.grants);
 
   const pageAssistInput = {
-    client_id: client.client_id,
+    connector_id: connectorId,
     device_id: target.device_id,
     endpoint_ref: `be_${"c".repeat(64)}`,
     allowed: true,
@@ -478,6 +487,8 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   const ownerPageAssistBody = await ownerPageAssist.json();
   assert.equal(ownerPageAssistBody.action, "connector_page_assist_set");
   assert.deepEqual(ownerPageAssistBody.grants, [{
+    connector_id: connectorId,
+    grant_generation: 1,
     device_id: target.device_id,
     endpoint_ref: pageAssistInput.endpoint_ref,
   }]);
@@ -540,8 +551,7 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(inventory.status, 200);
   const inventoryBody = await inventory.json();
   assert.equal(inventoryBody.connectors.length, 1);
-  const connectorId = inventoryBody.connectors[0].connector_id;
-  assert.match(connectorId, /^conn_[A-Za-z0-9_-]+$/);
+  assert.equal(inventoryBody.connectors[0].connector_id, connectorId);
   assert.equal(inventoryBody.legacy_clients.length, 1);
   assert.deepEqual(inventoryBody.legacy_clients[0], {
     client_id: "https://legacy.example/oauth/client-metadata.json",
@@ -678,6 +688,102 @@ test("MCP Connector administration requires fleet-admin; approved Connectors are
   const deniedBody = await denied.json();
   assert.equal(deniedBody.result.isError, true);
   assert.equal(deniedBody.result.structuredContent.code, "fleet_admin_required");
+});
+
+test("browser authority is fenced to one exact Connector instance even when client_id is shared", async () => {
+  const h = makeEnv();
+  const target = await pair(h.env, "exact-connector-browser-authority");
+  const connectorA = "conn_shared_client_a1";
+  const connectorB = "conn_shared_client_b1";
+  const endpointA = `be_${"a".repeat(64)}`;
+  const endpointB = `be_${"b".repeat(64)}`;
+  const forwarded = [];
+  const workstationStub = {
+    async fetch(request) {
+      forwarded.push(JSON.parse(await request.text()));
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { ok: true } },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  };
+  const oauthStub = {
+    async fetch(request) {
+      const url = new URL(request.url);
+      const body = await request.json();
+      if (url.pathname === "/internal/oauth/access/verify") {
+        if (body.token === "connector-a-token") {
+          return new Response(JSON.stringify({
+            ok: true,
+            client_id: "shared-chatgpt-client",
+            connector_id: connectorA,
+            grant_generation: 1,
+            principal_type: "connector",
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (body.token === "legacy-shared-client-token") {
+          return new Response(JSON.stringify({
+            ok: true,
+            client_id: "shared-chatgpt-client",
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+      }
+      if (url.pathname === "/internal/oauth/grant/get" && body.client_id === "shared-chatgpt-client") {
+        return new Response(JSON.stringify({
+          ok: true,
+          record: {
+            client_id: "shared-chatgpt-client",
+            status: "active",
+            resource: "https://edge.example/mcp",
+            scope: "mcp",
+            approved_at_ms: 1,
+            approved_by: "device:owner",
+            page_assist: [
+              { connector_id: connectorA, grant_generation: 1, device_id: target.device_id, endpoint_ref: endpointA },
+              { connector_id: connectorB, grant_generation: 1, device_id: target.device_id, endpoint_ref: endpointB },
+            ],
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ ok: false, code: "not_found" }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  h.env.OAUTH_STORE_DO = namespace(oauthStub);
+  h.env.WORKSTATION_DO = namespace(workstationStub);
+
+  const call = (token, id) => worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.page_assist",
+          device: target.device_id,
+          params: JSON.stringify({
+            endpoint_ref: endpointA,
+            action: "inspect",
+            target_origin: "https://example.com",
+          }),
+        },
+      },
+    }),
+  }), h.env);
+
+  assert.equal((await call("connector-a-token", 71)).status, 200);
+  assert.deepEqual(forwarded[0].trace?.page_assist_grants, [{
+    endpoint_ref: endpointA,
+  }], "Connector A receives only its own exact browser authority after device routing strips device metadata");
+
+  assert.equal((await call("legacy-shared-client-token", 72)).status, 200);
+  assert.equal(forwarded[1].trace?.page_assist_grants, undefined,
+    "client-only legacy identity cannot inherit browser authority from any Connector instance");
 });
 
 test("pairing creation requires fleet-admin auth and returns one-time material with worker origin metadata", async () => {

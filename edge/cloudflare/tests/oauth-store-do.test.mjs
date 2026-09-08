@@ -99,6 +99,22 @@ const approval = (overrides = {}) => ({
   ...overrides,
 });
 
+const connectorRecord = (clientId, connectorId, grantGeneration = 1) => ({
+  connector_id: connectorId,
+  client_id: clientId,
+  status: "active",
+  principal_type: "connector",
+  capabilities: ["mcp_access"],
+  resource: "https://issuer/mcp",
+  scope: "mcp",
+  redirect_uri: "https://example.com/cb",
+  auth_source: "legacy",
+  grant_generation: grantGeneration,
+  approved_at_ms: 100,
+  approved_by: "device:owner",
+  token_issue_count: 0,
+});
+
 async function body(response) { return response.json(); }
 
 test("normalizers enforce bounded OAuth state", () => {
@@ -316,6 +332,7 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
 
 test("WebChat Control grants normalize legacy records and add/remove one exact tuple without duplicates", async () => {
   const h = harness();
+  const connectorId = "conn_webchat_test_1";
   h.storage.map.set("grant:legacy-client", {
     client_id: "legacy-client",
     resource: "https://issuer/mcp",
@@ -324,14 +341,21 @@ test("WebChat Control grants normalize legacy records and add/remove one exact t
     can_approve_connectors: true,
     approved_at_ms: 100,
     approved_by: "device:owner",
+    webchat_control: [{
+      device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      endpoint_ref: `be_${"z".repeat(64)}`,
+      provider: "chatgpt",
+      account_ref: `br_${"y".repeat(64)}`,
+    }],
   });
+  h.storage.map.set(`connector:${connectorId}`, connectorRecord("legacy-client", connectorId));
 
   const legacy = await body(await h.post("/internal/oauth/grant/get", { client_id: "legacy-client" }));
   assert.equal(legacy.ok, true);
   assert.deepEqual(legacy.record.webchat_control, [], "pre-Alpha-4 grants fail closed instead of inheriting control");
 
   const tuple = {
-    client_id: "legacy-client",
+    connector_id: connectorId,
     device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
     endpoint_ref: `be_${"a".repeat(64)}`,
     provider: "chatgpt",
@@ -341,6 +365,8 @@ test("WebChat Control grants normalize legacy records and add/remove one exact t
   const enabled = await body(await h.post("/internal/oauth/grant/webchat-control", { ...tuple, allowed: true }));
   assert.equal(enabled.ok, true);
   assert.deepEqual(enabled.record.webchat_control, [{
+    connector_id: connectorId,
+    grant_generation: 1,
     device_id: tuple.device_id,
     endpoint_ref: tuple.endpoint_ref,
     provider: tuple.provider,
@@ -358,6 +384,7 @@ test("WebChat Control grants normalize legacy records and add/remove one exact t
 
 test("Page Assist grants normalize legacy records and add/remove one exact endpoint tuple without duplicates", async () => {
   const h = harness();
+  const connectorId = "conn_pageassist_test_1";
   h.storage.map.set("grant:legacy-page-client", {
     client_id: "legacy-page-client",
     resource: "https://issuer/mcp",
@@ -366,14 +393,19 @@ test("Page Assist grants normalize legacy records and add/remove one exact endpo
     can_approve_connectors: true,
     approved_at_ms: 100,
     approved_by: "device:owner",
+    page_assist: [{
+      device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      endpoint_ref: `be_${"z".repeat(64)}`,
+    }],
   });
+  h.storage.map.set(`connector:${connectorId}`, connectorRecord("legacy-page-client", connectorId));
 
   const legacy = await body(await h.post("/internal/oauth/grant/get", { client_id: "legacy-page-client" }));
   assert.equal(legacy.ok, true);
   assert.deepEqual(legacy.record.page_assist, [], "legacy grants fail closed instead of inheriting Page Assist");
 
   const tuple = {
-    client_id: "legacy-page-client",
+    connector_id: connectorId,
     device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
     endpoint_ref: `be_${"c".repeat(64)}`,
     changed_by: "device:owner",
@@ -381,6 +413,8 @@ test("Page Assist grants normalize legacy records and add/remove one exact endpo
   const enabled = await body(await h.post("/internal/oauth/grant/page-assist", { ...tuple, allowed: true }));
   assert.equal(enabled.ok, true);
   assert.deepEqual(enabled.record.page_assist, [{
+    connector_id: connectorId,
+    grant_generation: 1,
     device_id: tuple.device_id,
     endpoint_ref: tuple.endpoint_ref,
   }]);

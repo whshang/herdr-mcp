@@ -737,6 +737,17 @@ ok(zhLocale.cc_page_handoff === "手动接力"
     && zhLocale.hud_scope_binding_hint.includes("控制中心")
     && !zhLocale.hud_scope_binding_hint.includes("0 个窗格"),
   "zh copy keeps the HUD and Side Panel compact while preserving binding state");
+ok(controlCenterSource.includes('const runtimeHint = `${t("cc_brand")} Runtime · ${runtimeLabel}`;')
+    && controlCenterSource.includes("if (stats.working > 0)")
+    && controlCenterSource.includes("runtimeStats.hidden = true")
+    && controlCenterSource.includes('[data-i18n-title]')
+    && controlCenterCss.includes(".icon-action")
+    && controlCenterCss.includes(".runtime-stats[hidden]")
+    && controlCenterHtml.includes('id="runtimeText" class="sr-only"')
+    && controlCenterHtml.includes('id="refreshButton" type="button" class="ghost compact-action icon-action"')
+    && controlCenterHtml.includes('id="collapseButton" type="button" class="ghost compact-action icon-action"')
+    && controlCenterHtml.includes('id="settingsButton" type="button" class="ghost compact-action icon-action"'),
+  "Side Panel top bar keeps runtime status in the dot tooltip, hides zero working count, and uses icon-only actions");
 ok(controlCenterSource.includes('id.textContent = workspaceId;')
     && !controlCenterSource.includes('id.textContent = `(${workspaceId})`;')
     && controlCenterCss.includes('grid-template-columns: 14px 8px minmax(0, 1fr) max-content max-content')

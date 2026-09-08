@@ -138,7 +138,7 @@ export interface OAuthPublicStore {
   consumeApproval(requestId: string, resumeHash: string, nowMs: number): Promise<ConsumeApprovalResult>;
   getGrant(clientId: string): Promise<OAuthConnectorGrantRecord | null>;
   setWebChatControlGrant(input: {
-    client_id: string;
+    connector_id: string;
     device_id: string;
     endpoint_ref: string;
     provider: string;
@@ -147,7 +147,7 @@ export interface OAuthPublicStore {
     changed_by: string;
   }): Promise<OAuthConnectorGrantRecord | null>;
   setPageAssistGrant(input: {
-    client_id: string;
+    connector_id: string;
     device_id: string;
     endpoint_ref: string;
     allowed: boolean;

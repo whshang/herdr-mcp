@@ -1941,9 +1941,7 @@ console.log("\n[project handoff]");
   const started = await startP;
   ok(started?.ok === true && started.pending === true && started?.source_preserved === true,
     "manual Project rollover uses the read-only fallback without touching the source conversation", JSON.stringify(started));
-  const transferId = Object.values(storage.herdrConversationTransfers || {})
-    .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
-    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
+  const transferId = started?.handoff?.id;
   ok(!!transferId && handoffPrompt === failedPromptBefore,
     "manual ChatGPT Project handoff never submits HERDR_HANDOFF_V1 into the source conversation");
   ok(llmHandoffRequests.length === fallbackRequestsBefore + 1,

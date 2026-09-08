@@ -300,6 +300,10 @@ function applyStaticI18n() {
     const key = element.getAttribute("data-i18n-aria");
     if (key) element.setAttribute("aria-label", t(key));
   });
+  document.querySelectorAll("[data-i18n-title]").forEach((element) => {
+    const key = element.getAttribute("data-i18n-title");
+    if (key) element.setAttribute("title", t(key));
+  });
 }
 
 function siteLabel(site) {
@@ -441,12 +445,24 @@ function renderRuntime(state) {
   const stats = controlCenterStats(state);
   const presentation = runtimePresentation({ runtimeHealthy, eventStreamHealthy });
   runtimeDot.className = `dot ${presentation.dot}`;
-  runtimeText.textContent = !runtimeHealthy
+  const runtimeLabel = !runtimeHealthy
     ? t("cc_runtime_unavailable")
     : eventStreamHealthy === false
       ? t("cc_runtime_reconnecting")
       : t("cc_runtime_healthy");
-  runtimeStats.textContent = t("cc_stats", stats);
+  runtimeText.textContent = runtimeLabel;
+  const runtimeHint = `${t("cc_brand")} Runtime · ${runtimeLabel}`;
+  runtimeDot.title = runtimeHint;
+  runtimeDot.setAttribute("aria-label", runtimeHint);
+  if (stats.working > 0) {
+    runtimeStats.hidden = false;
+    runtimeStats.textContent = t("cc_stats", stats);
+    runtimeStats.title = t("cc_stats", stats);
+  } else {
+    runtimeStats.hidden = true;
+    runtimeStats.textContent = "";
+    runtimeStats.title = "";
+  }
 }
 
 function renderWorkspaceTree(state) {
