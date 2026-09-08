@@ -14,7 +14,7 @@
 - **生产 Link 是 Rust**，执行 `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`。
 - **公共 Edge contract 为 epoch 3 / 19 actions，workstation Runtime Execution Contract 保持 epoch 2 / 18 tools**；第 19 个 `herdr_devices` 由 Edge 本地执行，不转发到 workstation。
 - **浏览器控制面是有界的**：不宣称 browser true-steer；普通终端只开放有 target fencing 的窄化 `Run command -> pane.send_input + Enter`，任意 Herdr method 仍保持 preview-only。
-- **`v0.4.3` 已发布能力可作为当前产品能力呈现**；任何尚未发布的后续特性仍必须描述为 development/upcoming，不能提前写成当前产品能力。
+- **`v0.4.8` 是当前稳定 0.4.x 产品基线**；1.0 未发布能力仍必须描述为 development/upcoming，不能提前写成当前产品能力。
 
 ## 总体目标
 
@@ -37,7 +37,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 当前执行面彼此解耦：Runtime、Browser Extension、Edge/Link Contract 可以独立演进，但必须遵守 [`release-model.md`](./release-model.md) 的兼容边界。浏览器扩展持续独立迭代，不要求仅为扩展变化发布 Rust runtime。
 
-`v0.4.3` multi-device core 已发布，其冻结设计与 release plan 已归档到 [`history/architecture/`](./history/architecture/)。当前活跃长期设计继续以 Browser Control Plane 等未完成主题为准；多设备 scheduling/admin/console 只有在后续明确立项后才进入 `_wip`。
+`v0.4.8` 已提供 Connector/OAuth exact-instance lifecycle、Automation Client、first-Worker onboarding、multi-device enrollment/admin、Linux service/credential/updater、Relay/reconnect/backpressure 与 Native Messaging/Unix-socket 等 pre-1.0 stabilization 能力。1.0 直接继承这些边界，不再另写同类机制。
 
 Herdr-MCP 1.0 当前进入分阶段纵向实现，阶段边界独立于 0.4.x 发布线。唯一正式里程碑序列如下；阶段进度台账见 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md)：
 
@@ -50,17 +50,17 @@ alpha.5  Gemini second-provider vertical
 alpha.6  Claude provider vertical
 alpha.7  Grok provider vertical
 alpha.8  bounded generic Page Assist
-alpha.9  Toolchain Efficiency（native-default exec / 18-tool efficiency gate）
+alpha.9  Toolchain Efficiency（output compaction / 18-tool efficiency gate）
 beta.1   reliability / postcondition（reload/stale-view 恢复、uncertain delivery 结算）
 beta.2   multi-device / multi-endpoint / multi-account reservation + failover
 rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 ```
 
-**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）§16.2 只覆盖早期 alpha.1–4 → beta.1 → beta.2 → rc.1。后续真实实现依次补入第二 Provider、Claude/Grok provider vertical、Page Assist，以及本轮在 Beta 1 前插入的 Alpha 9 Toolchain Efficiency；因此上表（本文件）是唯一正式里程碑序列。Alpha 9 不增加工具数量；其中 native-default `herdr_exec` 会改变冻结 epoch-2 中明确的 VISIBLE utility-pane 语义，因此必须作为显式 1.0 Runtime Execution contract identity/hash 演进处理，不能在旧 hash 下静默切换。
+**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）只记录早期计划与 provenance；后续真实实现补入第二 Provider、Claude/Grok、Page Assist 与 Alpha 9，因此上表是当前唯一正式里程碑序列。Alpha 9 不增加工具数量；native-default `herdr_exec` 因会改变 epoch-2 明确的 VISIBLE utility-pane 语义而未在旧 hash 下发布，若未来继续该方向必须显式演进 Runtime Execution contract。
 
-1.0 以 v0.4.6 的 pre-1.0 stabilization 合同为基础，不复制其 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、planner tool-integrity、multi-device/Relay、Native Messaging local-auth、browser continuity/target-fencing 等实现。若 v0.4.6 的发布分支尚未回并 `main`，只在集成阶段吸收其已验证提交；1.0 feature branches 不另写同类机制。
+1.0 以正式 v0.4.8 的 pre-1.0 stabilization 合同为基础，不复制 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、multi-device/Relay、Linux platform support、Native Messaging local-auth 与 browser continuity/target-fencing 等实现。当前统一线见 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md)。
 
-阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)；alpha.4–alpha.6 与 alpha.8 分别见对应 `_wip/v1.0-alpha*-*.md`；alpha.7 的工程状态由 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md) 记录；alpha.9 见 [`_wip/v1.0-toolchain-efficiency.md`](./_wip/v1.0-toolchain-efficiency.md)。Alpha 9 implementation 可在 Alpha 8 isolated browser UAT 并行推进，但不得先于接受后的 Alpha 8 integration boundary 合并；完成后再进入 beta.1 reliability/postcondition。
+阶段规格：alpha.1–alpha.9 见对应 `_wip/v1.0-*.md`；beta.1 见 [`_wip/v1.0-beta1-reliability-postcondition.md`](./_wip/v1.0-beta1-reliability-postcondition.md)；beta.2 见 [`_wip/v1.0-beta2-webchat-orchestration.md`](./_wip/v1.0-beta2-webchat-orchestration.md)。实时工程状态统一由 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md) 记录。
 
 1.0 的两个正式跨 Provider 验收场景固定为：
 
