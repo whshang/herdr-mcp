@@ -260,11 +260,19 @@ pub fn reconcile_link() -> Result<(), String> {
     // previous generation. Reconcile the control document first: otherwise a
     // freshly restarted Link consumes the stale desired_active value and
     // advertises the superseded generation back to Edge again.
+    reconcile_runtime_control(&paths, &runtime_paths)?;
+    ensure_link_installed_with_restart(true)
+}
+
+fn reconcile_runtime_control(
+    paths: &LinuxPaths,
+    runtime_paths: &RuntimePaths,
+) -> Result<(), String> {
     crate::link::migrate_runtime_control::reconcile_current_generation(
         &paths.home,
         &runtime_paths.config_dir,
-    )?;
-    ensure_link_installed_with_restart(true)
+    )
+    .map(|_| ())
 }
 
 pub fn runtime_token_for_link() -> Result<String, String> {
@@ -274,7 +282,8 @@ pub fn runtime_token_for_link() -> Result<String, String> {
 fn install() -> Result<(), String> {
     let paths = LinuxPaths::discover()?;
     let backend = backend_for_install(&paths)?;
-    let config = Config::load(&RuntimePaths::discover()?.config_file)?;
+    let runtime_paths = RuntimePaths::discover()?;
+    let config = Config::load(&runtime_paths.config_file)?;
     ensure_secure_dir(&paths.config_dir, 0o700)?;
     ensure_secure_dir(&paths.runtime_root, 0o700)?;
     ensure_secure_dir(&paths.generations_dir, 0o700)?;
@@ -322,8 +331,8 @@ fn install() -> Result<(), String> {
         LinuxBackend::SystemdUser => unit_active(LINK_UNIT),
         LinuxBackend::DetachedProcess => managed_process_active(&paths.link_process, "link"),
     };
-    let reconcile_active_link =
-        should_reconcile_link_after_install(config.edge_device_id.is_some(), previous_link_active);
+    let reconcile_enrolled_link =
+        should_reconcile_link_after_install(config.edge_device_id.is_some());
     let runtime_env_existed = paths.runtime_env.exists();
     if !runtime_env_existed {
         let token = secure_token_hex()?;
@@ -367,7 +376,7 @@ fn install() -> Result<(), String> {
             format!("{}\n", backend.implementation()).as_bytes(),
             0o600,
         )?;
-        if reconcile_active_link {
+        if reconcile_enrolled_link {
             link_reconcile_attempted = true;
             reconcile_link()?;
         }
@@ -399,11 +408,24 @@ fn install() -> Result<(), String> {
             }
             LinuxBackend::DetachedProcess => None,
         };
-        let restore_link_error = if link_reconcile_attempted
-            && previous_link_active
-            && restore_service_error.is_none()
-        {
-            reconcile_link().err()
+        let restore_runtime_control_error = if link_reconcile_attempted {
+            reconcile_runtime_control(&paths, &runtime_paths).err()
+        } else {
+            None
+        };
+        let restore_link_error = if link_reconcile_attempted && restore_service_error.is_none() {
+            if previous_link_active && restore_runtime_control_error.is_none() {
+                ensure_link_installed_with_restart(true).err()
+            } else if !previous_link_active {
+                match backend {
+                    LinuxBackend::SystemdUser => systemctl(&["stop", LINK_UNIT]).err(),
+                    LinuxBackend::DetachedProcess => {
+                        stop_managed_process(&paths.link_process, "link").err()
+                    }
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -411,9 +433,10 @@ fn install() -> Result<(), String> {
             let _ = fs::remove_file(&paths.runtime_env);
         }
         return Err(format!(
-            "Linux service install failed and prior service state was restored: {error}; backend={}; restore_service_error={}; restore_link_error={}",
+            "Linux service install failed and prior service state was restored: {error}; backend={}; restore_service_error={}; restore_runtime_control_error={}; restore_link_error={}",
             backend.implementation(),
             restore_service_error.as_deref().unwrap_or("none"),
+            restore_runtime_control_error.as_deref().unwrap_or("none"),
             restore_link_error.as_deref().unwrap_or("none")
         ));
     }
@@ -432,13 +455,13 @@ fn install() -> Result<(), String> {
         "service_unit": service_unit,
         "user_cli": link_report.path,
         "user_cli_changed": link_report.changed,
-        "link_reconciled": reconcile_active_link,
+        "link_reconciled": reconcile_enrolled_link,
         "runtime_token_printed": false,
     }))
 }
 
-fn should_reconcile_link_after_install(enrolled: bool, previously_active: bool) -> bool {
-    enrolled && previously_active
+fn should_reconcile_link_after_install(enrolled: bool) -> bool {
+    enrolled
 }
 
 fn uninstall() -> Result<(), String> {
@@ -1328,11 +1351,9 @@ mod tests {
     }
 
     #[test]
-    fn install_reconciles_only_an_enrolled_link_that_was_already_active() {
-        assert!(should_reconcile_link_after_install(true, true));
-        assert!(!should_reconcile_link_after_install(true, false));
-        assert!(!should_reconcile_link_after_install(false, true));
-        assert!(!should_reconcile_link_after_install(false, false));
+    fn install_reconciles_any_enrolled_link() {
+        assert!(should_reconcile_link_after_install(true));
+        assert!(!should_reconcile_link_after_install(false));
     }
 
     #[test]
