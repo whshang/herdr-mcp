@@ -17,17 +17,17 @@ Do not bump the Rust runtime version solely to ship an extension-only UI/DOM/bro
 | Source checkout | repository/worktree | Editable source and scripts | Development only |
 | Build artifact | `target/debug/herdr-mcp` or `target/release/herdr-mcp` | Ephemeral Cargo output | Tests, local candidate runs, release preparation |
 | Installed generation | `~/.config/herdr-mcp/runtime/generations/rust-<content-id>/herdr-mcp` | Immutable installed binary | Service activation, update, rollback |
-| Active runtime | `~/.config/herdr-mcp/runtime/current/herdr-mcp` | Managed symlink to the active installed generation | Production launchd target and authoritative runtime CLI |
+| Active runtime | `~/.config/herdr-mcp/runtime/current/herdr-mcp` | Managed symlink to the active installed generation | Production service/Link target and authoritative runtime CLI |
 | User CLI | `~/.local/bin/herdr-mcp` | Stable command users invoke | User-facing control entrypoint; see migration note below |
 
 ### Hard rules
 
 1. Never use a repository build artifact as the production service binary. `target/*/herdr-mcp` may be rebuilt, deleted, or changed by branch switches.
-2. `dev.herdr-mcp.server` must execute the stable active-runtime path `~/.config/herdr-mcp/runtime/current/herdr-mcp`. Do not point launchd at a checkout, worktree, `target/`, `bin/`, or a fixed generation path.
+2. Every managed production service and Link must execute the stable active-runtime path `~/.config/herdr-mcp/runtime/current/herdr-mcp`. On macOS this includes the owned launchd server/production-Link jobs; on Linux it includes `herdr-mcp.service` / `herdr-mcp-link.service` or the managed user-process fallback. Do not point any platform service owner at a checkout, worktree, `target/`, `bin/`, or a fixed generation path.
 3. Installed generations are immutable. Create a new content-addressed generation, validate it, then atomically switch `runtime/current`. Never overwrite an existing generation in place.
-4. Do not infer the active runtime from Git `HEAD`, the current worktree, Cargo output, or a process-name heuristic. Query the active runtime and the exact launchd label.
+4. Do not infer the active runtime from Git `HEAD`, the current worktree, Cargo output, or a process-name heuristic. Query the active runtime and the exact platform service owner (`launchctl` on macOS; `systemctl --user` or managed process state on Linux).
 5. Do not use legacy checks such as `pgrep -f "dist/server.js"` or `pkill -f "dist/server.js"` for Rust service lifecycle decisions.
-6. Build/test operations must not modify `runtime/current`, installed generations, launchd, or the user CLI unless the task explicitly performs an install/update/cutover.
+6. Build/test operations must not modify `runtime/current`, installed generations, managed service/Link ownership, or the user CLI unless the task explicitly performs an install/update/cutover.
 7. Rollback must reactivate a previously installed managed generation using recorded service state. Do not rebuild a binary as part of rollback.
 8. Keep credentials out of source, Git history, CLI diagnostics, AGENTS.md, and non-secret state records. Preserve existing service credentials during generation changes.
 9. Any change to the installer, updater, CLI, release path, or service manager must preserve these ownership boundaries and include regression coverage for them.
@@ -78,17 +78,25 @@ When the task is specifically about the active `herdr-mcp` runtime, establish ru
 
 ### Service mutation safety
 
-Rust service mutations (`service install`, `start`, `stop`, `restart`, `rollback`, `uninstall`, and update activation) must run from an independent process/terminal. Do not run them from a managed `herdr_exec` session: restarting `dev.herdr-mcp.server` can terminate the process carrying its own control transaction. Read-only `service status` is safe from managed execution.
+Rust service mutations (`service install`, `start`, `stop`, `restart`, `rollback`, `uninstall`, and update activation) must run from an independent process/terminal. Do not run them from a managed `herdr_exec` session: restarting the active managed server/service can terminate the process carrying its own control transaction. Read-only `service status` is safe from managed execution.
 
-Destructive service/update/native-host/Link lifecycle mutations must never use `launchctl submit`. Inferred launchd jobs may replay after the command exits and can consume rollback or repeat another non-idempotent mutation. Use the managed lifecycle path or an explicit one-shot plist with `RunAtLoad=true` and `KeepAlive=false` when an independent launchd job is required.
+On macOS, destructive service/update/native-host/Link lifecycle mutations must never use `launchctl submit`. Inferred launchd jobs may replay after the command exits and can consume rollback or repeat another non-idempotent mutation. Use the managed lifecycle path or an explicit one-shot plist with `RunAtLoad=true` and `KeepAlive=false` when an independent launchd job is required. On Linux, use the managed `systemd --user` / process-backend lifecycle instead of importing launchd assumptions.
 
-### Link ownership (post-G5)
+### Link ownership (post-G5 macOS; native Linux)
 
-Production Link (`dev.herdr-mcp.link-prod`) is Rust and must execute the active
-runtime path `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`. A legacy
-or dev Node canary (`dev.herdr-mcp.link`) may still exist for compatibility or
-soak work, but it is not a production dependency. Do not retarget production
-Link to a checkout, worktree, `dist/`, or a fixed generation path.
+Production Link is Rust on every supported platform and must execute the active
+runtime path `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`. On macOS
+the post-G5 production owner is `dev.herdr-mcp.link-prod`; on normal Linux it is
+`herdr-mcp-link.service`, with the managed user-process backend used only when a
+user systemd manager is unavailable. A legacy/dev Node canary may still exist on
+macOS for compatibility or soak work, but it is not a production dependency.
+Do not retarget production Link to a checkout, worktree, `dist/`, or a fixed
+generation path. Linux Link generation control consumes the plain
+`runtime-control.json` / `runtime-status.json` files; never let historical
+macOS `*-prod.json` siblings take precedence when reconciling Linux state.
+
+The candidate/cutover rules below are macOS-specific unless a rule explicitly
+says otherwise:
 
 1. `herdr-mcp link run` is a foreground **candidate** only. It must not mutate
    `runtime/current` or change production Link ownership by itself.
@@ -115,6 +123,13 @@ readlink "$HOME/.config/herdr-mcp/runtime/current" || true
 "$HOME/.config/herdr-mcp/runtime/current/herdr-mcp" --version
 "$HOME/.config/herdr-mcp/runtime/current/herdr-mcp" service status
 launchctl list | awk -v label='dev.herdr-mcp.server' '$3 == label { print $1, $2, $3 }'
+```
+
+On Linux, replace the final launchd probe with the platform owner check:
+
+```bash
+systemctl --user show herdr-mcp.service herdr-mcp-link.service \
+  -p ActiveState -p ExecStart --no-pager
 ```
 
 After any lifecycle mutation, verify the active generation, exact launchd job, local health, runtime version, contract epoch/tool count, and rollback state before declaring success.
