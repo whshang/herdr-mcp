@@ -150,7 +150,11 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let report = collect(paths, config);
     let runtime_healthy = matches!(report.runtime, RuntimeHealth::Healthy(_));
     let methods_result = native_tools::methods("");
-    let schema_healthy = methods_result["ok"].as_bool() == Some(true);
+    // `native_tools::methods` can still return the local progressive-method
+    // registry when live Herdr schema reflection is unavailable. Doctor must
+    // prove the live schema itself rather than letting that local fallback
+    // mask a broken Herdr executable lookup.
+    let schema_healthy = crate::schema::list_methods("").is_ok();
     let native_call_result = paths
         .herdr_socket
         .as_ref()

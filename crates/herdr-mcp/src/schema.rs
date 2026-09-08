@@ -1,5 +1,7 @@
 use serde_json::{Map, Value};
+use std::env;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -367,12 +369,18 @@ fn load_live_registry() -> Result<SchemaRegistry, String> {
 }
 
 fn run_schema_command() -> Result<Vec<u8>, String> {
-    let mut child = Command::new("herdr")
+    let herdr = discover_herdr_binary();
+    let mut child = Command::new(&herdr)
         .args(["api", "schema", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("cannot start `herdr api schema --json`: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "cannot start `{} api schema --json`: {error}",
+                herdr.display()
+            )
+        })?;
 
     let stdout = child
         .stdout
@@ -422,6 +430,32 @@ fn run_schema_command() -> Result<Vec<u8>, String> {
         return Err(format!("herdr schema exceeded {MAX_SCHEMA_BYTES} bytes"));
     }
     Ok(stdout)
+}
+
+fn discover_herdr_binary() -> PathBuf {
+    let explicit = env::var_os("HERDR_BIN").map(PathBuf::from);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    discover_herdr_binary_from(explicit, home, |path| path.is_file())
+}
+
+fn discover_herdr_binary_from(
+    explicit: Option<PathBuf>,
+    home: Option<PathBuf>,
+    is_file: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    let candidates = [
+        home.map(|home| home.join(".local/bin/herdr")),
+        Some(PathBuf::from("/opt/homebrew/bin/herdr")),
+        Some(PathBuf::from("/usr/local/bin/herdr")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|path| is_file(path))
+        .unwrap_or_else(|| PathBuf::from("herdr"))
 }
 
 fn read_stream(mut stream: impl Read) -> Result<Vec<u8>, String> {
@@ -614,5 +648,31 @@ mod tests {
         let result = validate_with_registry(&registry(), "future.method", &json!({}));
         assert!(result.ok);
         assert_eq!(result.warnings.len(), 1);
+    }
+
+    #[test]
+    fn schema_binary_discovery_prefers_explicit_override() {
+        let explicit = PathBuf::from("/custom/herdr");
+        let resolved = discover_herdr_binary_from(
+            Some(explicit.clone()),
+            Some(PathBuf::from("/home/test")),
+            |_| false,
+        );
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn schema_binary_discovery_finds_user_local_install_without_path() {
+        let home = PathBuf::from("/home/test");
+        let expected = home.join(".local/bin/herdr");
+        let resolved = discover_herdr_binary_from(None, Some(home), |path| path == expected);
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn schema_binary_discovery_falls_back_to_path_lookup() {
+        let resolved =
+            discover_herdr_binary_from(None, Some(PathBuf::from("/home/test")), |_| false);
+        assert_eq!(resolved, PathBuf::from("herdr"));
     }
 }
