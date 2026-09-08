@@ -54,7 +54,7 @@ pub fn protected_live_link_labels() -> &'static [&'static str] {
 pub fn install() -> Result<ExitCode, String> {
     #[cfg(target_os = "linux")]
     {
-        crate::linux_service_manager::reconcile_link()?;
+        crate::linux_service_manager::install_link()?;
         println!(r#"{{"ok":true,"action":"link_install","implementation":"linux"}}"#);
         Ok(ExitCode::SUCCESS)
     }

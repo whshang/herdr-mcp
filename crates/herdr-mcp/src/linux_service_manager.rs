@@ -233,6 +233,21 @@ fn ensure_link_installed_with_restart(restart_existing: bool) -> Result<(), Stri
     Ok(())
 }
 
+pub fn install_link() -> Result<(), String> {
+    let runtime_paths = RuntimePaths::discover()?;
+    let config = Config::load(&runtime_paths.config_file)?;
+    require_link_enrollment(&config)?;
+    reconcile_link()
+}
+
+fn require_link_enrollment(config: &Config) -> Result<(), String> {
+    if config.edge_device_id.is_some() {
+        Ok(())
+    } else {
+        Err("Linux Link install requires an enrolled edge.device_id; run `herdr-mcp worker connect` first".to_owned())
+    }
+}
+
 pub fn reconcile_link() -> Result<(), String> {
     let paths = LinuxPaths::discover()?;
     let runtime_paths = RuntimePaths::discover()?;
@@ -1318,6 +1333,14 @@ mod tests {
         assert!(!should_reconcile_link_after_install(true, false));
         assert!(!should_reconcile_link_after_install(false, true));
         assert!(!should_reconcile_link_after_install(false, false));
+    }
+
+    #[test]
+    fn explicit_link_install_requires_enrollment() {
+        let mut config = Config::default();
+        assert!(require_link_enrollment(&config).is_err());
+        config.edge_device_id = Some("dev_01M1XYJHD1EGGTN1M11R14ZAYF".to_owned());
+        assert!(require_link_enrollment(&config).is_ok());
     }
 
     #[test]
