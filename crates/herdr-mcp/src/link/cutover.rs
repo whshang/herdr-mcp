@@ -103,7 +103,7 @@ fn run_rollback(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (home, config_dir);
-        Err("link cutover --rollback is macOS-only".to_owned())
+        Err("link cutover --rollback is a macOS launchd migration primitive; Linux Link ownership is managed directly by the Linux service manager".to_owned())
     }
     #[cfg(target_os = "macos")]
     {

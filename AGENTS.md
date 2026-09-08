@@ -4,6 +4,8 @@ Release planes and publication boundaries: [`docs/release-model.md`](docs/releas
 
 Documentation retention: do not classify a document as disposable solely because its filename or origin says `research`, `benchmark`, `UAT`, or `history`. Delete raw execution evidence, one-off repro logs, and superseded process records when appropriate; retain distilled articles that contain reusable architecture comparisons, product positioning, design trade-offs, or long-lived constraints, and update/consolidate them instead of deleting them.
 
+GitHub write fallback: if the GitHub App returns HTTP 403 / `Resource not accessible by integration` while creating a pull request, do not keep retrying GitHub App write mutations in that task. Route all subsequent GitHub write operations through the workstation's already-authenticated `gh` CLI (`gh pr ...`, `gh issue ...`, and other write-capable `gh` commands). GitHub reads may continue through either available read surface. This fallback does not relax confirmation requirements for merges, releases, tags, deployments, or any other irreversible operation.
+
 Do not bump the Rust runtime version solely to ship an extension-only UI/DOM/browser-compatibility change. If the current release tooling cannot publish the extension independently, fix or add the extension release path instead of manufacturing a runtime patch release with no runtime change.
 
 ## Binary and runtime ownership
@@ -29,6 +31,18 @@ Do not bump the Rust runtime version solely to ship an extension-only UI/DOM/bro
 7. Rollback must reactivate a previously installed managed generation using recorded service state. Do not rebuild a binary as part of rollback.
 8. Keep credentials out of source, Git history, CLI diagnostics, AGENTS.md, and non-secret state records. Preserve existing service credentials during generation changes.
 9. Any change to the installer, updater, CLI, release path, or service manager must preserve these ownership boundaries and include regression coverage for them.
+
+### Herdr 0.9 multi-machine control
+
+Herdr 0.9 saved SSH machines and herdr-mcp Edge devices may coexist for the same physical workstation, but they remain separate identity and transport namespaces.
+
+1. A Herdr saved machine is identified by the profile returned from `herdr machine list --json` (`id`, `target`, `session`, label/enabled state). SSH authentication remains owned by OpenSSH; do not copy SSH credentials into herdr-mcp state.
+2. An Edge workstation is identified by its immutable `dev_*` `device_id`, device credential, runtime generation, and device-bound `herdr_ref_*` values. Never infer equivalence from a hostname, display label, or a shared bare workspace/pane id.
+3. When both paths reach the same Herdr server/session, workspace, pane, agent, PTY, Git, and filesystem state are shared live state. If the saved machine points at another Herdr session, that Herdr session state is independent even on the same physical host.
+4. Herdr 0.9 TUI machine selection is not a programmatic routing selector. Ordinary `herdr pane ...` / `herdr workspace ...` CLI calls still address the CLI's local/current server, and `herdr --remote <target>` is a default TUI attach flow rather than a modifier that can be composed with pane/workspace subcommands.
+5. Until upstream provides machine-scoped CLI/socket addressing, the explicit maintenance/UAT bridge is: resolve the saved profile → preserve its SSH target and Herdr session → execute the Herdr CLI on that remote server → re-read that server's workspace/pane ids before mutation. Do not cache a bare `w1:p1` across machines.
+6. ChatGPT/Web-AI workstation work defaults to the Edge route when an enrolled device is available. SSH/Herdr-machine control is explicit maintenance, UAT, bootstrap, or recovery transport; it is never a transparent fallback for an Edge mutation. A failed Edge mutation may cross transports only after delivery evidence proves it was not delivered, or after live state proves it was not applied.
+7. Track the current upstream behavior against Herdr issue `herdrdev/herdr#3732` (cross-machine workspace-id ambiguity) and Discussion `herdrdev/herdr#515` (multi-machine control). If Herdr later exposes native machine-scoped pane/workspace APIs, prefer the native path after capability/schema verification, but keep machine profiles and Edge `device_id`s as separate identities.
 
 ### Validation ownership and test selection
 

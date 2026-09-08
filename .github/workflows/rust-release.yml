@@ -12,6 +12,9 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -31,6 +34,8 @@ jobs:
           node scripts/validate-release-notes.mjs "$release_tag"
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: Configure Rust compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Authoritative release gate
         run: scripts/release-gate.sh full
 
@@ -57,16 +62,34 @@ jobs:
       matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Linux musl build prerequisites
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils musl-tools
       - name: Install pinned Rust toolchain
         shell: bash
         run: rustup toolchain install 1.97.1 --profile minimal --target "${{ matrix.target }}"
+      - name: Configure Rust compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Build release binary
         shell: bash
         env:
           HERDR_MCP_BUILD_COMMIT: ${{ github.sha }}
-        run: cargo build --locked --release -p herdr-mcp --target "${{ matrix.target }}"
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          fi
+          cargo build --locked --release -p herdr-mcp --target "${{ matrix.target }}"
       - name: Stage raw release asset
         shell: bash
         run: |
@@ -78,6 +101,19 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/herdr-mcp" "release-assets/herdr-mcp-${VERSION}-${{ matrix.target }}"
             chmod 755 "release-assets/herdr-mcp-${VERSION}-${{ matrix.target }}"
+          fi
+      - name: Smoke Linux release portability
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(awk -F'\"' '/^version = / { print $2; exit }' crates/herdr-mcp/Cargo.toml)"
+          asset="release-assets/herdr-mcp-${VERSION}-${{ matrix.target }}"
+          test -x "$asset"
+          "$asset" --version
+          if readelf -l "$asset" | grep -q 'Requesting program interpreter'; then
+            echo "Linux release artifact unexpectedly requires a dynamic program interpreter" >&2
+            exit 1
           fi
       - uses: actions/upload-artifact@v4
         with:

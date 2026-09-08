@@ -131,10 +131,14 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.ok(approvalCode, "approval page should expose the one-time six-digit code");
   assert.ok(html.includes(`herdr-mcp connector approve ${requestId}`));
   assert.match(html, /id="copy-command"/);
+  assert.match(html, /id="continue-link"/);
+  assert.match(html, /Continue to ChatGPT/);
+  assert.match(html, /window\.location\.assign\(approvedRedirect\)/);
   assert.match(html, /navigator\.clipboard/);
   assert.match(html, /document\.execCommand\('copy'\)/);
   assert.match(html, /Requires herdr-mcp v0\.4\.6 or newer\./);
   assert.match(html, /visible CLI prompt/);
+  assert.match(html, /do not refresh it while approval is pending/);
   assert.doesNotMatch(html, /no-echo prompt/);
   assert.match(html, /unknown command 'connector'/);
   assert.match(html, /computer that is already enrolled in this Worker/);
@@ -142,7 +146,7 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.doesNotMatch(html, /another Herdr WebChat/);
   assert.match(resp.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
   assert.match(resp.headers.get("content-security-policy") ?? "", /style-src 'unsafe-inline'/);
-  assert.match(resp.headers.get("content-security-policy") ?? "", /script-src 'unsafe-inline'/);
+  assert.match(resp.headers.get("content-security-policy") ?? "", /script-src 'self' 'unsafe-inline'/);
   assert.equal(resp.headers.get("x-frame-options"), "DENY");
   return { requestId, resumeToken, approvalCode, verifier, challenge, state };
 }
@@ -167,8 +171,9 @@ async function approvePending(opts, pending, approver = "device:dev_owner") {
 }
 
 /** Authorize for a client through the explicit fleet-approval flow. */
+let authSequence = 0;
 async function makeAuthCode(opts, client_id, redirect_uri = "https://app.example/cb") {
-  const pending = await pendingAuthorization(opts, client_id, redirect_uri);
+  const pending = await pendingAuthorization(opts, client_id, redirect_uri, `auth-${++authSequence}`);
   const approved = await approvePending(opts, pending);
   return { code: approved.code, verifier: pending.verifier };
 }
@@ -202,7 +207,7 @@ async function doVerifier(opts) {
 
 test("OPTIONS on any owned path returns 204 with exact CORS headers", async () => {
   const opts = makeOptions();
-  for (const path of ["/.well-known/oauth-authorization-server", "/oauth/register", "/oauth/token", "/.well-known/mcp.json"]) {
+  for (const path of ["/.well-known/oauth-authorization-server", "/oauth/register", "/oauth/token", "/oauth/revoke", "/.well-known/mcp.json"]) {
     const resp = await handleOAuthPublic(new Request(`https://x.example${path}`, { method: "OPTIONS" }), opts);
     assert.equal(resp.status, 204);
     assert.equal(resp.headers.get("access-control-allow-origin"), "*");
@@ -251,8 +256,10 @@ test("metadata document is RFC8414 OAuth (no OIDC-only claims)", async () => {
   const doc = await (await GET("/.well-known/openid-configuration", opts)).json();
   assert.equal(doc.issuer, ISSUER);
   assert.equal(doc.token_endpoint, `${ISSUER}/oauth/token`);
+  assert.equal(doc.revocation_endpoint, `${ISSUER}/oauth/revoke`);
   assert.deepEqual(doc.scopes_supported, ["mcp"]);
   assert.deepEqual(doc.token_endpoint_auth_methods_supported, ["none", "private_key_jwt", "client_secret_post"]);
+  assert.deepEqual(doc.revocation_endpoint_auth_methods_supported, ["none", "private_key_jwt", "client_secret_post"]);
   assert.equal(doc.authorization_response_iss_parameter_supported, true);
   assert.equal(doc.client_id_metadata_document_supported, true);
   assert.equal("userinfo_endpoint" in doc, false);
@@ -388,7 +395,7 @@ test("authorize: first use requires fleet approval, then issues RFC9207 one-use 
   assert.equal((await replay.json()).error, "invalid_grant");
 });
 
-test("authorize: identical pending retry renders safe recovery page instead of JSON", async () => {
+test("authorize: identical pending retry gets an independently pollable page and shares only the exact attempt", async () => {
   const opts = makeOptions();
   const { client_id } = await registerClient(opts, {
     token_endpoint_auth_method: "none",
@@ -409,19 +416,32 @@ test("authorize: identical pending retry renders safe recovery page instead of J
   assert.match(retry.headers.get("content-type") ?? "", /^text\/html/);
   assert.equal(retry.headers.get("cache-control"), "no-store");
   assert.match(retry.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
-  assert.ok(Number(retry.headers.get("retry-after")) > 0);
+  assert.match(retry.headers.get("content-security-policy") ?? "", /script-src 'self' 'unsafe-inline'/);
+  assert.match(retry.headers.get("content-security-policy") ?? "", /connect-src 'self'/);
   const html = await retry.text();
-  assert.match(html, /Approval already pending/);
-  assert.match(html, /Use the original approval page if it is still open/);
-  assert.match(html, /retry automatically after the old request expires/);
-  assert.ok(html.includes(pending.requestId));
-  assert.match(html, /location\.reload\(\)/);
-  assert.doesNotMatch(html, /class="approval-code"/);
-  assert.doesNotMatch(html, /const resumeToken=/);
-  assert.doesNotMatch(html, /authorization_pending/);
+  const retryRequestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const retryResumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  assert.ok(retryRequestId);
+  assert.ok(retryResumeToken);
+  assert.notEqual(retryRequestId, pending.requestId, "retry owns a distinct resumable request");
+  assert.match(html, /class="approval-code"/);
+  assert.match(html, /Continue to ChatGPT/);
 
   const approvals = await opts.store.getApproval(pending.requestId, NOW_MS);
   assert.ok(approvals, "the original pending approval must remain authoritative");
+
+  await opts.store.approveApproval(
+    pending.requestId,
+    await hashOAuthApprovalCode(APPROVAL_SECRET, pending.requestId, pending.approvalCode),
+    "device:owner",
+    NOW_MS,
+  );
+  const retryPoll = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: retryRequestId,
+    resume_token: retryResumeToken,
+  })}`, opts);
+  assert.equal(retryPoll.status, 200, "approving either exact-attempt page completes its sibling without a second approval");
+  assert.equal((await retryPoll.json()).status, "approved");
 });
 
 test("authorize: unknown client returns 400 JSON, no redirect", async () => {
@@ -431,6 +451,36 @@ test("authorize: unknown client returns 400 JSON, no redirect", async () => {
   assert.equal(resp.status, 400);
   assert.equal((await resp.json()).error, "invalid_request");
   assert.equal(resp.headers.get("location"), null);
+});
+
+test("authorize: ChatGPT bare issuer fails before approval and points to /mcp", async () => {
+  const opts = makeOptions();
+  const client_id = "https://chatgpt.com/oauth/client.json";
+  const redirect_uri = "https://chatgpt.com/connector_platform_oauth_redirect";
+  const verifier = "E".repeat(43) + "zZ-._";
+  const challenge = await s256Challenge(verifier);
+  const before = await opts.store.listConnectors();
+  const qs = new URLSearchParams({
+    client_id,
+    redirect_uri,
+    response_type: "code",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    state: "wrong-mcp-endpoint",
+    resource: ISSUER,
+  });
+
+  const resp = await GET(`/oauth/authorize?${qs}`, opts);
+  assert.equal(resp.status, 400);
+  assert.match(resp.headers.get("content-type") ?? "", /^text\/html/);
+  assert.equal(resp.headers.get("location"), null);
+  assert.equal(resp.headers.get("cache-control"), "no-store");
+  const html = await resp.text();
+  assert.match(html, /Check the MCP server URL/);
+  assert.match(html, /missing the MCP endpoint path/);
+  assert.match(html, new RegExp(`${ISSUER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\/mcp`));
+  assert.doesNotMatch(html, /approval-code/);
+  assert.deepEqual(await opts.store.listConnectors(), before, "wrong endpoint must not create a Connector grant");
 });
 
 test("authorize: unregistered redirect_uri is rejected (no redirect)", async () => {
@@ -959,7 +1009,121 @@ test("refresh_token: wrong client for an active refresh is rejected", async () =
 });
 
 // ---------------------------------------------------------------------------
-// 10. ChatGPT CIMD private_key_jwt (real RS256, injected JWKS fetch)
+// 10. RFC 7009 Connector-instance revocation
+// ---------------------------------------------------------------------------
+
+test("revoke endpoint retires only the Connector owning the presented refresh token", async () => {
+  const opts = makeOptions();
+  const { client_id } = await registerClient(opts, { token_endpoint_auth_method: "none" });
+
+  const firstAuth = await makeAuthCode(opts, client_id);
+  const firstToken = await POST("/oauth/token", tokenBody(client_id, firstAuth.code, firstAuth.verifier), opts);
+  assert.equal(firstToken.status, 200);
+  const firstPair = await firstToken.json();
+  const firstConnector = (await opts.store.listConnectors()).find((c) => c.status === "active");
+  assert.ok(firstConnector);
+
+  const missingClient = await POST(
+    "/oauth/revoke",
+    { token: firstPair.refresh_token, token_type_hint: "refresh_token" },
+    opts,
+    { form: true },
+  );
+  assert.equal(missingClient.status, 400);
+  assert.equal((await missingClient.json()).error, "invalid_request");
+  assert.equal((await opts.store.getConnector(firstConnector.connector_id)).status, "active");
+
+  const secondAuth = await makeAuthCode(opts, client_id);
+  const secondToken = await POST("/oauth/token", tokenBody(client_id, secondAuth.code, secondAuth.verifier), opts);
+  assert.equal(secondToken.status, 200);
+  const secondPair = await secondToken.json();
+  const activeBefore = (await opts.store.listConnectors()).filter((c) => c.status === "active");
+  assert.equal(activeBefore.length, 2);
+  const secondConnector = activeBefore.find((c) => c.connector_id !== firstConnector.connector_id);
+  assert.ok(secondConnector);
+
+  const other = await registerClient(opts, { token_endpoint_auth_method: "none" });
+  const wrongOwner = await POST(
+    "/oauth/revoke",
+    { token: firstPair.refresh_token, token_type_hint: "refresh_token", client_id: other.client_id },
+    opts,
+    { form: true },
+  );
+  assert.equal(wrongOwner.status, 200);
+  assert.deepEqual(await wrongOwner.json(), {});
+  assert.equal((await opts.store.getConnector(firstConnector.connector_id)).status, "active");
+
+  const revoked = await POST(
+    "/oauth/revoke",
+    { token: firstPair.refresh_token, token_type_hint: "refresh_token", client_id },
+    opts,
+    { form: true },
+  );
+  assert.equal(revoked.status, 200);
+  assert.equal(revoked.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await revoked.json(), {});
+
+  assert.equal((await opts.store.getConnector(firstConnector.connector_id)).status, "revoked");
+  assert.equal((await opts.store.getConnector(secondConnector.connector_id)).status, "active");
+
+  const oldRefresh = await POST(
+    "/oauth/token",
+    { grant_type: "refresh_token", refresh_token: firstPair.refresh_token, client_id, resource: IDENTITY.resource },
+    opts,
+  );
+  assert.equal(oldRefresh.status, 400);
+  assert.equal((await oldRefresh.json()).error, "invalid_grant");
+
+  const siblingRefresh = await POST(
+    "/oauth/token",
+    { grant_type: "refresh_token", refresh_token: secondPair.refresh_token, client_id, resource: IDENTITY.resource },
+    opts,
+  );
+  assert.equal(siblingRefresh.status, 200);
+
+  const unknown = await POST(
+    "/oauth/revoke",
+    { token: "unknown-token-that-does-not-exist", client_id },
+    opts,
+    { form: true },
+  );
+  assert.equal(unknown.status, 200);
+  assert.deepEqual(await unknown.json(), {});
+  assert.equal((await opts.store.getConnector(secondConnector.connector_id)).status, "active");
+});
+
+test("revoke endpoint authenticates confidential clients before token retirement", async () => {
+  const opts = makeOptions();
+  const { client_id, client_secret } = await registerClient(opts);
+  const { code, verifier } = await makeAuthCode(opts, client_id);
+  const issued = await POST("/oauth/token", tokenBody(client_id, code, verifier, { client_secret }), opts);
+  assert.equal(issued.status, 200);
+  const pair = await issued.json();
+  const connector = (await opts.store.listConnectors()).find((c) => c.status === "active");
+  assert.ok(connector);
+
+  const missingSecret = await POST(
+    "/oauth/revoke",
+    { token: pair.refresh_token, client_id },
+    opts,
+    { form: true },
+  );
+  assert.equal(missingSecret.status, 401);
+  assert.equal((await missingSecret.json()).error, "invalid_client");
+  assert.equal((await opts.store.getConnector(connector.connector_id)).status, "active");
+
+  const revoked = await POST(
+    "/oauth/revoke",
+    { token: pair.refresh_token, client_id, client_secret },
+    opts,
+    { form: true },
+  );
+  assert.equal(revoked.status, 200);
+  assert.equal((await opts.store.getConnector(connector.connector_id)).status, "revoked");
+});
+
+// ---------------------------------------------------------------------------
+// 11. ChatGPT CIMD private_key_jwt (real RS256, injected JWKS fetch)
 // ---------------------------------------------------------------------------
 
 async function generateJwk(kid) {
@@ -1011,6 +1175,50 @@ test("token: ChatGPT CIMD private_key_jwt verified via injected fetch; no global
   assert.equal(resp.status, 200);
   assert.ok((await resp.json()).access_token);
   assert.equal(fetched, 1, "JWKS fetched exactly once via injected fetchFn");
+});
+
+test("revoke: ChatGPT private_key_jwt accepts the revocation endpoint audience", async () => {
+  const kid = "cimd-revoke-key";
+  const { jwk, privateKey } = await generateJwk(kid);
+  let fetched = 0;
+  const fetchFn = async (url) => {
+    fetched++;
+    assert.ok(String(url).endsWith("/oauth/jwks.json"), `jwks url: ${url}`);
+    return new Response(JSON.stringify({ keys: [jwk] }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const cimd = "https://chatgpt.com/oauth/client.json";
+  const opts = makeOptions({ fetchFn });
+  const { code, verifier } = await makeAuthCode(opts, cimd, "https://chatgpt.com/connector_platform_oauth_redirect");
+  const tokenAssertion = await signAssertion(
+    { iss: cimd, aud: `${ISSUER}/oauth/token`, sub: cimd, iat: NOW_SEC, exp: NOW_SEC + 300 },
+    privateKey, kid,
+  );
+  const issued = await POST("/oauth/token", cimdAssertionBody(cimd, tokenAssertion, { code, code_verifier: verifier }), opts);
+  assert.equal(issued.status, 200);
+  const pair = await issued.json();
+  const connector = (await opts.store.listConnectors()).find((c) => c.status === "active");
+  assert.ok(connector);
+
+  const revokeAssertion = await signAssertion(
+    { iss: cimd, aud: `${ISSUER}/oauth/revoke`, sub: cimd, iat: NOW_SEC, exp: NOW_SEC + 300 },
+    privateKey, kid,
+  );
+  const revoked = await POST(
+    "/oauth/revoke",
+    {
+      token: pair.refresh_token,
+      token_type_hint: "refresh_token",
+      client_id: cimd,
+      client_assertion: revokeAssertion,
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    },
+    opts,
+    { form: true },
+  );
+  assert.equal(revoked.status, 200);
+  assert.deepEqual(await revoked.json(), {});
+  assert.equal((await opts.store.getConnector(connector.connector_id)).status, "revoked");
+  assert.equal(fetched, 2, "token and revocation assertions each verify against ChatGPT JWKS");
 });
 
 test("token: CIMD assertion failure maps to invalid_client", async () => {
@@ -1117,4 +1325,210 @@ test("non-owned routes return null", async () => {
     const resp = await handleOAuthPublic(new Request(`https://x.example${path}`, { method }), opts);
     assert.equal(resp, null, `expected null for ${method} ${path}`);
   }
+});
+test("regression: exact authorize retry after approval reuses only that request-bound approval", async () => {
+  const opts = makeOptions();
+  const { client_id, client_secret } = await registerClient(opts);
+
+  // 1. First authorization attempt starts
+  const pending1 = await pendingAuthorization(opts, client_id);
+
+  // 2. Owner approves request A
+  const approved = await opts.store.approveApproval(
+    pending1.requestId,
+    await hashOAuthApprovalCode(APPROVAL_SECRET, pending1.requestId, pending1.approvalCode),
+    "device:owner",
+    NOW_MS,
+  );
+  assert.equal(approved.ok, true, "approval of first request succeeds");
+
+  // Verify connectors count is exactly 1
+  let connectors = await opts.store.listConnectors();
+  assert.equal(connectors.length, 1);
+  const connectorId = connectors[0].connector_id;
+
+  // 3. Browser retries the exact same authorization attempt after owner approval.
+  const verifier2 = pending1.verifier;
+  const challenge2 = pending1.challenge;
+  const retryQs = new URLSearchParams({
+    client_id,
+    redirect_uri: "https://app.example/cb",
+    response_type: "code",
+    code_challenge: challenge2,
+    code_challenge_method: "S256",
+    state: pending1.state,
+  });
+  const retryResp = await GET(`/oauth/authorize?${retryQs}`, opts);
+  assert.equal(retryResp.status, 200, "retry receives its own resumable completion page");
+  const retryHtml = await retryResp.text();
+  const retryRequestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(retryHtml)?.[1];
+  const retryResumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(retryHtml)?.[1];
+  assert.ok(retryRequestId);
+  assert.ok(retryResumeToken);
+  const retryPoll = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: retryRequestId,
+    resume_token: retryResumeToken,
+  })}`, opts);
+  assert.equal(retryPoll.status, 200, "exact retry is already approved without a second owner action");
+  const redirectLoc = new URL((await retryPoll.json()).redirect);
+  assert.equal(redirectLoc.searchParams.get("state"), pending1.state);
+  const code2 = redirectLoc.searchParams.get("code");
+  assert.ok(code2);
+
+  // connectors count must STILL be 1 (no duplicate conn_* created!)
+  connectors = await opts.store.listConnectors();
+  assert.equal(connectors.length, 1, "no duplicate logical connector created on retry");
+  assert.equal(connectors[0].connector_id, connectorId);
+
+  // 4. Token exchange with code2 succeeds
+  const tokenResp2 = await POST("/oauth/token", tokenBody(client_id, code2, verifier2, { client_secret }), opts);
+  assert.equal(tokenResp2.status, 200, "token exchange for retried authorization code succeeds");
+  const tokens2 = await tokenResp2.json();
+  assert.ok(tokens2.access_token);
+  assert.ok(tokens2.refresh_token);
+
+  // 5. Original browser poll (request 1) remains safe/replayable until expiry
+  const poll1 = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: pending1.requestId,
+    resume_token: pending1.resumeToken,
+  })}`, opts);
+  assert.equal(poll1.status, 200);
+  const poll1Body = await poll1.json();
+  assert.equal(poll1Body.status, "approved");
+  const code1 = new URL(poll1Body.redirect).searchParams.get("code");
+  assert.ok(code1);
+
+  // 6. Token exchange for code1 also exchanges into the same connector, and invalidates old refresh tokens
+  const tokenResp1 = await POST("/oauth/token", tokenBody(client_id, code1, pending1.verifier, { client_secret }), opts);
+  assert.equal(tokenResp1.status, 200);
+  const tokens1 = await tokenResp1.json();
+  assert.ok(tokens1.refresh_token);
+
+  // The older refresh token (tokens2.refresh_token) should now be fenced/invalidated, while tokens1 is active
+  const oldRefreshHash = await hashOpaqueToken(tokens2.refresh_token);
+  const newRefreshHash = await hashOpaqueToken(tokens1.refresh_token);
+  const oldRefreshCheck = await opts.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: oldRefreshHash, now_sec: NOW_SEC + 5 }),
+  }));
+  assert.equal(oldRefreshCheck.status, 404, "prior refresh token is invalidated when new token pair is issued for connector");
+
+  const newRefreshCheck = await opts.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: newRefreshHash, now_sec: NOW_SEC + 5 }),
+  }));
+  assert.equal(newRefreshCheck.status, 200, "latest refresh token remains valid");
+
+  // 7. Revoke fences it
+  assert.equal(await opts.store.revokeConnector(connectorId, "device:owner", NOW_MS + 10_000), true);
+  const afterRevokeCheck = await opts.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: newRefreshHash, now_sec: NOW_SEC + 15 }),
+  }));
+  assert.equal(afterRevokeCheck.status, 404, "revocation fences refresh token");
+});
+
+test("regression: distinct state/PKCE requests sharing a public client_id require independent owner approvals", async () => {
+  const opts = makeOptions();
+  const { client_id, client_secret } = await registerClient(opts);
+
+  // 1. First authorization attempt creates request A
+  const pendingA = await pendingAuthorization(opts, client_id, "https://app.example/cb", "state-A");
+
+  // 2. BEFORE owner approval, user reloads/retries creating request B with distinct state and PKCE
+  const verifierB = "G".repeat(43) + "bB-._";
+  const challengeB = await s256Challenge(verifierB);
+  const qsB = new URLSearchParams({
+    client_id,
+    redirect_uri: "https://app.example/cb",
+    response_type: "code",
+    code_challenge: challengeB,
+    code_challenge_method: "S256",
+    state: "state-B",
+  });
+  const respB = await GET(`/oauth/authorize?${qsB}`, opts);
+  assert.equal(respB.status, 200, "unapproved retry B gets its own approval page");
+  const htmlB = await respB.text();
+  const requestIdB = /const requestId="([A-Za-z0-9_-]+)";/.exec(htmlB)?.[1];
+  const resumeTokenB = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(htmlB)?.[1];
+  const approvalCodeB = /<div class="approval-code">(\d{6})<\/div>/.exec(htmlB)?.[1];
+  assert.ok(requestIdB);
+  assert.ok(resumeTokenB);
+  assert.notEqual(requestIdB, pendingA.requestId, "B has its own request id");
+  const storedBBeforeA = await opts.store.getApproval(requestIdB, NOW_MS);
+  assert.equal(storedBBeforeA?.status, "pending", "B is independently pending before A approval");
+
+  // 3. Owner approves ONLY request A
+  const approvedA = await opts.store.approveApproval(
+    pendingA.requestId,
+    await hashOAuthApprovalCode(APPROVAL_SECRET, pendingA.requestId, pendingA.approvalCode),
+    "device:owner",
+    NOW_MS,
+  );
+  assert.equal(approvedA.ok, true, "owner approval of A succeeds");
+  const storedBAfterA = await opts.store.getApproval(requestIdB, NOW_MS);
+  assert.equal(storedBAfterA?.status, "pending", "A approval must not consume, delete, or approve B");
+
+  // Only A exists after approving A.
+  let connectors = await opts.store.listConnectors();
+  assert.equal(connectors.length, 1, "only A's logical connector exists");
+  const connectorIdA = connectors[0].connector_id;
+
+  // 4. B remains pending: shared client_id is application identity, not account identity.
+  const pollB = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: requestIdB,
+    resume_token: resumeTokenB,
+  })}`, opts);
+  assert.equal(pollB.status, 202, "B is not authorized by A's approval");
+  assert.equal((await pollB.json()).status, "pending");
+
+  // B receives its own owner approval and then completes using its own state/PKCE.
+  const approvedB = await opts.store.approveApproval(
+    requestIdB,
+    await hashOAuthApprovalCode(APPROVAL_SECRET, requestIdB, approvalCodeB),
+    "device:owner",
+    NOW_MS + 1,
+  );
+  assert.equal(approvedB.ok, true);
+  const completedB = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: requestIdB,
+    resume_token: resumeTokenB,
+  })}`, opts);
+  assert.equal(completedB.status, 200);
+  const pollBBody = await completedB.json();
+  assert.equal(pollBBody.status, "approved");
+  const locB = new URL(pollBBody.redirect);
+  assert.equal(locB.searchParams.get("state"), "state-B", "B redirect is bound to B's own state");
+  const codeB = locB.searchParams.get("code");
+  assert.ok(codeB, "B redirect carries its own authorization code");
+
+  // Also verify A's poll completes bound to state-A
+  const pollA = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: pendingA.requestId,
+    resume_token: pendingA.resumeToken,
+  })}`, opts);
+  assert.equal(pollA.status, 200);
+  const pollABody = await pollA.json();
+  assert.equal(pollABody.status, "approved");
+  const locA = new URL(pollABody.redirect);
+  assert.equal(locA.searchParams.get("state"), "state-A", "A redirect is bound to A's own state");
+  const codeA = locA.searchParams.get("code");
+  assert.ok(codeA);
+  assert.notEqual(codeA, codeB, "A and B receive distinct authorization codes");
+
+  // Distinct authorization attempts have distinct Connector identities.
+  connectors = await opts.store.listConnectors();
+  assert.equal(connectors.length, 2);
+  assert.ok(connectors.some((connector) => connector.connector_id === connectorIdA));
+  assert.equal(new Set(connectors.map((connector) => connector.connector_id)).size, 2);
+
+  // 5. Token exchange for B succeeds using B's own code and PKCE verifier
+  const tokenRespB = await POST("/oauth/token", tokenBody(client_id, codeB, verifierB, { client_secret }), opts);
+  assert.equal(tokenRespB.status, 200, "token exchange for B succeeds");
+  const tokensB = await tokenRespB.json();
+  assert.ok(tokensB.access_token);
+  assert.ok(tokensB.refresh_token);
 });

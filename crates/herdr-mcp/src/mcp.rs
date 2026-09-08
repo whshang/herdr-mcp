@@ -311,7 +311,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         }
         "herdr_exec_read" => exec_tools::read(context.exec, &arguments),
         "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
-        "herdr_exec" => utility_exec::run(context.client, &context.cache.snapshot(), &arguments),
+        "herdr_exec" => utility_exec::run_durable(
+            context.client,
+            &context.cache.snapshot(),
+            context.exec,
+            &arguments,
+        ),
         "herdr_prompt" => prompt::run(context.client, context.prompt, &arguments),
         "herdr_skill" => context
             .skill

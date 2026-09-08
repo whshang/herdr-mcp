@@ -92,12 +92,16 @@ export interface OAuthConnectorRecord {
 export interface OAuthConnectorGrantRecord {
   client_id: string;
   status: "active" | "revoked";
+  /** Explicit client-wide kill switch. Missing on older records for compatibility. */
+  revocation_scope?: "client";
   can_approve_connectors?: boolean;
   webchat_control?: OAuthWebChatControlGrant[];
   page_assist?: OAuthPageAssistGrant[];
   principal_type?: "connector" | "automation";
   resource?: string;
   scope?: string;
+  connector_id?: string;
+  grant_generation?: number;
   /** Bound device_id for automation grants; validated as canonical dev_<26-char> ULID. */
   device_id?: string;
   device_name?: string;
@@ -376,14 +380,24 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
     if (!deviceId) return null;
     if (deviceName === undefined) return null;
   }
+  const connectorId = typeof value.connector_id === "string" && /^conn_[A-Za-z0-9_-]{8,128}$/.test(value.connector_id)
+    ? value.connector_id
+    : undefined;
+  const grantGeneration = Number.isSafeInteger(value.grant_generation) && (value.grant_generation as number) > 0
+    ? value.grant_generation as number
+    : undefined;
   const revokedAt = finiteEpoch(value.revoked_at_ms) ? value.revoked_at_ms as number : undefined;
   const revokedBy = typeof value.revoked_by === "string" && value.revoked_by.length <= 4096 ? value.revoked_by : undefined;
+  const revocationScope = value.revocation_scope === "client" ? "client" as const : undefined;
   return {
     client_id: value.client_id,
     status: value.status,
+    ...(revocationScope !== undefined ? { revocation_scope: revocationScope } : {}),
     can_approve_connectors: canApproveConnectors,
     webchat_control: webchatControl,
     page_assist: pageAssist,
+    ...(connectorId !== undefined ? { connector_id: connectorId } : {}),
+    ...(grantGeneration !== undefined ? { grant_generation: grantGeneration } : {}),
     ...(principalType !== undefined ? { principal_type: principalType } : {}),
     ...(resource !== undefined ? { resource } : {}),
     ...(scope !== undefined ? { scope } : {}),
@@ -512,12 +526,14 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/put") return this.putApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/get") return this.getApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/approve") return this.approveApproval(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/approval/cancel") return this.cancelApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/consume") return this.consumeApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/webchat-control") return this.setWebChatControlGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/page-assist") return this.setPageAssistGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/connector/find-active") return this.findActiveConnectorByClient(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/list") return this.listConnectors();
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/inventory") return this.connectorInventory();
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/revoke") return this.revokeConnector(request);
@@ -529,6 +545,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/signing/ensure") return this.signingPublicKey();
     if (request.method === "POST" && url.pathname === "/internal/oauth/access/verify") return this.verifyAccess(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/token/issue") return this.issuePair(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/token/revoke") return this.revokePresentedToken(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/refresh/exchange") return this.exchangeRefresh(request);
     return json({ ok: false, code: "not_found" }, 404);
   }
@@ -681,27 +698,48 @@ export class OAuthStoreDO {
     let clientPending = 0;
     for (const [existingKey, raw] of rows) {
       if (!record(raw) || !finiteEpoch(raw.expires_at_ms) || raw.expires_at_ms <= nowMs) {
+        const connectorId = record(raw) && boundedString(raw.connector_id, 256) ? raw.connector_id : undefined;
+        if (connectorId) {
+          const connector = normalizeConnector(
+            await this.state.storage.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + connectorId),
+          );
+          if (connector?.token_issue_count === 0) {
+            await this.state.storage.delete(CONNECTOR_PREFIX + connectorId);
+          }
+        }
         await this.state.storage.delete(existingKey);
         continue;
       }
-      if (raw.status !== "pending" && raw.status !== "locked") continue;
-      totalPending += 1;
-      if (raw.client_id === normalized.client_id) clientPending += 1;
-      if (
-        raw.status === "pending" &&
+      const sameAuthorizationAttempt =
         raw.client_id === normalized.client_id &&
         raw.redirect_uri === normalized.redirect_uri &&
         raw.code_challenge === normalized.code_challenge &&
         raw.resource === normalized.resource &&
         raw.scope === normalized.scope &&
-        raw.state === normalized.state
-      ) {
-        return json({
-          ok: false,
-          code: "duplicate_pending",
-          existing_request_id: existingKey.slice(APPROVAL_PREFIX.length),
-          expires_at_ms: raw.expires_at_ms,
-        }, 409);
+        raw.state === normalized.state &&
+        (raw.auth_source ?? "legacy") === (normalized.auth_source ?? "legacy");
+      if (sameAuthorizationAttempt && boundedString(raw.connector_id, 256)) {
+        // A retry of the exact same OAuth request gets its own resume token/page,
+        // but may share the request-bound Connector identity. Never reuse an
+        // identity merely because a public client_id matches: ChatGPT shares
+        // one application client_id across user accounts.
+        normalized.connector_id = raw.connector_id;
+        if (
+          raw.status === "approved" &&
+          finiteEpoch(raw.approved_at_ms) &&
+          boundedString(raw.approved_by, 4096)
+        ) {
+          normalized.status = "approved";
+          normalized.approved_at_ms = raw.approved_at_ms;
+          normalized.approved_by = raw.approved_by;
+          await this.state.storage.put(key, normalized);
+          return json({ ok: true, reused_approval: true });
+        }
+      }
+      if (raw.status !== "pending" && raw.status !== "locked") continue;
+      totalPending += 1;
+      if (raw.client_id === normalized.client_id) {
+        clientPending += 1;
       }
     }
     if (clientPending >= MAX_ACTIVE_PENDING_PER_CLIENT) {
@@ -724,6 +762,14 @@ export class OAuthStoreDO {
     const current = await this.state.storage.get<OAuthApprovalRecord>(key);
     if (!current) return json({ ok: false, code: "not_found" }, 404);
     if (current.expires_at_ms <= nowMs) {
+      if (current.connector_id) {
+        const connector = normalizeConnector(
+          await this.state.storage.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + current.connector_id),
+        );
+        if (connector?.token_issue_count === 0) {
+          await this.state.storage.delete(CONNECTOR_PREFIX + current.connector_id);
+        }
+      }
       await this.state.storage.delete(key);
       return json({ ok: false, code: "expired" }, 404);
     }
@@ -745,6 +791,14 @@ export class OAuthStoreDO {
       const current = await txn.get<OAuthApprovalRecord>(key);
       if (!current) return;
       if (current.expires_at_ms <= nowMs) {
+        if (current.connector_id) {
+          const connector = normalizeConnector(
+            await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + current.connector_id),
+          );
+          if (connector?.token_issue_count === 0) {
+            await txn.delete(CONNECTOR_PREFIX + current.connector_id);
+          }
+        }
         await txn.delete(key);
         result = { ok: false, code: "expired" };
         return;
@@ -799,12 +853,45 @@ export class OAuthStoreDO {
         page_assist: previousBrowserAuthority?.page_assist ?? [],
         resource: current.resource,
         scope: current.scope,
+        connector_id: connectorId,
+        grant_generation: 1,
         approved_at_ms: nowMs,
         approved_by: approver,
+        token_issue_count: 0,
       };
       await txn.put(key, approved);
       await txn.put(CONNECTOR_PREFIX + connectorId, connector);
       await txn.put(GRANT_PREFIX + current.client_id, grant);
+
+      // Propagate approval to still-pending sibling approvals that share the same
+      // logical connector/client/redirect/resource/scope/auth_source context,
+      // preserving each sibling approval's own request-bound state, challenge, and resume hash.
+      const allApprovals = await txn.list<OAuthApprovalRecord>({ prefix: APPROVAL_PREFIX });
+      for (const [siblingKey, rawSibling] of allApprovals) {
+        if (siblingKey === key) continue;
+        const sibling = normalizeOAuthApproval(rawSibling, nowMs);
+        if (
+          sibling &&
+          sibling.status === "pending" &&
+          sibling.client_id === current.client_id &&
+          sibling.redirect_uri === current.redirect_uri &&
+          sibling.code_challenge === current.code_challenge &&
+          sibling.resource === current.resource &&
+          sibling.scope === current.scope &&
+          sibling.state === current.state &&
+          (sibling.auth_source ?? "legacy") === (current.auth_source ?? "legacy") &&
+          sibling.connector_id === connectorId
+        ) {
+          const siblingApproved: OAuthApprovalRecord = {
+            ...sibling,
+            connector_id: connectorId,
+            status: "approved",
+            approved_at_ms: nowMs,
+            approved_by: approver,
+          };
+          await txn.put(siblingKey, siblingApproved);
+        }
+      }
       result = { ok: true, record: approved };
     });
     if (!result.ok) {
@@ -814,6 +901,44 @@ export class OAuthStoreDO {
       return json({ ok: false, code: result.code }, status);
     }
     return json({ ok: true, record: result.record });
+  }
+
+  private async cancelApproval(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const requestId = body?.request_id;
+    if (!boundedString(requestId, 256)) return json({ ok: false, code: "bad_request" }, 400);
+    const key = APPROVAL_PREFIX + requestId;
+    let result: { ok: boolean; code?: string; connector_deleted?: boolean } = {
+      ok: false,
+      code: "not_found",
+    };
+    await this.state.storage.transaction(async (txn) => {
+      const current = await txn.get<OAuthApprovalRecord>(key);
+      if (!current) return;
+      let connectorDeleted = false;
+      if (current.connector_id) {
+        const connector = normalizeConnector(
+          await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + current.connector_id),
+        );
+        if (connector && (connector.token_issue_count ?? 0) > 0) {
+          result = { ok: false, code: "already_used" };
+          return;
+        }
+        if (connector) {
+          await txn.delete(CONNECTOR_PREFIX + current.connector_id);
+          connectorDeleted = true;
+        }
+      }
+      await txn.delete(key);
+      result = { ok: true, connector_deleted: connectorDeleted };
+    });
+    if (!result.ok) {
+      return json(
+        { ok: false, code: result.code },
+        result.code === "already_used" ? 409 : 404,
+      );
+    }
+    return json({ ok: true, connector_deleted: result.connector_deleted === true });
   }
 
   private async consumeApproval(request: Request): Promise<Response> {
@@ -828,6 +953,14 @@ export class OAuthStoreDO {
       const current = await txn.get<OAuthApprovalRecord>(key);
       if (!current) return;
       if (current.expires_at_ms <= nowMs) {
+        if (current.connector_id) {
+          const connector = normalizeConnector(
+            await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + current.connector_id),
+          );
+          if (connector?.token_issue_count === 0) {
+            await txn.delete(CONNECTOR_PREFIX + current.connector_id);
+          }
+        }
         await txn.delete(key);
         result = { ok: false, code: "expired" };
         return;
@@ -844,8 +977,15 @@ export class OAuthStoreDO {
         result = { ok: false, code: "locked" };
         return;
       }
-      await txn.delete(key);
-      result = { ok: true, record: current };
+      if (current.status === "approved") {
+        // Keep approved requests replayable by the same resume token until
+        // expiry. Multiple browser tabs may poll concurrently; deleting the
+        // record on the first successful poll lets a stale tab steal the
+        // completion from the visible tab.
+        result = { ok: true, record: current };
+        return;
+      }
+      result = { ok: false, code: "not_found" };
     });
     if (!result.ok) {
       const status = result.code === "pending" ? 202
@@ -862,11 +1002,30 @@ export class OAuthStoreDO {
     const clientId = body?.client_id;
     if (!boundedString(clientId, 4096)) return json({ ok: false, code: "bad_request" }, 400);
     const value = await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId);
-    if (!value) return json({ ok: false, code: "not_found" }, 404);
-    const normalized = normalizeConnectorGrant(value);
-    return normalized
-      ? json({ ok: true, record: normalized })
-      : json({ ok: false, code: "invalid_record" }, 500);
+    if (value) {
+      const grant = normalizeConnectorGrant(value);
+      return grant ? json({ ok: true, record: grant }) : json({ ok: false, code: "invalid_record" }, 500);
+    }
+    const connectors = await this.state.storage.list<OAuthConnectorRecord>({ prefix: CONNECTOR_PREFIX });
+    for (const raw of connectors.values()) {
+      const conn = normalizeConnector(raw);
+      if (conn && conn.client_id === clientId && conn.status === "active") {
+        const syntheticGrant: OAuthConnectorGrantRecord = {
+          client_id: clientId,
+          status: "active",
+          principal_type: "connector",
+          resource: conn.resource,
+          scope: conn.scope,
+          connector_id: conn.connector_id,
+          grant_generation: conn.grant_generation,
+          approved_at_ms: conn.approved_at_ms,
+          approved_by: conn.approved_by,
+          token_issue_count: conn.token_issue_count,
+        };
+        return json({ ok: true, record: syntheticGrant });
+      }
+    }
+    return json({ ok: false, code: "not_found" }, 404);
   }
 
   private async setWebChatControlGrant(request: Request): Promise<Response> {
@@ -1062,6 +1221,7 @@ export class OAuthStoreDO {
     const revoked: OAuthConnectorGrantRecord = {
       ...(current ?? { client_id: clientId }),
       status: "revoked",
+      revocation_scope: "client",
       revoked_at_ms: nowMs,
       revoked_by: revokedBy,
     };
@@ -1092,6 +1252,20 @@ export class OAuthStoreDO {
         client_name: client?.client_name ?? null,
       },
     });
+  }
+
+  private async findActiveConnectorByClient(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    if (!boundedString(clientId, 4096)) return json({ ok: false, code: "bad_request" }, 400);
+    const rows = await this.state.storage.list<OAuthConnectorRecord>({ prefix: CONNECTOR_PREFIX });
+    for (const raw of rows.values()) {
+      const connector = normalizeConnector(raw);
+      if (connector && connector.client_id === clientId && connector.status === "active") {
+        return json({ ok: true, connector });
+      }
+    }
+    return json({ ok: false, code: "not_found" }, 404);
   }
 
   private async listConnectors(): Promise<Response> {
@@ -1156,16 +1330,32 @@ export class OAuthStoreDO {
     }
     connectors.sort((a, b) => Number(b.approved_at_ms ?? 0) - Number(a.approved_at_ms ?? 0));
 
+    const attributedAccessByClient = new Map<string, number>();
+    const attributedRefreshByClient = new Map<string, number>();
+    for (const connector of connectors) {
+      const clientId = String(connector.client_id ?? "");
+      if (!clientId) continue;
+      attributedAccessByClient.set(
+        clientId,
+        (attributedAccessByClient.get(clientId) ?? 0) + Number(connector.active_access_tokens ?? 0),
+      );
+      attributedRefreshByClient.set(
+        clientId,
+        (attributedRefreshByClient.get(clientId) ?? 0) + Number(connector.active_refresh_tokens ?? 0),
+      );
+    }
+
     const legacyClients: Array<Record<string, unknown>> = [];
+    const listedLegacyClients = new Set<string>();
     for (const [key, rawClient] of clientRows) {
       const clientId = key.slice(CLIENT_PREFIX.length);
-      if (representedClients.has(clientId)) continue;
       const client = normalizeOAuthClient(rawClient);
       if (!client) continue;
       const grant = normalizeConnectorGrant(grantRows.get(GRANT_PREFIX + clientId));
       if (grant?.principal_type === "automation") continue;
-      const access = activeAccessByClient.get(clientId) ?? 0;
-      const refresh = activeRefreshByClient.get(clientId) ?? 0;
+      const access = Math.max(0, (activeAccessByClient.get(clientId) ?? 0) - (attributedAccessByClient.get(clientId) ?? 0));
+      const refresh = Math.max(0, (activeRefreshByClient.get(clientId) ?? 0) - (attributedRefreshByClient.get(clientId) ?? 0));
+      if (representedClients.has(clientId) && access === 0 && refresh === 0) continue;
       const grantStatus = grant?.status ?? null;
       const registrationState = grantStatus === "revoked"
         ? "revoked"
@@ -1186,7 +1376,33 @@ export class OAuthStoreDO {
         active_access_tokens: access,
         active_refresh_tokens: refresh,
       });
+      listedLegacyClients.add(clientId);
       if (legacyClients.length >= 256) break;
+    }
+
+    const tokenClientIds = new Set<string>([
+      ...activeAccessByClient.keys(),
+      ...activeRefreshByClient.keys(),
+    ]);
+    for (const clientId of tokenClientIds) {
+      if (listedLegacyClients.has(clientId)) continue;
+      const access = Math.max(0, (activeAccessByClient.get(clientId) ?? 0) - (attributedAccessByClient.get(clientId) ?? 0));
+      const refresh = Math.max(0, (activeRefreshByClient.get(clientId) ?? 0) - (attributedRefreshByClient.get(clientId) ?? 0));
+      if (access === 0 && refresh === 0) continue;
+      if (legacyClients.length >= 256) break;
+      legacyClients.push({
+        client_id: clientId,
+        client_name: null,
+        issued_at: null,
+        created_at_ms: null,
+        last_used_at_ms: null,
+        grant_origin: "unattributed_existing_credentials",
+        grant_status: null,
+        registration_state: "active_credentials",
+        active_access_tokens: access,
+        active_refresh_tokens: refresh,
+      });
+      listedLegacyClients.add(clientId);
     }
     legacyClients.sort((a, b) => Number(b.issued_at ?? 0) - Number(a.issued_at ?? 0));
 
@@ -1229,7 +1445,6 @@ export class OAuthStoreDO {
       outcome = revoked;
     });
     if (!outcome) return json({ ok: false, code: "not_found" }, 404);
-
     const [refresh, access] = await Promise.all([
       this.state.storage.list<OAuthTokenRecord>({ prefix: REFRESH_PREFIX }),
       this.state.storage.list<OAuthTokenRecord>({ prefix: ACCESS_PREFIX }),
@@ -1269,6 +1484,7 @@ export class OAuthStoreDO {
     await this.state.storage.put(GRANT_PREFIX + clientId, {
       ...(currentGrant ?? { client_id: clientId }),
       status: "revoked",
+      revocation_scope: "client",
       revoked_at_ms: nowMs,
       revoked_by: revokedBy,
     } satisfies OAuthConnectorGrantRecord);
@@ -1631,6 +1847,74 @@ export class OAuthStoreDO {
     });
   }
 
+  private async revokePresentedToken(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const token = body?.token;
+    const clientId = body?.client_id;
+    const revokedBy = body?.revoked_by;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
+    if (
+      !boundedString(token, 16384) ||
+      !boundedString(clientId, 4096) ||
+      !boundedString(revokedBy, 4096)
+    ) return json({ ok: false, code: "bad_request" }, 400);
+
+    let ownerClientId: string | undefined;
+    let connectorId: string | undefined;
+    let opaqueKey: string | undefined;
+
+    if (token.includes(".")) {
+      const verified = await this.verifyAccess(new Request("https://oauth.internal/internal/oauth/access/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, now_sec: nowSec }),
+      }));
+      if (verified.ok) {
+        const data = await verified.json() as { client_id?: unknown; connector_id?: unknown };
+        if (boundedString(data.client_id, 4096)) ownerClientId = data.client_id;
+        if (typeof data.connector_id === "string" && /^conn_[A-Za-z0-9_-]{8,128}$/.test(data.connector_id)) {
+          connectorId = data.connector_id;
+        }
+      }
+    } else {
+      const hash = await hashOpaqueToken(token);
+      for (const prefix of [REFRESH_PREFIX, ACCESS_PREFIX]) {
+        const key = prefix + hash;
+        const record = await this.state.storage.get<OAuthTokenRecord>(key);
+        if (!record) continue;
+        if (record.expires_at <= nowSec) {
+          await this.state.storage.delete(key);
+          continue;
+        }
+        ownerClientId = record.client_id;
+        connectorId = record.connector_id;
+        opaqueKey = key;
+        break;
+      }
+    }
+
+    // RFC 7009: unknown tokens and tokens owned by another client are
+    // intentionally indistinguishable from successful revocation.
+    if (!ownerClientId || (typeof clientId === "string" && ownerClientId !== clientId)) {
+      return json({ ok: true, revoked: false });
+    }
+
+    if (connectorId) {
+      const revoked = await this.revokeConnector(new Request("https://oauth.internal/internal/oauth/connector/revoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ connector_id: connectorId, revoked_by: revokedBy, now_ms: nowMs }),
+      }));
+      return json({ ok: true, revoked: revoked.ok });
+    }
+
+    // Pre-v0.4.6 credentials have no connector identity. Revoke only the
+    // presented opaque credential; never infer a client-wide kill switch.
+    if (opaqueKey) await this.state.storage.delete(opaqueKey);
+    return json({ ok: true, revoked: Boolean(opaqueKey) });
+  }
+
   private parseIssueInput(body: Record<string, unknown> | null): ParsedIssuePairInput | null {
     if (!body || !boundedString(body.client_id, 4096) || !boundedString(body.resource, 4096)) return null;
     const nowSec = finiteEpoch(body.now_sec) ? body.now_sec as number : Math.floor(Date.now() / 1000);
@@ -1709,6 +1993,26 @@ export class OAuthStoreDO {
     if (!input) return json({ ok: false, code: "bad_request" }, 400);
     if (!(await this.connectorAllowsAccess(input.client_id, input.connector_id, input.grant_generation))) {
       return json({ ok: false, code: "invalid_grant" }, 400);
+    }
+    if (input.connector_id) {
+      const [refreshRows, accessRows] = await Promise.all([
+        this.state.storage.list<OAuthTokenRecord>({ prefix: REFRESH_PREFIX }),
+        this.state.storage.list<OAuthTokenRecord>({ prefix: ACCESS_PREFIX }),
+      ]);
+      const deletes: string[] = [];
+      for (const [key, token] of refreshRows) {
+        if (token.connector_id === input.connector_id) {
+          deletes.push(key);
+        }
+      }
+      for (const [key, token] of accessRows) {
+        if (token.connector_id === input.connector_id) {
+          deletes.push(key);
+        }
+      }
+      if (deletes.length > 0) {
+        await Promise.all(deletes.map((key) => this.state.storage.delete(key)));
+      }
     }
     return json({ ok: true, token: await this.createPair(input) });
   }

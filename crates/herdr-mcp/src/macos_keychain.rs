@@ -21,7 +21,7 @@ pub fn store_generic_secret(service: &str, account: &str, secret: &str) -> Resul
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (service, account, secret);
-        Err("workstation credential persistence requires macOS Keychain".to_owned())
+        Err("the macOS Keychain credential backend is unavailable on this platform; Linux uses the private per-user credential store".to_owned())
     }
 }
 
@@ -47,7 +47,7 @@ pub fn load_generic_secret(service: &str, account: &str) -> Result<String, Strin
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (service, account);
-        Err("workstation credential loading requires macOS Keychain".to_owned())
+        Err("the macOS Keychain credential backend is unavailable on this platform; Linux uses the private per-user credential store".to_owned())
     }
 }
 
@@ -72,7 +72,7 @@ pub fn delete_generic_secret(service: &str, account: &str) -> Result<(), String>
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (service, account);
-        Err("workstation credential deletion requires macOS Keychain".to_owned())
+        Err("the macOS Keychain credential backend is unavailable on this platform; Linux uses the private per-user credential store".to_owned())
     }
 }
 

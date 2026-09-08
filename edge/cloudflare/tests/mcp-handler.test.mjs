@@ -104,6 +104,64 @@ test("device-bound automation defaults to its device and rejects other selectors
   assert.deepEqual(fleet.body.result.structuredContent.devices.map((device) => device.device_id), [DEVICE_A]);
 });
 
+test("herdr_methods preflights private method routes without workstation delivery", async () => {
+  const cases = [
+    ["herdr_mcp.device.pair", "edge_local"],
+    ["herdr_mcp.text.read", "workstation_routed"],
+    ["herdr_mcp.skill.load", "unsupported"],
+    ["herdr_mcp.planning.advise", "unsupported"],
+  ];
+  for (const [query, route] of cases) {
+    const d = deps();
+    const response = await handleMcp(req(`route-${query}`, "tools/call", {
+      name: "herdr_methods",
+      arguments: { query },
+    }), "legacy-default", d.value);
+    assert.equal(response.body.result.structuredContent.ok, true);
+    assert.equal(response.body.result.structuredContent.methods[0].method, query);
+    assert.equal(response.body.result.structuredContent.methods[0].route, route);
+    const method = response.body.result.structuredContent.methods[0];
+    assert.ok([true, false, "unknown"].includes(method.implemented_local));
+    assert.ok([true, false, "unknown"].includes(method.available_local));
+    assert.ok([true, false, "unknown"].includes(method.edge_route_deployed));
+    assert.ok([true, false, "unknown"].includes(method.caller_routable));
+    assert.equal(typeof method.reason, "string");
+    assert.equal(response.body.result.structuredContent.source, "edge_route_preflight");
+    assert.equal(d.calls.length, 0, `${query} route preflight must not forward`);
+  }
+
+  const denied = deps({ client: { fleetAdmin: false } });
+  const deniedPair = await handleMcp(req("route-denied", "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "herdr_mcp.device.pair" },
+  }), "legacy-default", denied.value);
+  assert.equal(deniedPair.body.result.structuredContent.methods[0].edge_route_deployed, true);
+  assert.equal(deniedPair.body.result.structuredContent.methods[0].caller_routable, false);
+  assert.equal(deniedPair.body.result.structuredContent.methods[0].reason, "caller_not_authorized");
+
+  const owner = deps({ client: { fleetAdmin: true } });
+  const ownerPair = await handleMcp(req("route-owner", "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "herdr_mcp.device.pair" },
+  }), "legacy-default", owner.value);
+  assert.equal(ownerPair.body.result.structuredContent.methods[0].caller_routable, true);
+  assert.equal(ownerPair.body.result.structuredContent.methods[0].reason, "route_deployed");
+
+  const unknown = deps();
+  const response = await handleMcp(req("route-unknown", "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "herdr_mcp.unknown.future" },
+  }), "legacy-default", unknown.value);
+  assert.equal(response.body.result.structuredContent.methods[0].route, "unsupported");
+  assert.equal(response.body.result.structuredContent.methods[0].implemented_local, "unknown");
+  assert.equal(response.body.result.structuredContent.methods[0].available_local, "unknown");
+  assert.equal(response.body.result.structuredContent.methods[0].edge_route_deployed, false);
+  assert.equal(response.body.result.structuredContent.methods[0].caller_routable, false);
+  assert.equal(response.body.result.structuredContent.methods[0].reason, "edge_route_not_deployed");
+  assert.equal(response.body.result.structuredContent.methods[0].next_surface, "herdr_methods");
+  assert.equal(unknown.calls.length, 0);
+});
+
 test("initialize advertises legacy wire protocol and device-aware public identity", async () => {
   const d = deps();
   const r = await handleMcp(req(1, "initialize", {}), "w1", d.value);

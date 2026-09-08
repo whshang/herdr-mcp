@@ -759,6 +759,7 @@ fn refresh_prod_snapshot(runtime: &RuntimePaths, paths: &DevPaths) -> Result<Str
     file_sha256(&paths.prod_binary)
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn reconcile_after_public_prod_install() -> Result<(), String> {
     if crate::runtime_meta::runtime_channel() != "prod" {
         return Ok(());
@@ -870,7 +871,7 @@ where
 #[cfg(not(target_os = "macos"))]
 fn verify_runtime_activation(_runtime: &RuntimePaths, _generation: &str) -> Result<Value, String> {
     Err(
-        "runtime activation verification currently requires macOS service/Link ownership evidence"
+        "DEV sync activation verification currently depends on macOS launchd ownership evidence; production Linux install/update uses the Linux service/Link health path"
             .to_owned(),
     )
 }

@@ -57,8 +57,8 @@ pub use ladder::{
     default_embedded_relays,
 };
 pub use migrate_runtime_control::{MigrateMode, run as run_link_migrate_runtime_control};
-pub use ownership::{
-    doctor_layer_summary, production_ready_gate_catalog, run_status as run_link_status,
-};
+#[cfg(target_os = "macos")]
+pub use ownership::production_ready_gate_catalog;
+pub use ownership::{doctor_layer_summary, run_status as run_link_status};
 pub use run::{LINK_RUN_WIRED, run as run_link};
 pub use seal::{SealMode, run as run_link_seal};

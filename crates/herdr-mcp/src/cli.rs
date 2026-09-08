@@ -113,7 +113,12 @@ pub enum WorkerCommand {
     ConnectorApprove {
         request_id: String,
     },
-    ConnectorList,
+    ConnectorCancel {
+        request_id: String,
+    },
+    ConnectorList {
+        include_all: bool,
+    },
     ConnectorRevoke {
         connector_id: String,
     },
@@ -667,7 +672,18 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
         Some("--help" | "-h") => Ok(Command::Help {
             section: HelpSection::Connector,
         }),
-        Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::ConnectorList)),
+        Some("list") => match &args[1..] {
+            [] => Ok(Command::Worker(WorkerCommand::ConnectorList {
+                include_all: false,
+            })),
+            [flag] if flag == "--all" => Ok(Command::Worker(WorkerCommand::ConnectorList {
+                include_all: true,
+            })),
+            [flag] if flag == "--help" || flag == "-h" => Ok(Command::Help {
+                section: HelpSection::Connector,
+            }),
+            _ => Err("connector list accepts only --all or --help".to_owned()),
+        },
         Some("approve") => {
             let [request_id] = &args[1..] else {
                 return Err("connector approve requires exactly one approval request id; the 6-digit code is entered interactively".to_owned());
@@ -677,6 +693,18 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 return Err("connector approve requires a valid approval request id".to_owned());
             }
             Ok(Command::Worker(WorkerCommand::ConnectorApprove {
+                request_id: request_id.clone(),
+            }))
+        }
+        Some("cancel") => {
+            let [request_id] = &args[1..] else {
+                return Err("connector cancel requires exactly one approval request id".to_owned());
+            };
+            if request_id.starts_with('-') || request_id.trim().is_empty() || request_id.len() > 256
+            {
+                return Err("connector cancel requires a valid approval request id".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::ConnectorCancel {
                 request_id: request_id.clone(),
             }))
         }
@@ -806,12 +834,11 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some(value) => Err(format!(
-            "unknown connector command '{value}' (expected list, approve, revoke, revoke-client, webchat-control, or page-assist)"
+            "unknown connector command '{value}' (expected list, approve, cancel, revoke, revoke-client, webchat-control, or page-assist)"
         )),
-        None => Err(
-            "connector requires list, approve, revoke, revoke-client, webchat-control, or page-assist"
-                .to_owned(),
-        ),
+        None => {
+            Err("connector requires list, approve, cancel, revoke, revoke-client, webchat-control, or page-assist".to_owned())
+        }
     }
 }
 
@@ -1414,35 +1441,35 @@ pub fn help() -> &'static str {
 User path:\n\
   herdr-mcp install\n\
   herdr-mcp status\n\
-  herdr-mcp doctor\n\
+  herdr-mcp doctor  (exit 0 = no known failure in probed layers; E2E readiness is DOCTOR_JSON.overall)\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
   herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
-  herdr-mcp worker bootstrap  (macOS first device only; guided Cloudflare Worker + enrollment bootstrap)\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled device only; creates pairing for another computer)\n\
-  herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
+  herdr-mcp worker bootstrap  (macOS/Linux first device; guided Cloudflare Worker + enrollment bootstrap)\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS/Linux enrolled device; creates pairing for another computer)\n\
+  herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS/Linux; uses the platform credential store and reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
   herdr-mcp connector list  (enrolled-device credential; non-secret connector inventory)\n\
-  herdr-mcp connector approve <approval-request-id>  (macOS enrolled device; reads the 6-digit code interactively, never argv)\n\
+  herdr-mcp connector approve <approval-request-id>  (macOS/Linux enrolled device; reads the 6-digit code interactively, never argv)\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
   herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
-  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm  (macOS owner device only)\n\
-  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS owner device only)\n\
+  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm  (macOS/Linux enrolled owner device)\n\
+  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
   herdr-mcp automation list\n\
   herdr-mcp automation rotate <client-id> --confirm\n\
   herdr-mcp automation revoke <client-id> --confirm\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
-  herdr-mcp rollback\n\
-  herdr-mcp reinstall\n\
-  herdr-mcp uninstall\n\n\
-Same-machine UAT isolation (optional):\n\
+  herdr-mcp rollback  (macOS product rollback; Linux service rollback is not exposed)\n\
+  herdr-mcp reinstall  (macOS product lifecycle; Linux repair uses herdr-mcp install)\n\
+  herdr-mcp uninstall  (macOS product lifecycle; Linux removal uses service uninstall)\n\n\
+Same-machine UAT isolation (macOS launchd path):\n\
   herdr-mcp --instance uat install\n\
   HERDR_MCP_INSTANCE=uat herdr-mcp doctor\n\
-  Named instances use distinct LaunchAgent labels, a non-8772 port, and\n\
+  Named macOS instances use distinct LaunchAgent labels, a non-8772 port, and\n\
   ~/.config/herdr-mcp-<name>. They never rewrite ~/.local/bin/herdr-mcp.\n\n\
 Advanced / internal:\n\
   herdr-mcp version\n\
@@ -1468,15 +1495,16 @@ Advanced / internal:\n\
   herdr-mcp dev sync [--dry-run] [--allow-dirty]\n\
   herdr-mcp dev rollback\n\
   herdr-mcp candidate [--port 8873]\n\n\
-Prefer the top-level install/status/doctor/permissions/scan/update/rollback/reinstall/uninstall commands\n\
-for normal lifecycle. Use service ... only for advanced service control\n\
-(for example service install --adopt-node). link status is read-only G5\n\
-ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
-(Keychain/plist credentials). link install/uninstall manage only the candidate\n\
-LaunchAgent dev.herdr-mcp.link-rust-candidate → runtime/current link run; they\n\
-never unload or replace live Node link/link-prod. Candidate defaults to an\n\
-epoch-2 Edge (edge-prod) and refuses install when Edge /health is still epoch 1.\n\
-link cutover defaults to dry-run plan/validate only; --execute / --rollback\n\
+Prefer top-level install/status/doctor/permissions/scan/update for normal lifecycle on both\n\
+macOS and Linux. macOS also exposes product rollback/reinstall/uninstall; on Linux use install\n\
+for repair and service uninstall for explicit service removal. Use service ... otherwise only for\n\
+advanced service control (for example macOS service install --adopt-node). link status is read-only ownership/gates reporting.\n\
+On Linux, link install/reconcile activates the enrolled production Link through the Linux\n\
+service manager; Linux Link removal follows the Linux service lifecycle. On macOS, link\n\
+run/install/uninstall retain the candidate LaunchAgent dev.herdr-mcp.link-rust-candidate soak path\n\
+used by the launchd migration machinery. Candidate defaults to an epoch-2 Edge (edge-prod) and refuses install\n\
+when Edge /health is still epoch 1. macOS link cutover defaults to dry-run plan/validate only;\n\
+--execute / --rollback\n\
 require HERDR_LINK_CUTOVER_I_UNDERSTAND=1, mutate only link-prod via\n\
 bootout/bootstrap (never the forbidden launchd submission path), and --rollback clears any active\n\
 production_ready seal. link seal writes an auditable evidence artifact; it never\n\
@@ -1497,13 +1525,13 @@ commands require an enrolled-device credential.\n\n\
       removes the temporary operator credential, starts the production Link,\n\
       and succeeds only when link status reports operational_ready=true.\n\n\
   herdr-mcp device list\n      Lists the non-secret enrolled-device inventory and local Link/runtime\n      alignment. herdr-mcp worker list is a compatibility alias.\n\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]\n      Creates a pairing address for another computer to enroll.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine; requires Keychain, reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]\n      Creates a pairing address for another computer to enroll.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine on macOS or Linux; uses the platform credential store and reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
 }
 
 pub fn connector_help() -> &'static str {
     "Herdr MCP connector management (OAuth connectors registered against the fleet)\n\n\
 All of these require the credential of a device already enrolled in the fleet;\nthere is no WebChat delegated admin path. Secrets are never echoed or written\nto argv.\n\n\
-  herdr-mcp connector list\n      Lists current connector instances plus non-secret legacy client/grant\n      inventory and token counts as returned by the Edge.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes a connector by its connector_id (begins with conn_).\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Revokes every Connector/grant for a legacy OAuth client and invalidates\n      its issued access/refresh credentials.\n"
+  herdr-mcp connector list [--all]\n      Lists current/actionable Connector state by default. --all also includes\n      revoked Connector instances and legacy client/grant tombstones retained\n      for audit and credential fencing.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes only that Connector instance and its attributed credentials.\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Client-level kill switch: revokes every Connector/grant for that OAuth client\n      and invalidates its issued access/refresh credentials.\n"
 }
 
 pub fn automation_help() -> &'static str {
@@ -2147,7 +2175,21 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["connector", "list"])).unwrap().command,
-            Command::Worker(WorkerCommand::ConnectorList)
+            Command::Worker(WorkerCommand::ConnectorList { include_all: false })
+        );
+        assert_eq!(
+            parse(args(&["connector", "list", "--all"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorList { include_all: true })
+        );
+        assert_eq!(
+            parse(args(&["connector", "cancel", "req_abc"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorCancel {
+                request_id: "req_abc".to_owned(),
+            })
         );
         assert_eq!(
             parse(args(&[
@@ -2235,6 +2277,7 @@ mod tests {
         assert!(parse(args(&["connector", "revoke", "conn_abc", "--nope"])).is_err());
         assert!(parse(args(&["connector", "revoke", "conn_abc"])).is_err());
         assert!(parse(args(&["connector", "revoke-client", "legacy"])).is_err());
+        assert!(parse(args(&["connector", "list", "--unknown"])).is_err());
     }
 
     #[test]
@@ -2247,6 +2290,14 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["connector", "-h"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Connector,
+            }
+        );
+        assert_eq!(
+            parse(args(&["connector", "list", "--help"]))
+                .unwrap()
+                .command,
             Command::Help {
                 section: HelpSection::Connector,
             }
@@ -2461,6 +2512,13 @@ mod tests {
                 "help missing user-path command: {needle}"
             );
         }
+        assert!(text.contains("E2E readiness is DOCTOR_JSON.overall"));
+        assert!(text.contains("worker bootstrap  (macOS/Linux first device"));
+        assert!(text.contains("worker connect <pairing-address> [--name NAME]  (macOS/Linux"));
+        assert!(
+            text.contains("connector approve <approval-request-id>  (macOS/Linux enrolled device")
+        );
+        assert!(!text.contains("worker connect <pairing-address> [--name NAME]  (macOS only"));
         assert!(text.contains("User path:"));
         assert!(text.contains("Advanced / internal:"));
         assert!(text.contains("herdr-mcp link status"));

@@ -545,15 +545,20 @@ impl<'a> Cloudflare<'a> {
 }
 
 pub fn run(paths: &RuntimePaths) -> Result<ExitCode, String> {
-    if !cfg!(target_os = "macos") {
+    if !bootstrap_platform_supported(std::env::consts::OS) {
         return Err(
-            "worker bootstrap currently supports macOS first-device installation only".to_owned(),
+            "worker bootstrap currently supports macOS and Linux first-device installation"
+                .to_owned(),
         );
     }
     if paths.instance.is_named() {
         return Err("worker bootstrap is available only on the default Herdr instance".to_owned());
     }
     run_inner(paths)
+}
+
+fn bootstrap_platform_supported(os: &str) -> bool {
+    matches!(os, "macos" | "linux")
 }
 
 fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
@@ -2003,6 +2008,13 @@ fn read_hidden_line(prompt: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_worker_bootstrap_supports_macos_and_linux() {
+        assert!(bootstrap_platform_supported("macos"));
+        assert!(bootstrap_platform_supported("linux"));
+        assert!(!bootstrap_platform_supported("windows"));
+    }
 
     #[test]
     fn mutation_gate_refuses_before_classification() {

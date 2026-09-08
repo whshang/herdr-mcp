@@ -81,7 +81,15 @@ pub(crate) fn status_line() -> String {
     match status_snapshot() {
         Ok(value) => {
             if value.get("skipped").and_then(Value::as_bool) == Some(true) {
-                return "not scheduled for named instance".to_owned();
+                return match value.get("reason").and_then(Value::as_str) {
+                    Some("named_instance") => "not scheduled for named instance".to_owned(),
+                    Some("linux_no_resident_scheduler") => {
+                        "no resident Linux scheduler; update apply/auto remains available"
+                            .to_owned()
+                    }
+                    Some(reason) => format!("not scheduled ({reason})"),
+                    None => "not scheduled".to_owned(),
+                };
             }
             let present = value.get("present").and_then(Value::as_bool) == Some(true);
             let loaded = value.get("loaded").and_then(Value::as_bool) == Some(true);
@@ -111,6 +119,14 @@ pub(crate) fn ensure_updates_allowed() -> Result<(), String> {
                 .to_owned(),
         ),
     }
+}
+
+/// Linux has no launchd uninstall fence or resident scheduler. Manual and
+/// externally scheduled updates still use the same verified updater and the
+/// transactional Linux service installer.
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_updates_allowed() -> Result<(), String> {
+    Ok(())
 }
 
 /// Validate any durable fence before a manual service install mutates state.
@@ -409,7 +425,19 @@ fn ensure_real_dir(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn status_snapshot() -> Result<Value, String> {
+    Ok(json!({
+        "ok": true,
+        "present": false,
+        "loaded": false,
+        "owned": false,
+        "skipped": true,
+        "reason": "linux_no_resident_scheduler",
+    }))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn status_snapshot() -> Result<Value, String> {
     Ok(json!({
         "ok": true,

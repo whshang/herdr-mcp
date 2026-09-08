@@ -226,13 +226,14 @@ test("current workflows pin checkout and setup-node to reviewed v7 commits", asy
   }
 });
 
-test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 target contract", async () => {
+test("Rust release publishes authoritative macOS ARM64 + Debian-compatible Linux x64 + Windows x64 targets", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const targetContract = JSON.parse(await readFile(join(ROOT, ".github/rust-release-targets.json"), "utf8"));
   assert.deepEqual(targetContract, {
     schema_version: 1,
     targets: [
       { runner: "macos-15", target: "aarch64-apple-darwin" },
+      { runner: "ubuntu-24.04", target: "x86_64-unknown-linux-musl" },
       { runner: "windows-2025", target: "x86_64-pc-windows-msvc" },
     ],
   });
@@ -241,7 +242,9 @@ test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 targe
   assert.match(release, /needs: \[verify, targets\]/);
   assert.match(release, /matrix: \$\{\{ fromJSON\(needs\.targets\.outputs\.matrix\) \}\}/);
   assert.doesNotMatch(release, /x86_64-apple-darwin/);
-  assert.doesNotMatch(release, /unknown-linux-gnu/);
+  assert.match(release, /Install Linux musl build prerequisites/);
+  assert.match(release, /Smoke Linux release portability/);
+  assert.match(release, /Requesting program interpreter/);
 });
 
 test("tagged releases do not require paid Apple Developer signing", async () => {

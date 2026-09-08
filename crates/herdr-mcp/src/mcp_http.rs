@@ -4016,7 +4016,12 @@ mod tests {
         });
         let response = app
             .clone()
-            .oneshot(rpc_request(Method::POST, "/mcp", Some(initialize), &[]))
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(initialize.clone()),
+                &[],
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -4029,6 +4034,33 @@ mod tests {
         assert!(!session.is_empty());
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(list.clone()),
+                &[("mcp-session-id", session.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Repeating initialize on a live stateful transport session must not
+        // allocate a replacement session or poison the existing one.
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(initialize.clone()),
+                &[("mcp-session-id", session.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_none());
+
         let response = app
             .clone()
             .oneshot(rpc_request(
@@ -4058,6 +4090,38 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"]["code"], -32001);
+
+        // A stale/failed session can recover by starting a fresh initialize
+        // lifecycle without restarting the healthy runtime.
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(initialize.clone()),
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let retry_session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert_ne!(retry_session, session);
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::DELETE,
+                "/mcp",
+                None,
+                &[("mcp-session-id", retry_session.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         let response = app
             .clone()
@@ -4103,6 +4167,24 @@ mod tests {
                 "clientInfo": {"name": "ChatGPT", "version": "1"}
             }
         });
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(openai_initialize.clone()),
+                &[
+                    ("mcp-session-id", "poison"),
+                    ("user-agent", "openai-mcp/1.0.0"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_none());
+
+        // ChatGPT/OpenAI is explicitly stateless across repeated initialize
+        // events, even if the client sends a stale transport-session header.
         let response = app
             .clone()
             .oneshot(rpc_request(

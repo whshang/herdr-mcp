@@ -428,7 +428,7 @@ test("Page Assist grants normalize legacy records and add/remove one exact endpo
   assert.deepEqual(disabled.record.page_assist, []);
 });
 
-test("connector approval resume token is independent, one-use, and cannot be substituted", async () => {
+test("connector approval resume token is independent, idempotent until expiry, and cannot be substituted", async () => {
   const h = harness();
   await h.post("/internal/oauth/approval/put", {
     request_id: "req-resume",
@@ -464,7 +464,75 @@ test("connector approval resume token is independent, one-use, and cannot be sub
     resume_hash: "resume-good",
     now_ms: 302,
   });
-  assert.equal(replay.status, 404);
+  assert.equal(replay.status, 200);
+  assert.equal((await body(replay)).record.connector_id, first.record.connector_id);
+
+  const expired = await h.post("/internal/oauth/approval/consume", {
+    request_id: "req-resume",
+    resume_hash: "resume-good",
+    now_ms: 100001,
+  });
+  assert.equal(expired.status, 404);
+  const orphan = await h.post("/internal/oauth/connector/get", {
+    connector_id: first.record.connector_id,
+  });
+  assert.equal(orphan.status, 404);
+});
+
+test("connector approval cancel removes pending or unused approved state but refuses a used connector", async () => {
+  const h = harness();
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-cancel-pending",
+    record: approval(),
+    now_ms: 100,
+  });
+  const pendingCancel = await h.post("/internal/oauth/approval/cancel", {
+    request_id: "req-cancel-pending",
+  });
+  assert.equal(pendingCancel.status, 200);
+  assert.equal((await body(pendingCancel)).connector_deleted, false);
+  assert.equal(h.storage.map.has("approval:req-cancel-pending"), false);
+
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-cancel-approved",
+    record: approval({ approval_code_hash: "cancel-good" }),
+    now_ms: 100,
+  });
+  const approved = await body(await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-cancel-approved",
+    code_hash: "cancel-good",
+    approver: "device:owner",
+    now_ms: 200,
+  }));
+  const unusedId = approved.record.connector_id;
+  const unusedCancel = await h.post("/internal/oauth/approval/cancel", {
+    request_id: "req-cancel-approved",
+  });
+  assert.equal(unusedCancel.status, 200);
+  assert.equal((await body(unusedCancel)).connector_deleted, true);
+  assert.equal(h.storage.map.has(`connector:${unusedId}`), false);
+
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-cancel-used",
+    record: approval({ approval_code_hash: "used-good" }),
+    now_ms: 100,
+  });
+  const used = await body(await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-cancel-used",
+    code_hash: "used-good",
+    approver: "device:owner",
+    now_ms: 200,
+  }));
+  const usedId = used.record.connector_id;
+  const usedConnector = h.storage.map.get(`connector:${usedId}`);
+  await h.storage.put(`connector:${usedId}`, { ...usedConnector, token_issue_count: 1 });
+  const usedCancel = await h.post("/internal/oauth/approval/cancel", {
+    request_id: "req-cancel-used",
+  });
+  assert.equal(usedCancel.status, 409);
+  assert.equal((await body(usedCancel)).code, "already_used");
+  assert.equal(h.storage.map.has("approval:req-cancel-used"), true);
+  assert.equal(h.storage.map.has(`connector:${usedId}`), true);
 });
 
 test("connector grant revoke fences current and legacy JWT/refresh credentials with a durable tombstone", async () => {
@@ -540,13 +608,15 @@ test("connector grant revoke fences current and legacy JWT/refresh credentials w
 
 test("connector instance revoke is isolated while client kill-switch fences every instance and unknown legacy client", async () => {
   const h = harness();
-  const approve = async (requestId, codeHash) => {
+  const approve = async (requestId, codeHash, state, codeChallenge) => {
     await h.post("/internal/oauth/approval/put", {
       request_id: requestId,
       record: approval({
         client_id: "shared-client",
         approval_code_hash: codeHash,
         resume_hash: `resume-${requestId}`,
+        state,
+        code_challenge: codeChallenge,
       }),
       now_ms: 100,
     });
@@ -557,8 +627,8 @@ test("connector instance revoke is isolated while client kill-switch fences ever
       now_ms: 200,
     }));
   };
-  const first = await approve("req-inst-1", "good-1");
-  const second = await approve("req-inst-2", "good-2");
+  const first = await approve("req-inst-1", "good-1", "state-1", "challenge-1");
+  const second = await approve("req-inst-2", "good-2", "state-2", "challenge-2");
   assert.notEqual(first.record.connector_id, second.record.connector_id);
 
   const issueFor = async (record) => body(await h.post("/internal/oauth/token/issue", {
@@ -976,4 +1046,84 @@ test("signing key errors never echo kid, private modulus, or private exponent", 
   assert.equal(text.includes(pair.private_jwk.n), false);
   assert.equal(text.includes(pair.private_jwk.d), false);
   assert.equal(text.includes(pair.public_jwk.n), false);
+});
+
+test("issuing fresh tokens for a connector fences older refresh tokens of that connector while siblings remain untouched", async () => {
+  const h = harness();
+  const pair = await generateJwkPair("test-kid");
+  await h.post("/internal/oauth/import", { now_sec: 100, overwrite: true, signing_key: pair });
+
+  const approve = async (requestId, clientId, codeHash) => {
+    await h.post("/internal/oauth/approval/put", {
+      request_id: requestId,
+      record: approval({
+        client_id: clientId,
+        approval_code_hash: codeHash,
+        resume_hash: `resume-${requestId}`,
+      }),
+      now_ms: 100,
+    });
+    return body(await h.post("/internal/oauth/approval/approve", {
+      request_id: requestId,
+      code_hash: codeHash,
+      approver: "device:owner",
+      now_ms: 200,
+    }));
+  };
+
+  const app1 = await approve("req-f1", "c-f1", "good-1");
+  const app2 = await approve("req-f2", "c-f2", "good-2");
+  const conn1 = app1.record.connector_id;
+  const conn2 = app2.record.connector_id;
+
+  // Issue tokens for conn1
+  const t1 = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "c-f1",
+    connector_id: conn1,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    now_sec: 100,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 86400,
+  }));
+  assert.equal(t1.ok, true);
+
+  // Issue tokens for sibling conn2
+  const t2 = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "c-f2",
+    connector_id: conn2,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    now_sec: 100,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 86400,
+  }));
+  assert.equal(t2.ok, true);
+
+  const t1RefreshHash = await hashOpaqueToken(t1.token.refresh_token);
+  const t2RefreshHash = await hashOpaqueToken(t2.token.refresh_token);
+
+  // Verify both refresh tokens exist
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t1RefreshHash, now_sec: 101 })).status, 200);
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t2RefreshHash, now_sec: 101 })).status, 200);
+
+  // Re-authorize/re-issue tokens for conn1
+  const t1_fresh = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "c-f1",
+    connector_id: conn1,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    now_sec: 105,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 86400,
+  }));
+  assert.equal(t1_fresh.ok, true);
+  const t1FreshRefreshHash = await hashOpaqueToken(t1_fresh.token.refresh_token);
+
+  // conn1 old refresh must be gone (fenced)
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t1RefreshHash, now_sec: 106 })).status, 404);
+  // conn1 fresh refresh must exist
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t1FreshRefreshHash, now_sec: 106 })).status, 200);
+  // sibling conn2 refresh must still exist untouched
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: t2RefreshHash, now_sec: 106 })).status, 200);
 });

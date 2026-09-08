@@ -20,10 +20,10 @@
 
 Default to **first install / first Worker**. Do not infer fleet intent from a missing or empty local `~/.config/herdr-mcp` directory, and do not interrogate the user repeatedly.
 
-- If the user supplied a Herdr pairing address, this computer is joining an existing Worker: install/verify the local runtime and macOS permission, then `herdr-mcp worker connect "<pairing-address>"`. Skip Worker/R2/Connector creation.
+- If the user supplied a Herdr pairing address, this computer is joining an existing Worker: install/verify the local runtime and any platform-specific permission that applies, then `herdr-mcp worker connect "<pairing-address>"`. Skip Worker/R2/Connector creation.
 - Otherwise, detect what you can instead of asking: check the local runtime for an enrolled device identity, and (once a Cloudflare Token is available) list `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts` for an existing Herdr Worker. If either shows an existing fleet, switch to the [existing-fleet flow](existing-worker-connect.md).
 - Only if you cannot detect a fleet and the user has not supplied a pairing address, ask exactly one question: **create the first Herdr Worker, or join an existing Herdr Worker?** If they choose **join existing**, require a pairing from an already-enrolled device. If they choose **first Worker** (the default), continue to the Cloudflare bootstrap and pause only when Cloudflare authorization is actually required.
-- Never run `herdr-mcp worker pair` on the computer currently being installed as a way to discover whether a fleet exists. `worker pair` requires credentials proving that this machine is already enrolled in the target Worker. A fresh machine with no enrolled device identity / existing Edge origin must fail closed with first-Worker-or-connect guidance, not fall through to a missing LaunchAgent/Keychain implementation error.
+- Never run `herdr-mcp worker pair` on the computer currently being installed as a way to discover whether a fleet exists. `worker pair` requires credentials proving that this machine is already enrolled in the target Worker. A fresh machine with no enrolled device identity / existing Edge origin must fail closed with first-Worker-or-connect guidance, not fall through to a missing platform service/credential-backend implementation error.
 - Pairing, old-Worker upgrade, hostname reachability, or permission failures stay on the existing-fleet repair path. Never fall back to creating a random-suffixed Worker, R2 bucket, or Connector unless the user explicitly changes the fleet intent.
 
 ## 1. Prerequisites
@@ -163,7 +163,7 @@ Browser extension / Native Messaging remains optional and is not required for th
 - STANDALONE: v0.4.3+ GitHub/manual fixed-identity package, used when Store installation is unavailable or the user explicitly requests independent distribution.
 - DEV: source development only, loaded unpacked from a repo/worktree `extension/` directory with a path-derived ID.
 
-The Agent must inspect what the installed runtime actually supports. v0.4.2 has Store/DEV ownership only; do not invent standalone support. STANDALONE is a source-development-independent distribution channel, while DEV remains source-development only. On runtimes that expose it, select STANDALONE explicitly with `herdr-mcp native-host use standalone`. After selecting/installing a supported channel, run:
+The Agent must inspect what the installed runtime actually supports. v0.4.2 has Store/DEV ownership only; do not invent standalone support. STANDALONE is a source-development-independent distribution channel, while DEV remains source-development only. The managed Chromium Native Messaging host is currently a macOS integration; Linux core runtime/Link/Connector operation does not depend on it, so skip native-host setup on Linux. On macOS runtimes that expose it, select STANDALONE explicitly with `herdr-mcp native-host use standalone`. After selecting/installing a supported channel, run:
 
 ```bash
 herdr-mcp native-host status
@@ -171,9 +171,9 @@ herdr-mcp native-host status
 
 Status should identify the expected active channel/extension identity and confirm the Native Host runtime is consistent with the active runtime generation. See [Browser extension](extension.md) and [Browser continuity](browser-continuity.md).
 
-## 8. macOS persistent Herdr Link
+## 8. Persistent Herdr Link on macOS/Linux
 
-Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret. Prefer the managed Link install path exposed by the installed `herdr-mcp` binary (`herdr-mcp link ...` / current stable product docs). Do not leave production Link ownership on a repository Bash wrapper.
+On v0.4.8, do not manually provision `LINK_SHARED_SECRET` for a normal enrolled device. `worker bootstrap` / `worker connect` creates the per-device credential and stores it in the platform backend: Keychain on macOS, or the private `0700`/`0600` user credential store on Linux. Prefer the managed Link lifecycle exposed by the installed `herdr-mcp` binary. Do not leave production Link ownership on a repository Bash wrapper.
 
 The Agent should inspect network reachability instead of asking the user to choose a transport. Run `herdr-mcp doctor`, `herdr-mcp link status`, and bounded `/health` probes for the selected public origin / backing `workers.dev` origin. The Link reuses proxy settings that already exist in the user's environment; recognition precedence is `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`, and macOS also reads the existing `scutil --proxy` state (HTTPS, then HTTP, then SOCKS). `socks5://`/`socks5h://` URLs are supported with remote-DNS semantics, proxy authentication is not supported, and a macOS PAC configuration is detected but never evaluated.
 

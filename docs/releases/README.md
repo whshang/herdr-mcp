@@ -40,6 +40,7 @@ Rules:
 - Always include `Known issue` or `Known issues`. Use `- None known.` when there is nothing to report. A fix merged after the tag belongs here as a known issue/follow-up, not in the tagged release's `Main changes`.
 - `Compatibility` distinguishes workstation Runtime Execution Contract, public Edge contract, state schema, Connector behavior, and supported platform changes when relevant.
 - Published stable tags and assets are immutable evidence. Never replace a binary under an existing stable tag to fold in a later fix; publish a new maintenance version when a later fix merits distribution.
+- Automated tests, CI, deployment smoke checks, and controlled protocol qualification are **not** user acceptance testing. A version must not be tagged, packaged, or published as stable until the release owner has personally completed the required real target-client UAT and explicitly accepted the result. For Connector changes, acceptance requires the real authorization/redirect flow and at least one actual MCP tool call from the target client; an `approve` response or green CI alone is insufficient.
 
 Run locally before tagging:
 

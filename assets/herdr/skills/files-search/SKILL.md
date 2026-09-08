@@ -7,6 +7,8 @@ description: Perform bounded project reads, directory listing, native text searc
 
 Own: `herdr_fs_read`, `herdr_fs_list`, `herdr_fs_grep`, `herdr_fs_image`.
 
+**READ ONLY.** This skill never creates or overwrites files. Use `herdr_fs_read` for source reads; do not select `herdr_fs_write` as a generic file tool.
+
 Use the smallest scope that answers the question. Prefer targeted grep/list/read over whole-tree or whole-file ingestion; group independent reads into one wave and reuse known roots/paths.
 
 Use bounded line/byte windows and narrow subsequent reads from compact results. Treat search truncation as a signal to reduce scope, not to repeat the same broad query. Use literal search unless regex is required; add file globs/match limits when they materially narrow work.

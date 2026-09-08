@@ -32,6 +32,44 @@ struct StatusReport {
     herdr_transport_reachable: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DiagnosticState {
+    Pass,
+    Fail,
+    NotProbed,
+}
+
+impl DiagnosticState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::NotProbed => "not_probed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedMcpProbe {
+    state: DiagnosticState,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OverallReadiness {
+    Fail,
+    NotProven,
+}
+
+impl OverallReadiness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::NotProven => "not_proven",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct EventCacheProbe {
     healthy: bool,
@@ -112,7 +150,11 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let report = collect(paths, config);
     let runtime_healthy = matches!(report.runtime, RuntimeHealth::Healthy(_));
     let methods_result = native_tools::methods("");
-    let schema_healthy = methods_result["ok"].as_bool() == Some(true);
+    // `native_tools::methods` can still return the local progressive-method
+    // registry when live Herdr schema reflection is unavailable. Doctor must
+    // prove the live schema itself rather than letting that local fallback
+    // mask a broken Herdr executable lookup.
+    let schema_healthy = crate::schema::list_methods("").is_ok();
     let native_call_result = paths
         .herdr_socket
         .as_ref()
@@ -133,6 +175,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let event_cache = probe_event_cache(paths);
     let documents_permission = macos_privacy::probe_documents_permission(&paths.config_dir);
     let code_identity = macos_privacy::probe_code_identity();
+    let authenticated_local_mcp = probe_authenticated_local_mcp(config.runtime_port);
     println!("Herdr MCP doctor");
     println!(
         "runtime provenance: channel={} version={} source={}{}",
@@ -162,7 +205,43 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     println!("{}", code_identity.doctor_line());
     println!("{}", herdr_supervisor::doctor_line());
     println!("{}", crate::child_process::doctor_line());
-    print_layer_ownership(paths, config, &report);
+    let remote = print_layer_ownership(paths, config, &report);
+    println!(
+        "LAYER authenticated-local-mcp {}",
+        authenticated_local_mcp.detail
+    );
+    println!("LAYER authenticated-remote-mcp not_probed reason=no-connector-oauth-credential");
+    let service_health = runtime_healthy
+        && report.herdr_transport_reachable
+        && schema_healthy
+        && native_call_healthy
+        && snapshot_healthy
+        && inspect_healthy
+        && event_cache.healthy
+        && documents_permission.doctor_pass()
+        && macos_permissions
+            .as_ref()
+            .map(crate::macos_permissions::report_doctor_pass)
+            .unwrap_or(true);
+    let readiness = overall_readiness(service_health, authenticated_local_mcp.state, &remote);
+    println!(
+        "READINESS service_health={} authenticated_local_mcp={} authenticated_remote_mcp=not_probed overall={}",
+        if service_health { "pass" } else { "fail" },
+        authenticated_local_mcp.state.as_str(),
+        readiness.as_str()
+    );
+    println!(
+        "DOCTOR_JSON {}",
+        json!({
+            "service_health": if service_health { "pass" } else { "fail" },
+            "authenticated_local_mcp": authenticated_local_mcp.state.as_str(),
+            "authenticated_remote_mcp": "not_probed",
+            "edge_reachable": remote.edge_state.as_str(),
+            "oauth_metadata": remote.oauth_state.as_str(),
+            "mcp_surface": remote.mcp_surface_state.as_str(),
+            "overall": readiness.as_str(),
+        })
+    );
     println!("INFO config {}", paths.config_file.display());
     println!("INFO state {}", paths.config_dir.display());
     println!("INFO dev-state {}", paths.dev_state_dir.display());
@@ -200,23 +279,16 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         println!("WARN event-cache {error}");
     }
 
-    runtime_healthy
-        && report.herdr_transport_reachable
-        && schema_healthy
-        && native_call_healthy
-        && snapshot_healthy
-        && inspect_healthy
-        && event_cache.healthy
-        && documents_permission.doctor_pass()
-        && macos_permissions
-            .as_ref()
-            .map(crate::macos_permissions::report_doctor_pass)
-            .unwrap_or(true)
+    service_health && readiness != OverallReadiness::Fail
 }
 
 /// Product-layer ownership map. Local probes always run. When Edge is
 /// configured locally, doctor also runs bounded credential-free HTTPS probes.
-fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusReport) {
+fn print_layer_ownership(
+    paths: &RuntimePaths,
+    config: &Config,
+    report: &StatusReport,
+) -> RemoteProbeReport {
     println!("LAYER herdr {}", format_herdr_layer(paths, report));
     println!(
         "LAYER local-runtime {}",
@@ -245,6 +317,7 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER mcp-endpoint {}", remote.mcp_endpoint);
     println!("LAYER update-state {}", format_update_state_layer(paths));
     println!("{}", crate::residue::doctor_line());
+    remote
 }
 
 fn unix_now_seconds() -> i64 {
@@ -475,6 +548,9 @@ struct RemoteProbeReport {
     edge_reachable: String,
     oauth_metadata: String,
     mcp_endpoint: String,
+    edge_state: DiagnosticState,
+    oauth_state: DiagnosticState,
+    mcp_surface_state: DiagnosticState,
 }
 
 impl RemoteProbeReport {
@@ -483,6 +559,9 @@ impl RemoteProbeReport {
             edge_reachable: "skipped reason=edge-unconfigured".to_owned(),
             oauth_metadata: "skipped reason=edge-unconfigured".to_owned(),
             mcp_endpoint: "skipped reason=edge-unconfigured".to_owned(),
+            edge_state: DiagnosticState::NotProbed,
+            oauth_state: DiagnosticState::NotProbed,
+            mcp_surface_state: DiagnosticState::NotProbed,
         }
     }
 }
@@ -579,6 +658,9 @@ fn probe_edge_remote(edge: &EdgeConfigView) -> RemoteProbeReport {
                 edge_reachable: failed.clone(),
                 oauth_metadata: failed.clone(),
                 mcp_endpoint: failed,
+                edge_state: DiagnosticState::Fail,
+                oauth_state: DiagnosticState::Fail,
+                mcp_surface_state: DiagnosticState::Fail,
             };
         }
     };
@@ -587,23 +669,38 @@ fn probe_edge_remote(edge: &EdgeConfigView) -> RemoteProbeReport {
     let oauth_url = format!("{}/.well-known/oauth-authorization-server", edge.origin);
     let mcp_url = format!("{}/mcp", edge.origin);
 
-    let edge_reachable = match probe_https_get(&client, &health_url, RemoteExpect::Health) {
-        Ok(summary) => format!("reachable {summary}"),
-        Err(detail) => format!("unreachable detail={}", compact_detail(&detail)),
-    };
-    let oauth_metadata = match probe_https_get(&client, &oauth_url, RemoteExpect::OauthMetadata) {
-        Ok(summary) => format!("reachable {summary}"),
-        Err(detail) => format!("unreachable detail={}", compact_detail(&detail)),
-    };
-    let mcp_endpoint = match probe_https_get(&client, &mcp_url, RemoteExpect::McpEndpoint) {
-        Ok(summary) => format!("reachable {summary}"),
-        Err(detail) => format!("unreachable detail={}", compact_detail(&detail)),
-    };
+    let (edge_reachable, edge_state) =
+        match probe_https_get(&client, &health_url, RemoteExpect::Health) {
+            Ok(summary) => (format!("reachable {summary}"), DiagnosticState::Pass),
+            Err(detail) => (
+                format!("unreachable detail={}", compact_detail(&detail)),
+                DiagnosticState::Fail,
+            ),
+        };
+    let (oauth_metadata, oauth_state) =
+        match probe_https_get(&client, &oauth_url, RemoteExpect::OauthMetadata) {
+            Ok(summary) => (format!("reachable {summary}"), DiagnosticState::Pass),
+            Err(detail) => (
+                format!("unreachable detail={}", compact_detail(&detail)),
+                DiagnosticState::Fail,
+            ),
+        };
+    let (mcp_endpoint, mcp_surface_state) =
+        match probe_https_get(&client, &mcp_url, RemoteExpect::McpEndpoint) {
+            Ok(summary) => (format!("reachable {summary}"), DiagnosticState::Pass),
+            Err(detail) => (
+                format!("unreachable detail={}", compact_detail(&detail)),
+                DiagnosticState::Fail,
+            ),
+        };
 
     RemoteProbeReport {
         edge_reachable,
         oauth_metadata,
         mcp_endpoint,
+        edge_state,
+        oauth_state,
+        mcp_surface_state,
     }
 }
 
@@ -958,6 +1055,210 @@ fn probe_herdr_transport(paths: &RuntimePaths) -> bool {
         .is_some_and(|socket| HerdrClient::new(socket).ping().is_ok())
 }
 
+fn probe_authenticated_local_mcp(port: u16) -> AuthenticatedMcpProbe {
+    let token = match service_manager::doctor_runtime_token() {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return AuthenticatedMcpProbe {
+                state: DiagnosticState::NotProbed,
+                detail: "not_probed reason=runtime-bearer-unavailable".to_owned(),
+            };
+        }
+        Err(error) => {
+            return AuthenticatedMcpProbe {
+                state: DiagnosticState::NotProbed,
+                detail: format!(
+                    "not_probed reason=runtime-bearer-unavailable detail={}",
+                    compact_detail(&error)
+                ),
+            };
+        }
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_secs(1))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return AuthenticatedMcpProbe {
+                state: DiagnosticState::Fail,
+                detail: format!(
+                    "fail phase=client detail={}",
+                    compact_detail(&error.to_string())
+                ),
+            };
+        }
+    };
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": "doctor-init",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": crate::mcp::SDK_WIRE_PROTOCOL,
+            "capabilities": {},
+            "clientInfo": {"name": "herdr-doctor", "version": crate::runtime_meta::runtime_version()}
+        }
+    });
+    let response = match client
+        .post(&url)
+        .bearer_auth(&token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&initialize)
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return AuthenticatedMcpProbe {
+                state: DiagnosticState::Fail,
+                detail: format!(
+                    "fail phase=initialize detail={}",
+                    compact_detail(&error.to_string())
+                ),
+            };
+        }
+    };
+    if response.status().as_u16() != 200 {
+        return AuthenticatedMcpProbe {
+            state: DiagnosticState::Fail,
+            detail: format!("fail phase=initialize http={}", response.status().as_u16()),
+        };
+    }
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let initialize_bytes = match response.bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return AuthenticatedMcpProbe {
+                state: DiagnosticState::Fail,
+                detail: format!(
+                    "fail phase=initialize-read detail={}",
+                    compact_detail(&error.to_string())
+                ),
+            };
+        }
+    };
+    let initialize_payload: Value = match serde_json::from_slice(&initialize_bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return AuthenticatedMcpProbe {
+                state: DiagnosticState::Fail,
+                detail: "fail phase=initialize-decode".to_owned(),
+            };
+        }
+    };
+    let Some(protocol) = initialize_payload
+        .pointer("/result/protocolVersion")
+        .and_then(Value::as_str)
+    else {
+        return AuthenticatedMcpProbe {
+            state: DiagnosticState::Fail,
+            detail: "fail phase=initialize-result".to_owned(),
+        };
+    };
+    let Some(session_id) = session_id else {
+        return AuthenticatedMcpProbe {
+            state: DiagnosticState::Fail,
+            detail: "fail phase=initialize-session".to_owned(),
+        };
+    };
+
+    let list =
+        json!({"jsonrpc": "2.0", "id": "doctor-tools", "method": "tools/list", "params": {}});
+    let response = match client
+        .post(&url)
+        .bearer_auth(&token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header("mcp-session-id", &session_id)
+        .json(&list)
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = client
+                .delete(&url)
+                .bearer_auth(&token)
+                .header("mcp-session-id", &session_id)
+                .send();
+            return AuthenticatedMcpProbe {
+                state: DiagnosticState::Fail,
+                detail: format!(
+                    "fail phase=tools-list detail={}",
+                    compact_detail(&error.to_string())
+                ),
+            };
+        }
+    };
+    let status = response.status().as_u16();
+    let list_bytes = response.bytes();
+    let _ = client
+        .delete(&url)
+        .bearer_auth(&token)
+        .header("mcp-session-id", &session_id)
+        .send();
+    if status != 200 {
+        return AuthenticatedMcpProbe {
+            state: DiagnosticState::Fail,
+            detail: format!("fail phase=tools-list http={status}"),
+        };
+    }
+    let list_payload: Value = match list_bytes
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(value) => value,
+        None => {
+            return AuthenticatedMcpProbe {
+                state: DiagnosticState::Fail,
+                detail: "fail phase=tools-list-decode".to_owned(),
+            };
+        }
+    };
+    let Some(tools) = list_payload
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+    else {
+        return AuthenticatedMcpProbe {
+            state: DiagnosticState::Fail,
+            detail: "fail phase=tools-list-result".to_owned(),
+        };
+    };
+    AuthenticatedMcpProbe {
+        state: DiagnosticState::Pass,
+        detail: format!(
+            "pass protocol={} tools={}",
+            sanitize_probe_token(protocol),
+            tools.len()
+        ),
+    }
+}
+
+fn overall_readiness(
+    service_health: bool,
+    local_authenticated: DiagnosticState,
+    remote: &RemoteProbeReport,
+) -> OverallReadiness {
+    if !service_health
+        || local_authenticated == DiagnosticState::Fail
+        || remote.edge_state == DiagnosticState::Fail
+        || remote.oauth_state == DiagnosticState::Fail
+        || remote.mcp_surface_state == DiagnosticState::Fail
+    {
+        OverallReadiness::Fail
+    } else {
+        // Doctor intentionally does not possess or mint a user's Connector
+        // OAuth credential. A healthy public MCP surface therefore proves
+        // reachability, not authenticated end-to-end Connector usability.
+        OverallReadiness::NotProven
+    }
+}
+
 fn parse_http_status(response: &str) -> Option<u16> {
     let first_line = response.lines().next()?;
     let mut parts = first_line.split_whitespace();
@@ -1043,6 +1344,35 @@ mod tests {
             Some("herdr-edge-prod")
         );
         assert_eq!(json_u64_field(body, "contractEpoch"), Some(2));
+    }
+
+    #[test]
+    fn readiness_never_promotes_unauthenticated_remote_surface_to_ready() {
+        let mut remote = RemoteProbeReport::absent();
+        remote.edge_state = DiagnosticState::Pass;
+        remote.oauth_state = DiagnosticState::Pass;
+        remote.mcp_surface_state = DiagnosticState::Pass;
+        assert_eq!(
+            overall_readiness(true, DiagnosticState::Pass, &remote),
+            OverallReadiness::NotProven
+        );
+    }
+
+    #[test]
+    fn readiness_fails_on_known_authenticated_or_remote_breakage() {
+        let mut remote = RemoteProbeReport::absent();
+        remote.edge_state = DiagnosticState::Pass;
+        remote.oauth_state = DiagnosticState::Pass;
+        remote.mcp_surface_state = DiagnosticState::Pass;
+        assert_eq!(
+            overall_readiness(true, DiagnosticState::Fail, &remote),
+            OverallReadiness::Fail
+        );
+        remote.oauth_state = DiagnosticState::Fail;
+        assert_eq!(
+            overall_readiness(true, DiagnosticState::Pass, &remote),
+            OverallReadiness::Fail
+        );
     }
 
     #[test]

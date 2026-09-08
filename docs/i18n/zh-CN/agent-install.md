@@ -20,10 +20,10 @@
 
 默认按**首次安装 / 第一台 Worker** 处理。不能因为本地 `~/.config/herdr-mcp` 目录为空就推断 fleet 意图，也不要反复盘问用户。
 
-- 如果用户已经提供 Herdr pairing address，这台电脑就是加入已有 Worker：安装/验证本机 runtime 与 macOS 权限后，执行 `herdr-mcp worker connect "<pairing-address>"`。跳过 Worker/R2/Connector 创建。
+- 如果用户已经提供 Herdr pairing address，这台电脑就是加入已有 Worker：安装/验证本机 runtime 与当前平台需要的权限后，执行 `herdr-mcp worker connect "<pairing-address>"`。跳过 Worker/R2/Connector 创建。
 - 否则先做能自动判断的事，而不是问：检查本机 runtime 是否已有已登记的 device identity；拿到 Cloudflare Token 后列出 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts` 看是否已有 Herdr Worker。若检测到已有 fleet，切换到[既有 fleet 流程](existing-worker-connect.md)。
 - 只有当无法自动检测到 fleet、用户也没给 pairing address 时，才只问一个问题：**创建第一个 Herdr Worker，还是加入已有 Herdr Worker？** 选择**加入已有 Worker** 必须先由已登记设备给出 pairing；选择**创建第一套 Worker**（默认）才继续 Cloudflare bootstrap，并仅在确实需要 Cloudflare 授权时暂停。
-- **绝不能**在当前正在安装的这台新电脑上执行 `herdr-mcp worker pair` 来“探测是否已有 fleet”。`worker pair` 必须先有凭据证明本机已经加入目标 Worker。全新机器如果既没有已登记的 device identity，也没有已有 Edge origin，应 fail closed，明确提示“首个 Worker 初始化”或“用 pairing address 执行 `worker connect`”，而不是暴露缺失 LaunchAgent/Keychain 的底层错误。
+- **绝不能**在当前正在安装的这台新电脑上执行 `herdr-mcp worker pair` 来“探测是否已有 fleet”。`worker pair` 必须先有凭据证明本机已经加入目标 Worker。全新机器如果既没有已登记的 device identity，也没有已有 Edge origin，应 fail closed，明确提示“首个 Worker 初始化”或“用 pairing address 执行 `worker connect`”，而不是暴露缺失平台 service/credential backend 的底层错误。
 - pairing、旧 Worker 升级、hostname 连通性或权限失败都仍属于 existing-fleet 修复路径。除非用户明确改变 fleet 意图，否则禁止 fallback 到随机后缀的新 Worker、R2 桶或 Connector。
 
 ## 1. 前置条件
@@ -160,7 +160,7 @@ macOS 正常安装已由托管服务 `dev.herdr-mcp.herdr-supervisor` 保持 Her
 - STANDALONE：v0.4.3+ 的 GitHub/手动固定身份 package；Store 不可用或用户明确要求独立分发时使用。
 - DEV：仅源码开发，Load unpacked repo/worktree `extension/`，ID 路径派生。
 
-Agent 必须先读取当前 runtime 实际支持的 `native-host` 命令；v0.4.2 只有 Store/DEV，不得虚构 standalone。STANDALONE 是独立于源码开发的分发通道，DEV 仍仅用于源码开发。支持该能力的 runtime 使用 `herdr-mcp native-host use standalone` 显式切换。选择并安装通道后执行：
+Agent 必须先读取当前 runtime 实际支持的 `native-host` 命令；v0.4.2 只有 Store/DEV，不得虚构 standalone。STANDALONE 是独立于源码开发的分发通道，DEV 仍仅用于源码开发。托管 Chromium Native Messaging host 当前属于 macOS 集成；Linux 的核心 runtime / Link / Connector 不依赖它，因此 Linux 跳过 native-host 安装。macOS 上支持该能力的 runtime 使用 `herdr-mcp native-host use standalone` 显式切换。选择并安装通道后执行：
 
 ```bash
 herdr-mcp native-host status
@@ -168,9 +168,9 @@ herdr-mcp native-host status
 
 状态应明确显示预期 active channel / extension identity，并确认 Native Host runtime 与当前 runtime generation 一致。详见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
 
-## 8. macOS 持久 Herdr Link
+## 8. macOS/Linux 持久 Herdr Link
 
-把 `LINK_SHARED_SECRET` 存进 Keychain，服务名 `herdr-edge-link-<WORKSTATION_ID>`。命令文本只能引用环境变量，不能写字面秘密。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link 安装路径（`herdr-mcp link ...` / 当前 stable 产品文档）。不要把生产 Link 所有权留在仓库 Bash 包装上。
+v0.4.8 的正常已登记设备不要再手工配置 `LINK_SHARED_SECRET`。`worker bootstrap` / `worker connect` 会创建单设备凭据，并写入平台 credential backend：macOS 使用 Keychain，Linux 使用用户私有的 `0700`/`0600` credential store。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link lifecycle。不要把 production Link 所有权留在仓库 Bash 包装上。
 
 Agent 应该自己探测网络可达性，而不是让用户先选择 transport。执行 `herdr-mcp doctor`、`herdr-mcp link status`，并对最终 public origin / backing `workers.dev` 做有界 `/health` 探测。Link 会复用用户环境里**已经存在**的代理配置，识别优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 也会读取现有 `scutil --proxy` 状态（HTTPS、HTTP、SOCKS）。支持 `socks5://`/`socks5h://`（remote-DNS 语义），不支持代理认证；macOS PAC 只检测不执行。
 
