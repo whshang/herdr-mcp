@@ -226,6 +226,22 @@ test("current workflows pin checkout and setup-node to reviewed v7 commits", asy
   }
 });
 
+test("CI Rust gate uses a trusted-main-only shared compiler cache", async () => {
+  const ci = await readFile(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  assert.match(ci, /CARGO_INCREMENTAL:\s*["']0["']/);
+  assert.match(ci, /RUSTC_WRAPPER:\s*sccache/);
+  assert.match(ci, /SCCACHE_GHA_ENABLED:\s*["']true["']/);
+  assert.match(
+    ci,
+    /SCCACHE_GHA_RW_MODE:\s*\$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' && 'READ_WRITE' \|\| 'READ_ONLY' \}\}/,
+  );
+  assert.match(
+    ci,
+    /mozilla-actions\/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba/,
+    "sccache action must stay pinned to the reviewed commit",
+  );
+});
+
 test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 target contract", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const targetContract = JSON.parse(await readFile(join(ROOT, ".github/rust-release-targets.json"), "utf8"));
