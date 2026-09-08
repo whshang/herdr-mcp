@@ -24,46 +24,49 @@ test("README gives the Agent one executable install sentence plus a short explan
   }
 });
 
-test("Agent install guides own Cloudflare-token handoff and workers.dev-only bootstrap", () => {
+test("Agent install guides own Cloudflare-token handoff and direct release-artifact bootstrap", () => {
   for (const rel of ["docs/i18n/en/agent-install.md", "docs/i18n/zh-CN/agent-install.md"]) {
     const doc = read(rel);
     assert.match(doc, /dash\.cloudflare\.com\/profile\/api-tokens/);
     assert.match(doc, /Edit Cloudflare Workers/);
     assert.match(doc, /Workers Scripts/);
     assert.match(doc, /CLOUDFLARE_API_TOKEN/);
-    assert.match(doc, /CLOUDFLARE_ACCOUNT_ID/);
-    assert.match(doc, /wrangler whoami/);
-    assert.match(doc, /workers\/subdomain/);
-    assert.match(doc, /PUT \/client\/v4\/accounts\/<ACCOUNT_ID>\/workers\/subdomain/);
-    assert.match(doc, /wrangler deploy --config wrangler\.user\.toml/);
-    assert.match(doc, /provision-r2\.mjs/);
+    assert.match(doc, /herdr-mcp worker bootstrap/);
+    assert.match(doc, /herdr-edge-<version>\.mjs/);
+    assert.match(doc, /release manifest/);
+    assert.match(doc, /artifact attestation/);
+    assert.match(doc, /Cloudflare API/);
     assert.match(doc, /Workers R2 Storage/);
     assert.match(doc, /optional|可选/i);
-    assert.match(doc, /wrangler secret put LINK_SHARED_SECRET/);
-    assert.match(doc, /workers_dev = true/);
-    assert.match(doc, /routes = \[\]/);
+    assert.match(doc, /workers\.dev/);
+    assert.doesNotMatch(doc, /npx wrangler|wrangler deploy --config|wrangler secret put/);
   }
 });
 
-test("Agent install resolves fleet ownership before any Cloudflare mutation", () => {
+test("Agent install resolves fleet existence before any Cloudflare mutation", () => {
   const en = read("docs/i18n/en/agent-install.md");
   const zh = read("docs/i18n/zh-CN/agent-install.md");
 
-  assert.ok(en.indexOf("Fleet ownership gate") >= 0);
-  assert.ok(en.indexOf("Fleet ownership gate") < en.indexOf("Cloudflare authorization pause"));
-  assert.ok(zh.indexOf("Fleet 所有权闸门") >= 0);
-  assert.ok(zh.indexOf("Fleet 所有权闸门") < zh.indexOf("Cloudflare 授权暂停"));
+  assert.ok(en.indexOf("Fleet classification") >= 0);
+  assert.ok(en.indexOf("Fleet classification") < en.indexOf("## 4. Cloudflare authorization"));
+  assert.ok(zh.indexOf("Fleet 分类") >= 0);
+  assert.ok(zh.indexOf("Fleet 分类") < zh.indexOf("## 4. Cloudflare 授权"));
 
   for (const doc of [en, zh]) {
     assert.match(doc, /herdr-mcp worker pair/);
     assert.match(doc, /herdr-mcp worker connect "<pairing-address>"/);
-    assert.match(doc, /(?:--name[^\n]*(?:explicitly|明确)|(?:explicitly|明确)[^\n]*--name)/i);
+    assert.match(doc, /(?:default|默认)[^\n]*--name|--name[^\n]*(?:default|默认)/i);
     assert.match(doc, /~\/\.config\/herdr-mcp/);
     assert.match(doc, /export PATH="\$HOME\/\.local\/bin:\$PATH"/);
     assert.match(doc, /grep -Fqx/);
     assert.match(doc, /zsh -ic 'command -v herdr && herdr --version'/);
     assert.match(doc, /random-suffixed Worker|随机后缀[^\n]*Worker/);
-    assert.match(doc, /first[- ]fleet/i);
+    assert.match(doc, /first[- ](?:Worker|fleet)|第一(?:台|套)[^\n]*Worker/i);
+  }
+
+  for (const rel of ["docs/i18n/en/existing-worker-connect.md", "docs/i18n/zh-CN/existing-worker-connect.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /--name[^\n]*(?:explicitly|明确)|(?:explicitly|明确)[^\n]*--name/i);
   }
 
   assert.doesNotMatch(en, /choose a machine-specific\/random-suffixed name instead/);
@@ -84,7 +87,9 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
     assert.match(doc, /GitHub Releases/);
     assert.match(doc, /herdr-mcp install/);
     assert.doesNotMatch(doc, /## 2\.[^\n]*\n[\s\S]*?git clone https:\/\/github\.com\/whshang\/herdr-mcp/);
-    assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
+    assert.match(doc, /herdr-mcp worker bootstrap/);
+    assert.doesNotMatch(doc, /scripts\/cloudflare-worker-name\.mjs/);
+    assert.doesNotMatch(doc, /npx wrangler/);
     assert.match(doc, /WORKER_NAME/);
     assert.match(doc, /ACCOUNT_SUBDOMAIN/);
     assert.match(doc, /Cloudflare[^\n]*API/);
@@ -99,8 +104,9 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
   }
   for (const rel of ["docs/i18n/en/install.md", "docs/i18n/zh-CN/install.md"]) {
     const doc = read(rel);
-    assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
-    assert.match(doc, /WORKER_NAME/);
+    assert.match(doc, /herdr-mcp worker bootstrap/);
+    assert.doesNotMatch(doc, /scripts\/cloudflare-worker-name\.mjs/);
+    assert.doesNotMatch(doc, /npx wrangler/);
     assert.match(doc, /herdr-mcp install/);
   }
   for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
@@ -145,7 +151,7 @@ test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () =
   assert.doesNotMatch(src, /^NODE_BIN="\/usr\/local\/bin\/node"$/m);
 });
 
-test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and owner OAuth handoff", () => {
+test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and fleet OAuth handoff", () => {
   for (const rel of [
   ]) {
     const doc = read(rel);

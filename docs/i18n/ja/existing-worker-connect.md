@@ -2,7 +2,7 @@
 
 これは**新しいコンピュータを既存の herdr-mcp Worker/Connector に接続する**ための権威ある Agent 実行契約です。**新規 Worker デプロイではありません**。
 
-> **v0.4.3 では macOS のみ。** 安全な新規デバイス接続（ペアリング）は macOS Keychain の資格情報バックエンドを必要とします。Linux/Windows では `worker pair` / `worker connect` 経路は**利用不可で fail closed** です。runtime 自体はこれらのプラットフォームでもサポートされています。
+> **v0.4.8 では macOS と x86_64 Linux/Debian をサポートします。** macOS は最終デバイス資格情報を Keychain に保存し、Linux はユーザー専用の credential store（ディレクトリ `0700`、通常ファイル `0600`）に保存します。Windows の `worker pair` / `worker connect` は引き続き利用不可で fail closed です。
 
 ## 始める前に
 
@@ -12,15 +12,13 @@
 
 ## ペアリングの仕組み
 
-1. **推奨: 認可済みの ChatGPT / Herdr 会話から直接ペアリングを作成します。** 例えば次のように依頼します:
+1. **推奨: 登録済みのデバイスからペアリングを作成します。** fleet 内の任意の登録済みコンピュータで次を実行します:
 
-   ```text
-   新しいコンピュータ用に、10 分間有効な Herdr ペアリングリンクを生成してください。
+   ```bash
+   herdr-mcp worker pair
    ```
 
-   ChatGPT は Edge 上で直接ペアリングを作成でき、既存ワークステーションがオンラインである必要はありません。結果には、**ペアリングアドレス**、単回使用の **6 桁コード**、**正確な有効期限**、およびコピー可能な `herdr-mcp worker connect "<pairing-address>"` コマンドをまとめて表示します。通常の最大 TTL は 600 秒です。
-
-   CLI fallback として、fleet 内の認可済み macOS コンピュータで `herdr-mcp worker pair` を実行しても同じ短期 pairing を作成できます。CLI も UTC の正確な期限を表示します。
+   `worker pair` は device/operator が管理する fleet アクションであり、このマシンが対象 Worker に登録済みであることを証明する資格情報が必要です。Worker control plane で pairing を作成するため、既存ワークステーションがオンラインである必要はありません。結果には、**ペアリングアドレス**、単回使用の **6 桁コード**、**正確な有効期限**、およびコピー可能な `herdr-mcp worker connect "<pairing-address>"` コマンドをまとめて表示します。通常の最大 TTL は 600 秒です。
 
 2. **新しいコンピュータ**で、Agent が次を実行します:
 
@@ -28,20 +26,19 @@
    herdr-mcp worker connect "<pairing-address>"
    ```
 
-   CLI は**6 桁のコードの入力を求めます**（エコーバックなしの TTY プロンプト、または非対話時はエコーなしの stdin 1 行）。コードは**決してコマンドライン引数にはならず**、**決してエコーまたはログ記録されません**。
+   CLI は**6 桁のコードの入力を求めます**。対話端末では入力した数字を通常どおり表示するため、打ち間違いを確認できます。コードは**コマンドライン引数にはならない**ため、shell history には残りません。
 
-   デフォルトでは、参加するコンピュータの macOS **Computer Name** が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
+   デフォルトでは、参加するコンピュータがプラットフォームから取得したコンピュータ名/hostname が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
 
-   ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。ローカル service が healthy で、`link-prod` が managed runtime と新しい device identity を使用していることを確認できた場合のみ成功を返します。失敗時は既存の revoke / Keychain / config 補償経路を使用します。
+   ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。macOS は launchd、通常の Linux login/server 環境は `systemd --user` を優先します。user systemd manager/bus が存在しない init-less container などでは、PID と Linux `/proc` start time で所有プロセスを厳密に識別する detached user-process backend にフォールバックします。この fallback は host/container が動作している間は shell/SSH 終了後も継続しますが、systemd の crash restart や boot/container restart 後の自動起動は提供しません。長期常駐が必要な場合は systemd または外側の supervisor を使用してください。ローカル service が healthy で、production Link が新しい device identity を使用していることを確認できた場合のみ成功を返し、失敗時は remote revoke とローカル credential / config の補償を実行します。
 
-3. 成功すると、一時的なペアリングが既存の高エントロピー毎デバイス秘密情報と交換されます。最終的なデバイス秘密情報は**macOS Keychain のみ**に保存されます。ペアリングコード/セッションは即座に使用不能になります。参加デバイスでは、Cloudflare デプロイ資格情報も旧来の `LINK_SHARED_SECRET` も使用されません。
+3. 成功すると、一時的なペアリングが高エントロピーのデバイス単位資格情報と交換されます。macOS は最終資格情報を Keychain に、Linux は上記のユーザー専用 credential store に保存します。ペアリングコード/セッションは即座に使用不能になります。参加デバイスでは、Cloudflare デプロイ資格情報も旧来の `LINK_SHARED_SECRET` も使用されません。
 
 ## セキュリティ規則
 
 - 6 桁のコードは、意図された短時間有効なペアリング資格情報です。単回使用で、10 分で期限切れになり、**誤った試行が 5 回**を超えるとセッションは永久にロックされます。
 - ペアリング id は高エントロピーで推測不可能であり、ペアリングアドレス（URL フラグメント）に含まれます。HTTP アクセスログのパスには含まれません。最終的なデバイス秘密情報はペアリングアドレスには決して含まれません。
-- ユーザーが OAuth 認可済み owner 会話で明示的に pairing を作成した場合、その会話には単回使用コードを表示できます。それ以外では、コードを argv、シェル履歴、Git、通常ログ、コピーした transcript、無人自動化に保存しないでください。`echo 123456 | ...` のような方法も使用しません。
-- 最終的なデバイス資格情報は macOS Keychain に属します。印刷またはログ記録しないでください。
+- 最終的なデバイス資格情報は OS の安全なローカル credential store に属します。印刷またはログ記録しないでください。
 
 ## 検証
 
@@ -63,24 +60,20 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` も同じ操作です。rename が変更するのは人向けの表示名だけで、不変な `device_id`、workstation identity、資格情報、authorization、scheduling は変わりません。Link の再接続で明示的な rename が上書きされることもありません。default/legacy workstation も最初の登録時にローカル Computer Name を記録します。
 
-別の登録済みデバイスの認可を恒久的に取り消す場合、現在の推奨経路は認可済みの ChatGPT/Herdr Web 会話です。ChatGPT にデバイス一覧を表示させ、対象の不変 `device_id` を選び、そのデバイスを恒久的に revoke させます。Edge-local 操作は次と同等です:
-
-```text
-herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
-```
-
-この経路はワークステーションのオンライン状態を必要とせず、display name は受け付けません。CLI fallback として、まず `herdr_devices` で不変の `device_id` を確認し、owner ワークステーションで次を実行します:
+別の登録済みデバイスの認可を恒久的に取り消す場合、登録済みの任意のワークステーションで実行します。まず `herdr_devices` で不変の `device_id` を確認し、次を実行します:
 
 ```bash
 herdr-mcp worker revoke "<device-id>" --confirm
 ```
+
+デバイス/オペレーターが fleet 管理を担当します。この操作は display name を受け付けず、不変の `device_id` を使用する必要があります。承認済み WebChat Connector は通常の MCP 権限のみで、デバイスを revoke できません。
 
 revoke はそのデバイス identity と資格情報に対して恒久的です。稼働中の Link は切断され、古い資格情報では再接続できません。古い identity の復活を防ぐため内部には最小の revoked tombstone を保持しますが、通常のデバイス一覧には表示しません。後で同じコンピュータを再追加する場合は、新しい pairing で新しいデバイス identity として登録してください。
 
 ## 不確実な配信 / リカバリ
 
 - いずれかの mutation が不確実な配信を報告した場合は、**盲目的に再試行せず**、まず現在の状態を確認してください。
-- connect がサーバー側の消費後に失敗した場合は、組み込みの補償/revoke 動作（正確なリモート revoke-self + ローカル Keychain クリーンアップ + 以前の config の復元）に依存し、証拠を報告してください。手動の秘密情報処理を発明しないでください。
+- connect がサーバー側の消費後に失敗した場合は、組み込みの補償/revoke 動作（正確なリモート revoke-self + ローカルのプラットフォーム credential store クリーンアップ + 以前の config の復元）に依存し、証拠を報告してください。手動の秘密情報処理を発明しないでください。
 - コードを 5 回間違って入力すると、セッションは永久にロックされます。`herdr-mcp worker pair` で新しいペアリングを作成してください。
 
 ## 複数デバイスの検証

@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 标记的 `Latest` stable Release 为准。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。v0.4.3+ 的安装流程继续保持同一个 broker compatibility revision，并在会轮换的 runtime service 启动前先确保固定 broker 已存在。macOS 交互式首次安装会直接打开 **完全磁盘访问（Full Disk Access）**，但授权动作仍必须由用户本人在系统设置中确认；`herdr-mcp permissions setup` 可再次打开同一设置页，`herdr-mcp permissions verify` 用于验证。普通 runtime generation 更新不会重写同 revision 的 broker。最充分的 clean-machine qualification 证据仍来自 `v0.4.0` 的 **macOS Apple Silicon** 验收。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；Linux runtime 暂不作为当前 stable 的正式支持面承诺。
+当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 标记的 `Latest` stable Release 为准。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。v0.4.3+ 的安装流程继续保持同一个 broker compatibility revision，并在会轮换的 runtime service 启动前先确保固定 broker 已存在。macOS 交互式首次安装会直接打开 **完全磁盘访问（Full Disk Access）**，但授权动作仍必须由用户本人在系统设置中确认；`herdr-mcp permissions setup` 可再次打开同一设置页，`herdr-mcp permissions verify` 用于验证。普通 runtime generation 更新不会重写同 revision 的 broker。当前最充分的 clean-machine **existing-fleet 安装**证据来自 2026-09-08 的 v0.4.8 Apple Silicon UAT：精确 Release 产物 → Full Disk Access/TCC 验证 → 短期 `worker connect` → service/Link/generation/credential 检查 → `doctor` → ChatGPT 实际路由到该设备的 Herdr 调用。clean first-Worker bootstrap 仍属于发布后 production acceptance 的独立项目。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续。从 v0.4.8 发布线开始，GitHub Releases 也正式提供面向 x86_64 Debian 服务器的静态 `x86_64-unknown-linux-musl` runtime；该产物不依赖宿主机 glibc，目标覆盖 Debian 11/12/13 一类服务器环境。Linux 上的 `herdr-mcp install` 在正常用户会话优先使用 `systemd --user` 管理本地 runtime 与 production Link；如果环境没有 user systemd manager/bus，则使用受 PID + `/proc` start time 校验保护的 detached 用户进程 backend。首台设备的 `worker bootstrap`、已有 fleet 的 `worker pair` / `worker connect`、设备与 Connector 管理、Automation 管理统一使用 Linux 用户私有 credential store，不再假设 macOS Keychain。`update apply` / `update auto` 复用同一套 attestation 校验、native updater 与 Linux 事务安装器；Linux 不安装 macOS 的 launchd 每日 scheduler，如需周期检查由外部 scheduler 调用即可。浏览器 Native Messaging 与 macOS 隐私/TCC 集成仍属于 macOS 专属能力。
 
 macOS 的 v0.4.3 还把生产设备凭据从会轮换的 runtime 代码中分离出来：Keychain 读写统一经过固定的 `~/.config/herdr-mcp/herdr-mcp-credential-helper`。已有安装第一次迁移到这个 helper 时，macOS 可能只需要一次明确的钥匙串授权；该预检发生在 service / Link mutation 之前，弹窗被忽略或拒绝时会直接中止，不会进入反复重启 Link、反复弹窗的状态。普通 runtime 升级会保留同 compatibility revision 的 helper，因此每个新的 `runtime/generations/rust-*` 不再分别成为新的 Keychain client。这个 credential helper 与上面的完全磁盘访问 / TCC broker 是两个独立的稳定身份。
 
@@ -56,6 +56,8 @@ herdr-mcp update check
 ```
 
 `install` 会把不可变 generation 放到 `~/.config/herdr-mcp/runtime/` 并让用户 PATH 入口指向 `runtime/current/herdr-mcp`。普通用户不要用 git clone、`npm` 或 `cargo` 安装本机 runtime。
+
+x86_64 Debian 服务器应使用 `herdr-mcp-<version>-x86_64-unknown-linux-musl` 产物，先通过 release manifest 校验 checksum / attestation，再把该候选 binary 放到可执行位置并运行 `herdr-mcp install`。安装器会把当前 binary 复制为 `~/.config/herdr-mcp/runtime/` 下的不可变 generation，维护 `runtime/current` 与用户 CLI 链接，整个流程默认不需要 root。正常 Debian 登录/服务器环境使用 `systemd --user` 安装 `herdr-mcp.service` 和 `herdr-mcp-link.service`，systemd unit 不写入设备凭据或本地 MCP bearer。若 `systemctl --user` 没有可用 manager/bus（例如无 init 的开发容器），`rust-process-user` backend 会用同一 managed generation 启动 detached runtime 与 Link，并记录 PID + Linux process start time 后才认领该进程。该 fallback 在当前宿主机/容器生命周期内可跨 shell/SSH 退出存活，但不能替代 init system：崩溃重启、开机或容器重启后的自启动必须交给外层 supervisor。正常长期服务器仍优先使用 systemd；若发行版会在最后一个登录会话结束后停止 user manager，而又要求 Herdr 持续在线，应按本机运维策略开启 systemd user lingering。已有 fleet 创建短期 pairing 后，在 Debian 上执行 `herdr-mcp worker connect "<pairing-address>"`：每设备凭据写入用户私有 credential store（目录 `0700`、常规凭据文件 `0600`），Edge/device 配置按事务更新，然后启动托管 service 与 Link。注册完成的 Linux 设备可以执行依赖已注册设备 bearer 的设备与 Connector owner 操作。`herdr-mcp doctor` 通过后才算 Debian 安装闭环完成。
 
 macOS 上服务仍然是普通用户级 LaunchAgent；不需要 `sudo`，而且管理员权限本身也不能替代 TCC 授权。需要授予完全磁盘访问的是固定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`，不是持续变化的 `runtime/generations/rust-*`。非交互式安装会先准备好 broker，但不会强行打开系统设置；如果尚未授权，在用户终端执行一次 `herdr-mcp permissions setup` 即可。
 
@@ -76,21 +78,23 @@ herdr-mcp status
 
 自动化安装时由 Agent 按 [Agent 安装](agent-install.md) / [Agent 安装合同](agent-install.md) 直接执行这段；协议负责 Token 最小权限、Worker 命名、secret 注入、Account 选择和网络 blocker 的处理边界。
 
-手动执行时，至少遵守：
+手动/operator 安装同样直接运行已安装 runtime：
+
+```bash
+herdr-mcp worker bootstrap
+```
+
+该命令负责 Worker 命名、Release artifact 校验、Cloudflare API 直接上传、secret、第一台设备 enrollment 与 readiness 验证。普通手动安装不需要源码 checkout、Node.js、npm、Wrangler 或 `wrangler.user.toml`。
+
+同时遵守：
 
 - Cloudflare API Token 只作为临时进程环境变量；
 - 不把 Token 写进仓库、日志、截图或 shell history；
-- 保持 `workers_dev = true`；`routes = []` 只是零域名 bootstrap 状态，不是已有合适 active zone 时的优先最终身份；最终 hostname 优先走 Worker Custom Domain，不申请通用 DNS Write；
-- Worker 名使用仓库 helper：
-
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-```
-
+- 保持 `workers.dev` 作为零域名 bootstrap origin；已有合适 active zone 时，在 Connector 授权前固化 Worker Custom Domain，不申请通用 DNS Write；
 - `LINK_SHARED_SECRET` 作为 Worker secret 保存；
 - 工作站只主动建立出站 WSS，不暴露本机公网端口。
 
-详细手动协议见 [Agent 协助安装](agent-install.md) 与 [Cloudflare Edge 部署](cloudflare-edge-deployment.md)。
+普通 bootstrap 合同见 [Agent 协助安装](agent-install.md)。[Cloudflare Edge 部署](cloudflare-edge-deployment.md) 中的源码/Wrangler 流程只保留给维护者与深度运维。
 
 ## 第四步：安装并验证 Herdr Link
 
@@ -196,4 +200,4 @@ herdr-mcp reinstall
 herdr-mcp uninstall
 ```
 
-`reinstall` 会修复 / 替换 managed Rust runtime，同时保留配置与凭据；generations 按正常 service GC 保留 active / rollback-safe 集合。`uninstall` 会清理经过强 ownership 校验的 herdr-mcp 本机 runtime/config 状态：默认实例覆盖自己的 service、归属明确的每日 auto-update scheduler、Link/watchdog、Native Messaging host、managed CLI link 和 config root；named instance 只删除自己的 service/watchdog/config。产品卸载会在删除 config root 前，把一个极小的 durable update-fence tombstone 写到 config 之外的用户 cache 中，因此即使 config 已完全删除，已经排队的静默 updater 也不能把 service 复活；只有显式且成功的 install/reinstall 才会清除该 tombstone。它明确保留 Herdr 本体（`herdr`、Herdr service/socket/config），以及由浏览器、Cloudflare、Keychain、TCC 分别管理的授权状态。这类 lifecycle mutation 应从独立终端执行，不要在依赖目标 service 的 managed `herdr_exec` 会话内部执行。
+macOS 上，`reinstall` 会修复 / 替换 managed Rust runtime，同时保留配置与凭据。Linux 的 runtime 修复使用 `herdr-mcp install`，显式服务移除使用 `herdr-mcp service uninstall`；完整 product uninstall 仍属于 macOS lifecycle 集成。macOS 上，generations 按正常 service GC 保留 active / rollback-safe 集合。`uninstall` 会清理经过强 ownership 校验的 herdr-mcp 本机 runtime/config 状态：默认实例覆盖自己的 service、归属明确的每日 auto-update scheduler、Link/watchdog、Native Messaging host、managed CLI link 和 config root；named instance 只删除自己的 service/watchdog/config。产品卸载会在删除 config root 前，把一个极小的 durable update-fence tombstone 写到 config 之外的用户 cache 中，因此即使 config 已完全删除，已经排队的静默 updater 也不能把 service 复活；只有显式且成功的 install/reinstall 才会清除该 tombstone。它明确保留 Herdr 本体（`herdr`、Herdr service/socket/config），以及由浏览器、Cloudflare、Keychain、TCC 分别管理的授权状态。这类 lifecycle mutation 应从独立终端执行，不要在依赖目标 service 的 managed `herdr_exec` 会话内部执行。

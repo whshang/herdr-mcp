@@ -30,7 +30,7 @@ The model keeps planning. Your computers keep the real state. Small tasks can ru
 ### Recommended: paste one sentence to your Agent
 
 ```text
-Install and configure Herdr and herdr-mcp for me by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end; use the current stable GitHub Release, configure Cloudflare and ChatGPT, prefer a dedicated Cloudflare Custom Domain when my account already has a suitable active zone, otherwise keep workers.dev, automatically verify the workstation network/fallback path, pause only when I must personally sign in or authorize access, and verify the complete connection before finishing.
+Install Herdr and herdr-mcp for me by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end: use the current stable GitHub Release, configure Cloudflare and ChatGPT, prefer a dedicated Cloudflare Custom Domain when my account already has one suitable active zone (otherwise keep workers.dev), keep R2 optional, verify the workstation network path, and pause only when I must personally sign in, create a Cloudflare Token, or authorize ChatGPT.
 ```
 
 The Agent checks the machine, installs Herdr and herdr-mcp, bootstraps the Worker on `workers.dev`, recommends/finalizes a Custom Domain before OAuth when your Cloudflare account has a suitable zone, starts the workstation connection, guides you through ChatGPT authorization, tests the actual network path, and proves the setup with a real MCP request. No domain is required: without one, the Link transparently falls back from direct `workers.dev` to an already-configured local proxy and then to the qualified shared Relay baseline when necessary.
@@ -73,13 +73,13 @@ Web AI can also copy small non-secret UTF-8 text between enrolled computers thro
 
 ### Add another computer to the fleet
 
-Preferred: ask in the already-authorized ChatGPT conversation:
+On any computer already enrolled in the fleet, run:
 
 ```text
-Generate a Herdr pairing link for my new computer, valid for 10 minutes.
+herdr-mcp worker pair
 ```
 
-Herdr creates the pairing directly at Edge, so no old workstation needs to be online. ChatGPT returns the pairing address, one-time 6-digit code, exact expiry, and the copyable `herdr-mcp worker connect "<pairing-address>"` command. `herdr-mcp worker pair` on an authorized Mac remains the CLI fallback.
+Herdr creates the pairing at the Worker control plane, so the operation does not need to route through a workstation. Pairing is a device/operator fleet action: run it on any already-enrolled computer through `herdr-mcp worker pair`. Never run `worker pair` on the fresh computer as a discovery probe; if this is the first Worker, complete the Cloudflare bootstrap first. The pairing result includes the address, one-time 6-digit code, exact expiry, and the copyable `herdr-mcp worker connect "<pairing-address>"` command.
 
 On the new computer, give its coding agent this one sentence:
 
@@ -121,6 +121,16 @@ Good combinations:
 Avoid several agents editing the same working tree. Use isolated worktrees for parallel mutations.
 
 For long tests and builds, the planner uses `herdr_exec_start` and resumes with `herdr_exec_read(session_id, offset=next_offset)` instead of treating terminal scrollback as completion evidence. Completed sessions keep bounded final output and exit evidence long enough to survive a runtime replacement; a running process is never assumed to have been safely taken over after a restart.
+
+### Herdr 0.9 multi-machine + Herdr-MCP devices
+
+Herdr 0.9 can save SSH machines and show several Herdr servers in one TUI. Herdr-MCP keeps its own Edge device fleet for ChatGPT/Web-AI routing. The same physical computer may use both paths at once: if both paths reach the same Herdr session, they see the same live workspace, pane, agent, terminal, Git, and filesystem state because they are talking to the same Herdr server — not because two copies are synchronized.
+
+The identities stay separate. A Herdr saved machine is addressed by its machine profile + SSH target + Herdr session; an Edge device is addressed by its immutable `device_id` and device-bound `herdr_ref_*` references. Never treat a bare `w1` or `w1:p1` as globally unique across machines, and never merge the two identities just because labels or hostnames look similar.
+
+Herdr 0.9's multi-machine TUI does not yet provide machine-scoped pane/workspace CLI or socket calls. Selecting a remote machine in the TUI does not retarget ordinary local `herdr pane ...` / `herdr workspace ...` commands, and `herdr --remote <target>` is currently a TUI attach path rather than a modifier for those subcommands. Until upstream adds a native machine-scoped API, explicit maintenance/UAT automation can resolve `herdr machine list --json`, then use that profile's SSH target/session to run Herdr CLI on the remote server. ChatGPT operations continue to prefer the Edge device path; SSH is never a transparent retry for an Edge mutation with uncertain delivery.
+
+See [Herdr 0.9 multi-machine and dual-path control](docs/i18n/en/multi-machine-control.md) for the routing rules, verification procedure, and upstream tracking.
 
 ## Chrome extension
 
