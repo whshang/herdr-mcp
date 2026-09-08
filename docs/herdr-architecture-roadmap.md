@@ -47,16 +47,20 @@ alpha.2  Project Work Memory
 alpha.3  Browser Endpoint / Resource Registry
 alpha.4  ChatGPT Web adapter vertical
 alpha.5  Gemini second-provider vertical
+alpha.6  Claude provider vertical
+alpha.7  Grok provider vertical
+alpha.8  bounded generic Page Assist
+alpha.9  Toolchain Efficiency（native-default exec / 18-tool efficiency gate）
 beta.1   reliability / postcondition（reload/stale-view 恢复、uncertain delivery 结算）
 beta.2   multi-device / multi-endpoint / multi-account reservation + failover
 rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 ```
 
-**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）§16.2 的表格写于 alpha.5 追加之前，只覆盖 alpha.1–4 → beta.1 → beta.2 → rc.1、不含 alpha.5。自 alpha.5 追加起，该表格不再是里程碑序列的权威，上表（本文件）才是唯一正式序列。alpha.5 存在的原因正是冻结 plan §17 WebChat gate 的 "at least two providers prove the semantic adapter seam"：单一 ChatGPT vertical（alpha.4）无法证明 adapter seam 是 provider-neutral 的，因此必须在 beta.1 reliability/postcondition 之前增加第二个 Provider（Gemini）纵向阶段。
+**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）§16.2 只覆盖早期 alpha.1–4 → beta.1 → beta.2 → rc.1。后续真实实现依次补入第二 Provider、Claude/Grok provider vertical、Page Assist，以及本轮在 Beta 1 前插入的 Alpha 9 Toolchain Efficiency；因此上表（本文件）是唯一正式里程碑序列。Alpha 9 不增加工具数量；其中 native-default `herdr_exec` 会改变冻结 epoch-2 中明确的 VISIBLE utility-pane 语义，因此必须作为显式 1.0 Runtime Execution contract identity/hash 演进处理，不能在旧 hash 下静默切换。
 
 1.0 以 v0.4.6 的 pre-1.0 stabilization 合同为基础，不复制其 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、planner tool-integrity、multi-device/Relay、Native Messaging local-auth、browser continuity/target-fencing 等实现。若 v0.4.6 的发布分支尚未回并 `main`，只在集成阶段吸收其已验证提交；1.0 feature branches 不另写同类机制。
 
-阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)，已随 PR #315 合并。alpha.4 起尚未合并实现。alpha.5 明确位于 ChatGPT adapter 后、beta.1 reliability/postcondition 前；在 alpha.5 完成真实双 Provider UAT 以前，Work Memory 可以作为跨 Provider 状态合同实现，但不能宣称 ChatGPT/Gemini WebChat 已具备生产级跨 Provider 调度。
+阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)；alpha.4–alpha.6 与 alpha.8 分别见对应 `_wip/v1.0-alpha*-*.md`；alpha.7 的工程状态由 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md) 记录；alpha.9 见 [`_wip/v1.0-toolchain-efficiency.md`](./_wip/v1.0-toolchain-efficiency.md)。Alpha 9 implementation 可在 Alpha 8 isolated browser UAT 并行推进，但不得先于接受后的 Alpha 8 integration boundary 合并；完成后再进入 beta.1 reliability/postcondition。
 
 1.0 的两个正式跨 Provider 验收场景固定为：
 

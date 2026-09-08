@@ -2144,6 +2144,38 @@ mod tests {
     }
 
     #[test]
+    fn uniform_json_success_compacts_but_chunk_reads_recover_raw_bytes() {
+        let registry = registry();
+        let command = r#"awk 'BEGIN{printf "["; for(i=0;i<200;i++){if(i)printf ","; printf "{\"id\":%d,\"name\":\"worker-%03d\",\"status\":\"idle\",\"workspace\":\"w1\"}",i,i}; printf "]"}'"#;
+        let started = registry.start(Path::new("/tmp"), command).unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait_until_closed(&registry, &id, "stdout", 65_536);
+        assert_eq!(view["exit_code"], 0);
+        assert_eq!(view["truncated"], false);
+        assert_eq!(view["compacted"], true);
+        assert_eq!(view["counts"]["strategy"], "json_object_table_v1");
+        let compacted = view["text"].as_str().unwrap();
+        let total = view["bytes_total"].as_u64().unwrap() as usize;
+        assert!(compacted.len() < total);
+
+        let mut offset = 0;
+        let mut raw = String::new();
+        while offset < total {
+            let chunk = registry.read(&id, "stdout", offset, 4_096);
+            assert!(chunk.get("compacted").is_none());
+            raw.push_str(chunk["text"].as_str().unwrap());
+            let next = chunk["next_offset"].as_u64().unwrap() as usize;
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(raw.len(), total);
+        let decoded: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded.as_array().unwrap().len(), 200);
+        assert_eq!(decoded[0]["name"], "worker-000");
+        assert_eq!(decoded[199]["name"], "worker-199");
+    }
+
+    #[test]
     fn completed_incremental_read_exposes_compact_completion_evidence() {
         let registry = registry();
         let started = registry
