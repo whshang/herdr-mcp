@@ -1441,6 +1441,7 @@ const H2W_CONTENT_VERSION = "0.1.90";
   let registeredConvKey = null;
   let registeredBrowserSessionRef = null;
   let registeredBrowserGeneration = null;
+  let browserRegistrationAttempt = 0;
 
   // ---- Message listener ----
   try {
@@ -1799,6 +1800,7 @@ const H2W_CONTENT_VERSION = "0.1.90";
 
   async function registerCurrentConversation(reason = "startup") {
     if (!runtimeAlive()) return null;
+    const registrationAttempt = ++browserRegistrationAttempt;
     const convKey = ADAPTER.getConversationKey();
     if (!convKey) return null;
     if (registeredConvKey !== null && registeredConvKey !== convKey) {
@@ -1808,10 +1810,12 @@ const H2W_CONTENT_VERSION = "0.1.90";
       registeredBrowserGeneration = null;
     }
     const accountNativeIdentity = await browserAccountNativeIdentity();
-    if (ADAPTER.getConversationKey() !== convKey) {
+    if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
       if (registeredConvKey === convKey) {
-        registeredBrowserSessionRef = null;
-        registeredBrowserGeneration = null;
+        if (ADAPTER.getConversationKey() !== convKey) {
+          registeredBrowserSessionRef = null;
+          registeredBrowserGeneration = null;
+        }
       }
       return null;
     }
@@ -1823,10 +1827,12 @@ const H2W_CONTENT_VERSION = "0.1.90";
       accountNativeIdentity,
     });
     if (response !== null) {
-      if (ADAPTER.getConversationKey() !== convKey) {
+      if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
         if (registeredConvKey === convKey) {
-          registeredBrowserSessionRef = null;
-          registeredBrowserGeneration = null;
+          if (ADAPTER.getConversationKey() !== convKey) {
+            registeredBrowserSessionRef = null;
+            registeredBrowserGeneration = null;
+          }
         }
         return null;
       }

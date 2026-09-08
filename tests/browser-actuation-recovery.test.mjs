@@ -13,6 +13,11 @@ const recoveryEnd = backgroundSource.indexOf("\nasync function handleBrowserActu
 assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart, "recovery helper must remain extractable");
 const recoverySource = backgroundSource.slice(recoveryStart, recoveryEnd);
 
+const registrationStart = wakeSource.indexOf('async function registerCurrentConversation(reason = "startup")');
+const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch()", registrationStart);
+assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "registration helper must remain extractable");
+const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
+
 function recoveryHarness(tabRecords) {
   const browserSessionTargets = new Map();
   const chrome = {
@@ -47,6 +52,53 @@ function recoveryHarness(tabRecords) {
     `${recoverySource}; return recoverBrowserSessionTarget;`,
   )(chrome, activeH2WTabUrls, browserConversationInfoFromSupportedUrl, browserSessionTargets);
   return { recover, browserSessionTargets };
+}
+
+function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") {
+  return new Function(`
+    let currentConvKey = ${JSON.stringify(initialConvKey)};
+    let currentUrl = currentConvKey;
+    let registeredConvKey = currentConvKey;
+    let registeredBrowserSessionRef = "br_initial";
+    let registeredBrowserGeneration = 1;
+    let browserRegistrationAttempt = 0;
+    const pending = [];
+    const ADAPTER = { name: "claude", getConversationKey: () => currentConvKey };
+    const location = { get href() { return currentUrl; } };
+    const runtimeAlive = () => true;
+    const browserAccountNativeIdentity = async () => "opaque-account";
+    const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));
+    const ensureConversationHealth = async () => {};
+    const chatGptConversationId = () => null;
+    const refreshQueuedInsertStatus = () => {};
+    const backfillCurrentChatGptContinuity = () => {};
+    const CONTEXT_PRESSURE = false;
+    const usesOperationalHud = () => false;
+    const refreshPageHud = () => {};
+    let conversationHealth = null;
+    let contextPressureRecord = null;
+    let queuedInsertCount = 0;
+    const removeQueuedInsertButton = () => {};
+    ${registrationSource}
+    return {
+      register: registerCurrentConversation,
+      pending,
+      setRoute(value) { currentConvKey = value; currentUrl = value; },
+      state() {
+        return {
+          convKey: registeredConvKey,
+          sessionRef: registeredBrowserSessionRef,
+          generation: registeredBrowserGeneration,
+          attempt: browserRegistrationAttempt,
+        };
+      },
+    };
+  `)();
+}
+
+async function flushRegistrationToSend(harness) {
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  assert.ok(harness.pending.length > 0, "registration must reach background send");
 }
 
 test("service-worker recovery rebuilds exactly one stable session target without page mutation", async () => {
@@ -126,13 +178,57 @@ test("page identity handshake exposes only opaque Browser Registry recovery iden
 });
 
 test("conversation registration fences route changes before and after async background registration", () => {
-  const start = wakeSource.indexOf('async function registerCurrentConversation(reason = "startup")');
-  const end = wakeSource.indexOf("\n  function startConversationRouteWatch()", start);
-  assert.ok(start >= 0 && end > start, "registration helper must remain extractable");
-  const source = wakeSource.slice(start, end);
-  const send = source.indexOf("const response = await sendBg({");
-  const fences = [...source.matchAll(/if \(ADAPTER\.getConversationKey\(\) !== convKey\)/g)].map((match) => match.index);
+  const send = registrationSource.indexOf("const response = await sendBg({");
+  const fences = [...registrationSource.matchAll(/registrationAttempt !== browserRegistrationAttempt \|\| ADAPTER\.getConversationKey\(\) !== convKey/g)].map((match) => match.index);
   assert.equal(fences.length, 2, "registration must fence route drift on both sides of sendBg");
   assert.ok(fences[0] < send, "route drift during account lookup must stop before registration send");
   assert.ok(fences[1] > send, "stale registration response must not overwrite the current route identity");
+});
+
+test("newer same-route browser registration wins when responses arrive out of order", async () => {
+  const harness = registrationHarness();
+  const first = harness.register("first");
+  await flushRegistrationToSend(harness);
+  const second = harness.register("second");
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  assert.equal(harness.pending.length, 2);
+
+  harness.pending[1].resolve({ browser_session_ref: "br_new", browser_generation: 9, bound: false });
+  await second;
+  assert.deepEqual(harness.state(), {
+    convKey: "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    sessionRef: "br_new",
+    generation: 9,
+    attempt: 2,
+  });
+
+  harness.pending[0].resolve({ browser_session_ref: "br_old_late", browser_generation: 8, bound: false });
+  await first;
+  assert.equal(harness.state().sessionRef, "br_new");
+  assert.equal(harness.state().generation, 9);
+});
+
+test("A to B to A registration cannot resurrect an older A response", async () => {
+  const a = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const b = "https://claude.ai/chat/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const harness = registrationHarness(a);
+
+  const oldA = harness.register("old-a");
+  await flushRegistrationToSend(harness);
+  harness.setRoute(b);
+  const pendingB = harness.register("b");
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  harness.setRoute(a);
+  const newA = harness.register("new-a");
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  assert.equal(harness.pending.length, 3);
+
+  harness.pending[2].resolve({ browser_session_ref: "br_a_new", browser_generation: 12, bound: false });
+  await newA;
+  harness.pending[0].resolve({ browser_session_ref: "br_a_old", browser_generation: 10, bound: false });
+  harness.pending[1].resolve({ browser_session_ref: "br_b_late", browser_generation: 11, bound: false });
+  await Promise.all([oldA, pendingB]);
+  assert.equal(harness.state().convKey, a);
+  assert.equal(harness.state().sessionRef, "br_a_new");
+  assert.equal(harness.state().generation, 12);
 });
