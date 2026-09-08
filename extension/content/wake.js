@@ -1435,6 +1435,13 @@ const H2W_CONTENT_VERSION = "0.1.90";
     return evidence;
   }
 
+  // Browser Registry identity cached by the page script survives MV3
+  // service-worker suspension. It contains only Herdr opaque refs/generation,
+  // never the provider account's raw native identity.
+  let registeredConvKey = null;
+  let registeredBrowserSessionRef = null;
+  let registeredBrowserGeneration = null;
+
   // ---- Message listener ----
   try {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -1451,7 +1458,13 @@ const H2W_CONTENT_VERSION = "0.1.90";
         return true;
       }
       if (msg?.type === "h2w_get_convkey") {
-        sendResponse({ convKey: ADAPTER.getConversationKey(), url: location.href, site: ADAPTER.name });
+        sendResponse({
+          convKey: ADAPTER.getConversationKey(),
+          url: location.href,
+          site: ADAPTER.name,
+          browserSessionRef: registeredBrowserSessionRef,
+          browserGeneration: registeredBrowserGeneration,
+        });
         return;
       }
       if (msg?.type === "h2w_snapshot_turn") {
@@ -1680,7 +1693,6 @@ const H2W_CONTENT_VERSION = "0.1.90";
   // background state attached to the previous conversation. Poll the canonical
   // conversation key instead of monkey-patching history.pushState: content scripts
   // run in an isolated world and cannot reliably intercept the page's History API.
-  let registeredConvKey = null;
   const continuityBackfillInFlight = new Set();
 
   async function backfillCurrentChatGptContinuity(convKey, reason = "register") {
@@ -1787,6 +1799,12 @@ const H2W_CONTENT_VERSION = "0.1.90";
     if (!runtimeAlive()) return null;
     const convKey = ADAPTER.getConversationKey();
     if (!convKey) return null;
+    if (registeredConvKey !== null && registeredConvKey !== convKey) {
+      // Never let a route change advertise the previous conversation's stable
+      // Browser Registry target while the new route is still registering.
+      registeredBrowserSessionRef = null;
+      registeredBrowserGeneration = null;
+    }
     const accountNativeIdentity = await browserAccountNativeIdentity();
     const response = await sendBg({
       type: "h2w_register",
@@ -1798,6 +1816,14 @@ const H2W_CONTENT_VERSION = "0.1.90";
     if (response !== null) {
       const changed = registeredConvKey !== null && registeredConvKey !== convKey;
       registeredConvKey = convKey;
+      registeredBrowserSessionRef = typeof response?.browser_session_ref === "string"
+        && response.browser_session_ref
+        ? response.browser_session_ref
+        : null;
+      registeredBrowserGeneration = Number.isSafeInteger(response?.browser_generation)
+        && response.browser_generation > 0
+        ? response.browser_generation
+        : null;
       const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
       if (concreteChat) {
         await ensureConversationHealth(convKey);

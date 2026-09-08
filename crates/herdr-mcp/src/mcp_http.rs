@@ -41,6 +41,7 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
 const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
 const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(2);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
@@ -59,24 +60,72 @@ static NEXT_BROWSER_ACTUATION: AtomicU64 = AtomicU64::new(0);
 
 const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct BrowserActuationBroker {
     inner: Arc<(Mutex<BrowserActuationState>, Condvar)>,
+    timeout: Duration,
+    late_completion_ttl: Duration,
 }
 
 #[derive(Default)]
 struct BrowserActuationState {
     queued: VecDeque<Value>,
-    pending: BTreeSet<String>,
+    pending: HashMap<String, PendingBrowserActuation>,
     completions: HashMap<String, BrowserPostconditionEvidence>,
     last_extension_poll: Option<Instant>,
 }
 
+struct PendingBrowserActuation {
+    dispatch_id: Option<String>,
+    expected_generation: i64,
+    timed_out_at: Option<Instant>,
+}
+
+impl Default for BrowserActuationBroker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
+            timeout: BROWSER_ACTUATION_TIMEOUT,
+            late_completion_ttl: BROWSER_LATE_COMPLETION_TTL,
+        }
+    }
+}
+
 impl BrowserActuationBroker {
+    #[cfg(test)]
+    fn with_durations(timeout: Duration, late_completion_ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
+            timeout,
+            late_completion_ttl,
+        }
+    }
+
+    fn prune_expired(&self, state: &mut BrowserActuationState) {
+        let expired = state
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                pending
+                    .timed_out_at
+                    .is_some_and(|timed_out_at| timed_out_at.elapsed() > self.late_completion_ttl)
+            })
+            .map(|(actuation_id, _)| actuation_id.clone())
+            .collect::<Vec<_>>();
+        for actuation_id in expired {
+            state.pending.remove(&actuation_id);
+            state.completions.remove(&actuation_id);
+            state.queued.retain(|command| {
+                command.get("actuation_id").and_then(Value::as_str) != Some(actuation_id.as_str())
+            });
+        }
+    }
+
     fn take_next_for_extension(&self) -> Option<Value> {
         let Ok(mut state) = self.inner.0.lock() else {
             return None;
         };
+        self.prune_expired(&mut state);
         state.last_extension_poll = Some(Instant::now());
         state.queued.pop_front()
     }
@@ -90,7 +139,8 @@ impl BrowserActuationBroker {
         let mut state = lock
             .lock()
             .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
-        if !state.pending.contains(actuation_id) {
+        self.prune_expired(&mut state);
+        if !state.pending.contains_key(actuation_id) {
             return Err("browser_actuation_not_pending".to_owned());
         }
         state.completions.insert(actuation_id.to_owned(), evidence);
@@ -111,6 +161,7 @@ impl BrowserActuator for BrowserActuationBroker {
         operation: &str,
         params: &Value,
         expected_generation: i64,
+        dispatch_id: Option<&str>,
     ) -> Result<BrowserPostconditionEvidence, String> {
         let actuation_id = format!(
             "ba_{:016x}",
@@ -120,6 +171,7 @@ impl BrowserActuator for BrowserActuationBroker {
         let mut state = lock
             .lock()
             .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+        self.prune_expired(&mut state);
         if !Self::extension_live(&state) {
             return Ok(BrowserPostconditionEvidence {
                 observed_generation: expected_generation,
@@ -140,7 +192,14 @@ impl BrowserActuator for BrowserActuationBroker {
                 result: None,
             });
         }
-        state.pending.insert(actuation_id.clone());
+        state.pending.insert(
+            actuation_id.clone(),
+            PendingBrowserActuation {
+                dispatch_id: dispatch_id.map(str::to_owned),
+                expected_generation,
+                timed_out_at: None,
+            },
+        );
         state.queued.push_back(json!({
             "protocol": "herdr-browser-actuation/v1",
             "actuation_id": actuation_id,
@@ -150,7 +209,7 @@ impl BrowserActuator for BrowserActuationBroker {
         }));
         ready.notify_all();
 
-        let deadline = Instant::now() + BROWSER_ACTUATION_TIMEOUT;
+        let deadline = Instant::now() + self.timeout;
         loop {
             if let Some(evidence) = state.completions.remove(&actuation_id) {
                 state.pending.remove(&actuation_id);
@@ -158,7 +217,13 @@ impl BrowserActuator for BrowserActuationBroker {
             }
             let now = Instant::now();
             if now >= deadline {
-                state.pending.remove(&actuation_id);
+                if dispatch_id.is_some() {
+                    if let Some(pending) = state.pending.get_mut(&actuation_id) {
+                        pending.timed_out_at = Some(now);
+                    }
+                } else {
+                    state.pending.remove(&actuation_id);
+                }
                 state.queued.retain(|command| {
                     command.get("actuation_id").and_then(Value::as_str)
                         != Some(actuation_id.as_str())
@@ -190,6 +255,31 @@ impl BrowserActuator for BrowserActuationBroker {
                 .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
             state = waited.0;
         }
+    }
+
+    fn reconcile_dispatch(
+        &self,
+        dispatch_id: &str,
+        expected_generation: i64,
+    ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+        let (lock, _) = &*self.inner;
+        let mut state = lock
+            .lock()
+            .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+        self.prune_expired(&mut state);
+        let actuation_id = state.pending.iter().find_map(|(actuation_id, pending)| {
+            (pending.dispatch_id.as_deref() == Some(dispatch_id)
+                && pending.expected_generation == expected_generation)
+                .then(|| actuation_id.clone())
+        });
+        let Some(actuation_id) = actuation_id else {
+            return Ok(None);
+        };
+        let Some(evidence) = state.completions.remove(&actuation_id) else {
+            return Ok(None);
+        };
+        state.pending.remove(&actuation_id);
+        Ok(Some(evidence))
     }
 }
 
@@ -3158,6 +3248,7 @@ mod tests {
                 "herdr_mcp.browser_dispatch.submit",
                 &json!({"session_ref":"br_test","message":"hello"}),
                 7,
+                None,
             )
         });
         let command = loop {
@@ -3176,6 +3267,133 @@ mod tests {
         assert_eq!(observed.generation_owner, Some(7));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn browser_actuation_timeout_retains_only_exact_dispatch_late_completion() {
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(20),
+            Duration::from_millis(250),
+        );
+        assert!(broker.take_next_for_extension().is_none());
+        let dispatch_id = format!("bd_{}", "a".repeat(64));
+        let expected_dispatch_id = dispatch_id.clone();
+        let broker_for_task = broker.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            broker_for_task.actuate(
+                "herdr_mcp.browser_dispatch.submit",
+                &json!({"session_ref":"br_test","message":"hello"}),
+                7,
+                Some(&expected_dispatch_id),
+            )
+        });
+        let command = loop {
+            if let Some(command) = broker.take_next_for_extension() {
+                break command;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        let actuation_id = command["actuation_id"].as_str().unwrap().to_owned();
+        let timed_out = task.await.unwrap().unwrap();
+        assert!(timed_out.command_accepted);
+        assert!(!timed_out.accepted_message_observed);
+
+        let late = BrowserPostconditionEvidence {
+            observed_generation: 7,
+            command_accepted: true,
+            browser_online: true,
+            resource_available: true,
+            rejected: false,
+            stable_resource_ref_observed: true,
+            lifecycle_observed: true,
+            canonical_url_observed: true,
+            accepted_message_observed: true,
+            message_baseline_advanced: false,
+            reasoning_effort_readback: None,
+            required_apps_readback: Vec::new(),
+            generation_owner: Some(7),
+            generation_status_observed: true,
+            generation_stopped: false,
+            result: None,
+        };
+        broker.complete(&actuation_id, late.clone()).unwrap();
+        assert!(
+            broker
+                .reconcile_dispatch(&dispatch_id, 8)
+                .unwrap()
+                .is_none(),
+            "a newer generation must not consume old-generation evidence"
+        );
+        assert_eq!(
+            broker.reconcile_dispatch(&dispatch_id, 7).unwrap(),
+            Some(late)
+        );
+        assert!(
+            broker
+                .reconcile_dispatch(&dispatch_id, 7)
+                .unwrap()
+                .is_none(),
+            "late completion is one-use settlement evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_actuation_late_completion_expires_boundedly() {
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        assert!(broker.take_next_for_extension().is_none());
+        let dispatch_id = format!("bd_{}", "b".repeat(64));
+        let expected_dispatch_id = dispatch_id.clone();
+        let broker_for_task = broker.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            broker_for_task.actuate(
+                "herdr_mcp.browser_dispatch.submit",
+                &json!({"session_ref":"br_test","message":"hello"}),
+                7,
+                Some(&expected_dispatch_id),
+            )
+        });
+        let command = loop {
+            if let Some(command) = broker.take_next_for_extension() {
+                break command;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        let actuation_id = command["actuation_id"].as_str().unwrap().to_owned();
+        let _ = task.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            broker.complete(
+                &actuation_id,
+                BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: false,
+                    browser_online: true,
+                    resource_available: false,
+                    rejected: false,
+                    stable_resource_ref_observed: false,
+                    lifecycle_observed: false,
+                    canonical_url_observed: false,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: None,
+                }
+            ),
+            Err("browser_actuation_not_pending".to_owned())
+        );
+        assert!(
+            broker
+                .reconcile_dispatch(&dispatch_id, 7)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
