@@ -535,6 +535,126 @@ test("connector approval cancel removes pending or unused approved state but ref
   assert.equal(h.storage.map.has(`connector:${usedId}`), true);
 });
 
+test("connector inactivity sweep revokes only 30d-stale instances and retains audit identity", async () => {
+  const h = harness();
+  const day = 24 * 60 * 60_000;
+  const nowMs = 100 * day;
+  const makeConnector = (connectorId, activityMs) => ({
+    connector_id: connectorId,
+    client_id: "https://chatgpt.com/oauth/client.json",
+    status: "active",
+    principal_type: "connector",
+    capabilities: ["mcp_access"],
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    auth_source: "chatgpt_cimd",
+    grant_generation: 1,
+    approved_at_ms: activityMs,
+    approved_by: "device:owner",
+    last_used_at_ms: activityMs,
+    token_issue_count: 1,
+  });
+
+  const staleId = "conn_stale123";
+  const recentId = "conn_recent123";
+  await h.storage.put(`connector:${staleId}`, makeConnector(staleId, nowMs - 31 * day));
+  await h.storage.put(`connector:${recentId}`, makeConnector(recentId, nowMs - 29 * day));
+
+  const staleRefresh = "stale-refresh-token";
+  const recentRefresh = "recent-refresh-token";
+  const staleHash = await hashOpaqueToken(staleRefresh);
+  const recentHash = await hashOpaqueToken(recentRefresh);
+  const expiresAt = Math.floor(nowMs / 1000) + 60 * 60;
+  await h.storage.put(`refresh:${staleHash}`, {
+    client_id: "https://chatgpt.com/oauth/client.json",
+    connector_id: staleId,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    expires_at: expiresAt,
+  });
+  await h.storage.put(`refresh:${recentHash}`, {
+    client_id: "https://chatgpt.com/oauth/client.json",
+    connector_id: recentId,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    expires_at: expiresAt,
+  });
+
+  const swept = await body(await h.post("/internal/oauth/connector/sweep-inactive", {
+    now_ms: nowMs,
+    inactive_ms: 30 * day,
+    limit: 64,
+  }));
+  assert.equal(swept.ok, true);
+  assert.equal(swept.scanned, 2);
+  assert.equal(swept.eligible, 1);
+  assert.equal(swept.revoked, 1);
+  assert.equal(swept.deleted_tokens, 1);
+
+  const stale = h.storage.map.get(`connector:${staleId}`);
+  const recent = h.storage.map.get(`connector:${recentId}`);
+  assert.equal(stale.status, "revoked");
+  assert.equal(stale.revoked_by, "worker:inactivity_gc");
+  assert.equal(stale.revocation_reason, "inactive_30d");
+  assert.equal(stale.last_used_at_ms, nowMs - 31 * day);
+  assert.equal(recent.status, "active");
+  assert.equal(h.storage.map.has(`refresh:${staleHash}`), false);
+  assert.equal(h.storage.map.has(`refresh:${recentHash}`), true);
+
+  const inventory = await body(await h.post("/internal/oauth/connector/inventory", {}));
+  const retained = inventory.connectors.find((row) => row.connector_id === staleId);
+  assert.equal(retained.connector_name, "ChatGPT");
+  assert.equal(retained.created_at_ms, nowMs - 31 * day);
+  assert.equal(retained.last_used_at_ms, nowMs - 31 * day);
+  assert.equal(retained.revocation_reason, "inactive_30d");
+});
+
+test("authenticated Connector activity persists last_used_at at most once per 24h", async () => {
+  const h = harness();
+  const connectorId = "conn_activity123";
+  const clientId = "https://chatgpt.com/oauth/client.json";
+  const firstUseSec = 5_000_000;
+  await h.storage.put(`connector:${connectorId}`, {
+    connector_id: connectorId,
+    client_id: clientId,
+    status: "active",
+    principal_type: "connector",
+    capabilities: ["mcp_access"],
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    auth_source: "chatgpt_cimd",
+    grant_generation: 1,
+    approved_at_ms: firstUseSec * 1000 - 1_000,
+    approved_by: "device:owner",
+    last_token_issued_at_ms: firstUseSec * 1000 - 500,
+    token_issue_count: 1,
+  });
+  const accessToken = "opaque-connector-access";
+  const accessHash = await hashOpaqueToken(accessToken);
+  await h.storage.put(`access:${accessHash}`, {
+    client_id: clientId,
+    connector_id: connectorId,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    expires_at: firstUseSec + 3 * 24 * 60 * 60,
+  });
+
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: accessToken, now_sec: firstUseSec })).status, 200);
+  assert.equal(h.storage.map.get(`connector:${connectorId}`).last_used_at_ms, firstUseSec * 1000);
+
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: accessToken, now_sec: firstUseSec + 60 * 60 })).status, 200);
+  assert.equal(h.storage.map.get(`connector:${connectorId}`).last_used_at_ms, firstUseSec * 1000);
+
+  const nextDaySec = firstUseSec + 24 * 60 * 60 + 1;
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: accessToken, now_sec: nextDaySec })).status, 200);
+  assert.equal(h.storage.map.get(`connector:${connectorId}`).last_used_at_ms, nextDaySec * 1000);
+});
+
 test("connector grant revoke fences current and legacy JWT/refresh credentials with a durable tombstone", async () => {
   const h = harness();
   const legacyIssued = await body(await h.post("/internal/oauth/token/issue", {
@@ -645,9 +765,14 @@ test("connector instance revoke is isolated while client kill-switch fences ever
   const firstAfterIssue = await body(await h.post("/internal/oauth/connector/get", {
     connector_id: first.record.connector_id,
   }));
-  assert.equal(firstAfterIssue.connector.last_used_at_ms, 1000 * 1000);
+  assert.equal(firstAfterIssue.connector.last_token_issued_at_ms, 1000 * 1000);
+  assert.equal(firstAfterIssue.connector.last_used_at_ms, undefined);
   assert.equal((await h.post("/internal/oauth/access/verify", { token: firstIssued.token.access_token, now_sec: 1001 })).status, 200);
   assert.equal((await h.post("/internal/oauth/access/verify", { token: secondIssued.token.access_token, now_sec: 1001 })).status, 200);
+  const firstAfterUse = await body(await h.post("/internal/oauth/connector/get", {
+    connector_id: first.record.connector_id,
+  }));
+  assert.equal(firstAfterUse.connector.last_used_at_ms, 1001 * 1000);
 
   assert.equal((await h.post("/internal/oauth/connector/revoke", {
     connector_id: first.record.connector_id,

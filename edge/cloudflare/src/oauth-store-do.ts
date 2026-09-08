@@ -17,6 +17,7 @@ const MAX_ACTIVE_PENDING_TOTAL = 128;
 const MAX_ACTIVE_PENDING_PER_CLIENT = 4;
 const MAX_UNAPPROVED_DCR_CLIENTS = 256;
 const UNAPPROVED_DCR_TTL_MS = 60 * 60_000;
+const CONNECTOR_USAGE_TOUCH_MS = 24 * 60 * 60_000;
 
 export interface OAuthClientRecord {
   client_secret_hash: string | null;
@@ -87,6 +88,7 @@ export interface OAuthConnectorRecord {
   token_issue_count?: number;
   revoked_at_ms?: number;
   revoked_by?: string;
+  revocation_reason?: string;
 }
 
 export interface OAuthConnectorGrantRecord {
@@ -317,12 +319,13 @@ function normalizeConnector(value: unknown): OAuthConnectorRecord | null {
   if (!finiteEpoch(value.approved_at_ms) || !boundedString(value.approved_by, 4096)) return null;
   const alias = typeof value.alias === "string" && value.alias.length > 0 && value.alias.length <= 256 ? value.alias : undefined;
   const lastTokenIssuedAt = finiteEpoch(value.last_token_issued_at_ms) ? value.last_token_issued_at_ms as number : undefined;
-  const lastUsedAt = finiteEpoch(value.last_used_at_ms) ? value.last_used_at_ms as number : lastTokenIssuedAt;
+  const lastUsedAt = finiteEpoch(value.last_used_at_ms) ? value.last_used_at_ms as number : undefined;
   const tokenIssueCount = Number.isSafeInteger(value.token_issue_count) && (value.token_issue_count as number) >= 0
     ? value.token_issue_count as number
     : undefined;
   const revokedAt = finiteEpoch(value.revoked_at_ms) ? value.revoked_at_ms as number : undefined;
   const revokedBy = boundedString(value.revoked_by, 4096) ? value.revoked_by : undefined;
+  const revocationReason = boundedString(value.revocation_reason, 256) ? value.revocation_reason : undefined;
   return {
     connector_id: value.connector_id,
     client_id: value.client_id,
@@ -342,7 +345,26 @@ function normalizeConnector(value: unknown): OAuthConnectorRecord | null {
     ...(tokenIssueCount !== undefined ? { token_issue_count: tokenIssueCount } : {}),
     ...(revokedAt !== undefined ? { revoked_at_ms: revokedAt } : {}),
     ...(revokedBy !== undefined ? { revoked_by: revokedBy } : {}),
+    ...(revocationReason !== undefined ? { revocation_reason: revocationReason } : {}),
   };
+}
+
+function connectorDisplayName(
+  connector: OAuthConnectorRecord,
+  client: OAuthClientRecord | null,
+): string {
+  if (connector.alias) return connector.alias;
+  if (client?.client_name) return client.client_name;
+  if (connector.auth_source === "chatgpt_cimd" || connector.client_id.includes("chatgpt.com")) {
+    return "ChatGPT";
+  }
+  try {
+    const host = new URL(connector.client_id).hostname;
+    if (host) return host;
+  } catch {
+    // Non-URL DCR client ids remain identifiable by their bounded client id.
+  }
+  return connector.client_id;
 }
 
 function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | null {
@@ -537,6 +559,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/list") return this.listConnectors();
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/inventory") return this.connectorInventory();
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/revoke") return this.revokeConnector(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/connector/sweep-inactive") return this.sweepInactiveConnectors(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/revoke-client") return this.revokeClientConnectors(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/automation/create") return this.createAutomation(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/automation/list") return this.listAutomations();
@@ -1275,7 +1298,11 @@ export class OAuthStoreDO {
       const connector = normalizeConnector(raw);
       if (!connector) continue;
       const client = normalizeOAuthClient(await this.state.storage.get<OAuthClientRecord>(CLIENT_PREFIX + connector.client_id));
-      connectors.push({ ...connector, client_name: client?.client_name ?? null });
+      connectors.push({
+        ...connector,
+        connector_name: connectorDisplayName(connector, client),
+        client_name: client?.client_name ?? null,
+      });
       if (connectors.length >= 256) break;
     }
     connectors.sort((a, b) => Number(b.approved_at_ms ?? 0) - Number(a.approved_at_ms ?? 0));
@@ -1320,6 +1347,7 @@ export class OAuthStoreDO {
       connectors.push({
         ...connector,
         client_name: client?.client_name ?? null,
+        connector_name: connectorDisplayName(connector, client),
         created_at_ms: connector.approved_at_ms,
         last_used_at_ms: connector.last_used_at_ms ?? null,
         grant_origin: "explicit_approval",
@@ -1422,6 +1450,7 @@ export class OAuthStoreDO {
     const body = await this.body(request);
     const connectorId = body?.connector_id;
     const revokedBy = body?.revoked_by;
+    const revocationReason = boundedString(body?.revocation_reason, 256) ? body!.revocation_reason as string : undefined;
     const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
     if (
       typeof connectorId !== "string" || !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId) ||
@@ -1440,6 +1469,7 @@ export class OAuthStoreDO {
             grant_generation: current.grant_generation + 1,
             revoked_at_ms: nowMs,
             revoked_by: revokedBy,
+            ...(revocationReason ? { revocation_reason: revocationReason } : {}),
           };
       if (current.status !== "revoked") await txn.put(key, revoked);
       outcome = revoked;
@@ -1454,6 +1484,60 @@ export class OAuthStoreDO {
     for (const [tokenKey, token] of access) if (token.connector_id === connectorId) deletes.push(tokenKey);
     if (deletes.length > 0) await Promise.all(deletes.map((tokenKey) => this.state.storage.delete(tokenKey)));
     return json({ ok: true, connector_id: connectorId, revoked_at_ms: nowMs, deleted_tokens: deletes.length });
+  }
+
+  private async sweepInactiveConnectors(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    const inactiveMs = finiteEpoch(body?.inactive_ms) ? body!.inactive_ms as number : 30 * 24 * 60 * 60_000;
+    const limit = Number.isSafeInteger(body?.limit) && (body!.limit as number) > 0
+      ? Math.min(body!.limit as number, 64)
+      : 64;
+    if (inactiveMs < 24 * 60 * 60_000) return json({ ok: false, code: "bad_request" }, 400);
+
+    const rows = await this.state.storage.list<OAuthConnectorRecord>({ prefix: CONNECTOR_PREFIX });
+    const stale: Array<{ connector_id: string; activity_ms: number }> = [];
+    let scanned = 0;
+    for (const raw of rows.values()) {
+      const connector = normalizeConnector(raw);
+      if (!connector || connector.status !== "active") continue;
+      scanned += 1;
+      const activityMs = Math.max(
+        connector.approved_at_ms,
+        connector.last_token_issued_at_ms ?? 0,
+        connector.last_used_at_ms ?? 0,
+      );
+      if (nowMs - activityMs >= inactiveMs) stale.push({ connector_id: connector.connector_id, activity_ms: activityMs });
+    }
+    stale.sort((a, b) => a.activity_ms - b.activity_ms);
+
+    let revoked = 0;
+    let deletedTokens = 0;
+    for (const candidate of stale.slice(0, limit)) {
+      const response = await this.revokeConnector(new Request("https://oauth.internal/internal/oauth/connector/revoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          connector_id: candidate.connector_id,
+          revoked_by: "worker:inactivity_gc",
+          revocation_reason: "inactive_30d",
+          now_ms: nowMs,
+        }),
+      }));
+      if (!response.ok) continue;
+      const result = await response.json() as { deleted_tokens?: unknown };
+      revoked += 1;
+      deletedTokens += Number.isSafeInteger(result.deleted_tokens) ? result.deleted_tokens as number : 0;
+    }
+    return json({
+      ok: true,
+      scanned,
+      eligible: stale.length,
+      revoked,
+      deleted_tokens: deletedTokens,
+      remaining_eligible: Math.max(0, stale.length - revoked),
+      inactivity_ms: inactiveMs,
+    });
   }
 
   private async revokeClientConnectors(request: Request): Promise<Response> {
@@ -1695,6 +1779,7 @@ export class OAuthStoreDO {
     clientId: string,
     connectorId: string | undefined,
     grantGeneration: number | undefined,
+    nowMs?: number,
   ): Promise<boolean> {
     if (!(await this.grantAllowsAccess(clientId))) return false;
     if (!connectorId && grantGeneration === undefined) return this.grantAllowsAccess(clientId);
@@ -1702,9 +1787,30 @@ export class OAuthStoreDO {
     const connector = normalizeConnector(
       await this.state.storage.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + connectorId),
     );
-    return connector?.status === "active"
+    const allowed = connector?.status === "active"
       && connector.client_id === clientId
       && connector.grant_generation === grantGeneration;
+    if (!allowed || nowMs === undefined || !connector) return allowed;
+
+    if (
+      connector.last_used_at_ms !== undefined
+      && nowMs - connector.last_used_at_ms < CONNECTOR_USAGE_TOUCH_MS
+    ) return true;
+    await this.state.storage.transaction(async (txn) => {
+      const current = normalizeConnector(await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + connectorId));
+      if (
+        !current
+        || current.status !== "active"
+        || current.client_id !== clientId
+        || current.grant_generation !== grantGeneration
+      ) return;
+      if (
+        current.last_used_at_ms !== undefined
+        && nowMs - current.last_used_at_ms < CONNECTOR_USAGE_TOUCH_MS
+      ) return;
+      await txn.put(CONNECTOR_PREFIX + connectorId, { ...current, last_used_at_ms: nowMs } satisfies OAuthConnectorRecord);
+    });
+    return true;
   }
 
   private async automationAllowsAccess(
@@ -1735,7 +1841,6 @@ export class OAuthStoreDO {
       if (!connector || connector.status !== "active" || connector.grant_generation !== grantGeneration) return;
       await txn.put(key, {
         ...connector,
-        last_used_at_ms: nowMs,
         last_token_issued_at_ms: nowMs,
         token_issue_count: (connector.token_issue_count ?? 0) + 1,
       } satisfies OAuthConnectorRecord);
@@ -1809,7 +1914,7 @@ export class OAuthStoreDO {
             if (!(await this.automationAllowsAccess(verdict.clientId, verdict.deviceId))) {
               return json({ ok: false, code: "invalid_token" }, 401);
             }
-          } else if (!(await this.connectorAllowsAccess(verdict.clientId, verdict.connectorId, verdict.grantGeneration))) {
+          } else if (!(await this.connectorAllowsAccess(verdict.clientId, verdict.connectorId, verdict.grantGeneration, nowSec * 1000))) {
             return json({ ok: false, code: "invalid_token" }, 401);
           }
           return json({
@@ -1835,7 +1940,7 @@ export class OAuthStoreDO {
       await this.state.storage.delete(key);
       return json({ ok: false, code: "invalid_token" }, 401);
     }
-    if (!(await this.connectorAllowsAccess(legacy.client_id, legacy.connector_id, legacy.grant_generation))) {
+    if (!(await this.connectorAllowsAccess(legacy.client_id, legacy.connector_id, legacy.grant_generation, nowSec * 1000))) {
       return json({ ok: false, code: "invalid_token" }, 401);
     }
     return json({
