@@ -19,6 +19,9 @@ jobs:
     timeout-minutes: 15
     env:
       CARGO_INCREMENTAL: "0"
+      # Keep file/line backtraces while avoiding full CI-only debuginfo.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       # Only trusted main pushes may seed the shared compiler cache.

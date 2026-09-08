@@ -229,6 +229,8 @@ test("current workflows pin checkout and setup-node to reviewed v7 commits", asy
 test("CI Rust gate uses a trusted-main-only shared compiler cache", async () => {
   const ci = await readFile(join(ROOT, ".github/workflows/ci.yml"), "utf8");
   assert.match(ci, /CARGO_INCREMENTAL:\s*["']0["']/);
+  assert.match(ci, /CARGO_PROFILE_DEV_DEBUG:\s*line-tables-only/);
+  assert.match(ci, /CARGO_PROFILE_TEST_DEBUG:\s*line-tables-only/);
   assert.match(ci, /RUSTC_WRAPPER:\s*sccache/);
   assert.match(ci, /SCCACHE_GHA_ENABLED:\s*["']true["']/);
   assert.match(
