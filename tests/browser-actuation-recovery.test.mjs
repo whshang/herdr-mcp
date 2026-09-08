@@ -115,11 +115,24 @@ test("service-worker recovery reports a newer generation instead of reusing a st
 });
 
 test("page identity handshake exposes only opaque Browser Registry recovery identity", () => {
-  assert.match(wakeSource, /browserSessionRef:\s*registeredBrowserSessionRef/);
-  assert.match(wakeSource, /browserGeneration:\s*registeredBrowserGeneration/);
+  assert.match(wakeSource, /const identityMatchesRoute = Boolean\(convKey && registeredConvKey === convKey\)/);
+  assert.match(wakeSource, /browserSessionRef:\s*identityMatchesRoute \? registeredBrowserSessionRef : null/);
+  assert.match(wakeSource, /browserGeneration:\s*identityMatchesRoute \? registeredBrowserGeneration : null/);
   assert.match(wakeSource, /registeredBrowserSessionRef\s*=\s*null;\s*\n\s*registeredBrowserGeneration\s*=\s*null;/);
   assert.doesNotMatch(
     wakeSource.slice(wakeSource.indexOf('if \(msg?.type === "h2w_get_convkey"\)'), wakeSource.indexOf('if \(msg?.type === "h2w_snapshot_turn"\)')),
     /accountNativeIdentity|email|userId/i,
   );
+});
+
+test("conversation registration fences route changes before and after async background registration", () => {
+  const start = wakeSource.indexOf('async function registerCurrentConversation(reason = "startup")');
+  const end = wakeSource.indexOf("\n  function startConversationRouteWatch()", start);
+  assert.ok(start >= 0 && end > start, "registration helper must remain extractable");
+  const source = wakeSource.slice(start, end);
+  const send = source.indexOf("const response = await sendBg({");
+  const fences = [...source.matchAll(/if \(ADAPTER\.getConversationKey\(\) !== convKey\)/g)].map((match) => match.index);
+  assert.equal(fences.length, 2, "registration must fence route drift on both sides of sendBg");
+  assert.ok(fences[0] < send, "route drift during account lookup must stop before registration send");
+  assert.ok(fences[1] > send, "stale registration response must not overwrite the current route identity");
 });

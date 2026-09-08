@@ -1664,24 +1664,38 @@ fn browser_dispatch_submit(
     let Ok(mut store) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
-    let dispatch = match store.update_browser_dispatch(BrowserDispatchUpdateInput {
-        dispatch_id: &reserved.dispatch_id,
-        expected_generation,
-        delivery_state,
-        generation_owner: evidence.generation_owner,
-        updated_at: now,
-    }) {
-        Ok(dispatch) => dispatch,
+    let current = match store.browser_dispatch(&reserved.dispatch_id) {
+        Ok(Some(dispatch)) => dispatch,
+        Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
         Err(error) => return browser_store_error(error),
+    };
+    let dispatch = match current.delivery_state {
+        BrowserDeliveryState::Uncertain if delivery_state != BrowserDeliveryState::Uncertain => {
+            match store.settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &reserved.dispatch_id,
+                expected_generation,
+                delivery_state,
+                generation_owner: evidence.generation_owner,
+                updated_at: now,
+            }) {
+                Ok(dispatch) => dispatch,
+                Err(error) => return browser_store_error(error),
+            }
+        }
+        BrowserDeliveryState::Uncertain => current,
+        BrowserDeliveryState::NotApplied => {
+            return json!({"ok": false, "code": "browser_dispatch_not_claimed"});
+        }
+        _ => current,
     };
     let work_memory_writeback = browser_dispatch_work_memory_writeback(&mut store, &dispatch);
     let success = matches!(
-        delivery_state,
+        dispatch.delivery_state,
         BrowserDeliveryState::Applied | BrowserDeliveryState::Stopped
     );
     json!({
         "ok": success,
-        "code": if success { Value::Null } else { json!(delivery_state.as_str()) },
+        "code": if success { Value::Null } else { json!(dispatch.delivery_state.as_str()) },
         "dispatch": browser_dispatch_json(dispatch),
         "replayed": false,
         "work_memory_writeback": work_memory_writeback,
@@ -4642,6 +4656,55 @@ mod tests {
             1,
             "terminal status must not consume or request a second reconciliation"
         );
+
+        struct ConcurrentSettlementActuator {
+            store: Arc<Mutex<StateStore>>,
+        }
+        impl BrowserActuator for ConcurrentSettlementActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let dispatch_id = dispatch_id.expect("dispatch identity is required");
+                self.store
+                    .lock()
+                    .unwrap()
+                    .settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                        dispatch_id,
+                        expected_generation,
+                        delivery_state: BrowserDeliveryState::Applied,
+                        generation_owner: Some(expected_generation),
+                        updated_at: browser_epoch_ms(),
+                    })
+                    .unwrap();
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                Ok(evidence)
+            }
+        }
+        let settlement_race_params = json!({
+            "session_ref": session_ref,
+            "message": "status settlement wins before submit timeout writeback",
+            "expected_generation": 7,
+            "idempotency_key": "delivery-settlement-race-idempotency-key"
+        });
+        let settlement_race = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &settlement_race_params,
+            true,
+            Some(&ConcurrentSettlementActuator {
+                store: store.clone(),
+            }),
+        );
+        assert_eq!(settlement_race["ok"], true);
+        assert!(settlement_race["code"].is_null());
+        assert_eq!(settlement_race["dispatch"]["delivery_state"], "applied");
 
         struct AppliedActuator;
         impl BrowserActuator for AppliedActuator {

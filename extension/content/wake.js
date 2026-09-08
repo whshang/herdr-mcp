@@ -1458,12 +1458,14 @@ const H2W_CONTENT_VERSION = "0.1.90";
         return true;
       }
       if (msg?.type === "h2w_get_convkey") {
+        const convKey = ADAPTER.getConversationKey();
+        const identityMatchesRoute = Boolean(convKey && registeredConvKey === convKey);
         sendResponse({
-          convKey: ADAPTER.getConversationKey(),
+          convKey,
           url: location.href,
           site: ADAPTER.name,
-          browserSessionRef: registeredBrowserSessionRef,
-          browserGeneration: registeredBrowserGeneration,
+          browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
+          browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
         });
         return;
       }
@@ -1806,6 +1808,13 @@ const H2W_CONTENT_VERSION = "0.1.90";
       registeredBrowserGeneration = null;
     }
     const accountNativeIdentity = await browserAccountNativeIdentity();
+    if (ADAPTER.getConversationKey() !== convKey) {
+      if (registeredConvKey === convKey) {
+        registeredBrowserSessionRef = null;
+        registeredBrowserGeneration = null;
+      }
+      return null;
+    }
     const response = await sendBg({
       type: "h2w_register",
       convKey,
@@ -1814,6 +1823,13 @@ const H2W_CONTENT_VERSION = "0.1.90";
       accountNativeIdentity,
     });
     if (response !== null) {
+      if (ADAPTER.getConversationKey() !== convKey) {
+        if (registeredConvKey === convKey) {
+          registeredBrowserSessionRef = null;
+          registeredBrowserGeneration = null;
+        }
+        return null;
+      }
       const changed = registeredConvKey !== null && registeredConvKey !== convKey;
       registeredConvKey = convKey;
       registeredBrowserSessionRef = typeof response?.browser_session_ref === "string"
