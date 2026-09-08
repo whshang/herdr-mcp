@@ -453,6 +453,36 @@ test("authorize: unknown client returns 400 JSON, no redirect", async () => {
   assert.equal(resp.headers.get("location"), null);
 });
 
+test("authorize: ChatGPT bare issuer fails before approval and points to /mcp", async () => {
+  const opts = makeOptions();
+  const client_id = "https://chatgpt.com/oauth/client.json";
+  const redirect_uri = "https://chatgpt.com/connector_platform_oauth_redirect";
+  const verifier = "E".repeat(43) + "zZ-._";
+  const challenge = await s256Challenge(verifier);
+  const before = await opts.store.listConnectors();
+  const qs = new URLSearchParams({
+    client_id,
+    redirect_uri,
+    response_type: "code",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    state: "wrong-mcp-endpoint",
+    resource: ISSUER,
+  });
+
+  const resp = await GET(`/oauth/authorize?${qs}`, opts);
+  assert.equal(resp.status, 400);
+  assert.match(resp.headers.get("content-type") ?? "", /^text\/html/);
+  assert.equal(resp.headers.get("location"), null);
+  assert.equal(resp.headers.get("cache-control"), "no-store");
+  const html = await resp.text();
+  assert.match(html, /Check the MCP server URL/);
+  assert.match(html, /missing the MCP endpoint path/);
+  assert.match(html, new RegExp(`${ISSUER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\/mcp`));
+  assert.doesNotMatch(html, /approval-code/);
+  assert.deepEqual(await opts.store.listConnectors(), before, "wrong endpoint must not create a Connector grant");
+});
+
 test("authorize: unregistered redirect_uri is rejected (no redirect)", async () => {
   const opts = makeOptions();
   const { client_id } = await registerClient(opts);

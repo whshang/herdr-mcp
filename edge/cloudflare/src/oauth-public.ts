@@ -293,6 +293,37 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+function chatgptMcpEndpointErrorPage(issuer: string): Response {
+  const endpoint = `${issuer}/mcp`;
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Check the Herdr MCP server URL</title>
+<style>
+:root{color-scheme:light dark;--card:#fff;--text:#16181d;--muted:#69707d;--line:#e5e7eb;--soft:#f7f8fa;--bad:#a43228;--badSoft:#fff0ef;--shadow:0 24px 70px rgba(20,24,32,.12)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;min-height:100dvh;padding:32px 20px;background:radial-gradient(circle at 50% -10%,#fff 0,#f5f6f8 52%,#eef0f3 100%);color:var(--text);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center}.shell{width:min(680px,100%)}.brand{display:flex;align-items:center;gap:10px;margin:0 0 14px 4px;color:#4d5562;font-size:13px;font-weight:650;letter-spacing:.08em;text-transform:uppercase}.mark{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:#17191f;color:#fff;font-weight:800}.card{background:var(--card);border:1px solid rgba(20,24,32,.08);border-radius:24px;box-shadow:var(--shadow);overflow:hidden}.main{padding:34px 36px 30px}h1{margin:0;font-size:clamp(27px,5vw,38px);line-height:1.12;letter-spacing:-.035em}.lead{margin:13px 0;color:var(--muted);font-size:16px}.notice{margin:24px 0;padding:16px 18px;border-radius:15px;background:var(--badSoft);color:var(--bad);font-weight:650}.endpoint{margin:18px 0;padding:14px 16px;border:1px solid var(--line);border-radius:13px;background:var(--soft);overflow-wrap:anywhere}.endpoint code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.footer{padding:15px 36px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px}@media(max-width:560px){body{padding:16px 12px}.main{padding:26px 20px}.footer{padding:14px 20px}}@media(prefers-color-scheme:dark){:root{--card:#15181d;--text:#f4f5f7;--muted:#9aa2af;--line:#2a2f37;--soft:#111419;--bad:#ff9a8f;--badSoft:#3a1c1a;--shadow:0 28px 80px rgba(0,0,0,.45)}body{background:radial-gradient(circle at 50% -10%,#22262d 0,#111419 48%,#0b0d10 100%)}.brand{color:#b2b8c2}.mark{background:#f4f5f7;color:#111318}.card{border-color:#292e36}}
+</style></head><body><main class="shell">
+<div class="brand"><span class="mark" aria-hidden="true">H</span><span>Herdr secure access</span></div>
+<section class="card"><div class="main">
+<h1>Check the MCP server URL</h1>
+<p class="lead">ChatGPT reached the Herdr site, but the configured server URL is missing the MCP endpoint path.</p>
+<div class="notice" role="alert">Do not approve this request. Return to ChatGPT and set the MCP Server URL to the full <code>/mcp</code> endpoint.</div>
+<div class="endpoint"><code>${escapeHtml(endpoint)}</code></div>
+<p class="lead">The site root <code>${escapeHtml(issuer)}</code> is not the MCP server endpoint. No Herdr approval or Connector grant was created for this request.</p>
+</div><div class="footer">After correcting the URL in ChatGPT, reconnect Herdr and continue the normal approval flow.</div></section>
+</main></body></html>`;
+  return new Response(html, {
+    status: 400,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
 function approvalPage(input: {
   issuer: string;
   requestId: string;
@@ -963,6 +994,13 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
   }
   if (scopeParam && scopeParam !== OAUTH_SCOPE) {
     return redirectError("invalid_scope", `unsupported scope '${scopeParam}'`);
+  }
+  if (
+    isChatgptOAuthClientId(clientId)
+    && resourceParam
+    && resourceParam.replace(/\/+$/, "") === ctx.identity.issuer
+  ) {
+    return chatgptMcpEndpointErrorPage(ctx.identity.issuer);
   }
   const resource = normalizeResource(ctx.identity, resourceParam ?? "");
   if (!resource) {
