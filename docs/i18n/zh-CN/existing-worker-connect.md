@@ -4,6 +4,8 @@
 
 Herdr 的多设备模型是：一个公网 Worker/Connector，后面连接多台拥有独立身份的电脑。ChatGPT 可以查看设备列表、为任务选择目标设备，并让后续操作继续绑定到同一台设备。新电脑通过短期配对加入现有 Worker，不会重新部署 Worker，也不会获得一份全局共享密钥。
 
+Herdr 0.9 还提供独立的 SSH saved machine 多机器 TUI。这一层可以与 Herdr-MCP Edge 设备同时存在，甚至同时指向同一台物理机，但它不会替代 `device_id` 路由。身份、路由和故障切换规则见 [Herdr 0.9 多机器与双线控制](multi-machine-control.md)。
+
 > v0.4.8 的安全新设备配对支持 macOS 与 x86_64 Linux/Debian。macOS 最终凭据仍进入 Keychain；Linux 使用用户私有 credential store，目录权限为 `0700`、常规凭据文件为 `0600`。Windows 配对仍不可用并 fail closed。
 
 ## 在 ChatGPT 查看设备组
