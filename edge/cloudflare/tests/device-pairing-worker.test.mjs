@@ -437,7 +437,21 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(redirect.searchParams.get("state"), "state-connector");
   assert.ok(redirect.searchParams.get("code"));
 
+  const cancelRegistration = await worker.fetch(new Request("https://edge.example/oauth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      redirect_uris: ["https://client.example/callback"],
+      token_endpoint_auth_method: "none",
+      client_name: "Cancel Connector",
+    }),
+  }), h.env);
+  assert.equal(cancelRegistration.status, 201);
+  const cancelClient = await cancelRegistration.json();
+
   const cancelAuthorize = new URL(authorize);
+  cancelAuthorize.searchParams.set("client_id", cancelClient.client_id);
+  cancelAuthorize.searchParams.set("code_challenge", "B".repeat(43));
   cancelAuthorize.searchParams.set("state", "state-cancel");
   const cancelPage = await worker.fetch(new Request(cancelAuthorize), h.env);
   assert.equal(cancelPage.status, 200);
@@ -454,6 +468,9 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   cancelledPoll.searchParams.set("request_id", cancelRequestId);
   cancelledPoll.searchParams.set("resume_token", cancelResumeToken);
   assert.equal((await worker.fetch(new Request(cancelledPoll), h.env)).status, 410);
+  // Keep the legacy-inventory assertions below scoped to their original
+  // fixtures; this disposable DCR registration exists only to exercise cancel.
+  await oauthStorage.delete(`client:${cancelClient.client_id}`);
 
   const nowSec = Math.floor(Date.now() / 1000);
   await oauthStorage.put("client:https://legacy.example/oauth/client-metadata.json", {

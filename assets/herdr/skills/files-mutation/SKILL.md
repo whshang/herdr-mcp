@@ -9,9 +9,9 @@ Own: `herdr_fs_edit`, `herdr_fs_write`, `herdr_fs_patch`.
 
 ## Tool selection
 
-- `herdr_fs_edit`: one exact unique replacement in an existing file.
-- `herdr_fs_write`: new file or intentional full rewrite.
-- `herdr_fs_patch`: coherent multi-hunk/multi-file changes and transaction-style preflight.
+- `herdr_fs_edit`: EDIT EXISTING FILE via one exact unique replacement.
+- `herdr_fs_write`: CREATE NEW FILE / FULL REWRITE only; it is not a read or generic file-operation tool.
+- `herdr_fs_patch`: PATCH EXISTING FILES for coherent multi-hunk/multi-file changes and transaction-style preflight.
 
 Read exact target context when current content is not already known. For patches, preflight every target before applying.
 

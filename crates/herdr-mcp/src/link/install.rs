@@ -50,11 +50,17 @@ pub fn protected_live_link_labels() -> &'static [&'static str] {
     &[LINK_LABEL, LINK_PROD_LABEL]
 }
 
-/// CLI entry: install the Rust Link candidate LaunchAgent.
+/// CLI entry: install/reconcile the managed Link for the current platform.
 pub fn install() -> Result<ExitCode, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        Err("herdr-mcp link install is macOS-only (LaunchAgent candidate soak)".to_owned())
+        crate::linux_service_manager::install_link()?;
+        println!(r#"{{"ok":true,"action":"link_install","implementation":"linux"}}"#);
+        Ok(ExitCode::SUCCESS)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err("herdr-mcp link install is supported on macOS and Linux only".to_owned())
     }
     #[cfg(target_os = "macos")]
     {
@@ -69,7 +75,7 @@ pub fn install() -> Result<ExitCode, String> {
 pub fn uninstall() -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        Err("herdr-mcp link uninstall is macOS-only (LaunchAgent candidate soak)".to_owned())
+        Err("link uninstall removes the macOS LaunchAgent candidate-soak job only; Linux production Link lifecycle is owned by the Linux service manager".to_owned())
     }
     #[cfg(target_os = "macos")]
     {

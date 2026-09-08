@@ -116,18 +116,11 @@ impl Config {
         rendered
     }
 
-    #[cfg(any(target_os = "macos", test))]
     pub fn set_edge_public_origin(&mut self, origin: &str) -> Result<(), String> {
         self.edge_public_origin = Some(normalize_edge_public_origin(origin)?);
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "macos", test)))]
-    pub fn set_edge_public_origin(&mut self, _origin: &str) -> Result<(), String> {
-        Err("edge configuration requires macOS".to_owned())
-    }
-
-    #[cfg(any(target_os = "macos", test))]
     #[allow(dead_code)]
     pub fn set_edge_link_upstream_origin(&mut self, origin: &str) -> Result<(), String> {
         self.edge_link_upstream_origin = Some(normalize_edge_origin_field(
@@ -137,28 +130,15 @@ impl Config {
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "macos", test)))]
-    #[allow(dead_code)]
-    pub fn set_edge_link_upstream_origin(&mut self, _origin: &str) -> Result<(), String> {
-        Err("edge configuration requires macOS".to_owned())
-    }
-
-    #[cfg(any(target_os = "macos", test))]
     pub fn set_edge_device_id(&mut self, device_id: &str) -> Result<(), String> {
         self.edge_device_id = Some(normalize_device_id(device_id)?);
         Ok(())
     }
 
-    #[cfg(any(target_os = "macos", test))]
     pub fn edge_link_keychain_service(&self) -> Option<String> {
         self.edge_device_id
             .as_ref()
             .map(|device_id| format!("herdr-edge-link-{device_id}"))
-    }
-
-    #[cfg(not(any(target_os = "macos", test)))]
-    pub fn edge_link_keychain_service(&self) -> Option<String> {
-        None
     }
 
     /// The effective origin used by the Link transport (prefers explicit

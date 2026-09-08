@@ -314,7 +314,7 @@ pub fn handle_request(bytes: &[u8]) -> Result<Value, String> {
     #[cfg(all(not(target_os = "macos"), not(test)))]
     {
         let _ = (op, service, account);
-        Err("credential helper requires macOS".to_owned())
+        Err("this credential helper is the macOS Keychain backend; Linux uses the private per-user credential store".to_owned())
     }
 }
 

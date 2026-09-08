@@ -598,10 +598,40 @@ export default {
     return jsonResponse({ ok: false, code: "not_found", retryable: false, path: url.pathname }, 404);
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    if (!env.ARTIFACT_BUCKET) return;
-    const result = await sweepExpiredArtifacts(env.ARTIFACT_BUCKET, Date.now());
-    logger.info("artifact.sweep", { scanned: result.scanned, deleted: result.deleted });
+  async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
+    const nowMs = Number.isFinite(event.scheduledTime) ? event.scheduledTime : Date.now();
+    if (env.ARTIFACT_BUCKET) {
+      const result = await sweepExpiredArtifacts(env.ARTIFACT_BUCKET, nowMs);
+      logger.info("artifact.sweep", { scanned: result.scanned, deleted: result.deleted });
+    }
+
+    // The Worker already runs every ten minutes for artifact expiry. Reuse one
+    // deterministic daily tick for Connector lifecycle GC instead of adding a
+    // second cron or scanning OAuth state every ten minutes.
+    const scheduled = new Date(nowMs);
+    if (scheduled.getUTCHours() !== 3 || scheduled.getUTCMinutes() !== 0) return;
+    const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+    const response = await stub.fetch(new Request("https://oauth.internal/internal/oauth/connector/sweep-inactive", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        now_ms: nowMs,
+        inactive_ms: 30 * 24 * 60 * 60_000,
+        limit: 64,
+      }),
+    }));
+    if (!response.ok) {
+      logger.warn("connector.inactivity_sweep_failed", { status: response.status });
+      return;
+    }
+    const result = await response.json() as Record<string, unknown>;
+    logger.info("connector.inactivity_sweep", {
+      scanned: result.scanned ?? 0,
+      eligible: result.eligible ?? 0,
+      revoked: result.revoked ?? 0,
+      deletedTokens: result.deleted_tokens ?? 0,
+      remainingEligible: result.remaining_eligible ?? 0,
+    });
   },
 };
 
@@ -642,6 +672,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         userAgent: request.headers.get("user-agent"),
         oauthClientId: devAuth.clientId ?? null,
         automationDeviceId: devAuth.principalType === "automation" ? (devAuth.deviceId ?? null) : null,
+        fleetAdmin: Boolean(mcpFleetPrincipal),
       },
       forward: async (stub: unknown, body: string) => {
         const internal = new Request("https://do.internal/internal/forward", {

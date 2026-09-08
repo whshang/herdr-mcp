@@ -178,6 +178,16 @@ fn project_snapshot(
         "protocol".to_owned(),
         pong.get("protocol").cloned().unwrap_or(Value::Null),
     );
+    output.insert(
+        "herdr_capabilities".to_owned(),
+        pong.get("capabilities").cloned().unwrap_or(Value::Null),
+    );
+    output.insert(
+        "endpoint_protocol_generation".to_owned(),
+        pong.pointer("/capabilities/endpoint_protocol_generation")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
     visibility.append_meta(&mut output, hidden_agents);
     let visible_scanned_workers = capability_snapshot
         .workers
@@ -546,7 +556,17 @@ mod tests {
         let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
         let output = project_snapshot(
             &fixture(),
-            &json!({"version": "0.8.2", "protocol": 20}),
+            &json!({
+                "version": "0.9.0",
+                "protocol": 22,
+                "capabilities": {
+                    "live_handoff": true,
+                    "detached_server_daemon": true,
+                    "endpoint_protocol_generation": 1,
+                    "surface_interest": true,
+                    "health_check": true
+                }
+            }),
             SnapshotSource::Snapshot,
             &visibility,
             &[],
@@ -572,8 +592,12 @@ mod tests {
         assert_eq!(output["agents"][0]["kind"], "pi");
         assert_eq!(output["agents"][0]["status"], "working");
         assert_eq!(output["agents"][0]["session_ref"]["source"], "herdr:pi");
-        assert_eq!(output["herdr_version"], "0.8.2");
-        assert_eq!(output["protocol"], 20);
+        assert_eq!(output["herdr_version"], "0.9.0");
+        assert_eq!(output["protocol"], 22);
+        assert_eq!(output["endpoint_protocol_generation"], 1);
+        assert_eq!(output["herdr_capabilities"]["surface_interest"], true);
+        assert_eq!(output["herdr_capabilities"]["health_check"], true);
+        assert_eq!(output["herdr_capabilities"]["live_handoff"], true);
         assert_eq!(output["agent_visibility"], "allowlist");
         assert_eq!(output["agents_hidden"], 0);
         assert_eq!(output["capability_inventory"]["source"], "not_scanned");
@@ -609,6 +633,8 @@ mod tests {
         assert_eq!(output["agents"][0]["kind"], "pi");
         assert_eq!(output["panes"][0]["agent"]["name"], "w1:p1");
         assert_eq!(output["panes"][0]["agent"]["kind"], "pi");
+        assert!(output["herdr_capabilities"].is_null());
+        assert!(output["endpoint_protocol_generation"].is_null());
     }
 
     #[cfg(unix)]

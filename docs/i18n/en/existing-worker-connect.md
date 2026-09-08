@@ -4,7 +4,9 @@
 
 A Herdr fleet has one public Worker/Connector and multiple independently identified computers behind it. ChatGPT can discover the fleet, choose a device for a task, and keep follow-up operations attached to that device. New computers join the existing Worker through short-lived pairing; they do not deploy another Worker or receive a shared global secret.
 
-> Secure new-device pairing currently uses the macOS Keychain credential backend, so the pairing workflow is currently macOS-only.
+Herdr 0.9 also has its own saved SSH-machine layer for a multi-machine TUI. That layer can coexist with this Edge fleet, including on the same physical computer, but it does not replace `device_id` routing. See [Herdr 0.9 multi-machine and dual-path control](multi-machine-control.md) for the identity, routing, and failover rules.
+
+> v0.4.8 supports secure new-device pairing on macOS and x86_64 Linux/Debian. macOS keeps the final device credential in Keychain; Linux uses a private per-user credential store with a `0700` directory and `0600` regular credential files. Windows pairing remains unavailable and fails closed.
 
 ## See the fleet from ChatGPT
 
@@ -54,9 +56,9 @@ herdr-mcp worker connect "<pairing-address>"
 
 The CLI then prompts for the 6-digit code as normal visible terminal input so you can verify what you typed. The code is intentionally not accepted as a normal command-line argument, so it stays out of shell history.
 
-By default, the joining computer registers its macOS **Computer Name** as the device display name. Use `--name "<device-name>"` only when the user explicitly wants a different initial name. A `worker pair --name ...` value supplied by the pairing creator is also an explicit override and takes precedence.
+By default, the joining computer registers the platform-reported computer/host name as the device display name. Use `--name "<device-name>"` only when the user explicitly wants a different initial name. A `worker pair --name ...` value supplied by the pairing creator is also an explicit override and takes precedence.
 
-After the pairing is consumed, `worker connect` installs/starts the local `herdr-mcp` service and ensures the enrolled Rust production Link is created and loaded. The command reports success only after the local service is healthy and `link-prod` is owned by the managed runtime with the new device identity; a failure triggers the existing revoke/Keychain/config compensation path.
+After the pairing is consumed, `worker connect` installs/starts the local `herdr-mcp` service and ensures the enrolled Rust production Link is created and loaded. On macOS that lifecycle is owned by launchd. On a normal Linux login/server environment Herdr prefers `systemd --user`; when no user systemd manager/bus exists (for example an init-less development container), it falls back to a detached per-user process backend with PID plus `/proc` start-time identity checks so lifecycle commands never kill an unrelated reused PID. The fallback survives the invoking shell exiting, but it cannot provide systemd-style restart-on-crash or boot/container-restart persistence; use the surrounding container/host supervisor if that persistence is required. The command still reports success only after the local service is healthy and the production Link uses the new device identity; any activation failure triggers remote revoke plus local credential/config compensation.
 
 For an Agent-assisted setup, paste this sentence on the new computer:
 
@@ -96,7 +98,7 @@ Revocation is permanent for that device identity and credential: the live Link i
 
 ## What pairing changes
 
-The short-lived pairing is exchanged for a new per-device credential. The final credential is stored in macOS Keychain, and the Worker stores only the verifier needed to authenticate that device. The pairing session becomes unusable after successful consumption.
+The short-lived pairing is exchanged for a new per-device credential. macOS stores the final credential in Keychain; Linux stores it in the private user credential store described above. The Worker stores only the verifier needed to authenticate that device. The pairing session becomes unusable after successful consumption.
 
 The joining computer does **not** need:
 

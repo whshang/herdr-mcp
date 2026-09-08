@@ -221,18 +221,7 @@ fn run_unix_durable(
     ) {
         let readiness = utility_pane_readiness(&info);
         if !readiness.ready {
-            return json!({
-                "ok": false,
-                "code": "utility_pane_not_ready",
-                "backend": "utility_pane",
-                "workspace": workspace_id,
-                "pane_id": pane_id,
-                "command": command,
-                "foreground": readiness.foreground,
-                "shell_pid": readiness.shell_pid,
-                "foreground_process_group_id": readiness.foreground_process_group_id,
-                "hint": "utility pane is owned by an interactive program (for example less/git/gh); exit it and retry herdr_exec",
-            });
+            return utility_pane_contention_result(workspace_id, &pane_id, command, &readiness);
         }
     }
 
@@ -332,6 +321,31 @@ fn run_unix_durable(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn utility_pane_contention_result(
+    workspace_id: &str,
+    pane_id: &str,
+    command: &str,
+    readiness: &PaneReadiness,
+) -> Value {
+    json!({
+        "ok": false,
+        "code": "utility_pane_not_ready",
+        "backend": "utility_pane",
+        "workspace": workspace_id,
+        "pane_id": pane_id,
+        "command": command,
+        "foreground": readiness.foreground,
+        "shell_pid": readiness.shell_pid,
+        "foreground_process_group_id": readiness.foreground_process_group_id,
+        "conflict_key": format!("workspace:{workspace_id}:utility_pane"),
+        "retryable": true,
+        "retry_after_ms": 500,
+        "delivery_state": "not_delivered",
+        "safe_retry_mode": "retry_after_resource_release",
+        "hint": "utility pane is owned by an interactive program (for example less/git/gh); retry after the resource is released",
+    })
 }
 
 fn resolve_workspace(snapshot: &Value, target: &str) -> Option<WorkspaceRecord> {
@@ -1074,6 +1088,23 @@ mod tests {
             }
         }));
         assert!(!blocked.ready);
+    }
+
+    #[test]
+    fn utility_pane_contention_is_explicitly_retryable_before_delivery() {
+        let readiness = PaneReadiness {
+            ready: false,
+            shell_pid: Some(42),
+            foreground_process_group_id: Some(77),
+            foreground: vec![json!({"pid": 77, "name": "less"})],
+        };
+        let result = utility_pane_contention_result("w1", "w1:p2", "git status", &readiness);
+        assert_eq!(result["code"], "utility_pane_not_ready");
+        assert_eq!(result["conflict_key"], "workspace:w1:utility_pane");
+        assert_eq!(result["retryable"], true);
+        assert_eq!(result["retry_after_ms"], 500);
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["safe_retry_mode"], "retry_after_resource_release");
     }
 
     #[test]

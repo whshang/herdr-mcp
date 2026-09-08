@@ -331,6 +331,40 @@ test("artifact delete removes the object and sweep drops expired leftovers", asy
   assert.equal(state.ARTIFACT_BUCKET.store.has(artifactObjectKey(stale.id)), false);
 });
 
+test("worker cron runs Connector inactivity GC once on the daily 03:00 UTC tick", async () => {
+  const calls = [];
+  const oauthStub = {
+    async fetch(request) {
+      calls.push({ url: request.url, body: await request.json() });
+      return new Response(JSON.stringify({
+        ok: true,
+        scanned: 3,
+        eligible: 1,
+        revoked: 1,
+        deleted_tokens: 1,
+        remaining_eligible: 0,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  };
+  const state = env({
+    ARTIFACT_BUCKET: undefined,
+    OAUTH_STORE_DO: {
+      idFromName(name) { return name; },
+      get() { return oauthStub; },
+    },
+  });
+
+  await worker.scheduled({ scheduledTime: Date.UTC(2026, 8, 8, 2, 50) }, state);
+  assert.equal(calls.length, 0);
+  await worker.scheduled({ scheduledTime: Date.UTC(2026, 8, 8, 3, 0) }, state);
+  assert.equal(calls.length, 1);
+  assert.equal(new URL(calls[0].url).pathname, "/internal/oauth/connector/sweep-inactive");
+  assert.equal(calls[0].body.inactive_ms, 30 * 24 * 60 * 60_000);
+  assert.equal(calls[0].body.limit, 64);
+  await worker.scheduled({ scheduledTime: Date.UTC(2026, 8, 8, 3, 10) }, state);
+  assert.equal(calls.length, 1);
+});
+
 test("artifact routes are Worker-private and have no browser-extension coupling", async () => {
   const state = env();
   const unauth = await worker.fetch(new Request("https://edge.example/artifacts", { method: "POST", body: PNG }), state);

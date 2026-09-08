@@ -1,7 +1,9 @@
-//! macOS service manager for the Rust local runtime.
+//! Platform service manager for the Rust local runtime.
 //!
-//! The default (production) launchd label stays `dev.herdr-mcp.server` so
-//! callers and the browser extension keep a single primary service identity.
+//! macOS uses launchd; Linux uses `systemd --user` when available and an
+//! ownership-checked detached user-process fallback in init-less environments.
+//! On macOS, the default production launchd label stays `dev.herdr-mcp.server`
+//! so callers and the browser extension keep a single primary service identity.
 //! Named instances (`HERDR_MCP_INSTANCE` / `--instance`) suffix labels and ports
 //! for same-uid UAT and never rewrite `~/.local/bin/herdr-mcp`.
 //! A Rust install is content-addressed under `runtime/generations/` and launchd
@@ -15,10 +17,15 @@ use serde_json::Value;
 use std::process::ExitCode;
 
 pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_service_manager::run(command)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = command;
-        Err("service_manager_currently_requires_macos".to_owned())
+        Err("service manager is currently supported on macOS and Linux".to_owned())
     }
 
     #[cfg(target_os = "macos")]
@@ -85,6 +92,7 @@ pub(crate) fn run_install_from_payload(
 /// Return the managed Rust binary targeted by the current ready rollback.
 /// This is read-only preflight data; `rollback()` independently revalidates the
 /// ledger and target immediately before mutation.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn rollback_target_runtime_binary() -> Result<Option<std::path::PathBuf>, String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -99,18 +107,54 @@ pub fn rollback_target_runtime_binary() -> Result<Option<std::path::PathBuf>, St
 
 /// Read-only service ownership snapshot for `doctor`. Never mutates launchd.
 pub fn doctor_status() -> Result<serde_json::Value, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_service_manager::doctor_status()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Ok(serde_json::json!({
             "ok": false,
             "implementation": "unsupported",
-            "detail": "service manager currently requires macOS",
+            "detail": "service manager is currently supported on macOS and Linux",
         }))
     }
 
     #[cfg(target_os = "macos")]
     {
         macos::doctor_status()
+    }
+}
+
+/// Return the active local runtime bearer only for an in-process doctor probe.
+/// The caller must never print, serialize, or otherwise expose this value.
+pub(crate) fn doctor_runtime_token() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    let managed_token = macos::doctor_runtime_token();
+
+    #[cfg(target_os = "linux")]
+    let managed_token = crate::linux_service_manager::doctor_runtime_token();
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Ok(Some(token)) = &managed_token {
+        return Ok(Some(token.clone()));
+    }
+
+    if let Ok(token) = std::env::var("HERDR_MCP_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return Ok(Some(token));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(None)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        managed_token
     }
 }
 
@@ -2589,6 +2633,17 @@ mod macos {
     pub(super) fn doctor_status() -> Result<Value, String> {
         let paths = ServicePaths::discover()?;
         status(&paths)
+    }
+
+    pub(super) fn doctor_runtime_token() -> Result<Option<String>, String> {
+        let paths = ServicePaths::discover()?;
+        let bytes = read_optional_bounded(&paths.plist, 256 * 1024)?;
+        let descriptor = describe_service(bytes.as_deref(), &paths)?;
+        Ok(descriptor
+            .env
+            .get("HERDR_MCP_TOKEN")
+            .cloned()
+            .filter(|value| !value.trim().is_empty()))
     }
 
     fn status(paths: &ServicePaths) -> Result<Value, String> {

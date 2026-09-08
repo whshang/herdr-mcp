@@ -10,6 +10,7 @@ mod child_process;
 mod cli;
 mod config;
 mod contract;
+mod credential_store;
 mod dev;
 pub mod development_orchestration;
 mod device_name;
@@ -30,6 +31,8 @@ mod inspect;
 mod instance;
 mod instance_admin;
 mod link;
+#[cfg(any(target_os = "linux", test))]
+mod linux_service_manager;
 mod local_skills;
 mod macos_credential_helper;
 mod macos_keychain;
@@ -69,8 +72,9 @@ mod text_transfer;
 mod update_scheduler;
 mod updater;
 mod updater_store;
-// Wired only from the macOS service manager; keep unit tests compiling on Linux CI.
-#[cfg(any(target_os = "macos", test))]
+// The stable PATH link is a Unix ownership primitive shared by launchd and
+// systemd-user installations.
+#[cfg(any(unix, test))]
 mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
@@ -78,9 +82,32 @@ mod worker;
 mod worker_bootstrap;
 mod workstation;
 
-use std::process::ExitCode;
+use std::{any::Any, panic, process::ExitCode};
 
 fn main() -> ExitCode {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if !panic_payload_is_broken_pipe(info.payload()) {
+            default_hook(info);
+        }
+    }));
+    match panic::catch_unwind(main_inner) {
+        Ok(code) => code,
+        Err(payload) if panic_payload_is_broken_pipe(payload.as_ref()) => ExitCode::SUCCESS,
+        Err(payload) => panic::resume_unwind(payload),
+    }
+}
+
+fn panic_payload_is_broken_pipe(payload: &(dyn Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied());
+    message
+        .is_some_and(|message| message.contains("Broken pipe") || message.contains("os error 32"))
+}
+
+fn main_inner() -> ExitCode {
     // Pin runtime start evidence at process entry so later cursor-reset
     // attribution is measured against the actual process lifetime, not the
     // first diagnostics call that happens to request build metadata.
@@ -260,5 +287,18 @@ fn run() -> Result<ExitCode, String> {
                 link::run_link_migrate_runtime_control(mode)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod broken_pipe_tests {
+    use super::panic_payload_is_broken_pipe;
+
+    #[test]
+    fn broken_pipe_detection_is_narrow() {
+        let broken = "failed printing to stdout: Broken pipe (os error 32)".to_owned();
+        let ordinary = "ordinary panic".to_owned();
+        assert!(panic_payload_is_broken_pipe(&broken));
+        assert!(!panic_payload_is_broken_pipe(&ordinary));
     }
 }

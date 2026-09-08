@@ -244,7 +244,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
     },
     BuiltinSkillSpec {
         id: "files-search",
-        description: "Read, list, search, and inspect images inside managed project roots.",
+        description: "READ ONLY: read, list, search, and inspect images inside managed project roots. Use herdr_fs_read for source reads; this skill owns no file-creation tool.",
         content: FILES_SEARCH,
         triggers: &["read file", "list files", "search", "grep", "image"],
         requires_capabilities: &["managed project root"],
@@ -259,7 +259,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
     },
     BuiltinSkillSpec {
         id: "files-mutation",
-        description: "Apply safe repository file edits, writes, and transactional patches.",
+        description: "File mutation only: herdr_fs_write = CREATE / FULL REWRITE; herdr_fs_edit = exact replacement; herdr_fs_patch = PATCH EXISTING FILES or coherent multi-file changes.",
         content: FILES_MUTATION,
         triggers: &["edit", "write", "patch", "modify files"],
         requires_capabilities: &["managed project root", "mutation gate"],
@@ -1908,6 +1908,28 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0]["method"], GITHUB_STATUS_METHOD);
         assert_eq!(methods[0]["params"]["required"][0], "project_root");
+    }
+
+    #[test]
+    fn file_skill_discovery_keeps_read_write_and_patch_intents_distinct() {
+        let service = ProgressiveSkillService::new();
+        let catalog = service.catalog();
+        let search = catalog
+            .iter()
+            .find(|skill| skill.id == "files-search")
+            .unwrap();
+        let mutation = catalog
+            .iter()
+            .find(|skill| skill.id == "files-mutation")
+            .unwrap();
+
+        assert!(search.description.contains("READ ONLY"));
+        assert!(search.owned_tools.contains(&"herdr_fs_read".to_owned()));
+        assert!(!search.owned_tools.contains(&"herdr_fs_write".to_owned()));
+        assert!(mutation.description.contains("CREATE / FULL REWRITE"));
+        assert!(mutation.description.contains("PATCH EXISTING FILES"));
+        assert!(mutation.owned_tools.contains(&"herdr_fs_write".to_owned()));
+        assert!(mutation.owned_tools.contains(&"herdr_fs_patch".to_owned()));
     }
 
     #[test]

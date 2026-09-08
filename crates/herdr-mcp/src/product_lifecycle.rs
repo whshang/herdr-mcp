@@ -14,7 +14,7 @@ pub(crate) fn reinstall() -> Result<ExitCode, String> {
     refuse_managed_exec_mutation()?;
     #[cfg(not(target_os = "macos"))]
     {
-        Err("product reinstall currently requires macOS".to_owned())
+        Err("top-level product reinstall is currently implemented for macOS lifecycle integration; Linux runtime repair uses `herdr-mcp install`".to_owned())
     }
     #[cfg(target_os = "macos")]
     {
@@ -26,7 +26,7 @@ pub(crate) fn uninstall() -> Result<ExitCode, String> {
     refuse_managed_exec_mutation()?;
     #[cfg(not(target_os = "macos"))]
     {
-        Err("product uninstall currently requires macOS".to_owned())
+        Err("top-level product uninstall is currently implemented for macOS lifecycle integration; Linux service removal uses `herdr-mcp service uninstall`".to_owned())
     }
     #[cfg(target_os = "macos")]
     {

@@ -46,7 +46,7 @@ pub(crate) fn run(command: HerdrSupervisorCommand) -> Result<ExitCode, String> {
                 );
                 Ok(ExitCode::SUCCESS)
             }
-            _ => Err("Herdr dependency supervisor is currently macOS-only".to_owned()),
+            _ => Err("the managed Herdr dependency supervisor is a macOS launchd integration; Linux herdr-mcp service lifecycle does not use this supervisor".to_owned()),
         }
     }
 }
@@ -112,6 +112,7 @@ pub(crate) fn restore_install_state_for_service(state: InstallState) -> Result<(
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn runtime_binary_supports_supervisor(binary: &std::path::Path) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {

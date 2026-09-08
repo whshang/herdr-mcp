@@ -122,6 +122,16 @@ Avoid several agents editing the same working tree. Use isolated worktrees for p
 
 For long tests and builds, the planner uses `herdr_exec_start` and resumes with `herdr_exec_read(session_id, offset=next_offset)` instead of treating terminal scrollback as completion evidence. Completed sessions keep bounded final output and exit evidence long enough to survive a runtime replacement; a running process is never assumed to have been safely taken over after a restart.
 
+### Herdr 0.9 multi-machine + Herdr-MCP devices
+
+Herdr 0.9 can save SSH machines and show several Herdr servers in one TUI. Herdr-MCP keeps its own Edge device fleet for ChatGPT/Web-AI routing. The same physical computer may use both paths at once: if both paths reach the same Herdr session, they see the same live workspace, pane, agent, terminal, Git, and filesystem state because they are talking to the same Herdr server — not because two copies are synchronized.
+
+The identities stay separate. A Herdr saved machine is addressed by its machine profile + SSH target + Herdr session; an Edge device is addressed by its immutable `device_id` and device-bound `herdr_ref_*` references. Never treat a bare `w1` or `w1:p1` as globally unique across machines, and never merge the two identities just because labels or hostnames look similar.
+
+Herdr 0.9's multi-machine TUI does not yet provide machine-scoped pane/workspace CLI or socket calls. Selecting a remote machine in the TUI does not retarget ordinary local `herdr pane ...` / `herdr workspace ...` commands, and `herdr --remote <target>` is currently a TUI attach path rather than a modifier for those subcommands. Until upstream adds a native machine-scoped API, explicit maintenance/UAT automation can resolve `herdr machine list --json`, then use that profile's SSH target/session to run Herdr CLI on the remote server. ChatGPT operations continue to prefer the Edge device path; SSH is never a transparent retry for an Edge mutation with uncertain delivery.
+
+See [Herdr 0.9 multi-machine and dual-path control](docs/i18n/en/multi-machine-control.md) for the routing rules, verification procedure, and upstream tracking.
+
 ## Chrome extension
 
 The browser extension is optional for the core ChatGPT → MCP → workstation connection. Install it when you want conversation continuity, queued next-turn messages, Browser Control Center, or supported ChatGPT artifact capture.

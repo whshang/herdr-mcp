@@ -71,27 +71,30 @@ test("normalizeResource maps '' / issuer / issuer+/mcp and rejects foreign", () 
   assert.equal(normalizeResource(id, "https://herdr-mcp.example.com/other"), null);
 });
 
-test("oauthEdgeMetadata preserves the legacy discovery contract and adds pre-provisioned Automation Client grant", () => {
+test("oauthEdgeMetadata preserves discovery and advertises Connector revocation plus Automation Client grant", () => {
   const id = createOAuthIdentity("https://herdr-mcp.example.com");
   const doc = oauthEdgeMetadata(id);
   assert.deepEqual(doc, {
     issuer: "https://herdr-mcp.example.com",
     authorization_endpoint: "https://herdr-mcp.example.com/oauth/authorize",
     token_endpoint: "https://herdr-mcp.example.com/oauth/token",
+    revocation_endpoint: "https://herdr-mcp.example.com/oauth/revoke",
     registration_endpoint: "https://herdr-mcp.example.com/oauth/register",
     scopes_supported: ["mcp"],
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"],
     token_endpoint_auth_methods_supported: ["none", "private_key_jwt", "client_secret_post"],
+    revocation_endpoint_auth_methods_supported: ["none", "private_key_jwt", "client_secret_post"],
     code_challenge_methods_supported: ["S256"],
     authorization_response_iss_parameter_supported: true,
     client_id_metadata_document_supported: true,
     protected_resources: ["https://herdr-mcp.example.com/mcp"],
   });
-  // Keep the discovery shape stable. `client_credentials` is the intentional
-  // Edge-only extension for Worker-provisioned Automation Clients; DCR still
-  // cannot self-register that grant and the legacy local Node compatibility
-  // server does not become a second automation-credential authority.
+  // Keep discovery additions explicit. `client_credentials` is the Edge-only
+  // extension for Worker-provisioned Automation Clients; RFC 7009 revocation
+  // is the Connector lifecycle endpoint. DCR still cannot self-register the
+  // automation grant and the local Node compatibility server is not a second
+  // automation-credential authority.
   assert.deepEqual(Object.keys(doc).sort(), [
     "authorization_endpoint",
     "authorization_response_iss_parameter_supported",
@@ -102,6 +105,8 @@ test("oauthEdgeMetadata preserves the legacy discovery contract and adds pre-pro
     "protected_resources",
     "registration_endpoint",
     "response_types_supported",
+    "revocation_endpoint",
+    "revocation_endpoint_auth_methods_supported",
     "scopes_supported",
     "token_endpoint",
     "token_endpoint_auth_methods_supported",

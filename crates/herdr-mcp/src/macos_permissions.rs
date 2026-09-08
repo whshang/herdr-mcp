@@ -31,7 +31,8 @@ const HINT_UNKNOWN: &str = "re-run `herdr-mcp permissions verify`";
 #[cfg(any(target_os = "macos", test))]
 const HINT_GRANTED: &str = "protected path readable";
 #[cfg(any(not(target_os = "macos"), test))]
-const HINT_NOT_APPLICABLE: &str = "macOS only";
+const HINT_NOT_APPLICABLE: &str =
+    "not applicable: this command manages macOS privacy/TCC permissions";
 #[cfg(any(target_os = "macos", test))]
 const FULL_DISK_ACCESS_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";

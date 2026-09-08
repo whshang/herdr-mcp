@@ -149,7 +149,7 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
         Ok(serde_json::json!({
             "ok": false,
             "implementation": "unsupported",
-            "detail": "native host install currently requires macOS",
+            "detail": "Chromium Native Messaging host installation is currently implemented on macOS; Linux core MCP/Link operation does not depend on the native host",
         }))
     }
 
@@ -2365,7 +2365,7 @@ fn failpoint_after_restore_mutation() -> Result<(), String> {
 // Edge write failing) so a retry can be proven to resume from the same durable
 // snapshot. It is macOS-test-only and has no production effect. Keeping the
 // helpers out of non-macOS test builds also prevents Linux CI from compiling
-// unused failpoint symbols after the macOS-only mutation paths are cfg'd out.
+// unused failpoint symbols after the macOS mutation paths are cfg'd out.
 #[cfg(all(test, target_os = "macos"))]
 thread_local! {
     static MUTATION_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };

@@ -2,6 +2,16 @@
 members = ["crates/herdr-mcp"]
 resolver = "3"
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

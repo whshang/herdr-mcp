@@ -89,7 +89,13 @@ pub(crate) fn reconcile_after_service_generation_change(
         return Ok(());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let _ = paths;
+        crate::linux_service_manager::reconcile_link()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = paths;
         Ok(())
