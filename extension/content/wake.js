@@ -1350,12 +1350,43 @@ const H2W_CONTENT_VERSION = "0.1.90";
   async function performBrowserActuationCommand(command) {
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
-    if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)
-        || !Number.isSafeInteger(expectedGeneration)
-        || expectedGeneration < 1) {
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
       return { ...evidence, resource_available: false };
     }
     if (command?.expectedConvKey && command.expectedConvKey !== ADAPTER.getConversationKey()) {
+      return { ...evidence, resource_available: false };
+    }
+    if (command?.operation === "herdr_mcp.browser_session.open") {
+      if (ADAPTER.name !== "chatgpt") {
+        return { ...evidence, resource_available: false };
+      }
+      const params = command?.params && typeof command.params === "object" ? command.params : {};
+      const sessionRef = typeof params.session_ref === "string" ? params.session_ref : "";
+      if (!sessionRef || sessionRef !== registeredBrowserSessionRef) {
+        return { ...evidence, resource_available: false };
+      }
+      if (expectedGeneration !== registeredBrowserGeneration) {
+        return { ...evidence, resource_available: false };
+      }
+      const currentConvKey = ADAPTER.getConversationKey();
+      if (!currentConvKey || currentConvKey !== registeredConvKey) {
+        return { ...evidence, resource_available: false };
+      }
+      if (!providerCanonicalConversationObserved()) {
+        return { ...evidence, resource_available: false };
+      }
+      if (document.hidden) {
+        return { ...evidence, resource_available: false };
+      }
+      evidence.command_accepted = true;
+      evidence.resource_available = true;
+      evidence.stable_resource_ref_observed = true;
+      evidence.lifecycle_observed = true;
+      evidence.canonical_url_observed = true;
+      evidence.observed_generation = expectedGeneration;
+      return evidence;
+    }
+    if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)) {
       return { ...evidence, resource_available: false };
     }
     if (command?.operation !== "herdr_mcp.browser_dispatch.submit") {

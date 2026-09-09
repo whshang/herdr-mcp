@@ -232,3 +232,50 @@ test("A to B to A registration cannot resurrect an older A response", async () =
   assert.equal(harness.state().sessionRef, "br_a_new");
   assert.equal(harness.state().generation, 12);
 });
+
+test("ChatGPT session.open is the only supported existing-view open (create stays unsupported)", () => {
+  assert.match(backgroundSource, /capabilities:\s*\{\s*operations:\s*provider === "chatgpt"/);
+  assert.match(backgroundSource, /"session\.open"/);
+  assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
+  // No provider except chatgpt should ever reach the open postcondition.
+  assert.match(wakeSource, /if \(ADAPTER\.name !== "chatgpt"\)\s*\{\s*return \{[^}]*resource_available:\s*false/);
+});
+
+test("background session.open recovers unique target via recoverBrowserSessionTarget and activates without message insert", () => {
+  const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
+  assert.ok(start >= 0, "session.open branch must exist in handleBrowserActuation");
+  const segment = backgroundSource.slice(start, backgroundSource.indexOf("\n  const sessionRef = String(params.session_ref", start));
+  assert.match(segment, /recoverBrowserSessionTarget/);
+  assert.match(segment, /chrome\.tabs\.update.*active:\s*true.*autoDiscardable:\s*false/);
+  assert.match(segment, /protectBoundTab/);
+  assert.doesNotMatch(segment, /insertMainWorld|performWake|tabs\.reload|executeScript/);
+  // Must fail closed on missing/duplicate/stale/provider mismatch.
+  assert.match(segment, /observedGeneration/);
+  assert.match(segment, /provider !== "chatgpt"/);
+});
+
+test("content script session.open verifies identity, generation, route, canonical readiness and never submits", () => {
+  const start = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_session.open")');
+  assert.ok(start >= 0, "wake must handle session.open");
+  const dispatchStart = wakeSource.indexOf('if (command?.operation !== "herdr_mcp.browser_dispatch.submit")', start);
+  const segment = wakeSource.slice(start, dispatchStart >= 0 ? dispatchStart : start + 3000);
+  assert.match(segment, /registeredBrowserSessionRef/);
+  assert.match(segment, /registeredBrowserGeneration/);
+  assert.match(segment, /registeredConvKey/);
+  assert.match(segment, /providerCanonicalConversationObserved/);
+  assert.match(segment, /ADAPTER\.getConversationKey/);
+  assert.doesNotMatch(segment, /performWake|insertMainWorld|dispatchEnterSubmit|findSendButton|isTurnInProgress/);
+  // Must set the session.open postcondition evidence without message fields.
+  assert.match(segment, /stable_resource_ref_observed\s*=\s*true/);
+  assert.match(segment, /lifecycle_observed\s*=\s*true/);
+  assert.match(segment, /canonical_url_observed\s*=\s*true/);
+  assert.match(segment, /command_accepted\s*=\s*true/);
+});
+
+test("browser_session.create remains unsupported and never reaches browser actuation", () => {
+  // Background must not have a dedicated create branch, and Rust matrix keeps it unsupported.
+  assert.equal(backgroundSource.includes('herdr_mcp.browser_session.create') && backgroundSource.includes('if (operation === "herdr_mcp.browser_session.create")'), false);
+  assert.match(wakeSource, /herdr_mcp\.browser_dispatch\.submit/);
+  // Ensure the capability snapshot for non-chatgpt never advertises session.open.
+  assert.match(backgroundSource, /provider === "chatgpt"\s*\?/);
+});

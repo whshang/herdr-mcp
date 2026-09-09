@@ -12,10 +12,10 @@ use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
     BrowserDeliveryState, BrowserDispatchReservation, BrowserDispatchReserveInput,
-    BrowserDispatchUpdateInput, BrowserResourceResolveInput, ContinuitySearchInput, StateStore,
-    WorkMemoryBindingInput, WorkMemoryCheckpointInput, WorkMemoryEvidenceInput,
-    WorkMemoryPortableSourceInput, WorkMemorySearchBoundary, WorkMemorySearchPage,
-    WorkMemorySearchPageOptions, WorkMemoryTurnInput,
+    BrowserDispatchUpdateInput, BrowserResourceResolveInput, ContinuitySearchInput,
+    OperationReservation, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
+    WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemorySearchBoundary,
+    WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
@@ -1803,6 +1803,140 @@ fn browser_dispatch_status(
     })
 }
 
+fn browser_session_open(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+    let expected_generation = params
+        .get("expected_generation")
+        .and_then(Value::as_i64)
+        .unwrap();
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .unwrap();
+
+    let request_json = json!({
+        "operation": "herdr_mcp.browser_session.open",
+        "session_ref": session_ref,
+        "expected_generation": expected_generation
+    })
+    .to_string();
+    let request_hash = browser_sha256(&request_json);
+    let idempotency_digest = browser_sha256(idempotency_key);
+    let op_id = format!("op:browser_session_open:{}", &idempotency_digest[..32]);
+    let now = browser_epoch_ms();
+    let expires_at = now.saturating_add(10 * 60 * 1000);
+
+    let reservation = {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match guard.reserve_operation(
+            "browser_session.open",
+            &idempotency_digest,
+            &request_hash,
+            &op_id,
+            now,
+            expires_at,
+        ) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        }
+    };
+
+    match reservation {
+        OperationReservation::Existing(record) => {
+            if record.request_hash != request_hash {
+                return json!({
+                    "ok": false,
+                    "code": "idempotency_key_conflict",
+                    "op_id": record.op_id,
+                });
+            }
+            match record.state.as_deref() {
+                Some("pending") => {
+                    return json!({
+                        "ok": false,
+                        "code": "idempotency_in_flight",
+                        "op_id": record.op_id,
+                    });
+                }
+                Some("complete") => {
+                    let Some(result_json) = record.result_json else {
+                        return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                    };
+                    let mut replay: Value = match serde_json::from_str(&result_json) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                        }
+                    };
+                    if let Some(object) = replay.as_object_mut() {
+                        object.insert("idempotent_replay".to_owned(), json!(true));
+                        object.insert("op_id".to_owned(), json!(record.op_id));
+                    }
+                    return replay;
+                }
+                _ => {
+                    return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                }
+            }
+        }
+        OperationReservation::Reserved => {}
+    }
+
+    let evidence = match actuator {
+        Some(actuator) => match actuator.actuate(
+            BrowserOperation::SessionOpen.method(),
+            params,
+            expected_generation,
+            None,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => return browser_store_error(error),
+        },
+        None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+    };
+    let delivery_state = match browser_delivery_state_from_postcondition(
+        BrowserOperation::SessionOpen,
+        params,
+        expected_generation,
+        &evidence,
+    ) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    let mut result =
+        browser_operation_delivery_result(BrowserOperation::SessionOpen, delivery_state);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("op_id".to_owned(), json!(op_id));
+        object.insert("idempotent_replay".to_owned(), json!(false));
+    }
+    let result_json = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned());
+    let Ok(mut guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    if let Err(error) = guard.complete_operation(
+        "browser_session.open",
+        &idempotency_digest,
+        &request_hash,
+        &result_json,
+        browser_epoch_ms(),
+        expires_at,
+    ) {
+        return json!({
+            "ok": false,
+            "code": "idempotency_completion_persist_failed",
+            "message": error,
+            "op_id": op_id,
+        });
+    }
+    result
+}
+
 fn browser_dispatch_work_memory_writeback(
     store: &mut StateStore,
     dispatch: &crate::state_store::BrowserDispatchRecord,
@@ -1901,6 +2035,9 @@ fn browser_operation_call_with_grant(
 }
 
 fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Value) -> bool {
+    if operation == BrowserOperation::SessionOpen {
+        return true;
+    }
     if operation != BrowserOperation::DispatchSubmit {
         return !operation.is_mutation();
     }
@@ -1954,6 +2091,19 @@ fn browser_operation_call_with_grants(
         let Ok(store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
+        if operation == BrowserOperation::SessionOpen {
+            let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+            if let Ok(Some(resource)) = store_guard.browser_resource(session_ref) {
+                if resource.provider != "chatgpt" {
+                    return json!({
+                        "ok": false,
+                        "code": "unsupported",
+                        "operation": operation.method(),
+                        "actuation_available": false,
+                    });
+                }
+            }
+        }
         let alpha4_supported = browser_operation_alpha4_supported(operation, params);
         match browser_operation_actuation_decision(
             &store_guard,
@@ -2011,6 +2161,7 @@ fn browser_operation_call_with_grants(
             operation,
             caller_webchat_control_grants,
         ),
+        BrowserOperation::SessionOpen => browser_session_open(store, params, browser_actuator),
         BrowserOperation::DispatchSubmit => {
             browser_dispatch_submit(store, params, browser_actuator)
         }
@@ -2336,6 +2487,9 @@ fn browser_operation_actuation_decision(
         caller_webchat_control_grants,
         params.get("expected_generation").and_then(Value::as_i64),
     )?;
+    if operation == BrowserOperation::SessionOpen && target.provider != "chatgpt" {
+        return Ok((false, Some("capability_not_allowed")));
+    }
     if decision != (true, None) || operation != BrowserOperation::DispatchSubmit {
         return Ok(decision);
     }
@@ -5046,14 +5200,6 @@ mod tests {
                 }),
             ),
             (
-                "herdr_mcp.browser_session.open",
-                json!({
-                    "session_ref": "br_session",
-                    "expected_generation": 7,
-                    "idempotency_key": "unsupported-session-open"
-                }),
-            ),
-            (
                 "herdr_mcp.browser_message.append",
                 json!({
                     "session_ref": "br_session",
@@ -5127,6 +5273,488 @@ mod tests {
                 "idempotency_key": "supported-plain-dispatch"
             })
         ));
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::SessionOpen,
+            &json!({
+                "session_ref": "br_session",
+                "expected_generation": 7,
+                "idempotency_key": "supported-session-open"
+            })
+        ));
+        assert!(
+            !browser_operation_alpha4_supported(
+                BrowserOperation::SessionCreate,
+                &json!({
+                    "endpoint_ref": "be_alpha4",
+                    "provider": "chatgpt",
+                    "account_ref": "br_account",
+                    "display_label": "Conversation",
+                    "expected_generation": 7,
+                    "idempotency_key": "still-unsupported-session-create"
+                })
+            ),
+            "browser_session.create must remain unsupported"
+        );
+    }
+
+    #[test]
+    fn browser_session_open_unique_and_durable_idempotency_regression() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (session_ref, other_session_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-open-unique-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "account-hidden-unique",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-hidden-unique",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            let other_session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-hidden-unique-2",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            (session.resource_ref, other_session.resource_ref)
+        };
+
+        struct SessionOpenActuator {
+            calls: AtomicUsize,
+            expected_session_ref: String,
+        }
+        impl BrowserActuator for SessionOpenActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, "herdr_mcp.browser_session.open");
+                assert_eq!(expected_generation, 7);
+                assert!(dispatch_id.is_none());
+                // Must never carry a message payload; only opaque refs + generation + idempotency.
+                assert!(params.get("message").is_none());
+                assert!(params.get("selector").is_none());
+                assert_eq!(
+                    params.get("session_ref").and_then(Value::as_str).unwrap(),
+                    self.expected_session_ref
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: None,
+                })
+            }
+        }
+
+        let actuator = SessionOpenActuator {
+            calls: AtomicUsize::new(0),
+            expected_session_ref: session_ref.clone(),
+        };
+        let params = json!({
+            "session_ref": session_ref,
+            "expected_generation": 7,
+            "idempotency_key": "session-open-unique-1"
+        });
+        let first = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["delivery_state"], "applied");
+        assert_eq!(first["operation"], "herdr_mcp.browser_session.open");
+        assert_eq!(first["idempotent_replay"], false);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        // Same key + same request replays without a second tab activation.
+        let replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["delivery_state"], "applied");
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["op_id"], first["op_id"]);
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            1,
+            "idempotent replay must not invoke browser actuation again"
+        );
+
+        // Same key + different request conflicts (different session_ref with same key).
+        let conflict2 = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": other_session_ref,
+                "expected_generation": 7,
+                "idempotency_key": "session-open-unique-1"
+            }),
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(conflict2["code"], "idempotency_key_conflict");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        // Pending/uncertain must not auto-repeat.
+        {
+            let mut guard = store.lock().unwrap();
+            let pending_digest = browser_sha256("session-open-pending-key");
+            let pending_request = browser_sha256(&json!({"operation":"herdr_mcp.browser_session.open","session_ref":session_ref,"expected_generation":7}).to_string());
+            let pending_op_id = format!("op:browser_session_open:{}", &pending_digest[..32]);
+            let now = browser_epoch_ms();
+            let expires = now + 10 * 60 * 1000;
+            guard
+                .reserve_operation(
+                    "browser_session.open",
+                    &pending_digest,
+                    &pending_request,
+                    &pending_op_id,
+                    now,
+                    expires,
+                )
+                .unwrap();
+        }
+        let in_flight = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 7,
+                "idempotency_key": "session-open-pending-key"
+            }),
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(in_flight["code"], "idempotency_in_flight");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        // Ensure no message was ever submitted via the session.open path.
+        assert_eq!(replay["idempotent_replay"], true);
+    }
+
+    #[test]
+    fn browser_session_open_fails_closed_on_missing_stale_and_non_chatgpt() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, session_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-open-failclosed-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "account-failclosed",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-failclosed",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref.clone(), session.resource_ref.clone())
+        };
+
+        struct NoopActuator;
+        impl BrowserActuator for NoopActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(BrowserPostconditionEvidence::resource_unavailable(
+                    expected_generation,
+                ))
+            }
+        }
+
+        // Missing resource
+        let missing = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": format!("br_{}", "f".repeat(64)),
+                "expected_generation": 7,
+                "idempotency_key": "missing-session"
+            }),
+            true,
+            Some(&NoopActuator),
+        );
+        assert_eq!(missing["code"], "browser_resource_not_found");
+
+        // Stale generation
+        let stale = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 999,
+                "idempotency_key": "stale-gen"
+            }),
+            true,
+            Some(&NoopActuator),
+        );
+        assert_eq!(stale["code"], "stale_capability_generation");
+
+        // Non-ChatGPT provider remains unsupported even with same session.open capability.
+        let (gemini_session_ref, grants) = {
+            let mut guard = store.lock().unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "gemini",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 15,
+                })
+                .unwrap();
+            let gemini_account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "gemini",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "gemini-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 16,
+                })
+                .unwrap();
+            let gemini_session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "gemini",
+                    kind: "session",
+                    parent_ref: Some(&gemini_account.resource_ref),
+                    native_identity: "gemini-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 17,
+                })
+                .unwrap();
+            // Create a grant for gemini account but request from same endpoint/provider.
+            // Directly test the provider gate via a gemini grant.
+            let grants = vec![BrowserCallerGrant {
+                endpoint_ref: endpoint_ref.clone(),
+                provider: "gemini".to_owned(),
+                account_ref: gemini_account.resource_ref.clone(),
+            }];
+            (gemini_session.resource_ref, grants)
+        };
+        let gemini_result = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": gemini_session_ref,
+                "expected_generation": 7,
+                "idempotency_key": "gemini-session-open"
+            }),
+            &grants,
+            Some(&NoopActuator),
+            None,
+        );
+        assert_eq!(gemini_result["code"], "unsupported");
+    }
+
+    #[test]
+    fn browser_session_create_remains_unsupported_regression() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-create-unsupported-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "account-create-unsupported",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        };
+        let result = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": account_ref,
+                "display_label": "Conversation",
+                "expected_generation": 7,
+                "idempotency_key": "create-still-unsupported"
+            }),
+            true,
+            None,
+        );
+        assert_eq!(result["code"], "unsupported");
+        assert_eq!(result["operation"], "herdr_mcp.browser_session.create");
     }
 
     #[test]

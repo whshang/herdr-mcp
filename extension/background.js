@@ -1519,7 +1519,9 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
     provider,
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
-    capabilities: { operations: ["composer.submit", "generation.status", "session.inspect"] },
+    capabilities: { operations: provider === "chatgpt"
+        ? ["composer.submit", "generation.status", "session.inspect", "session.open"]
+        : ["composer.submit", "generation.status", "session.inspect"] },
     observed_at: Date.now(),
   });
   const account = await postBrowserRegistry({
@@ -2369,6 +2371,66 @@ async function handleBrowserActuation(command) {
       resource_available: true,
       result,
     }).catch(() => {});
+    return;
+  }
+  if (operation === "herdr_mcp.browser_session.open") {
+    const sessionRefOpen = String(params.session_ref || "");
+    let targetOpen = browserSessionTargets.get(sessionRefOpen);
+    let recoveredOpen = null;
+    if (!targetOpen) {
+      recoveredOpen = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration);
+      targetOpen = recoveredOpen.target;
+      if (!targetOpen) {
+        await postBrowserActuationEvidence(
+          actuationId,
+          unavailableBrowserActuationEvidence(expectedGeneration, recoveredOpen.observedGeneration),
+        );
+        return;
+      }
+    }
+    if (targetOpen.observationGeneration !== expectedGeneration || targetOpen.provider !== "chatgpt") {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration, targetOpen.observationGeneration),
+      );
+      return;
+    }
+    let tabOpen = null;
+    try { tabOpen = await chrome.tabs.get(targetOpen.tabId); } catch (_) {}
+    const liveOpen = browserConversationInfo(targetOpen.provider || "chatgpt", tabOpen?.url || "");
+    if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
+      browserSessionTargets.delete(sessionRefOpen);
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration),
+      );
+      return;
+    }
+    try {
+      await chrome.tabs.update(targetOpen.tabId, { active: true, autoDiscardable: false });
+      await protectBoundTab(targetOpen.tabId);
+    } catch (_) {}
+    try {
+      const response = await sendBrowserActuationTabMessage(targetOpen.tabId, {
+        type: "h2w_browser_actuation",
+        command: {
+          operation,
+          expected_generation: expectedGeneration,
+          params,
+          expectedConvKey: targetOpen.convKey,
+        },
+      });
+      const evidence = response?.evidence && typeof response.evidence === "object"
+        ? response.evidence
+        : { ...unavailableBrowserActuationEvidence(expectedGeneration), command_accepted: true, resource_available: true };
+      await postBrowserActuationEvidence(actuationId, evidence);
+    } catch (_) {
+      await postBrowserActuationEvidence(actuationId, {
+        ...unavailableBrowserActuationEvidence(expectedGeneration),
+        command_accepted: true,
+        resource_available: true,
+      }).catch(() => {});
+    }
     return;
   }
   const sessionRef = String(params.session_ref || "");
