@@ -11,11 +11,14 @@
 //   2. large top-level blocks inside an unfocused ProseMirror writing block are
 //      contained only when they are far from the viewport. IntersectionObserver
 //      supplies their committed height asynchronously, so no forced layout is
-//      introduced by MutationObserver.
+//      introduced by MutationObserver;
+//   3. settled, heavy tool-call clusters are fully skipped while they are outside
+//      the viewport. Their exact committed height comes from IntersectionObserver,
+//      so scroll geometry is preserved without reading layout in the mutation path.
 (() => {
   "use strict";
 
-  const VERSION = "6";
+  const VERSION = "7";
   const API_NAME = "__HERDR_CHATGPT_PERF__";
 
   const VIEWER_SELECTOR = "#code-block-viewer.cm-editor";
@@ -34,7 +37,20 @@
   const MAX_EDITABLE_BLOCK_HEIGHT_PX = 200000;
   const BLOCK_ROOT_MARGIN = "1400px 0px";
 
+  const TOOL_MESSAGE_SELECTOR = '[class~="group/tool-message"]';
+  const TOOL_CLUSTER_ATTR = "data-herdr-tool-cluster-hidden";
+  const TOOL_CLUSTER_OBSERVED_ATTR = "data-herdr-tool-cluster-observed";
+  const TOOL_CLUSTER_INTRINSIC_VAR = "--herdr-tool-cluster-intrinsic-size";
+  const TOOL_CLUSTER_NEAREST_COUNT = 2;
+  const TOOL_CLUSTER_MIN_MESSAGES = 8;
+  const TOOL_CLUSTER_MIN_HEIGHT_PX = 600;
+  const TOOL_CLUSTER_MAX_HEIGHT_PX = 500000;
+  const TOOL_CLUSTER_ANCESTOR_DEPTH = 12;
+  const TOOL_FIND_SUSPEND_MS = 30000;
+
   const QUIET_MS = 300;
+  const MAX_DISCOVERY_LATENCY_MS = 1000;
+  const DISCOVERY_IDLE_TIMEOUT_MS = 100;
   const STOP_SELECTORS = [
     'button[data-testid="stop-button"]',
     '[role="button"][data-testid="stop-button"]',
@@ -43,7 +59,6 @@
     'button[aria-label="停止生成"]',
     'button[aria-label="停止流式"]',
   ];
-  const STREAMING_THROTTLE_ATTR = "data-herdr-streaming-throttle";
   const DYNAMIC_MEDIA_SELECTOR = "img,video,iframe,canvas";
 
   if (window[API_NAME]) return;
@@ -52,6 +67,7 @@
     observer_batches: 0,
     mutation_records: 0,
     idle_scans: 0,
+    forced_scans: 0,
     viewers_prepared: 0,
     viewers_updated: 0,
     viewers_cleared: 0,
@@ -62,31 +78,43 @@
     editable_blocks_updated: 0,
     editable_blocks_revealed: 0,
     editable_blocks_skipped: 0,
-    streaming_throttle_activations: 0,
-    streaming_throttle_deactivations: 0,
+    tool_clusters_observed: 0,
+    tool_clusters_hidden: 0,
+    tool_clusters_updated: 0,
+    tool_clusters_revealed: 0,
+    tool_clusters_skipped: 0,
+    tool_discovery_batches: 0,
     last_batch_records: 0,
     last_scan_ms: 0,
     last_intrinsic_height_px: 0,
     max_intrinsic_height_px: 0,
     last_editable_block_height_px: 0,
     max_editable_block_height_px: 0,
+    last_tool_cluster_height_px: 0,
+    max_tool_cluster_height_px: 0,
   };
 
   let enabled = true;
   let observer = null;
   let blockObserver = null;
+  let toolClusterObserver = null;
   let styleElement = null;
   let listenersInstalled = false;
   let quietTimer = null;
+  let maxDiscoveryTimer = null;
   let idleHandle = null;
   let lastMutationAt = 0;
   let discoveryPending = false;
+  let toolFindSuspendUntil = 0;
+  let toolFindResumeTimer = null;
 
   const viewerHeights = new WeakMap();
   const pendingViewers = new Set();
   const observedRoots = new Set();
   const observedBlocks = new Set();
   const blockHeights = new WeakMap();
+  const observedToolClusters = new Set();
+  const toolClusterHeights = new WeakMap();
 
   function publish(value) {
     try {
@@ -260,47 +288,6 @@
     return false;
   }
 
-  function setStreamingThrottle(active) {
-    const root = document.documentElement;
-    if (!root) return false;
-    const current = root.getAttribute(STREAMING_THROTTLE_ATTR) === "1";
-    const next = Boolean(enabled && active);
-    if (current === next) return false;
-    if (next) {
-      root.setAttribute(STREAMING_THROTTLE_ATTR, "1");
-      stats.streaming_throttle_activations += 1;
-    } else {
-      root.removeAttribute(STREAMING_THROTTLE_ATTR);
-      stats.streaming_throttle_deactivations += 1;
-    }
-    return true;
-  }
-
-  function nodeHasStopControl(node) {
-    const element = elementForNode(node);
-    if (!element) return false;
-    for (const selector of STOP_SELECTORS) {
-      try {
-        if (element.matches?.(selector) || element.querySelector?.(selector)) return true;
-      } catch (_) {}
-    }
-    return false;
-  }
-
-  function updateStreamingThrottleFromMutations(records) {
-    let added = false;
-    let removed = false;
-    for (const record of records) {
-      if (record.type && record.type !== "childList") continue;
-      for (const node of record.addedNodes || []) added ||= nodeHasStopControl(node);
-      for (const node of record.removedNodes || []) removed ||= nodeHasStopControl(node);
-    }
-    if (added && removed) return setStreamingThrottle(composerGenerating());
-    if (added) return setStreamingThrottle(true);
-    if (removed) return setStreamingThrottle(composerGenerating());
-    return false;
-  }
-
   function safetySnapshot() {
     const generating = composerGenerating();
     let streamingMessage = null;
@@ -427,6 +414,201 @@
     return true;
   }
 
+  function toolClusterFor(node) {
+    const element = elementForNode(node);
+    if (!element) return null;
+    const cluster = element.closest?.(
+      `[${TOOL_CLUSTER_OBSERVED_ATTR}="1"], [${TOOL_CLUSTER_ATTR}="1"]`,
+    );
+    return cluster instanceof Element ? cluster : null;
+  }
+
+  function nodeHasToolMessage(node) {
+    const element = elementForNode(node);
+    if (!element) return false;
+    try {
+      return element.matches?.(TOOL_MESSAGE_SELECTOR)
+        || Boolean(element.querySelector?.(TOOL_MESSAGE_SELECTOR));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function clearToolCluster(cluster) {
+    if (!(cluster instanceof Element) || cluster.getAttribute(TOOL_CLUSTER_ATTR) !== "1") return false;
+    try {
+      cluster.removeAttribute(TOOL_CLUSTER_ATTR);
+      cluster.style.removeProperty(TOOL_CLUSTER_INTRINSIC_VAR);
+      stats.tool_clusters_revealed += 1;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function clearAllToolClusters() {
+    let cleared = 0;
+    for (const cluster of observedToolClusters) cleared += clearToolCluster(cluster) ? 1 : 0;
+    return cleared;
+  }
+
+  function unobserveToolCluster(cluster, clear = true) {
+    if (!(cluster instanceof Element)) return false;
+    if (clear) clearToolCluster(cluster);
+    try { toolClusterObserver?.unobserve?.(cluster); } catch (_) {}
+    observedToolClusters.delete(cluster);
+    try { cluster.removeAttribute(TOOL_CLUSTER_OBSERVED_ATTR); } catch (_) {}
+    return true;
+  }
+
+  function toolClusterUnsafe(cluster, safety) {
+    if (!(cluster instanceof Element)) return true;
+    if (safety.active && safety.active !== document.body && cluster.contains?.(safety.active)) return true;
+    for (const element of safety.selected) {
+      if (cluster.contains?.(element)) return true;
+    }
+    return false;
+  }
+
+  function toolHidingSuspended() {
+    const now = performance.now?.() || Date.now();
+    return now < toolFindSuspendUntil;
+  }
+
+  function hideToolCluster(cluster, height) {
+    if (!enabled || !(cluster instanceof Element)) return false;
+    const cssHeight = cssPixels(height, TOOL_CLUSTER_MAX_HEIGHT_PX);
+    const previous = toolClusterHeights.get(cluster);
+    if (previous === cssHeight && cluster.getAttribute(TOOL_CLUSTER_ATTR) === "1") return false;
+    try {
+      cluster.style.setProperty(TOOL_CLUSTER_INTRINSIC_VAR, cssHeight);
+      cluster.setAttribute(TOOL_CLUSTER_ATTR, "1");
+    } catch (_) {
+      stats.tool_clusters_skipped += 1;
+      return false;
+    }
+
+    if (previous == null) stats.tool_clusters_hidden += 1;
+    else stats.tool_clusters_updated += 1;
+    toolClusterHeights.set(cluster, cssHeight);
+    stats.last_tool_cluster_height_px = height;
+    stats.max_tool_cluster_height_px = Math.max(stats.max_tool_cluster_height_px, height);
+    return true;
+  }
+
+  function handleToolClusterEntries(entries) {
+    if (!enabled) return;
+    const safety = safetySnapshot();
+    const suspended = toolHidingSuspended();
+    for (const entry of entries) {
+      const cluster = entry?.target;
+      if (!(cluster instanceof Element) || !cluster.isConnected || !observedToolClusters.has(cluster)) {
+        unobserveToolCluster(cluster);
+        continue;
+      }
+      if (entry.isIntersecting || suspended || toolClusterUnsafe(cluster, safety)) {
+        clearToolCluster(cluster);
+        continue;
+      }
+      const height = Number(entry.boundingClientRect?.height || 0);
+      if (!Number.isFinite(height) || height < TOOL_CLUSTER_MIN_HEIGHT_PX) {
+        clearToolCluster(cluster);
+        stats.tool_clusters_skipped += 1;
+        continue;
+      }
+      hideToolCluster(cluster, height);
+    }
+  }
+
+  function installToolClusterObserver() {
+    if (toolClusterObserver || typeof IntersectionObserver !== "function") return Boolean(toolClusterObserver);
+    toolClusterObserver = new IntersectionObserver(handleToolClusterEntries, {
+      root: null,
+      rootMargin: "0px",
+      threshold: 0,
+    });
+    return true;
+  }
+
+  function observeToolCluster(cluster) {
+    if (!enabled || !(cluster instanceof Element) || observedToolClusters.has(cluster)) return false;
+    if (!installToolClusterObserver()) return false;
+    observedToolClusters.add(cluster);
+    try {
+      cluster.setAttribute(TOOL_CLUSTER_OBSERVED_ATTR, "1");
+      toolClusterObserver.observe(cluster);
+    } catch (_) {
+      observedToolClusters.delete(cluster);
+      try { cluster.removeAttribute(TOOL_CLUSTER_OBSERVED_ATTR); } catch (_) {}
+      return false;
+    }
+    stats.tool_clusters_observed += 1;
+    return true;
+  }
+
+  function discoverToolClusters() {
+    if (!enabled || !installToolClusterObserver()) return 0;
+    const tools = Array.from(document.querySelectorAll?.(TOOL_MESSAGE_SELECTOR) || []);
+    const counts = new Map();
+
+    for (const tool of tools) {
+      let ancestor = tool.parentElement;
+      for (let depth = 0; ancestor && depth < TOOL_CLUSTER_ANCESTOR_DEPTH; depth += 1) {
+        counts.set(ancestor, (counts.get(ancestor) || 0) + 1);
+        ancestor = ancestor.parentElement;
+      }
+    }
+
+    const nearest = new Set();
+    for (const tool of tools) {
+      let ancestor = tool.parentElement;
+      for (let depth = 0; ancestor && depth < TOOL_CLUSTER_ANCESTOR_DEPTH; depth += 1) {
+        if ((counts.get(ancestor) || 0) >= TOOL_CLUSTER_NEAREST_COUNT) {
+          nearest.add(ancestor);
+          break;
+        }
+        ancestor = ancestor.parentElement;
+      }
+    }
+
+    const heavy = Array.from(nearest).filter(
+      (cluster) => (counts.get(cluster) || 0) >= TOOL_CLUSTER_MIN_MESSAGES,
+    );
+    const minimal = heavy.filter(
+      (cluster) => !heavy.some((other) => other !== cluster && cluster.contains?.(other)),
+    );
+    const keep = new Set(minimal);
+
+    for (const cluster of Array.from(observedToolClusters)) {
+      if (!cluster?.isConnected || !keep.has(cluster)) unobserveToolCluster(cluster);
+    }
+    for (const cluster of minimal) observeToolCluster(cluster);
+    return minimal.length;
+  }
+
+  function rearmToolClusters() {
+    if (!enabled || !toolClusterObserver) return;
+    for (const cluster of observedToolClusters) {
+      try {
+        toolClusterObserver.unobserve(cluster);
+        toolClusterObserver.observe(cluster);
+      } catch (_) {}
+    }
+  }
+
+  function suspendToolHiding(ms = TOOL_FIND_SUSPEND_MS) {
+    const now = performance.now?.() || Date.now();
+    toolFindSuspendUntil = Math.max(toolFindSuspendUntil, now + ms);
+    clearAllToolClusters();
+    if (toolFindResumeTimer != null) clearTimeout(toolFindResumeTimer);
+    toolFindResumeTimer = setTimeout(() => {
+      toolFindResumeTimer = null;
+      if (!enabled) return;
+      toolFindSuspendUntil = 0;
+      rearmToolClusters();
+    }, ms);
+  }
+
   function installStyle() {
     if (styleElement?.isConnected) return true;
     if (typeof document.createElement !== "function") return false;
@@ -445,18 +627,10 @@
           content-visibility: auto;
           contain-intrinsic-size: auto var(${EDITABLE_BLOCK_INTRINSIC_VAR}, 80px);
         }
-      }
-      html[${STREAMING_THROTTLE_ATTR}="1"] [data-message-author-role="assistant"]
-        :not(button, button *, [role="button"], [role="button"] *,
-          [class~="group/tool-message"], [class~="group/tool-message"] *,
-          [aria-busy="true"], [aria-busy="true"] *,
-          [class*="animate-spin"], [class*="animate-pulse"],
-          video, audio, iframe, canvas, svg) {
-        animation-duration: 0.001ms !important;
-        animation-delay: 0ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.001ms !important;
-        transition-delay: 0ms !important;
+        [${TOOL_CLUSTER_ATTR}="1"] {
+          content-visibility: hidden;
+          contain-intrinsic-size: var(${TOOL_CLUSTER_INTRINSIC_VAR}, 600px);
+        }
       }
     `;
     parent.appendChild(style);
@@ -474,6 +648,9 @@
   function processMutationNode(node) {
     const element = elementForNode(node);
     if (!element) return;
+
+    const toolCluster = toolClusterFor(element);
+    if (toolCluster) unobserveToolCluster(toolCluster);
 
     const viewer = viewerFor(element);
     if (viewer) markViewerDirty(viewer);
@@ -501,10 +678,15 @@
     stats.mutation_records += records.length;
     stats.last_batch_records = records.length;
 
+    let toolStructureChanged = false;
     for (const record of records) {
       processMutationNode(record.target);
-      for (const node of record.addedNodes || []) processMutationNode(node);
+      for (const node of record.addedNodes || []) {
+        processMutationNode(node);
+        toolStructureChanged ||= nodeHasToolMessage(node);
+      }
       for (const node of record.removedNodes || []) {
+        toolStructureChanged ||= nodeHasToolMessage(node);
         const element = elementForNode(node);
         if (element && observedBlocks.has(element)) {
           try { blockObserver?.unobserve?.(element); } catch (_) {}
@@ -513,7 +695,11 @@
       }
     }
 
-    updateStreamingThrottleFromMutations(records);
+    if (toolStructureChanged) {
+      stats.tool_discovery_batches += 1;
+      discoverToolClusters();
+    }
+
     scheduleSettledScan();
   }
 
@@ -521,7 +707,7 @@
     if (!enabled) return 0;
     installStyle();
     installBlockObserver();
-    setStreamingThrottle(composerGenerating());
+    installToolClusterObserver();
     const started = performance.now?.() || 0;
     let discovered = 0;
 
@@ -535,6 +721,8 @@
       observeRoot(root, true);
       discovered += 1;
     }
+
+    discovered += discoverToolClusters();
 
     for (const block of Array.from(observedBlocks)) {
       if (!block?.isConnected || !isEditableRoot(block.parentElement)) {
@@ -566,22 +754,45 @@
       quietTimer = setTimeout(runSettledScan, Math.ceil(remaining));
       return;
     }
+    queueDiscoveryScan(false);
+  }
+
+  function forceDiscoveryScan() {
+    maxDiscoveryTimer = null;
+    if (!enabled || !discoveryPending) return;
+    queueDiscoveryScan(true);
+  }
+
+  function queueDiscoveryScan(forced) {
     discoveryPending = false;
+    if (quietTimer != null) {
+      clearTimeout(quietTimer);
+      quietTimer = null;
+    }
+    if (maxDiscoveryTimer != null) {
+      clearTimeout(maxDiscoveryTimer);
+      maxDiscoveryTimer = null;
+    }
+    if (forced) stats.forced_scans += 1;
 
     const run = () => {
       idleHandle = null;
       if (enabled) scan();
     };
     if (typeof requestIdleCallback === "function") {
-      idleHandle = requestIdleCallback(run);
+      idleHandle = requestIdleCallback(run, { timeout: DISCOVERY_IDLE_TIMEOUT_MS });
     } else {
       idleHandle = setTimeout(run, 0);
     }
   }
 
   function scheduleSettledScan() {
+    const firstPending = !discoveryPending;
     discoveryPending = true;
     lastMutationAt = performance.now?.() || Date.now();
+    if (firstPending && maxDiscoveryTimer == null) {
+      maxDiscoveryTimer = setTimeout(forceDiscoveryScan, MAX_DISCOVERY_LATENCY_MS);
+    }
     if (quietTimer != null) return;
     quietTimer = setTimeout(runSettledScan, QUIET_MS);
   }
@@ -594,6 +805,8 @@
   }
 
   function handleFocusIn(event) {
+    const toolCluster = toolClusterFor(event?.target);
+    if (toolCluster) unobserveToolCluster(toolCluster);
     const root = editableRootFor(event?.target);
     if (root) clearEditableRoot(root);
   }
@@ -612,11 +825,28 @@
       return;
     }
     const roots = new Set();
+    const toolClusters = new Set();
     for (const node of [selection.anchorNode, selection.focusNode]) {
       const root = editableRootFor(node);
       if (root) roots.add(root);
+      const cluster = toolClusterFor(node);
+      if (cluster) toolClusters.add(cluster);
     }
     for (const root of roots) clearEditableRoot(root);
+    for (const cluster of toolClusters) unobserveToolCluster(cluster);
+  }
+
+  function handleKeyDown(event) {
+    if (!enabled) return;
+    if ((event?.metaKey || event?.ctrlKey) && String(event?.key || "").toLowerCase() === "f") {
+      suspendToolHiding();
+    }
+  }
+
+  function handleBeforeMatch(event) {
+    if (!enabled) return;
+    const cluster = toolClusterFor(event?.target);
+    if (cluster) suspendToolHiding();
   }
 
   function installListeners() {
@@ -624,6 +854,8 @@
     document.addEventListener("focusin", handleFocusIn, true);
     document.addEventListener("focusout", handleFocusOut, true);
     document.addEventListener("selectionchange", handleSelectionChange, true);
+    document.addEventListener("keydown", handleKeyDown, true);
+    document.addEventListener("beforematch", handleBeforeMatch, true);
     listenersInstalled = true;
   }
 
@@ -632,6 +864,8 @@
     document.removeEventListener("focusin", handleFocusIn, true);
     document.removeEventListener("focusout", handleFocusOut, true);
     document.removeEventListener("selectionchange", handleSelectionChange, true);
+    document.removeEventListener("keydown", handleKeyDown, true);
+    document.removeEventListener("beforematch", handleBeforeMatch, true);
     listenersInstalled = false;
   }
 
@@ -642,7 +876,10 @@
     for (const block of document.querySelectorAll?.(`[${EDITABLE_BLOCK_ATTR}="1"]`) || []) {
       clearEditableBlock(block);
     }
-    try { document.documentElement?.removeAttribute(STREAMING_THROTTLE_ATTR); } catch (_) {}
+    for (const cluster of Array.from(observedToolClusters)) {
+      clearToolCluster(cluster);
+      try { cluster.removeAttribute(TOOL_CLUSTER_OBSERVED_ATTR); } catch (_) {}
+    }
   }
 
   function cancelScheduledWork() {
@@ -650,16 +887,26 @@
       clearTimeout(quietTimer);
       quietTimer = null;
     }
+    if (maxDiscoveryTimer != null) {
+      clearTimeout(maxDiscoveryTimer);
+      maxDiscoveryTimer = null;
+    }
     if (idleHandle != null) {
       if (typeof cancelIdleCallback === "function") cancelIdleCallback(idleHandle);
       else clearTimeout(idleHandle);
       idleHandle = null;
     }
+    if (toolFindResumeTimer != null) {
+      clearTimeout(toolFindResumeTimer);
+      toolFindResumeTimer = null;
+    }
+    toolFindSuspendUntil = 0;
     discoveryPending = false;
   }
 
   installStyle();
   installBlockObserver();
+  installToolClusterObserver();
   startObserver();
   installListeners();
   scheduleSettledScan();
@@ -674,12 +921,15 @@
       observer = null;
       blockObserver?.disconnect?.();
       blockObserver = null;
+      toolClusterObserver?.disconnect?.();
+      toolClusterObserver = null;
       cancelScheduledWork();
       removeListeners();
       cleanupContainment();
       pendingViewers.clear();
       observedRoots.clear();
       observedBlocks.clear();
+      observedToolClusters.clear();
       styleElement?.remove?.();
       styleElement = null;
       return { enabled };
@@ -689,9 +939,9 @@
       enabled = true;
       installStyle();
       installBlockObserver();
+      installToolClusterObserver();
       startObserver();
       installListeners();
-      setStreamingThrottle(composerGenerating());
       scheduleSettledScan();
       return { enabled };
     },

@@ -60,7 +60,17 @@ function makeContext() {
       this.dataset = {};
     }
     matches(selector) {
+      if (selector.includes(",")) return selector.split(",").some((part) => this.matches(part.trim()));
       if (/^[a-z]+$/i.test(selector)) return this.tagName === selector.toUpperCase();
+      if (selector === '[class~="group/tool-message"]') {
+        return this.classList.contains("group/tool-message");
+      }
+      if (selector === '[data-herdr-tool-cluster-observed="1"]') {
+        return this.getAttribute("data-herdr-tool-cluster-observed") === "1";
+      }
+      if (selector === '[data-herdr-tool-cluster-hidden="1"]') {
+        return this.getAttribute("data-herdr-tool-cluster-hidden") === "1";
+      }
       if (selector === "#code-block-viewer.cm-editor") {
         return this.id === "code-block-viewer" && this.classList.contains("cm-editor");
       }
@@ -194,8 +204,11 @@ function makeContext() {
     removeEventListener(type, handler) {
       this.listeners.set(type, (this.listeners.get(type) || []).filter((entry) => entry !== handler));
     }
-    emit(type, target) {
-      for (const handler of this.listeners.get(type) || []) handler({ target });
+    emit(type, eventOrTarget) {
+      const event = eventOrTarget && typeof eventOrTarget === "object" && "target" in eventOrTarget
+        ? eventOrTarget
+        : { target: eventOrTarget };
+      for (const handler of this.listeners.get(type) || []) handler(event);
     }
   }
 
@@ -318,6 +331,30 @@ function assistantWritingRoot(FakeElement, document) {
   return { message, root, block, leaf };
 }
 
+function toolClusterTree(FakeElement, document, { tools = 8, outerTools = 0 } = {}) {
+  const outer = new FakeElement("div");
+  outer.ownerDocument = document;
+  const cluster = new FakeElement("div", "flex", "max-w-full", "flex-col", "gap-4", "grow");
+  cluster.ownerDocument = document;
+  const toolNodes = [];
+  for (let i = 0; i < tools; i += 1) {
+    const wrapper = new FakeElement("span", "group/tool-message");
+    wrapper.ownerDocument = document;
+    const button = new FakeElement("button");
+    button.ownerDocument = document;
+    wrapper.appendChild(button);
+    cluster.appendChild(wrapper);
+    toolNodes.push(wrapper);
+  }
+  outer.appendChild(cluster);
+  for (let i = 0; i < outerTools; i += 1) {
+    const wrapper = new FakeElement("span", "group/tool-message");
+    wrapper.ownerDocument = document;
+    outer.appendChild(wrapper);
+  }
+  return { outer, cluster, toolNodes };
+}
+
 function farEntry(target, height = 442) {
   return { target, isIntersecting: false, boundingClientRect: { height } };
 }
@@ -326,67 +363,21 @@ function nearEntry(target, height = 442) {
   return { target, isIntersecting: true, boundingClientRect: { height } };
 }
 
-test("v6 keeps React mutation hot path free of synchronous layout reads", () => {
+test("v7 keeps React mutation hot path free of synchronous layout reads", () => {
   const { context, originalAppendChild } = makeContext();
-  assert.equal(context.__HERDR_CHATGPT_PERF__.version, "6");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.version, "7");
   assert.equal(context.Node.prototype.appendChild, originalAppendChild);
   assert.equal(source.includes("getBoundingClientRect"), false);
   assert.equal(source.includes('querySelectorAll?.("*")'), false);
 });
 
-test("streaming throttle activates from a stop-control mutation without a document-wide query", () => {
-  const { context, document, FakeElement, mutationObservers } = makeContext();
-  const stop = new FakeElement("button");
-  stop.ownerDocument = document;
-  stop.setAttribute("data-testid", "stop-button");
-  const before = document.documentQueryCount;
-
-  mutationObservers[0].trigger([{ type: "childList", target: document.body, addedNodes: [stop], removedNodes: [] }]);
-
-  assert.equal(document.documentElement.getAttribute("data-herdr-streaming-throttle"), "1");
-  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.streaming_throttle_activations, 1);
-  assert.equal(document.documentQueryCount, before);
+test("v7 does not install the rejected streaming style throttle", () => {
+  assert.equal(source.includes("data-herdr-streaming-throttle"), false);
+  assert.equal(source.includes("transition-duration: 0.001ms"), false);
+  assert.equal(source.includes("streaming_throttle_activations"), false);
 });
 
-test("streaming throttle clears when the stop control is removed", () => {
-  const { context, document, FakeElement, mutationObservers } = makeContext();
-  const stop = new FakeElement("button");
-  stop.ownerDocument = document;
-  stop.setAttribute("data-testid", "stop-button");
-  mutationObservers[0].trigger([{ type: "childList", target: document.body, addedNodes: [stop], removedNodes: [] }]);
-  document._querySelectorHook = () => null;
-
-  mutationObservers[0].trigger([{ type: "childList", target: document.body, addedNodes: [], removedNodes: [stop] }]);
-
-  assert.equal(document.documentElement.getAttribute("data-herdr-streaming-throttle"), null);
-  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.streaming_throttle_deactivations, 1);
-});
-
-test("same-batch stop-control replacement resolves the final DOM state", () => {
-  const { context, document, FakeElement, mutationObservers } = makeContext();
-  const oldStop = new FakeElement("button");
-  const newStop = new FakeElement("button");
-  for (const stop of [oldStop, newStop]) {
-    stop.ownerDocument = document;
-    stop.setAttribute("data-testid", "stop-button");
-  }
-  document._querySelectorHook = (selector) => selector.includes("stop-button") ? newStop : null;
-
-  mutationObservers[0].trigger([{ type: "childList", target: document.body, addedNodes: [newStop], removedNodes: [oldStop] }]);
-
-  assert.equal(document.documentElement.getAttribute("data-herdr-streaming-throttle"), "1");
-  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.streaming_throttle_activations, 1);
-});
-
-test("streaming CSS preserves tool activity and interactive controls", () => {
-  assert.match(source, /data-herdr-streaming-throttle/);
-  assert.match(source, /group\/tool-message/);
-  assert.match(source, /animate-spin/);
-  assert.match(source, /aria-busy/);
-  assert.match(source, /transition-duration: 0\.001ms/);
-});
-
-test("v6 preserves the proven code-viewer intrinsic estimate", () => {
+test("v7 preserves the proven code-viewer intrinsic estimate", () => {
   const { context, document, FakeElement } = makeContext();
   const text = Array.from({ length: 231 }, (_, i) => `line-${i}`).join("\n");
   const { viewer } = codeViewer(FakeElement, document, text);
@@ -537,6 +528,146 @@ test("manual/idle scan can discover a deeply nested writing root without layout 
   assert.equal(intersectionObservers[0].observed.has(block), true);
 });
 
+
+test("v7 discovers only the minimal heavy tool cluster", () => {
+  const { context, document, FakeElement, intersectionObservers } = makeContext();
+  const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8, outerTools: 4 });
+  document.body.appendChild(outer);
+
+  context.__HERDR_CHATGPT_PERF__.scan();
+
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+  assert.ok(toolObserver);
+  assert.equal(toolObserver.observed.has(cluster), true);
+  assert.equal(toolObserver.observed.has(outer), false);
+  assert.equal(cluster.getAttribute("data-herdr-tool-cluster-observed"), "1");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_observed, 1);
+});
+
+test("v7 does not merge separate small tool groups into a conversation-wide cluster", () => {
+  const { context, document, FakeElement, intersectionObservers } = makeContext();
+  const outer = new FakeElement("div", "qMYqUG_convSearchResultHighlightRoot");
+  outer.ownerDocument = document;
+  for (let group = 0; group < 3; group += 1) {
+    const local = new FakeElement("div", "flex", "max-w-full", "flex-col", "gap-4", "grow");
+    local.ownerDocument = document;
+    for (let i = 0; i < 3; i += 1) {
+      const tool = new FakeElement("span", "group/tool-message");
+      tool.ownerDocument = document;
+      local.appendChild(tool);
+    }
+    outer.appendChild(local);
+  }
+  document.body.appendChild(outer);
+
+  context.__HERDR_CHATGPT_PERF__.scan();
+
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+  assert.ok(toolObserver);
+  assert.equal(toolObserver.observed.size, 0);
+  assert.equal(outer.getAttribute("data-herdr-tool-cluster-observed"), null);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_observed, 0);
+});
+
+test("v7 forces discovery when continuous mutations never become quiet", () => {
+  const {
+    context,
+    document,
+    FakeElement,
+    mutationObservers,
+    intersectionObservers,
+    runAllTimers,
+    runAllIdle,
+  } = makeContext();
+  const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
+  document.body.appendChild(outer);
+
+  for (let i = 0; i < 5; i += 1) {
+    mutationObservers[0].trigger([{ target: document.body, addedNodes: [outer], removedNodes: [] }]);
+  }
+  runAllTimers();
+  runAllIdle();
+
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+  assert.ok(toolObserver);
+  assert.equal(toolObserver.observed.has(cluster), true);
+  assert.ok(context.__HERDR_CHATGPT_PERF__.stats.forced_scans >= 1);
+});
+
+test("v7 discovers a heavy tool cluster directly from its mutation batch", () => {
+  const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
+  document.body.appendChild(outer);
+
+  mutationObservers[0].trigger([{ target: document.body, addedNodes: [outer], removedNodes: [] }]);
+
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+  assert.ok(toolObserver);
+  assert.equal(toolObserver.observed.has(cluster), true);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.idle_scans, 0);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_discovery_batches, 1);
+});
+
+test("v7 hides a far heavy tool cluster with observer-provided exact height", () => {
+  const { context, document, FakeElement, intersectionObservers } = makeContext();
+  const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
+  document.body.appendChild(outer);
+  context.__HERDR_CHATGPT_PERF__.scan();
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+
+  toolObserver.trigger([farEntry(cluster, 2761.5)]);
+
+  assert.equal(cluster.getAttribute("data-herdr-tool-cluster-hidden"), "1");
+  assert.equal(cluster.style.getPropertyValue("--herdr-tool-cluster-intrinsic-size"), "2761.5px");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_hidden, 1);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.max_tool_cluster_height_px, 2761.5);
+});
+
+test("v7 reveals a hidden tool cluster when it reaches the viewport", () => {
+  const { context, document, FakeElement, intersectionObservers } = makeContext();
+  const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
+  document.body.appendChild(outer);
+  context.__HERDR_CHATGPT_PERF__.scan();
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+  toolObserver.trigger([farEntry(cluster, 2761.5)]);
+
+  toolObserver.trigger([nearEntry(cluster, 2761.5)]);
+
+  assert.equal(cluster.getAttribute("data-herdr-tool-cluster-hidden"), null);
+  assert.ok(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_revealed >= 1);
+});
+
+test("v7 reveals and unobserves a mutating hidden tool cluster without layout reads", () => {
+  const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { outer, cluster, toolNodes } = toolClusterTree(FakeElement, document, { tools: 8 });
+  document.body.appendChild(outer);
+  context.__HERDR_CHATGPT_PERF__.scan();
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+  toolObserver.trigger([farEntry(cluster, 2761.5)]);
+  cluster.getBoundingClientRect = () => { throw new Error("hot-path layout read"); };
+
+  mutationObservers[0].trigger([{ target: toolNodes[0], addedNodes: [], removedNodes: [] }]);
+
+  assert.equal(cluster.getAttribute("data-herdr-tool-cluster-hidden"), null);
+  assert.equal(cluster.getAttribute("data-herdr-tool-cluster-observed"), null);
+  assert.equal(toolObserver.observed.has(cluster), false);
+});
+
+test("v7 suspends tool hiding for find-in-page", () => {
+  const { context, document, FakeElement, intersectionObservers } = makeContext();
+  const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
+  document.body.appendChild(outer);
+  context.__HERDR_CHATGPT_PERF__.scan();
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+  toolObserver.trigger([farEntry(cluster, 2761.5)]);
+  assert.equal(cluster.getAttribute("data-herdr-tool-cluster-hidden"), "1");
+
+  document.emit("keydown", { target: document.body, key: "f", metaKey: true, ctrlKey: false });
+  toolObserver.trigger([farEntry(cluster, 2761.5)]);
+
+  assert.equal(cluster.getAttribute("data-herdr-tool-cluster-hidden"), null);
+});
+
 test("wrapped code viewers remain uncontained", () => {
   const { context, document, FakeElement } = makeContext();
   const { viewer } = codeViewer(FakeElement, document, "a very long wrapped line", { wrapped: true });
@@ -546,22 +677,30 @@ test("wrapped code viewers remain uncontained", () => {
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.viewers_skipped, 1);
 });
 
-test("disable removes containment and disconnects both observer layers", () => {
+test("disable removes containment and disconnects all observer layers", () => {
   const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
   const { viewer } = codeViewer(FakeElement, document, "a\nb");
   const { message, root, block } = assistantWritingRoot(FakeElement, document);
+  const { outer: toolOuter, cluster: toolCluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(viewer);
   document.body.appendChild(message);
+  document.body.appendChild(toolOuter);
   context.__HERDR_CHATGPT_PERF__.scan();
   intersectionObservers[0].trigger([farEntry(block, 442)]);
+  const toolObserver = intersectionObservers.find((observer) => observer.options?.rootMargin === "0px");
+  toolObserver.trigger([farEntry(toolCluster, 2761.5)]);
   assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), "1");
   assert.equal(block.getAttribute("data-herdr-editable-block-contained"), "1");
+  assert.equal(toolCluster.getAttribute("data-herdr-tool-cluster-hidden"), "1");
 
   context.__HERDR_CHATGPT_PERF__.disable();
 
   assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), null);
   assert.equal(block.getAttribute("data-herdr-editable-block-contained"), null);
+  assert.equal(toolCluster.getAttribute("data-herdr-tool-cluster-hidden"), null);
+  assert.equal(toolCluster.getAttribute("data-herdr-tool-cluster-observed"), null);
   assert.equal(context.__HERDR_CHATGPT_PERF__.enabled, false);
   assert.equal(mutationObservers[0].connected, false);
   assert.equal(intersectionObservers[0].connected, false);
+  assert.equal(toolObserver.connected, false);
 });
