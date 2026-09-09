@@ -24,6 +24,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 const MAX_BUFFER_PER_STREAM: usize = 512 * 1024;
 const SESSION_TTL_MS: u64 = 60 * 60_000;
+const MAX_LOADED_CLOSED_SESSIONS: usize = 64;
 const KILL_GRACE: Duration = Duration::from_millis(1500);
 const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 const RECOVERY_MAX_ENTRIES: usize = 64;
@@ -460,7 +461,7 @@ impl ExecRegistry {
         clean_expired_spools(&state_dir, &unexpired_ids);
 
         let closed_records = state_store
-            .closed_exec_sessions(now, RECOVERY_MAX_ENTRIES)
+            .closed_exec_sessions(now, MAX_LOADED_CLOSED_SESSIONS)
             .unwrap_or_default();
 
         let mut initial_sessions = HashMap::new();
@@ -1035,6 +1036,7 @@ impl ExecRegistry {
                 }
                 keep
             });
+            prune_loaded_closed_sessions(&mut sessions, MAX_LOADED_CLOSED_SESSIONS);
         }
         if let Ok(store) = self.inner.state_store.lock() {
             if store.prune_exec_sessions(now).is_err() {
@@ -1047,6 +1049,31 @@ impl ExecRegistry {
             }
         }
     }
+}
+
+fn prune_loaded_closed_sessions(
+    sessions: &mut HashMap<String, Arc<Session>>,
+    max_closed: usize,
+) -> usize {
+    let mut closed = sessions
+        .iter()
+        .filter_map(|(id, session)| {
+            let status = session_status(session);
+            status
+                .ended_at_ms
+                .map(|ended_at_ms| (id.clone(), ended_at_ms))
+        })
+        .collect::<Vec<_>>();
+    if closed.len() <= max_closed {
+        return 0;
+    }
+    closed.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let remove_count = closed.len() - max_closed;
+    let mut removed = 0usize;
+    for (id, _) in closed.into_iter().take(remove_count) {
+        removed += usize::from(sessions.remove(&id).is_some());
+    }
+    removed
 }
 
 fn session_view(session: &Arc<Session>) -> Value {
@@ -2947,6 +2974,140 @@ mod tests {
         drop(restarted_with_expired);
         drop(restarted);
         let _ = fs::remove_file(&marker_path);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn loaded_completed_sessions_are_bounded_without_losing_durable_evidence() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-loaded-cap-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let now = now_ms();
+        let base = now.saturating_sub(10_000);
+        let total_closed = MAX_LOADED_CLOSED_SESSIONS + 6;
+
+        {
+            let store = registry.inner.state_store.lock().unwrap();
+            for i in 0..total_closed {
+                let session_id = format!("es_loaded_{i:03}");
+                let started_at_ms = base + i as u64;
+                let ended_at_ms = started_at_ms + 1;
+                store
+                    .record_exec_running(
+                        &session_id,
+                        20_000 + u32::try_from(i).unwrap(),
+                        None,
+                        started_at_ms,
+                    )
+                    .unwrap();
+                store
+                    .settle_exec_session(
+                        &session_id,
+                        "closed",
+                        Some(ended_at_ms),
+                        Some(0),
+                        None,
+                        now + SESSION_TTL_MS,
+                    )
+                    .unwrap();
+
+                let output = format!("output-{i}\n").into_bytes();
+                let session = Arc::new(Session {
+                    id: session_id.clone(),
+                    cwd: PathBuf::new(),
+                    command: String::new(),
+                    started_at_ms,
+                    pid: None,
+                    backend: SessionBackend::Completed,
+                    buffers: Mutex::new(Buffers {
+                        chunks: vec![Chunk {
+                            seq: 0,
+                            stream: StreamKind::Stdout,
+                            data: output.clone(),
+                        }],
+                        next_seq: 1,
+                        stdout_bytes: output.len(),
+                        stderr_bytes: 0,
+                        truncated: false,
+                    }),
+                    status: Mutex::new(SessionStatus {
+                        closed: true,
+                        exit_code: Some(0),
+                        signal: None,
+                        ended_at_ms: Some(ended_at_ms),
+                    }),
+                });
+                write_session_spool(&path, &session).unwrap();
+                registry
+                    .inner
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .insert(session_id, session);
+            }
+
+            store
+                .record_pane_exec_running("es_loaded_running", now)
+                .unwrap();
+        }
+
+        let running = Arc::new(Session {
+            id: "es_loaded_running".to_owned(),
+            cwd: PathBuf::new(),
+            command: "still-running".to_owned(),
+            started_at_ms: now,
+            pid: None,
+            backend: SessionBackend::Completed,
+            buffers: Mutex::new(Buffers::default()),
+            status: Mutex::new(SessionStatus::default()),
+        });
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(running.id.clone(), running);
+
+        registry.prune();
+        let views = registry.list_views();
+        assert_eq!(views.len(), MAX_LOADED_CLOSED_SESSIONS + 1);
+        assert!(
+            views.iter().any(|view| {
+                view["session_id"] == "es_loaded_running" && view["running"] == true
+            })
+        );
+        assert!(
+            !views
+                .iter()
+                .any(|view| view["session_id"] == "es_loaded_000")
+        );
+        assert!(
+            views
+                .iter()
+                .any(|view| { view["session_id"] == format!("es_loaded_{:03}", total_closed - 1) })
+        );
+
+        let oldest_spool = exec_spool_path(&path, "es_loaded_000");
+        assert!(oldest_spool.exists());
+        let recovered = registry.read("es_loaded_000", "stdout", 0, 64);
+        assert_eq!(recovered["ok"], true);
+        assert_eq!(recovered["phase"], "completed");
+        assert_eq!(recovered["recovered"], true);
+        assert_eq!(recovered["text"], "output-0\n");
+        assert!(oldest_spool.exists());
+
+        let rebound = registry.list_views();
+        assert_eq!(rebound.len(), MAX_LOADED_CLOSED_SESSIONS + 1);
+        assert!(
+            !rebound
+                .iter()
+                .any(|view| view["session_id"] == "es_loaded_000")
+        );
+
+        drop(registry);
         let _ = fs::remove_dir_all(&path);
     }
 

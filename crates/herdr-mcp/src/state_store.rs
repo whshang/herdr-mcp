@@ -4311,7 +4311,7 @@ impl StateStore {
                 "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
                  FROM exec_sessions
                  WHERE state = 'closed' AND (expires_at IS NULL OR expires_at > ?1)
-                 ORDER BY started_at ASC
+                 ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC, session_id DESC
                  LIMIT ?2",
             )
             .map_err(|error| format!("cannot prepare closed exec sessions query: {error}"))?;
@@ -6811,11 +6811,12 @@ mod tests {
                 .is_none()
         );
 
-        // At t=1500, both closed sessions are unexpired
+        // At t=1500, both closed sessions are unexpired and the most recently
+        // completed session is returned first so startup can keep a bounded hot set.
         let unexpired = store.closed_exec_sessions(1500, 10).unwrap();
         assert_eq!(unexpired.len(), 2);
-        assert_eq!(unexpired[0].session_id, "es_closed_a");
-        assert_eq!(unexpired[1].session_id, "es_closed_b");
+        assert_eq!(unexpired[0].session_id, "es_closed_b");
+        assert_eq!(unexpired[1].session_id, "es_closed_a");
 
         // At t=3000, es_closed_b (expires_at=2000) is filtered out
         let filtered = store.closed_exec_sessions(3000, 10).unwrap();
