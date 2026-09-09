@@ -286,10 +286,13 @@ ok(
   chatGptPerfScript?.matches?.includes("https://chatgpt.com/*")
     && chatGptPerfScript?.run_at === "document_start"
     && chatGptPerfScript?.world === "MAIN"
-    && chatGptPerfMainSource.includes('const EXTERNAL_API = "__CHATGPT_CM_PERF_FIX__"')
-    && chatGptPerfMainSource.includes('announced?.classList.contains("cm-announced")')
-    && chatGptPerfMainSource.includes('scroller?.classList.contains("cm-scroller")'),
-  "ChatGPT installs a MAIN-world document-start exact-fingerprint CodeMirror batch mount and yields to the known userscript",
+    && chatGptPerfMainSource.includes('const VIEWER_SELECTOR = "#code-block-viewer.cm-editor"')
+    && chatGptPerfMainSource.includes("new MutationObserver(handleMutations)")
+    && chatGptPerfMainSource.includes("content-visibility: auto")
+    && chatGptPerfMainSource.includes("contain-intrinsic-size: auto var")
+    && !chatGptPerfMainSource.includes("patchedAppendChild")
+    && !chatGptPerfMainSource.includes("__CHATGPT_CM_PERF_FIX__"),
+  "ChatGPT uses MAIN-world document-start React code-viewer containment without legacy CodeMirror mount interception",
 );
 ok(
   jsonBridgeSource.includes("root.parentElement.insertBefore(bar, root)")
