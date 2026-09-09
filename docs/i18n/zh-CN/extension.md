@@ -30,7 +30,7 @@ stable v0.4.2 的 Native Host contract 只有 STORE/DEV；STANDALONE 需要实�
 
 默认安装 [Herdr Chrome Web Store 官方扩展](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp)。只有 Store 不适用且 runtime 明确支持时才选 STANDALONE；DEV 只用于源码开发。
 
-v0.4.3+ 可直接从 GitHub 仓库生成本机可 Load unpacked 的 STANDALONE 副本，不需要 clone 源码仓库：
+v0.4.3+ 可直接从 GitHub 仓库生成本机可 Load unpacked 的 STANDALONE 副本，不需要 clone 源码仓库。当前 standalone installer 会在同一条命令里激活 STANDALONE Native Host owner；已发布的 Runtime 0.4.8 早于这一键激活行为，仍需执行下面单独的 `native-host use standalone`：
 
 ```bash
 herdr-mcp extension standalone install

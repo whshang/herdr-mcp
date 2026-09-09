@@ -30,7 +30,7 @@ Stable v0.4.2 only has STORE/DEV Native Host ownership. STANDALONE requires a v0
 
 Default to the [official Herdr Chrome Web Store extension](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp). Use STANDALONE only when Store distribution is not appropriate and the installed runtime explicitly supports it. DEV is for source development only.
 
-A v0.4.3+ runtime can materialize a Load-unpacked STANDALONE copy directly from the GitHub repository without cloning the source tree:
+A v0.4.3+ runtime can materialize a Load-unpacked STANDALONE copy directly from the GitHub repository without cloning the source tree. Current standalone installers also activate the STANDALONE Native Host owner as part of the same command; published Runtime 0.4.8 predates that one-step activation and still needs the explicit `native-host use standalone` command shown below:
 
 ```bash
 herdr-mcp extension standalone install

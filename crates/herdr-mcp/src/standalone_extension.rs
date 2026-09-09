@@ -71,7 +71,22 @@ pub fn run_install(options: StandaloneInstallOptions) -> Result<ExitCode, String
 
 pub fn run_status() -> Result<ExitCode, String> {
     let home = home_dir()?;
-    let base = base_dir_for(&home);
+    let native_host_status = crate::native_host_install::doctor_status().unwrap_or_else(|error| {
+        json!({
+            "ok": false,
+            "error": error,
+        })
+    });
+    let view = status_view(&home, native_host_status)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&view).map_err(|e| e.to_string())?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn status_view(home: &Path, native_host_status: Value) -> Result<Value, String> {
+    let base = base_dir_for(home);
     let current = base.join("current");
     let identity = crate::browser_extension_identity::official_standalone_identity()?;
     let manifest = read_json(&current.join("manifest.json")).ok();
@@ -93,13 +108,43 @@ pub fn run_status() -> Result<ExitCode, String> {
         .as_deref()
         .filter(|path| *path != current)
         .map(|path| inspect_alias(path, &current))
-        .unwrap_or_else(|| inspect_user_visible_alias(&home, &current));
+        .unwrap_or_else(|| inspect_user_visible_alias(home, &current));
     let load_unpacked_path = preferred_load_unpacked_path(&user_visible_path, &current);
-    let view = json!({
-        "ok": installed,
+    let native_host_configured = native_host_status
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let native_host_channel = native_host_status.get("active_channel").cloned();
+    let standalone_origin_match = native_host_status
+        .get("standalone_origin_match")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(json!({
+        "ok": true,
         "installed": installed,
+        "installed_semantics": "managed_installer_copy_valid",
         "path": current,
         "user_visible_path": user_visible_path,
+        "managed_install": {
+            "valid": installed,
+            "path": current,
+            "manifest_present": manifest.is_some(),
+            "manifest_key_matches": key_ok,
+            "state": state,
+        },
+        "browser_load": {
+            "load_unpacked_path": load_unpacked_path,
+            "loaded_observed": Value::Null,
+            "observation": "browser_loaded_state_not_tracked_by_standalone_status",
+        },
+        "native_host": {
+            "configured": native_host_configured,
+            "active_channel": native_host_channel,
+            "standalone_origin_match": standalone_origin_match,
+            "connected_observed": Value::Null,
+            "connection_observation": "active_native_host_connection_not_tracked_by_standalone_status",
+            "status": native_host_status,
+        },
         "chrome": {
             "url": "chrome://extensions",
             "action": "Developer mode -> Load unpacked",
@@ -108,16 +153,7 @@ pub fn run_status() -> Result<ExitCode, String> {
         "extension_id": identity.extension_id,
         "manifest_key_matches": key_ok,
         "state": state,
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&view).map_err(|e| e.to_string())?
-    );
-    Ok(if installed {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    })
+    }))
 }
 
 fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
@@ -214,6 +250,11 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
     if backup.exists() {
         let _ = fs::remove_dir_all(&backup);
     }
+    let native_host = crate::native_host_install::activate_standalone().map_err(|error| {
+        format!(
+            "standalone extension files were installed, but automatic Native Host activation failed: {error}; rerun `herdr-mcp extension standalone install` after repairing Native Host state"
+        )
+    })?;
     Ok(json!({
         "ok": true,
         "channel": "standalone",
@@ -229,7 +270,7 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
             "action": "Developer mode -> Load unpacked",
             "load_unpacked_path": load_unpacked_path,
         },
-        "next_command": "herdr-mcp native-host use standalone",
+        "native_host": native_host,
         "note": "All Git-tracked extension/ files come from the pinned commit; manifest.json differs only by the injected standalone public key.",
     }))
 }
@@ -877,6 +918,32 @@ mod tests {
             assert_eq!(wrong_link["kind"], "symlink");
             assert_eq!(fs::read_link(&alias).unwrap(), other);
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_separates_managed_install_browser_load_and_native_host_evidence() {
+        let root = env::temp_dir().join(format!("herdr-standalone-status-test-{}", now_ms()));
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let view = status_view(
+            &home,
+            json!({
+                "ok": true,
+                "active_channel": "standalone",
+                "standalone_origin_match": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(view["ok"], true);
+        assert_eq!(view["installed"], false);
+        assert_eq!(view["installed_semantics"], "managed_installer_copy_valid");
+        assert_eq!(view["managed_install"]["valid"], false);
+        assert_eq!(view["browser_load"]["loaded_observed"], Value::Null);
+        assert_eq!(view["native_host"]["configured"], true);
+        assert_eq!(view["native_host"]["standalone_origin_match"], true);
+        assert_eq!(view["native_host"]["connected_observed"], Value::Null);
         let _ = fs::remove_dir_all(root);
     }
 }

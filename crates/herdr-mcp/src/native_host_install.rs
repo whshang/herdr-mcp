@@ -160,6 +160,48 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
     }
 }
 
+/// Activate the fixed STANDALONE Native Messaging identity as part of the
+/// managed standalone-extension install flow. On macOS this reuses the same
+/// transactional Native Host mutation as `native-host use standalone` and
+/// verifies the resulting owner before returning success. Other platforms keep
+/// extension materialization available while reporting that managed Native Host
+/// integration is not supported there yet.
+pub fn activate_standalone() -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(serde_json::json!({
+            "supported": false,
+            "activated": false,
+            "reason": "native_host_install_currently_requires_macos",
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        require_default_instance()?;
+        let paths = InstallPaths::discover(&NativeHostCommand::UseStandalone)?;
+        let install_view = install(&paths)?;
+        let status_view = status(&paths);
+        let activated = status_view.get("ok").and_then(Value::as_bool) == Some(true)
+            && status_view
+                .get("standalone_origin_match")
+                .and_then(Value::as_bool)
+                == Some(true);
+        if !activated {
+            return Err(
+                "native-host standalone activation returned without a healthy standalone ownership postcondition"
+                    .to_owned(),
+            );
+        }
+        Ok(json!({
+            "supported": true,
+            "activated": true,
+            "install": install_view,
+            "status": status_view,
+        }))
+    }
+}
+
 /// Product-uninstall primitive with stricter ownership than the interactive
 /// `native-host uninstall` command. A bare executable/wrapper is never enough
 /// evidence for destructive cleanup: at least one currently owned manifest
