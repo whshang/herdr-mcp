@@ -172,6 +172,8 @@ macOS 正常安装已由托管服务 `dev.herdr-mcp.herdr-supervisor` 保持 Her
 
 Agent 必须先读取当前 runtime 实际支持的 `native-host` 命令；v0.4.2 只有 Store/DEV，不得虚构 standalone。STANDALONE 是独立于源码开发的分发通道，DEV 仍仅用于源码开发。托管 Chromium Native Messaging host 当前属于 macOS 集成；Linux 的核心 runtime / Link / Connector 不依赖它，因此 Linux 跳过 native-host 安装。macOS 上支持该能力的 runtime 使用 `herdr-mcp native-host use standalone` 显式切换。选择并安装通道后执行：
 
+对于实际暴露该参数的 runtime，可执行 `herdr-mcp extension standalone install --ref extension-vX.Y.Z --path ~/Documents/herdr-mcp/extension`。受管副本始终保留在 `~/.config/herdr-mcp/extensions/standalone/current`，`--path` 只创建 HOME 下安全、用户可见的软链；显式路径已被占用时必须失败而不是覆盖。自动化需要确定 Chrome 应选择哪个目录时，读取 `herdr-mcp extension standalone status` 返回的 `chrome.load_unpacked_path`。
+
 ```bash
 herdr-mcp native-host status
 ```

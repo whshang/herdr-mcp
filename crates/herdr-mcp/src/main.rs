@@ -273,9 +273,10 @@ fn run() -> Result<ExitCode, String> {
             updater::run(command)
         }
         cli::Command::Extension(command) => match command {
-            cli::ExtensionCommand::StandaloneInstall { reference } => {
+            cli::ExtensionCommand::StandaloneInstall { reference, path } => {
                 standalone_extension::run_install(standalone_extension::StandaloneInstallOptions {
                     reference,
+                    load_path: path,
                 })
             }
             cli::ExtensionCommand::StandaloneStatus => standalone_extension::run_status(),

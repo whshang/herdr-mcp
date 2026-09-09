@@ -39,6 +39,8 @@ herdr-mcp native-host use standalone
 
 正式 runtime 默认使用编译时记录的不可变 source commit；开发构建无法证明 build commit 时才回退 `main`。需要明确追踪仓库最新源码时可执行 `herdr-mcp extension standalone install --ref main`。下载结果稳定放在 `~/.config/herdr-mcp/extensions/standalone/current`，Chrome 首次进入 `chrome://extensions` → Developer mode → Load unpacked 后选择该目录，后续更新继续复用同一路径。
 
+新版 runtime 还可以暴露 `--path`，例如 `herdr-mcp extension standalone install --ref extension-vX.Y.Z --path ~/Documents/herdr-mcp/extension`。真实受管副本仍固定在 `~/.config/herdr-mcp/extensions/standalone/current`；指定路径只是 HOME 目录下指向该副本的稳定软链。显式指定的路径若已被占用必须失败，不得覆盖。未传 `--path` 时安装器会在安全时使用默认用户可见别名，否则返回受管目录作为 fallback。Chrome 或自动化需要精确路径时读取 `herdr-mcp extension standalone status` 的 `chrome.load_unpacked_path`。
+
 下载器先把 ref 解析为不可变 commit SHA，再只下载该 commit 下 Git 跟踪的 `extension/` 文件。除 `manifest.json` 为固定 STANDALONE ID 注入公开 `key` 外，其余文件必须与该 commit 的 `extension/` 字节一致；repo/worktree 中的 DEV `extension/manifest.json` 不会被修改。可用 `herdr-mcp extension standalone status` 查看已安装 commit、版本、ID 和路径。
 
 选择通道后验证：

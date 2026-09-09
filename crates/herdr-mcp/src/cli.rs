@@ -193,7 +193,10 @@ pub enum NativeHostCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExtensionCommand {
-    StandaloneInstall { reference: Option<String> },
+    StandaloneInstall {
+        reference: Option<String>,
+        path: Option<String>,
+    },
     StandaloneStatus,
 }
 
@@ -1464,25 +1467,47 @@ fn parse_native_host(args: &[String]) -> Result<Command, String> {
 }
 
 fn parse_extension(args: &[String]) -> Result<Command, String> {
+    if matches!(args, [channel, action, ..] if channel == "standalone" && action == "install") {
+        let mut reference = None;
+        let mut path = None;
+        let mut index = 2;
+        while index < args.len() {
+            let flag = &args[index];
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{flag} requires a value"))?;
+            match flag.as_str() {
+                "--ref" => {
+                    if reference.replace(value.clone()).is_some() {
+                        return Err("duplicate extension standalone --ref".to_owned());
+                    }
+                }
+                "--path" => {
+                    if path.replace(value.clone()).is_some() {
+                        return Err("duplicate extension standalone --path".to_owned());
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "unknown extension standalone install option '{flag}'"
+                    ));
+                }
+            }
+            index += 2;
+        }
+        return Ok(Command::Extension(ExtensionCommand::StandaloneInstall {
+            reference,
+            path,
+        }));
+    }
     match args {
-        [channel, action] if channel == "standalone" && action == "install" => {
-            Ok(Command::Extension(ExtensionCommand::StandaloneInstall {
-                reference: None,
-            }))
-        }
-        [channel, action, flag, reference]
-            if channel == "standalone" && action == "install" && flag == "--ref" =>
-        {
-            Ok(Command::Extension(ExtensionCommand::StandaloneInstall {
-                reference: Some(reference.clone()),
-            }))
-        }
         [channel, action] if channel == "standalone" && action == "status" => {
             Ok(Command::Extension(ExtensionCommand::StandaloneStatus))
         }
-        [] => {
-            Err("extension requires standalone install [--ref REF] or standalone status".to_owned())
-        }
+        [] => Err(
+            "extension requires standalone install [--ref REF] [--path PATH] or standalone status"
+                .to_owned(),
+        ),
         _ => Err("invalid extension command or arguments".to_owned()),
     }
 }
@@ -2007,7 +2032,10 @@ mod tests {
             parse(args(&["extension", "standalone", "install"]))
                 .unwrap()
                 .command,
-            Command::Extension(ExtensionCommand::StandaloneInstall { reference: None })
+            Command::Extension(ExtensionCommand::StandaloneInstall {
+                reference: None,
+                path: None,
+            })
         );
         assert_eq!(
             parse(args(&[
@@ -2020,8 +2048,39 @@ mod tests {
             .unwrap()
             .command,
             Command::Extension(ExtensionCommand::StandaloneInstall {
-                reference: Some("main".to_owned())
+                reference: Some("main".to_owned()),
+                path: None,
             })
+        );
+        assert_eq!(
+            parse(args(&[
+                "extension",
+                "standalone",
+                "install",
+                "--path",
+                "~/Documents/herdr-mcp/extension",
+                "--ref",
+                "extension-v0.1.91"
+            ]))
+            .unwrap()
+            .command,
+            Command::Extension(ExtensionCommand::StandaloneInstall {
+                reference: Some("extension-v0.1.91".to_owned()),
+                path: Some("~/Documents/herdr-mcp/extension".to_owned()),
+            })
+        );
+        assert!(parse(args(&["extension", "standalone", "install", "--path"])).is_err());
+        assert!(
+            parse(args(&[
+                "extension",
+                "standalone",
+                "install",
+                "--path",
+                "one",
+                "--path",
+                "two"
+            ]))
+            .is_err()
         );
         assert_eq!(
             parse(args(&["extension", "standalone", "status"]))

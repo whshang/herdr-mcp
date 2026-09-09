@@ -144,6 +144,20 @@ test("quick Agent protocols automate Herdr/runtime and preserve STORE STANDALONE
   }
 });
 
+test("standalone docs expose the safe optional user-visible load path", () => {
+  for (const rel of [
+    "docs/i18n/en/agent-install.md",
+    "docs/i18n/zh-CN/agent-install.md",
+    "docs/i18n/en/extension.md",
+    "docs/i18n/zh-CN/extension.md",
+  ]) {
+    const doc = read(rel);
+    assert.match(doc, /--path ~\/Documents\/herdr-mcp\/extension/);
+    assert.match(doc, /~\/\.config\/herdr-mcp\/extensions\/standalone\/current/);
+    assert.match(doc, /chrome\.load_unpacked_path/);
+  }
+});
+
 test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () => {
   const src = read("bin/herdr-link");
   assert.match(src, /HERDR_NODE_BIN/);

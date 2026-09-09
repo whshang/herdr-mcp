@@ -6,7 +6,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +22,7 @@ const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneInstallOptions {
     pub reference: Option<String>,
+    pub load_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +70,8 @@ pub fn run_install(options: StandaloneInstallOptions) -> Result<ExitCode, String
 }
 
 pub fn run_status() -> Result<ExitCode, String> {
-    let base = base_dir()?;
+    let home = home_dir()?;
+    let base = base_dir_for(&home);
     let current = base.join("current");
     let identity = crate::browser_extension_identity::official_standalone_identity()?;
     let manifest = read_json(&current.join("manifest.json")).ok();
@@ -82,10 +84,27 @@ pub fn run_status() -> Result<ExitCode, String> {
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
     let installed = current.is_dir() && manifest.is_some() && key_ok;
+    let configured_load_path = state
+        .as_ref()
+        .and_then(|value| value.get("load_unpacked_path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let user_visible_path = configured_load_path
+        .as_deref()
+        .filter(|path| *path != current)
+        .map(|path| inspect_alias(path, &current))
+        .unwrap_or_else(|| inspect_user_visible_alias(&home, &current));
+    let load_unpacked_path = preferred_load_unpacked_path(&user_visible_path, &current);
     let view = json!({
         "ok": installed,
         "installed": installed,
         "path": current,
+        "user_visible_path": user_visible_path,
+        "chrome": {
+            "url": "chrome://extensions",
+            "action": "Developer mode -> Load unpacked",
+            "load_unpacked_path": load_unpacked_path,
+        },
         "extension_id": identity.extension_id,
         "manifest_key_matches": key_ok,
         "state": state,
@@ -104,11 +123,22 @@ pub fn run_status() -> Result<ExitCode, String> {
 fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
     let requested_ref = options.reference.unwrap_or_else(default_source_ref);
     validate_ref(&requested_ref)?;
+    let home = home_dir()?;
+    let base = base_dir_for(&home);
+    let current = base.join("current");
+    let explicit_load_path = options
+        .load_path
+        .as_deref()
+        .map(|value| resolve_load_path(&home, value))
+        .transpose()?;
+    if let Some(path) = explicit_load_path.as_deref() {
+        preflight_explicit_load_path(path, &current)?;
+    }
+
     let client = client()?;
     let commit = resolve_ref(&client, &requested_ref)?;
     let blobs = list_blobs(&client, &commit)?;
 
-    let base = base_dir()?;
     fs::create_dir_all(&base).map_err(|e| format!("cannot create standalone directory: {e}"))?;
     let staging = base.join(format!(".staging-{}-{}", std::process::id(), now_ms()));
     fs::create_dir_all(&staging).map_err(|e| format!("cannot create staging directory: {e}"))?;
@@ -133,7 +163,6 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         }
     };
 
-    let current = base.join("current");
     let backup = base.join(format!(".previous-{}-{}", std::process::id(), now_ms()));
     let had_current = current.exists();
     if had_current {
@@ -147,6 +176,24 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         return Err(format!("cannot activate standalone extension: {error}"));
     }
 
+    let user_visible_path = match explicit_load_path.as_deref() {
+        Some(path) if path == current => json!({
+            "ready": true,
+            "status": "managed",
+            "path": current,
+            "target": current,
+        }),
+        Some(path) => match ensure_explicit_alias(&home, path, &current) {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_activation(&current, &backup, had_current);
+                return Err(error);
+            }
+        },
+        None => ensure_user_visible_alias(&home, &current),
+    };
+    let load_unpacked_path = preferred_load_unpacked_path(&user_visible_path, &current);
+
     let state = json!({
         "schema_version": 1,
         "repository": REPOSITORY,
@@ -157,18 +204,16 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         "source_manifest_sha256": prepared.source_sha256,
         "installed_at_unix_ms": now_ms(),
         "path": current,
+        "load_unpacked_path": load_unpacked_path,
     });
     if let Err(error) = atomic_json(&base.join("state.json"), &state) {
-        let _ = fs::remove_dir_all(&current);
-        if had_current {
-            let _ = fs::rename(&backup, &current);
-        }
+        remove_alias_if_created(&user_visible_path, &current);
+        rollback_activation(&current, &backup, had_current);
         return Err(error);
     }
     if backup.exists() {
         let _ = fs::remove_dir_all(&backup);
     }
-
     Ok(json!({
         "ok": true,
         "channel": "standalone",
@@ -178,10 +223,11 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         "extension_version": state["extension_version"],
         "extension_id": state["extension_id"],
         "path": current,
+        "user_visible_path": user_visible_path,
         "chrome": {
             "url": "chrome://extensions",
             "action": "Developer mode -> Load unpacked",
-            "load_unpacked_path": current,
+            "load_unpacked_path": load_unpacked_path,
         },
         "next_command": "herdr-mcp native-host use standalone",
         "note": "All Git-tracked extension/ files come from the pinned commit; manifest.json differs only by the injected standalone public key.",
@@ -419,9 +465,252 @@ fn safe_rel(value: &str) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-fn base_dir() -> Result<PathBuf, String> {
-    let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
-    Ok(PathBuf::from(home).join(".config/herdr-mcp/extensions/standalone"))
+fn home_dir() -> Result<PathBuf, String> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_owned())
+}
+
+fn base_dir_for(home: &Path) -> PathBuf {
+    home.join(".config/herdr-mcp/extensions/standalone")
+}
+
+fn user_visible_alias_path(home: &Path) -> PathBuf {
+    home.join("Documents/herdr-mcp/extension")
+}
+
+fn inspect_user_visible_alias(home: &Path, current: &Path) -> Value {
+    let path = user_visible_alias_path(home);
+    inspect_alias(&path, current)
+}
+
+fn inspect_alias(path: &Path, current: &Path) -> Value {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({
+            "ready": false,
+            "status": "missing",
+            "path": path,
+            "target": current,
+        }),
+        Err(error) => json!({
+            "ready": false,
+            "status": "error",
+            "path": path,
+            "target": current,
+            "error": error.to_string(),
+        }),
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(path) {
+            Ok(existing_target) if existing_target == current => json!({
+                "ready": true,
+                "status": "ready",
+                "path": path,
+                "target": current,
+            }),
+            Ok(existing_target) => json!({
+                "ready": false,
+                "status": "occupied",
+                "kind": "symlink",
+                "path": path,
+                "target": current,
+                "existing_target": existing_target,
+            }),
+            Err(error) => json!({
+                "ready": false,
+                "status": "error",
+                "path": path,
+                "target": current,
+                "error": error.to_string(),
+            }),
+        },
+        Ok(metadata) => json!({
+            "ready": false,
+            "status": "occupied",
+            "kind": if metadata.is_dir() { "directory" } else if metadata.is_file() { "file" } else { "other" },
+            "path": path,
+            "target": current,
+        }),
+    }
+}
+
+fn ensure_user_visible_alias(home: &Path, current: &Path) -> Value {
+    let path = user_visible_alias_path(home);
+    ensure_alias(home, &path, current)
+}
+
+fn ensure_alias(home: &Path, path: &Path, current: &Path) -> Value {
+    let initial = inspect_alias(path, current);
+    if initial.get("status").and_then(Value::as_str) != Some("missing") {
+        return initial;
+    }
+    let Some(parent) = path.parent() else {
+        return json!({
+            "ready": false,
+            "status": "error",
+            "path": path,
+            "target": current,
+            "error": "user-visible extension path has no parent",
+        });
+    };
+    if let Err(error) = ensure_alias_parent(home, parent) {
+        return json!({
+            "ready": false,
+            "status": "error",
+            "path": path,
+            "target": current,
+            "error": error,
+        });
+    }
+    match create_directory_symlink(current, path) {
+        Ok(()) => json!({
+            "ready": true,
+            "status": "created",
+            "path": path,
+            "target": current,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => inspect_alias(path, current),
+        Err(error) => json!({
+            "ready": false,
+            "status": "error",
+            "path": path,
+            "target": current,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn ensure_explicit_alias(home: &Path, path: &Path, current: &Path) -> Result<Value, String> {
+    let result = ensure_alias(home, path, current);
+    if result.get("ready").and_then(Value::as_bool) == Some(true) {
+        return Ok(result);
+    }
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Err(format!(
+        "requested standalone --path '{}' is not usable ({status}); choose an unused path or the existing standalone symlink",
+        path.display()
+    ))
+}
+
+fn preflight_explicit_load_path(path: &Path, current: &Path) -> Result<(), String> {
+    if path == current {
+        return Ok(());
+    }
+    let state = inspect_alias(path, current);
+    match state.get("status").and_then(Value::as_str) {
+        Some("missing" | "ready") => Ok(()),
+        Some(status) => Err(format!(
+            "requested standalone --path '{}' is already occupied ({status}); refusing to overwrite it",
+            path.display()
+        )),
+        None => Err(format!(
+            "requested standalone --path '{}' cannot be inspected safely",
+            path.display()
+        )),
+    }
+}
+
+fn resolve_load_path(home: &Path, value: &str) -> Result<PathBuf, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 4096 || value.chars().any(|ch| ch.is_control()) {
+        return Err("invalid standalone --path".to_owned());
+    }
+    let path = if value == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        let raw = PathBuf::from(value);
+        if raw.is_absolute() {
+            raw
+        } else {
+            home.join(raw)
+        }
+    };
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err("standalone --path must not contain '..'".to_owned());
+    }
+    if path == home || !path.starts_with(home) {
+        return Err("standalone --path must resolve below HOME".to_owned());
+    }
+    Ok(path)
+}
+
+fn ensure_alias_parent(home: &Path, parent: &Path) -> Result<(), String> {
+    let canonical_home = fs::canonicalize(home)
+        .map_err(|e| format!("cannot resolve HOME for standalone --path: {e}"))?;
+    let mut ancestor = parent;
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| "standalone --path has no existing ancestor".to_owned())?;
+    }
+    let canonical_ancestor = fs::canonicalize(ancestor)
+        .map_err(|e| format!("cannot resolve standalone --path ancestor: {e}"))?;
+    if !canonical_ancestor.starts_with(&canonical_home) {
+        return Err("standalone --path would escape HOME through a symlinked parent".to_owned());
+    }
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create standalone --path parent: {e}"))?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|e| format!("cannot resolve standalone --path parent: {e}"))?;
+    if !canonical_parent.starts_with(canonical_home) {
+        return Err("standalone --path parent resolves outside HOME".to_owned());
+    }
+    Ok(())
+}
+
+fn rollback_activation(current: &Path, backup: &Path, had_current: bool) {
+    let _ = fs::remove_dir_all(current);
+    if had_current {
+        let _ = fs::rename(backup, current);
+    }
+}
+
+fn remove_alias_if_created(alias: &Value, current: &Path) {
+    if alias.get("status").and_then(Value::as_str) != Some("created") {
+        return;
+    }
+    let Some(path) = alias.get("path").and_then(Value::as_str).map(PathBuf::from) else {
+        return;
+    };
+    if fs::read_link(&path).ok().as_deref() == Some(current) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn preferred_load_unpacked_path(alias: &Value, current: &Path) -> PathBuf {
+    if alias.get("ready").and_then(Value::as_bool) == Some(true) {
+        alias
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| current.to_path_buf())
+    } else {
+        current.to_path_buf()
+    }
+}
+
+#[cfg(unix)]
+fn create_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_directory_symlink(_target: &Path, _link: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory symlinks are unsupported on this platform",
+    ))
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -498,6 +787,96 @@ mod tests {
         assert_eq!(manifest["key"], identity.manifest_key.unwrap());
         assert_eq!(prepared.extension_id, identity.extension_id);
         assert_eq!(prepared.source_sha256, sha256(source));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_load_paths_expand_under_home_and_reject_escape() {
+        let home = PathBuf::from("/Users/example");
+        assert_eq!(
+            resolve_load_path(&home, "~/Documents/herdr/extension").unwrap(),
+            home.join("Documents/herdr/extension")
+        );
+        assert_eq!(
+            resolve_load_path(&home, "Downloads/herdr-extension").unwrap(),
+            home.join("Downloads/herdr-extension")
+        );
+        assert!(resolve_load_path(&home, "~/../outside").is_err());
+        assert!(resolve_load_path(&home, "/tmp/herdr-extension").is_err());
+        assert!(resolve_load_path(&home, "~").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_load_path_is_created_and_conflicts_fail_closed() {
+        let root = env::temp_dir().join(format!("herdr-standalone-custom-alias-{}", now_ms()));
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        let custom = home.join("Downloads/herdr-extension");
+        fs::create_dir_all(&current).unwrap();
+
+        preflight_explicit_load_path(&custom, &current).unwrap();
+        let created = ensure_explicit_alias(&home, &custom, &current).unwrap();
+        assert_eq!(created["status"], "created");
+        assert_eq!(fs::read_link(&custom).unwrap(), current);
+        preflight_explicit_load_path(&custom, &current).unwrap();
+
+        fs::remove_file(&custom).unwrap();
+        fs::create_dir_all(&custom).unwrap();
+        let error = preflight_explicit_load_path(&custom, &current).unwrap_err();
+        assert!(error.contains("refusing to overwrite"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_visible_alias_is_created_once_and_reused() {
+        let root = env::temp_dir().join(format!("herdr-standalone-alias-test-{}", now_ms()));
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        fs::create_dir_all(&current).unwrap();
+
+        let created = ensure_user_visible_alias(&home, &current);
+        assert_eq!(created["ready"], true);
+        assert_eq!(created["status"], "created");
+        let alias = user_visible_alias_path(&home);
+        assert_eq!(fs::read_link(&alias).unwrap(), current);
+
+        let reused = ensure_user_visible_alias(&home, &current);
+        assert_eq!(reused["ready"], true);
+        assert_eq!(reused["status"], "ready");
+        assert_eq!(preferred_load_unpacked_path(&reused, &current), alias);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn user_visible_alias_never_overwrites_an_occupied_path() {
+        let root = env::temp_dir().join(format!("herdr-standalone-alias-conflict-{}", now_ms()));
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        let alias = user_visible_alias_path(&home);
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&alias).unwrap();
+
+        let occupied = ensure_user_visible_alias(&home, &current);
+        assert_eq!(occupied["ready"], false);
+        assert_eq!(occupied["status"], "occupied");
+        assert_eq!(occupied["kind"], "directory");
+        assert!(alias.is_dir());
+        assert_eq!(preferred_load_unpacked_path(&occupied, &current), current);
+
+        #[cfg(unix)]
+        {
+            fs::remove_dir(&alias).unwrap();
+            let other = root.join("other-extension");
+            fs::create_dir_all(&other).unwrap();
+            std::os::unix::fs::symlink(&other, &alias).unwrap();
+            let wrong_link = ensure_user_visible_alias(&home, &current);
+            assert_eq!(wrong_link["ready"], false);
+            assert_eq!(wrong_link["status"], "occupied");
+            assert_eq!(wrong_link["kind"], "symlink");
+            assert_eq!(fs::read_link(&alias).unwrap(), other);
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -39,6 +39,8 @@ herdr-mcp native-host use standalone
 
 A release runtime defaults to its immutable compile-time source commit; only a development build without a verifiable build commit falls back to `main`. Use `herdr-mcp extension standalone install --ref main` when development explicitly needs the latest repository source. The managed copy lives at the stable path `~/.config/herdr-mcp/extensions/standalone/current`; choose that directory once in `chrome://extensions` → Developer mode → Load unpacked, then future updates keep the same path.
 
+Newer runtimes may also expose `--path`, for example `herdr-mcp extension standalone install --ref extension-vX.Y.Z --path ~/Documents/herdr-mcp/extension`. The managed copy still stays at `~/.config/herdr-mcp/extensions/standalone/current`; the selected path is only a stable symlink below the user's HOME. An explicitly requested occupied path fails closed. Without `--path`, the installer uses the default user-visible alias when it can do so safely and otherwise reports the managed directory as the fallback. `herdr-mcp extension standalone status` exposes the exact `chrome.load_unpacked_path` for Chrome or automation.
+
 The installer resolves the requested ref to an immutable commit SHA and downloads only Git-tracked files below that commit's `extension/` tree. Every file remains byte-identical to the repository source except `manifest.json`, where Herdr injects the public `key` required for the fixed STANDALONE extension ID. The repo/worktree DEV manifest is never modified. `herdr-mcp extension standalone status` reports the installed commit, version, ID, and path.
 
 After choosing a channel, verify:
