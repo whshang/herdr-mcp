@@ -632,7 +632,7 @@ function promptNotInterruptMeta(before: { agent_status: string | null } | null):
   return before?.agent_status === "working" ? {
     prompt_is_not_interrupt: true,
     interrupt_hint:
-      "target was already working before this prompt. agent.prompt/herdr_prompt is business input and does not stop the current execution. To interrupt: agent.send_keys ESC -> fresh agent.get/herdr_since -> CTRL_C only if still working -> fresh verify.",
+      "target was already working before this prompt. agent.prompt/herdr_prompt is business input and does not stop the current execution. To interrupt: agent.send_keys ESC -> fresh agent.get/herdr_since -> ctrl+c only if still working -> fresh verify.",
   } : {};
 }
 
@@ -1015,7 +1015,7 @@ function registerTools(server: McpServer): void {
             agent_status: state.agent_status ?? "unknown",
             state_change_seq: state.state_change_seq,
             message: "pane.close is resource reclamation, not an Agent interrupt; attached Agent is not verified settled",
-            hint: "send agent.send_keys keys=[\"ESC\"], verify with agent.get/herdr_since, then send keys=[\"CTRL_C\"] only if still working; verify again before closing",
+            hint: "send agent.send_keys keys=[\"ESC\"], verify with agent.get/herdr_since, then send keys=[\"ctrl+c\"] only if still working; verify again before closing",
             pane_close_is_not_cancellation_proof: true,
           });
         }
@@ -1029,7 +1029,7 @@ function registerTools(server: McpServer): void {
         }
         if (method === "agent.send_keys") {
           const keys = Array.isArray(given["keys"]) ? given["keys"] as unknown[] : [];
-          if (keys.some((key) => key === "ESC" || key === "CTRL_C")) {
+          if (keys.some((key) => key === "ESC" || key === "ctrl+c")) {
             controlMeta["control_signal_sent"] = true;
             controlMeta["interrupt_state_verified"] = false;
             controlMeta["control_note"] = "control key was sent, but Agent state is not proven settled; verify with agent.get or herdr_since before another control signal or pane.close";

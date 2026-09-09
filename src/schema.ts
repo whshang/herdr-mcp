@@ -139,7 +139,7 @@ export function listMethods(query = ""): MethodListing[] {
 
 function nativeMethodGuidance(method: string): string | null {
   if (method === "agent.send_keys") {
-    return "Agent interruption is terminal control, not business input: send keys=[\"ESC\"] first, verify fresh state with agent.get or herdr_since, then send keys=[\"CTRL_C\"] only if it is still working and verify again. agent.prompt/herdr_prompt never means stop/cancel.";
+    return "Agent interruption is terminal control, not business input: send keys=[\"ESC\"] first, verify fresh state with agent.get or herdr_since, then send keys=[\"ctrl+c\"] only if it is still working and verify again. agent.prompt/herdr_prompt never means stop/cancel.";
   }
   if (method === "pane.close") {
     return "Resource reclamation only. herdr-mcp refuses pane.close while an attached Agent is working or its state is not settled. Interrupt and verify the Agent first. Pane closure is never mutation-cancellation proof.";

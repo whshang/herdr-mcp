@@ -418,7 +418,7 @@ fn annotate_prompt_control_semantics(result: &mut Value, before: Option<&AgentSt
     object.insert("prompt_is_not_interrupt".to_owned(), json!(true));
     object.insert(
         "interrupt_hint".to_owned(),
-        json!("target was already working before this prompt. agent.prompt/herdr_prompt is business input and does not stop the current execution. To interrupt: agent.send_keys ESC -> fresh agent.get/herdr_since -> CTRL_C only if still working -> fresh verify."),
+        json!("target was already working before this prompt. agent.prompt/herdr_prompt is business input and does not stop the current execution. To interrupt: agent.send_keys ESC -> fresh agent.get/herdr_since -> ctrl+c only if still working -> fresh verify."),
     );
 }
 
@@ -1000,6 +1000,12 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("agent.send_keys ESC")
+        );
+        assert!(
+            result["interrupt_hint"]
+                .as_str()
+                .unwrap()
+                .contains("ctrl+c")
         );
         server.join().unwrap();
         fs::remove_file(socket).unwrap();

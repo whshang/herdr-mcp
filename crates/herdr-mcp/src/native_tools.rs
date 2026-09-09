@@ -369,7 +369,7 @@ fn pane_close_guard(client: &HerdrClient, snapshot: &Value, pane_id: &str) -> Op
                 "pane_id": pane_id,
                 "message": "cannot freshly verify that the pane has no running Agent; pane.close was not sent",
                 "probe_error": {"code": error.code, "message": error.message},
-                "hint": "verify with agent.get / herdr_since; interrupt with agent.send_keys ESC then CTRL_C only if still working; retry pane.close only after a settled state is observed",
+                "hint": "verify with agent.get / herdr_since; interrupt with agent.send_keys ESC then ctrl+c only if still working; retry pane.close only after a settled state is observed",
                 "pane_close_is_not_cancellation_proof": true,
             }));
         }
@@ -413,7 +413,7 @@ fn pane_close_blocked(pane_id: &str, agent: &Value, source: &str) -> Value {
         "state_change_seq": agent.get("state_change_seq").cloned().unwrap_or(Value::Null),
         "state_source": source,
         "message": "pane.close is resource reclamation, not an Agent interrupt; attached Agent is not verified settled",
-        "hint": "if the Agent is working, send agent.send_keys keys=[\"ESC\"]; verify with agent.get/herdr_since; if still working send keys=[\"CTRL_C\"] and verify again before closing",
+        "hint": "if the Agent is working, send agent.send_keys keys=[\"ESC\"]; verify with agent.get/herdr_since; if still working send keys=[\"ctrl+c\"] and verify again before closing",
         "pane_close_is_not_cancellation_proof": true,
     })
 }
@@ -441,7 +441,7 @@ fn annotate_control_semantics(method: &str, params: &Value, result: &mut Value) 
             .flatten()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
-        if keys.iter().any(|key| matches!(*key, "ESC" | "CTRL_C")) {
+        if keys.iter().any(|key| matches!(*key, "ESC" | "ctrl+c")) {
             object.insert("control_signal_sent".to_owned(), json!(true));
             object.insert("interrupt_state_verified".to_owned(), json!(false));
             object.insert(
@@ -485,7 +485,7 @@ fn method_json(method: &MethodSchema) -> Value {
 fn native_method_guidance(method: &str) -> Option<&'static str> {
     match method {
         "agent.send_keys" => Some(
-            "Agent interruption is terminal control, not business input: send keys=[\"ESC\"] first, then verify fresh state with agent.get or herdr_since; only if it is still working send keys=[\"CTRL_C\"], then verify again. agent.prompt/herdr_prompt never means stop/cancel.",
+            "Agent interruption is terminal control, not business input: send keys=[\"ESC\"] first, then verify fresh state with agent.get or herdr_since; only if it is still working send keys=[\"ctrl+c\"], then verify again. agent.prompt/herdr_prompt never means stop/cancel.",
         ),
         "pane.close" => Some(
             "Resource reclamation only. herdr-mcp refuses pane.close while an attached Agent is working or its state is not settled. Interrupt and verify the Agent first. A closed pane is never proof that an Agent mutation was cancelled or had no side effects.",
@@ -743,7 +743,7 @@ mod tests {
     fn native_method_guidance_makes_interrupt_and_close_semantics_explicit() {
         let interrupt = native_method_guidance("agent.send_keys").unwrap();
         assert!(interrupt.contains("ESC"));
-        assert!(interrupt.contains("CTRL_C"));
+        assert!(interrupt.contains("ctrl+c"));
         assert!(interrupt.contains("never means stop/cancel"));
 
         let close = native_method_guidance("pane.close").unwrap();
