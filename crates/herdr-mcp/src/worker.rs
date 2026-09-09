@@ -365,14 +365,6 @@ pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_js
     }))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(crate) fn extension_fleet_snapshot_with_proxy(
-    paths: &RuntimePaths,
-    _proxy_url: Option<&str>,
-) -> Result<serde_json::Value, String> {
-    extension_fleet_snapshot(paths)
-}
-
 #[cfg(target_os = "linux")]
 pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
