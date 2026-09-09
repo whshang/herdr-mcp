@@ -63,6 +63,18 @@ function requestParts(input) {
   };
 }
 
+function nativeRequestPayload(input, init = {}) {
+  const { baseUrl, path } = requestParts(input);
+  return {
+    base_url: baseUrl,
+    path,
+    method: String(init.method || "GET").toUpperCase(),
+    headers: normalizedHeaders(init.headers),
+    body: init.body == null ? "" : String(init.body),
+    timeout_ms: Number(init.nativeTimeoutMs || 10_000),
+  };
+}
+
 export async function getNativeExtensionOwnerStatus() {
   return nativeMessage({ type: "identity" });
 }
@@ -100,17 +112,9 @@ export async function captureWebArtifactNative(artifact) {
 
 
 export async function localHerdrFetch(input, init = {}) {
-  const { baseUrl, path } = requestParts(input);
-  const body = init.body == null ? "" : String(init.body);
-  const timeoutMs = Number(init.nativeTimeoutMs || 10_000);
   const response = await nativeMessage({
     type: "request",
-    base_url: baseUrl,
-    path,
-    method: String(init.method || "GET").toUpperCase(),
-    headers: normalizedHeaders(init.headers),
-    body,
-    timeout_ms: timeoutMs,
+    ...nativeRequestPayload(input, init),
   });
   if (response?.ok !== true) {
     throw new Error(String(response?.error || "native-host-request-failed"));
@@ -119,6 +123,43 @@ export async function localHerdrFetch(input, init = {}) {
     status: Number(response.status || 500),
     headers: response.headers && typeof response.headers === "object" ? response.headers : {},
   });
+}
+
+export async function localHerdrBatchFetch(requests = []) {
+  if (!Array.isArray(requests) || requests.length === 0) {
+    return { ok: false, error: "native-request-batch-empty" };
+  }
+  if (requests.length > 24) {
+    return { ok: false, error: "native-request-batch-too-large" };
+  }
+  let encoded;
+  try {
+    encoded = requests.map((request) => nativeRequestPayload(request?.input, request?.init || {}));
+  } catch (error) {
+    return { ok: false, error: "native-request-batch-invalid", detail: String(error?.message || error || "") };
+  }
+  const response = await nativeMessage({ type: "request_batch", requests: encoded });
+  if (response?.ok !== true) {
+    return { ok: false, error: String(response?.error || "native-host-request-batch-failed") };
+  }
+  if (!Array.isArray(response.responses) || response.responses.length !== encoded.length) {
+    return { ok: false, error: "native-host-request-batch-malformed" };
+  }
+  return {
+    ok: true,
+    responses: response.responses.map((item) => {
+      if (item?.ok !== true) {
+        return { ok: false, error: String(item?.error || "native-host-request-failed") };
+      }
+      return {
+        ok: true,
+        response: new Response(String(item.body || ""), {
+          status: Number(item.status || 500),
+          headers: item.headers && typeof item.headers === "object" ? item.headers : {},
+        }),
+      };
+    }),
+  };
 }
 
 function decodeBase64(value) {

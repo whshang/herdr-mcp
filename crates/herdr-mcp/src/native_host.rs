@@ -27,6 +27,8 @@ use base64::Engine as _;
 #[cfg(unix)]
 use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(unix)]
+use futures_util::stream::{self, StreamExt};
+#[cfg(unix)]
 use http_body_util::{BodyExt, Full};
 #[cfg(unix)]
 use hyper::body::{Bytes, Incoming};
@@ -63,6 +65,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const MIN_TIMEOUT_MS: u64 = 1_000;
 #[cfg(unix)]
 const MAX_TIMEOUT_MS: u64 = 120_000;
+#[cfg(unix)]
+const MAX_NATIVE_REQUEST_BATCH: usize = 24;
+#[cfg(unix)]
+const MAX_NATIVE_REQUEST_BATCH_PARALLEL: usize = 4;
 
 #[cfg(unix)]
 const ALLOWED_PROXY_PATHS: &[&str] = &[
@@ -206,6 +212,10 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
             .map_err(|error| format!("cannot build native-host runtime: {error}"))?;
         match message_type {
             "request" => match runtime.block_on(proxy_request(&config, &message)) {
+                Ok(value) => write_native_message(&mut writer, &value)?,
+                Err(error) => write_error(&mut writer, &error)?,
+            },
+            "request_batch" => match runtime.block_on(proxy_request_batch(&config, &message)) {
                 Ok(value) => write_native_message(&mut writer, &value)?,
                 Err(error) => write_error(&mut writer, &error)?,
             },
@@ -588,6 +598,33 @@ async fn proxy_request(config: &HostConfig, message: &Value) -> Result<Value, St
         "headers": headers,
         "body": String::from_utf8_lossy(&body),
     }))
+}
+
+#[cfg(unix)]
+async fn proxy_request_batch(config: &HostConfig, message: &Value) -> Result<Value, String> {
+    let requests = message
+        .get("requests")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "native_request_batch_invalid".to_owned())?;
+    if requests.is_empty() {
+        return Err("native_request_batch_empty".to_owned());
+    }
+    if requests.len() > MAX_NATIVE_REQUEST_BATCH {
+        return Err("native_request_batch_too_large".to_owned());
+    }
+    if requests.iter().any(|request| !request.is_object()) {
+        return Err("native_request_batch_invalid".to_owned());
+    }
+    let responses = stream::iter(requests.iter().cloned().map(|request| async move {
+        match proxy_request(config, &request).await {
+            Ok(value) => value,
+            Err(error) => json!({"ok": false, "error": error}),
+        }
+    }))
+    .buffered(MAX_NATIVE_REQUEST_BATCH_PARALLEL)
+    .collect::<Vec<_>>()
+    .await;
+    Ok(json!({"ok": true, "responses": responses}))
 }
 
 #[cfg(unix)]
@@ -978,6 +1015,89 @@ mod tests {
         );
         server.join().unwrap();
         fs::remove_file(path).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_batch_proxy_preserves_order_and_rejects_oversize() {
+        let path = socket_path("request-batch");
+        fs::remove_file(&path).ok();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 8192];
+                let read = stream.read(&mut request).unwrap();
+                let text = String::from_utf8_lossy(&request[..read]);
+                let observed_path = if text.starts_with("GET /push/state HTTP/1.1") {
+                    "/push/state"
+                } else if text.starts_with("GET /extension/fleet HTTP/1.1") {
+                    "/extension/fleet"
+                } else {
+                    panic!("unexpected batched native request: {text}");
+                };
+                let body = format!(r#"{{"path":"{observed_path}"}}"#);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let config = HostConfig {
+            expected_origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned(),
+            socket_path: path.clone(),
+            enforce_owner_fence: false,
+        };
+        let result = proxy_request_batch(
+            &config,
+            &json!({
+                "type":"request_batch",
+                "requests":[
+                    {
+                        "base_url":"http://127.0.0.1:8772",
+                        "path":"/push/state",
+                        "method":"GET"
+                    },
+                    {
+                        "base_url":"http://127.0.0.1:8772",
+                        "path":"/extension/fleet",
+                        "method":"GET"
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let responses = result["responses"].as_array().unwrap();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<Value>(responses[0]["body"].as_str().unwrap()).unwrap()["path"],
+            "/push/state"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(responses[1]["body"].as_str().unwrap()).unwrap()["path"],
+            "/extension/fleet"
+        );
+        server.join().unwrap();
+        fs::remove_file(&path).ok();
+
+        let oversized = vec![
+            json!({
+                "base_url":"http://127.0.0.1:8772",
+                "path":"/push/state",
+                "method":"GET"
+            });
+            MAX_NATIVE_REQUEST_BATCH + 1
+        ];
+        assert_eq!(
+            proxy_request_batch(&config, &json!({"requests": oversized}))
+                .await
+                .unwrap_err(),
+            "native_request_batch_too_large"
+        );
     }
 
     #[cfg(unix)]
