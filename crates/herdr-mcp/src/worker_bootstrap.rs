@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +30,7 @@ const PAIRING_PEPPER_SECRET: &str = "LINK_SHARED_SECRET";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEVICE_FLOW_MAX: Duration = Duration::from_secs(300);
 const TEMP_OPERATOR_TTL: Duration = Duration::from_secs(10 * 60);
+const TRUSTED_DOH_HOST: &str = "cloudflare-dns.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +184,15 @@ impl EdgeHttpClient {
 
     fn via_proxy(proxy: &crate::link::proxy::ResolvedProxy) -> Result<Self, String> {
         Self::build(Some(proxy.url.as_str()), None)
+    }
+
+    fn direct_resolved(host: &str, ips: &[IpAddr]) -> Result<Self, String> {
+        Self::build(None, Some((host, ips)))
+    }
+
+    fn trusted_dns() -> Result<Self, String> {
+        let ips = trusted_doh_bootstrap_ips();
+        Self::build(None, Some((TRUSTED_DOH_HOST, &ips)))
     }
 
     fn via_socks_resolved(
@@ -1493,10 +1503,8 @@ fn verify_current_device_inventory(
     expected: Option<&str>,
     _edge_http: &EdgeHttpClient,
 ) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let payload = crate::worker::extension_fleet_snapshot_with_client(paths, &_edge_http.client)?;
-    #[cfg(not(target_os = "macos"))]
-    let payload = crate::worker::extension_fleet_snapshot_with_proxy(paths, None)?;
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err("authenticated device inventory is unavailable after bootstrap".to_owned());
     }
@@ -1521,30 +1529,213 @@ fn verify_health(
         Err(error) if !error.may_retry_via_proxy() => Err(error.into_message()),
         Err(error) => {
             let direct_error = error.into_message();
-            let Some(proxy) = crate::link::proxy::resolve_link_proxy() else {
-                return Err(direct_error);
-            };
-            let proxied = EdgeHttpClient::via_proxy(&proxy)?;
-            match probe_health(&proxied, edge_origin, worker_name, expected_version) {
-                Ok(()) => Ok(proxied),
-                Err(error) if !error.may_retry_via_proxy() => Err(error.into_message()),
+            let mut last_transport_error = direct_error;
+
+            if let Some(proxy) = crate::link::proxy::resolve_link_proxy() {
+                let proxied = EdgeHttpClient::via_proxy(&proxy)?;
+                match probe_health(&proxied, edge_origin, worker_name, expected_version) {
+                    Ok(()) => return Ok(proxied),
+                    Err(error) if !error.may_retry_via_proxy() => {
+                        return Err(error.into_message());
+                    }
+                    Err(error) => last_transport_error = error.into_message(),
+                }
+            }
+
+            match trusted_dns_direct_client(edge_origin) {
+                Ok(Some(resolved)) => {
+                    match probe_health(&resolved, edge_origin, worker_name, expected_version) {
+                        Ok(()) => return Ok(resolved),
+                        Err(error) if !error.may_retry_via_proxy() => {
+                            return Err(error.into_message());
+                        }
+                        Err(error) => last_transport_error = error.into_message(),
+                    }
+                }
+                Ok(None) => {}
                 Err(error) => {
-                    let proxy_error = error.into_message();
-                    let Some(socks) = crate::link::proxy::resolve_link_socks_proxy() else {
-                        return Err(proxy_error);
-                    };
-                    let host = edge_origin_host(edge_origin)?;
+                    last_transport_error = format!(
+                        "{last_transport_error}; direct trusted DNS fallback unavailable: {error}"
+                    );
+                }
+            }
+
+            if let Some(socks) = crate::link::proxy::resolve_link_socks_proxy() {
+                let proxied = EdgeHttpClient::via_proxy(&socks)?;
+                let host = edge_origin_host(edge_origin)?;
+                if host.ends_with(".workers.dev") {
                     let ips = resolve_trusted_worker_ips(&proxied, &host).map_err(|error| {
-                        format!("{proxy_error}; trusted DNS fallback unavailable: {error}")
+                        format!("{last_transport_error}; trusted DNS fallback unavailable: {error}")
                     })?;
                     let resolved = EdgeHttpClient::via_socks_resolved(&socks, &host, &ips)?;
                     probe_health(&resolved, edge_origin, worker_name, expected_version)
                         .map_err(EdgeHealthProbeError::into_message)?;
-                    Ok(resolved)
+                    return Ok(resolved);
                 }
             }
+
+            Err(last_transport_error)
         }
     }
+}
+
+pub(crate) fn client_for_edge_origin(
+    edge_origin: &str,
+) -> Result<reqwest::blocking::Client, String> {
+    let direct = EdgeHttpClient::direct()?;
+    match probe_edge_transport(&direct, edge_origin) {
+        Ok(()) => Ok(direct.client),
+        Err(error) if !error.may_retry_via_proxy() => Err(error.into_message()),
+        Err(error) => {
+            let mut last_transport_error = error.into_message();
+
+            if let Some(proxy) = crate::link::proxy::resolve_link_proxy() {
+                let proxied = EdgeHttpClient::via_proxy(&proxy)?;
+                match probe_edge_transport(&proxied, edge_origin) {
+                    Ok(()) => return Ok(proxied.client),
+                    Err(error) if !error.may_retry_via_proxy() => {
+                        return Err(error.into_message());
+                    }
+                    Err(error) => last_transport_error = error.into_message(),
+                }
+            }
+
+            match trusted_dns_direct_client(edge_origin) {
+                Ok(Some(resolved)) => match probe_edge_transport(&resolved, edge_origin) {
+                    Ok(()) => return Ok(resolved.client),
+                    Err(error) if !error.may_retry_via_proxy() => {
+                        return Err(error.into_message());
+                    }
+                    Err(error) => last_transport_error = error.into_message(),
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    last_transport_error = format!(
+                        "{last_transport_error}; direct trusted DNS fallback unavailable: {error}"
+                    );
+                }
+            }
+
+            if let Some(socks) = crate::link::proxy::resolve_link_socks_proxy() {
+                let proxied = EdgeHttpClient::via_proxy(&socks)?;
+                let host = edge_origin_host(edge_origin)?;
+                if host.ends_with(".workers.dev") {
+                    let ips = resolve_trusted_worker_ips(&proxied, &host).map_err(|error| {
+                        format!("{last_transport_error}; trusted DNS fallback unavailable: {error}")
+                    })?;
+                    let resolved = EdgeHttpClient::via_socks_resolved(&socks, &host, &ips)?;
+                    probe_edge_transport(&resolved, edge_origin)
+                        .map_err(EdgeHealthProbeError::into_message)?;
+                    return Ok(resolved.client);
+                }
+            }
+
+            Err(last_transport_error)
+        }
+    }
+}
+
+fn probe_edge_transport(
+    edge_http: &EdgeHttpClient,
+    edge_origin: &str,
+) -> Result<(), EdgeHealthProbeError> {
+    let response = edge_http
+        .client
+        .get(format!("{edge_origin}/health"))
+        .send()
+        .map_err(|error| {
+            EdgeHealthProbeError::Transport(format!("Worker HTTP preflight failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(edge_health_http_error(
+            "Worker HTTP preflight",
+            response.status(),
+        ));
+    }
+    let payload: Value = response.json().map_err(|_| {
+        EdgeHealthProbeError::Validation("Worker HTTP preflight returned non-JSON".to_owned())
+    })?;
+    validate_edge_transport_payload(&payload, edge_origin).map_err(EdgeHealthProbeError::Validation)
+}
+
+fn validate_edge_transport_payload(payload: &Value, edge_origin: &str) -> Result<(), String> {
+    let service = payload
+        .get("service")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Worker HTTP preflight returned no service identity".to_owned())?;
+    match expected_worker_service_from_origin(edge_origin)? {
+        Some(expected) if service != expected => {
+            return Err(
+                "Worker HTTP preflight service identity does not match Worker origin".to_owned(),
+            );
+        }
+        Some(_) => {}
+        None if !valid_worker_name(service) || !service.starts_with("herdr-edge-") => {
+            return Err("Worker HTTP preflight service identity is not a Herdr Worker".to_owned());
+        }
+        None => {}
+    }
+    validate_health_payload(payload, service, None)
+}
+
+fn expected_worker_service_from_origin(edge_origin: &str) -> Result<Option<String>, String> {
+    let host = edge_origin_host(edge_origin)?;
+    let Some(prefix) = host.strip_suffix(".workers.dev") else {
+        return Ok(None);
+    };
+    let (worker, account_subdomain) = prefix
+        .split_once('.')
+        .ok_or_else(|| "workers.dev Edge origin is missing its account subdomain".to_owned())?;
+    if !valid_worker_name(worker) || account_subdomain.is_empty() {
+        return Err("workers.dev Edge origin has an invalid Worker identity".to_owned());
+    }
+    Ok(Some(worker.to_owned()))
+}
+
+fn trusted_dns_direct_client(edge_origin: &str) -> Result<Option<EdgeHttpClient>, String> {
+    let host = edge_origin_host(edge_origin)?;
+    if !host.ends_with(".workers.dev") {
+        return Ok(None);
+    }
+
+    // Prefer ordinary HTTPS to the trusted DoH hostname. This path still works when a
+    // network selectively blocks or poisons workers.dev in local DNS, and it requires no
+    // Herdr-specific proxy configuration.
+    let named_result =
+        EdgeHttpClient::direct().and_then(|dns| resolve_trusted_worker_ips(&dns, &host));
+    if let Ok(ips) = named_result.as_ref() {
+        return EdgeHttpClient::direct_resolved(&host, ips).map(Some);
+    }
+
+    // If local DNS is unavailable more broadly, bootstrap the same DoH hostname through
+    // Cloudflare's fixed anycast addresses while preserving TLS SNI/hostname validation.
+    let pinned_result =
+        EdgeHttpClient::trusted_dns().and_then(|dns| resolve_trusted_worker_ips(&dns, &host));
+    if let Ok(ips) = pinned_result.as_ref() {
+        return EdgeHttpClient::direct_resolved(&host, ips).map(Some);
+    }
+
+    // A detected local proxy is an optional final resolver path, never a prerequisite.
+    if let Some(proxy) = crate::link::proxy::resolve_link_proxy() {
+        let proxied = EdgeHttpClient::via_proxy(&proxy)?;
+        if let Ok(ips) = resolve_trusted_worker_ips(&proxied, &host) {
+            return EdgeHttpClient::direct_resolved(&host, &ips).map(Some);
+        }
+    }
+
+    Err(format!(
+        "trusted DNS fallback unavailable without a usable proxy: hostname DoH failed: {}; pinned DoH failed: {}",
+        named_result.unwrap_err(),
+        pinned_result.unwrap_err()
+    ))
+}
+
+fn trusted_doh_bootstrap_ips() -> [IpAddr; 2] {
+    [
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+    ]
 }
 
 fn edge_origin_host(edge_origin: &str) -> Result<String, String> {
@@ -1564,7 +1755,7 @@ fn resolve_trusted_worker_ips(
     edge_http: &EdgeHttpClient,
     host: &str,
 ) -> Result<Vec<IpAddr>, String> {
-    let mut doh_url = "https://cloudflare-dns.com/dns-query"
+    let mut doh_url = format!("https://{TRUSTED_DOH_HOST}/dns-query")
         .parse::<url::Url>()
         .map_err(|_| "trusted DNS endpoint is invalid".to_owned())?;
     doh_url
@@ -1635,16 +1826,28 @@ fn probe_health(
             EdgeHealthProbeError::Transport(format!("Worker health probe failed: {error}"))
         })?;
     if !response.status().is_success() {
-        return Err(EdgeHealthProbeError::Validation(format!(
-            "Worker health probe returned HTTP {}",
-            response.status().as_u16()
-        )));
+        return Err(edge_health_http_error(
+            "Worker health probe",
+            response.status(),
+        ));
     }
     let payload: Value = response.json().map_err(|_| {
         EdgeHealthProbeError::Validation("Worker health returned non-JSON".to_owned())
     })?;
     validate_health_payload(&payload, worker_name, expected_version)
         .map_err(EdgeHealthProbeError::Validation)
+}
+
+fn edge_health_http_error(context: &str, status: reqwest::StatusCode) -> EdgeHealthProbeError {
+    let message = format!("{context} returned HTTP {}", status.as_u16());
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        EdgeHealthProbeError::Transport(message)
+    } else {
+        EdgeHealthProbeError::Validation(message)
+    }
 }
 
 fn validate_health_payload(
@@ -2097,6 +2300,64 @@ mod tests {
         assert!(
             !EdgeHealthProbeError::Validation("wrong contract".to_owned()).may_retry_via_proxy()
         );
+
+        for status in [408, 429, 500, 502, 503, 504, 524] {
+            assert!(
+                edge_health_http_error("health", reqwest::StatusCode::from_u16(status).unwrap())
+                    .may_retry_via_proxy(),
+                "HTTP {status} should remain route-retryable for a read-only health probe"
+            );
+        }
+        for status in [400, 401, 403, 404, 409] {
+            assert!(
+                !edge_health_http_error("health", reqwest::StatusCode::from_u16(status).unwrap())
+                    .may_retry_via_proxy(),
+                "HTTP {status} should fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn management_health_preflight_binds_workers_dev_service_and_fails_closed() {
+        let payload = json!({
+            "ok": true,
+            "service": "herdr-edge-mac",
+            "contractEpoch": 2,
+            "contractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
+        });
+        assert!(
+            validate_edge_transport_payload(&payload, "https://herdr-edge-mac.example.workers.dev")
+                .is_ok()
+        );
+        assert!(
+            validate_edge_transport_payload(
+                &payload,
+                "https://herdr-edge-other.example.workers.dev"
+            )
+            .unwrap_err()
+            .contains("does not match Worker origin")
+        );
+        assert_eq!(
+            expected_worker_service_from_origin("https://herdr-edge-mac.example.workers.dev")
+                .unwrap()
+                .as_deref(),
+            Some("herdr-edge-mac")
+        );
+    }
+
+    #[test]
+    fn management_health_preflight_rejects_non_herdr_custom_domain_service() {
+        let payload = json!({
+            "ok": true,
+            "service": "other-service",
+            "contractEpoch": 2,
+            "contractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
+        });
+        assert!(
+            validate_edge_transport_payload(&payload, "https://mcp.example.com")
+                .unwrap_err()
+                .contains("not a Herdr Worker")
+        );
     }
 
     #[test]
@@ -2119,6 +2380,21 @@ mod tests {
             ]
         );
         assert!(parse_trusted_dns_ipv4_answers(&json!({"Status": 2})).is_empty());
+
+        assert_eq!(
+            trusted_doh_bootstrap_ips(),
+            [
+                "1.1.1.1".parse::<IpAddr>().unwrap(),
+                "1.0.0.1".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(
+            EdgeHttpClient::direct_resolved(
+                "herdr-edge-dnsless.example.workers.dev",
+                &["203.0.113.10".parse::<IpAddr>().unwrap()],
+            )
+            .is_ok()
+        );
     }
 
     #[test]

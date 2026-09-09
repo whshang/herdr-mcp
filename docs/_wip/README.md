@@ -23,4 +23,5 @@ Current active WIP includes the v0.4.5 follow-up maintenance plan (planner effic
 - alpha.6 spec: [`v1.0-alpha6-claude-adapter.md`](v1.0-alpha6-claude-adapter.md)
 - alpha.8 spec: [`v1.0-alpha8-page-assist.md`](v1.0-alpha8-page-assist.md)
 - alpha.9 spec: [`v1.0-toolchain-efficiency.md`](v1.0-toolchain-efficiency.md) — native-default exec and measured 18-tool efficiency gate before beta.1.
+- Cross-cutting compile/memory efficiency plan: [`v1.0-performance-resource-plan.md`](v1.0-performance-resource-plan.md) — measurement-driven constraints applied inside the existing milestones; no new stage or scheduler.
 - Stage progress ledger: [`v1.0-status.md`](v1.0-status.md) (engineering-stage progress only; release status remains owned by `docs/release-model.md`).

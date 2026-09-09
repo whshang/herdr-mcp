@@ -12,8 +12,6 @@ use crate::paths::RuntimePaths;
 use reqwest::blocking::{Client, Response};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use reqwest::redirect::Policy;
 use serde_json::Value;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use serde_json::json;
@@ -32,8 +30,6 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::time::Duration;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -46,8 +42,6 @@ use std::os::unix::fs::OpenOptionsExt;
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 const LEGACY_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-prod-link-secret";
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 struct FleetLinkIdentity {
@@ -383,13 +377,24 @@ pub(crate) fn extension_fleet_snapshot_with_proxy(
 pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let owner = resolve_fleet_link_identity(paths, &config)?;
+    let client = client_for_origin(&owner.edge_origin)?;
+    extension_fleet_snapshot_with_client(paths, &client)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn extension_fleet_snapshot_with_client(
+    paths: &RuntimePaths,
+    client: &Client,
+) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&owner.credential)?;
     headers.insert(
         "x-herdr-workstation",
         HeaderValue::from_str(&owner.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client
         .get(endpoint(&owner.edge_origin, "/devices")?)
         .headers(headers)
         .send()
@@ -434,7 +439,9 @@ pub(crate) fn extension_fleet_snapshot_with_proxy(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
-    let client = client()?;
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
+    let client = client_for_origin(&owner.edge_origin)?;
     extension_fleet_snapshot_with_client(paths, &client)
 }
 
@@ -528,7 +535,7 @@ fn create_pairing(
         HeaderValue::from_str(&owner.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&owner.edge_origin)?
         .post(endpoint)
         .headers(headers)
         .json(&pairing_create_request_body(ttl_seconds, name))
@@ -705,7 +712,7 @@ fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, Stri
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/devices/revoke")?)
         .headers(headers)
         .json(&json!({ "device_id": device_id }))
@@ -747,7 +754,8 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let inspect = client()?
+    let client = client_for_origin(&identity.edge_origin)?;
+    let inspect = client
         .post(endpoint(&identity.edge_origin, "/connectors/inspect")?)
         .headers(headers.clone())
         .json(&json!({ "request_id": request_id }))
@@ -790,7 +798,7 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
         eprintln!("  expires: {expires_at}");
     }
     let code = read_pairing_code_tty()?;
-    let response = client()?
+    let response = client
         .post(endpoint(&identity.edge_origin, "/connectors/approve")?)
         .headers(headers)
         .json(&json!({ "request_id": request_id, "code": code }))
@@ -832,7 +840,7 @@ fn cancel_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, 
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/connectors/cancel")?)
         .headers(headers)
         .json(&json!({ "request_id": request_id }))
@@ -874,7 +882,7 @@ fn revoke_connector(paths: &RuntimePaths, connector_id: &str) -> Result<ExitCode
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/connectors/revoke")?)
         .headers(headers)
         .json(&connector_revoke_request_body(connector_id))
@@ -915,7 +923,7 @@ fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<Exit
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/connectors/revoke")?)
         .headers(headers)
         .json(&connector_client_revoke_request_body(client_id))
@@ -1005,7 +1013,7 @@ fn set_connector_webchat_control(
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(
             &identity.edge_origin,
             "/connectors/webchat-control",
@@ -1085,7 +1093,7 @@ fn set_connector_page_assist(
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/connectors/page-assist")?)
         .headers(headers)
         .json(&json!({
@@ -1130,7 +1138,7 @@ fn list_connectors(paths: &RuntimePaths, include_all: bool) -> Result<ExitCode, 
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .get(endpoint(&identity.edge_origin, "/connectors")?)
         .headers(headers)
         .send()
@@ -1167,7 +1175,7 @@ fn create_automation(paths: &RuntimePaths, name: &str, device: &str) -> Result<E
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/automations")?)
         .headers(headers)
         .json(&automation_create_request_body(name, device))
@@ -1218,7 +1226,7 @@ fn list_automations(paths: &RuntimePaths) -> Result<ExitCode, String> {
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .get(endpoint(&identity.edge_origin, "/automations")?)
         .headers(headers)
         .send()
@@ -1250,7 +1258,7 @@ fn rotate_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, 
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/automations/rotate")?)
         .headers(headers)
         .json(&json!({ "client_id": client_id }))
@@ -1288,7 +1296,7 @@ fn revoke_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, 
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/automations/revoke")?)
         .headers(headers)
         .json(&json!({ "client_id": client_id }))
@@ -1325,7 +1333,7 @@ fn rename_current_device(paths: &RuntimePaths, name: &str) -> Result<ExitCode, S
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/devices/rename-self")?)
         .headers(headers)
         .json(&json!({
@@ -1706,7 +1714,7 @@ fn consume_pairing(
     code: &str,
     name: Option<&str>,
 ) -> Result<EnrolledCredential, String> {
-    let response = client()?
+    let response = client_for_origin(edge_origin)?
         .post(endpoint(edge_origin, "/devices/pairings/consume")?)
         .header(CONTENT_TYPE, "application/json")
         .json(&pairing_consume_request_body(pairing_id, code, name))
@@ -1722,7 +1730,7 @@ fn consume_pairing(
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn revoke_self(edge_origin: &str, workstation_id: &str, credential: &str) -> Result<bool, String> {
-    let response = client()?
+    let response = client_for_origin(edge_origin)?
         .post(endpoint(edge_origin, "/devices/revoke-self")?)
         .headers(bearer_headers(credential)?)
         .json(&json!({ "workstation_id": workstation_id }))
@@ -1908,12 +1916,8 @@ fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), Stri
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .redirect(Policy::none())
-        .build()
-        .map_err(|error| format!("cannot initialize Worker HTTP client: {error}"))
+fn client_for_origin(edge_origin: &str) -> Result<Client, String> {
+    crate::worker_bootstrap::client_for_edge_origin(edge_origin)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

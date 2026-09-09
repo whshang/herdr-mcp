@@ -231,8 +231,15 @@ test("CI Rust gate uses a trusted-main-only shared compiler cache", async () => 
   assert.match(ci, /CARGO_INCREMENTAL:\s*["']0["']/);
   assert.match(ci, /RUSTC_WRAPPER:\s*sccache/);
   assert.match(ci, /SCCACHE_GHA_ENABLED:\s*["']true["']/);
-  assert.match(ci, /SCCACHE_GHA_RW_MODE:.*refs\/heads\/main.*READ_WRITE.*READ_ONLY/);
-  assert.match(ci, /mozilla-actions\/sccache-action/);
+  assert.match(
+    ci,
+    /SCCACHE_GHA_RW_MODE:\s*\$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' && 'READ_WRITE' \|\| 'READ_ONLY' \}\}/,
+  );
+  assert.match(
+    ci,
+    /mozilla-actions\/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba/,
+    "sccache action must stay pinned to the reviewed commit",
+  );
 });
 
 test("Rust release publishes authoritative macOS ARM64 + Debian-compatible Linux x64 + Windows x64 targets", async () => {
