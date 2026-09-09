@@ -387,6 +387,7 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         ),
         Err(error) => prompt_failure(client, target, before.as_ref(), wait.is_some(), error),
     };
+    annotate_prompt_control_semantics(&mut result, before.as_ref());
 
     if let Some(op_id) = operation_id
         && let Some(object) = result.as_object_mut()
@@ -405,6 +406,20 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         }
     }
     result
+}
+
+fn annotate_prompt_control_semantics(result: &mut Value, before: Option<&AgentState>) {
+    if before.and_then(|state| state.agent_status.as_deref()) != Some("working") {
+        return;
+    }
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    object.insert("prompt_is_not_interrupt".to_owned(), json!(true));
+    object.insert(
+        "interrupt_hint".to_owned(),
+        json!("target was already working before this prompt. agent.prompt/herdr_prompt is business input and does not stop the current execution. To interrupt: agent.send_keys ESC -> fresh agent.get/herdr_since -> CTRL_C only if still working -> fresh verify."),
+    );
 }
 
 fn prompt_success(
@@ -940,6 +955,52 @@ mod tests {
         assert_eq!(first["resolved_pane"], "w1:p1");
         let replay = run(&client, &registry, &args);
         assert_eq!(replay["idempotent_replay"], true);
+        server.join().unwrap();
+        fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn prompt_to_working_agent_is_explicitly_not_an_interrupt() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for expected in ["agent.get", "agent.prompt"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], expected);
+                let result = if expected == "agent.get" {
+                    json!({
+                        "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 9}
+                    })
+                } else {
+                    json!({"prompt": {
+                        "status": "submitted",
+                        "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 9}
+                    }})
+                };
+                writeln!(stream, "{}", json!({"id": request["id"], "result": result})).unwrap();
+            }
+        });
+        let client = HerdrClient::new(&socket);
+        let registry = PromptRegistry::new();
+        let result = run(
+            &client,
+            &registry,
+            &json!({"target": "worker", "text": "stop now"}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["submitted"], true);
+        assert_eq!(result["prompt_is_not_interrupt"], true);
+        assert!(
+            result["interrupt_hint"]
+                .as_str()
+                .unwrap()
+                .contains("agent.send_keys ESC")
+        );
         server.join().unwrap();
         fs::remove_file(socket).unwrap();
     }

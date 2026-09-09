@@ -15,6 +15,8 @@ Own: `herdr_prompt`. Combine this policy with live facts from `herdr_inspect`/`h
 4. When the planner chooses delegation, submit one bounded task with explicit ownership and validation boundary, then verify delivery through prompt evidence plus live state.
 5. Record a progress checkpoint for delegated work. On the next relevant planner turn and before integration, use `herdr_since` plus the lane's Git/output evidence to confirm progress; when evidence shows drift or a stall, tighten the prompt, stop the lane, or reassign it before starting another worker.
 
+Stopping a running Agent is terminal control, not another delegation prompt. For a `working` Agent that is drifting, looping, or must be terminated, use `agent.send_keys` with `ESC`, verify with fresh `agent.get` / `herdr_since`, then send `CTRL_C` only if it is still `working`, and verify again. `agent.prompt` / `herdr_prompt` never means stop/cancel. Do not close a pane until the Agent is verified `idle`, `blocked`, or `done`; pane closure is resource reclamation and is never mutation-cancellation proof.
+
 A user-specified agent/model/pane target has priority and is never silently replaced. A busy preferred worker may fall back only to a reliably equivalent compatible worker; do not silently lower capability or quality.
 
 Generic same-project reasoning may consider an idle allowed worker even when optional model/edit/vision traits are unknown. A task that actually requires one of those traits must fail closed until the capability is verified.

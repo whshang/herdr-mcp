@@ -28,6 +28,12 @@ export interface ValidationResult {
   warnings: ValidationIssue[];
 }
 
+export interface MethodListing {
+  method: string;
+  params: { properties: Record<string, unknown>; required: string[]; empty: boolean };
+  guidance?: string;
+}
+
 const SCHEMA_TTL_MS = 60_000;
 const SCHEMA_LOAD_TIMEOUT_MS = 8_000;
 let schemaCache: { raw: string; loadedAt: number } | null = null;
@@ -111,19 +117,34 @@ export function getMethodParamsSchema(method: string): ParamsSchema | null {
 }
 /** List every method name with its params schema INLINED (resolve $ref to
  * properties + required) so clients see param names without guessing. */
-export function listMethods(query = ""): { method: string; params: { properties: Record<string, unknown>; required: string[]; empty: boolean } }[] {
+export function listMethods(query = ""): MethodListing[] {
   const doc = loadSchema();
   const { oneOf } = requestDoc(doc);
-  const out: { method: string; params: { properties: Record<string, unknown>; required: string[]; empty: boolean } }[] = [];
+  const out: MethodListing[] = [];
   for (const item of oneOf) {
     const rec = (item ?? {}) as Record<string, unknown>;
     const props = (rec["properties"] ?? {}) as Record<string, unknown>;
     const mprop = (props["method"] ?? {}) as Record<string, unknown>;
     const method = typeof mprop["const"] === "string" ? mprop["const"] : null;
     if (!method || (query && !method.toLowerCase().includes(query.toLowerCase()))) continue;
-    out.push({ method, params: getMethodParamsSchema(method) ?? { properties: {}, required: [], empty: true } });
+    const guidance = nativeMethodGuidance(method);
+    out.push({
+      method,
+      params: getMethodParamsSchema(method) ?? { properties: {}, required: [], empty: true },
+      ...(guidance ? { guidance } : {}),
+    });
   }
   return out;
+}
+
+function nativeMethodGuidance(method: string): string | null {
+  if (method === "agent.send_keys") {
+    return "Agent interruption is terminal control, not business input: send keys=[\"ESC\"] first, verify fresh state with agent.get or herdr_since, then send keys=[\"CTRL_C\"] only if it is still working and verify again. agent.prompt/herdr_prompt never means stop/cancel.";
+  }
+  if (method === "pane.close") {
+    return "Resource reclamation only. herdr-mcp refuses pane.close while an attached Agent is working or its state is not settled. Interrupt and verify the Agent first. Pane closure is never mutation-cancellation proof.";
+  }
+  return null;
 }
 
 function primitiveType(prop: unknown, defs: Record<string, unknown>): { type: string | string[] | null; enum?: unknown[] } | null {

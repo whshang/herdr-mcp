@@ -9,6 +9,9 @@ use crate::state_cache::{DigestSnapshot, EventCache};
 use crate::state_store::GenerationTransitionRecord;
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::time::Duration;
+
+const AGENT_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn inspect(
     client: &HerdrClient,
@@ -147,13 +150,43 @@ pub fn call_with_local(
             })
         });
     }
-    let result = call(client, method, params.clone());
+
+    if method == "pane.close" {
+        let validation = match schema::validate_method_params(method, &params) {
+            Ok(validation) => validation,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "reason": "schema_unavailable",
+                    "method": method,
+                    "message": error,
+                });
+            }
+        };
+        if !validation.ok {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "method": method,
+                "errors": validation.errors.iter().map(issue_json).collect::<Vec<_>>(),
+                "warnings": validation.warnings.iter().map(issue_json).collect::<Vec<_>>(),
+            });
+        }
+        if let Some(pane_id) = params.get("pane_id").and_then(Value::as_str)
+            && let Some(blocked) = pane_close_guard(client, snapshot, pane_id)
+        {
+            return blocked;
+        }
+    }
+
+    let mut result = call(client, method, params.clone());
     if method == "worktree.remove"
         && result.get("ok").and_then(Value::as_bool) == Some(false)
         && result.get("code").and_then(Value::as_str) == Some("not_linked_worktree")
     {
-        return reconcile_historical_linked_worktree_remove(client, snapshot, &params, result);
+        result = reconcile_historical_linked_worktree_remove(client, snapshot, &params, result);
     }
+    annotate_control_semantics(method, &params, &mut result);
     result
 }
 
@@ -302,6 +335,123 @@ where
     }
 }
 
+fn pane_close_guard(client: &HerdrClient, snapshot: &Value, pane_id: &str) -> Option<Value> {
+    let live = client.call_with_timeout(
+        "agent.get",
+        json!({"target": pane_id}),
+        AGENT_STATE_PROBE_TIMEOUT,
+    );
+    match live {
+        Ok(value) => {
+            let agent = value.get("agent").unwrap_or(&value);
+            let status = agent
+                .get("agent_status")
+                .and_then(Value::as_str)
+                .or_else(|| agent.get("status").and_then(Value::as_str));
+            if status.is_some_and(agent_status_settled) {
+                return None;
+            }
+            return Some(pane_close_blocked(pane_id, agent, "fresh_agent_get"));
+        }
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "agent_not_found" | "unknown_agent" | "unknown_pane"
+            ) => {}
+        Err(error) => {
+            if let Some(agent) = pane_agent_from_snapshot(snapshot, pane_id) {
+                return Some(pane_close_blocked(pane_id, agent, "snapshot_fallback"));
+            }
+            return Some(json!({
+                "ok": false,
+                "code": "pane_close_agent_state_unverified",
+                "method": "pane.close",
+                "pane_id": pane_id,
+                "message": "cannot freshly verify that the pane has no running Agent; pane.close was not sent",
+                "probe_error": {"code": error.code, "message": error.message},
+                "hint": "verify with agent.get / herdr_since; interrupt with agent.send_keys ESC then CTRL_C only if still working; retry pane.close only after a settled state is observed",
+                "pane_close_is_not_cancellation_proof": true,
+            }));
+        }
+    }
+
+    pane_agent_from_snapshot(snapshot, pane_id).and_then(|agent| {
+        let status = agent
+            .get("agent_status")
+            .and_then(Value::as_str)
+            .or_else(|| agent.get("status").and_then(Value::as_str));
+        (!status.is_some_and(agent_status_settled))
+            .then(|| pane_close_blocked(pane_id, agent, "snapshot_fallback"))
+    })
+}
+
+fn pane_agent_from_snapshot<'a>(snapshot: &'a Value, pane_id: &str) -> Option<&'a Value> {
+    snapshot
+        .get("agents")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|agent| agent.get("pane_id").and_then(Value::as_str) == Some(pane_id))
+}
+
+fn agent_status_settled(status: &str) -> bool {
+    matches!(status, "idle" | "blocked" | "done")
+}
+
+fn pane_close_blocked(pane_id: &str, agent: &Value, source: &str) -> Value {
+    let status = agent
+        .get("agent_status")
+        .and_then(Value::as_str)
+        .or_else(|| agent.get("status").and_then(Value::as_str))
+        .unwrap_or("unknown");
+    json!({
+        "ok": false,
+        "code": "pane_close_agent_not_settled",
+        "method": "pane.close",
+        "pane_id": pane_id,
+        "agent": agent.get("name").cloned().or_else(|| agent.get("agent").cloned()).unwrap_or(Value::Null),
+        "agent_status": status,
+        "state_change_seq": agent.get("state_change_seq").cloned().unwrap_or(Value::Null),
+        "state_source": source,
+        "message": "pane.close is resource reclamation, not an Agent interrupt; attached Agent is not verified settled",
+        "hint": "if the Agent is working, send agent.send_keys keys=[\"ESC\"]; verify with agent.get/herdr_since; if still working send keys=[\"CTRL_C\"] and verify again before closing",
+        "pane_close_is_not_cancellation_proof": true,
+    })
+}
+
+fn annotate_control_semantics(method: &str, params: &Value, result: &mut Value) {
+    let ok = result.get("ok").and_then(Value::as_bool) == Some(true);
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    if method == "pane.close" && ok {
+        object.insert(
+            "pane_close_is_not_cancellation_proof".to_owned(),
+            json!(true),
+        );
+        object.insert(
+            "control_note".to_owned(),
+            json!("pane closed after preflight; this does not prove that any prior Agent mutation was cancelled or side-effect free"),
+        );
+    }
+    if method == "agent.send_keys" && ok {
+        let keys = params
+            .get("keys")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        if keys.iter().any(|key| matches!(*key, "ESC" | "CTRL_C")) {
+            object.insert("control_signal_sent".to_owned(), json!(true));
+            object.insert("interrupt_state_verified".to_owned(), json!(false));
+            object.insert(
+                "control_note".to_owned(),
+                json!("control key was sent, but Agent state is not proven settled; verify with agent.get or herdr_since before another control signal or pane.close"),
+            );
+        }
+    }
+}
+
 fn method_json(method: &MethodSchema) -> Value {
     let target_kind = if method.method.starts_with("agent.") {
         Some("agent")
@@ -326,7 +476,22 @@ fn method_json(method: &MethodSchema) -> Value {
             .expect("method schema is an object")
             .insert("target_kind".to_owned(), json!(target_kind));
     }
+    if let Some(guidance) = native_method_guidance(&method.method) {
+        value["guidance"] = json!(guidance);
+    }
     value
+}
+
+fn native_method_guidance(method: &str) -> Option<&'static str> {
+    match method {
+        "agent.send_keys" => Some(
+            "Agent interruption is terminal control, not business input: send keys=[\"ESC\"] first, then verify fresh state with agent.get or herdr_since; only if it is still working send keys=[\"CTRL_C\"], then verify again. agent.prompt/herdr_prompt never means stop/cancel.",
+        ),
+        "pane.close" => Some(
+            "Resource reclamation only. herdr-mcp refuses pane.close while an attached Agent is working or its state is not settled. Interrupt and verify the Agent first. A closed pane is never proof that an Agent mutation was cancelled or had no side effects.",
+        ),
+        _ => None,
+    }
 }
 
 fn issue_json(issue: &ValidationIssue) -> Value {
@@ -572,6 +737,75 @@ mod tests {
                 .unwrap()
                 .contains("not forwarded")
         );
+    }
+
+    #[test]
+    fn native_method_guidance_makes_interrupt_and_close_semantics_explicit() {
+        let interrupt = native_method_guidance("agent.send_keys").unwrap();
+        assert!(interrupt.contains("ESC"));
+        assert!(interrupt.contains("CTRL_C"));
+        assert!(interrupt.contains("never means stop/cancel"));
+
+        let close = native_method_guidance("pane.close").unwrap();
+        assert!(close.contains("Resource reclamation only"));
+        assert!(close.contains("never proof"));
+    }
+
+    #[test]
+    fn control_results_never_claim_interrupt_or_close_cancellation_proof() {
+        let mut keys = json!({"ok": true, "result": {"type": "ok"}});
+        annotate_control_semantics(
+            "agent.send_keys",
+            &json!({"target": "worker", "keys": ["ESC"]}),
+            &mut keys,
+        );
+        assert_eq!(keys["control_signal_sent"], true);
+        assert_eq!(keys["interrupt_state_verified"], false);
+
+        let mut failed_keys = json!({
+            "ok": false,
+            "code": "herdr_socket_error",
+        });
+        annotate_control_semantics(
+            "agent.send_keys",
+            &json!({"target": "worker", "keys": ["ESC"]}),
+            &mut failed_keys,
+        );
+        assert!(failed_keys.get("control_signal_sent").is_none());
+        assert!(failed_keys.get("interrupt_state_verified").is_none());
+
+        let mut close = json!({"ok": true, "result": {"type": "ok"}});
+        annotate_control_semantics("pane.close", &json!({"pane_id": "w1:p1"}), &mut close);
+        assert_eq!(close["pane_close_is_not_cancellation_proof"], true);
+        assert!(
+            close["control_note"]
+                .as_str()
+                .unwrap()
+                .contains("does not prove")
+        );
+    }
+
+    #[test]
+    fn pane_close_guard_treats_working_and_unknown_as_not_settled() {
+        assert!(agent_status_settled("idle"));
+        assert!(agent_status_settled("blocked"));
+        assert!(agent_status_settled("done"));
+        assert!(!agent_status_settled("working"));
+        assert!(!agent_status_settled("unknown"));
+
+        let working = pane_close_blocked(
+            "w1:p1",
+            &json!({
+                "name": "worker",
+                "pane_id": "w1:p1",
+                "agent_status": "working",
+                "state_change_seq": 7,
+            }),
+            "fresh_agent_get",
+        );
+        assert_eq!(working["code"], "pane_close_agent_not_settled");
+        assert_eq!(working["agent_status"], "working");
+        assert_eq!(working["pane_close_is_not_cancellation_proof"], true);
     }
 
     #[test]

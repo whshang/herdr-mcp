@@ -604,6 +604,38 @@ async function agentStateOf(
   }
 }
 
+function agentStatusSettled(status: string | null): boolean {
+  return status === "idle" || status === "blocked" || status === "done";
+}
+
+function paneAgentStateFromSnapshot(
+  snap: HerdrResult,
+  paneId: string,
+): { pane_id: string | null; agent_status: string | null; state_change_seq: number | null; name: string | null } | null {
+  const agents = Array.isArray(snap["agents"]) ? (snap["agents"] as unknown[]) : [];
+  for (const raw of agents) {
+    const agent = (raw ?? {}) as Record<string, unknown>;
+    if (agent["pane_id"] !== paneId) continue;
+    return {
+      pane_id: paneId,
+      agent_status: typeof agent["agent_status"] === "string" ? agent["agent_status"]
+        : typeof agent["status"] === "string" ? agent["status"] : null,
+      state_change_seq: typeof agent["state_change_seq"] === "number" ? agent["state_change_seq"] : null,
+      name: typeof agent["name"] === "string" ? agent["name"]
+        : typeof agent["agent"] === "string" ? agent["agent"] : null,
+    };
+  }
+  return null;
+}
+
+function promptNotInterruptMeta(before: { agent_status: string | null } | null): Record<string, unknown> {
+  return before?.agent_status === "working" ? {
+    prompt_is_not_interrupt: true,
+    interrupt_hint:
+      "target was already working before this prompt. agent.prompt/herdr_prompt is business input and does not stop the current execution. To interrupt: agent.send_keys ESC -> fresh agent.get/herdr_since -> CTRL_C only if still working -> fresh verify.",
+  } : {};
+}
+
 /**
  * Resolve a herdr_diff `target` to the pane(s) to diff (mirrors wait.ts's
  * findAgent pane-resolution pattern):
@@ -968,9 +1000,42 @@ function registerTools(server: McpServer): void {
       if (!v.ok) {
         return toResult({ ok: false, code: "invalid_params", method, errors: v.errors, warnings: v.warnings });
       }
+      if (method === "pane.close" && typeof given["pane_id"] === "string") {
+        const paneId = given["pane_id"] as string;
+        const liveState = await agentStateOf(c, paneId);
+        const cachedState = paneAgentStateFromSnapshot(getSnapshotCache(c).getSnapshot(), paneId);
+        const state = liveState ?? cachedState;
+        if (state && !agentStatusSettled(state.agent_status)) {
+          return toResult({
+            ok: false,
+            code: "pane_close_agent_not_settled",
+            method,
+            pane_id: paneId,
+            agent: cachedState?.name ?? null,
+            agent_status: state.agent_status ?? "unknown",
+            state_change_seq: state.state_change_seq,
+            message: "pane.close is resource reclamation, not an Agent interrupt; attached Agent is not verified settled",
+            hint: "send agent.send_keys keys=[\"ESC\"], verify with agent.get/herdr_since, then send keys=[\"CTRL_C\"] only if still working; verify again before closing",
+            pane_close_is_not_cancellation_proof: true,
+          });
+        }
+      }
       try {
         const result = await c.call(method, given);
-        return toResult({ ok: true, result, ...(v.warnings.length ? { warnings: v.warnings } : {}) });
+        const controlMeta: Record<string, unknown> = {};
+        if (method === "pane.close") {
+          controlMeta["pane_close_is_not_cancellation_proof"] = true;
+          controlMeta["control_note"] = "pane closed after preflight; this does not prove that any prior Agent mutation was cancelled or side-effect free";
+        }
+        if (method === "agent.send_keys") {
+          const keys = Array.isArray(given["keys"]) ? given["keys"] as unknown[] : [];
+          if (keys.some((key) => key === "ESC" || key === "CTRL_C")) {
+            controlMeta["control_signal_sent"] = true;
+            controlMeta["interrupt_state_verified"] = false;
+            controlMeta["control_note"] = "control key was sent, but Agent state is not proven settled; verify with agent.get or herdr_since before another control signal or pane.close";
+          }
+        }
+        return toResult({ ok: true, result, ...controlMeta, ...(v.warnings.length ? { warnings: v.warnings } : {}) });
       } catch (e) {
         return herdrErrorResult(e, `herdr_call:${method}`);
       }
@@ -2936,6 +3001,7 @@ function registerTools(server: McpServer): void {
         if (idempotency_key) rememberPrompt(idempotency_key, result);
         return toResult(result);
       }
+      const promptControlMeta = promptNotInterruptMeta(before);
       const params: Record<string, unknown> = { target, text, wait: wait ?? null };
       const callTimeout = clampHerdrTimeout(wait ? (wait.timeout_ms ?? 25000) + 5000 : 30000);
       let r: HerdrResult;
@@ -2964,6 +3030,7 @@ function registerTools(server: McpServer): void {
             code: err.code,
             message: err.message,
             retryable: false,
+            ...promptControlMeta,
             hint: "status wait timed out after accept — verify with herdr_inspect / herdr_since before re-sending",
             wait: { completed: false, reason: "agent_status_timeout" },
           };
@@ -2997,6 +3064,7 @@ function registerTools(server: McpServer): void {
             after: afterProbe ? { agent_status: afterProbe.agent_status, state_change_seq: afterProbe.state_change_seq } : null,
             ...buildStateObservation({ before, after: afterProbe, waited: !!wait }),
             message: rootMessage,
+            ...promptControlMeta,
             error: {
               type: /ExceptionGroup/i.test(err.message) ? "ExceptionGroup" : "TaskGroup",
               message: rootMessage,
@@ -3013,6 +3081,7 @@ function registerTools(server: McpServer): void {
           before: before ? { agent_status: before.agent_status, state_change_seq: before.state_change_seq } : null,
           after: afterProbe ? { agent_status: afterProbe.agent_status, state_change_seq: afterProbe.state_change_seq } : null,
           code: err.code, message: err.message, retryable: err.retryable,
+          ...promptControlMeta,
           hint: err.retryable
             ? "non-idempotent: a timeout may still have delivered — verify with herdr_explain/herdr_read before re-sending"
             : undefined,
@@ -3036,6 +3105,7 @@ function registerTools(server: McpServer): void {
         before: before ? { agent_status: before.agent_status, state_change_seq: before.state_change_seq } : null,
         after: after ? { agent_status: after.agent_status, state_change_seq: after.state_change_seq } : null,
         ...obs,
+        ...promptControlMeta,
         seq_note: !wait ? "seq may lag; state_observation.changed=unknown does NOT prove non-delivery" : undefined,
         prompt: pr,
         ...(idempotency_key ? {} : { idempotency_hint: "pass idempotency_key on mutating prompts to make retries safe" }),
