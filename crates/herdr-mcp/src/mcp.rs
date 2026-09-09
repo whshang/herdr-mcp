@@ -2093,15 +2093,15 @@ fn browser_operation_call_with_grants(
         };
         if operation == BrowserOperation::SessionOpen {
             let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
-            if let Ok(Some(resource)) = store_guard.browser_resource(session_ref) {
-                if resource.provider != "chatgpt" {
-                    return json!({
-                        "ok": false,
-                        "code": "unsupported",
-                        "operation": operation.method(),
-                        "actuation_available": false,
-                    });
-                }
+            if let Ok(Some(resource)) = store_guard.browser_resource(session_ref)
+                && resource.provider != "chatgpt"
+            {
+                return json!({
+                    "ok": false,
+                    "code": "unsupported",
+                    "operation": operation.method(),
+                    "actuation_available": false,
+                });
             }
         }
         let alpha4_supported = browser_operation_alpha4_supported(operation, params);
