@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Herdr MCP - Workspace Connector",
   "version": "0.1.90",
+  "minimum_chrome_version": "111",
   "description": "Connect ChatGPT and Web AI to local Herdr workspaces with Control Center, safe continuity, handoff, and queued next turns.",
   "permissions": [
     "storage",
@@ -58,6 +59,16 @@
     }
   ],
   "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "content/chatgpt-perf-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": [
         "https://claude.ai/*"

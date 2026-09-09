@@ -102,6 +102,8 @@ const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
 const continuityResolveRequests = [];
 const browserRegistryRequests = [];
+const mcpRequestBodies = [];
+const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
@@ -137,6 +139,7 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.endsWith("/mcp")) {
     const body = JSON.parse(init?.body || "{}");
+    mcpRequestBodies.push(body);
     const result = body.method === "tools/list"
       ? { tools: [{ name: "herdr_inspect", description: "inspect", inputSchema: { type: "object" } }] }
       : { content: [{ type: "text", text: "ok" }] };
@@ -281,6 +284,26 @@ globalThis.chrome = {
     onInstalled: { addListener: (fn) => listeners.onInstalled.push(fn) },
     openOptionsPage: () => {},
     sendNativeMessage(_host, message, callback) {
+      if (message?.type === "request_batch") {
+        nativeBatchRequests.push(message);
+        const responses = (message.requests || []).map((request) => {
+          if (request?.path !== "/mcp") return { ok: false, error: "unexpected-native-batch-path" };
+          const body = JSON.parse(request.body || "{}");
+          mcpRequestBodies.push(body);
+          const result = body.method === "tools/list"
+            ? { tools: [{ name: "herdr_inspect", description: "inspect", inputSchema: { type: "object" } }] }
+            : { content: [{ type: "text", text: "ok" }] };
+          return {
+            ok: true,
+            transport: "ipc",
+            status: 200,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: body.id, result }),
+          };
+        });
+        callback({ ok: true, responses });
+        return;
+      }
       if (message?.type !== "request") {
         callback({ ok: false, error: "unsupported-native-test-message" });
         return;
@@ -434,6 +457,7 @@ globalThis.chrome = {
       }
       if (message.path === "/mcp") {
         const body = JSON.parse(message.body || "{}");
+        mcpRequestBodies.push(body);
         const result = body.method === "tools/list"
           ? { tools: [{ name: "herdr_inspect", description: "inspect", inputSchema: { type: "object" } }] }
           : { content: [{ type: "text", text: "ok" }] };
@@ -1646,6 +1670,65 @@ console.log("\n[json bridge automation]");
   const mismatch = await mismatchP;
   ok(mismatch?.ok === false && mismatch?.error === "json-bridge-site-mismatch",
     "JSON bridge rejects a mismatched site identity", JSON.stringify(mismatch));
+
+  const callsBeforeBatch = mcpRequestBodies.filter((body) => body.method === "tools/call").length;
+  const nativeBatchesBefore = nativeBatchRequests.length;
+  let resolveBatch;
+  const batchP = new Promise((r) => { resolveBatch = r; });
+  onMsg({
+    type: "h2w_json_bridge_call_batch",
+    site: "z.ai",
+    convKey: ZAI_CONV,
+    calls: [
+      { tool: "herdr_inspect", args: {} },
+      { tool: "herdr_inspect", args: {} },
+    ],
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveBatch(r));
+  const batch = await batchP;
+  const callsAfterBatch = mcpRequestBodies.filter((body) => body.method === "tools/call").length;
+  ok(batch?.ok === true && batch.responses?.length === 2
+      && batch.responses.every((response) => response?.ok === true)
+      && callsAfterBatch - callsBeforeBatch === 1
+      && nativeBatchRequests.length - nativeBatchesBefore === 1,
+    "one JSON-bridge wave uses one Native Host batch, deduplicates identical reads, and fans the ordered result back to every index", JSON.stringify(batch));
+
+  const nativeBatchesBeforeMutation = nativeBatchRequests.length;
+  let resolveMutationBatch;
+  const mutationBatchP = new Promise((r) => { resolveMutationBatch = r; });
+  onMsg({
+    type: "h2w_json_bridge_call_batch",
+    site: "z.ai",
+    convKey: ZAI_CONV,
+    calls: [
+      { tool: "herdr_inspect", args: {} },
+      { tool: "herdr_exec", args: { workspace: "w1", command: "echo mutation" } },
+      { tool: "herdr_inspect", args: {} },
+      { tool: "herdr_exec", args: { workspace: "w1", command: "echo mutation" } },
+    ],
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveMutationBatch(r));
+  const mutationBatch = await mutationBatchP;
+  const callsAfterMutationBatch = mcpRequestBodies.filter((body) => body.method === "tools/call").length;
+  ok(mutationBatch?.ok === true && mutationBatch.responses?.length === 4
+      && callsAfterMutationBatch - callsAfterBatch === 4
+      && nativeBatchRequests.length - nativeBatchesBeforeMutation === 1,
+    "reads separated by mutations stay fresh and identical mutation calls remain distinct inside one Native Host batch", JSON.stringify(mutationBatch));
+
+  const callsBeforeRejectedBatch = callsAfterMutationBatch;
+  const nativeBatchesBeforeRejectedBatch = nativeBatchRequests.length;
+  let resolveRejectedBatch;
+  const rejectedBatchP = new Promise((r) => { resolveRejectedBatch = r; });
+  onMsg({
+    type: "h2w_json_bridge_call_batch",
+    site: "z.ai",
+    convKey: ZAI_CONV,
+    calls: Array.from({ length: 25 }, () => ({ tool: "herdr_inspect", args: {} })),
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveRejectedBatch(r));
+  const rejectedBatch = await rejectedBatchP;
+  const callsAfterRejectedBatch = mcpRequestBodies.filter((body) => body.method === "tools/call").length;
+  ok(rejectedBatch?.ok === false && rejectedBatch?.error === "json-bridge-batch-too-large"
+      && callsAfterRejectedBatch === callsBeforeRejectedBatch
+      && nativeBatchRequests.length === nativeBatchesBeforeRejectedBatch,
+    "oversized JSON-bridge batches fail closed before any Native Host or workstation call", JSON.stringify(rejectedBatch));
 }
 
 // ---- Scenario 6cc: plain ChatGPT conversations get isolated conversation-scoped automation ----

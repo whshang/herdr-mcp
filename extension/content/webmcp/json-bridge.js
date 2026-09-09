@@ -27,7 +27,7 @@
   }
 
   const ROUND_YIELD_INTERVAL = 12;
-  const MAX_PARALLEL = 4;
+  const MAX_BATCH_CALLS = 24;
   const REPLY_TIMEOUT_MS = 120000;
   const STABLE_TICKS = 4;
   const TICK_MS = 500;
@@ -171,27 +171,33 @@
     return new Set((catalog || []).map((tool) => tool?.name).filter(Boolean));
   }
 
-  async function callTool(call) {
-    const known = knownToolNames();
-    if (!known.has(call.tool)) {
-      return { ok: false, error: "unknown-tool", detail: `Unknown Herdr tool: ${call.tool}` };
-    }
-    const response = await sendBg({
-      type: "h2w_json_bridge_call",
-      site: ADAPTER.name,
-      convKey: ADAPTER.getConversationKey(),
-      tool: call.tool,
-      args: call.args || {},
-    });
-    return response || { ok: false, error: "background-unavailable" };
-  }
-
   async function runToolBatch(calls) {
-    const results = [];
-    for (let offset = 0; offset < calls.length; offset += MAX_PARALLEL) {
-      const chunk = calls.slice(offset, offset + MAX_PARALLEL);
-      const chunkResults = await Promise.all(chunk.map(callTool));
-      results.push(...chunkResults);
+    if (calls.length > MAX_BATCH_CALLS) {
+      return calls.map(() => ({ ok: false, error: "json-bridge-batch-too-large" }));
+    }
+    const known = knownToolNames();
+    const results = new Array(calls.length);
+    const executable = [];
+    calls.forEach((call, index) => {
+      if (!known.has(call.tool)) {
+        results[index] = { ok: false, error: "unknown-tool", detail: `Unknown Herdr tool: ${call.tool}` };
+        return;
+      }
+      executable.push({ index, call });
+    });
+    for (let offset = 0; offset < executable.length; offset += MAX_BATCH_CALLS) {
+      const chunk = executable.slice(offset, offset + MAX_BATCH_CALLS);
+      const response = await sendBg({
+        type: "h2w_json_bridge_call_batch",
+        site: ADAPTER.name,
+        convKey: ADAPTER.getConversationKey(),
+        calls: chunk.map(({ call }) => ({ tool: call.tool, args: call.args || {} })),
+      });
+      const responses = response?.ok && Array.isArray(response.responses) ? response.responses : null;
+      chunk.forEach(({ index }, chunkIndex) => {
+        results[index] = responses?.[chunkIndex]
+          || { ok: false, error: response?.error || "background-unavailable", detail: response?.detail || "" };
+      });
     }
     return results;
   }
