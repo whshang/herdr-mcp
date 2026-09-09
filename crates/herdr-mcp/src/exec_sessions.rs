@@ -617,11 +617,7 @@ impl ExecRegistry {
         let script_path = pane_script_path(&id);
         let spool = pane_spool_paths(&id);
         write_pane_script(&script_path, cwd, command, &spool)?;
-        let launch_line = format!(
-            "{} {}",
-            shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
-            shell_quote(script_path.to_string_lossy().as_ref()),
-        );
+        let launch_line = pane_launch_line(&id);
         if let Err(error) = client.call_with_timeout(
             "pane.send_text",
             json!({"pane_id": pane_id, "text": format!("{launch_line}\n")}),
@@ -709,11 +705,7 @@ impl ExecRegistry {
         let script_path = pane_script_path(&id);
         let spool = pane_spool_paths(&id);
         write_pane_script(&script_path, cwd, command, &spool)?;
-        let launch_line = format!(
-            "{} {}",
-            shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
-            shell_quote(script_path.to_string_lossy().as_ref()),
-        );
+        let launch_line = pane_launch_line(&id);
         if let Err(error) = client.call_with_timeout(
             "pane.send_text",
             json!({"pane_id": pane_id, "text": format!("{launch_line}\n")}),
@@ -1297,7 +1289,15 @@ fn short_session_id(id: &str) -> String {
 }
 
 fn pane_script_path(id: &str) -> PathBuf {
-    env::temp_dir().join(format!("herdr-mcp-pane-exec-{}.sh", marker_safe_id(id)))
+    env::temp_dir().join(format!("herdr-exec-{}.sh", marker_safe_id(id)))
+}
+
+fn pane_launch_line(id: &str) -> String {
+    // The script remains the same private 0700 TCC-bearing transport artifact,
+    // but the pane sees a stable shell expression rather than an expanded
+    // macOS /var/folders path. Executing the shebang script directly also
+    // removes the explicit `/bin/zsh <script>` wrapper from scrollback.
+    format!("\"${{TMPDIR:-/tmp}}/herdr-exec-{}.sh\"", marker_safe_id(id))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -2745,6 +2745,50 @@ mod tests {
         assert!(a.stderr.to_string_lossy().ends_with(".stderr"));
         assert!(a.status.to_string_lossy().ends_with(".status"));
         assert!(a.status_tmp.to_string_lossy().ends_with(".status.tmp"));
+    }
+
+    #[test]
+    fn pane_launch_line_hides_internal_temp_script_path() {
+        let id = "es_1-2-3";
+        let launch = pane_launch_line(id);
+        assert_eq!(launch, "\"${TMPDIR:-/tmp}/herdr-exec-es_1_2_3.sh\"");
+        assert!(!launch.contains("herdr-mcp-pane-exec-"));
+        assert!(!launch.contains("/bin/zsh"));
+        assert!(!launch.contains(env::temp_dir().to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_launch_line_executes_managed_script_without_wrapper() {
+        let id = format!(
+            "es_launch_test_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let script = pane_script_path(&id);
+        let spool = pane_spool_paths(&id);
+        cleanup_pane_files(&script, &spool);
+        write_pane_script(
+            &script,
+            Path::new("/tmp"),
+            "printf launch-ok; exit 7",
+            &spool,
+        )
+        .unwrap();
+
+        let status = Command::new(resolve_exec_shell())
+            .arg("-c")
+            .arg(pane_launch_line(&id))
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(fs::read_to_string(&spool.stdout).unwrap(), "launch-ok");
+        assert_eq!(fs::read_to_string(&spool.status).unwrap(), "7\n");
+        assert!(
+            !script.exists(),
+            "managed pane script must still self-delete"
+        );
+        cleanup_pane_files(&script, &spool);
     }
 
     #[test]
