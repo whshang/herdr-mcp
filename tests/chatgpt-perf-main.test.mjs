@@ -42,10 +42,7 @@ function makeContext() {
     get parentElement() { return this.parentNode instanceof FakeElement ? this.parentNode : null; }
     get firstElementChild() { return this.children[0] || null; }
     get childElementCount() { return this.children.length; }
-    set textContent(value) {
-      this._text = String(value);
-      this.children = [];
-    }
+    set textContent(value) { this._text = String(value); this.children = []; }
     get textContent() {
       if (this.children.length) return this.children.map((child) => child.textContent).join("");
       return this._text;
@@ -61,14 +58,8 @@ function makeContext() {
       this.attributes = new Map();
       this.style = new StyleDecl();
       this.dataset = {};
-      this._height = 0;
-    }
-    setRectHeight(value) { this._height = Number(value); return this; }
-    getBoundingClientRect() {
-      return { x: 0, y: 0, width: 0, height: this._height, top: 0, right: 0, bottom: this._height, left: 0 };
     }
     matches(selector) {
-      if (selector === "*") return true;
       if (/^[a-z]+$/i.test(selector)) return this.tagName === selector.toUpperCase();
       if (selector === "#code-block-viewer.cm-editor") {
         return this.id === "code-block-viewer" && this.classList.contains("cm-editor");
@@ -83,18 +74,26 @@ function makeContext() {
       if (selector === '[data-message-author-role="assistant"]') {
         return this.getAttribute("data-message-author-role") === "assistant";
       }
-      if (selector === '[data-message-author-role="user"]') {
-        return this.getAttribute("data-message-author-role") === "user";
-      }
-      if (selector === '[data-message-author-role][data-herdr-message-contained="1"]') {
-        return this.matches("[data-message-author-role]")
-          && this.getAttribute("data-herdr-message-contained") === "1";
-      }
       if (selector === '.ProseMirror[contenteditable="true"]') {
         return this.classList.contains("ProseMirror") && this.getAttribute("contenteditable") === "true";
       }
       if (selector === '[data-herdr-editable-block-contained="1"]') {
         return this.getAttribute("data-herdr-editable-block-contained") === "1";
+      }
+      if (selector.includes('data-testid="stop-button"')) {
+        return this.getAttribute("data-testid") === "stop-button";
+      }
+      if (selector.startsWith('button[aria-label="Stop generating"')) {
+        return this.tagName === "BUTTON" && this.getAttribute("aria-label") === "Stop generating";
+      }
+      if (selector.startsWith('button[aria-label="Stop streaming"')) {
+        return this.tagName === "BUTTON" && this.getAttribute("aria-label") === "Stop streaming";
+      }
+      if (selector === 'button[aria-label="停止生成"]') {
+        return this.tagName === "BUTTON" && this.getAttribute("aria-label") === "停止生成";
+      }
+      if (selector === 'button[aria-label="停止流式"]') {
+        return this.tagName === "BUTTON" && this.getAttribute("aria-label") === "停止流式";
       }
       return false;
     }
@@ -108,13 +107,10 @@ function makeContext() {
     }
     contains(node) {
       if (node === this) return true;
-      for (const child of this.children) {
-        if (child === node) return true;
-        if (child instanceof FakeElement && child.contains(node)) return true;
-      }
-      return false;
+      return this.children.some((child) => child === node || (child instanceof FakeElement && child.contains(node)));
     }
     querySelectorAll(selector) {
+      this.ownerDocument?._noteElementQuery(selector);
       const out = [];
       const visit = (node) => {
         for (const child of node.children || []) {
@@ -125,7 +121,22 @@ function makeContext() {
       visit(this);
       return out;
     }
-    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    querySelector(selector) {
+      if (selector === "img,video,iframe,canvas") {
+        const tags = new Set(["IMG", "VIDEO", "IFRAME", "CANVAS"]);
+        let found = null;
+        const visit = (node) => {
+          for (const child of node.children || []) {
+            if (found) return;
+            if (child instanceof FakeElement && tags.has(child.tagName)) { found = child; return; }
+            visit(child);
+          }
+        };
+        visit(this);
+        return found;
+      }
+      return this.querySelectorAll(selector)[0] || null;
+    }
     setAttribute(name, value) { this.attributes.set(name, String(value)); }
     getAttribute(name) { return this.attributes.get(name) ?? null; }
     removeAttribute(name) { this.attributes.delete(name); }
@@ -145,6 +156,8 @@ function makeContext() {
       this.activeElement = null;
       this.listeners = new Map();
       this._querySelectorHook = null;
+      this.documentQueryCount = 0;
+      this.elementQueryCount = 0;
       this.documentElement = new FakeElement("html");
       this.documentElement.ownerDocument = this;
       this.documentElement._setConnected(true);
@@ -155,12 +168,14 @@ function makeContext() {
       this.body.ownerDocument = this;
       this.documentElement.appendChild(this.body);
     }
+    _noteElementQuery() { this.elementQueryCount += 1; }
     createElement(tagName) {
       const element = new FakeElement(tagName);
       element.ownerDocument = this;
       return element;
     }
     querySelectorAll(selector) {
+      this.documentQueryCount += 1;
       const out = [];
       if (this.documentElement.matches(selector)) out.push(this.documentElement);
       out.push(...this.documentElement.querySelectorAll(selector));
@@ -186,44 +201,86 @@ function makeContext() {
 
   const mutationObservers = [];
   class FakeMutationObserver {
-    constructor(callback) {
-      this.callback = callback;
-      this.connected = false;
-      mutationObservers.push(this);
-    }
+    constructor(callback) { this.callback = callback; this.connected = false; mutationObservers.push(this); }
     observe() { this.connected = true; }
     disconnect() { this.connected = false; }
-    trigger(records) {
-      if (this.connected) this.callback(records, this);
-    }
+    trigger(records) { if (this.connected) this.callback(records, this); }
   }
+
+  const intersectionObservers = [];
+  class FakeIntersectionObserver {
+    constructor(callback, options) {
+      this.callback = callback;
+      this.options = options;
+      this.observed = new Set();
+      this.connected = true;
+      intersectionObservers.push(this);
+    }
+    observe(element) { if (this.connected) this.observed.add(element); }
+    unobserve(element) { this.observed.delete(element); }
+    disconnect() { this.connected = false; this.observed.clear(); }
+    trigger(entries) { if (this.connected) this.callback(entries, this); }
+  }
+
+  const timers = new Map();
+  const idleCallbacks = new Map();
+  let nextTimer = 1;
+  let nextIdle = 1000;
+  function fakeSetTimeout(callback, delay = 0) {
+    const id = nextTimer++;
+    timers.set(id, { callback, delay });
+    return id;
+  }
+  function fakeClearTimeout(id) { timers.delete(id); }
+  function fakeRequestIdleCallback(callback) {
+    const id = nextIdle++;
+    idleCallbacks.set(id, callback);
+    return id;
+  }
+  function fakeCancelIdleCallback(id) { idleCallbacks.delete(id); }
 
   const document = new FakeDocument();
   let currentSelection = null;
   const context = {
     console,
     performance,
-    queueMicrotask,
     Node: FakeNode,
     Element: FakeElement,
     MutationObserver: FakeMutationObserver,
+    IntersectionObserver: FakeIntersectionObserver,
     document,
     getSelection: () => currentSelection,
-    requestAnimationFrame: (callback) => { callback(performance.now()); return 1; },
-    setTimeout,
+    setTimeout: fakeSetTimeout,
+    clearTimeout: fakeClearTimeout,
+    requestIdleCallback: fakeRequestIdleCallback,
+    cancelIdleCallback: fakeCancelIdleCallback,
   };
   context.window = context;
   vm.createContext(context);
   const originalAppendChild = FakeNode.prototype.appendChild;
   vm.runInContext(source, context);
+
   return {
     context,
     document,
     FakeNode,
     FakeElement,
     mutationObservers,
+    intersectionObservers,
     originalAppendChild,
     setSelection(value) { currentSelection = value; },
+    runAllTimers() {
+      for (const [id, item] of Array.from(timers)) {
+        timers.delete(id);
+        item.callback();
+      }
+    },
+    runAllIdle() {
+      for (const [id, callback] of Array.from(idleCallbacks)) {
+        idleCallbacks.delete(id);
+        callback({ didTimeout: false, timeRemaining: () => 50 });
+      }
+    },
   };
 }
 
@@ -231,7 +288,6 @@ function codeViewer(FakeElement, document, text, { wrapped = false } = {}) {
   const viewer = new FakeElement("div", "cm-editor", "q9tKkq_viewer", ...(wrapped ? ["q9tKkq_wrapLines"] : []));
   viewer.id = "code-block-viewer";
   viewer.ownerDocument = document;
-
   const scroller = new FakeElement("div", "cm-scroller");
   scroller.ownerDocument = document;
   const pre = new FakeElement("pre", "cm-content", "q9tKkq_readonly");
@@ -239,222 +295,273 @@ function codeViewer(FakeElement, document, text, { wrapped = false } = {}) {
   const code = new FakeElement("code");
   code.ownerDocument = document;
   code.textContent = text;
-
   pre.appendChild(code);
   scroller.appendChild(pre);
   viewer.appendChild(scroller);
   return { viewer, code };
 }
 
-function message(FakeElement, document, role, height) {
-  const root = new FakeElement("div").setRectHeight(height);
+function assistantWritingRoot(FakeElement, document) {
+  const message = new FakeElement("div");
+  message.ownerDocument = document;
+  message.setAttribute("data-message-author-role", "assistant");
+  const root = new FakeElement("div", "ProseMirror");
   root.ownerDocument = document;
-  root.setAttribute("data-message-author-role", role);
-  return root;
-}
-
-function editableWritingBlock(FakeElement, document, messageRoot, { height = 13440, blockHeight = 442, descendants = 9 } = {}) {
-  const pm = new FakeElement("div", "ProseMirror").setRectHeight(height);
-  pm.ownerDocument = document;
-  pm.setAttribute("contenteditable", "true");
-  const block = new FakeElement("ul").setRectHeight(blockHeight);
+  root.setAttribute("contenteditable", "true");
+  const block = new FakeElement("div");
   block.ownerDocument = document;
-  for (let i = 0; i < descendants; i += 1) {
-    const li = new FakeElement("li");
-    li.ownerDocument = document;
-    block.appendChild(li);
-  }
-  pm.appendChild(block);
-  messageRoot.appendChild(pm);
-  return { pm, block };
+  const leaf = new FakeElement("span");
+  leaf.ownerDocument = document;
+  block.appendChild(leaf);
+  root.appendChild(block);
+  message.appendChild(root);
+  return { message, root, block, leaf };
 }
 
-test("ChatGPT perf v4 leaves Node.prototype.appendChild untouched", () => {
+function farEntry(target, height = 442) {
+  return { target, isIntersecting: false, boundingClientRect: { height } };
+}
+
+function nearEntry(target, height = 442) {
+  return { target, isIntersecting: true, boundingClientRect: { height } };
+}
+
+test("v6 keeps React mutation hot path free of synchronous layout reads", () => {
   const { context, originalAppendChild } = makeContext();
+  assert.equal(context.__HERDR_CHATGPT_PERF__.version, "6");
   assert.equal(context.Node.prototype.appendChild, originalAppendChild);
-  assert.equal(context.__HERDR_CHATGPT_PERF__.version, "4");
-  assert.equal(context.__HERDR_CHATGPT_PERF__.enabled, true);
+  assert.equal(source.includes("getBoundingClientRect"), false);
+  assert.equal(source.includes('querySelectorAll?.("*")'), false);
 });
 
-test("ChatGPT perf prepares the current React code viewer with measured intrinsic height", () => {
+test("streaming throttle activates from a stop-control mutation without a document-wide query", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const stop = new FakeElement("button");
+  stop.ownerDocument = document;
+  stop.setAttribute("data-testid", "stop-button");
+  const before = document.documentQueryCount;
+
+  mutationObservers[0].trigger([{ type: "childList", target: document.body, addedNodes: [stop], removedNodes: [] }]);
+
+  assert.equal(document.documentElement.getAttribute("data-herdr-streaming-throttle"), "1");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.streaming_throttle_activations, 1);
+  assert.equal(document.documentQueryCount, before);
+});
+
+test("streaming throttle clears when the stop control is removed", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const stop = new FakeElement("button");
+  stop.ownerDocument = document;
+  stop.setAttribute("data-testid", "stop-button");
+  mutationObservers[0].trigger([{ type: "childList", target: document.body, addedNodes: [stop], removedNodes: [] }]);
+  document._querySelectorHook = () => null;
+
+  mutationObservers[0].trigger([{ type: "childList", target: document.body, addedNodes: [], removedNodes: [stop] }]);
+
+  assert.equal(document.documentElement.getAttribute("data-herdr-streaming-throttle"), null);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.streaming_throttle_deactivations, 1);
+});
+
+test("same-batch stop-control replacement resolves the final DOM state", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const oldStop = new FakeElement("button");
+  const newStop = new FakeElement("button");
+  for (const stop of [oldStop, newStop]) {
+    stop.ownerDocument = document;
+    stop.setAttribute("data-testid", "stop-button");
+  }
+  document._querySelectorHook = (selector) => selector.includes("stop-button") ? newStop : null;
+
+  mutationObservers[0].trigger([{ type: "childList", target: document.body, addedNodes: [newStop], removedNodes: [oldStop] }]);
+
+  assert.equal(document.documentElement.getAttribute("data-herdr-streaming-throttle"), "1");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.streaming_throttle_activations, 1);
+});
+
+test("streaming CSS preserves tool activity and interactive controls", () => {
+  assert.match(source, /data-herdr-streaming-throttle/);
+  assert.match(source, /group\/tool-message/);
+  assert.match(source, /animate-spin/);
+  assert.match(source, /aria-busy/);
+  assert.match(source, /transition-duration: 0\.001ms/);
+});
+
+test("v6 preserves the proven code-viewer intrinsic estimate", () => {
   const { context, document, FakeElement } = makeContext();
-  const { viewer } = codeViewer(FakeElement, document, Array.from({ length: 231 }, (_, i) => `line-${i}`).join("\n"));
+  const text = Array.from({ length: 231 }, (_, i) => `line-${i}`).join("\n");
+  const { viewer } = codeViewer(FakeElement, document, text);
   document.body.appendChild(viewer);
 
-  assert.equal(context.__HERDR_CHATGPT_PERF__.scan(), 1);
+  context.__HERDR_CHATGPT_PERF__.scan();
   assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), "1");
   assert.equal(viewer.style.getPropertyValue("--herdr-code-block-intrinsic-size"), "4632px");
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.viewers_prepared, 1);
-  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.max_intrinsic_height_px, 4632);
 });
 
-test("ChatGPT perf MutationObserver resolves characterData targets back to the code viewer", () => {
+test("streaming code mutation reveals immediately and only remeasures on settled scan", () => {
   const { context, document, FakeNode, FakeElement, mutationObservers } = makeContext();
   const { viewer, code } = codeViewer(FakeElement, document, "a\nb");
   document.body.appendChild(viewer);
-
-  const observer = mutationObservers[0];
-  observer.trigger([{ target: document.body, addedNodes: [viewer] }]);
+  context.__HERDR_CHATGPT_PERF__.scan();
   assert.equal(viewer.style.getPropertyValue("--herdr-code-block-intrinsic-size"), "52px");
 
-  const textNode = new FakeNode();
-  textNode.ownerDocument = document;
-  textNode.textContent = Array.from({ length: 11 }, (_, i) => `line-${i}`).join("\n");
-  code.appendChild(textNode);
-  observer.trigger([{ target: textNode, addedNodes: [] }]);
+  const text = new FakeNode();
+  text.ownerDocument = document;
+  text.textContent = Array.from({ length: 11 }, (_, i) => `line-${i}`).join("\n");
+  code.appendChild(text);
+  mutationObservers[0].trigger([{ target: text, addedNodes: [], removedNodes: [] }]);
 
+  assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), null);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.viewers_updated, 0);
+
+  context.__HERDR_CHATGPT_PERF__.scan();
   assert.equal(viewer.style.getPropertyValue("--herdr-code-block-intrinsic-size"), "232px");
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.viewers_updated, 1);
 });
 
-test("ChatGPT perf contains a large committed message using its exact measured height", () => {
-  const { context, document, FakeElement } = makeContext();
-  const root = message(FakeElement, document, "assistant", 13626.375);
-  document.body.appendChild(root);
+test("MutationObserver registers a direct writing root without a document-wide scan", () => {
+  const { document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { message, root, block } = assistantWritingRoot(FakeElement, document);
+  document.body.appendChild(message);
+  const before = document.documentQueryCount;
 
-  context.__HERDR_CHATGPT_PERF__.scan();
-  assert.equal(root.getAttribute("data-herdr-message-contained"), "1");
-  assert.equal(root.style.getPropertyValue("--herdr-message-intrinsic-size"), "13626.375px");
-  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.messages_prepared, 1);
+  mutationObservers[0].trigger([{ target: message, addedNodes: [root], removedNodes: [] }]);
+
+  assert.equal(document.documentQueryCount, before);
+  assert.equal(intersectionObservers[0].observed.has(block), true);
 });
 
-test("ChatGPT perf does not add message containment to small turns", () => {
-  const { context, document, FakeElement } = makeContext();
-  const root = message(FakeElement, document, "assistant", 252);
-  document.body.appendChild(root);
+test("far heavy writing block is contained from asynchronous observer geometry", () => {
+  const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { message, root, block } = assistantWritingRoot(FakeElement, document);
+  document.body.appendChild(message);
+  mutationObservers[0].trigger([{ target: message, addedNodes: [root], removedNodes: [] }]);
 
-  context.__HERDR_CHATGPT_PERF__.scan();
-  assert.equal(root.getAttribute("data-herdr-message-contained"), null);
-  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.messages_prepared, 0);
-});
+  intersectionObservers[0].trigger([farEntry(block, 442.375)]);
 
-test("ChatGPT perf keeps the current streaming assistant message revealed until generation settles", () => {
-  const { context, document, FakeElement } = makeContext();
-  const root = message(FakeElement, document, "assistant", 1400);
-  const stop = new FakeElement("button");
-  document.body.appendChild(root);
-  document._querySelectorHook = (selector) => selector.includes("stop-button") ? stop : null;
-
-  context.__HERDR_CHATGPT_PERF__.scan();
-  assert.equal(root.getAttribute("data-herdr-message-contained"), null);
-
-  document._querySelectorHook = null;
-  context.__HERDR_CHATGPT_PERF__.scan();
-  assert.equal(root.getAttribute("data-herdr-message-contained"), "1");
-});
-
-test("ChatGPT perf remeasures a contained message after its DOM changes", () => {
-  const { context, document, FakeElement, mutationObservers } = makeContext();
-  const root = message(FakeElement, document, "assistant", 1000);
-  const child = new FakeElement("div");
-  child.ownerDocument = document;
-  root.appendChild(child);
-  document.body.appendChild(root);
-  context.__HERDR_CHATGPT_PERF__.scan();
-
-  root.setRectHeight(1400.5);
-  mutationObservers[0].trigger([{ target: child, addedNodes: [] }]);
-
-  assert.equal(root.getAttribute("data-herdr-message-contained"), "1");
-  assert.equal(root.style.getPropertyValue("--herdr-message-intrinsic-size"), "1400.5px");
-  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.messages_updated, 1);
-  assert.ok(context.__HERDR_CHATGPT_PERF__.stats.messages_cleared >= 1);
-});
-
-test("ChatGPT perf skips message containment for dynamic media", () => {
-  const { context, document, FakeElement } = makeContext();
-  const root = message(FakeElement, document, "assistant", 1800);
-  const image = new FakeElement("img");
-  image.ownerDocument = document;
-  root.appendChild(image);
-  document.body.appendChild(root);
-
-  context.__HERDR_CHATGPT_PERF__.scan();
-  assert.equal(root.getAttribute("data-herdr-message-contained"), null);
-  assert.ok(context.__HERDR_CHATGPT_PERF__.stats.messages_skipped >= 1);
-});
-
-test("ChatGPT perf contains heavy writing-block children only while the editor is unfocused", () => {
-  const { context, document, FakeElement } = makeContext();
-  const root = message(FakeElement, document, "assistant", 13626.375);
-  const { pm, block } = editableWritingBlock(FakeElement, document, root);
-  document.body.appendChild(root);
-
-  context.__HERDR_CHATGPT_PERF__.scan();
   assert.equal(block.getAttribute("data-herdr-editable-block-contained"), "1");
-  assert.equal(block.style.getPropertyValue("--herdr-editable-block-intrinsic-size"), "442px");
-  assert.equal(root.getAttribute("data-herdr-message-contained"), "1");
+  assert.equal(block.style.getPropertyValue("--herdr-editable-block-intrinsic-size"), "442.375px");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.editable_blocks_contained, 1);
+});
 
-  document.activeElement = pm;
-  context.__HERDR_CHATGPT_PERF__.scan();
+test("near writing block is always revealed", () => {
+  const { document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { message, root, block } = assistantWritingRoot(FakeElement, document);
+  document.body.appendChild(message);
+  mutationObservers[0].trigger([{ target: message, addedNodes: [root], removedNodes: [] }]);
+  intersectionObservers[0].trigger([farEntry(block, 442)]);
+  assert.equal(block.getAttribute("data-herdr-editable-block-contained"), "1");
+
+  intersectionObservers[0].trigger([nearEntry(block, 442)]);
   assert.equal(block.getAttribute("data-herdr-editable-block-contained"), null);
-  assert.equal(root.getAttribute("data-herdr-message-contained"), null);
-  assert.ok(context.__HERDR_CHATGPT_PERF__.stats.editable_blocks_cleared >= 1);
-  assert.ok(context.__HERDR_CHATGPT_PERF__.stats.messages_cleared >= 1);
 });
 
-test("ChatGPT perf reveals a contained writing block while text inside it is selected", () => {
-  const { context, document, FakeElement, setSelection } = makeContext();
-  const root = message(FakeElement, document, "assistant", 13626.375);
-  const { block } = editableWritingBlock(FakeElement, document, root);
-  const leaf = block.firstElementChild;
-  document.body.appendChild(root);
-  context.__HERDR_CHATGPT_PERF__.scan();
+test("focused writing root is never contained", () => {
+  const { document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { message, root, block } = assistantWritingRoot(FakeElement, document);
+  document.body.appendChild(message);
+  document.activeElement = root;
+  mutationObservers[0].trigger([{ target: message, addedNodes: [root], removedNodes: [] }]);
+  intersectionObservers[0].trigger([farEntry(block, 900)]);
+  assert.equal(block.getAttribute("data-herdr-editable-block-contained"), null);
+});
 
-  assert.equal(root.getAttribute("data-herdr-message-contained"), "1");
+test("selection change reveals the touched writing root without global rescan", () => {
+  const { document, FakeElement, mutationObservers, intersectionObservers, setSelection } = makeContext();
+  const { message, root, block, leaf } = assistantWritingRoot(FakeElement, document);
+  document.body.appendChild(message);
+  mutationObservers[0].trigger([{ target: message, addedNodes: [root], removedNodes: [] }]);
+  intersectionObservers[0].trigger([farEntry(block, 442)]);
   assert.equal(block.getAttribute("data-herdr-editable-block-contained"), "1");
+  const before = document.documentQueryCount;
 
   setSelection({ rangeCount: 1, isCollapsed: false, anchorNode: leaf, focusNode: leaf });
   document.emit("selectionchange", leaf);
 
-  assert.equal(root.getAttribute("data-herdr-message-contained"), null);
   assert.equal(block.getAttribute("data-herdr-editable-block-contained"), null);
+  assert.equal(document.documentQueryCount, before);
+});
 
-  setSelection(null);
-  document.emit("selectionchange", document.body);
-  assert.equal(root.getAttribute("data-herdr-message-contained"), "1");
+test("current streaming assistant root remains revealed", () => {
+  const { document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { message, root, block } = assistantWritingRoot(FakeElement, document);
+  const stop = new FakeElement("button");
+  document.body.appendChild(message);
+  document._querySelectorHook = (selector) => selector.includes("stop-button") ? stop : null;
+  mutationObservers[0].trigger([{ target: message, addedNodes: [root], removedNodes: [] }]);
+
+  intersectionObservers[0].trigger([farEntry(block, 900)]);
+  assert.equal(block.getAttribute("data-herdr-editable-block-contained"), null);
+});
+
+test("dynamic media blocks are skipped", () => {
+  const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { message, root, block } = assistantWritingRoot(FakeElement, document);
+  const image = new FakeElement("img");
+  image.ownerDocument = document;
+  block.appendChild(image);
+  document.body.appendChild(message);
+  mutationObservers[0].trigger([{ target: message, addedNodes: [root], removedNodes: [] }]);
+
+  intersectionObservers[0].trigger([farEntry(block, 900)]);
+  assert.equal(block.getAttribute("data-herdr-editable-block-contained"), null);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.editable_blocks_contained, 0);
+});
+
+test("mutation of a contained block reveals it without forcing layout or deep document scan", () => {
+  const { document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
+  const { message, root, block, leaf } = assistantWritingRoot(FakeElement, document);
+  document.body.appendChild(message);
+  mutationObservers[0].trigger([{ target: message, addedNodes: [root], removedNodes: [] }]);
+  intersectionObservers[0].trigger([farEntry(block, 442)]);
   assert.equal(block.getAttribute("data-herdr-editable-block-contained"), "1");
+  block.getBoundingClientRect = () => { throw new Error("hot-path layout read"); };
+  const before = document.documentQueryCount;
+
+  mutationObservers[0].trigger([{ target: leaf, addedNodes: [], removedNodes: [] }]);
+
+  assert.equal(block.getAttribute("data-herdr-editable-block-contained"), null);
+  assert.equal(document.documentQueryCount, before);
 });
 
-test("ChatGPT perf ignores unrelated cm-editor DOM", () => {
-  const { context, document, FakeElement, mutationObservers } = makeContext();
-  const editor = new FakeElement("div", "cm-editor");
-  editor.ownerDocument = document;
-  document.body.appendChild(editor);
+test("manual/idle scan can discover a deeply nested writing root without layout reads", () => {
+  const { context, document, FakeElement, intersectionObservers } = makeContext();
+  const wrapper = new FakeElement("section");
+  wrapper.ownerDocument = document;
+  const { message, block } = assistantWritingRoot(FakeElement, document);
+  wrapper.appendChild(message);
+  document.body.appendChild(wrapper);
 
-  mutationObservers[0].trigger([{ target: document.body, addedNodes: [editor] }]);
-  assert.equal(editor.getAttribute("data-herdr-code-block-contained"), null);
-  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.viewers_prepared, 0);
+  const discovered = context.__HERDR_CHATGPT_PERF__.scan();
+  assert.ok(discovered >= 1);
+  assert.equal(intersectionObservers[0].observed.has(block), true);
 });
 
-test("ChatGPT perf skips wrapped viewers instead of guessing scroll geometry", () => {
+test("wrapped code viewers remain uncontained", () => {
   const { context, document, FakeElement } = makeContext();
   const { viewer } = codeViewer(FakeElement, document, "a very long wrapped line", { wrapped: true });
   document.body.appendChild(viewer);
-
-  assert.equal(context.__HERDR_CHATGPT_PERF__.scan(), 0);
+  context.__HERDR_CHATGPT_PERF__.scan();
   assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), null);
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.viewers_skipped, 1);
 });
 
-test("ChatGPT perf disable removes every containment layer and enable restores safe ones", () => {
-  const { context, document, FakeElement } = makeContext();
+test("disable removes containment and disconnects both observer layers", () => {
+  const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
   const { viewer } = codeViewer(FakeElement, document, "a\nb");
-  const root = message(FakeElement, document, "assistant", 13626.375);
-  const { block } = editableWritingBlock(FakeElement, document, root);
+  const { message, root, block } = assistantWritingRoot(FakeElement, document);
   document.body.appendChild(viewer);
-  document.body.appendChild(root);
+  document.body.appendChild(message);
   context.__HERDR_CHATGPT_PERF__.scan();
+  intersectionObservers[0].trigger([farEntry(block, 442)]);
+  assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), "1");
+  assert.equal(block.getAttribute("data-herdr-editable-block-contained"), "1");
 
   context.__HERDR_CHATGPT_PERF__.disable();
+
   assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), null);
-  assert.equal(root.getAttribute("data-herdr-message-contained"), null);
   assert.equal(block.getAttribute("data-herdr-editable-block-contained"), null);
   assert.equal(context.__HERDR_CHATGPT_PERF__.enabled, false);
-
-  context.__HERDR_CHATGPT_PERF__.enable();
-  assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), "1");
-  assert.equal(root.getAttribute("data-herdr-message-contained"), "1");
-  assert.equal(block.getAttribute("data-herdr-editable-block-contained"), "1");
-  assert.equal(context.__HERDR_CHATGPT_PERF__.enabled, true);
+  assert.equal(mutationObservers[0].connected, false);
+  assert.equal(intersectionObservers[0].connected, false);
 });

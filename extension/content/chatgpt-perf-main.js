@@ -1,23 +1,21 @@
 // chatgpt-perf-main.js — MAIN-world, document-start ChatGPT render containment.
 //
-// Current ChatGPT (2026-09) already virtualizes conversation history, so the
-// remaining hot path is usually a small number of very large mounted messages.
-// Rendered code uses ordinary React DOM rather than CodeMirror EditorView.
+// Current ChatGPT (2026-09) already virtualizes conversation history. The
+// pathological case is a small number of very large mounted assistant trees.
+// Never add synchronous layout work to React's mutation hot path: doing so can
+// turn a long mount into layout thrash. The hot path here only records dirtiness
+// and registers exact nodes; geometry comes from browser-scheduled observers.
 //
-// Do not interfere with React's commit path or delete React-owned DOM. Let
-// Chromium skip offscreen work with content-visibility:auto at three safe
-// boundaries:
-//   1. exact current code viewers;
-//   2. large mounted message roots;
-//   3. large top-level blocks in an unfocused ProseMirror writing block.
-//
-// Message/block intrinsic sizes are measured from the real committed layout
-// before containment is enabled. This preserves scroll geometry while letting
-// Chromium decide when offscreen contents become relevant again.
+// Optimization layers:
+//   1. exact current code viewers use the proven line-count intrinsic estimate;
+//   2. large top-level blocks inside an unfocused ProseMirror writing block are
+//      contained only when they are far from the viewport. IntersectionObserver
+//      supplies their committed height asynchronously, so no forced layout is
+//      introduced by MutationObserver.
 (() => {
   "use strict";
 
-  const VERSION = "4";
+  const VERSION = "6";
   const API_NAME = "__HERDR_CHATGPT_PERF__";
 
   const VIEWER_SELECTOR = "#code-block-viewer.cm-editor";
@@ -29,18 +27,14 @@
   const MAX_VIEWER_HEIGHT_PX = 200000;
 
   const MESSAGE_SELECTOR = "[data-message-author-role]";
-  const MESSAGE_ATTR = "data-herdr-message-contained";
-  const MESSAGE_INTRINSIC_VAR = "--herdr-message-intrinsic-size";
-  const MESSAGE_MIN_HEIGHT_PX = 600;
-  const MAX_MESSAGE_HEIGHT_PX = 1000000;
-
   const EDITABLE_ROOT_SELECTOR = ".ProseMirror[contenteditable=\"true\"]";
   const EDITABLE_BLOCK_ATTR = "data-herdr-editable-block-contained";
   const EDITABLE_BLOCK_INTRINSIC_VAR = "--herdr-editable-block-intrinsic-size";
-  const EDITABLE_BLOCK_MIN_HEIGHT_PX = 64;
-  const EDITABLE_BLOCK_MIN_DESCENDANTS = 8;
+  const EDITABLE_BLOCK_MIN_HEIGHT_PX = 80;
   const MAX_EDITABLE_BLOCK_HEIGHT_PX = 200000;
+  const BLOCK_ROOT_MARGIN = "1400px 0px";
 
+  const QUIET_MS = 300;
   const STOP_SELECTORS = [
     'button[data-testid="stop-button"]',
     '[role="button"][data-testid="stop-button"]',
@@ -49,44 +43,50 @@
     'button[aria-label="停止生成"]',
     'button[aria-label="停止流式"]',
   ];
-  const DYNAMIC_MEDIA_TAGS = ["IMG", "VIDEO", "IFRAME", "CANVAS"];
+  const STREAMING_THROTTLE_ATTR = "data-herdr-streaming-throttle";
+  const DYNAMIC_MEDIA_SELECTOR = "img,video,iframe,canvas";
 
   if (window[API_NAME]) return;
 
   const stats = {
     observer_batches: 0,
+    mutation_records: 0,
+    idle_scans: 0,
     viewers_prepared: 0,
     viewers_updated: 0,
+    viewers_cleared: 0,
     viewers_skipped: 0,
-    messages_prepared: 0,
-    messages_updated: 0,
-    messages_skipped: 0,
-    messages_cleared: 0,
-    editable_blocks_prepared: 0,
+    editable_roots_observed: 0,
+    editable_blocks_observed: 0,
+    editable_blocks_contained: 0,
     editable_blocks_updated: 0,
+    editable_blocks_revealed: 0,
     editable_blocks_skipped: 0,
-    editable_blocks_cleared: 0,
-    last_batch_viewers: 0,
-    last_batch_messages: 0,
-    last_batch_editable_blocks: 0,
+    streaming_throttle_activations: 0,
+    streaming_throttle_deactivations: 0,
+    last_batch_records: 0,
+    last_scan_ms: 0,
     last_intrinsic_height_px: 0,
     max_intrinsic_height_px: 0,
-    last_message_height_px: 0,
-    max_message_height_px: 0,
     last_editable_block_height_px: 0,
     max_editable_block_height_px: 0,
   };
 
   let enabled = true;
   let observer = null;
+  let blockObserver = null;
   let styleElement = null;
   let listenersInstalled = false;
-  let lastGenerating = false;
-  let selectionRefreshScheduled = false;
+  let quietTimer = null;
+  let idleHandle = null;
+  let lastMutationAt = 0;
+  let discoveryPending = false;
 
-  const lastHeightByViewer = new WeakMap();
-  const lastHeightByMessage = new WeakMap();
-  const lastHeightByEditableBlock = new WeakMap();
+  const viewerHeights = new WeakMap();
+  const pendingViewers = new Set();
+  const observedRoots = new Set();
+  const observedBlocks = new Set();
+  const blockHeights = new WeakMap();
 
   function publish(value) {
     try {
@@ -119,6 +119,12 @@
       && viewer.classList.contains("cm-editor");
   }
 
+  function viewerFor(node) {
+    const element = elementForNode(node);
+    const viewer = element?.closest?.(VIEWER_SELECTOR);
+    return isCurrentViewer(viewer) ? viewer : null;
+  }
+
   function isWrappedViewer(viewer) {
     try {
       return Array.from(viewer.classList).some((name) => /(?:^|_)wrapLines$/.test(name));
@@ -139,7 +145,10 @@
 
   function estimateViewerHeight(code) {
     const text = code.textContent ?? "";
-    const lines = text.length === 0 ? 1 : text.split("\n").length;
+    let lines = 1;
+    for (let i = 0; i < text.length; i += 1) {
+      if (text.charCodeAt(i) === 10) lines += 1;
+    }
     return clamp(
       VERTICAL_CHROME_PX + (lines * LINE_HEIGHT_PX),
       MIN_VIEWER_HEIGHT_PX,
@@ -147,24 +156,30 @@
     );
   }
 
+  function clearViewer(viewer) {
+    if (!(viewer instanceof Element) || viewer.getAttribute(VIEWER_ATTR) !== "1") return false;
+    try {
+      viewer.removeAttribute(VIEWER_ATTR);
+      viewer.style.removeProperty(VIEWER_INTRINSIC_VAR);
+      stats.viewers_cleared += 1;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function prepareViewer(viewer) {
     if (!enabled || !isCurrentViewer(viewer)) return false;
-
-    // Wrapped code has width-dependent visual line count. Do not guess an
-    // intrinsic height that could destabilize scroll anchoring.
     if (isWrappedViewer(viewer)) {
+      clearViewer(viewer);
       stats.viewers_skipped += 1;
       return false;
     }
-
     const code = codeElementFor(viewer);
-    if (!code) {
-      stats.viewers_skipped += 1;
-      return false;
-    }
+    if (!code) return false;
 
     const height = estimateViewerHeight(code);
-    const previous = lastHeightByViewer.get(viewer);
+    const previous = viewerHeights.get(viewer);
     if (previous === height && viewer.getAttribute(VIEWER_ATTR) === "1") return false;
 
     try {
@@ -177,7 +192,7 @@
 
     if (previous == null) stats.viewers_prepared += 1;
     else stats.viewers_updated += 1;
-    lastHeightByViewer.set(viewer, height);
+    viewerHeights.set(viewer, height);
     stats.last_intrinsic_height_px = height;
     stats.max_intrinsic_height_px = Math.max(stats.max_intrinsic_height_px, height);
     return true;
@@ -193,106 +208,6 @@
     const element = elementForNode(node);
     const message = element?.closest?.(MESSAGE_SELECTOR);
     return isMessage(message) ? message : null;
-  }
-
-  function hasDynamicMedia(root) {
-    if (!(root instanceof Element)) return false;
-    for (const tag of DYNAMIC_MEDIA_TAGS) {
-      if (root.querySelector?.(tag.toLowerCase())) return true;
-    }
-    return false;
-  }
-
-  function composerGenerating() {
-    for (const selector of STOP_SELECTORS) {
-      try {
-        if (document.querySelector?.(selector)) return true;
-      } catch (_) {}
-    }
-    return false;
-  }
-
-  function lastAssistantMessage() {
-    const assistants = document.querySelectorAll?.('[data-message-author-role="assistant"]') || [];
-    return assistants.length ? assistants[assistants.length - 1] : null;
-  }
-
-  function isStreamingMessage(message, generating = composerGenerating()) {
-    return generating
-      && message?.getAttribute?.("data-message-author-role") === "assistant"
-      && message === lastAssistantMessage();
-  }
-
-  function containsActiveElement(root) {
-    const active = document.activeElement;
-    return Boolean(active && active !== document.body && root?.contains?.(active));
-  }
-
-  function selectionElements() {
-    const selection = window.getSelection?.();
-    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return [];
-    const elements = new Set();
-    for (const node of [selection.anchorNode, selection.focusNode]) {
-      const element = elementForNode(node);
-      if (element) elements.add(element);
-    }
-    return Array.from(elements);
-  }
-
-  function selectionTouches(root) {
-    if (!(root instanceof Element)) return false;
-    return selectionElements().some((element) => root.contains?.(element));
-  }
-
-  function clearMessage(message) {
-    if (!(message instanceof Element) || message.getAttribute(MESSAGE_ATTR) !== "1") return false;
-    try {
-      message.removeAttribute(MESSAGE_ATTR);
-      message.style.removeProperty(MESSAGE_INTRINSIC_VAR);
-      stats.messages_cleared += 1;
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function prepareMessage(message, generating = composerGenerating()) {
-    if (!enabled || !isMessage(message)) return false;
-
-    if (isStreamingMessage(message, generating)
-      || containsActiveElement(message)
-      || selectionTouches(message)
-      || hasDynamicMedia(message)) {
-      clearMessage(message);
-      stats.messages_skipped += 1;
-      return false;
-    }
-
-    const rect = message.getBoundingClientRect?.();
-    const height = Number(rect?.height || 0);
-    if (!Number.isFinite(height) || height < MESSAGE_MIN_HEIGHT_PX) {
-      clearMessage(message);
-      return false;
-    }
-
-    const previous = lastHeightByMessage.get(message);
-    const cssHeight = cssPixels(height, MAX_MESSAGE_HEIGHT_PX);
-    if (previous === cssHeight && message.getAttribute(MESSAGE_ATTR) === "1") return false;
-
-    try {
-      message.setAttribute(MESSAGE_ATTR, "1");
-      message.style.setProperty(MESSAGE_INTRINSIC_VAR, cssHeight);
-    } catch (_) {
-      stats.messages_skipped += 1;
-      return false;
-    }
-
-    if (previous == null) stats.messages_prepared += 1;
-    else stats.messages_updated += 1;
-    lastHeightByMessage.set(message, cssHeight);
-    stats.last_message_height_px = height;
-    stats.max_message_height_px = Math.max(stats.max_message_height_px, height);
-    return true;
   }
 
   function isEditableRoot(root) {
@@ -322,7 +237,7 @@
     try {
       block.removeAttribute(EDITABLE_BLOCK_ATTR);
       block.style.removeProperty(EDITABLE_BLOCK_INTRINSIC_VAR);
-      stats.editable_blocks_cleared += 1;
+      stats.editable_blocks_revealed += 1;
       return true;
     } catch (_) {
       return false;
@@ -332,48 +247,105 @@
   function clearEditableRoot(root) {
     if (!isEditableRoot(root)) return 0;
     let cleared = 0;
-    for (const block of root.querySelectorAll?.(`[${EDITABLE_BLOCK_ATTR}="1"]`) || []) {
-      cleared += clearEditableBlock(block) ? 1 : 0;
-    }
+    for (const block of root.children || []) cleared += clearEditableBlock(block) ? 1 : 0;
     return cleared;
   }
 
-  function isHeavyEditableBlock(block) {
-    if (!(block instanceof Element)) return false;
-    const root = block.parentElement;
-    if (!isEditableRoot(root)) return false;
-    if (block.getAttribute("contenteditable") === "false" || hasDynamicMedia(block)) return false;
-    const rect = block.getBoundingClientRect?.();
-    const height = Number(rect?.height || 0);
-    const descendants = Number(block.querySelectorAll?.("*")?.length || 0);
-    return Number.isFinite(height)
-      && height > 0
-      && (height >= EDITABLE_BLOCK_MIN_HEIGHT_PX || descendants >= EDITABLE_BLOCK_MIN_DESCENDANTS);
+  function composerGenerating() {
+    for (const selector of STOP_SELECTORS) {
+      try {
+        if (document.querySelector?.(selector)) return true;
+      } catch (_) {}
+    }
+    return false;
   }
 
-  function editableRootUnsafe(root, generating = composerGenerating()) {
-    if (!isEditableRoot(root)) return true;
-    return containsActiveElement(root)
-      || selectionTouches(root)
-      || isStreamingMessage(messageFor(root), generating);
+  function setStreamingThrottle(active) {
+    const root = document.documentElement;
+    if (!root) return false;
+    const current = root.getAttribute(STREAMING_THROTTLE_ATTR) === "1";
+    const next = Boolean(enabled && active);
+    if (current === next) return false;
+    if (next) {
+      root.setAttribute(STREAMING_THROTTLE_ATTR, "1");
+      stats.streaming_throttle_activations += 1;
+    } else {
+      root.removeAttribute(STREAMING_THROTTLE_ATTR);
+      stats.streaming_throttle_deactivations += 1;
+    }
+    return true;
   }
 
-  function prepareEditableBlock(block, generating = composerGenerating(), rootUnsafe = null) {
-    if (!enabled || !(block instanceof Element)) return false;
-    const root = block.parentElement;
-    if (!isEditableRoot(root)) return false;
+  function nodeHasStopControl(node) {
+    const element = elementForNode(node);
+    if (!element) return false;
+    for (const selector of STOP_SELECTORS) {
+      try {
+        if (element.matches?.(selector) || element.querySelector?.(selector)) return true;
+      } catch (_) {}
+    }
+    return false;
+  }
 
-    const unsafe = rootUnsafe == null ? editableRootUnsafe(root, generating) : rootUnsafe;
-    if (unsafe || !isHeavyEditableBlock(block)) {
-      clearEditableBlock(block);
-      return false;
+  function updateStreamingThrottleFromMutations(records) {
+    let added = false;
+    let removed = false;
+    for (const record of records) {
+      if (record.type && record.type !== "childList") continue;
+      for (const node of record.addedNodes || []) added ||= nodeHasStopControl(node);
+      for (const node of record.removedNodes || []) removed ||= nodeHasStopControl(node);
+    }
+    if (added && removed) return setStreamingThrottle(composerGenerating());
+    if (added) return setStreamingThrottle(true);
+    if (removed) return setStreamingThrottle(composerGenerating());
+    return false;
+  }
+
+  function safetySnapshot() {
+    const generating = composerGenerating();
+    let streamingMessage = null;
+    if (generating) {
+      const assistants = document.querySelectorAll?.('[data-message-author-role="assistant"]') || [];
+      streamingMessage = assistants.length ? assistants[assistants.length - 1] : null;
     }
 
-    const height = Number(block.getBoundingClientRect?.().height || 0);
-    const cssHeight = cssPixels(height, MAX_EDITABLE_BLOCK_HEIGHT_PX);
-    const previous = lastHeightByEditableBlock.get(block);
-    if (previous === cssHeight && block.getAttribute(EDITABLE_BLOCK_ATTR) === "1") return false;
+    const selected = new Set();
+    const selection = window.getSelection?.();
+    if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+      for (const node of [selection.anchorNode, selection.focusNode]) {
+        const element = elementForNode(node);
+        if (element) selected.add(element);
+      }
+    }
 
+    return {
+      active: document.activeElement,
+      selected,
+      streamingMessage,
+    };
+  }
+
+  function rootUnsafe(root, safety) {
+    if (!isEditableRoot(root)) return true;
+    if (safety.active && safety.active !== document.body && root.contains?.(safety.active)) return true;
+    for (const element of safety.selected) {
+      if (root.contains?.(element)) return true;
+    }
+    return Boolean(safety.streamingMessage && messageFor(root) === safety.streamingMessage);
+  }
+
+  function hasDynamicMedia(block) {
+    try {
+      return Boolean(block?.querySelector?.(DYNAMIC_MEDIA_SELECTOR));
+    } catch (_) {
+      return true;
+    }
+  }
+
+  function applyEditableContainment(block, height) {
+    const cssHeight = cssPixels(height, MAX_EDITABLE_BLOCK_HEIGHT_PX);
+    const previous = blockHeights.get(block);
+    if (previous === cssHeight && block.getAttribute(EDITABLE_BLOCK_ATTR) === "1") return false;
     try {
       block.setAttribute(EDITABLE_BLOCK_ATTR, "1");
       block.style.setProperty(EDITABLE_BLOCK_INTRINSIC_VAR, cssHeight);
@@ -382,26 +354,77 @@
       return false;
     }
 
-    if (previous == null) stats.editable_blocks_prepared += 1;
+    if (previous == null) stats.editable_blocks_contained += 1;
     else stats.editable_blocks_updated += 1;
-    lastHeightByEditableBlock.set(block, cssHeight);
+    blockHeights.set(block, cssHeight);
     stats.last_editable_block_height_px = height;
     stats.max_editable_block_height_px = Math.max(stats.max_editable_block_height_px, height);
     return true;
   }
 
-  function scanEditableRoot(root, generating = composerGenerating()) {
-    if (!enabled || !isEditableRoot(root)) return 0;
-    const unsafe = editableRootUnsafe(root, generating);
-    if (unsafe) {
-      clearEditableRoot(root);
-      return 0;
+  function handleBlockEntries(entries) {
+    if (!enabled) return;
+    const safety = safetySnapshot();
+    const unsafeByRoot = new Map();
+
+    for (const entry of entries) {
+      const block = entry?.target;
+      const root = block?.parentElement;
+      if (!(block instanceof Element) || !isEditableRoot(root) || !block.isConnected) {
+        try { blockObserver?.unobserve?.(block); } catch (_) {}
+        observedBlocks.delete(block);
+        continue;
+      }
+
+      if (!unsafeByRoot.has(root)) unsafeByRoot.set(root, rootUnsafe(root, safety));
+      if (entry.isIntersecting || unsafeByRoot.get(root) || hasDynamicMedia(block)) {
+        clearEditableBlock(block);
+        continue;
+      }
+
+      const height = Number(entry.boundingClientRect?.height || 0);
+      if (!Number.isFinite(height) || height < EDITABLE_BLOCK_MIN_HEIGHT_PX) {
+        clearEditableBlock(block);
+        continue;
+      }
+      applyEditableContainment(block, height);
     }
-    let prepared = 0;
+  }
+
+  function installBlockObserver() {
+    if (blockObserver || typeof IntersectionObserver !== "function") return Boolean(blockObserver);
+    blockObserver = new IntersectionObserver(handleBlockEntries, {
+      root: null,
+      rootMargin: BLOCK_ROOT_MARGIN,
+      threshold: 0,
+    });
+    return true;
+  }
+
+  function observeBlock(block) {
+    if (!enabled || !(block instanceof Element) || !isEditableRoot(block.parentElement)) return false;
+    if (observedBlocks.has(block)) return false;
+    if (!installBlockObserver()) return false;
+    observedBlocks.add(block);
+    blockObserver.observe(block);
+    stats.editable_blocks_observed += 1;
+    return true;
+  }
+
+  function observeRoot(root, rearm = false) {
+    if (!enabled || !isEditableRoot(root)) return false;
+    if (!observedRoots.has(root)) {
+      observedRoots.add(root);
+      stats.editable_roots_observed += 1;
+    }
     for (const block of root.children || []) {
-      prepared += prepareEditableBlock(block, generating, false) ? 1 : 0;
+      if (!observedBlocks.has(block)) observeBlock(block);
+      else if (rearm && blockObserver) {
+        blockObserver.unobserve(block);
+        blockObserver.observe(block);
+      }
     }
-    return prepared;
+    return true;
   }
 
   function installStyle() {
@@ -418,14 +441,22 @@
           content-visibility: auto;
           contain-intrinsic-size: auto var(${VIEWER_INTRINSIC_VAR}, 52px);
         }
-        ${MESSAGE_SELECTOR}[${MESSAGE_ATTR}="1"] {
-          content-visibility: auto;
-          contain-intrinsic-size: auto var(${MESSAGE_INTRINSIC_VAR}, 600px);
-        }
         [data-message-author-role="assistant"] ${EDITABLE_ROOT_SELECTOR} > [${EDITABLE_BLOCK_ATTR}="1"] {
           content-visibility: auto;
-          contain-intrinsic-size: auto var(${EDITABLE_BLOCK_INTRINSIC_VAR}, 64px);
+          contain-intrinsic-size: auto var(${EDITABLE_BLOCK_INTRINSIC_VAR}, 80px);
         }
+      }
+      html[${STREAMING_THROTTLE_ATTR}="1"] [data-message-author-role="assistant"]
+        :not(button, button *, [role="button"], [role="button"] *,
+          [class~="group/tool-message"], [class~="group/tool-message"] *,
+          [aria-busy="true"], [aria-busy="true"] *,
+          [class*="animate-spin"], [class*="animate-pulse"],
+          video, audio, iframe, canvas, svg) {
+        animation-duration: 0.001ms !important;
+        animation-delay: 0ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+        transition-delay: 0ms !important;
       }
     `;
     parent.appendChild(style);
@@ -433,124 +464,126 @@
     return true;
   }
 
-  function collectViewers(records) {
-    const viewers = new Set();
-    for (const record of records) {
-      const target = elementForNode(record.target);
-      if (target) {
-        if (isCurrentViewer(target)) viewers.add(target);
-        const owner = target.closest?.(VIEWER_SELECTOR);
-        if (owner) viewers.add(owner);
-      }
-
-      for (const node of record.addedNodes || []) {
-        const element = elementForNode(node);
-        if (!element) continue;
-        if (isCurrentViewer(element)) viewers.add(element);
-        for (const viewer of element.querySelectorAll?.(VIEWER_SELECTOR) || []) viewers.add(viewer);
-      }
-    }
-    return viewers;
+  function markViewerDirty(viewer) {
+    if (!isCurrentViewer(viewer)) return false;
+    clearViewer(viewer);
+    pendingViewers.add(viewer);
+    return true;
   }
 
-  function collectMessages(records) {
-    const messages = new Set();
-    for (const record of records) {
-      const owner = messageFor(record.target);
-      if (owner) messages.add(owner);
+  function processMutationNode(node) {
+    const element = elementForNode(node);
+    if (!element) return;
 
-      for (const node of record.addedNodes || []) {
-        const element = elementForNode(node);
-        if (!element) continue;
-        if (isMessage(element)) messages.add(element);
-        const nestedOwner = messageFor(element);
-        if (nestedOwner) messages.add(nestedOwner);
-        for (const message of element.querySelectorAll?.(MESSAGE_SELECTOR) || []) {
-          if (isMessage(message)) messages.add(message);
-        }
+    const viewer = viewerFor(element);
+    if (viewer) markViewerDirty(viewer);
+    else if (isCurrentViewer(element)) markViewerDirty(element);
+
+    const root = isEditableRoot(element) ? element : editableRootFor(element);
+    if (root) {
+      const block = editableBlockFor(element);
+      if (block) {
+        clearEditableBlock(block);
+        observeBlock(block);
       }
+      if (element === root) observeRoot(root);
+    } else if (isEditableRoot(element.parentElement)) {
+      clearEditableBlock(element);
+      observeBlock(element);
+      observeRoot(element.parentElement);
     }
-    return messages;
-  }
-
-  function collectEditableBlocks(records) {
-    const blocks = new Set();
-    for (const record of records) {
-      const owner = editableBlockFor(record.target);
-      if (owner) blocks.add(owner);
-
-      for (const node of record.addedNodes || []) {
-        const element = elementForNode(node);
-        if (!element) continue;
-        const block = editableBlockFor(element);
-        if (block) blocks.add(block);
-        if (isEditableRoot(element)) {
-          for (const child of element.children || []) blocks.add(child);
-        }
-        for (const root of element.querySelectorAll?.(EDITABLE_ROOT_SELECTOR) || []) {
-          if (!isEditableRoot(root)) continue;
-          for (const child of root.children || []) blocks.add(child);
-        }
-      }
-    }
-    return blocks;
   }
 
   function handleMutations(records) {
-    if (!enabled) return 0;
+    if (!enabled) return;
     installStyle();
-
-    const generating = composerGenerating();
-    const messages = collectMessages(records);
-    const viewers = collectViewers(records);
-    const blocks = collectEditableBlocks(records);
-
-    // A contained message that is mutating must be revealed before any child
-    // measurement, otherwise a skipped subtree may only expose its old intrinsic
-    // size. Current streaming/focused messages remain revealed until settled.
-    for (const message of messages) clearMessage(message);
-
-    let changed = 0;
-    for (const viewer of viewers) changed += prepareViewer(viewer) ? 1 : 0;
-    const editableRootUnsafeCache = new Map();
-    for (const block of blocks) {
-      const root = block.parentElement;
-      if (!isEditableRoot(root)) continue;
-      if (!editableRootUnsafeCache.has(root)) {
-        editableRootUnsafeCache.set(root, editableRootUnsafe(root, generating));
-      }
-      changed += prepareEditableBlock(block, generating, editableRootUnsafeCache.get(root)) ? 1 : 0;
-    }
-    for (const message of messages) changed += prepareMessage(message, generating) ? 1 : 0;
-
     stats.observer_batches += 1;
-    stats.last_batch_viewers = viewers.size;
-    stats.last_batch_messages = messages.size;
-    stats.last_batch_editable_blocks = blocks.size;
+    stats.mutation_records += records.length;
+    stats.last_batch_records = records.length;
 
-    if (lastGenerating && !generating) queueMicrotask?.(scan);
-    lastGenerating = generating;
-    return changed;
+    for (const record of records) {
+      processMutationNode(record.target);
+      for (const node of record.addedNodes || []) processMutationNode(node);
+      for (const node of record.removedNodes || []) {
+        const element = elementForNode(node);
+        if (element && observedBlocks.has(element)) {
+          try { blockObserver?.unobserve?.(element); } catch (_) {}
+          observedBlocks.delete(element);
+        }
+      }
+    }
+
+    updateStreamingThrottleFromMutations(records);
+    scheduleSettledScan();
   }
 
   function scan() {
     if (!enabled) return 0;
     installStyle();
-    const generating = composerGenerating();
-    let changed = 0;
+    installBlockObserver();
+    setStreamingThrottle(composerGenerating());
+    const started = performance.now?.() || 0;
+    let discovered = 0;
 
     for (const viewer of document.querySelectorAll?.(VIEWER_SELECTOR) || []) {
-      changed += prepareViewer(viewer) ? 1 : 0;
-    }
-    for (const root of document.querySelectorAll?.(EDITABLE_ROOT_SELECTOR) || []) {
-      changed += scanEditableRoot(root, generating);
-    }
-    for (const message of document.querySelectorAll?.(MESSAGE_SELECTOR) || []) {
-      changed += prepareMessage(message, generating) ? 1 : 0;
+      pendingViewers.add(viewer);
+      discovered += 1;
     }
 
-    lastGenerating = generating;
-    return changed;
+    for (const root of document.querySelectorAll?.(EDITABLE_ROOT_SELECTOR) || []) {
+      if (!isEditableRoot(root)) continue;
+      observeRoot(root, true);
+      discovered += 1;
+    }
+
+    for (const block of Array.from(observedBlocks)) {
+      if (!block?.isConnected || !isEditableRoot(block.parentElement)) {
+        try { blockObserver?.unobserve?.(block); } catch (_) {}
+        observedBlocks.delete(block);
+      }
+    }
+    for (const root of Array.from(observedRoots)) {
+      if (!root?.isConnected || !isEditableRoot(root)) observedRoots.delete(root);
+    }
+
+    for (const viewer of Array.from(pendingViewers)) {
+      pendingViewers.delete(viewer);
+      if (viewer?.isConnected) prepareViewer(viewer);
+    }
+
+    stats.idle_scans += 1;
+    const ended = performance.now?.() || started;
+    stats.last_scan_ms = Math.max(0, ended - started);
+    return discovered;
+  }
+
+  function runSettledScan() {
+    quietTimer = null;
+    if (!enabled || !discoveryPending) return;
+    const now = performance.now?.() || Date.now();
+    const remaining = QUIET_MS - (now - lastMutationAt);
+    if (remaining > 0) {
+      quietTimer = setTimeout(runSettledScan, Math.ceil(remaining));
+      return;
+    }
+    discoveryPending = false;
+
+    const run = () => {
+      idleHandle = null;
+      if (enabled) scan();
+    };
+    if (typeof requestIdleCallback === "function") {
+      idleHandle = requestIdleCallback(run);
+    } else {
+      idleHandle = setTimeout(run, 0);
+    }
+  }
+
+  function scheduleSettledScan() {
+    discoveryPending = true;
+    lastMutationAt = performance.now?.() || Date.now();
+    if (quietTimer != null) return;
+    quietTimer = setTimeout(runSettledScan, QUIET_MS);
   }
 
   function startObserver() {
@@ -561,93 +594,75 @@
   }
 
   function handleFocusIn(event) {
-    const message = messageFor(event?.target);
-    if (message) clearMessage(message);
     const root = editableRootFor(event?.target);
     if (root) clearEditableRoot(root);
   }
 
   function handleFocusOut(event) {
-    const message = messageFor(event?.target);
     const root = editableRootFor(event?.target);
-    queueMicrotask?.(() => {
-      if (!enabled) return;
-      const generating = composerGenerating();
-      if (root && !containsActiveElement(root)) scanEditableRoot(root, generating);
-      if (message && !containsActiveElement(message)) prepareMessage(message, generating);
-    });
-  }
-
-  function scheduleSelectionRefresh() {
-    if (selectionRefreshScheduled) return;
-    selectionRefreshScheduled = true;
-    const run = () => {
-      selectionRefreshScheduled = false;
-      if (enabled) scan();
-    };
-    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
-    else setTimeout(run, 0);
+    if (root) observeRoot(root, true);
+    scheduleSettledScan();
   }
 
   function handleSelectionChange() {
-    for (const element of selectionElements()) {
-      const message = messageFor(element);
-      if (message) clearMessage(message);
-      const root = editableRootFor(element);
-      if (root) clearEditableRoot(root);
+    if (!enabled) return;
+    const selection = window.getSelection?.();
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      scheduleSettledScan();
+      return;
     }
-    scheduleSelectionRefresh();
+    const roots = new Set();
+    for (const node of [selection.anchorNode, selection.focusNode]) {
+      const root = editableRootFor(node);
+      if (root) roots.add(root);
+    }
+    for (const root of roots) clearEditableRoot(root);
   }
 
   function installListeners() {
-    if (listenersInstalled || typeof document.addEventListener !== "function") return false;
+    if (listenersInstalled || typeof document.addEventListener !== "function") return;
     document.addEventListener("focusin", handleFocusIn, true);
     document.addEventListener("focusout", handleFocusOut, true);
     document.addEventListener("selectionchange", handleSelectionChange, true);
     listenersInstalled = true;
-    return true;
   }
 
   function removeListeners() {
-    if (!listenersInstalled || typeof document.removeEventListener !== "function") return false;
+    if (!listenersInstalled || typeof document.removeEventListener !== "function") return;
     document.removeEventListener("focusin", handleFocusIn, true);
     document.removeEventListener("focusout", handleFocusOut, true);
     document.removeEventListener("selectionchange", handleSelectionChange, true);
     listenersInstalled = false;
-    return true;
   }
 
-  function cleanCurrentViewers() {
+  function cleanupContainment() {
     for (const viewer of document.querySelectorAll?.(`${VIEWER_SELECTOR}[${VIEWER_ATTR}="1"]`) || []) {
-      try {
-        viewer.removeAttribute(VIEWER_ATTR);
-        viewer.style.removeProperty(VIEWER_INTRINSIC_VAR);
-      } catch (_) {}
+      clearViewer(viewer);
     }
-  }
-
-  function cleanCurrentMessages() {
-    for (const message of document.querySelectorAll?.(`${MESSAGE_SELECTOR}[${MESSAGE_ATTR}="1"]`) || []) {
-      try {
-        message.removeAttribute(MESSAGE_ATTR);
-        message.style.removeProperty(MESSAGE_INTRINSIC_VAR);
-      } catch (_) {}
-    }
-  }
-
-  function cleanCurrentEditableBlocks() {
     for (const block of document.querySelectorAll?.(`[${EDITABLE_BLOCK_ATTR}="1"]`) || []) {
-      try {
-        block.removeAttribute(EDITABLE_BLOCK_ATTR);
-        block.style.removeProperty(EDITABLE_BLOCK_INTRINSIC_VAR);
-      } catch (_) {}
+      clearEditableBlock(block);
     }
+    try { document.documentElement?.removeAttribute(STREAMING_THROTTLE_ATTR); } catch (_) {}
+  }
+
+  function cancelScheduledWork() {
+    if (quietTimer != null) {
+      clearTimeout(quietTimer);
+      quietTimer = null;
+    }
+    if (idleHandle != null) {
+      if (typeof cancelIdleCallback === "function") cancelIdleCallback(idleHandle);
+      else clearTimeout(idleHandle);
+      idleHandle = null;
+    }
+    discoveryPending = false;
   }
 
   installStyle();
+  installBlockObserver();
   startObserver();
   installListeners();
-  queueMicrotask?.(scan);
+  scheduleSettledScan();
 
   const api = {
     version: VERSION,
@@ -655,22 +670,29 @@
     scan,
     disable() {
       enabled = false;
-      observer?.disconnect();
+      observer?.disconnect?.();
       observer = null;
+      blockObserver?.disconnect?.();
+      blockObserver = null;
+      cancelScheduledWork();
       removeListeners();
+      cleanupContainment();
+      pendingViewers.clear();
+      observedRoots.clear();
+      observedBlocks.clear();
       styleElement?.remove?.();
       styleElement = null;
-      cleanCurrentViewers();
-      cleanCurrentMessages();
-      cleanCurrentEditableBlocks();
       return { enabled };
     },
     enable() {
+      if (enabled) return { enabled };
       enabled = true;
       installStyle();
+      installBlockObserver();
       startObserver();
       installListeners();
-      scan();
+      setStreamingThrottle(composerGenerating());
+      scheduleSettledScan();
       return { enabled };
     },
     get enabled() { return enabled; },
