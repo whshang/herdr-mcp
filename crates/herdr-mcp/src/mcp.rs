@@ -263,6 +263,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
+            } else if method == crate::progressive_skills::EXEC_SEQUENCE_METHOD {
+                utility_exec::run_sequence(
+                    context.client,
+                    &context.cache.snapshot(),
+                    context.exec,
+                    &params,
+                )
             } else {
                 native_tools::call_with_local(
                     context.client,

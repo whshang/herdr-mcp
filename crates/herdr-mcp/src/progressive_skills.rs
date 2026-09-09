@@ -17,6 +17,7 @@ pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
 pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
 pub const GITHUB_STATUS_METHOD: &str = "herdr_mcp.github.status";
+pub const EXEC_SEQUENCE_METHOD: &str = "herdr_mcp.exec.sequence";
 pub const TEXT_READ_METHOD: &str = "herdr_mcp.text.read";
 pub const TEXT_WRITE_METHOD: &str = "herdr_mcp.text.write";
 pub const WORK_MEMORY_BIND_METHOD: &str = "work_memory.bind";
@@ -112,6 +113,38 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 },
                 "required": ["project_root"],
                 "empty": false,
+            },
+        }),
+        json!({
+            "method": EXEC_SEQUENCE_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "mutation",
+            "effect": "bounded_sequential_exec",
+            "params": {
+                "properties": {
+                    "workspace": {"type": "string", "minLength": 1},
+                    "project_root": {"type": "string"},
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "maxLength": 32, "pattern": "^[A-Za-z0-9._-]+$"},
+                                "command": {"type": "string", "minLength": 1, "maxLength": 8192}
+                            },
+                            "required": ["command"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 60000},
+                    "confirm_busy": {"type": "boolean"},
+                    "continue_on_error": {"type": "boolean"}
+                },
+                "required": ["workspace", "steps"],
+                "empty": false,
+                "additionalProperties": false,
             },
         }),
         json!({
@@ -2324,6 +2357,16 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0]["method"], GITHUB_STATUS_METHOD);
         assert_eq!(methods[0]["params"]["required"][0], "project_root");
+
+        let methods = local_method_schemas("exec.sequence");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["method"], EXEC_SEQUENCE_METHOD);
+        assert_eq!(methods[0]["access"], "mutation");
+        assert_eq!(methods[0]["params"]["properties"]["steps"]["maxItems"], 8);
+        assert_eq!(
+            methods[0]["params"]["properties"]["steps"]["items"]["additionalProperties"],
+            false
+        );
 
         let methods = local_method_schemas("work_memory.");
         assert_eq!(methods.len(), 6);

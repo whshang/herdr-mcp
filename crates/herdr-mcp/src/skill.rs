@@ -448,6 +448,12 @@ fn runtime_context(config: &SkillConfig) -> Value {
             "server_concurrent_requests": true,
             "jsonrpc_batch": false,
             "multi_operation_tool_args": false,
+            "private_exec_sequence": {
+                "available": true,
+                "method": "herdr_mcp.exec.sequence",
+                "max_steps": 8,
+                "scope": "same workspace/project; ordered bounded shell steps known before execution",
+            },
             "read_policy": "parallel independent reads when the MCP client supports concurrent calls",
             "mutation_policy": "ordered by default within one project",
         },
@@ -790,6 +796,14 @@ mod tests {
         assert_eq!(
             runtime["tool_execution"]["multi_operation_tool_args"],
             false
+        );
+        assert_eq!(
+            runtime["tool_execution"]["private_exec_sequence"]["method"],
+            "herdr_mcp.exec.sequence"
+        );
+        assert_eq!(
+            runtime["tool_execution"]["private_exec_sequence"]["max_steps"],
+            8
         );
         let encoded = runtime.to_string();
         assert!(!encoded.contains("secret"));

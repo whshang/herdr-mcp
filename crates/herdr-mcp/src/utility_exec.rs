@@ -4,7 +4,7 @@ use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
 use crate::projects;
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -29,6 +29,10 @@ const PRE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: usize = 8_000;
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_SEQUENCE_STEPS: usize = 8;
+const MAX_SEQUENCE_STEP_BYTES: usize = 8 * 1024;
+const MAX_SEQUENCE_COMMAND_BYTES: usize = 32 * 1024;
+const MAX_SEQUENCE_ID_BYTES: usize = 32;
 static NEXT_EXEC: AtomicU64 = AtomicU64::new(0);
 static UTILITY_PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static UTILITY_PANE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -66,6 +70,12 @@ struct LocalResult {
     output: String,
     timed_out: bool,
     truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SequenceStep {
+    id: String,
+    command: String,
 }
 
 pub fn run_durable(
@@ -176,6 +186,265 @@ pub fn run_durable(
     )
 }
 
+pub fn run_sequence(
+    client: &HerdrClient,
+    snapshot: &Value,
+    registry: &ExecRegistry,
+    args: &Value,
+) -> Value {
+    let Some(object) = args.as_object() else {
+        return invalid("sequence params must be an object");
+    };
+    const ALLOWED: &[&str] = &[
+        "workspace",
+        "project_root",
+        "steps",
+        "timeout_ms",
+        "confirm_busy",
+        "continue_on_error",
+    ];
+    if let Some(key) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
+        return invalid(&format!("unknown sequence param: {key}"));
+    }
+
+    let workspace = match required_str(args, "workspace") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => return invalid("workspace must not be empty"),
+        Err(error) => return error,
+    };
+    let project_root = match optional_str(args, "project_root") {
+        Ok(value) => value.map(str::to_owned),
+        Err(error) => return error,
+    };
+    let timeout_ms = match optional_u64(args, "timeout_ms", 1, MAX_TIMEOUT_MS) {
+        Ok(value) => value.unwrap_or(DEFAULT_TIMEOUT_MS),
+        Err(error) => return error,
+    };
+    let confirm_busy = match optional_bool(args, "confirm_busy") {
+        Ok(value) => value.unwrap_or(false),
+        Err(error) => return error,
+    };
+    let continue_on_error = match optional_bool(args, "continue_on_error") {
+        Ok(value) => value.unwrap_or(false),
+        Err(error) => return error,
+    };
+    let steps = match parse_sequence_steps(args.get("steps")) {
+        Ok(value) => value,
+        Err(message) => return invalid(&message),
+    };
+
+    let status_path = match create_sequence_status_path() {
+        Ok(path) => path,
+        Err(message) => {
+            return json!({
+                "ok": false,
+                "code": "exec_sequence_status_failed",
+                "message": message,
+                "delivery_state": "not_delivered",
+                "retryable": true,
+            });
+        }
+    };
+    let combined = build_sequence_command(&steps, &status_path, continue_on_error);
+    let mut durable_args = Map::new();
+    durable_args.insert("workspace".to_owned(), json!(workspace));
+    durable_args.insert("command".to_owned(), json!(combined));
+    durable_args.insert("timeout_ms".to_owned(), json!(timeout_ms));
+    durable_args.insert("confirm_busy".to_owned(), json!(confirm_busy));
+    if let Some(project_root) = project_root {
+        durable_args.insert("project_root".to_owned(), json!(project_root));
+    }
+
+    let mut result = run_durable(client, snapshot, registry, &Value::Object(durable_args));
+    let terminal = result.get("phase").and_then(Value::as_str) == Some("completed");
+    let step_states = sequence_step_states(&steps, &status_path, terminal, continue_on_error);
+    let has_session = result.get("session_id").and_then(Value::as_str).is_some();
+    if terminal || !has_session {
+        let _ = fs::remove_file(&status_path);
+    }
+    if let Some(object) = result.as_object_mut() {
+        object.remove("command");
+        object.insert("sequence".to_owned(), json!(true));
+        object.insert("step_count".to_owned(), json!(steps.len()));
+        object.insert("continue_on_error".to_owned(), json!(continue_on_error));
+        object.insert("steps".to_owned(), Value::Array(step_states));
+    }
+    result
+}
+
+fn parse_sequence_steps(value: Option<&Value>) -> Result<Vec<SequenceStep>, String> {
+    let steps = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| "steps must be a non-empty array".to_owned())?;
+    if steps.is_empty() || steps.len() > MAX_SEQUENCE_STEPS {
+        return Err(format!("steps must contain 1..={MAX_SEQUENCE_STEPS} items"));
+    }
+    let mut parsed = Vec::with_capacity(steps.len());
+    let mut seen = HashSet::new();
+    let mut total_bytes = 0usize;
+    for (index, value) in steps.iter().enumerate() {
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("steps[{index}] must be an object"))?;
+        if let Some(key) = object
+            .keys()
+            .find(|key| !matches!(key.as_str(), "id" | "command"))
+        {
+            return Err(format!("steps[{index}] has unknown field: {key}"));
+        }
+        let id = match object.get("id") {
+            None => format!("step-{}", index + 1),
+            Some(Value::String(value)) if valid_sequence_id(value) => value.clone(),
+            Some(Value::String(_)) => return Err(format!("steps[{index}].id is invalid")),
+            Some(_) => return Err(format!("steps[{index}].id must be a string")),
+        };
+        if !seen.insert(id.clone()) {
+            return Err(format!("duplicate step id: {id}"));
+        }
+        let command = object
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("steps[{index}].command must be a string"))?;
+        if command.trim().is_empty() || command.as_bytes().contains(&0) {
+            return Err(format!(
+                "steps[{index}].command must not be empty or contain NUL"
+            ));
+        }
+        if command.len() > MAX_SEQUENCE_STEP_BYTES {
+            return Err(format!(
+                "steps[{index}].command exceeds {MAX_SEQUENCE_STEP_BYTES} bytes"
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(command.len());
+        if total_bytes > MAX_SEQUENCE_COMMAND_BYTES {
+            return Err(format!(
+                "sequence command payload exceeds {MAX_SEQUENCE_COMMAND_BYTES} bytes"
+            ));
+        }
+        parsed.push(SequenceStep {
+            id,
+            command: command.to_owned(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn valid_sequence_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SEQUENCE_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn create_sequence_status_path() -> Result<PathBuf, String> {
+    let sequence = NEXT_EXEC.fetch_add(1, Ordering::Relaxed);
+    let path = env::temp_dir().join(format!(
+        "herdr-mcp-exec-sequence-{}-{}-{sequence}.status",
+        std::process::id(),
+        now_ms()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("cannot create sequence status file: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot initialize sequence status file: {error}"))?;
+    Ok(path)
+}
+
+fn build_sequence_command(
+    steps: &[SequenceStep],
+    status_path: &Path,
+    continue_on_error: bool,
+) -> String {
+    let status = shell_quote(status_path.to_string_lossy().as_ref());
+    let mut lines = vec!["umask 077".to_owned(), "wave_rc=0".to_owned()];
+    for step in steps {
+        let id = shell_quote(&step.id);
+        lines.push(format!("printf '[herdr-step:%s] start\\n' {id} >&2"));
+        lines.push(format!("printf '%s\\tstart\\n' {id} >> {status}"));
+        lines.push("(".to_owned());
+        lines.push(step.command.clone());
+        lines.push(")".to_owned());
+        lines.push("step_rc=$?".to_owned());
+        lines.push(format!(
+            "printf '%s\\tend\\t%s\\n' {id} \"$step_rc\" >> {status}"
+        ));
+        lines.push(format!(
+            "printf '[herdr-step:%s] exit=%s\\n' {id} \"$step_rc\" >&2"
+        ));
+        lines.push(
+            "if [ \"$step_rc\" -ne 0 ] && [ \"$wave_rc\" -eq 0 ]; then wave_rc=\"$step_rc\"; fi"
+                .to_owned(),
+        );
+        if !continue_on_error {
+            lines.push("if [ \"$step_rc\" -ne 0 ]; then exit \"$step_rc\"; fi".to_owned());
+        }
+    }
+    lines.push("exit \"$wave_rc\"".to_owned());
+    lines.join("\n")
+}
+
+fn sequence_step_states(
+    steps: &[SequenceStep],
+    status_path: &Path,
+    terminal: bool,
+    continue_on_error: bool,
+) -> Vec<Value> {
+    let mut started = HashSet::<String>::new();
+    let mut ended = HashMap::<String, i32>::new();
+    if let Ok(raw) = fs::read_to_string(status_path) {
+        for line in raw.lines() {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            match fields.as_slice() {
+                [id, "start"] if steps.iter().any(|step| step.id == *id) => {
+                    started.insert((*id).to_owned());
+                }
+                [id, "end", code] if steps.iter().any(|step| step.id == *id) => {
+                    if let Ok(code) = code.parse::<i32>() {
+                        ended.insert((*id).to_owned(), code);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut prior_failure = false;
+    steps
+        .iter()
+        .map(|step| {
+            let (status, exit_code) = if let Some(code) = ended.get(&step.id).copied() {
+                if code == 0 {
+                    ("passed", Some(code))
+                } else {
+                    prior_failure = true;
+                    ("failed", Some(code))
+                }
+            } else if started.contains(&step.id) {
+                if terminal {
+                    ("interrupted", None)
+                } else {
+                    ("running", None)
+                }
+            } else if terminal && prior_failure && !continue_on_error {
+                ("skipped", None)
+            } else {
+                ("not_started", None)
+            };
+            json!({
+                "id": step.id,
+                "status": status,
+                "exit_code": exit_code,
+            })
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 fn run_unix_durable(
     client: &HerdrClient,
@@ -188,6 +457,21 @@ fn run_unix_durable(
 ) -> Value {
     let (workspace_id, effective_root) = target;
     let started = Instant::now();
+    #[cfg(target_os = "macos")]
+    if linked_worktree_gitdir_is_protected(effective_root) {
+        return local_fallback(
+            command,
+            effective_root,
+            workspace_id,
+            timeout_ms,
+            "linked_worktree_git_metadata_requires_runtime",
+            working,
+            Some(
+                "linked worktree Git metadata resolves into a macOS protected user folder; the visible utility pane may not be able to read the worktree control files"
+                    .to_owned(),
+            ),
+        );
+    }
     let (pane_id, created) =
         match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
             Ok(value) => value,
@@ -641,6 +925,41 @@ fn utility_pane_readiness(raw: &Value) -> PaneReadiness {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn linked_worktree_gitdir_is_protected(root: &Path) -> bool {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    linked_worktree_gitdir_is_protected_for_home(root, &home)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn linked_worktree_gitdir_is_protected_for_home(root: &Path, home: &Path) -> bool {
+    let marker = root.join(".git");
+    let Ok(metadata) = fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(raw) = fs::read_to_string(&marker) else {
+        return false;
+    };
+    let Some(raw_gitdir) = raw.trim().strip_prefix("gitdir: ") else {
+        return false;
+    };
+    let gitdir = PathBuf::from(raw_gitdir);
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        root.join(gitdir)
+    };
+    ["Documents", "Desktop", "Downloads"]
+        .into_iter()
+        .map(|name| home.join(name))
+        .any(|protected| gitdir.starts_with(protected))
+}
+
 fn finite_pid(value: Option<&Value>) -> Option<u64> {
     value
         .and_then(Value::as_u64)
@@ -719,7 +1038,10 @@ fn cleanup_stale_scripts() -> usize {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with("herdr-mcp-exec-") || !name.ends_with(".sh") {
+        let stale_exec_script = name.starts_with("herdr-mcp-exec-") && name.ends_with(".sh");
+        let stale_sequence_status =
+            name.starts_with("herdr-mcp-exec-sequence-") && name.ends_with(".status");
+        if !stale_exec_script && !stale_sequence_status {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
@@ -1052,6 +1374,196 @@ mod tests {
             select_project_root(Some("/tmp/c"), &roots).unwrap_err(),
             PathBuf::from("/tmp/c")
         );
+    }
+
+    #[test]
+    fn sequence_steps_are_bounded_unique_and_strict() {
+        let parsed = parse_sequence_steps(Some(&json!([
+            {"id": "fmt", "command": "cargo fmt --check"},
+            {"command": "cargo test -q"}
+        ])))
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "fmt");
+        assert_eq!(parsed[1].id, "step-2");
+
+        assert!(parse_sequence_steps(Some(&json!([]))).is_err());
+        assert!(
+            parse_sequence_steps(Some(&json!([
+                {"id": "dup", "command": "true"},
+                {"id": "dup", "command": "true"}
+            ])))
+            .is_err()
+        );
+        assert!(
+            parse_sequence_steps(Some(&json!([
+                {"id": "bad id", "command": "true"}
+            ])))
+            .is_err()
+        );
+        assert!(
+            parse_sequence_steps(Some(&json!([
+                {"id": "x", "command": "true", "cwd": "/tmp"}
+            ])))
+            .is_err()
+        );
+        let too_many = (0..=MAX_SEQUENCE_STEPS)
+            .map(|index| json!({"id": format!("s{index}"), "command": "true"}))
+            .collect::<Vec<_>>();
+        assert!(parse_sequence_steps(Some(&Value::Array(too_many))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sequence_stops_after_failure_and_reports_skipped_steps() {
+        let status = env::temp_dir().join(format!(
+            "herdr-sequence-stop-{}-{}.status",
+            std::process::id(),
+            NEXT_EXEC.fetch_add(1, Ordering::Relaxed)
+        ));
+        let steps = vec![
+            SequenceStep {
+                id: "one".to_owned(),
+                command: "true".to_owned(),
+            },
+            SequenceStep {
+                id: "two".to_owned(),
+                command: "exit 7".to_owned(),
+            },
+            SequenceStep {
+                id: "three".to_owned(),
+                command: "true".to_owned(),
+            },
+        ];
+        let command = build_sequence_command(&steps, &status, false);
+        let result = Command::new(resolve_exec_shell())
+            .arg("-c")
+            .arg(command)
+            .status()
+            .unwrap();
+        assert_eq!(result.code(), Some(7));
+        let states = sequence_step_states(&steps, &status, true, false);
+        assert_eq!(states[0]["status"], "passed");
+        assert_eq!(states[1]["status"], "failed");
+        assert_eq!(states[1]["exit_code"], 7);
+        assert_eq!(states[2]["status"], "skipped");
+        fs::remove_file(status).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sequence_continue_on_error_runs_remaining_steps() {
+        let status = env::temp_dir().join(format!(
+            "herdr-sequence-continue-{}-{}.status",
+            std::process::id(),
+            NEXT_EXEC.fetch_add(1, Ordering::Relaxed)
+        ));
+        let steps = vec![
+            SequenceStep {
+                id: "bad".to_owned(),
+                command: "exit 9".to_owned(),
+            },
+            SequenceStep {
+                id: "after".to_owned(),
+                command: "true".to_owned(),
+            },
+        ];
+        let command = build_sequence_command(&steps, &status, true);
+        let result = Command::new(resolve_exec_shell())
+            .arg("-c")
+            .arg(command)
+            .status()
+            .unwrap();
+        assert_eq!(result.code(), Some(9));
+        let states = sequence_step_states(&steps, &status, true, true);
+        assert_eq!(states[0]["status"], "failed");
+        assert_eq!(states[1]["status"], "passed");
+        fs::remove_file(status).ok();
+    }
+
+    #[test]
+    fn sequence_terminal_partial_step_is_interrupted_not_running() {
+        let status = env::temp_dir().join(format!(
+            "herdr-sequence-interrupted-{}-{}.status",
+            std::process::id(),
+            NEXT_EXEC.fetch_add(1, Ordering::Relaxed)
+        ));
+        let steps = vec![SequenceStep {
+            id: "active".to_owned(),
+            command: "sleep 10".to_owned(),
+        }];
+        fs::write(&status, "active\tstart\n").unwrap();
+        let running = sequence_step_states(&steps, &status, false, false);
+        assert_eq!(running[0]["status"], "running");
+        let terminal = sequence_step_states(&steps, &status, true, false);
+        assert_eq!(terminal[0]["status"], "interrupted");
+        fs::remove_file(status).ok();
+    }
+
+    #[test]
+    fn linked_worktree_protected_gitdir_is_detected_without_git_probe() {
+        let base = env::temp_dir().join(format!(
+            "herdr-linked-worktree-{}-{}",
+            std::process::id(),
+            NEXT_EXEC.fetch_add(1, Ordering::Relaxed)
+        ));
+        let home = base.join("home");
+        let root = base.join("worktree");
+        fs::create_dir_all(&root).unwrap();
+        let protected = home.join("Documents").join("repo/.git/worktrees/feature");
+        fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", protected.display()),
+        )
+        .unwrap();
+        assert!(linked_worktree_gitdir_is_protected_for_home(&root, &home));
+
+        let ordinary = home.join("src/repo/.git/worktrees/feature");
+        fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", ordinary.display()),
+        )
+        .unwrap();
+        assert!(!linked_worktree_gitdir_is_protected_for_home(&root, &home));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn protected_linked_worktree_falls_back_before_pane_delivery() {
+        let base = env::temp_dir().join(format!(
+            "herdr-linked-fallback-{}-{}",
+            std::process::id(),
+            NEXT_EXEC.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = base.join("worktree");
+        fs::create_dir_all(&root).unwrap();
+        let home = env::var_os("HOME").map(PathBuf::from).unwrap();
+        let protected = home.join("Documents").join("repo/.git/worktrees/perf-test");
+        fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", protected.display()),
+        )
+        .unwrap();
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+        let client = HerdrClient::new(base.join("missing.sock"));
+        let result = run_unix_durable(
+            &client,
+            &json!({}),
+            &registry,
+            ("w-test", &root),
+            "printf fallback-ok",
+            5_000,
+            &[],
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["backend"], "local_fallback");
+        assert_eq!(
+            result["fallback_reason"],
+            "linked_worktree_git_metadata_requires_runtime"
+        );
+        assert_eq!(result["output"], "fallback-ok");
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]
