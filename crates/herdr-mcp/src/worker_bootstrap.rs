@@ -1585,21 +1585,28 @@ pub(crate) fn client_for_edge_origin(
     let direct = EdgeHttpClient::direct()?;
     match probe_edge_transport(&direct, edge_origin) {
         Ok(()) => Ok(direct.client),
+        Err(error) if !error.may_retry_via_proxy() => Err(error.into_message()),
         Err(error) => {
-            let mut last_transport_error = error;
+            let mut last_transport_error = error.into_message();
 
             if let Some(proxy) = crate::link::proxy::resolve_link_proxy() {
                 let proxied = EdgeHttpClient::via_proxy(&proxy)?;
                 match probe_edge_transport(&proxied, edge_origin) {
                     Ok(()) => return Ok(proxied.client),
-                    Err(error) => last_transport_error = error,
+                    Err(error) if !error.may_retry_via_proxy() => {
+                        return Err(error.into_message());
+                    }
+                    Err(error) => last_transport_error = error.into_message(),
                 }
             }
 
             match trusted_dns_direct_client(edge_origin) {
                 Ok(Some(resolved)) => match probe_edge_transport(&resolved, edge_origin) {
                     Ok(()) => return Ok(resolved.client),
-                    Err(error) => last_transport_error = error,
+                    Err(error) if !error.may_retry_via_proxy() => {
+                        return Err(error.into_message());
+                    }
+                    Err(error) => last_transport_error = error.into_message(),
                 },
                 Ok(None) => {}
                 Err(error) => {
@@ -1617,7 +1624,8 @@ pub(crate) fn client_for_edge_origin(
                         format!("{last_transport_error}; trusted DNS fallback unavailable: {error}")
                     })?;
                     let resolved = EdgeHttpClient::via_socks_resolved(&socks, &host, &ips)?;
-                    probe_edge_transport(&resolved, edge_origin)?;
+                    probe_edge_transport(&resolved, edge_origin)
+                        .map_err(EdgeHealthProbeError::into_message)?;
                     return Ok(resolved.client);
                 }
             }
@@ -1627,27 +1635,62 @@ pub(crate) fn client_for_edge_origin(
     }
 }
 
-fn probe_edge_transport(edge_http: &EdgeHttpClient, edge_origin: &str) -> Result<(), String> {
+fn probe_edge_transport(
+    edge_http: &EdgeHttpClient,
+    edge_origin: &str,
+) -> Result<(), EdgeHealthProbeError> {
     let response = edge_http
         .client
         .get(format!("{edge_origin}/health"))
         .send()
-        .map_err(|error| format!("Worker HTTP preflight failed: {error}"))?;
+        .map_err(|error| {
+            EdgeHealthProbeError::Transport(format!("Worker HTTP preflight failed: {error}"))
+        })?;
     if !response.status().is_success() {
-        return Err(format!(
-            "Worker HTTP preflight returned HTTP {}",
-            response.status().as_u16()
+        return Err(edge_health_http_error(
+            "Worker HTTP preflight",
+            response.status(),
         ));
     }
-    let payload: Value = response
-        .json()
-        .map_err(|_| "Worker HTTP preflight returned non-JSON".to_owned())?;
+    let payload: Value = response.json().map_err(|_| {
+        EdgeHealthProbeError::Validation("Worker HTTP preflight returned non-JSON".to_owned())
+    })?;
+    validate_edge_transport_payload(&payload, edge_origin).map_err(EdgeHealthProbeError::Validation)
+}
+
+fn validate_edge_transport_payload(payload: &Value, edge_origin: &str) -> Result<(), String> {
     let service = payload
         .get("service")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Worker HTTP preflight returned no service identity".to_owned())?;
-    validate_health_payload(&payload, service, None)
+    match expected_worker_service_from_origin(edge_origin)? {
+        Some(expected) if service != expected => {
+            return Err(
+                "Worker HTTP preflight service identity does not match Worker origin".to_owned(),
+            );
+        }
+        Some(_) => {}
+        None if !valid_worker_name(service) || !service.starts_with("herdr-edge-") => {
+            return Err("Worker HTTP preflight service identity is not a Herdr Worker".to_owned());
+        }
+        None => {}
+    }
+    validate_health_payload(payload, service, None)
+}
+
+fn expected_worker_service_from_origin(edge_origin: &str) -> Result<Option<String>, String> {
+    let host = edge_origin_host(edge_origin)?;
+    let Some(prefix) = host.strip_suffix(".workers.dev") else {
+        return Ok(None);
+    };
+    let (worker, account_subdomain) = prefix
+        .split_once('.')
+        .ok_or_else(|| "workers.dev Edge origin is missing its account subdomain".to_owned())?;
+    if !valid_worker_name(worker) || account_subdomain.is_empty() {
+        return Err("workers.dev Edge origin has an invalid Worker identity".to_owned());
+    }
+    Ok(Some(worker.to_owned()))
 }
 
 fn trusted_dns_direct_client(edge_origin: &str) -> Result<Option<EdgeHttpClient>, String> {
@@ -1783,16 +1826,28 @@ fn probe_health(
             EdgeHealthProbeError::Transport(format!("Worker health probe failed: {error}"))
         })?;
     if !response.status().is_success() {
-        return Err(EdgeHealthProbeError::Validation(format!(
-            "Worker health probe returned HTTP {}",
-            response.status().as_u16()
-        )));
+        return Err(edge_health_http_error(
+            "Worker health probe",
+            response.status(),
+        ));
     }
     let payload: Value = response.json().map_err(|_| {
         EdgeHealthProbeError::Validation("Worker health returned non-JSON".to_owned())
     })?;
     validate_health_payload(&payload, worker_name, expected_version)
         .map_err(EdgeHealthProbeError::Validation)
+}
+
+fn edge_health_http_error(context: &str, status: reqwest::StatusCode) -> EdgeHealthProbeError {
+    let message = format!("{context} returned HTTP {}", status.as_u16());
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        EdgeHealthProbeError::Transport(message)
+    } else {
+        EdgeHealthProbeError::Validation(message)
+    }
 }
 
 fn validate_health_payload(
@@ -2244,6 +2299,64 @@ mod tests {
         assert!(EdgeHealthProbeError::Transport("timeout".to_owned()).may_retry_via_proxy());
         assert!(
             !EdgeHealthProbeError::Validation("wrong contract".to_owned()).may_retry_via_proxy()
+        );
+
+        for status in [408, 429, 500, 502, 503, 504, 524] {
+            assert!(
+                edge_health_http_error("health", reqwest::StatusCode::from_u16(status).unwrap())
+                    .may_retry_via_proxy(),
+                "HTTP {status} should remain route-retryable for a read-only health probe"
+            );
+        }
+        for status in [400, 401, 403, 404, 409] {
+            assert!(
+                !edge_health_http_error("health", reqwest::StatusCode::from_u16(status).unwrap())
+                    .may_retry_via_proxy(),
+                "HTTP {status} should fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn management_health_preflight_binds_workers_dev_service_and_fails_closed() {
+        let payload = json!({
+            "ok": true,
+            "service": "herdr-edge-mac",
+            "contractEpoch": 2,
+            "contractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
+        });
+        assert!(
+            validate_edge_transport_payload(&payload, "https://herdr-edge-mac.example.workers.dev")
+                .is_ok()
+        );
+        assert!(
+            validate_edge_transport_payload(
+                &payload,
+                "https://herdr-edge-other.example.workers.dev"
+            )
+            .unwrap_err()
+            .contains("does not match Worker origin")
+        );
+        assert_eq!(
+            expected_worker_service_from_origin("https://herdr-edge-mac.example.workers.dev")
+                .unwrap()
+                .as_deref(),
+            Some("herdr-edge-mac")
+        );
+    }
+
+    #[test]
+    fn management_health_preflight_rejects_non_herdr_custom_domain_service() {
+        let payload = json!({
+            "ok": true,
+            "service": "other-service",
+            "contractEpoch": 2,
+            "contractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
+        });
+        assert!(
+            validate_edge_transport_payload(&payload, "https://mcp.example.com")
+                .unwrap_err()
+                .contains("not a Herdr Worker")
         );
     }
 
