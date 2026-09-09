@@ -58,6 +58,7 @@ import type {
   OAuthApprovalRecord,
   OAuthClientRecord,
   OAuthCodeRecord,
+  OAuthConnectorRecord,
   OAuthConnectorGrantRecord,
 } from "./oauth-store-do.js";
 import { MCP_SERVER_VERSION } from "./version.js";
@@ -84,6 +85,14 @@ export type ApproveApprovalResult =
   | { ok: true; record: OAuthApprovalRecord }
   | { ok: false; code: "not_found" | "expired" | "invalid_code" | "locked" };
 
+export type PutClientResult =
+  | { ok: true }
+  | { ok: false; code: string; status: number };
+
+export type PutApprovalResult =
+  | { ok: true }
+  | { ok: false; code: string; status: number; existing_request_id?: string; expires_at_ms?: number };
+
 /** Public token response — identical shape to src/oauth.ts `issueTokens`. */
 export interface IssuedTokenPair {
   access_token: string;
@@ -93,8 +102,17 @@ export interface IssuedTokenPair {
   scope: string;
 }
 
+export interface IssuedAccessToken {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  scope: string;
+}
+
 export interface TokenIssueInput {
   client_id: string;
+  connector_id?: string;
+  grant_generation?: number;
   resource: string;
   now_sec: number;
   access_ttl_sec: number;
@@ -111,16 +129,16 @@ export type RefreshExchangeInput = TokenIssueInput & { hash: string };
  */
 export interface OAuthPublicStore {
   getClient(clientId: string): Promise<OAuthClientRecord | null>;
-  putClient(clientId: string, record: OAuthClientRecord): Promise<boolean>;
+  putClient(clientId: string, record: OAuthClientRecord, nowMs: number): Promise<PutClientResult>;
   putCode(hash: string, record: OAuthCodeRecord, nowMs: number): Promise<boolean>;
   consumeCode(hash: string, nowMs: number): Promise<ConsumeCodeResult>;
-  putApproval(requestId: string, record: OAuthApprovalRecord, nowMs: number): Promise<boolean>;
+  putApproval(requestId: string, record: OAuthApprovalRecord, nowMs: number): Promise<PutApprovalResult>;
   getApproval(requestId: string, nowMs: number): Promise<OAuthApprovalRecord | null>;
   approveApproval(requestId: string, codeHash: string, approver: string, nowMs: number): Promise<ApproveApprovalResult>;
   consumeApproval(requestId: string, resumeHash: string, nowMs: number): Promise<ConsumeApprovalResult>;
   getGrant(clientId: string): Promise<OAuthConnectorGrantRecord | null>;
   setWebChatControlGrant(input: {
-    client_id: string;
+    connector_id: string;
     device_id: string;
     endpoint_ref: string;
     provider: string;
@@ -128,8 +146,23 @@ export interface OAuthPublicStore {
     allowed: boolean;
     changed_by: string;
   }): Promise<OAuthConnectorGrantRecord | null>;
+  setPageAssistGrant(input: {
+    connector_id: string;
+    device_id: string;
+    endpoint_ref: string;
+    allowed: boolean;
+    changed_by: string;
+  }): Promise<OAuthConnectorGrantRecord | null>;
   revokeGrant(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
+  getConnector(connectorId: string): Promise<OAuthConnectorRecord | null>;
+  findActiveConnectorByClient(clientId: string): Promise<OAuthConnectorRecord | null>;
+  listConnectors(): Promise<OAuthConnectorRecord[]>;
+  connectorInventory(): Promise<Record<string, unknown>>;
+  revokeConnector(connectorId: string, revokedBy: string, nowMs: number): Promise<boolean>;
+  revokeClientConnectors(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
+  revokeToken(token: string, clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   issueTokens(input: TokenIssueInput): Promise<IssuedTokenPair | null>;
+  issueAutomationAccess(input: Omit<TokenIssueInput, "refresh_ttl_sec" | "connector_id" | "grant_generation">): Promise<IssuedAccessToken | null>;
   exchangeRefresh(input: RefreshExchangeInput): Promise<IssuedTokenPair | null>;
 }
 
@@ -137,7 +170,7 @@ export interface OAuthPublicOptions {
   /** Exact production issuer/resource identity (see createOAuthIdentity). */
   identity: OAuthEdgeIdentity;
   store: OAuthPublicStore;
-  /** Existing deployment secret used only to HMAC short owner-approval codes. */
+  /** Existing deployment secret used only to HMAC short fleet-approval codes. */
   approvalSecret: string;
   /** Injected fetch for CIMD metadata + ChatGPT JWKS (default globalThis.fetch). */
   fetchFn?: typeof globalThis.fetch;
@@ -163,6 +196,7 @@ const DEFAULT_ACCESS_TTL_S = 86400;
 const DEFAULT_REFRESH_TTL_S = 2592000; // 30 days
 const DEFAULT_CODE_TTL_MS = 5 * 60_000;
 const DEFAULT_APPROVAL_TTL_MS = 10 * 60_000;
+const AUTOMATION_ACCESS_TTL_S = 60 * 60;
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_MAX_QUERY_BYTES = 16 * 1024;
 const DEFAULT_MAX_PARAM_BYTES = 4096;
@@ -199,6 +233,7 @@ const MCP_JSON_PATH = "/.well-known/mcp.json";
 const AUTHORIZE_PATH = "/oauth/authorize";
 const AUTHORIZE_POLL_PATH = "/oauth/authorize/poll";
 const TOKEN_PATH = "/oauth/token";
+const REVOKE_PATH = "/oauth/revoke";
 
 function isOwnedPath(path: string): boolean {
   return (
@@ -208,7 +243,8 @@ function isOwnedPath(path: string): boolean {
     path === MCP_JSON_PATH ||
     path === AUTHORIZE_PATH ||
     path === AUTHORIZE_POLL_PATH ||
-    path === TOKEN_PATH
+    path === TOKEN_PATH ||
+    path === REVOKE_PATH
   );
 }
 
@@ -273,6 +309,37 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+function chatgptMcpEndpointErrorPage(issuer: string): Response {
+  const endpoint = `${issuer}/mcp`;
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Check the Herdr MCP server URL</title>
+<style>
+:root{color-scheme:light dark;--card:#fff;--text:#16181d;--muted:#69707d;--line:#e5e7eb;--soft:#f7f8fa;--bad:#a43228;--badSoft:#fff0ef;--shadow:0 24px 70px rgba(20,24,32,.12)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;min-height:100dvh;padding:32px 20px;background:radial-gradient(circle at 50% -10%,#fff 0,#f5f6f8 52%,#eef0f3 100%);color:var(--text);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center}.shell{width:min(680px,100%)}.brand{display:flex;align-items:center;gap:10px;margin:0 0 14px 4px;color:#4d5562;font-size:13px;font-weight:650;letter-spacing:.08em;text-transform:uppercase}.mark{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:#17191f;color:#fff;font-weight:800}.card{background:var(--card);border:1px solid rgba(20,24,32,.08);border-radius:24px;box-shadow:var(--shadow);overflow:hidden}.main{padding:34px 36px 30px}h1{margin:0;font-size:clamp(27px,5vw,38px);line-height:1.12;letter-spacing:-.035em}.lead{margin:13px 0;color:var(--muted);font-size:16px}.notice{margin:24px 0;padding:16px 18px;border-radius:15px;background:var(--badSoft);color:var(--bad);font-weight:650}.endpoint{margin:18px 0;padding:14px 16px;border:1px solid var(--line);border-radius:13px;background:var(--soft);overflow-wrap:anywhere}.endpoint code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.footer{padding:15px 36px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px}@media(max-width:560px){body{padding:16px 12px}.main{padding:26px 20px}.footer{padding:14px 20px}}@media(prefers-color-scheme:dark){:root{--card:#15181d;--text:#f4f5f7;--muted:#9aa2af;--line:#2a2f37;--soft:#111419;--bad:#ff9a8f;--badSoft:#3a1c1a;--shadow:0 28px 80px rgba(0,0,0,.45)}body{background:radial-gradient(circle at 50% -10%,#22262d 0,#111419 48%,#0b0d10 100%)}.brand{color:#b2b8c2}.mark{background:#f4f5f7;color:#111318}.card{border-color:#292e36}}
+</style></head><body><main class="shell">
+<div class="brand"><span class="mark" aria-hidden="true">H</span><span>Herdr secure access</span></div>
+<section class="card"><div class="main">
+<h1>Check the MCP server URL</h1>
+<p class="lead">ChatGPT reached the Herdr site, but the configured server URL is missing the MCP endpoint path.</p>
+<div class="notice" role="alert">Do not approve this request. Return to ChatGPT and set the MCP Server URL to the full <code>/mcp</code> endpoint.</div>
+<div class="endpoint"><code>${escapeHtml(endpoint)}</code></div>
+<p class="lead">The site root <code>${escapeHtml(issuer)}</code> is not the MCP server endpoint. No Herdr approval or Connector grant was created for this request.</p>
+</div><div class="footer">After correcting the URL in ChatGPT, reconnect Herdr and continue the normal approval flow.</div></section>
+</main></body></html>`;
+  return new Response(html, {
+    status: 400,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
 function approvalPage(input: {
   issuer: string;
   requestId: string;
@@ -284,29 +351,153 @@ function approvalPage(input: {
   const poll = `${input.issuer}${AUTHORIZE_POLL_PATH}`;
   const expiresAt = new Date(input.expiresAtMs).toISOString();
   const title = input.clientName ? `Approve ${input.clientName}` : "Approve Herdr Connector";
+  const clientLabel = input.clientName ?? "Web AI Connector";
+  const approvalCommand = `herdr-mcp connector approve ${input.requestId}`;
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)}</title>
-<style>body{font:16px system-ui,sans-serif;max-width:680px;margin:10vh auto;padding:0 24px;color:#171717}code{font-size:1.05em;word-break:break-all}.code{font-size:2rem;letter-spacing:.18em;font-weight:700}.muted{color:#666}</style></head>
-<body><h1>${escapeHtml(title)}</h1>
-<p>This Connector is waiting for approval from an already trusted Herdr owner.</p>
-<p>Request ID:<br><code>${escapeHtml(input.requestId)}</code></p>
-<p>Approval code:</p><p class="code">${escapeHtml(input.code)}</p>
-<p>On an already-enrolled owner computer, run:<br><code>herdr-mcp connector approve ${escapeHtml(input.requestId)}</code><br>and enter the six-digit code when prompted. You may also ask an already-authorized Herdr WebChat that has connector-approval authority to approve this request.</p>
-<p class="muted">Expires ${escapeHtml(expiresAt)}. Do not enter this code into an untrusted site.</p>
-<p id="status">Waiting for approval…</p>
+<style>
+:root{color-scheme:light dark;--bg:#f5f6f8;--card:#fff;--text:#16181d;--muted:#69707d;--line:#e5e7eb;--soft:#f7f8fa;--accent:#17191f;--accentText:#fff;--good:#147a42;--goodSoft:#e9f7ef;--warn:#8a5a00;--warnSoft:#fff6df;--shadow:0 24px 70px rgba(20,24,32,.12)}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;min-height:100dvh;padding:32px 20px;background:radial-gradient(circle at 50% -10%,#fff 0,#f5f6f8 52%,#eef0f3 100%);color:var(--text);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center}
+.shell{width:min(720px,100%)}
+.brand{display:flex;align-items:center;gap:10px;margin:0 0 14px 4px;color:#4d5562;font-size:13px;font-weight:650;letter-spacing:.08em;text-transform:uppercase}
+.brand-mark{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:#17191f;color:#fff;font-size:13px;font-weight:800;letter-spacing:0;box-shadow:0 5px 16px rgba(20,24,32,.16)}
+.card{background:var(--card);border:1px solid rgba(20,24,32,.08);border-radius:24px;box-shadow:var(--shadow);overflow:hidden}
+.main{padding:34px 36px 28px}
+.eyebrow{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
+.eyebrow-label{font-size:12px;font-weight:750;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:6px 10px;border-radius:999px;background:var(--warnSoft);color:var(--warn);font-size:12px;font-weight:700;white-space:nowrap}
+.pill-dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 12%,transparent)}
+h1{margin:0;font-size:clamp(27px,5vw,38px);line-height:1.12;letter-spacing:-.035em;font-weight:760}
+.lead{margin:12px 0 0;color:var(--muted);font-size:16px;max-width:600px}
+.connector{font-weight:700;color:var(--text)}
+.code-card{margin:28px 0 22px;padding:22px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(180deg,#fafbfc,#f5f6f8);text-align:center}
+.code-label{font-size:12px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.approval-code{font:760 clamp(34px,8vw,48px)/1 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;letter-spacing:.18em;font-variant-numeric:tabular-nums;padding-left:.18em;color:#111318}
+.code-help{margin:10px 0 0;color:var(--muted);font-size:13px}
+.step{display:grid;grid-template-columns:32px minmax(0,1fr);gap:14px;padding:18px 0 4px}
+.step-number{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:#17191f;color:#fff;font-size:13px;font-weight:800}
+.step-title{font-weight:720;margin:2px 0 9px}
+.command-row{display:flex;align-items:stretch;gap:8px;padding:7px 7px 7px 13px;border:1px solid var(--line);border-radius:13px;background:#111318;color:#f7f8fa;min-width:0}
+.command-row code{display:block;align-self:center;min-width:0;flex:1;overflow-x:auto;white-space:nowrap;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;scrollbar-width:thin}
+.copy{appearance:none;border:0;border-radius:9px;padding:8px 12px;background:#fff;color:#17191f;font:700 12px/1 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer;white-space:nowrap;transition:transform .12s ease,opacity .12s ease}
+.copy:hover{opacity:.9}.copy:active{transform:scale(.97)}.copy:focus-visible{outline:3px solid rgba(120,160,255,.55);outline-offset:2px}
+.helper{margin:9px 0 0;color:var(--muted);font-size:13px}
+.status{display:flex;align-items:center;gap:10px;margin-top:22px;padding:12px 14px;border-radius:13px;background:var(--warnSoft);color:var(--warn);font-size:13px;font-weight:650}
+.status-dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:0 0 auto;animation:pulse 1.8s ease-in-out infinite}
+.status.success{background:var(--goodSoft);color:var(--good)}
+.status.error{background:#fff0ef;color:#a43228}
+.continue-row{margin-top:12px;display:flex;align-items:center;gap:10px}.continue-row[hidden]{display:none!important}.continue-link{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:11px;background:var(--accent);color:var(--accentText);font-weight:750;text-decoration:none}.continue-help{color:var(--muted);font-size:12px}
+details{margin-top:20px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted)}
+summary{cursor:pointer;font-size:13px;font-weight:700;color:#4d5562;user-select:none}
+.details-grid{display:grid;grid-template-columns:110px minmax(0,1fr);gap:7px 14px;margin-top:12px;font-size:12px}
+.details-grid dt{color:var(--muted)}.details-grid dd{margin:0;color:#444b56;min-width:0;overflow-wrap:anywhere}.details-grid code{font-size:12px}
+.security{display:flex;gap:9px;margin:18px 0 0;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+.security strong{color:#4d5562}
+.footer{padding:15px 36px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.38}}
+@media(max-width:560px){body{padding:16px 12px}.main{padding:26px 20px 22px}.footer{padding:14px 20px}.eyebrow{align-items:flex-start;flex-direction:column-reverse;gap:10px}.command-row{align-items:stretch;flex-direction:column;padding:10px}.command-row code{padding:2px 3px}.copy{padding:10px 12px}.details-grid{grid-template-columns:1fr;gap:2px}.details-grid dd{margin-bottom:8px}}
+@media(prefers-color-scheme:dark){:root{--bg:#0d0f12;--card:#15181d;--text:#f4f5f7;--muted:#9aa2af;--line:#2a2f37;--soft:#111419;--accent:#f4f5f7;--accentText:#111318;--good:#70d79d;--goodSoft:#123524;--warn:#f0c46d;--warnSoft:#352812;--shadow:0 28px 80px rgba(0,0,0,.45)}body{background:radial-gradient(circle at 50% -10%,#22262d 0,#111419 48%,#0b0d10 100%)}.brand{color:#b2b8c2}.brand-mark{background:#f4f5f7;color:#111318}.card{border-color:#292e36}.eyebrow-label{color:#9aa2af}.connector{color:#fff}.code-card{background:linear-gradient(180deg,#1b1f25,#171a1f)}.approval-code{color:#fff}.step-number{background:#f4f5f7;color:#111318}.command-row{background:#0c0e11;border-color:#303640}.copy{background:#f4f5f7}.details-grid dd,summary,.security strong{color:#c8cdd5}.status.error{background:#3a1c1a;color:#ff9a8f}}
+</style></head>
+<body><main class="shell">
+<div class="brand"><span class="brand-mark" aria-hidden="true">H</span><span>Herdr secure access</span></div>
+<section class="card" aria-labelledby="approval-title">
+<div class="main">
+<div class="eyebrow"><span class="eyebrow-label">Connector authorization</span><span class="pill" id="status-pill"><span class="pill-dot" aria-hidden="true"></span>Waiting for approval</span></div>
+<h1 id="approval-title">${escapeHtml(title)}</h1>
+<p class="lead"><span class="connector">${escapeHtml(clientLabel)}</span> is requesting access to this Herdr Worker. Approve it from a computer that is already enrolled in this Worker.</p>
+
+<div class="code-card" aria-label="Six digit approval code">
+  <div class="code-label">Approval code</div>
+  <div class="approval-code">${escapeHtml(input.code)}</div>
+  <p class="code-help">You will enter this code only after the CLI asks for it.</p>
+</div>
+
+<div class="step">
+  <div class="step-number" aria-hidden="true">1</div>
+  <div>
+    <div class="step-title">Run this command on an enrolled computer</div>
+    <div class="command-row">
+      <code id="approval-command">${escapeHtml(approvalCommand)}</code>
+      <button class="copy" type="button" id="copy-command" aria-label="Copy approval command">Copy</button>
+    </div>
+    <p class="helper">Requires herdr-mcp v0.4.6 or newer. Then enter the six-digit code above at the visible CLI prompt. The code is intentionally not included in the command or shell history. Keep this page open and do not refresh it while approval is pending. If the CLI says <code>unknown command 'connector'</code>, update herdr-mcp first and retry while keeping this page open.</p>
+  </div>
+</div>
+
+<div class="status" id="status-wrap" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="status">Waiting for approval…</span></div>
+<div class="continue-row" id="continue-row" hidden><a class="continue-link" id="continue-link" href="#">Continue to ChatGPT</a><span class="continue-help">Use this if automatic return is blocked.</span></div>
+
+<details>
+  <summary>Request details</summary>
+  <dl class="details-grid">
+    <dt>Connector</dt><dd>${escapeHtml(clientLabel)}</dd>
+    <dt>Request ID</dt><dd><code>${escapeHtml(input.requestId)}</code></dd>
+    <dt>Expires</dt><dd>${escapeHtml(expiresAt)}</dd>
+  </dl>
+</details>
+
+<p class="security"><span aria-hidden="true">◈</span><span><strong>Security check:</strong> approve only requests you just initiated. Never enter this code into an untrusted site. Approval grants ordinary MCP access; it does not grant fleet-administration authority.</span></p>
+</div>
+<div class="footer">Herdr keeps the workstation private: the enrolled device approves this request, then the authorization result returns only to the original OAuth callback.</div>
+</section></main>
 <script>
 const endpoint=${JSON.stringify(poll)};
 const requestId=${JSON.stringify(input.requestId)};
 const resumeToken=${JSON.stringify(input.resumeToken)};
+const approvalCommand=${JSON.stringify(approvalCommand)};
+const copyButton=document.getElementById('copy-command');
+const statusWrap=document.getElementById('status-wrap');
+const statusText=document.getElementById('status');
+const statusPill=document.getElementById('status-pill');
+const continueRow=document.getElementById('continue-row');
+const continueLink=document.getElementById('continue-link');
+let approvedRedirect=null;
+function setStatus(message,state){
+  statusText.textContent=message;
+  statusWrap.className='status'+(state?' '+state:'');
+  if(state==='success')statusPill.textContent='Approved';
+  else if(state==='error')statusPill.textContent='Approval stopped';
+}
+async function copyApprovalCommand(){
+  let copied=false;
+  try{
+    if(window.isSecureContext&&navigator.clipboard&&navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(approvalCommand);copied=true;
+    }
+  }catch{}
+  if(!copied){
+    try{
+      const area=document.createElement('textarea');
+      area.value=approvalCommand;area.setAttribute('readonly','');area.style.position='fixed';area.style.opacity='0';area.style.pointerEvents='none';
+      document.body.appendChild(area);area.select();copied=document.execCommand('copy');area.remove();
+    }catch{}
+  }
+  copyButton.textContent=copied?'Copied':'Copy failed';
+  setTimeout(()=>{copyButton.textContent='Copy'},1600);
+}
+copyButton.addEventListener('click',copyApprovalCommand);
+continueLink.addEventListener('click',(event)=>{if(!approvedRedirect)event.preventDefault()});
 async function poll(){
+  poll.failures=poll.failures||0;
   try{
     const u=new URL(endpoint);u.searchParams.set('request_id',requestId);u.searchParams.set('resume_token',resumeToken);
     const r=await fetch(u.toString(),{cache:'no-store'});const p=await r.json();
-    if(p.status==='approved'&&p.redirect){location.replace(p.redirect);return;}
+    poll.failures=0;
+    if(p.status==='approved'&&p.redirect){
+      approvedRedirect=p.redirect;continueLink.href=approvedRedirect;continueRow.hidden=false;
+      setStatus('Approved. Returning to ChatGPT…','success');
+      try{window.location.assign(approvedRedirect)}catch{}
+      return;
+    }
     if(p.status==='pending'){setTimeout(poll,1500);return;}
-    document.getElementById('status').textContent=p.message||'Approval failed or expired.';
-  }catch{setTimeout(poll,2500)}
+    setStatus(p.message||'Approval failed or expired.','error');
+  }catch{
+    poll.failures++;
+    if(poll.failures>=5){setStatus('Approval status could not be checked. Reload the original Connector flow and try again.','error');return;}
+    setTimeout(poll,2500)
+  }
 }poll();
 </script></body></html>`;
   return new Response(html, {
@@ -314,7 +505,53 @@ async function poll(){
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+      "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
+function pendingApprovalPage(input: {
+  requestId: string;
+  expiresAtMs: number;
+  nowMs: number;
+  clientName?: string;
+}): Response {
+  const expiresAt = new Date(input.expiresAtMs).toISOString();
+  const retryAfterMs = Math.max(250, input.expiresAtMs - input.nowMs + 250);
+  const retryAfterSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
+  const clientLabel = input.clientName ?? "Web AI Connector";
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connector approval already pending</title>
+<style>
+:root{color-scheme:light dark;--card:#fff;--text:#16181d;--muted:#69707d;--line:#e5e7eb;--soft:#f7f8fa;--warn:#8a5a00;--warnSoft:#fff6df;--shadow:0 24px 70px rgba(20,24,32,.12)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;min-height:100dvh;padding:32px 20px;background:radial-gradient(circle at 50% -10%,#fff 0,#f5f6f8 52%,#eef0f3 100%);color:var(--text);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center}.shell{width:min(680px,100%)}.brand{display:flex;align-items:center;gap:10px;margin:0 0 14px 4px;color:#4d5562;font-size:13px;font-weight:650;letter-spacing:.08em;text-transform:uppercase}.mark{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:#17191f;color:#fff;font-weight:800}.card{background:var(--card);border:1px solid rgba(20,24,32,.08);border-radius:24px;box-shadow:var(--shadow);overflow:hidden}.main{padding:34px 36px 30px}h1{margin:0;font-size:clamp(27px,5vw,38px);line-height:1.12;letter-spacing:-.035em}.lead{margin:13px 0;color:var(--muted);font-size:16px}.notice{margin:24px 0;padding:16px 18px;border-radius:15px;background:var(--warnSoft);color:var(--warn);font-weight:650}.details{margin-top:22px;padding-top:18px;border-top:1px solid var(--line);display:grid;grid-template-columns:100px minmax(0,1fr);gap:8px 14px;font-size:13px}.details span:nth-child(odd){color:var(--muted)}code{overflow-wrap:anywhere}.footer{padding:15px 36px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px}@media(max-width:560px){body{padding:16px 12px}.main{padding:26px 20px}.footer{padding:14px 20px}.details{grid-template-columns:1fr;gap:3px}.details span:nth-child(even){margin-bottom:8px}}@media(prefers-color-scheme:dark){:root{--card:#15181d;--text:#f4f5f7;--muted:#9aa2af;--line:#2a2f37;--soft:#111419;--warn:#f0c46d;--warnSoft:#352812;--shadow:0 28px 80px rgba(0,0,0,.45)}body{background:radial-gradient(circle at 50% -10%,#22262d 0,#111419 48%,#0b0d10 100%)}.brand{color:#b2b8c2}.mark{background:#f4f5f7;color:#111318}.card{border-color:#292e36}}
+</style></head><body><main class="shell">
+<div class="brand"><span class="mark" aria-hidden="true">H</span><span>Herdr secure access</span></div>
+<section class="card"><div class="main">
+<h1>Approval already pending</h1>
+<p class="lead"><strong>${escapeHtml(clientLabel)}</strong> retried the same OAuth authorization request while its first Herdr approval page is still active.</p>
+<div class="notice" id="status" role="status">Use the original approval page if it is still open. If that page was closed and the enrolled computer has herdr-mcp v0.4.7 or newer, run <code>herdr-mcp connector cancel ${escapeHtml(input.requestId)}</code>, then restart the Connector authorization. Older runtimes can leave this page open; it will retry automatically after the old request expires.</div>
+<div class="details"><span>Request ID</span><code>${escapeHtml(input.requestId)}</code><span>Expires</span><code>${escapeHtml(expiresAt)}</code><span>Retry</span><span id="countdown">after expiry</span></div>
+</div><div class="footer">No approval code, resume token, access token or client secret is recovered or exposed on this page.</div></section></main>
+<script>
+const retryAfterMs=${retryAfterMs};
+const deadline=Date.now()+retryAfterMs;
+const countdown=document.getElementById('countdown');
+function tick(){const left=Math.max(0,deadline-Date.now());countdown.textContent=left>0?'in '+Math.ceil(left/1000)+'s':'retrying…';if(left>0)setTimeout(tick,1000)}
+tick();setTimeout(()=>location.reload(),retryAfterMs);
+</script></body></html>`;
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "retry-after": String(retryAfterSec),
+      "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+      "x-frame-options": "DENY",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
     },
@@ -414,9 +651,11 @@ function isChatgptRedirectUri(uri: string): boolean {
   }
 }
 
-function redirectUriAllowed(client: OAuthClientRecord, redirectUri: string): boolean {
+function redirectUriAllowed(clientId: string, client: OAuthClientRecord, redirectUri: string): boolean {
   if (client.redirect_uris.includes(redirectUri)) return true;
-  if (client.redirect_uris.length === 0 && isChatgptRedirectUri(redirectUri)) return true;
+  if (client.redirect_uris.length === 0 && isChatgptOAuthClientId(clientId) && isChatgptRedirectUri(redirectUri)) {
+    return true;
+  }
   return false;
 }
 
@@ -637,8 +876,11 @@ async function handleRegister(request: Request, ctx: HandlerCtx): Promise<Respon
     scope,
     ...(clientName !== undefined ? { client_name: clientName } : {}),
     issued_at: nowSec,
-  });
-  if (!persisted) {
+  }, ctx.nowMs());
+  if (!persisted.ok) {
+    if (persisted.status === 429) {
+      return tokenError(ctx, "temporarily_unavailable", "dynamic client registration capacity reached", 429);
+    }
     return serverError(ctx, "client registration failed");
   }
 
@@ -663,6 +905,8 @@ async function issueAuthorizationRedirect(
   ctx: HandlerCtx,
   input: {
     clientId: string;
+    connectorId: string;
+    grantGeneration: number;
     redirectUri: string;
     codeChallenge: string;
     resource: string;
@@ -676,6 +920,8 @@ async function issueAuthorizationRedirect(
     codeHash,
     {
       client_id: input.clientId,
+      connector_id: input.connectorId,
+      grant_generation: input.grantGeneration,
       redirect_uri: input.redirectUri,
       code_challenge: input.codeChallenge,
       resource: input.resource,
@@ -695,7 +941,7 @@ async function issueAuthorizationRedirect(
 
 /**
  * Authorization endpoint. Registered/DCR clients do not self-authorize: an
- * unknown grant becomes a short-lived pending owner-approval request.
+ * unknown grant becomes a short-lived pending fleet-approval request.
  */
 async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
   if (url.search.length > ctx.maxQueryBytes) {
@@ -729,7 +975,10 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
     // RFC 6749 §4.1.2.1: unknown client / unverifiable redirect_uri → no redirect.
     return ctx.json({ error: "invalid_request", error_description: "unknown client_id" }, 400);
   }
-  if (!redirectUri || !redirectUriAllowed(client, redirectUri)) {
+  if (!client.grant_types.includes("authorization_code")) {
+    return ctx.json({ error: "unauthorized_client", error_description: "client does not support authorization_code" }, 400);
+  }
+  if (!redirectUri || !redirectUriAllowed(clientId, client, redirectUri)) {
     return ctx.json(
       { error: "invalid_request", error_description: "redirect_uri is not registered for this client" },
       400,
@@ -762,24 +1011,37 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
   if (scopeParam && scopeParam !== OAUTH_SCOPE) {
     return redirectError("invalid_scope", `unsupported scope '${scopeParam}'`);
   }
+  if (
+    isChatgptOAuthClientId(clientId)
+    && resourceParam
+    && resourceParam.replace(/\/+$/, "") === ctx.identity.issuer
+  ) {
+    return chatgptMcpEndpointErrorPage(ctx.identity.issuer);
+  }
   const resource = normalizeResource(ctx.identity, resourceParam ?? "");
   if (!resource) {
     return redirectError("invalid_target", "unsupported resource");
   }
 
   const existingGrant = await ctx.store.getGrant(clientId);
-  if (existingGrant?.status === "active" && existingGrant.resource === resource && existingGrant.scope === OAUTH_SCOPE) {
-    return issueAuthorizationRedirect(ctx, {
-      clientId,
-      redirectUri,
-      codeChallenge,
-      resource,
-      state,
-      nowMs,
-    });
+  if (existingGrant?.status === "revoked") {
+    // Revoked grant rows are client-wide kill switches. Older rows predate the
+    // explicit revocation_scope field, so keep treating them conservatively as
+    // client revocations. Connector-instance revoke never writes this row.
+    return redirectError("access_denied", "client grant is revoked");
   }
 
+  // A public OAuth client_id identifies an application, not a ChatGPT account.
+  // Every fresh authorization request therefore enters owner approval. Exact
+  // request retries are reconciled only by request-bound state/PKCE identity.
+
   const requestId = randomBase64UrlToken();
+  const connectorId = `conn_${randomBase64UrlToken().slice(0, 22)}`;
+  const authSource = isChatgptOAuthClientId(clientId)
+    ? "chatgpt_cimd" as const
+    : clientId.startsWith("dcr-")
+      ? "dcr" as const
+      : "cimd" as const;
   const approvalCode = randomApprovalCode();
   const resumeToken = randomBase64UrlToken();
   const expiresAtMs = nowMs + DEFAULT_APPROVAL_TTL_MS;
@@ -787,6 +1049,8 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
     requestId,
     {
       client_id: clientId,
+      connector_id: connectorId,
+      auth_source: authSource,
       redirect_uri: redirectUri,
       code_challenge: codeChallenge,
       resource,
@@ -801,7 +1065,28 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
     },
     nowMs,
   );
-  if (!persisted) return serverError(ctx, "connector approval request creation failed");
+  if (!persisted.ok) {
+    if (persisted.code === "duplicate_pending") {
+      const existingRequestId = persisted.existing_request_id;
+      const existingExpiresAtMs = persisted.expires_at_ms;
+      if (existingRequestId && typeof existingExpiresAtMs === "number") {
+        return pendingApprovalPage({
+          requestId: existingRequestId,
+          expiresAtMs: existingExpiresAtMs,
+          nowMs,
+          clientName: client.client_name,
+        });
+      }
+      return serverError(ctx, "duplicate Connector approval could not be resolved safely");
+    }
+    if (persisted.status === 429) {
+      return ctx.json({
+        error: "temporarily_unavailable",
+        error_description: "Connector approval capacity reached; retry after existing requests expire or are handled",
+      }, 429, { "cache-control": "no-store" });
+    }
+    return serverError(ctx, "connector approval request creation failed");
+  }
   return approvalPage({
     issuer: ctx.identity.issuer,
     requestId,
@@ -829,8 +1114,15 @@ async function handleAuthorizePoll(url: URL, ctx: HandlerCtx): Promise<Response>
     const status = result.code === "invalid_resume" ? 403 : result.code === "locked" ? 423 : 410;
     return ctx.json({ status: "error", code: result.code, message: "approval failed, expired, or was already consumed" }, status, { "cache-control": "no-store" });
   }
+  if (!result.record.connector_id) return serverError(ctx, "approved Connector identity is missing");
+  const connector = await ctx.store.getConnector(result.record.connector_id);
+  if (!connector || connector.status !== "active" || connector.client_id !== result.record.client_id) {
+    return serverError(ctx, "approved Connector grant is unavailable");
+  }
   const redirect = await issueAuthorizationRedirect(ctx, {
     clientId: result.record.client_id,
+    connectorId: connector.connector_id,
+    grantGeneration: connector.grant_generation,
     redirectUri: result.record.redirect_uri,
     codeChallenge: result.record.code_challenge,
     resource: result.record.resource,
@@ -916,6 +1208,27 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
     return tokenError(ctx, "invalid_client", "client authentication failed");
   }
 
+  if (grantType === "client_credentials") {
+    const scopeParam = first("scope");
+    if (!client.grant_types.includes("client_credentials")) {
+      return tokenError(ctx, "unauthorized_client", "client_credentials is not enabled for this client");
+    }
+    if (client.token_endpoint_auth_method !== "client_secret_post" || assertion) {
+      return tokenError(ctx, "invalid_client", "automation clients require client_secret authentication");
+    }
+    if (scopeParam && scopeParam !== OAUTH_SCOPE) {
+      return tokenError(ctx, "invalid_scope", `unsupported scope '${scopeParam}'`);
+    }
+    const token = await ctx.store.issueAutomationAccess({
+      client_id: clientId,
+      resource,
+      now_sec: nowSec,
+      access_ttl_sec: Math.min(ctx.accessTtlSec, AUTOMATION_ACCESS_TTL_S),
+    });
+    if (!token) return tokenError(ctx, "invalid_grant", "automation client is revoked or not authorized");
+    return ctx.json(token, 200, { "cache-control": "no-store" });
+  }
+
   if (grantType === "authorization_code") {
     const code = first("code");
     const redirectUri = first("redirect_uri");
@@ -952,8 +1265,13 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
     if (!(await verifyPkceS256(codeVerifier, entry.code_challenge))) {
       return tokenError(ctx, "invalid_grant", "PKCE verification failed");
     }
+    if (!entry.connector_id || !entry.grant_generation) {
+      return tokenError(ctx, "invalid_grant", "authorization code is missing Connector grant identity");
+    }
     const pair = await ctx.store.issueTokens({
       client_id: clientId,
+      connector_id: entry.connector_id,
+      grant_generation: entry.grant_generation,
       resource,
       now_sec: nowSec,
       access_ttl_sec: ctx.accessTtlSec,
@@ -986,6 +1304,75 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
   }
 
   return tokenError(ctx, "unsupported_grant_type", `unsupported grant_type '${grantType}'`);
+}
+
+/** RFC 7009 token revocation. Token possession identifies the exact Connector instance. */
+async function handleRevoke(request: Request, ctx: HandlerCtx): Promise<Response> {
+  const bodyResult = await readRequestBody(request, ctx.maxBodyBytes);
+  if (!bodyResult.ok) {
+    return ctx.json(
+      {
+        error: "invalid_request",
+        error_description: bodyResult.code === "payload_too_large" ? "request body too large" : "invalid request body",
+      },
+      bodyResult.code === "payload_too_large" ? 413 : 400,
+      { "cache-control": "no-store" },
+    );
+  }
+
+  const first = (k: string): string => firstOf(bodyResult.value[k]);
+  const token = first("token");
+  const clientId = first("client_id");
+  if (!token || !clientId || token.length > 16384 || clientId.length > ctx.maxParamBytes) {
+    return ctx.json(
+      { error: "invalid_request", error_description: "token and client_id are required" },
+      400,
+      { "cache-control": "no-store" },
+    );
+  }
+
+  if (clientId) {
+    const nowSec = Math.floor(ctx.nowMs() / 1000);
+    const client = await resolveClient(clientId, ctx.store, nowSec, ctx.fetchFn, ctx.maxParamBytes);
+    if (!client) {
+      return ctx.json({ error: "invalid_client" }, 401, { "cache-control": "no-store" });
+    }
+    const assertion = first("client_assertion");
+    const assertionType = first("client_assertion_type");
+    if (assertion) {
+      if (
+        (assertionType && assertionType !== JWT_BEARER) ||
+        !isChatgptOAuthClientId(clientId) ||
+        assertion.length > ctx.maxParamBytes
+      ) {
+        return ctx.json({ error: "invalid_client" }, 401, { "cache-control": "no-store" });
+      }
+      const verdict = await verifyChatgptPrivateKeyJwt(
+        assertion,
+        clientId,
+        ctx.identity.issuer,
+        nowSec,
+        ctx.fetchFn,
+        [`${ctx.identity.issuer}/oauth/revoke`],
+      );
+      if (!verdict.ok) {
+        return ctx.json({ error: "invalid_client" }, 401, { "cache-control": "no-store" });
+      }
+    } else if (!(await authenticateClient(client, first("client_secret")))) {
+      return ctx.json({ error: "invalid_client" }, 401, { "cache-control": "no-store" });
+    }
+  }
+
+  // RFC 7009 requires unknown/already-revoked tokens to be indistinguishable
+  // from successful revocation. The DO verifies client_id against token
+  // ownership before mutating anything.
+  await ctx.store.revokeToken(
+    token,
+    clientId,
+    `oauth:revocation:${clientId}`,
+    ctx.nowMs(),
+  );
+  return ctx.json({}, 200, { "cache-control": "no-store" });
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,6 +1459,9 @@ export async function handleOAuthPublic(
     if (path === TOKEN_PATH) {
       return handleToken(request, hctx);
     }
+    if (path === REVOKE_PATH) {
+      return handleRevoke(request, hctx);
+    }
     return null;
   }
 
@@ -1109,6 +1499,17 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
     return pair;
   };
 
+  const accessToken = async (resp: Response): Promise<IssuedAccessToken | null> => {
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as {
+      ok?: boolean;
+      token?: IssuedAccessToken & { key_id?: string };
+    };
+    if (!data.ok || !data.token) return null;
+    const { key_id: _keyId, ...token } = data.token;
+    return token;
+  };
+
   return {
     async getClient(clientId) {
       const resp = await internal("/internal/oauth/client/get", { client_id: clientId });
@@ -1116,9 +1517,11 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
       const data = (await resp.json()) as { ok?: boolean; record?: OAuthClientRecord };
       return data.record ?? null;
     },
-    async putClient(clientId, record) {
-      const resp = await internal("/internal/oauth/client/put", { client_id: clientId, record });
-      return resp.ok;
+    async putClient(clientId, record, nowMs) {
+      const resp = await internal("/internal/oauth/client/put", { client_id: clientId, record, now_ms: nowMs });
+      if (resp.ok) return { ok: true };
+      const data = (await resp.json().catch(() => null)) as { code?: string } | null;
+      return { ok: false, code: data?.code ?? "client_put_failed", status: resp.status };
     },
     async putCode(hash, record, nowMs) {
       const resp = await internal("/internal/oauth/code/put", { hash, record, now_ms: nowMs });
@@ -1139,7 +1542,19 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
         record,
         now_ms: nowMs,
       });
-      return resp.ok;
+      if (resp.ok) return { ok: true };
+      const data = (await resp.json().catch(() => null)) as {
+        code?: string;
+        existing_request_id?: string;
+        expires_at_ms?: number;
+      } | null;
+      return {
+        ok: false,
+        code: data?.code ?? "approval_put_failed",
+        status: resp.status,
+        ...(typeof data?.existing_request_id === "string" ? { existing_request_id: data.existing_request_id } : {}),
+        ...(typeof data?.expires_at_ms === "number" ? { expires_at_ms: data.expires_at_ms } : {}),
+      };
     },
     async getApproval(requestId, nowMs) {
       const resp = await internal("/internal/oauth/approval/get", {
@@ -1172,14 +1587,18 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
         resume_hash: resumeHash,
         now_ms: nowMs,
       });
-      if (!resp.ok) {
-        const data = (await resp.json().catch(() => null)) as { code?: string } | null;
-        const allowed = new Set(["expired", "pending", "locked", "invalid_resume"]);
-        const code = data?.code && allowed.has(data.code) ? data.code : "not_found";
-        return { ok: false, code } as ConsumeApprovalResult;
-      }
-      const data = (await resp.json()) as { ok?: boolean; record?: OAuthApprovalRecord };
-      return data.record ? { ok: true, record: data.record } : { ok: false, code: "not_found" };
+      const data = (await resp.json().catch(() => null)) as {
+        ok?: boolean;
+        code?: string;
+        record?: OAuthApprovalRecord;
+      } | null;
+      if (data?.record) return { ok: true, record: data.record };
+      // 202 is intentionally used by the DO for a still-pending approval, but
+      // Fetch classifies every 2xx response as ok=true. Preserve the semantic
+      // status instead of accidentally collapsing 202 into not_found/410.
+      const allowed = new Set(["expired", "pending", "locked", "invalid_resume"]);
+      const code = data?.code && allowed.has(data.code) ? data.code : "not_found";
+      return { ok: false, code } as ConsumeApprovalResult;
     },
     async getGrant(clientId) {
       const resp = await internal("/internal/oauth/grant/get", { client_id: clientId });
@@ -1193,6 +1612,12 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
       const data = (await resp.json()) as { ok?: boolean; record?: OAuthConnectorGrantRecord };
       return data.record ?? null;
     },
+    async setPageAssistGrant(input) {
+      const resp = await internal("/internal/oauth/grant/page-assist", input);
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as { ok?: boolean; record?: OAuthConnectorGrantRecord };
+      return data.record ?? null;
+    },
     async revokeGrant(clientId, revokedBy, nowMs) {
       const resp = await internal("/internal/oauth/grant/revoke", {
         client_id: clientId,
@@ -1201,15 +1626,75 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
       });
       return resp.ok;
     },
+    async getConnector(connectorId) {
+      const resp = await internal("/internal/oauth/connector/get", { connector_id: connectorId });
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as { connector?: OAuthConnectorRecord };
+      return data.connector ?? null;
+    },
+    async findActiveConnectorByClient(clientId) {
+      const resp = await internal("/internal/oauth/connector/find-active", { client_id: clientId });
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as { connector?: OAuthConnectorRecord };
+      return data.connector ?? null;
+    },
+    async listConnectors() {
+      const resp = await internal("/internal/oauth/connector/list", {});
+      if (!resp.ok) return [];
+      const data = (await resp.json()) as { connectors?: OAuthConnectorRecord[] };
+      return Array.isArray(data.connectors) ? data.connectors : [];
+    },
+    async connectorInventory() {
+      const resp = await internal("/internal/oauth/connector/inventory", {});
+      if (!resp.ok) return { ok: false, code: "connector_inventory_unavailable" };
+      return await resp.json() as Record<string, unknown>;
+    },
+    async revokeConnector(connectorId, revokedBy, nowMs) {
+      const resp = await internal("/internal/oauth/connector/revoke", {
+        connector_id: connectorId,
+        revoked_by: revokedBy,
+        now_ms: nowMs,
+      });
+      return resp.ok;
+    },
+    async revokeClientConnectors(clientId, revokedBy, nowMs) {
+      const resp = await internal("/internal/oauth/connector/revoke-client", {
+        client_id: clientId,
+        revoked_by: revokedBy,
+        now_ms: nowMs,
+      });
+      return resp.ok;
+    },
+    async revokeToken(token, clientId, revokedBy, nowMs) {
+      const resp = await internal("/internal/oauth/token/revoke", {
+        token,
+        ...(clientId ? { client_id: clientId } : {}),
+        revoked_by: revokedBy,
+        now_ms: nowMs,
+      });
+      return resp.ok;
+    },
     async issueTokens(input) {
       const resp = await internal("/internal/oauth/token/issue", {
         client_id: input.client_id,
+        ...(input.connector_id
+          ? { connector_id: input.connector_id, grant_generation: input.grant_generation }
+          : {}),
         resource: input.resource,
         now_sec: input.now_sec,
         access_ttl_sec: input.access_ttl_sec,
         refresh_ttl_sec: input.refresh_ttl_sec,
       });
       return tokenPair(resp);
+    },
+    async issueAutomationAccess(input) {
+      const resp = await internal("/internal/oauth/automation/token/issue", {
+        client_id: input.client_id,
+        resource: input.resource,
+        now_sec: input.now_sec,
+        access_ttl_sec: input.access_ttl_sec,
+      });
+      return accessToken(resp);
     },
     async exchangeRefresh(input) {
       const resp = await internal("/internal/oauth/refresh/exchange", {

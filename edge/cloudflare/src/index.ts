@@ -6,8 +6,8 @@
  *   GET  /health                          edge health (no DO involved)
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
- *   GET  /devices                         owner-authenticated device inventory
- *   POST /devices/pairings               owner-authenticated pairing session creation
+ *   GET  /devices                         fleet-admin device inventory
+ *   POST /devices/pairings               fleet-admin pairing session creation
  *   POST /devices/pairings/consume       one-time pairing consumption by a new device
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
  *   POST /artifacts  GET|DELETE /artifacts/:id   private R2 generic artifact relay
@@ -54,6 +54,8 @@ import { normalizeDeviceId } from "./device-model.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity, hashOAuthApprovalCode } from "./oauth-edge.js";
 import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
+import { randomBase64UrlToken } from "./oauth-token-crypto.js";
+import { sha256Hex } from "./device-crypto.js";
 
 export { DeviceRegistryDO, OAuthStoreDO, WorkstationDO };
 
@@ -143,9 +145,9 @@ export default {
           { path: "/ws/:workstationId", stage: "dev (WS upgrade, link auth)" },
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
           { path: "/devices/revoke-self", stage: "device self-revoke (exact credential binding)" },
-          { path: "/devices/revoke", stage: "owner/operator revoke of any enrolled device" },
-          { path: "/devices", stage: "owner-authenticated device inventory" },
-          { path: "/devices/pairings", stage: "owner-authenticated device pairing creation" },
+          { path: "/devices/revoke", stage: "fleet-admin revoke of any enrolled device" },
+          { path: "/devices", stage: "fleet-admin device inventory" },
+          { path: "/devices/pairings", stage: "fleet-admin device pairing creation" },
           { path: "/devices/pairings/consume", stage: "one-time device pairing consumption" },
           { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
           { path: "/artifacts", stage: "private R2 generic artifact relay (auth + capability)" },
@@ -180,13 +182,23 @@ export default {
       }, response.ok ? 200 : 503);
     }
 
-    // ---- Connector approval bootstrap. Unlike the older generic owner
-    // helper, these routes deliberately accept ONLY the exact owner device
-    // credential. Pre-v0.4.6 OAuth tokens were issued without consent and
-    // therefore can never bootstrap connector-administration authority.
+    // ---- Connector approval bootstrap. Fleet administration belongs to an
+    // enrolled Device or Worker operator credential. Approved Connectors remain
+    // ordinary MCP principals and never become fleet-administration channels.
+    // Pre-v0.4.6 OAuth tokens likewise keep ordinary MCP compatibility only.
+    if (request.method === "GET" && url.pathname === "/connectors") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const store = createOAuthPublicStore(env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1")));
+      const inventory = await store.connectorInventory();
+      return inventory.ok === false
+        ? noStoreJsonResponse(inventory, 503)
+        : noStoreJsonResponse(inventory);
+    }
+
     if (request.method === "POST" && url.pathname === "/connectors/inspect") {
-      const ownerDevice = await authenticateOwnerDevice(request, env);
-      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.request_id !== "string") {
         const code = parsed.ok ? "bad_request" : parsed.code;
@@ -201,8 +213,8 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/connectors/approve") {
-      const ownerDevice = await authenticateOwnerDevice(request, env);
-      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
@@ -213,26 +225,113 @@ export default {
       if (!requestId || requestId.length > 256 || !/^\d{6}$/.test(code)) {
         return noStoreJsonResponse({ ok: false, code: "invalid_connector_approval" }, 400);
       }
-      const result = await approveConnectorRequest(env, requestId, code, `device:${ownerDevice}`);
+      const result = await approveConnectorRequest(env, requestId, code, fleetAdmin);
       return result.ok
         ? noStoreJsonResponse({ action: "connector_approve", ...result })
         : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "invalid_code" ? 403 : result.code === "locked" ? 423 : 404);
     }
 
+    if (request.method === "POST" && url.pathname === "/connectors/cancel") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.request_id !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const requestId = parsed.value.request_id.trim();
+      if (!requestId || requestId.length > 256) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_connector_approval" }, 400);
+      }
+      const result = await cancelConnectorRequest(env, requestId);
+      return result.ok
+        ? noStoreJsonResponse({ action: "connector_cancel", request_id: requestId, ...result })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "already_used" ? 409 : 404);
+    }
+
     if (request.method === "POST" && url.pathname === "/connectors/revoke") {
-      const ownerDevice = await authenticateOwnerDevice(request, env);
-      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const connectorId = typeof parsed.value.connector_id === "string" ? parsed.value.connector_id.trim() : "";
+      const clientId = typeof parsed.value.client_id === "string" ? parsed.value.client_id.trim() : "";
+      if ((connectorId.length > 0) === (clientId.length > 0)) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_connector_revoke" }, 400);
+      }
+      if (connectorId) {
+        if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)) {
+          return noStoreJsonResponse({ ok: false, code: "invalid_connector_id" }, 400);
+        }
+        const result = await revokeConnectorInstance(env, connectorId, fleetAdmin);
+        return result.ok
+          ? noStoreJsonResponse({ ok: true, action: "connector_revoke", connector_id: connectorId })
+          : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "connector_not_found" ? 404 : 500);
+      }
+      if (clientId.length > 4096) return noStoreJsonResponse({ ok: false, code: "invalid_client_id" }, 400);
+      const result = await revokeConnectorClient(env, clientId, fleetAdmin);
+      return result.ok
+        ? noStoreJsonResponse({ ok: true, action: "connector_client_revoke", client_id: clientId })
+        : noStoreJsonResponse({ ok: false, code: result.code }, 500);
+    }
+
+    // ---- Non-interactive automation principals (GitLab CI, other CI/CD).
+    // These are Worker-owned service principals, not global bearer secrets.
+    // Their long-lived client_secret is returned only by create/rotate and is
+    // never persisted in plaintext by the Worker. Automation principals may
+    // call ordinary MCP but can never satisfy authenticateFleetAdmin().
+    if (request.method === "GET" && url.pathname === "/automations") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const result = await listAutomationClients(env);
+      return result.ok
+        ? noStoreJsonResponse(result)
+        : noStoreJsonResponse(result, 503);
+    }
+
+    if (request.method === "POST" && url.pathname === "/automations") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.name !== "string" || typeof parsed.value.device !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const name = parsed.value.name.trim();
+      if (!name || name.length > 256) return noStoreJsonResponse({ ok: false, code: "invalid_automation_name" }, 400);
+      const deviceSelector = parsed.value.device.trim();
+      if (!deviceSelector) return noStoreJsonResponse({ ok: false, code: "invalid_automation_device" }, 400);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const resolved = await resolveDeviceRouteWithContext(registry, {
+        selector: deviceSelector,
+        legacyWorkstationId: env.DEFAULT_WORKSTATION_ID ?? "dev-ws1",
+      });
+      if (!resolved.ok || !resolved.device_id) {
+        return noStoreJsonResponse({ ok: false, code: "automation_device_not_routable" }, 400);
+      }
+      const result = await createAutomationClient(env, name, fleetAdmin, resolved.device_id, resolved.device_name ?? null);
+      return result.ok
+        ? noStoreJsonResponse(result, 201)
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "oauth_not_configured" ? 503 : 409);
+    }
+
+    if (request.method === "POST" && url.pathname === "/automations/rotate") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.client_id !== "string") {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
       const clientId = parsed.value.client_id.trim();
-      if (!clientId || clientId.length > 4096) return noStoreJsonResponse({ ok: false, code: "invalid_client_id" }, 400);
-      const result = await revokeConnectorGrant(env, clientId, `device:${ownerDevice}`);
+      if (!/^svc_[A-Za-z0-9_-]{8,128}$/.test(clientId)) return noStoreJsonResponse({ ok: false, code: "invalid_client_id" }, 400);
+      const result = await rotateAutomationClient(env, clientId, fleetAdmin);
       return result.ok
-        ? noStoreJsonResponse({ ok: true, action: "connector_revoke", client_id: clientId })
-        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "connector_grant_not_found" ? 404 : 500);
+        ? noStoreJsonResponse(result)
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "automation_client_not_found" ? 404 : 409);
     }
 
     if (request.method === "POST" && url.pathname === "/connectors/webchat-control") {
@@ -243,18 +342,18 @@ export default {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
-      const allowedKeys = new Set(["client_id", "device_id", "endpoint_ref", "provider", "account_ref", "allowed"]);
+      const allowedKeys = new Set(["connector_id", "device_id", "endpoint_ref", "provider", "account_ref", "allowed"]);
       if (Object.keys(parsed.value).some((key) => !allowedKeys.has(key))) {
         return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
       }
-      const clientId = typeof parsed.value.client_id === "string" ? parsed.value.client_id.trim() : "";
+      const connectorId = typeof parsed.value.connector_id === "string" ? parsed.value.connector_id.trim() : "";
       const deviceId = typeof parsed.value.device_id === "string" ? parsed.value.device_id.trim() : "";
       const endpointRef = typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "";
       const provider = typeof parsed.value.provider === "string" ? parsed.value.provider.trim() : "";
       const accountRef = typeof parsed.value.account_ref === "string" ? parsed.value.account_ref.trim() : "";
       const normalizedDeviceId = normalizeDeviceId(deviceId);
       if (
-        !clientId || clientId.length > 4096
+        !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
         || !normalizedDeviceId || normalizedDeviceId !== deviceId
         || !endpointRef || endpointRef.length > 96
         || !accountRef || accountRef.length > 96
@@ -266,7 +365,7 @@ export default {
       const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
       const store = createOAuthPublicStore(stub);
       const record = await store.setWebChatControlGrant({
-        client_id: clientId,
+        connector_id: connectorId,
         device_id: deviceId,
         endpoint_ref: endpointRef,
         provider,
@@ -278,7 +377,7 @@ export default {
         ? noStoreJsonResponse({
           ok: true,
           action: "connector_webchat_control_set",
-          client_id: clientId,
+          connector_id: connectorId,
           device_id: deviceId,
           endpoint_ref: endpointRef,
           provider,
@@ -289,16 +388,78 @@ export default {
         : noStoreJsonResponse({ ok: false, code: "webchat_control_grant_update_failed" }, 409);
     }
 
-    // ---- Device pairing control plane. Pairing creation requires
-    // owner/operator auth; consumption requires only the raw pairing_id plus
+    if (request.method === "POST" && url.pathname === "/connectors/page-assist") {
+      const ownerDevice = await authenticateOwnerDevice(request, env);
+      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const allowedKeys = new Set(["connector_id", "device_id", "endpoint_ref", "allowed"]);
+      if (Object.keys(parsed.value).some((key) => !allowedKeys.has(key))) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const connectorId = typeof parsed.value.connector_id === "string" ? parsed.value.connector_id.trim() : "";
+      const deviceId = typeof parsed.value.device_id === "string" ? parsed.value.device_id.trim() : "";
+      const endpointRef = typeof parsed.value.endpoint_ref === "string" ? parsed.value.endpoint_ref.trim() : "";
+      const normalizedDeviceId = normalizeDeviceId(deviceId);
+      if (
+        !/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)
+        || !normalizedDeviceId || normalizedDeviceId !== deviceId
+        || !endpointRef || endpointRef.length > 96 || /[\u0000-\u001f\u007f]/.test(endpointRef)
+        || typeof parsed.value.allowed !== "boolean"
+      ) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_page_assist_grant" }, 400);
+      }
+      const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+      const store = createOAuthPublicStore(stub);
+      const record = await store.setPageAssistGrant({
+        connector_id: connectorId,
+        device_id: deviceId,
+        endpoint_ref: endpointRef,
+        allowed: parsed.value.allowed,
+        changed_by: `device:${ownerDevice}`,
+      });
+      return record
+        ? noStoreJsonResponse({
+          ok: true,
+          action: "connector_page_assist_set",
+          connector_id: connectorId,
+          device_id: deviceId,
+          endpoint_ref: endpointRef,
+          allowed: parsed.value.allowed,
+          grants: record.page_assist,
+        })
+        : noStoreJsonResponse({ ok: false, code: "page_assist_grant_update_failed" }, 409);
+    }
+
+    if (request.method === "POST" && url.pathname === "/automations/revoke") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.client_id !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const clientId = parsed.value.client_id.trim();
+      if (!/^svc_[A-Za-z0-9_-]{8,128}$/.test(clientId)) return noStoreJsonResponse({ ok: false, code: "invalid_client_id" }, 400);
+      const result = await revokeAutomationClient(env, clientId, fleetAdmin);
+      return result.ok
+        ? noStoreJsonResponse({ ok: true, action: "automation_revoke", client_id: clientId })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "automation_client_not_found" ? 404 : 409);
+    }
+
+    // ---- Device pairing control plane. Pairing creation requires Worker-owned
+    // fleet-admin auth; consumption requires only the raw pairing_id plus
     // the six-digit code, so a second workstation never needs Cloudflare
     // deploy credentials. Raw pairing material is returned once and never
     // stored or logged; the DO keeps only digest-keyed, HMAC-bound verifiers.
     // The six-digit code NEVER travels in a URL/URI/query — consumption is
     // JSON-body-only; only the pairing_id may appear in a descriptor/fragment.
     if (request.method === "GET" && url.pathname === "/devices") {
-      const ownerAuth = await authenticateOwner(request, env);
-      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "device_inventory_admin_required" }, 401);
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "device_inventory_admin_required" }, 401);
       const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
       try {
         const devices = await listPublicDevices(
@@ -312,18 +473,19 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/devices/pairings") {
-      const ownerAuth = await authenticateOwner(request, env);
-      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "pairing_admin_required" }, 401);
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "pairing_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
-      const input: { ttl_seconds?: number; name?: string; worker_context: string } = {
+      const input: { ttl_seconds?: number; name?: string; worker_context: string; require_empty_fleet?: boolean } = {
         worker_context: pairingWorkerContext(env),
       };
       if (parsed.value.ttl_seconds !== undefined) input.ttl_seconds = parsed.value.ttl_seconds as number;
       if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
+      if (parsed.value.require_empty_fleet === true) input.require_empty_fleet = true;
       const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
       const result = await createPairingSession(registry, input);
       return result.ok
@@ -402,11 +564,11 @@ export default {
       const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
       let authorized = deviceAuth.ok;
       if (!authorized) {
-        const ownerAuth = await authenticateOwner(request, env);
-        const ownerWorkstation = request.headers.get("x-herdr-workstation")?.trim() ?? "";
-        authorized = ownerAuth
+        const fleetAdmin = await authenticateFleetAdmin(request, env);
+        const presentedWorkstation = request.headers.get("x-herdr-workstation")?.trim() ?? "";
+        authorized = fleetAdmin !== null
           && workstationId === env.DEFAULT_WORKSTATION_ID
-          && ownerWorkstation === workstationId;
+          && presentedWorkstation === workstationId;
       }
       if (!authorized) return noStoreJsonResponse({ ok: false, code: "rename_auth_failed" }, 401);
 
@@ -427,15 +589,13 @@ export default {
       return noStoreJsonResponse({ ok: false, code: renamed.code }, status);
     }
 
-    // ---- Owner/operator revoke of any enrolled device. The caller supplies only
+    // ---- Fleet-admin revoke of any enrolled device. The caller supplies only
     // the canonical target device_id — never a workstation_id or target secret.
-    // Authorization is the same trusted owner contract used for pairing
-    // creation: trusted MCP/OAuth/operator auth, or the exact default-workstation
-    // link credential. A joined member device credential is never sufficient
-    // unless its authenticated workstation is exactly DEFAULT_WORKSTATION_ID.
+    // Authorization is the same Worker-owned fleet-admin contract used for
+    // pairing creation; enrolled devices have no owner/member hierarchy.
     if (request.method === "POST" && url.pathname === "/devices/revoke") {
-      const ownerAuth = await authenticateOwner(request, env);
-      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "revoke_admin_required" }, 401);
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "revoke_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.device_id !== "string") {
         const code = parsed.ok ? "bad_request" : parsed.code;
@@ -539,10 +699,40 @@ export default {
     return jsonResponse({ ok: false, code: "not_found", retryable: false, path: url.pathname }, 404);
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    if (!env.ARTIFACT_BUCKET) return;
-    const result = await sweepExpiredArtifacts(env.ARTIFACT_BUCKET, Date.now());
-    logger.info("artifact.sweep", { scanned: result.scanned, deleted: result.deleted });
+  async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
+    const nowMs = Number.isFinite(event.scheduledTime) ? event.scheduledTime : Date.now();
+    if (env.ARTIFACT_BUCKET) {
+      const result = await sweepExpiredArtifacts(env.ARTIFACT_BUCKET, nowMs);
+      logger.info("artifact.sweep", { scanned: result.scanned, deleted: result.deleted });
+    }
+
+    // The Worker already runs every ten minutes for artifact expiry. Reuse one
+    // deterministic daily tick for Connector lifecycle GC instead of adding a
+    // second cron or scanning OAuth state every ten minutes.
+    const scheduled = new Date(nowMs);
+    if (scheduled.getUTCHours() !== 3 || scheduled.getUTCMinutes() !== 0) return;
+    const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+    const response = await stub.fetch(new Request("https://oauth.internal/internal/oauth/connector/sweep-inactive", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        now_ms: nowMs,
+        inactive_ms: 30 * 24 * 60 * 60_000,
+        limit: 64,
+      }),
+    }));
+    if (!response.ok) {
+      logger.warn("connector.inactivity_sweep_failed", { status: response.status });
+      return;
+    }
+    const result = await response.json() as Record<string, unknown>;
+    logger.info("connector.inactivity_sweep", {
+      scanned: result.scanned ?? 0,
+      eligible: result.eligible ?? 0,
+      revoked: result.revoked ?? 0,
+      deletedTokens: result.deleted_tokens ?? 0,
+      remainingEligible: result.remaining_eligible ?? 0,
+    });
   },
 };
 
@@ -560,6 +750,10 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
   if (!devAuth.ok) {
     return mcpUnauthorized(env);
   }
+  const mcpFleetPrincipal =
+    devAuth.source === "dev_bearer" || devAuth.source === "static_bearer"
+      ? `operator:${devAuth.source}`
+      : null;
 
   if (request.method === "GET" && isMcpPath) {
     return withMcpCors(createSessionlessMcpProbeResponse({ signal: request.signal }));
@@ -573,7 +767,18 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
       ));
     }
     const workstationId = resolveWorkstation(request, env);
-    const webchatControlGrants = await oauthClientWebChatControlGrants(env, devAuth.clientId);
+    const webchatControlGrants = await oauthClientWebChatControlGrants(
+      env,
+      devAuth.clientId,
+      devAuth.connectorId,
+      devAuth.grantGeneration,
+    );
+    const pageAssistGrants = await oauthClientPageAssistGrants(
+      env,
+      devAuth.clientId,
+      devAuth.connectorId,
+      devAuth.grantGeneration,
+    );
     const dev = await handleMcp(parsed.value, workstationId, {
       limits,
       client: {
@@ -581,6 +786,9 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         oauthClientId: devAuth.clientId ?? null,
         authSource: devAuth.source,
         webchatControlGrants,
+        pageAssistGrants,
+        automationDeviceId: devAuth.principalType === "automation" ? (devAuth.deviceId ?? null) : null,
+        fleetAdmin: Boolean(mcpFleetPrincipal),
       },
       forward: async (stub: unknown, body: string) => {
         const internal = new Request("https://do.internal/internal/forward", {
@@ -599,6 +807,9 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         );
       },
       createPairing: async (input) => {
+        if (!mcpFleetPrincipal) {
+          return { ok: false, code: "fleet_admin_required", status: 403 };
+        }
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
         const pairingInput = {
           worker_context: pairingWorkerContext(env),
@@ -620,6 +831,9 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         };
       },
       revokeDevice: async (deviceId) => {
+        if (!mcpFleetPrincipal) {
+          return { ok: false, code: "fleet_admin_required", retryable: false };
+        }
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
         const result = await revokeRegisteredDevice(registry, deviceId);
         if (!result.ok) {
@@ -647,21 +861,21 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         return await response.json() as Record<string, unknown>;
       },
       approveConnector: async (input) => {
-        if (!(await oauthClientCanApproveConnectors(env, devAuth.clientId))) {
-          return { ok: false, code: "connector_approval_authority_required" };
+        if (!mcpFleetPrincipal) {
+          return { ok: false, code: "fleet_admin_required" };
         }
         return approveConnectorRequest(
           env,
           input.request_id,
           input.code,
-          `oauth:${devAuth.clientId}`,
+          mcpFleetPrincipal,
         );
       },
-      revokeConnector: async (clientId) => {
-        if (!(await oauthClientCanApproveConnectors(env, devAuth.clientId))) {
-          return { ok: false, code: "connector_approval_authority_required" };
+      revokeConnector: async (connectorId) => {
+        if (!mcpFleetPrincipal) {
+          return { ok: false, code: "fleet_admin_required" };
         }
-        return revokeConnectorGrant(env, clientId, `oauth:${devAuth.clientId}`);
+        return revokeConnectorInstance(env, connectorId, mcpFleetPrincipal);
       },
       resolveDevice: async (selector, args) => {
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
@@ -695,7 +909,7 @@ async function handleEdgeOAuthPublic(request: Request, env: Env): Promise<Respon
     if (path === "/oauth/authorize" || path === "/oauth/authorize/poll") {
       return noStoreJsonResponse({
         error: "server_error",
-        error_description: "OAuth owner approval is not configured",
+        error_description: "OAuth fleet approval is not configured",
       }, 503);
     }
   }
@@ -795,7 +1009,14 @@ async function handleOAuthAdmin(request: Request, env: Env): Promise<Response> {
   return jsonResponse({ ok: false, code: "not_found" }, 404);
 }
 
-async function verifyEdgeAccessToken(env: Env, token: string): Promise<{ ok: boolean; clientId?: string }> {
+async function verifyEdgeAccessToken(env: Env, token: string): Promise<{
+  ok: boolean;
+  clientId?: string;
+  connectorId?: string;
+  grantGeneration?: number;
+  principalType?: string;
+  deviceId?: string;
+}> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   const response = await stub.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
     method: "POST",
@@ -805,13 +1026,41 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{ ok: boo
   if (!response.ok) return { ok: false };
   const payload = await response.json() as Record<string, unknown>;
   const clientId = typeof payload.client_id === "string" ? payload.client_id : undefined;
-  return clientId ? { ok: true, clientId } : { ok: payload.ok === true };
+  const connectorId = typeof payload.connector_id === "string" && /^conn_[A-Za-z0-9_-]{8,128}$/.test(payload.connector_id)
+    ? payload.connector_id
+    : undefined;
+  const grantGeneration = Number.isSafeInteger(payload.grant_generation) && Number(payload.grant_generation) > 0
+    ? Number(payload.grant_generation)
+    : undefined;
+  const principalType = typeof payload.principal_type === "string" ? payload.principal_type : undefined;
+  const deviceId = typeof payload.device_id === "string" ? payload.device_id : undefined;
+  if (!clientId || ((connectorId === undefined) !== (grantGeneration === undefined))) return { ok: false };
+  return {
+    ok: true,
+    clientId,
+    ...(connectorId ? { connectorId, grantGeneration } : {}),
+    ...(principalType ? { principalType } : {}),
+    ...(deviceId ? { deviceId } : {}),
+  };
 }
 
 async function authenticateEdgeMcpRequest(request: Request, env: Env) {
   return authenticateMcpRequest(request, env, {
     verifyEdgeToken: (token) => verifyEdgeAccessToken(env, token),
+    verifyLegacyClient: (clientId) => verifyLegacyOAuthClientGrantFence(env, clientId),
   });
+}
+
+async function verifyLegacyOAuthClientGrantFence(env: Env, clientId: string): Promise<boolean> {
+  const response = await oauthInternal(env, "/internal/oauth/grant/get", { client_id: clientId });
+  if (response.status === 404) {
+    // Pre-v0.4.6 clients have no grant record and retain ordinary MCP access
+    // until an explicit revoke creates a durable tombstone.
+    return true;
+  }
+  if (!response.ok) return false;
+  const payload = await response.json().catch(() => null) as { record?: { status?: string } } | null;
+  return payload?.record?.status === "active";
 }
 
 /**
@@ -825,22 +1074,53 @@ function pairingWorkerContext(env: Env): string {
 }
 
 /**
- * Shared owner/operator authorization for the device control plane (pairing
- * creation and owner revoke). Accepted owner contracts:
- *  - trusted MCP/OAuth/operator auth (authenticateEdgeMcpRequest); or
- *  - the exact DEFAULT_WORKSTATION_ID link credential (device or legacy).
- * A joined member device credential is never sufficient unless its
- * authenticated workstation is exactly DEFAULT_WORKSTATION_ID.
+ * Worker-owned fleet administration. There is no owner/member device
+ * hierarchy: any active enrolled device is an equivalent administration
+ * channel. Worker operator credentials are also accepted. OAuth Connectors,
+ * including explicitly approved v0.4.6+ instances, remain ordinary MCP
+ * principals and never gain fleet administration merely by being approved.
  */
-async function authenticateOwner(request: Request, env: Env): Promise<boolean> {
-  const owner = await authenticateEdgeMcpRequest(request, env);
-  if (owner.ok) return true;
-
-  return (await authenticateOwnerDevice(request, env)) !== null;
+async function authenticateFleetAdmin(request: Request, env: Env): Promise<string | null> {
+  const mcp = await authenticateEdgeMcpRequest(request, env);
+  if (mcp.ok) {
+    if (mcp.source === "dev_bearer" || mcp.source === "static_bearer") {
+      return `operator:${mcp.source}`;
+    }
+  }
+  return authenticateFleetDevice(request, env);
 }
 
-async function authenticateOwnerDevice(request: Request, env: Env): Promise<string | null> {
+async function authenticateFleetDevice(request: Request, env: Env): Promise<string | null> {
+  const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
+  if (!workstationId || !/^[A-Za-z0-9_.-]{1,64}$/.test(workstationId)) return null;
+  const extracted = extractLinkCredential(request);
+  if (!extracted.ok) return null;
 
+  const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+  const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
+  if (deviceAuth.ok) return `device:${deviceAuth.device_id}`;
+  if (deviceAuth.code !== "device_not_found" && deviceAuth.code !== "device_credential_missing") {
+    return null;
+  }
+  if (!env.DEFAULT_WORKSTATION_ID || workstationId !== env.DEFAULT_WORKSTATION_ID) return null;
+  // Pre-device-registry single-workstation installs keep the legacy shared
+  // secret fallback only for the configured default workstation. Once a
+  // device record exists, the per-device credential is authoritative.
+  const legacy = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
+  if (!legacy.authenticate(request, workstationId, Date.now()).ok) return null;
+  try {
+    const registered = await ensureLegacyDeviceRegistration(registry, workstationId);
+    return `device:${registered.device_id}`;
+  } catch {
+    return null;
+  }
+}
+
+// WebChat Control is a separate 1.0 security boundary: unlike ordinary
+// v0.4.6 fleet administration, widening a WebChat grant remains restricted to
+// the configured owner workstation. Keep this check distinct from
+// authenticateFleetDevice/authenticateFleetAdmin.
+async function authenticateOwnerDevice(request: Request, env: Env): Promise<string | null> {
   const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
   if (!env.DEFAULT_WORKSTATION_ID || workstationId !== env.DEFAULT_WORKSTATION_ID) return null;
   const extracted = extractLinkCredential(request);
@@ -856,20 +1136,139 @@ async function authenticateOwnerDevice(request: Request, env: Env): Promise<stri
   return legacy.authenticate(request, workstationId, Date.now()).ok ? workstationId : null;
 }
 
-async function oauthClientCanApproveConnectors(env: Env, clientId: string | undefined): Promise<boolean> {
-  if (!clientId) return false;
+async function oauthInternal(env: Env, path: string, body: Record<string, unknown>): Promise<Response> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
-  const store = createOAuthPublicStore(stub);
-  const grant = await store.getGrant(clientId);
-  return grant?.status === "active" && grant.can_approve_connectors === true;
+  return stub.fetch(new Request(`https://oauth.internal${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }));
 }
 
-async function oauthClientWebChatControlGrants(env: Env, clientId: string | undefined) {
-  if (!clientId) return [];
+async function createAutomationClient(
+  env: Env,
+  name: string,
+  createdBy: string,
+  deviceId: string,
+  deviceName: string | null,
+): Promise<
+  | { ok: true; action: "automation_create"; client_id: string; client_secret: string; name: string; device_id: string; device_name: string | null; token_endpoint: string; scope: "mcp" }
+  | { ok: false; code: string }
+> {
+  if (!env.OAUTH_ISSUER) return { ok: false, code: "oauth_not_configured" };
+  const identity = createOAuthIdentity(env.OAUTH_ISSUER);
+  const clientId = `svc_${randomBase64UrlToken().slice(0, 22)}`;
+  const clientSecret = `herdr_svc_${randomBase64UrlToken()}`;
+  const response = await oauthInternal(env, "/internal/oauth/automation/create", {
+    client_id: clientId,
+    client_secret_hash: await sha256Hex(clientSecret),
+    client_name: name,
+    resource: identity.resource,
+    scope: "mcp",
+    created_by: createdBy,
+    device_id: deviceId,
+    device_name: deviceName,
+    now_ms: Date.now(),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { code?: string } | null;
+    return { ok: false, code: payload?.code ?? "automation_create_failed" };
+  }
+  return {
+    ok: true,
+    action: "automation_create",
+    client_id: clientId,
+    client_secret: clientSecret,
+    name,
+    device_id: deviceId,
+    device_name: deviceName,
+    token_endpoint: `${identity.issuer}/oauth/token`,
+    scope: "mcp",
+  };
+}
+
+async function listAutomationClients(
+  env: Env,
+): Promise<{ ok: true; automations: unknown[] } | { ok: false; code: string }> {
+  const response = await oauthInternal(env, "/internal/oauth/automation/list", {});
+  if (!response.ok) return { ok: false, code: "automation_list_failed" };
+  const payload = await response.json().catch(() => null) as { automations?: unknown[] } | null;
+  return { ok: true, automations: Array.isArray(payload?.automations) ? payload.automations : [] };
+}
+
+async function rotateAutomationClient(
+  env: Env,
+  clientId: string,
+  rotatedBy: string,
+): Promise<
+  | { ok: true; action: "automation_rotate"; client_id: string; client_secret: string }
+  | { ok: false; code: string }
+> {
+  const clientSecret = `herdr_svc_${randomBase64UrlToken()}`;
+  const response = await oauthInternal(env, "/internal/oauth/automation/rotate", {
+    client_id: clientId,
+    client_secret_hash: await sha256Hex(clientSecret),
+    rotated_by: rotatedBy,
+    now_ms: Date.now(),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { code?: string } | null;
+    return { ok: false, code: payload?.code ?? "automation_rotate_failed" };
+  }
+  return { ok: true, action: "automation_rotate", client_id: clientId, client_secret: clientSecret };
+}
+
+async function revokeAutomationClient(
+  env: Env,
+  clientId: string,
+  revokedBy: string,
+): Promise<{ ok: true } | { ok: false; code: string }> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   const store = createOAuthPublicStore(stub);
   const grant = await store.getGrant(clientId);
-  return grant?.status === "active" ? grant.webchat_control : [];
+  if (!grant) return { ok: false, code: "automation_client_not_found" };
+  if (grant.principal_type !== "automation") return { ok: false, code: "not_automation_client" };
+  if (!(await store.revokeGrant(clientId, revokedBy, Date.now()))) {
+    return { ok: false, code: "automation_revoke_failed" };
+  }
+  return { ok: true };
+}
+
+async function oauthClientWebChatControlGrants(
+  env: Env,
+  clientId: string | undefined,
+  connectorId: string | undefined,
+  grantGeneration: number | undefined,
+) {
+  if (!clientId || !connectorId || !grantGeneration) return [];
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  const grant = await store.getGrant(clientId);
+  if (grant?.status !== "active") return [];
+  return (grant.webchat_control ?? [])
+    .filter((item) => item.connector_id === connectorId && item.grant_generation === grantGeneration)
+    .map((item) => ({
+      device_id: item.device_id,
+      endpoint_ref: item.endpoint_ref,
+      provider: item.provider,
+      account_ref: item.account_ref,
+    }));
+}
+
+async function oauthClientPageAssistGrants(
+  env: Env,
+  clientId: string | undefined,
+  connectorId: string | undefined,
+  grantGeneration: number | undefined,
+) {
+  if (!clientId || !connectorId || !grantGeneration) return [];
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  const grant = await store.getGrant(clientId);
+  if (grant?.status !== "active") return [];
+  return (grant.page_assist ?? [])
+    .filter((item) => item.connector_id === connectorId && item.grant_generation === grantGeneration)
+    .map((item) => ({ device_id: item.device_id, endpoint_ref: item.endpoint_ref }));
 }
 
 function fleetControllerAuthority(auth: { source: string; clientId?: string }): { principal: string; can_force_takeover: boolean } | null {
@@ -900,6 +1299,21 @@ async function approveConnectorRequest(
     client_id: result.record.client_id,
     approved_at_ms: result.record.approved_at_ms ?? null,
   };
+}
+
+async function cancelConnectorRequest(
+  env: Env,
+  requestId: string,
+): Promise<{ ok: true; connector_deleted: boolean } | { ok: false; code: string }> {
+  const response = await oauthInternal(env, "/internal/oauth/approval/cancel", {
+    request_id: requestId,
+  });
+  const payload = await response.json().catch(() => null) as {
+    code?: string;
+    connector_deleted?: boolean;
+  } | null;
+  if (!response.ok) return { ok: false, code: payload?.code ?? "connector_cancel_failed" };
+  return { ok: true, connector_deleted: payload?.connector_deleted === true };
 }
 
 async function inspectConnectorRequest(
@@ -937,15 +1351,27 @@ async function inspectConnectorRequest(
   };
 }
 
-async function revokeConnectorGrant(
+async function revokeConnectorInstance(
+  env: Env,
+  connectorId: string,
+  revokedBy: string,
+): Promise<{ ok: true } | { ok: false; code: string }> {
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  if (!(await store.getConnector(connectorId))) return { ok: false, code: "connector_not_found" };
+  if (!(await store.revokeConnector(connectorId, revokedBy, Date.now()))) return { ok: false, code: "connector_revoke_failed" };
+  return { ok: true };
+}
+
+async function revokeConnectorClient(
   env: Env,
   clientId: string,
   revokedBy: string,
 ): Promise<{ ok: true } | { ok: false; code: string }> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   const store = createOAuthPublicStore(stub);
-  const grant = await store.getGrant(clientId);
-  if (!grant) return { ok: false, code: "connector_grant_not_found" };
-  if (!(await store.revokeGrant(clientId, revokedBy, Date.now()))) return { ok: false, code: "connector_revoke_failed" };
+  if (!(await store.revokeClientConnectors(clientId, revokedBy, Date.now()))) {
+    return { ok: false, code: "connector_client_revoke_failed" };
+  }
   return { ok: true };
 }

@@ -16,6 +16,13 @@ const STATUS_COMPACT_AFTER: usize = 24;
 const DIFF_COMPACT_AFTER_FILES: usize = 8;
 const DIFF_COMPACT_AFTER_BYTES: usize = 8192;
 const LOG_COMPACT_AFTER: usize = 40;
+// Untracked workspace changes surfaced on `action=diff` when not staged. Git
+// cannot diff an untracked file, so we expose bounded structured metadata
+// (path, size, kind, truncation indicator) instead of fabricating a unified
+// diff. Sampling is capped so classification stays bounded for huge files.
+const UNTRACKED_SAMPLE_BYTES: usize = 8192;
+const UNTRACKED_MAX_FILES: usize = 1000;
+const UNTRACKED_STATUS_BUDGET: usize = 512 * 1024;
 
 pub fn run(snapshot: &Value, args: &Value) -> Value {
     let root_input = match required_str(args, "root") {
@@ -51,6 +58,7 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
         Err(error) => return error,
     };
 
+    let mut safe_diff_target: Option<PathBuf> = None;
     let mut command_args = Vec::<String>::new();
     match action {
         "status" => command_args.extend(["status".into(), "--porcelain".into(), "-b".into()]),
@@ -64,6 +72,7 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
                     Ok(value) => value,
                     Err(error) => return error,
                 };
+                safe_diff_target = Some(safe_path.clone());
                 command_args.push("--".into());
                 command_args.push(safe_path.to_string_lossy().into_owned());
             }
@@ -122,6 +131,35 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
         if compact.commits > LOG_COMPACT_AFTER {
             output.insert("output".to_owned(), json!(compact.grouped));
             output.insert("compacted".to_owned(), json!(true));
+        }
+    }
+    // `git diff` cannot represent untracked files. When the caller asks for the
+    // working-tree diff (staged=false), surface untracked changes as bounded
+    // metadata. A staged diff stays strictly staged-only: it must NOT include
+    // untracked files.
+    if action == "diff" && !staged && result.exit_code == 0 {
+        match collect_untracked(&managed.root, safe_diff_target.as_ref()) {
+            Ok((untracked, listing_truncated)) => {
+                let metadata: Vec<Value> = untracked
+                    .iter()
+                    .map(|file| {
+                        json!({
+                            "path": file.path,
+                            "size": file.size,
+                            "kind": file.kind,
+                            "truncated": file.truncated,
+                        })
+                    })
+                    .collect();
+                output.insert("untracked".to_owned(), Value::Array(metadata));
+                output.insert("untracked_count".to_owned(), json!(untracked.len()));
+                output.insert("untracked_truncated".to_owned(), json!(listing_truncated));
+            }
+            Err(_) => {
+                output.insert("untracked".to_owned(), json!([]));
+                output.insert("untracked_count".to_owned(), json!(0));
+                output.insert("untracked_error".to_owned(), json!(true));
+            }
         }
     }
     if !result.stderr.is_empty() {
@@ -375,6 +413,128 @@ fn strip_diff_prefix(path: &str) -> String {
         .or_else(|| path.strip_prefix("a/"))
         .unwrap_or(path)
         .to_owned()
+}
+
+/// Bounded metadata for one untracked workspace file surfaced alongside a
+/// working-tree `git diff`. We deliberately do not fabricate a unified diff
+/// body for untracked files; callers read the raw file when they need content.
+struct UntrackedFile {
+    path: String,
+    size: u64,
+    kind: &'static str,
+    truncated: bool,
+}
+
+fn classify_untracked_file(root: &Path, relative: &Path) -> UntrackedFile {
+    let path = relative.to_string_lossy().replace('\\', "/");
+    let full = root.join(relative);
+    let (size, kind, truncated) = match std::fs::symlink_metadata(&full) {
+        Ok(meta) => {
+            let size = meta.len();
+            if !meta.file_type().is_file() {
+                // Never follow untracked symlinks or other special files merely
+                // to classify a Git diff. Their presence is visible, but the
+                // metadata probe stays inside the repository boundary.
+                (size, "unreadable", false)
+            } else {
+                match sample_classify(&full, size) {
+                    Some((kind, truncated)) => (size, kind, truncated),
+                    // Metadata readable but the file itself is not openable.
+                    None => (size, "unreadable", false),
+                }
+            }
+        }
+        // Broken symlink, vanished path, or unreadable metadata.
+        Err(_) => (0, "unreadable", false),
+    };
+    UntrackedFile {
+        path,
+        size,
+        kind,
+        truncated,
+    }
+}
+
+/// Read a bounded prefix to decide text vs binary. Returns (kind, truncated)
+/// where truncated is true when the file is larger than the sampled prefix, so
+/// callers know classification is approximate but the payload stayed bounded.
+fn sample_classify(path: &Path, size: u64) -> Option<(&'static str, bool)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let sample = size.min(UNTRACKED_SAMPLE_BYTES as u64) as usize;
+    let mut buf = vec![0u8; sample];
+    let mut read = 0usize;
+    loop {
+        let n = file.read(&mut buf[read..]).ok()?;
+        if n == 0 {
+            break;
+        }
+        read += n;
+        if read >= sample {
+            break;
+        }
+    }
+    let binary = buf[..read].contains(&0u8);
+    let truncated = size > UNTRACKED_SAMPLE_BYTES as u64;
+    Some((if binary { "binary" } else { "text" }, truncated))
+}
+
+/// Enumerate untracked files under `root` (optionally restricted to `filter`),
+/// returning bounded per-file metadata plus whether the listing was truncated.
+/// Denied secret paths are excluded and never surfaced.
+fn collect_untracked(
+    root: &Path,
+    filter: Option<&PathBuf>,
+) -> Result<(Vec<UntrackedFile>, bool), String> {
+    let mut args = vec![
+        "status".to_owned(),
+        "--porcelain=v1".to_owned(),
+        "-z".to_owned(),
+        "--untracked-files=all".to_owned(),
+        "--no-renames".to_owned(),
+    ];
+    if let Some(filter) = filter {
+        let relative = filter.strip_prefix(root).unwrap_or(filter.as_path());
+        args.push("--".to_owned());
+        args.push(relative.to_string_lossy().into_owned());
+    }
+    let result = run_git(root, &args, UNTRACKED_STATUS_BUDGET, TIMEOUT)?;
+    let mut files = Vec::new();
+    let mut listing_truncated = result.truncated;
+    // A byte-budget cut can land in the middle of the final NUL-delimited
+    // porcelain record. Never turn that partial path into authoritative file
+    // metadata; the explicit listing_truncated flag preserves the uncertainty.
+    let complete_stdout = if result.truncated && !result.stdout.ends_with('\0') {
+        result
+            .stdout
+            .rfind('\0')
+            .map(|index| &result.stdout[..=index])
+            .unwrap_or("")
+    } else {
+        result.stdout.as_str()
+    };
+    for entry in complete_stdout.split('\0') {
+        if entry.is_empty() || entry.len() < 4 {
+            continue;
+        }
+        if &entry[..2] != "??" {
+            continue;
+        }
+        let rel = &entry[3..];
+        if rel.is_empty() {
+            continue;
+        }
+        let rel_path = PathBuf::from(rel);
+        if fs_security::denied_secret_path(&root.join(&rel_path)) {
+            continue;
+        }
+        if files.len() >= UNTRACKED_MAX_FILES {
+            listing_truncated = true;
+            break;
+        }
+        files.push(classify_untracked_file(root, &rel_path));
+    }
+    Ok((files, listing_truncated))
 }
 
 struct LogCompact {
@@ -1299,6 +1459,141 @@ aaa1111 (api) preserve this prefix
         assert_eq!(result["truncated"], true);
         assert!(result.get("compacted").is_none());
         assert!(result.get("counts").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_untracked_only_exposes_bounded_metadata() {
+        let root = unique_temp_dir("git-diff-untracked");
+        git_init(&root);
+        // No tracked changes at all: git diff body is empty, but untracked files
+        // must still be surfaced as structured metadata (never a fake diff).
+        fs::write(root.join("brand-new.txt"), "hello\nworld\n").unwrap();
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["untracked_count"], 1);
+        assert_eq!(result["untracked_truncated"], false);
+        let untracked = result["untracked"].as_array().unwrap();
+        assert_eq!(untracked.len(), 1);
+        assert_eq!(untracked[0]["path"], "brand-new.txt");
+        assert_eq!(untracked[0]["size"], 12);
+        assert_eq!(untracked[0]["kind"], "text");
+        assert_eq!(untracked[0]["truncated"], false);
+        // No unified diff body is fabricated for the untracked file.
+        assert!(!result["output"].as_str().unwrap().contains("hello"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_tracked_plus_untracked_reports_both() {
+        let root = unique_temp_dir("git-diff-mixed");
+        git_init(&root);
+        fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git_commit(&root, "baseline");
+        fs::write(root.join("tracked.txt"), "base\nCHANGED\n").unwrap();
+        fs::write(root.join("fresh.txt"), "untracked\n").unwrap();
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert!(result["output"].as_str().unwrap().contains("tracked.txt"));
+        assert!(result["output"].as_str().unwrap().contains("CHANGED"));
+        assert_eq!(result["untracked_count"], 1);
+        assert_eq!(result["untracked"][0]["path"], "fresh.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_diff_excludes_untracked() {
+        let root = unique_temp_dir("git-diff-staged");
+        git_init(&root);
+        fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git_commit(&root, "baseline");
+        fs::write(root.join("tracked.txt"), "base\nSTAGED\n").unwrap();
+        fs::write(root.join("fresh.txt"), "untracked\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "tracked.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "staged": true, "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert!(result["output"].as_str().unwrap().contains("STAGED"));
+        assert!(result.get("untracked").is_none());
+        assert!(result.get("untracked_count").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_untracked_binary_and_large_are_bounded() {
+        let root = unique_temp_dir("git-diff-untracked-binary");
+        git_init(&root);
+        fs::write(root.join("blob.bin"), [0u8, 1, 2, 0, 255, 7, 0]).unwrap();
+        let big = vec![b'x'; UNTRACKED_SAMPLE_BYTES + 4096];
+        fs::write(root.join("big.txt"), big).unwrap();
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["untracked_count"], 2);
+        let untracked = result["untracked"].as_array().unwrap();
+        let blob = untracked
+            .iter()
+            .find(|file| file["path"] == "blob.bin")
+            .unwrap();
+        assert_eq!(blob["kind"], "binary");
+        assert_eq!(blob["truncated"], false);
+        let big = untracked
+            .iter()
+            .find(|file| file["path"] == "big.txt")
+            .unwrap();
+        assert_eq!(big["kind"], "text");
+        assert_eq!(big["truncated"], true);
+        assert_eq!(big["size"], (UNTRACKED_SAMPLE_BYTES + 4096) as u64);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_untracked_respects_path_filter_and_secret_denial() {
+        let root = unique_temp_dir("git-diff-untracked-path");
+        git_init(&root);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.txt"), "inside\n").unwrap();
+        fs::write(root.join("outside.txt"), "outside\n").unwrap();
+        fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "path": "sub", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["untracked_count"], 1);
+        assert_eq!(result["untracked"][0]["path"], "sub/a.txt");
+
+        let full = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "max_bytes": 65536}),
+        );
+        assert_eq!(full["ok"], true);
+        let paths: Vec<&str> = full["untracked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"outside.txt"));
+        assert!(!paths.contains(&".env"));
         fs::remove_dir_all(root).unwrap();
     }
 }

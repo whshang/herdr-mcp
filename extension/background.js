@@ -32,6 +32,11 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
+  originToMatchPattern,
+  parseAllowedOrigins,
+  validatePageAssistRequest,
+} from "./page-assist-core.js";
+import {
   QUEUED_INSERT_STORAGE_KEY,
   ackQueuedInsertBatch,
   clearQueuedInserts,
@@ -47,10 +52,14 @@ const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
   deepseek: "*://chat.deepseek.com/*",
+  gemini: "*://gemini.google.com/*",
+  grok: "*://grok.com/*",
 };
 const EXPERIMENTAL_SITE_PERMISSION_PATTERNS = {
   "z.ai": "https://chat.z.ai/*",
   deepseek: "https://chat.deepseek.com/*",
+  gemini: "https://gemini.google.com/*",
+  grok: "https://grok.com/*",
 };
 const EXPERIMENTAL_CONTENT_SCRIPTS = [
   {
@@ -73,6 +82,30 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
     js: [
       "content/base.js", "content/injector/deepseek.js", "content/webmcp/speaks-json.js",
       "content/webmcp/json-bridge-core.js", "content/webmcp/json-bridge.js", "performance-core.js",
+      "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
+      "content/hud/hud.js", "content/wake.js",
+    ],
+    runAt: "document_idle",
+    persistAcrossSessions: true,
+  },
+  {
+    id: "herdr-experimental-gemini",
+    site: "gemini",
+    matches: ["https://gemini.google.com/*"],
+    js: [
+      "content/base.js", "content/injector/gemini.js", "performance-core.js",
+      "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
+      "content/hud/hud.js", "content/wake.js",
+    ],
+    runAt: "document_idle",
+    persistAcrossSessions: true,
+  },
+  {
+    id: "herdr-experimental-grok",
+    site: "grok",
+    matches: ["https://grok.com/*"],
+    js: [
+      "content/base.js", "content/injector/grok.js", "performance-core.js",
       "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
       "content/hud/hud.js", "content/wake.js",
     ],
@@ -206,9 +239,12 @@ let CFG = {
   llmJudgeModel: "",
   llmJudgePromptTemplate: "",
   llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-  // z.ai and DeepSeek stay opt-in until the next compatibility/UAT cycle.
+  // Experimental Web AI origins stay opt-in until their compatibility/UAT gate passes.
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
+  experimentalGeminiEnabled: false,
+  experimentalGrokEnabled: false,
+  pageAssistOrigins: [],
 };
 let PROJECT_AUTOMATION = {};
 let CONVERSATION_AUTOMATION = {};
@@ -238,6 +274,8 @@ function isJsonBridgeConversation(convKey) {
 function experimentalSiteEnabled(site) {
   if (site === "z.ai") return CFG.experimentalZAiEnabled === true;
   if (site === "deepseek") return CFG.experimentalDeepSeekEnabled === true;
+  if (site === "gemini") return CFG.experimentalGeminiEnabled === true;
+  if (site === "grok") return CFG.experimentalGrokEnabled === true;
   return true;
 }
 
@@ -272,6 +310,27 @@ async function hasLlmHostPermission(cfg) {
   return hasHostPermission(hostPermissionPatternForUrl(cfg?.llmJudgeBaseUrl));
 }
 
+async function reloadOpenTabsAfterExperimentalRegistration(site, matches) {
+  if (!chrome.tabs?.query || !chrome.tabs?.reload || !Array.isArray(matches) || matches.length === 0) return;
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: matches });
+  } catch (error) {
+    callLog(`experimental content script recovery scan failed for ${site}:`, error?.message || String(error));
+    return;
+  }
+  for (const tab of tabs) {
+    if (!tab?.id || tab.status !== "complete" || reloadedTabs.has(tab.id)) continue;
+    reloadedTabs.add(tab.id);
+    try {
+      await chrome.tabs.reload(tab.id);
+    } catch (error) {
+      reloadedTabs.delete(tab.id);
+      callLog(`experimental content script recovery reload failed for ${site}:`, error?.message || String(error));
+    }
+  }
+}
+
 async function syncExperimentalContentScripts() {
   if (!chrome.scripting?.getRegisteredContentScripts
     || !chrome.scripting?.registerContentScripts
@@ -290,15 +349,19 @@ async function syncExperimentalContentScripts() {
       }
       continue;
     }
+    let newlyRegistered = false;
     try {
       if (registered.has(spec.id) && chrome.scripting?.updateContentScripts) {
         await chrome.scripting.updateContentScripts([registration]);
       } else if (!registered.has(spec.id)) {
         await chrome.scripting.registerContentScripts([registration]);
+        newlyRegistered = true;
       }
     } catch (error) {
       callLog(`experimental content script sync failed for ${site}:`, error?.message || String(error));
+      continue;
     }
+    if (newlyRegistered) await reloadOpenTabsAfterExperimentalRegistration(site, registration.matches);
   }
 }
 
@@ -560,26 +623,42 @@ function clearActionBadge() {
   try { chrome.action.setBadgeText({ text: "" }); } catch (e) {}
 }
 
+function browserConversationInfoFromSupportedUrl(rawUrl) {
+  const core = conversationInfoFromSupportedUrl(rawUrl);
+  if (core) return core;
+  const claude = claudeConversationInfo(rawUrl);
+  if (claude) return claude;
+  if (experimentalSiteEnabled("gemini")) {
+    const gemini = geminiConversationInfo(rawUrl);
+    if (gemini) return gemini;
+  }
+  if (experimentalSiteEnabled("grok")) {
+    const grok = grokConversationInfo(rawUrl);
+    if (grok) return grok;
+  }
+  return null;
+}
+
 async function conversationInfoForTab(tabId) {
   if (!tabId) return null;
   try {
     const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
     if (live?.convKey) {
-      const parsed = conversationInfoFromSupportedUrl(live.url || live.convKey);
+      const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
       return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
     }
   } catch (_) {}
 
   let tab = null;
   try { tab = await chrome.tabs.get(tabId); } catch (_) {}
-  const fallback = conversationInfoFromSupportedUrl(tab?.url);
+  const fallback = browserConversationInfoFromSupportedUrl(tab?.url);
   if (!fallback) return null;
 
-  // A manual MV3 extension reload can leave an already-open ChatGPT tab without
-  // a live listener. Never re-inject the manifest-managed classic-script bundle
-  // into the same document: top-level class/const declarations would collide.
-  // One bounded page reload gives Chrome a fresh document and one manifest load.
-  if (fallback.site === "chatgpt") {
+  // A manual MV3 extension reload or first dynamic-script registration can leave
+  // an already-open supported tab without a live listener. Never re-inject the manifest-managed classic-script bundle
+  // or a dynamically registered classic-script bundle into the same document:
+  // top-level declarations can collide. One bounded page reload gives Chrome a fresh document and one load.
+  if (["chatgpt", "gemini", "claude", "grok"].includes(fallback.site)) {
     try {
       const last = tabRecoveryAttemptAt.get(tabId) || 0;
       if (Date.now() - last >= TAB_RECOVERY_COOLDOWN_MS) {
@@ -591,7 +670,7 @@ async function conversationInfoForTab(tabId) {
         try {
           const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
           if (live?.convKey) {
-            const parsed = conversationInfoFromSupportedUrl(live.url || live.convKey);
+            const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
             return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
           }
         } catch (error) {
@@ -607,12 +686,12 @@ async function conversationInfoForTab(tabId) {
 }
 
 // ---- Content-script version synchronization ----
-async function sweepStaleTabs() {
+async function sweepStaleTabs(force = false) {
   try {
     const tabs = await chrome.tabs.query({ url: activeH2WTabUrls() });
     for (const t of tabs) {
       if (t.status !== "complete" || reloadedTabs.has(t.id)) continue;
-      if (tabVersions.get(t.id) === H2W_SCRIPT_VERSION) continue;
+      if (!force && tabVersions.get(t.id) === H2W_SCRIPT_VERSION) continue;
       reloadedTabs.add(t.id);
       callLog(`tab ${t.id} ${t.url} content script ${tabVersions.get(t.id) || "old/unreported"}; reloading`);
       chrome.tabs.reload(t.id);
@@ -1315,6 +1394,88 @@ function browserActuationUrl() {
   return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/browser/actuation`;
 }
 
+function geminiConversationInfo(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.origin !== "https://gemini.google.com") return null;
+    const appMatch = url.pathname.match(/^\/app\/([^/?#]+)\/?$/);
+    const sparkMatch = url.pathname.match(/^\/u\/([0-9]{1,3})\/spark\/chat\/([^/?#]+)\/?$/);
+    const encodedId = appMatch?.[1] || sparkMatch?.[2] || null;
+    if (!encodedId) return null;
+    const conversationId = decodeURIComponent(encodedId);
+    if (!conversationId || conversationId.length > 512 || /[\u0000-\u001f\u007f]/.test(conversationId)) return null;
+    const convKey = appMatch
+      ? `${url.origin}/app/${encodeURIComponent(conversationId)}`
+      : `${url.origin}/u/${sparkMatch[1]}/spark/chat/${encodeURIComponent(conversationId)}`;
+    return {
+      site: "gemini",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function claudeConversationInfo(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.origin !== "https://claude.ai") return null;
+    const match = url.pathname.match(/^\/chat\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+    if (!match) return null;
+    const conversationId = match[1].toLowerCase();
+    return {
+      site: "claude",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey: `${url.origin}/chat/${conversationId}`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function grokConversationInfo(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.origin !== "https://grok.com") return null;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const directMatch = url.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+    if (directMatch) {
+      const conversationId = directMatch[1].toLowerCase();
+      return {
+        site: "grok",
+        conversation_id: conversationId,
+        project_id: null,
+        convKey: `${url.origin}/c/${conversationId}`,
+      };
+    }
+
+    const projectMatch = url.pathname.match(/^\/project\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+    const chatValues = url.searchParams.getAll("chat");
+    if (!projectMatch || chatValues.length !== 1 || !uuid.test(chatValues[0])) return null;
+    const projectId = projectMatch[1].toLowerCase();
+    const conversationId = chatValues[0].toLowerCase();
+    return {
+      site: "grok",
+      conversation_id: conversationId,
+      project_id: projectId,
+      convKey: `${url.origin}/project/${projectId}?chat=${conversationId}`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserConversationInfo(provider, rawUrl) {
+  if (provider === "chatgpt") return chatGptConversationInfo(rawUrl);
+  if (provider === "gemini") return geminiConversationInfo(rawUrl);
+  if (provider === "claude") return claudeConversationInfo(rawUrl);
+  if (provider === "grok") return grokConversationInfo(rawUrl);
+  return null;
+}
+
 async function getBrowserObservationGeneration() {
   if (Number.isSafeInteger(browserObservationGeneration) && browserObservationGeneration > 0) {
     return browserObservationGeneration;
@@ -1344,8 +1505,9 @@ async function postBrowserRegistry(payload) {
   return parsed;
 }
 
-async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNativeIdentity }) {
+async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, accountNativeIdentity }) {
   if (!tabId || !pageInfo?.conversation_id || !accountNativeIdentity) return null;
+  if (!["chatgpt", "gemini", "claude", "grok"].includes(provider)) return null;
   const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
   if (!endpoint?.endpoint_ref) return null;
   const profileSeed = await getOrCreateBrowserProfileSeed();
@@ -1354,17 +1516,19 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
     operation: "provider.observe",
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
-    provider: "chatgpt",
+    provider,
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
-    capabilities: { operations: ["composer.submit", "generation.status", "session.inspect"] },
+    capabilities: { operations: provider === "chatgpt"
+        ? ["composer.submit", "generation.status", "session.inspect", "session.open"]
+        : ["composer.submit", "generation.status", "session.inspect"] },
     observed_at: Date.now(),
   });
   const account = await postBrowserRegistry({
     operation: "resource.observe",
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
-    provider: "chatgpt",
+    provider,
     kind: "account",
     parent_ref: null,
     native_identity: accountNativeIdentity,
@@ -1379,7 +1543,7 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
       operation: "resource.observe",
       profile_seed: profileSeed,
       endpoint_ref: endpoint.endpoint_ref,
-      provider: "chatgpt",
+      provider,
       kind: "space",
       parent_ref: parentRef,
       native_identity: pageInfo.project_id,
@@ -1395,7 +1559,7 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
     operation: "resource.observe",
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
-    provider: "chatgpt",
+    provider,
     kind: "session",
     parent_ref: parentRef,
     native_identity: pageInfo.conversation_id,
@@ -1406,6 +1570,7 @@ async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNat
   const sessionRef = session.resource?.resource_ref || null;
   if (!sessionRef) return null;
   browserSessionTargets.set(sessionRef, {
+    provider,
     tabId,
     convKey,
     conversationId: pageInfo.conversation_id,
@@ -1430,6 +1595,48 @@ async function getOrCreateBrowserProfileSeed() {
   return seed;
 }
 
+function browserEndpointView(endpoint) {
+  if (!endpoint?.endpoint_ref) return null;
+  const consent = endpoint.consent && typeof endpoint.consent === "object"
+    ? endpoint.consent
+    : {};
+  const consentRevision = Number.isSafeInteger(endpoint.consent_revision)
+    ? endpoint.consent_revision
+    : (Number.isSafeInteger(consent.revision) ? consent.revision : 0);
+  return {
+    endpoint_ref: endpoint.endpoint_ref,
+    browser_family: endpoint.browser_family || null,
+    extension_version: endpoint.extension_version || null,
+    consent: {
+      webchat_control: consent.webchat_control === true,
+      tool_bridge: consent.tool_bridge === true,
+      tool_bridge_workstation_mutation: consent.tool_bridge_workstation_mutation === true,
+      revision: consentRevision,
+    },
+    consent_revision: consentRevision,
+  };
+}
+
+async function setLocalBrowserWebchatControlConsent(allowed) {
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const current = browserEndpointView(endpoint);
+  if (!endpoint?.endpoint_ref || !current) throw new Error("browser-endpoint-unavailable");
+  const profileSeed = await getOrCreateBrowserProfileSeed();
+  const parsed = await postBrowserRegistry({
+    operation: "endpoint.consent",
+    profile_seed: profileSeed,
+    endpoint_ref: endpoint.endpoint_ref,
+    expected_consent_revision: current.consent_revision,
+    webchat_control_allowed: allowed,
+    tool_bridge_allowed: current.consent.tool_bridge,
+    tool_bridge_mutation_allowed: current.consent.tool_bridge_workstation_mutation,
+    observed_at: Date.now(),
+  });
+  if (!parsed?.endpoint) throw new Error("browser-consent-response-missing-endpoint");
+  browserEndpoint = parsed.endpoint;
+  return browserEndpointView(browserEndpoint);
+}
+
 async function registerLocalBrowserEndpoint() {
   await configReady;
   try {
@@ -1452,8 +1659,13 @@ async function registerLocalBrowserEndpoint() {
       await getBrowserObservationGeneration();
       return browserEndpoint;
     }
+    callLog(
+      "browser endpoint registration failed:",
+      parsed?.code || parsed?.error || `HTTP ${response.status}`,
+    );
     return null;
-  } catch (_) {
+  } catch (error) {
+    callLog("browser endpoint registration failed:", error?.message || String(error));
     return null;
   }
 }
@@ -1826,6 +2038,13 @@ async function sendChatGptTabMessage(tabId, message) {
   }
 }
 
+async function sendBrowserActuationTabMessage(tabId, message) {
+  // Browser dispatch is a single fenced Alpha 4/5 attempt. Missing receivers,
+  // reload recovery, and stale-view reconciliation belong to beta.1, so this
+  // path must never reuse the handoff helper's reload/retry behavior.
+  return chrome.tabs.sendMessage(tabId, message);
+}
+
 async function sendHandoffTabMessage(tabId, site, message) {
   if (site === "chatgpt") return sendChatGptTabMessage(tabId, message);
   let lastError = null;
@@ -2061,25 +2280,171 @@ function unavailableBrowserActuationEvidence(expectedGeneration, observedGenerat
   };
 }
 
+async function recoverBrowserSessionTarget(sessionRef, expectedGeneration) {
+  let observedGeneration = expectedGeneration;
+  let exactTarget = null;
+  try {
+    const candidates = await chrome.tabs.query({ url: activeH2WTabUrls() });
+    for (const tab of candidates) {
+      if (!tab?.id || tab.status !== "complete") continue;
+      let live = null;
+      try {
+        live = await chrome.tabs.sendMessage(tab.id, { type: "h2w_get_convkey" });
+      } catch (_) {
+        continue;
+      }
+      if (live?.browserSessionRef !== sessionRef) continue;
+      const liveGeneration = Number(live?.browserGeneration || 0);
+      if (Number.isSafeInteger(liveGeneration) && liveGeneration > 0) {
+        observedGeneration = liveGeneration;
+      }
+      if (liveGeneration !== expectedGeneration) continue;
+      const pageInfo = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
+      if (!pageInfo?.conversation_id) continue;
+      const target = {
+        provider: pageInfo.site,
+        tabId: tab.id,
+        convKey: pageInfo.convKey,
+        conversationId: pageInfo.conversation_id,
+        projectId: pageInfo.project_id || null,
+        observationGeneration: liveGeneration,
+        spaceRef: null,
+        lastSeenAt: Date.now(),
+      };
+      // The same logical browser session may be visible in multiple tabs. Do
+      // not guess which physical view owns actuation after service-worker loss.
+      if (exactTarget) return { target: null, observedGeneration, ambiguous: true };
+      exactTarget = target;
+    }
+  } catch (_) {}
+  if (exactTarget) browserSessionTargets.set(sessionRef, exactTarget);
+  return { target: exactTarget, observedGeneration, ambiguous: false };
+}
+
 async function handleBrowserActuation(command) {
   const actuationId = String(command?.actuation_id || "");
   const operation = String(command?.operation || "");
   const expectedGeneration = Number(command?.expected_generation || 0);
   const params = command?.params && typeof command.params === "object" ? command.params : {};
-  if (command?.protocol !== "herdr-browser-actuation/v1"
-      || !/^ba_[0-9a-f]{16}$/.test(actuationId)
+  if (!/^ba_[0-9a-f]{16}$/.test(actuationId)
       || !Number.isSafeInteger(expectedGeneration)
       || expectedGeneration < 1) {
     return;
   }
-  const sessionRef = String(params.session_ref || "");
-  const target = browserSessionTargets.get(sessionRef);
-  if (!target) {
-    await postBrowserActuationEvidence(
-      actuationId,
-      unavailableBrowserActuationEvidence(expectedGeneration),
-    );
+  if (command?.protocol !== "herdr-browser-actuation/v1") {
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration),
+      resource_available: true,
+      rejected: true,
+    }).catch(() => {});
     return;
+  }
+  if (operation === "herdr_mcp.page_assist") {
+    let result;
+    try {
+      const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+      const current = browserEndpointView(endpoint);
+      const endpointRef = String(params.endpoint_ref || "");
+      if (!current?.endpoint_ref || endpointRef !== current.endpoint_ref) {
+        result = { ok: false, error: "page_assist_endpoint_mismatch" };
+      } else {
+        result = await performPageAssistRequest({
+          type: "h2w_page_assist",
+          action: params.action,
+          targetOrigin: params.target_origin,
+          tabId: params.tab_id,
+          maxChars: params.max_chars,
+          generation: params.generation,
+          ref: params.ref,
+          value: params.value,
+        });
+      }
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = { ok: false, error: "page_assist_invalid_result" };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
+    return;
+  }
+  if (operation === "herdr_mcp.browser_session.open") {
+    const sessionRefOpen = String(params.session_ref || "");
+    let targetOpen = browserSessionTargets.get(sessionRefOpen);
+    let recoveredOpen = null;
+    if (!targetOpen) {
+      recoveredOpen = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration);
+      targetOpen = recoveredOpen.target;
+      if (!targetOpen) {
+        await postBrowserActuationEvidence(
+          actuationId,
+          unavailableBrowserActuationEvidence(expectedGeneration, recoveredOpen.observedGeneration),
+        );
+        return;
+      }
+    }
+    if (targetOpen.observationGeneration !== expectedGeneration || targetOpen.provider !== "chatgpt") {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration, targetOpen.observationGeneration),
+      );
+      return;
+    }
+    let tabOpen = null;
+    try { tabOpen = await chrome.tabs.get(targetOpen.tabId); } catch (_) {}
+    const liveOpen = browserConversationInfo(targetOpen.provider || "chatgpt", tabOpen?.url || "");
+    if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
+      browserSessionTargets.delete(sessionRefOpen);
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration),
+      );
+      return;
+    }
+    try {
+      await chrome.tabs.update(targetOpen.tabId, { active: true, autoDiscardable: false });
+      await protectBoundTab(targetOpen.tabId);
+    } catch (_) {}
+    try {
+      const response = await sendBrowserActuationTabMessage(targetOpen.tabId, {
+        type: "h2w_browser_actuation",
+        command: {
+          operation,
+          expected_generation: expectedGeneration,
+          params,
+          expectedConvKey: targetOpen.convKey,
+        },
+      });
+      const evidence = response?.evidence && typeof response.evidence === "object"
+        ? response.evidence
+        : { ...unavailableBrowserActuationEvidence(expectedGeneration), command_accepted: true, resource_available: true };
+      await postBrowserActuationEvidence(actuationId, evidence);
+    } catch (_) {
+      await postBrowserActuationEvidence(actuationId, {
+        ...unavailableBrowserActuationEvidence(expectedGeneration),
+        command_accepted: true,
+        resource_available: true,
+      }).catch(() => {});
+    }
+    return;
+  }
+  const sessionRef = String(params.session_ref || "");
+  let target = browserSessionTargets.get(sessionRef);
+  if (!target) {
+    const recovered = await recoverBrowserSessionTarget(sessionRef, expectedGeneration);
+    target = recovered.target;
+    if (!target) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+      );
+      return;
+    }
   }
   if (target.observationGeneration !== expectedGeneration) {
     await postBrowserActuationEvidence(
@@ -2090,7 +2455,8 @@ async function handleBrowserActuation(command) {
   }
   let tab = null;
   try { tab = await chrome.tabs.get(target.tabId); } catch (_) {}
-  const live = chatGptConversationInfo(tab?.url || "");
+  const targetProvider = target.provider || "chatgpt";
+  const live = browserConversationInfo(targetProvider, tab?.url || "");
   if (!tab || live?.conversation_id !== target.conversationId) {
     browserSessionTargets.delete(sessionRef);
     await postBrowserActuationEvidence(
@@ -2100,7 +2466,7 @@ async function handleBrowserActuation(command) {
     return;
   }
   try {
-    const response = await sendChatGptTabMessage(target.tabId, {
+    const response = await sendBrowserActuationTabMessage(target.tabId, {
       type: "h2w_browser_actuation",
       command: {
         operation,
@@ -4275,8 +4641,97 @@ async function handleWebArtifactCapture(msg, sender) {
     : { ok: false, error: "artifact-capture-native-empty" };
 }
 
+async function performPageAssistRequest(msg) {
+  await configReady;
+  const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
+  const validation = validatePageAssistRequest(msg, allowed);
+  if (!validation.ok) return validation;
+
+  const pattern = originToMatchPattern(validation.targetOrigin);
+  const hasPerm = await hasHostPermission(pattern);
+  if (!hasPerm) return { ok: false, error: "origin_permission_missing" };
+
+  let tabId = Number(msg.tabId);
+  if (!Number.isInteger(tabId) || tabId <= 0) {
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({ url: pattern });
+    } catch (_) {}
+    const activeTab = tabs.find((tab) => tab.active) || tabs[0];
+    if (!activeTab?.id) return { ok: false, error: "target_tab_not_found" };
+    tabId = activeTab.id;
+  }
+
+  let targetTab = null;
+  try {
+    targetTab = await chrome.tabs.get(tabId);
+  } catch (_) {}
+  if (!targetTab?.url) return { ok: false, error: "tab_unavailable" };
+
+  try {
+    const tabOrigin = new URL(targetTab.url).origin.toLowerCase();
+    if (tabOrigin !== validation.targetOrigin) return { ok: false, error: "tab_origin_mismatch" };
+  } catch (_) {
+    return { ok: false, error: "tab_origin_invalid" };
+  }
+
+  const payload = {
+    type: "h2w_page_assist",
+    ...validation,
+    expectedOrigin: validation.targetOrigin,
+  };
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, payload);
+    return response || { ok: false, error: "empty_content_response" };
+  } catch (error) {
+    if (validation.action !== "inspect") {
+      return { ok: false, error: "page_assist_unavailable", detail: error?.message || String(error) };
+    }
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/page-assist.js"],
+      world: "ISOLATED",
+    });
+  } catch (error) {
+    return { ok: false, error: "script_injection_failed", detail: error?.message || String(error) };
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, payload);
+    return response || { ok: false, error: "empty_content_response" };
+  } catch (error) {
+    return { ok: false, error: error?.message || "content_script_message_failed" };
+  }
+}
+
 // ---- Message handling ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "h2w_page_assist") {
+    const extensionBaseUrl = chrome.runtime?.getURL ? chrome.runtime.getURL("") : "";
+    const senderUrl = String(sender?.url || "");
+    const isTrustedSender = Boolean(
+      sender?.id
+      && chrome.runtime?.id
+      && sender.id === chrome.runtime.id
+      && !sender.tab
+      && extensionBaseUrl
+      && senderUrl.startsWith(extensionBaseUrl)
+    );
+    if (!isTrustedSender) {
+      sendResponse({ ok: false, error: "page_assist_sender_denied" });
+      return false;
+    }
+
+    void performPageAssistRequest(msg)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
   if (msg?.type === "h2w_extension_owner_status") {
     void getNativeExtensionOwnerStatus()
       .then((status) => sendResponse(status || { ok: false, error: "native-owner-status-unavailable" }))
@@ -4434,20 +4889,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_register") {
     void (async () => {
       await configReady;
-      const registeringSite = String(msg.site || "").trim();
-      if (["z.ai", "deepseek"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
+      const rawRegisteringSite = String(msg.site || "").trim();
+      const registeringSite = rawRegisteringSite === "claude.ai" ? "claude" : rawRegisteringSite;
+      if (["z.ai", "deepseek", "gemini", "grok"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
         sendResponse({ ok: false, error: "experimental-site-disabled" });
         return;
       }
       const bindings = await loadBindings();
       const pageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
+      const browserPageInfo = pageInfo?.site === "chatgpt"
+        ? pageInfo
+        : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       let browserObservation = null;
-      if (pageInfo?.site === "chatgpt" && pageInfo.conversation_id && sender.tab?.id) {
+      if (browserPageInfo?.conversation_id && sender.tab?.id) {
         try {
-          browserObservation = await observeChatGptConversation({
+          browserObservation = await observeBrowserConversation({
+            provider: browserPageInfo.site,
             tabId: sender.tab.id,
             convKey: String(msg.convKey || ""),
-            pageInfo,
+            pageInfo: browserPageInfo,
             accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
           });
         } catch (error) {
@@ -4464,7 +4924,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sender.tab.id,
           );
           if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
-        } else {
+        } else if (!["gemini", "claude", "grok"].includes(registeringSite)) {
           const migration = await migrateZaiRootConversationState(
             bindings,
             String(msg.convKey || ""),
@@ -4928,6 +5388,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const automation = automationScopeForConversation(convInfo?.convKey || "");
       sendResponse({
         convInfo,
+        browserEndpoint: browserEndpointView(browserEndpoint),
         binding: bindingViewOne,
         sessionBindings,
         idleNudgeLast,
@@ -4956,6 +5417,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           llmJudgeConfigured: isLlmJudgeConfigured(CFG),
         },
       });
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_browser_webchat_control_set") {
+    const controlCenterUrl = chrome.runtime.getURL("control-center.html");
+    if (sender?.url !== controlCenterUrl) {
+      sendResponse({ ok: false, error: "browser-consent-user-gesture-required" });
+      return false;
+    }
+    if (typeof msg.allowed !== "boolean") {
+      sendResponse({ ok: false, error: "browser-consent-invalid-value" });
+      return false;
+    }
+    void (async () => {
+      try {
+        const endpoint = await setLocalBrowserWebchatControlConsent(msg.allowed);
+        sendResponse({ ok: true, browserEndpoint: endpoint });
+      } catch (error) {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      }
     })();
     return true;
   }
@@ -5425,6 +5906,10 @@ async function ensureAlive(preloaded) {
     reconcileProgressTimers({});
     return;
   }
+  // Endpoint bootstrap can legitimately fail when the extension starts before
+  // a runtime that exposes Browser Registry is active. Reuse the existing
+  // keepalive instead of introducing another retry timer/state owner.
+  if (!browserEndpoint) await registerLocalBrowserEndpoint();
   const bindings = preloaded || await loadBindings();
   ensurePushStream(bindings);
   if (progressTickSecMs() <= 0) return;
@@ -5436,8 +5921,16 @@ async function ensureAlive(preloaded) {
 // ---- Install, browser startup, and every service-worker startup ----
 // MV3 can restart the worker without onInstalled/onStartup, so rebuild at module scope.
 chrome.runtime.onStartup.addListener(() => { void rebuildStreams(); });
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   void rebuildStreams();
+  // Chrome treats a Developer Mode Reload of an unpacked extension as an
+  // update. Existing documents can still hold the prior extension context even
+  // when the dynamic content-script registration itself survives the reload.
+  // Force the existing bounded stale-tab sweep once for install/update only;
+  // ordinary MV3 service-worker wakes must never reload user tabs.
+  if (details?.reason === "install" || details?.reason === "update") {
+    void configReady.then(() => sweepStaleTabs(true));
+  }
   chrome.storage.local.get(["herdrMcpUrl"], (cfg) => {
     if (!cfg.herdrMcpUrl) chrome.storage.local.set({
       herdrMcpUrl: "http://127.0.0.1:8772",

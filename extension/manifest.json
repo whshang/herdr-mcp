@@ -51,7 +51,9 @@
         "https://chatgpt.com/*",
         "https://claude.ai/*",
         "https://chat.z.ai/*",
-        "https://chat.deepseek.com/*"
+        "https://chat.deepseek.com/*",
+        "https://gemini.google.com/*",
+        "https://grok.com/*"
       ]
     }
   ],

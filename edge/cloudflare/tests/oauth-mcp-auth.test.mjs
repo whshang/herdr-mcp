@@ -53,6 +53,31 @@ test("static bearer preserves the current runtime operator/curl auth contract", 
   );
 });
 
+test("temporary static bearer fails closed after its bounded expiry", async () => {
+  const token = "bootstrap-static";
+  assert.deepEqual(
+    await authenticateMcpRequest(request(token), {
+      STATIC_MCP_BEARER_SECRET: token,
+      STATIC_MCP_BEARER_EXPIRES_AT_MS: String(Date.now() - 1),
+    }),
+    { ok: false, code: "mcp_auth_failed" },
+  );
+  assert.deepEqual(
+    await authenticateMcpRequest(request(token), {
+      STATIC_MCP_BEARER_SECRET: token,
+      STATIC_MCP_BEARER_EXPIRES_AT_MS: String(Date.now() + 60_000),
+    }),
+    { ok: true, source: "static_bearer" },
+  );
+  assert.deepEqual(
+    await authenticateMcpRequest(request(token), {
+      STATIC_MCP_BEARER_SECRET: token,
+      STATIC_MCP_BEARER_EXPIRES_AT_MS: "not-a-timestamp",
+    }),
+    { ok: false, code: "mcp_auth_failed" },
+  );
+});
+
 test("production issuer RS256 JWT validates with migrated public PEM", async () => {
   const kp = await keyPair();
   const pem = await publicPem(kp.publicKey);
@@ -72,6 +97,68 @@ test("production issuer RS256 JWT validates with migrated public PEM", async () 
   assert.equal(result.ok, true);
   assert.equal(result.source, "oauth_jwt");
   assert.equal(result.clientId, "https://chatgpt.com/client");
+});
+
+test("migrated public-PEM JWT obeys the injected legacy client grant fence", async () => {
+  const kp = await keyPair();
+  const pem = await publicPem(kp.publicKey);
+  const now = Math.floor(Date.now() / 1000);
+  const token = await jwt(kp.privateKey, {
+    iss: ISSUER,
+    aud: `${ISSUER}/mcp`,
+    sub: "legacy-client",
+    client_id: "legacy-client",
+    iat: now,
+    exp: now + 3600,
+  });
+  const env = { OAUTH_ISSUER: ISSUER, OAUTH_JWT_PUBLIC_PEM: pem };
+
+  assert.equal((await authenticateMcpRequest(request(token), env, {
+    verifyLegacyClient: async (clientId) => clientId === "legacy-client",
+  })).ok, true);
+  assert.deepEqual(await authenticateMcpRequest(request(token), env, {
+    verifyLegacyClient: async () => false,
+  }), { ok: false, code: "mcp_auth_failed" });
+  assert.deepEqual(await authenticateMcpRequest(request(token), env, {
+    verifyLegacyClient: async () => { throw new Error("grant store unavailable"); },
+  }), { ok: false, code: "mcp_auth_failed" });
+});
+
+test("new-shaped PEM JWT cannot bypass Edge principal and device verification", async () => {
+  const kp = await keyPair();
+  const pem = await publicPem(kp.publicKey);
+  const now = Math.floor(Date.now() / 1000);
+  const deviceId = "dev_01M1TEST000000000000000000";
+  const token = await jwt(kp.privateKey, {
+    iss: ISSUER,
+    aud: `${ISSUER}/mcp`,
+    sub: "svc_ci",
+    client_id: "svc_ci",
+    principal_type: "automation",
+    device_id: deviceId,
+    iat: now,
+    exp: now + 3600,
+  });
+  let edgeVerified = false;
+  const result = await authenticateMcpRequest(request(token), {
+    OAUTH_ISSUER: ISSUER,
+    OAUTH_JWT_PUBLIC_PEM: pem,
+  }, {
+    verifyLegacyClient: async () => true,
+    verifyEdgeToken: async (presented) => {
+      assert.equal(presented, token);
+      edgeVerified = true;
+      return { ok: true, clientId: "svc_ci", principalType: "automation", deviceId };
+    },
+  });
+  assert.equal(edgeVerified, true);
+  assert.deepEqual(result, {
+    ok: true,
+    source: "oauth_edge",
+    clientId: "svc_ci",
+    principalType: "automation",
+    deviceId,
+  });
 });
 
 test("wrong audience, issuer, signature, or missing OAuth config fail closed", async () => {

@@ -28,6 +28,18 @@ const ZAI_NEW = "https://chat.z.ai/c/new-chat-123";
 const ZAI_OTHER = "https://chat.z.ai/c/history-chat-456";
 const ZAI_SOURCE = "https://chat.z.ai/c/handoff-source";
 const ZAI_TARGET = "https://chat.z.ai/c/handoff-target";
+const GEMINI_SPARK_URL = "https://gemini.google.com/u/1/spark/chat/gemini-recovery-session?pageId=none";
+const GEMINI_SPARK_KEY = "https://gemini.google.com/u/1/spark/chat/gemini-recovery-session";
+const CLAUDE_CHAT_ID = "123e4567-e89b-12d3-a456-426614174000";
+const CLAUDE_CHAT_URL = `https://claude.ai/chat/${CLAUDE_CHAT_ID}?from=history`;
+const CLAUDE_CHAT_KEY = `https://claude.ai/chat/${CLAUDE_CHAT_ID}`;
+const GROK_CHAT_ID = "223e4567-e89b-12d3-a456-426614174001";
+const GROK_CHAT_URL = `https://grok.com/c/${GROK_CHAT_ID}?rid=ignored`;
+const GROK_CHAT_KEY = `https://grok.com/c/${GROK_CHAT_ID}`;
+const GROK_PROJECT_ID = "323e4567-e89b-42d3-a456-426614174002";
+const GROK_PROJECT_CHAT_ID = "423e4567-e89b-42d3-a456-426614174003";
+const GROK_PROJECT_URL = `https://grok.com/project/${GROK_PROJECT_ID}?ignored=1&chat=${GROK_PROJECT_CHAT_ID}`;
+const GROK_PROJECT_KEY = `https://grok.com/project/${GROK_PROJECT_ID}?chat=${GROK_PROJECT_CHAT_ID}`;
 
 let failures = 0;
 function ok(cond, label, detail = "") {
@@ -45,10 +57,10 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true, experimentalGrokEnabled: true };
 const listeners = {
   onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
-  onSidePanelOpened: [], onSidePanelClosed: [],
+  onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [],
 };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -70,6 +82,7 @@ const llmHandoffRequests = [];
 const reloadCalls = [];
 const sidePanelOpenCalls = [];
 const sidePanelCloseCalls = [];
+const executeScriptCalls = [];
 let projectNavigationReadyAfter = 0;
 let projectNavigationPollCount = 0;
 let sourceProbeLooksSeeded = false;
@@ -89,6 +102,8 @@ const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
 const continuityResolveRequests = [];
 const browserRegistryRequests = [];
+let failNextBrowserEndpointRegistration = true;
+const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
 let initialLocaleReadSeen = false;
@@ -135,6 +150,42 @@ globalThis.fetch = async (input, init) => {
 
 function targetListener(tab) {
   return (msg, _sender, sendResponse) => {
+    if (String(tab.url || "").startsWith("https://gemini.google.com/")) {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({
+          convKey: GEMINI_SPARK_KEY,
+          url: tab.url,
+          site: "gemini",
+        });
+        return;
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+    if (String(tab.url || "").startsWith("https://claude.ai/")) {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({
+          convKey: CLAUDE_CHAT_KEY,
+          url: tab.url,
+          site: "claude",
+        });
+        return;
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+    if (String(tab.url || "").startsWith("https://grok.com/")) {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({
+          convKey: GROK_CHAT_KEY,
+          url: tab.url,
+          site: "grok",
+        });
+        return;
+      }
+      sendResponse({ ok: true });
+      return;
+    }
     if (String(tab.url || "").startsWith("https://chat.z.ai")) {
       if (msg?.type === "h2w_get_convkey") {
         sendResponse({
@@ -270,20 +321,74 @@ globalThis.chrome = {
       if (message.path === "/extension/browser/registry") {
         const body = JSON.parse(message.body || "{}");
         browserRegistryRequests.push(body);
-        callback({
-          ok: true,
-          transport: "ipc",
-          status: 200,
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
+        if (body.operation === "endpoint.register" && failNextBrowserEndpointRegistration) {
+          failNextBrowserEndpointRegistration = false;
+          callback({
+            ok: true,
+            transport: "ipc",
+            status: 503,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, code: "browser_registry_test_unavailable" }),
+          });
+          return;
+        }
+        const result = body.operation === "endpoint.register"
+          ? {
             ok: true,
             endpoint: {
               endpoint_ref: "bep_test",
               device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
               browser_family: "chrome",
               extension_version: body.extension_version,
+              consent: {
+                webchat_control: false,
+                tool_bridge: false,
+                tool_bridge_workstation_mutation: false,
+                revision: 0,
+              },
+              consent_revision: 0,
             },
-          }),
+          }
+          : body.operation === "endpoint.consent"
+            ? {
+              ok: true,
+              endpoint: {
+                endpoint_ref: "bep_test",
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                browser_family: "chrome",
+                extension_version: "0.1.90",
+                consent: {
+                  webchat_control: body.webchat_control_allowed === true,
+                  tool_bridge: body.tool_bridge_allowed === true,
+                  tool_bridge_workstation_mutation: body.tool_bridge_mutation_allowed === true,
+                  revision: body.expected_consent_revision + 1,
+                },
+                consent_revision: body.expected_consent_revision + 1,
+              },
+            }
+          : body.operation === "resource.observe"
+            ? {
+              ok: true,
+              resource: {
+                resource_ref: body.provider === "claude"
+                  ? (body.kind === "account" ? "bra_claude_account" : "brs_claude_session")
+                  : body.provider === "grok"
+                    ? (body.kind === "account"
+                      ? "bra_grok_account"
+                      : body.kind === "space"
+                        ? "brsp_grok_project"
+                        : "brs_grok_session")
+                    : (body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session"),
+                kind: body.kind,
+              },
+            }
+            : { ok: true };
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(result),
         });
         return;
       }
@@ -395,8 +500,16 @@ globalThis.chrome = {
   },
   tabs: {
     async query({ url }) {
-      const glob = url.replace("*", "");
-      return [...tabs.values()].filter((t) => t.url.startsWith(glob)).map((t) => ({ id: t.id, url: t.url }));
+      const patterns = (Array.isArray(url) ? url : [url]).filter(Boolean);
+      const matchesPattern = (value, pattern) => {
+        const escaped = String(pattern).split("*")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join(".*");
+        return new RegExp(`^${escaped}$`).test(String(value || ""));
+      };
+      return [...tabs.values()]
+        .filter((t) => patterns.some((pattern) => matchesPattern(t.url, pattern)))
+        .map((t) => ({ id: t.id, url: t.url, status: t.status || "complete" }));
     },
     async sendMessage(tabId, msg) {
       if (hangAutomationNotifications && msg?.type === "h2w_automation_changed") {
@@ -458,7 +571,19 @@ globalThis.chrome = {
       tab.status = "complete";
       return { id: tab.id, url: tab.url, status: tab.status, active: tab.active };
     },
-    async reload(tabId, options) { reloadCalls.push({ tabId, options }); },
+    async reload(tabId, options) {
+      reloadCalls.push({ tabId, options });
+      const tab = tabs.get(tabId);
+      if (tab?.url?.startsWith("https://gemini.google.com/")
+        && registeredContentScripts.has("herdr-experimental-gemini")) {
+        tab.listener = targetListener(tab);
+      } else if (tab?.url?.startsWith("https://grok.com/")
+        && registeredContentScripts.has("herdr-experimental-grok")) {
+        tab.listener = targetListener(tab);
+      } else if (tab?.url?.startsWith("https://claude.ai/")) {
+        tab.listener = targetListener(tab);
+      }
+    },
     onActivated: { addListener: (fn) => listeners.onActivated.push(fn) },
   },
   action: {
@@ -478,8 +603,43 @@ globalThis.chrome = {
     onOpened: { addListener: (fn) => listeners.onSidePanelOpened.push(fn) },
     onClosed: { addListener: (fn) => listeners.onSidePanelClosed.push(fn) },
   },
-  scripting: { executeScript: async () => [{ result: { ok: true } }] },
-  alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
+  scripting: {
+    async executeScript(args) {
+      executeScriptCalls.push(args);
+      const tabId = args?.target?.tabId;
+      const tab = tabs.get(tabId);
+      if (tab) {
+        tab.listener = (msg, _sender, sendResponse) => {
+          if (msg?.type === "h2w_page_assist") {
+            if (msg.action === "inspect") {
+              sendResponse({ ok: true, generation: "gen_test_1", elements: [{ ref: "ref_gen_test_1_0" }] });
+              return;
+            }
+            if (msg.action === "click") {
+              sendResponse({ ok: true, ref: msg.ref, generation: msg.generation });
+              return;
+            }
+          }
+          sendResponse({ ok: false });
+        };
+      }
+      return [{ result: { ok: true } }];
+    },
+    async getRegisteredContentScripts({ ids } = {}) {
+      const rows = [...registeredContentScripts.values()];
+      return Array.isArray(ids) ? rows.filter((row) => ids.includes(row.id)) : rows;
+    },
+    async registerContentScripts(specs) {
+      for (const spec of specs || []) registeredContentScripts.set(spec.id, { ...spec });
+    },
+    async updateContentScripts(specs) {
+      for (const spec of specs || []) registeredContentScripts.set(spec.id, { ...spec });
+    },
+    async unregisterContentScripts({ ids } = {}) {
+      for (const id of ids || []) registeredContentScripts.delete(id);
+    },
+  },
+  alarms: { create: () => {}, onAlarm: { addListener: (fn) => listeners.onAlarm.push(fn) } },
 };
 
 // Content-script stub for wake.js h2w_get_convkey responses.
@@ -553,7 +713,7 @@ ok(coldHud?.ok === true
 
 console.log("\n[browser endpoint registry bootstrap]");
 ok(await waitForTest(() => browserRegistryRequests.length === 1),
-  "service-worker startup registers one browser endpoint through Native Messaging");
+  "service-worker startup attempts browser endpoint registration through Native Messaging");
 const browserRegister = browserRegistryRequests[0] || {};
 ok(browserRegister.operation === "endpoint.register"
     && browserRegister.browser_family === "chrome"
@@ -568,10 +728,55 @@ ok(!Object.prototype.hasOwnProperty.call(browserRegister, "device_id")
 const storedBrowserSeed = storage.herdrBrowserProfileSeedV1;
 ok(storedBrowserSeed === browserRegister.profile_seed,
   "browser profile seed persists only in extension local storage");
+const keepaliveAlarm = listeners.onAlarm[0];
+ok(!!keepaliveAlarm, "browser keepalive alarm listener registered");
+keepaliveAlarm({ name: "h2w-keepalive" });
+ok(await waitForTest(() => browserRegistryRequests.length === 2),
+  "keepalive retries endpoint bootstrap after the initial runtime failure");
+ok(browserRegistryRequests[1]?.profile_seed === storedBrowserSeed,
+  "endpoint bootstrap retry reuses the stable browser profile seed");
 for (const startup of listeners.onStartup) startup();
 await new Promise((resolve) => setTimeout(resolve, 0));
-ok(browserRegistryRequests.length === 1 && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
+ok(browserRegistryRequests.length === 2 && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
   "browser startup does not create a second endpoint registration loop or rotate the profile seed");
+
+const deniedConsent = await dispatchMessage({
+  type: "h2w_browser_webchat_control_set",
+  allowed: true,
+}, { url: "https://gemini.google.com/app/not-a-user-gesture" });
+ok(deniedConsent?.ok === false && deniedConsent?.error === "browser-consent-user-gesture-required",
+  "browser consent rejects messages that do not originate from the Control Center",
+  JSON.stringify(deniedConsent));
+
+const consentBefore = browserRegistryRequests.length;
+const allowedConsent = await dispatchMessage({
+  type: "h2w_browser_webchat_control_set",
+  allowed: true,
+}, { url: "chrome-extension://test-ext/control-center.html" });
+const consentRequests = browserRegistryRequests.slice(consentBefore);
+ok(allowedConsent?.ok === true
+    && allowedConsent?.browserEndpoint?.consent?.webchat_control === true
+    && allowedConsent?.browserEndpoint?.consent_revision === 1,
+  "Control Center user gesture enables only local WebChat Control consent",
+  JSON.stringify(allowedConsent));
+ok(consentRequests.length === 1
+    && consentRequests[0]?.operation === "endpoint.consent"
+    && consentRequests[0]?.expected_consent_revision === 0
+    && consentRequests[0]?.webchat_control_allowed === true
+    && consentRequests[0]?.tool_bridge_allowed === false
+    && consentRequests[0]?.tool_bridge_mutation_allowed === false,
+  "WebChat Control consent preserves both Tool Bridge gates as disabled",
+  JSON.stringify(consentRequests));
+
+const disabledConsent = await dispatchMessage({
+  type: "h2w_browser_webchat_control_set",
+  allowed: false,
+}, { url: "chrome-extension://test-ext/control-center.html" });
+ok(disabledConsent?.ok === true
+    && disabledConsent?.browserEndpoint?.consent?.webchat_control === false
+    && disabledConsent?.browserEndpoint?.consent_revision === 2,
+  "Control Center can narrow WebChat Control consent without affecting Tool Bridge",
+  JSON.stringify(disabledConsent));
 
 const actionClick = listeners.onActionClicked[0];
 ok(!!actionClick, "toolbar action click listener registered");
@@ -616,6 +821,311 @@ function dispatchMessage(msg, sender = {}) {
     onMsg(msg, sender, done);
     setTimeout(() => done(undefined), 1000);
   });
+}
+
+console.log("\n[Gemini optional-origin registration]");
+{
+  ok(await waitForTest(() => registeredContentScripts.has("herdr-experimental-gemini")),
+    "Gemini opt-in registers one dynamic content script after explicit site permission");
+  const script = registeredContentScripts.get("herdr-experimental-gemini") || {};
+  ok(script.matches?.[0] === "https://gemini.google.com/*"
+      && script.js?.includes("content/injector/gemini.js")
+      && script.js?.includes("content/wake.js")
+      && !script.js?.includes("content/webmcp/json-bridge.js"),
+    "Gemini dynamic script is origin-scoped and does not inherit the JSON bridge",
+    JSON.stringify(script));
+
+  const disabled = await dispatchMessage({
+    type: "h2w_set_config",
+    config: { experimentalGeminiEnabled: false },
+  });
+  ok(disabled?.ok === true && !registeredContentScripts.has("herdr-experimental-gemini"),
+    "disabling Gemini unregisters its dynamic content script");
+  const blocked = await dispatchMessage({
+    type: "h2w_register",
+    site: "gemini",
+    convKey: "https://gemini.google.com/app/disabled-test",
+    url: "https://gemini.google.com/app/disabled-test",
+  }, { tab: { id: 900, url: "https://gemini.google.com/app/disabled-test" } });
+  ok(blocked?.ok === false && blocked?.error === "experimental-site-disabled",
+    "disabled Gemini registration fails closed before Browser Registry mutation",
+    JSON.stringify(blocked));
+
+  const recoveryTabId = 901;
+  tabs.set(recoveryTabId, { id: recoveryTabId, url: GEMINI_SPARK_URL, status: "complete", listener: null });
+  const reloadsBeforeEnable = reloadCalls.length;
+  const enabled = await dispatchMessage({
+    type: "h2w_set_config",
+    config: { experimentalGeminiEnabled: true },
+  });
+  ok(enabled?.ok === true && registeredContentScripts.has("herdr-experimental-gemini"),
+    "re-enabling Gemini re-registers the dynamic content script");
+  ok(reloadCalls.slice(reloadsBeforeEnable).some((call) => call.tabId === recoveryTabId),
+    "first Gemini dynamic-script registration reloads an already-open complete Gemini tab once",
+    JSON.stringify(reloadCalls.slice(reloadsBeforeEnable)));
+
+  const extensionReloadTabId = 903;
+  tabs.set(extensionReloadTabId, { id: extensionReloadTabId, url: GEMINI_SPARK_URL, status: "complete", listener: null });
+  const reloadsBeforeExtensionUpdate = reloadCalls.length;
+  for (const installed of listeners.onInstalled) installed({ reason: "update", previousVersion: "0.1.90" });
+  const extensionUpdateRecovered = await waitForTest(
+    () => reloadCalls.slice(reloadsBeforeExtensionUpdate).some((call) => call.tabId === extensionReloadTabId),
+    500,
+  );
+  ok(extensionUpdateRecovered,
+    "same-version unpacked extension reload recovers already-open Gemini tabs once",
+    JSON.stringify(reloadCalls.slice(reloadsBeforeExtensionUpdate)));
+
+  const fallbackTabId = 902;
+  tabs.set(fallbackTabId, { id: fallbackTabId, url: GEMINI_SPARK_URL, status: "complete", listener: null });
+  const reloadsBeforeFallback = reloadCalls.length;
+  const fallbackState = await dispatchMessage({ type: "h2w_state", tabId: fallbackTabId });
+  ok(fallbackState?.convInfo?.site === "gemini"
+      && fallbackState?.convInfo?.convKey === GEMINI_SPARK_KEY
+      && reloadCalls.slice(reloadsBeforeFallback).some((call) => call.tabId === fallbackTabId),
+    "Control Center recovers a listener-less Gemini Spark tab from its bounded URL identity",
+    JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
+}
+
+console.log("\n[Claude listener-less recovery]");
+{
+  const fallbackTabId = 904;
+  tabs.set(fallbackTabId, { id: fallbackTabId, url: CLAUDE_CHAT_URL, status: "complete", listener: null });
+  const reloadsBeforeFallback = reloadCalls.length;
+  const fallbackState = await dispatchMessage({ type: "h2w_state", tabId: fallbackTabId });
+  ok(fallbackState?.convInfo?.site === "claude"
+      && fallbackState?.convInfo?.convKey === CLAUDE_CHAT_KEY
+      && reloadCalls.slice(reloadsBeforeFallback).some((call) => call.tabId === fallbackTabId),
+    "Control Center recovers a listener-less Claude chat from its bounded URL identity",
+    JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
+}
+
+console.log("\n[Grok optional-origin registration and recovery]");
+{
+  ok(await waitForTest(() => registeredContentScripts.has("herdr-experimental-grok")),
+    "Grok opt-in registers one dynamic content script after explicit site permission");
+  const script = registeredContentScripts.get("herdr-experimental-grok") || {};
+  ok(script.matches?.[0] === "https://grok.com/*"
+      && script.js?.includes("content/injector/grok.js")
+      && script.js?.includes("content/wake.js")
+      && !script.js?.includes("content/webmcp/json-bridge.js"),
+    "Grok dynamic script is exact-origin scoped and does not inherit the JSON bridge",
+    JSON.stringify(script));
+
+  const disabled = await dispatchMessage({
+    type: "h2w_set_config",
+    config: { experimentalGrokEnabled: false },
+  });
+  ok(disabled?.ok === true && !registeredContentScripts.has("herdr-experimental-grok"),
+    "disabling Grok unregisters its dynamic content script");
+  const blocked = await dispatchMessage({
+    type: "h2w_register",
+    site: "grok",
+    convKey: GROK_CHAT_KEY,
+    url: GROK_CHAT_URL,
+    accountNativeIdentity: `grok-account-sha256:${"e".repeat(64)}`,
+  }, { tab: { id: 905, url: GROK_CHAT_URL } });
+  ok(blocked?.ok === false && blocked?.error === "experimental-site-disabled",
+    "disabled Grok registration fails closed before Browser Registry mutation",
+    JSON.stringify(blocked));
+
+  const fallbackTabId = 906;
+  tabs.set(fallbackTabId, { id: fallbackTabId, url: GROK_CHAT_URL, status: "complete", listener: null });
+  const reloadsBeforeEnable = reloadCalls.length;
+  const enabled = await dispatchMessage({
+    type: "h2w_set_config",
+    config: { experimentalGrokEnabled: true },
+  });
+  ok(enabled?.ok === true && registeredContentScripts.has("herdr-experimental-grok"),
+    "re-enabling Grok re-registers the dynamic content script");
+  ok(reloadCalls.slice(reloadsBeforeEnable).some((call) => call.tabId === fallbackTabId),
+    "first Grok dynamic-script registration reloads an already-open complete Grok tab once",
+    JSON.stringify(reloadCalls.slice(reloadsBeforeEnable)));
+
+  tabs.get(fallbackTabId).listener = null;
+  const reloadsBeforeFallback = reloadCalls.length;
+  const fallbackState = await dispatchMessage({ type: "h2w_state", tabId: fallbackTabId });
+  ok(fallbackState?.convInfo?.site === "grok"
+      && fallbackState?.convInfo?.convKey === GROK_CHAT_KEY
+      && reloadCalls.slice(reloadsBeforeFallback).some((call) => call.tabId === fallbackTabId),
+    "Control Center recovers a listener-less Grok chat from its bounded URL identity",
+    JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
+
+  const projectFallbackTabId = 907;
+  tabs.set(projectFallbackTabId, {
+    id: projectFallbackTabId,
+    url: GROK_PROJECT_URL,
+    status: "complete",
+    listener: null,
+  });
+  const projectReloadsBeforeFallback = reloadCalls.length;
+  const projectFallbackState = await dispatchMessage({ type: "h2w_state", tabId: projectFallbackTabId });
+  ok(projectFallbackState?.convInfo?.site === "grok"
+      && projectFallbackState?.convInfo?.project_id === GROK_PROJECT_ID
+      && projectFallbackState?.convInfo?.conversation_id === GROK_PROJECT_CHAT_ID
+      && projectFallbackState?.convInfo?.convKey === GROK_PROJECT_KEY
+      && reloadCalls.slice(projectReloadsBeforeFallback).some((call) => call.tabId === projectFallbackTabId),
+    "Control Center recovers a listener-less Grok project chat from project + chat URL identity",
+    JSON.stringify({
+      convInfo: projectFallbackState?.convInfo,
+      reloads: reloadCalls.slice(projectReloadsBeforeFallback),
+    }));
+}
+
+console.log("\n[Gemini browser registry observation]");
+{
+  const before = browserRegistryRequests.length;
+  const geminiUrl = "https://gemini.google.com/u/1/spark/chat/gemini-session-1?pageId=none";
+  const canonicalGeminiUrl = "https://gemini.google.com/u/1/spark/chat/gemini-session-1";
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "gemini",
+    convKey: canonicalGeminiUrl,
+    url: geminiUrl,
+    accountNativeIdentity: `google-account-sha256:${"a".repeat(64)}`,
+  }, { tab: { id: 91, url: geminiUrl } });
+  const observed = browserRegistryRequests.slice(before);
+  ok(registered?.bound === false
+      && registered?.browser_session_ref === "brs_gemini_session"
+      && Number.isSafeInteger(registered?.browser_generation),
+    "Gemini registration returns the opaque browser session and capability generation",
+    JSON.stringify(registered));
+  ok(observed.length === 3
+      && observed[0]?.operation === "provider.observe"
+      && observed[0]?.provider === "gemini"
+      && observed[1]?.operation === "resource.observe"
+      && observed[1]?.kind === "account"
+      && observed[1]?.parent_ref === null
+      && observed[2]?.operation === "resource.observe"
+      && observed[2]?.kind === "session"
+      && observed[2]?.parent_ref === "bra_gemini_account"
+      && observed[2]?.native_identity === "gemini-session-1"
+      && !observed.some((request) => request?.kind === "space"),
+    "Gemini Spark observes account -> session without fabricating a space resource",
+    JSON.stringify(observed));
+
+  const beforeUnsupported = browserRegistryRequests.length;
+  const unsupportedUrl = "https://gemini.google.com/gem/custom/app/gemini-session-2";
+  const unsupported = await dispatchMessage({
+    type: "h2w_register",
+    site: "gemini",
+    convKey: unsupportedUrl,
+    url: unsupportedUrl,
+    accountNativeIdentity: `google-account-sha256:${"b".repeat(64)}`,
+  }, { tab: { id: 92, url: unsupportedUrl } });
+  ok(unsupported?.bound === false
+      && unsupported?.browser_session_ref == null
+      && browserRegistryRequests.length === beforeUnsupported,
+    "Gemini unsupported URL shapes fail closed without creating browser resources",
+    JSON.stringify(unsupported));
+}
+
+console.log("\n[Claude browser registry observation]");
+{
+  const before = browserRegistryRequests.length;
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "claude",
+    convKey: CLAUDE_CHAT_KEY,
+    url: CLAUDE_CHAT_URL,
+    accountNativeIdentity: `claude-account-sha256:${"c".repeat(64)}`,
+  }, { tab: { id: 93, url: CLAUDE_CHAT_URL } });
+  const observed = browserRegistryRequests.slice(before);
+  ok(registered?.bound === false
+      && registered?.browser_session_ref === "brs_claude_session"
+      && Number.isSafeInteger(registered?.browser_generation),
+    "Claude registration returns the opaque browser session and capability generation",
+    JSON.stringify(registered));
+  ok(observed.length === 3
+      && observed[0]?.operation === "provider.observe"
+      && observed[0]?.provider === "claude"
+      && observed[1]?.operation === "resource.observe"
+      && observed[1]?.kind === "account"
+      && observed[1]?.parent_ref === null
+      && observed[2]?.operation === "resource.observe"
+      && observed[2]?.kind === "session"
+      && observed[2]?.parent_ref === "bra_claude_account"
+      && observed[2]?.native_identity === CLAUDE_CHAT_ID
+      && !observed.some((request) => request?.kind === "space"),
+    "Claude observes account -> session without fabricating a project space",
+    JSON.stringify(observed));
+
+  const beforeLegacyToken = browserRegistryRequests.length;
+  const legacyTokenRegistration = await dispatchMessage({
+    type: "h2w_register",
+    site: "claude.ai",
+    convKey: CLAUDE_CHAT_KEY,
+    url: CLAUDE_CHAT_URL,
+    accountNativeIdentity: `claude-account-sha256:${"d".repeat(64)}`,
+  }, { tab: { id: 94, url: CLAUDE_CHAT_URL } });
+  const legacyTokenObserved = browserRegistryRequests.slice(beforeLegacyToken);
+  ok(legacyTokenRegistration?.browser_session_ref === "brs_claude_session"
+      && legacyTokenObserved.length === 3
+      && legacyTokenObserved[0]?.provider === "claude",
+    "legacy claude.ai page token normalizes to Claude Browser Registry without entering another provider migration",
+    JSON.stringify({ registration: legacyTokenRegistration, observed: legacyTokenObserved }));
+}
+
+console.log("\n[Grok browser registry observation]");
+{
+  const before = browserRegistryRequests.length;
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "grok",
+    convKey: GROK_CHAT_KEY,
+    url: GROK_CHAT_URL,
+    accountNativeIdentity: `grok-account-sha256:${"f".repeat(64)}`,
+  }, { tab: { id: 95, url: GROK_CHAT_URL } });
+  const observed = browserRegistryRequests.slice(before);
+  ok(registered?.bound === false
+      && registered?.browser_session_ref === "brs_grok_session"
+      && Number.isSafeInteger(registered?.browser_generation),
+    "Grok registration returns the opaque browser session and capability generation",
+    JSON.stringify(registered));
+  ok(observed.length === 3
+      && observed[0]?.operation === "provider.observe"
+      && observed[0]?.provider === "grok"
+      && observed[1]?.operation === "resource.observe"
+      && observed[1]?.kind === "account"
+      && observed[1]?.parent_ref === null
+      && observed[2]?.operation === "resource.observe"
+      && observed[2]?.kind === "session"
+      && observed[2]?.parent_ref === "bra_grok_account"
+      && observed[2]?.native_identity === GROK_CHAT_ID
+      && !observed.some((request) => request?.kind === "space"),
+    "Grok observes account -> session without fabricating a space resource",
+    JSON.stringify(observed));
+
+  const beforeProject = browserRegistryRequests.length;
+  const projectRegistered = await dispatchMessage({
+    type: "h2w_register",
+    site: "grok",
+    convKey: GROK_PROJECT_KEY,
+    url: GROK_PROJECT_URL,
+    accountNativeIdentity: `grok-account-sha256:${"9".repeat(64)}`,
+  }, { tab: { id: 96, url: GROK_PROJECT_URL } });
+  const projectObserved = browserRegistryRequests.slice(beforeProject);
+  ok(projectRegistered?.bound === false
+      && projectRegistered?.browser_session_ref === "brs_grok_session"
+      && Number.isSafeInteger(projectRegistered?.browser_generation),
+    "Grok project registration returns the opaque browser session and capability generation",
+    JSON.stringify(projectRegistered));
+  ok(projectObserved.length === 4
+      && projectObserved[0]?.operation === "provider.observe"
+      && projectObserved[0]?.provider === "grok"
+      && projectObserved[1]?.operation === "resource.observe"
+      && projectObserved[1]?.kind === "account"
+      && projectObserved[1]?.parent_ref === null
+      && projectObserved[2]?.operation === "resource.observe"
+      && projectObserved[2]?.kind === "space"
+      && projectObserved[2]?.parent_ref === "bra_grok_account"
+      && projectObserved[2]?.native_identity === GROK_PROJECT_ID
+      && projectObserved[3]?.operation === "resource.observe"
+      && projectObserved[3]?.kind === "session"
+      && projectObserved[3]?.parent_ref === "brsp_grok_project"
+      && projectObserved[3]?.native_identity === GROK_PROJECT_CHAT_ID,
+    "Grok project chat observes account -> space(project) -> session(chat)",
+    JSON.stringify(projectObserved));
 }
 
 console.log("\n[trusted browser control action]");
@@ -1593,9 +2103,7 @@ console.log("\n[project handoff]");
   const started = await startP;
   ok(started?.ok === true && started.pending === true && started?.source_preserved === true,
     "manual Project rollover uses the read-only fallback without touching the source conversation", JSON.stringify(started));
-  const transferId = Object.values(storage.herdrConversationTransfers || {})
-    .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
-    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
+  const transferId = started?.handoff?.id;
   ok(!!transferId && handoffPrompt === failedPromptBefore,
     "manual ChatGPT Project handoff never submits HERDR_HANDOFF_V1 into the source conversation");
   ok(llmHandoffRequests.length === fallbackRequestsBefore + 1,
@@ -2440,6 +2948,83 @@ console.log("\n[project hard-limit handoff LLM fallback]");
     llmJudgeModel: "",
   } }, {}, (r) => resolveClearConfig(r));
   await clearConfigP;
+}
+
+console.log("\n[page-assist injection idempotency]");
+{
+  const paTabId = 991;
+  const paOrigin = "https://example.com";
+  const paUrl = "https://example.com/app";
+  tabs.set(paTabId, { id: paTabId, url: paUrl, status: "complete", active: true, listener: null });
+
+  const trustedExtSender = { id: "test-ext", url: "chrome-extension://test-ext/control-center.html" };
+  const contentScriptSender = { id: "test-ext", tab: { id: paTabId }, url: paUrl };
+
+  let resolvePaConfig;
+  const paConfigP = new Promise((resolve) => { resolvePaConfig = resolve; });
+  onMsg({ type: "h2w_set_config", config: { pageAssistOrigins: [paOrigin] } }, {}, (response) => resolvePaConfig(response));
+  await paConfigP;
+
+  const scriptCallsBefore = executeScriptCalls.length;
+
+  let resolveDenied;
+  const deniedP = new Promise((resolve) => { resolveDenied = resolve; });
+  onMsg({ type: "h2w_page_assist", action: "inspect", targetOrigin: paOrigin, tabId: paTabId }, contentScriptSender, (response) => resolveDenied(response));
+  const deniedRes = await deniedP;
+  ok(deniedRes?.ok === false && deniedRes?.error === "page_assist_sender_denied",
+    "untrusted content-script sender receives page_assist_sender_denied",
+    JSON.stringify(deniedRes));
+  ok(executeScriptCalls.length === scriptCallsBefore,
+    "denied content-script sender cannot trigger script injection");
+
+  let resolveInspect;
+  const inspectP = new Promise((resolve) => { resolveInspect = resolve; });
+  onMsg({ type: "h2w_page_assist", action: "inspect", targetOrigin: paOrigin, tabId: paTabId }, trustedExtSender, (response) => resolveInspect(response));
+  const inspectRes = await inspectP;
+  ok(inspectRes?.ok === true && inspectRes?.generation === "gen_test_1",
+    "inspect dynamically injects page-assist when listener is absent and returns inspect result",
+    JSON.stringify(inspectRes));
+  ok(executeScriptCalls.length === scriptCallsBefore + 1,
+    "inspect triggers exactly one script injection call");
+
+  let resolveClick;
+  const clickP = new Promise((resolve) => { resolveClick = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "click",
+    targetOrigin: paOrigin,
+    tabId: paTabId,
+    ref: "ref_gen_test_1_0",
+    generation: "gen_test_1",
+  }, trustedExtSender, (response) => resolveClick(response));
+  const clickRes = await clickP;
+  ok(clickRes?.ok === true && clickRes?.ref === "ref_gen_test_1_0",
+    "click succeeds using existing listener without reinjecting page-assist",
+    JSON.stringify(clickRes));
+  ok(executeScriptCalls.length === scriptCallsBefore + 1,
+    "subsequent click does not reinject page-assist");
+
+  const noListenerTabId = 992;
+  tabs.set(noListenerTabId, { id: noListenerTabId, url: paUrl, status: "complete", active: true, listener: null });
+  let resolveClickNoListener;
+  const clickNoListenerP = new Promise((resolve) => { resolveClickNoListener = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "click",
+    targetOrigin: paOrigin,
+    tabId: noListenerTabId,
+    ref: "ref_gen_test_1_0",
+    generation: "gen_test_1",
+  }, trustedExtSender, (response) => resolveClickNoListener(response));
+  const clickNoListenerRes = await clickNoListenerP;
+  ok(clickNoListenerRes?.ok === false && clickNoListenerRes?.error === "page_assist_unavailable",
+    "click with no listener fails closed as page_assist_unavailable without reinjecting",
+    JSON.stringify(clickNoListenerRes));
+  ok(executeScriptCalls.length === scriptCallsBefore + 1,
+    "failed click with absent listener did not trigger script injection");
+
+  tabs.delete(paTabId);
+  tabs.delete(noListenerTabId);
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

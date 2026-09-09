@@ -77,6 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
+const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
+const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
+const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
 ok(manifest.version === "0.1.90", "manifest version stays aligned with the browser product build");
 ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.90"'), "background version matches manifest");
 ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.90"'), "content version matches manifest");
@@ -102,9 +105,39 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
     && manifest.optional_host_permissions?.includes("https://*/*")
     && manifest.optional_host_permissions?.includes("http://*/*"),
   "broad network access is optional and the always-on host permission stays loopback-only");
+ok(!manifest.content_scripts.some((entry) => (entry.js || []).includes("content/page-assist.js"))
+    && backgroundSource.includes("pageAssistOrigins: []")
+    && optionsHtml.includes('id="pageAssistOrigins"')
+    && optionsSource.includes('for (const origin of config.pageAssistOrigins || [])')
+    && optionsSource.includes('pageAssistOrigins: cleanPa'),
+  "Page Assist is default-off, is never statically injected, and requests only origins explicitly saved in Options");
+const pageAssistDispatchSource = backgroundSource.match(
+  /async function performPageAssistRequest\(msg\) \{[\s\S]*?\n}\n/,
+)?.[0] || "";
+ok(pageAssistDispatchSource.includes('validation.action !== "inspect"')
+    && pageAssistDispatchSource.includes('files: ["content/page-assist.js"]')
+    && pageAssistDispatchSource.indexOf('validation.action !== "inspect"') < pageAssistDispatchSource.indexOf("chrome.scripting.executeScript")
+    && pageAssistDispatchSource.includes("tabOrigin !== validation.targetOrigin"),
+  "Page Assist may inject only for inspect recovery; click/fill fail closed and the live tab origin is rechecked");
+ok(!/\beval\s*\(/.test(pageAssistSource)
+    && !/new\s+Function\b/.test(pageAssistSource)
+    && !/document\.cookie/.test(pageAssistSource)
+    && !/localStorage|sessionStorage/.test(pageAssistSource)
+    && !/XPath|evaluate\s*\(/.test(pageAssistSource),
+  "Page Assist content code does not expose script evaluation, cookies/storage, or XPath control");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
+    && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
+    && backgroundSource.includes('grok: "https://grok.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
-  "experimental content-script registration requires an explicitly granted site permission");
+  "experimental content-script registration, including Gemini and Grok, requires an explicitly granted site permission");
+const browserActuationSendSource = backgroundSource.match(
+  /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
+)?.[0] || "";
+ok(browserActuationSendSource.includes("chrome.tabs.sendMessage")
+    && !browserActuationSendSource.includes("chrome.tabs.reload")
+    && !browserActuationSendSource.includes("sendChatGptTabMessage")
+    && backgroundSource.includes("const response = await sendBrowserActuationTabMessage(target.tabId"),
+  "browser actuation is one strict attempt and cannot inherit handoff reload recovery");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -480,7 +513,6 @@ ok(
     && backgroundSource.includes("native-transport-failed"),
   "local Herdr failures surface Native Messaging errors instead of browser loopback permission state",
 );
-const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 ok(
   optionsSource.includes('type: "h2w_agents"')
     && optionsSource.includes("native_host_help")
@@ -706,6 +738,17 @@ ok(zhLocale.cc_page_handoff === "手动接力"
     && zhLocale.hud_scope_binding_hint.includes("控制中心")
     && !zhLocale.hud_scope_binding_hint.includes("0 个窗格"),
   "zh copy keeps the HUD and Side Panel compact while preserving binding state");
+ok(controlCenterSource.includes('const runtimeHint = `${t("cc_brand")} Runtime · ${runtimeLabel}`;')
+    && controlCenterSource.includes("if (stats.working > 0)")
+    && controlCenterSource.includes("runtimeStats.hidden = true")
+    && controlCenterSource.includes('[data-i18n-title]')
+    && controlCenterCss.includes(".icon-action")
+    && controlCenterCss.includes(".runtime-stats[hidden]")
+    && controlCenterHtml.includes('id="runtimeText" class="sr-only"')
+    && controlCenterHtml.includes('id="refreshButton" type="button" class="ghost compact-action icon-action"')
+    && controlCenterHtml.includes('id="collapseButton" type="button" class="ghost compact-action icon-action"')
+    && controlCenterHtml.includes('id="settingsButton" type="button" class="ghost compact-action icon-action"'),
+  "Side Panel top bar keeps runtime status in the dot tooltip, hides zero working count, and uses icon-only actions");
 ok(controlCenterSource.includes('id.textContent = workspaceId;')
     && !controlCenterSource.includes('id.textContent = `(${workspaceId})`;')
     && controlCenterCss.includes('grid-template-columns: 14px 8px minmax(0, 1fr) max-content max-content')
@@ -765,7 +808,6 @@ ok(!wakeSource.includes("Wake on") && !wakeSource.includes("Wake off") && !wakeS
   "HUD source has no legacy English wake/automation labels");
 ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake + LLM nudge"),
   "Options source no longer exposes the legacy wake+nudge switch name");
-const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 ok(optionsHtml.includes('id="manualContinueMessage"')
     && optionsSource.includes('"progressTemplate", "manualContinueMessage", "automationMode"')
     && optionsSource.includes('manualContinueMessage: $("manualContinueMessage").value.trim() || t("manual_continue_message")')
@@ -783,22 +825,36 @@ ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
   "Options exposes one Project-automation checkbox and no independent permission toggle");
 ok(optionsHtml.includes('id="experimentalZAiEnabled"')
     && optionsHtml.includes('id="experimentalDeepSeekEnabled"')
-    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled"')
+    && optionsHtml.includes('id="experimentalGeminiEnabled"')
+    && optionsHtml.includes('id="experimentalGrokEnabled"')
+    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled"')
     && optionsSource.includes('experimentalZAiEnabled: $("experimentalZAiEnabled").checked')
-    && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked'),
-  "Options exposes separate experimental z.ai and DeepSeek switches");
+    && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked')
+    && optionsSource.includes('experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked')
+    && optionsSource.includes('experimentalGrokEnabled: $("experimentalGrokEnabled").checked'),
+  "Options exposes separate experimental z.ai, DeepSeek, Gemini, and Grok switches");
 ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md")
     && optionsSource.includes("setConnectionFailure")
     && [enLocale, zhLocale, jaLocale].every((locale) => locale.open_github_setup_guide),
   "failed local connection tests link to a localized GitHub setup path");
 ok(backgroundSource.includes('experimentalZAiEnabled: false')
     && backgroundSource.includes('experimentalDeepSeekEnabled: false')
+    && backgroundSource.includes('experimentalGeminiEnabled: false')
+    && backgroundSource.includes('experimentalGrokEnabled: false')
+    && backgroundSource.includes('site: "gemini"')
+    && backgroundSource.includes('matches: ["https://gemini.google.com/*"]')
+    && backgroundSource.includes('"content/injector/gemini.js"')
+    && backgroundSource.includes('site: "grok"')
+    && backgroundSource.includes('matches: ["https://grok.com/*"]')
+    && backgroundSource.includes('"content/injector/grok.js"')
     && backgroundSource.includes('error: "experimental-site-disabled"')
     && wakeSource.includes("experimentalZAiEnabled")
     && wakeSource.includes("experimentalDeepSeekEnabled")
+    && wakeSource.includes("experimentalGeminiEnabled")
+    && wakeSource.includes("experimentalGrokEnabled")
     && jsonBridgeSource.includes("experimentalZAiEnabled")
     && jsonBridgeSource.includes("experimentalDeepSeekEnabled"),
-  "experimental site integrations fail closed in both background and content layers");
+  "experimental site integrations fail closed in background/content while Gemini and Grok stay outside JSON bridge");
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation is folded into effective Project automation");
@@ -980,7 +1036,7 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
 
 // ---- 2. JavaScript syntax for the fixed file list ----
 const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js",
-  "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/claude.js",
+  "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/gemini.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {
   const p = path.join(EXT, f);
@@ -1161,6 +1217,9 @@ console.log("\n[permission auto-allow decisions]");
   ok(fn("isAllowButtonText('允许')") === true, "accepts Chinese Allow");
   ok(fn("isAllowButtonText('Allow')") === true, "accepts English Allow");
   ok(fn("isAllowButtonText('同意并继续')") === true, "accepts Chinese Agree and continue");
+  ok(fn("isPersistentAllowButtonText('始终允许')") === true, "recognizes Chinese persistent Allow");
+  ok(fn("isPersistentAllowButtonText('Always allow')") === true, "recognizes English persistent Allow");
+  ok(fn("isPersistentAllowButtonText('允许一次')") === false, "does not confuse one-time Allow with persistent Allow");
   ok(fn("isAllowButtonText('拒绝')") === false, "rejects Chinese Deny");
   ok(fn("isAllowButtonText('取消')") === false, "rejects Chinese Cancel");
   ok(fn("isAllowButtonText('Deny')") === false, "rejects English Deny");
@@ -1252,6 +1311,40 @@ console.log("\n[tool-action permission-card auto-allow]");
   vm.runInContext(code, ctx);
   const P = vm.runInContext("window.__H2W_PERMISSION__", ctx);
 
+  // 0) Herdr's ChatGPT card prefers persistent Allow over one-time Allow.
+  {
+    const alwaysAllow = btn("始终允许", { "data-state": "closed" });
+    const deny = btn("拒绝");
+    const allowOnce = btn("允许一次");
+    const drop = btn("", { "aria-haspopup": "menu", "aria-label": "Allow herdr for this conversation" });
+    const card = el("div", { class: "tool-action-card" },
+      el("div", {}, "herdr"),
+      el("h2", {}, "允许 ChatGPT 使用 herdr？"),
+      el("p", {}, "ChatGPT 请求权限以使用工具"),
+      el("div", { class: "btn-area", "data-testid": "tool-action-buttons" }, alwaysAllow, deny, allowOnce, drop));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === true && r.button === alwaysAllow, "Herdr permission card prefers persistent Allow");
+    ok(alwaysAllow.clickCount === 1 && allowOnce.clickCount === 0, "persistent Allow wins over one-time Allow");
+    ok(deny.clickCount === 0 && drop.clickCount === 0, "Herdr persistent Allow leaves deny and dropdown untouched");
+  }
+  // 0b) Other apps keep the existing one-time Allow behavior.
+  {
+    const alwaysAllow = btn("始终允许", { "data-state": "closed" });
+    const deny = btn("拒绝");
+    const allowOnce = btn("允许一次");
+    const card = el("div", { class: "tool-action-card" },
+      el("div", {}, "other-app"),
+      el("h2", {}, "允许 ChatGPT 使用 other-app？"),
+      el("p", {}, "ChatGPT 请求权限以使用工具"),
+      el("div", { class: "btn-area", "data-testid": "tool-action-buttons" }, alwaysAllow, deny, allowOnce));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === true && r.button === allowOnce, "non-Herdr card keeps one-time Allow behavior");
+    ok(alwaysAllow.clickCount === 0 && allowOnce.clickCount === 1, "non-Herdr card does not gain persistent authorization");
+  }
   // 1) A new tool-action card clicks the primary Allow exactly once.
   {
     const allow = btn("允许");

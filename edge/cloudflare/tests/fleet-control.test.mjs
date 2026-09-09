@@ -675,6 +675,121 @@ test("execution lanes require explicit active device and portable repo/branch id
   assert.equal(traversalScope.code, "invalid_params");
 });
 
+test("execution lanes durably bind opaque WebChat sessions and fence device reassignment", async () => {
+  const { storage, registry } = makeRegistry();
+  await putDevice(storage, device(DEVICE_A));
+  await putDevice(storage, device(DEVICE_B));
+  const created = await createChain(registry, "webchat-lane-chain");
+  const lease = await acquire(registry, created.chain, "webchat-lane-lease");
+  const binding = {
+    endpoint_ref: `bep_${"a".repeat(64)}`,
+    provider: "chatgpt",
+    account_ref: `br_${"b".repeat(64)}`,
+    space_ref: null,
+    session_ref: `br_${"c".repeat(64)}`,
+    observation_generation: 7,
+  };
+
+  const lane = await call(registry, "herdr_mcp.execution_lane.create", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lease.chain.revision,
+    expected_lease_generation: 1,
+    idempotency_key: "webchat-lane-create",
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: "feat/webchat-lane",
+    webchat_binding: binding,
+  }, PRINCIPAL_A, 5000);
+  assert.equal(lane.ok, true);
+  assert.deepEqual(
+    {
+      endpoint_ref: lane.lane.webchat_binding.endpoint_ref,
+      provider: lane.lane.webchat_binding.provider,
+      account_ref: lane.lane.webchat_binding.account_ref,
+      space_ref: lane.lane.webchat_binding.space_ref,
+      session_ref: lane.lane.webchat_binding.session_ref,
+      observation_generation: lane.lane.webchat_binding.observation_generation,
+    },
+    binding,
+  );
+  assert.equal(lane.lane.webchat_binding.schema_version, 1);
+  assert.equal(lane.lane.webchat_binding.bound_at_ms, 5000);
+
+  const badBinding = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lane.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: 1,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-lane-bad-binding",
+    webchat_binding: { ...binding, native_identity: "must-not-cross-boundary" },
+  }, PRINCIPAL_A, 5001);
+  assert.equal(badBinding.code, "invalid_params");
+  assert.equal(badBinding.field, "webchat_binding");
+
+  const nativeRef = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lane.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: 1,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-lane-native-ref",
+    webchat_binding: { ...binding, account_ref: "user@example.com" },
+  }, PRINCIPAL_A, 5001);
+  assert.equal(nativeRef.code, "invalid_params");
+  assert.equal(nativeRef.field, "webchat_binding");
+
+  const staleReassign = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lane.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: 1,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-lane-reassign-stale",
+    reassign: true,
+    device_id: DEVICE_B,
+  }, PRINCIPAL_A, 5002);
+  assert.equal(staleReassign.code, "execution_lane_webchat_unbind_required");
+
+  const reboundAcrossDevice = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lane.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: 1,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-lane-reassign-rebound",
+    reassign: true,
+    device_id: DEVICE_B,
+    webchat_binding: {
+      ...binding,
+      session_ref: `br_${"d".repeat(64)}`,
+    },
+  }, PRINCIPAL_A, 5002);
+  assert.equal(reboundAcrossDevice.code, "execution_lane_webchat_unbind_required");
+
+  const reassigned = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lane.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: 1,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-lane-reassign-unbound",
+    reassign: true,
+    device_id: DEVICE_B,
+    webchat_binding: null,
+  }, PRINCIPAL_A, 5003);
+  assert.equal(reassigned.ok, true);
+  assert.equal(reassigned.lane.device_id, DEVICE_B);
+  assert.equal(reassigned.lane.webchat_binding, null);
+
+  const persisted = await call(registry, "herdr_mcp.execution_lane.inspect", {
+    lane_id: lane.lane.lane_id,
+  }, PRINCIPAL_A, 5004);
+  assert.equal(persisted.ok, true);
+  assert.equal(persisted.lane.webchat_binding, null);
+});
+
 test("execution lane identity and scopes use portable canonical syntax", async () => {
   const { storage, registry } = makeRegistry();
   await putDevice(storage, device(DEVICE_A));
@@ -784,6 +899,7 @@ test("execution lane identity and scopes use portable canonical syntax", async (
 
   const legacyStoredLane = structuredClone(await storage.get(`fleet:lane:v1:${sha256Lane.lane.lane_id}`));
   delete legacyStoredLane.validation_refs;
+  delete legacyStoredLane.webchat_binding;
   await storage.put(`fleet:lane:v1:${sha256Lane.lane.lane_id}`, legacyStoredLane);
 
   const reconstructed = makeRegistry(storage).registry;
@@ -792,6 +908,7 @@ test("execution lane identity and scopes use portable canonical syntax", async (
   }, PRINCIPAL_B, 5000);
   assert.equal(inspected.ok, true);
   assert.deepEqual(inspected.lane.validation_refs, []);
+  assert.equal(inspected.lane.webchat_binding, null);
 });
 
 test("unknown, revoked, and missing devices fail closed without auto-routing", async () => {

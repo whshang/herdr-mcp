@@ -135,6 +135,37 @@ test("state: sessionSummary reflects stale link", () => {
   assert.equal(summary.runtimeVersion, undefined);
 });
 
+test("state: reconnect evidence survives storage round-trip and distinguishes recycle-threshold recovery", () => {
+  const session = sessionFromClaims({
+    workstationId: "w1", linkVersion: "0.4.6", bootId: "boot-a", protocolVersion: "1", connectedAtMs: 1_000,
+  });
+  session.lastRecoveredAtMs = 402_000;
+  session.lastReconnectDurationMs = 301_000;
+  session.reconnectCount = 2;
+  const parsed = parseSession(serializeSession(session));
+  assert.equal(parsed.ok, true);
+  const summary = sessionSummary(parsed.session, {
+    now: 403_000,
+    linkStaleAfterMs: 5_000,
+    activeRequests: 0,
+    edgeVersion: "edge",
+  });
+  assert.equal(summary.lastRecoveredAtMs, 402_000);
+  assert.equal(summary.lastReconnectDurationMs, 301_000);
+  assert.equal(summary.reconnectCount, 2);
+  assert.equal(summary.lastReconnectCrossedRecycleThreshold, true);
+
+  parsed.session.status = "offline";
+  parsed.session.disconnectedAtMs = 402_500;
+  const offline = sessionSummary(parsed.session, {
+    now: 403_000,
+    linkStaleAfterMs: 5_000,
+    activeRequests: 0,
+    edgeVersion: "edge",
+  });
+  assert.equal(offline.reconnectingSinceMs, 402_500);
+});
+
 test("state: status falls back to hello runtime/contract identity across hibernation", () => {
   const session = sessionFromClaims({
     workstationId: "w1",

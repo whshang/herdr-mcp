@@ -1,9 +1,9 @@
 //! Foreground `herdr-mcp link run` entry for a staged Rust Link candidate.
 //!
 //! Loads credentials with Node `macos-daemon.ts` parity (env override, then
-//! macOS Keychain for the link secret, then the MCP server LaunchAgent plist
-//! for `HERDR_MCP_TOKEN`). This path never mutates launchd, plists,
-//! `runtime/current`, or production Link ownership.
+//! the platform device-credential store for the link secret, then the managed
+//! local service credential for `HERDR_MCP_TOKEN`). This path never mutates
+//! service ownership, `runtime/current`, or production Link ownership.
 
 use std::collections::HashMap;
 use std::env;
@@ -176,15 +176,25 @@ fn load_link_token_from_keychain(
         let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
         let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
             .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
-        crate::macos_credential_helper::load(&service, &username)
-            .map_err(DaemonConfigError::Message)
+        crate::credential_store::load(&service, &username).map_err(DaemonConfigError::Message)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = env_map;
-        Err(DaemonConfigError::Message(
-            "HERDR_LINK_TOKEN is required (Keychain load is macOS-only)".to_owned(),
-        ))
+        #[cfg(target_os = "linux")]
+        {
+            let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
+            let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
+                .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
+            crate::credential_store::load(&service, &username).map_err(DaemonConfigError::Message)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = env_map;
+            Err(DaemonConfigError::Message(
+                "HERDR_LINK_TOKEN is required on this platform".to_owned(),
+            ))
+        }
     }
 }
 
@@ -216,10 +226,20 @@ fn load_runtime_token_from_server_plist(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = env_map;
-        Err(DaemonConfigError::Message(
-            "HERDR_MCP_TOKEN is required (LaunchAgent plist load is macOS-only)".to_owned(),
-        ))
+        #[cfg(target_os = "linux")]
+        {
+            let _ = env_map;
+            crate::linux_service_manager::runtime_token_for_link()
+                .map_err(DaemonConfigError::Message)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = env_map;
+            Err(DaemonConfigError::Message(
+                "HERDR_MCP_TOKEN is required on this platform".to_owned(),
+            ))
+        }
     }
 }
 

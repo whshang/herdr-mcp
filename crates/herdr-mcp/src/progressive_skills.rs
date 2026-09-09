@@ -249,7 +249,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
         json!({
             "method": WORK_MEMORY_SEARCH_METHOD,
             "source": "herdr_mcp_local",
-            "schema_version": 1,
+            "schema_version": 2,
             "params": {
                 "properties": {
                     "project_ref": {"type": "string", "maxLength": 512},
@@ -257,8 +257,13 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "work_chain_id": {"type": "string", "maxLength": 128},
                     "query": {"type": "string", "maxLength": 512},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "cursor": {"type": "string", "maxLength": 4096},
                 },
-                "required": ["project_ref", "repo_id", "work_chain_id", "query"],
+                "required": [],
+                "oneOf": [
+                    {"required": ["project_ref", "repo_id", "work_chain_id", "query"]},
+                    {"required": ["cursor"]},
+                ],
                 "empty": false,
             },
         }),
@@ -655,7 +660,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
     },
     BuiltinSkillSpec {
         id: "files-search",
-        description: "Read, list, search, and inspect images inside managed project roots.",
+        description: "READ ONLY: read, list, search, and inspect images inside managed project roots. Use herdr_fs_read for source reads; this skill owns no file-creation tool.",
         content: FILES_SEARCH,
         triggers: &["read file", "list files", "search", "grep", "image"],
         requires_capabilities: &["managed project root"],
@@ -670,7 +675,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
     },
     BuiltinSkillSpec {
         id: "files-mutation",
-        description: "Apply safe repository file edits, writes, and transactional patches.",
+        description: "File mutation only: herdr_fs_write = CREATE / FULL REWRITE; herdr_fs_edit = exact replacement; herdr_fs_patch = PATCH EXISTING FILES or coherent multi-file changes.",
         content: FILES_MUTATION,
         triggers: &["edit", "write", "patch", "modify files"],
         requires_capabilities: &["managed project root", "mutation gate"],
@@ -2330,6 +2335,13 @@ mod tests {
             json!(["project_ref", "repo_id", "work_chain_id"])
         );
         assert_eq!(methods[5]["method"], WORK_MEMORY_SEARCH_METHOD);
+        assert_eq!(methods[5]["schema_version"], 2);
+        assert_eq!(methods[5]["params"]["required"], json!([]));
+        assert_eq!(
+            methods[5]["params"]["properties"]["cursor"]["maxLength"],
+            4096
+        );
+        assert_eq!(methods[5]["params"]["oneOf"].as_array().unwrap().len(), 2);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
         assert_eq!(methods.len(), 17);
@@ -2359,6 +2371,28 @@ mod tests {
             let name = method["method"].as_str().unwrap();
             !name.contains("consent") && !name.contains("observe") && !name.contains("register")
         }));
+    }
+
+    #[test]
+    fn file_skill_discovery_keeps_read_write_and_patch_intents_distinct() {
+        let service = ProgressiveSkillService::new();
+        let catalog = service.catalog();
+        let search = catalog
+            .iter()
+            .find(|skill| skill.id == "files-search")
+            .unwrap();
+        let mutation = catalog
+            .iter()
+            .find(|skill| skill.id == "files-mutation")
+            .unwrap();
+
+        assert!(search.description.contains("READ ONLY"));
+        assert!(search.owned_tools.contains(&"herdr_fs_read".to_owned()));
+        assert!(!search.owned_tools.contains(&"herdr_fs_write".to_owned()));
+        assert!(mutation.description.contains("CREATE / FULL REWRITE"));
+        assert!(mutation.description.contains("PATCH EXISTING FILES"));
+        assert!(mutation.owned_tools.contains(&"herdr_fs_write".to_owned()));
+        assert!(mutation.owned_tools.contains(&"herdr_fs_patch".to_owned()));
     }
 
     #[test]

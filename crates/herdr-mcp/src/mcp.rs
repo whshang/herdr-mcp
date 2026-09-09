@@ -12,12 +12,15 @@ use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
     BrowserDeliveryState, BrowserDispatchReservation, BrowserDispatchReserveInput,
-    BrowserDispatchUpdateInput, BrowserResourceResolveInput, ContinuitySearchInput, StateStore,
-    WorkMemoryBindingInput, WorkMemoryCheckpointInput, WorkMemoryEvidenceInput,
-    WorkMemoryPortableSourceInput, WorkMemoryTurnInput,
+    BrowserDispatchUpdateInput, BrowserResourceResolveInput, ContinuitySearchInput,
+    OperationReservation, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
+    WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemorySearchBoundary,
+    WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,12 +38,18 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
     "2024-11-05",
     "2024-10-07",
 ];
+const BROWSER_ADAPTER_PROTOCOL_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserCallerGrant {
     pub endpoint_ref: String,
     pub provider: String,
     pub account_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageAssistCallerGrant {
+    pub endpoint_ref: String,
 }
 
 pub struct RuntimeContext<'a> {
@@ -51,6 +60,7 @@ pub struct RuntimeContext<'a> {
     pub skill: &'a SkillService,
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
     pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
+    pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::Mutex<()>>,
 }
@@ -61,7 +71,16 @@ pub trait BrowserActuator: Send + Sync {
         operation: &str,
         params: &Value,
         expected_generation: i64,
+        dispatch_id: Option<&str>,
     ) -> Result<BrowserPostconditionEvidence, String>;
+
+    fn reconcile_dispatch(
+        &self,
+        _dispatch_id: &str,
+        _expected_generation: i64,
+    ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+        Ok(None)
+    }
 }
 
 pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
@@ -183,7 +202,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_since" => {
             let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
             let workspace = arguments.get("workspace").and_then(Value::as_str);
-            native_tools::since(context.cache, cursor, workspace)
+            let transition = context
+                .state_store
+                .lock()
+                .map_err(|_| "state store lock is poisoned".to_owned())
+                .and_then(|store| store.latest_generation_transition());
+            native_tools::since(context.cache, cursor, workspace, transition)
         }
         "herdr_call" => {
             let method = arguments
@@ -213,6 +237,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if method == "herdr_mcp.page_assist" {
+                page_assist_call(
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
             } else if BrowserOperation::parse(method).is_some() {
                 browser_operation_call_with_grants(
                     context.state_store,
@@ -291,7 +321,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         }
         "herdr_exec_read" => exec_tools::read(context.exec, &arguments),
         "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
-        "herdr_exec" => utility_exec::run(context.client, &context.cache.snapshot(), &arguments),
+        "herdr_exec" => utility_exec::run_durable(
+            context.client,
+            &context.cache.snapshot(),
+            context.exec,
+            &arguments,
+        ),
         "herdr_prompt" => prompt::run(context.client, context.prompt, &arguments),
         "herdr_skill" => context
             .skill
@@ -539,6 +574,181 @@ fn continuity_call(
         }
         _ => json!({"ok": false, "code": "unknown_local_method", "method": method}),
     }
+}
+
+const WORK_MEMORY_CURSOR_PREFIX: &str = "wmc1";
+const WORK_MEMORY_CURSOR_MAX_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkMemoryCursorV1 {
+    version: u8,
+    kind: String,
+    continuity_id: String,
+    project_ref: String,
+    repo_id: String,
+    work_chain_id: String,
+    query: String,
+    query_sha256: String,
+    checkpoint_revision: i64,
+    through_evidence_id: Option<String>,
+    max_fts_rowid: i64,
+    page_size: u64,
+    offset: u64,
+}
+
+impl WorkMemoryCursorV1 {
+    fn boundary(&self) -> WorkMemorySearchBoundary {
+        WorkMemorySearchBoundary {
+            continuity_id: self.continuity_id.clone(),
+            checkpoint_revision: self.checkpoint_revision,
+            through_evidence_id: self.through_evidence_id.clone(),
+            max_fts_rowid: self.max_fts_rowid,
+        }
+    }
+}
+
+fn work_memory_cursor_sha256(value: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(value))
+}
+
+fn encode_work_memory_cursor(cursor: &WorkMemoryCursorV1) -> Result<String, &'static str> {
+    let payload = serde_json::to_vec(cursor).map_err(|_| "work_memory_cursor_invalid")?;
+    let encoded = URL_SAFE_NO_PAD.encode(&payload);
+    let digest = work_memory_cursor_sha256(&payload);
+    let token = format!("{WORK_MEMORY_CURSOR_PREFIX}.{encoded}.{digest}");
+    if token.len() > WORK_MEMORY_CURSOR_MAX_BYTES {
+        return Err("work_memory_cursor_invalid");
+    }
+    Ok(token)
+}
+
+fn decode_work_memory_cursor(value: &str) -> Result<WorkMemoryCursorV1, &'static str> {
+    if value.is_empty() || value.len() > WORK_MEMORY_CURSOR_MAX_BYTES {
+        return Err("work_memory_cursor_invalid");
+    }
+    let mut parts = value.split('.');
+    let Some(prefix) = parts.next() else {
+        return Err("work_memory_cursor_invalid");
+    };
+    if prefix != WORK_MEMORY_CURSOR_PREFIX {
+        return if prefix.starts_with("wmc") {
+            Err("work_memory_cursor_version_unsupported")
+        } else {
+            Err("work_memory_cursor_invalid")
+        };
+    }
+    let (Some(encoded), Some(expected_digest)) = (parts.next(), parts.next()) else {
+        return Err("work_memory_cursor_invalid");
+    };
+    if parts.next().is_some() {
+        return Err("work_memory_cursor_invalid");
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "work_memory_cursor_invalid")?;
+    if expected_digest != work_memory_cursor_sha256(&payload) {
+        return Err("work_memory_cursor_invalid");
+    }
+    let cursor: WorkMemoryCursorV1 =
+        serde_json::from_slice(&payload).map_err(|_| "work_memory_cursor_invalid")?;
+    if cursor.version != 1 || cursor.kind != "work_memory.search" {
+        return Err("work_memory_cursor_version_unsupported");
+    }
+    if cursor.query.is_empty()
+        || cursor.query.len() > 512
+        || cursor.query_sha256 != work_memory_cursor_sha256(cursor.query.as_bytes())
+        || cursor.checkpoint_revision < 0
+        || cursor.max_fts_rowid < 0
+        || !(1..=20).contains(&cursor.page_size)
+        || cursor.offset > 1_000_000
+    {
+        return Err("work_memory_cursor_invalid");
+    }
+    Ok(cursor)
+}
+
+fn work_memory_coverage(
+    checkpoint_revision: i64,
+    through_evidence_id: Option<&str>,
+    has_portable_source_claims: bool,
+    display_page_truncated: bool,
+    display_excerpt_truncated: bool,
+) -> Value {
+    let mut limitations = Vec::new();
+    if display_page_truncated {
+        limitations.push("display_page_truncated");
+    }
+    if display_excerpt_truncated {
+        limitations.push("display_excerpt_truncated");
+    }
+    if has_portable_source_claims {
+        limitations.push("source_revision_unverified");
+    }
+    json!({
+        "boundary": {
+            "checkpoint_revision": checkpoint_revision,
+            "through_evidence_id": through_evidence_id,
+        },
+        "result_completeness": "complete",
+        "source_verification": if has_portable_source_claims { "unverified" } else { "not_applicable" },
+        "display_truncated": display_page_truncated || display_excerpt_truncated,
+        "limitations": limitations,
+    })
+}
+
+fn work_memory_search_page_json(
+    project_ref: &str,
+    repo_id: &str,
+    work_chain_id: &str,
+    query: &str,
+    page_size: usize,
+    page: WorkMemorySearchPage,
+) -> Value {
+    let display_excerpt_truncated = page.hits.iter().any(|hit| hit.excerpt.contains('…'));
+    let coverage = work_memory_coverage(
+        page.boundary.checkpoint_revision,
+        page.boundary.through_evidence_id.as_deref(),
+        page.has_portable_source_claims,
+        page.has_more,
+        display_excerpt_truncated,
+    );
+    let next_cursor = if page.has_more {
+        let cursor = WorkMemoryCursorV1 {
+            version: 1,
+            kind: "work_memory.search".to_owned(),
+            continuity_id: page.boundary.continuity_id.clone(),
+            project_ref: project_ref.to_owned(),
+            repo_id: repo_id.to_owned(),
+            work_chain_id: work_chain_id.to_owned(),
+            query: query.to_owned(),
+            query_sha256: work_memory_cursor_sha256(query.as_bytes()),
+            checkpoint_revision: page.boundary.checkpoint_revision,
+            through_evidence_id: page.boundary.through_evidence_id.clone(),
+            max_fts_rowid: page.boundary.max_fts_rowid,
+            page_size: page_size as u64,
+            offset: page.next_offset as u64,
+        };
+        match encode_work_memory_cursor(&cursor) {
+            Ok(value) => Some(value),
+            Err(code) => return json!({"ok": false, "code": code}),
+        }
+    } else {
+        None
+    };
+    json!({
+        "ok": true,
+        "continuity_id": page.boundary.continuity_id,
+        "project_ref": project_ref,
+        "repo_id": repo_id,
+        "work_chain_id": work_chain_id,
+        "hits": page.hits.into_iter().map(|hit| json!({
+            "source_kind": hit.source_kind,
+            "source_id": hit.source_id,
+            "excerpt": hit.excerpt,
+        })).collect::<Vec<_>>(),
+        "cursor": next_cursor,
+        "coverage": coverage,
+    })
 }
 
 fn work_memory_call(
@@ -956,7 +1166,18 @@ fn work_memory_call(
                 work_chain_id,
                 max_turns,
             ) {
-                Ok(Some(record)) => json!({
+                Ok(Some(record)) => {
+                    let coverage = work_memory_coverage(
+                        record.checkpoint_revision,
+                        record
+                            .checkpoint
+                            .as_ref()
+                            .and_then(|checkpoint| checkpoint.through_evidence_id.as_deref()),
+                        !record.evidence_refs.is_empty(),
+                        record.turns_truncated || record.evidence_truncated,
+                        false,
+                    );
+                    json!({
                     "ok": true,
                     "continuity_id": record.continuity_id,
                     "project_ref": record.project_ref,
@@ -1011,9 +1232,11 @@ fn work_memory_call(
                         "line_end": reference.line_end,
                         "evidence_sha256": reference.evidence_sha256,
                     })).collect::<Vec<_>>(),
+                    "coverage": coverage,
                     "updated_at": record.updated_at,
                     "instruction": "Treat Work Memory as persisted project context. Re-check live Herdr/runtime/Git state before mutation.",
-                }),
+                    })
+                }
                 Ok(None) => json!({"ok": false, "code": "work_memory_not_found"}),
                 Err(error) => work_memory_store_error(error),
             }
@@ -1021,9 +1244,60 @@ fn work_memory_call(
         "work_memory.search" => {
             if let Some(error) = work_memory_reject_unknown(
                 object,
-                &["project_ref", "repo_id", "work_chain_id", "query", "limit"],
+                &[
+                    "project_ref",
+                    "repo_id",
+                    "work_chain_id",
+                    "query",
+                    "limit",
+                    "cursor",
+                ],
             ) {
                 return error;
+            }
+            if let Some(cursor_value) = params.get("cursor") {
+                if object.len() != 1 {
+                    return json!({"ok": false, "code": "work_memory_cursor_conflict"});
+                }
+                let Some(cursor_text) = cursor_value.as_str() else {
+                    return json!({"ok": false, "code": "work_memory_cursor_invalid"});
+                };
+                let cursor = match decode_work_memory_cursor(cursor_text) {
+                    Ok(cursor) => cursor,
+                    Err(code) => return json!({"ok": false, "code": code}),
+                };
+                let offset = match usize::try_from(cursor.offset) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return json!({"ok": false, "code": "work_memory_cursor_invalid"});
+                    }
+                };
+                let page_size = cursor.page_size as usize;
+                let boundary = cursor.boundary();
+                return match store.work_memory_search_page(
+                    &cursor.project_ref,
+                    &cursor.repo_id,
+                    &cursor.work_chain_id,
+                    &cursor.query,
+                    WorkMemorySearchPageOptions {
+                        limit: page_size,
+                        offset,
+                        expected_boundary: Some(&boundary),
+                    },
+                ) {
+                    Ok(Some(page)) => work_memory_search_page_json(
+                        &cursor.project_ref,
+                        &cursor.repo_id,
+                        &cursor.work_chain_id,
+                        &cursor.query,
+                        page_size,
+                        page,
+                    ),
+                    Ok(None) => {
+                        json!({"ok": false, "code": "work_memory_cursor_partition_mismatch"})
+                    }
+                    Err(error) => work_memory_store_error(error),
+                };
             }
             let project_ref = match work_memory_required_string(params, "project_ref", 512) {
                 Ok(value) => value,
@@ -1048,18 +1322,26 @@ fn work_memory_call(
                     _ => return json!({"ok": false, "code": "work_memory_limit_invalid"}),
                 },
             };
-            match store.work_memory_search(project_ref, repo_id, work_chain_id, query, limit) {
-                Ok(hits) => json!({
-                    "ok": true,
-                    "project_ref": project_ref,
-                    "repo_id": repo_id,
-                    "work_chain_id": work_chain_id,
-                    "hits": hits.into_iter().map(|hit| json!({
-                        "source_kind": hit.source_kind,
-                        "source_id": hit.source_id,
-                        "excerpt": hit.excerpt,
-                    })).collect::<Vec<_>>()
-                }),
+            match store.work_memory_search_page(
+                project_ref,
+                repo_id,
+                work_chain_id,
+                query,
+                WorkMemorySearchPageOptions {
+                    limit,
+                    offset: 0,
+                    expected_boundary: None,
+                },
+            ) {
+                Ok(Some(page)) => work_memory_search_page_json(
+                    project_ref,
+                    repo_id,
+                    work_chain_id,
+                    query,
+                    limit,
+                    page,
+                ),
+                Ok(None) => json!({"ok": false, "code": "work_memory_not_found"}),
                 Err(error) => work_memory_store_error(error),
             }
         }
@@ -1161,6 +1443,7 @@ pub struct BrowserPostconditionEvidence {
     pub generation_owner: Option<i64>,
     pub generation_status_observed: bool,
     pub generation_stopped: bool,
+    pub result: Option<Value>,
 }
 
 impl BrowserPostconditionEvidence {
@@ -1181,6 +1464,7 @@ impl BrowserPostconditionEvidence {
             generation_owner: None,
             generation_status_observed: false,
             generation_stopped: false,
+            result: None,
         }
     }
 }
@@ -1361,6 +1645,7 @@ fn browser_dispatch_submit(
             BrowserOperation::DispatchSubmit.method(),
             params,
             expected_generation,
+            Some(&reserved.dispatch_id),
         ) {
             Ok(evidence) => evidence,
             Err(error) => return browser_store_error(error),
@@ -1379,28 +1664,277 @@ fn browser_dispatch_submit(
     let Ok(mut store) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
-    let dispatch = match store.update_browser_dispatch(BrowserDispatchUpdateInput {
-        dispatch_id: &reserved.dispatch_id,
-        expected_generation,
-        delivery_state,
-        generation_owner: evidence.generation_owner,
-        updated_at: now,
-    }) {
-        Ok(dispatch) => dispatch,
+    let current = match store.browser_dispatch(&reserved.dispatch_id) {
+        Ok(Some(dispatch)) => dispatch,
+        Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
         Err(error) => return browser_store_error(error),
+    };
+    let dispatch = match current.delivery_state {
+        BrowserDeliveryState::Uncertain if delivery_state != BrowserDeliveryState::Uncertain => {
+            match store.settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &reserved.dispatch_id,
+                expected_generation,
+                delivery_state,
+                generation_owner: evidence.generation_owner,
+                updated_at: now,
+            }) {
+                Ok(dispatch) => dispatch,
+                Err(error) => return browser_store_error(error),
+            }
+        }
+        BrowserDeliveryState::Uncertain => current,
+        BrowserDeliveryState::NotApplied => {
+            return json!({"ok": false, "code": "browser_dispatch_not_claimed"});
+        }
+        _ => current,
     };
     let work_memory_writeback = browser_dispatch_work_memory_writeback(&mut store, &dispatch);
     let success = matches!(
-        delivery_state,
+        dispatch.delivery_state,
         BrowserDeliveryState::Applied | BrowserDeliveryState::Stopped
     );
     json!({
         "ok": success,
-        "code": if success { Value::Null } else { json!(delivery_state.as_str()) },
+        "code": if success { Value::Null } else { json!(dispatch.delivery_state.as_str()) },
         "dispatch": browser_dispatch_json(dispatch),
         "replayed": false,
         "work_memory_writeback": work_memory_writeback,
     })
+}
+
+fn browser_dispatch_status(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    dispatch_id: &str,
+    actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let dispatch = {
+        let Ok(store) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match store.browser_dispatch(dispatch_id) {
+            Ok(Some(dispatch)) => dispatch,
+            Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
+            Err(error) => return browser_store_error(error),
+        }
+    };
+
+    if dispatch.delivery_state == BrowserDeliveryState::Uncertain
+        && let Some(actuator) = actuator
+    {
+        let evidence = match actuator
+            .reconcile_dispatch(&dispatch.dispatch_id, dispatch.expected_generation)
+        {
+            Ok(Some(evidence)) => Some(evidence),
+            Ok(None) => None,
+            Err(error) => return browser_store_error(error),
+        };
+        if let Some(evidence) = evidence {
+            let delivery_state = match browser_delivery_state_from_postcondition(
+                BrowserOperation::DispatchSubmit,
+                &json!({}),
+                dispatch.expected_generation,
+                &evidence,
+            ) {
+                Ok(state) => state,
+                Err(code) => {
+                    return json!({
+                        "ok": true,
+                        "dispatch": browser_dispatch_json(dispatch),
+                        "reconciled": false,
+                        "reconciliation_code": code,
+                    });
+                }
+            };
+            if delivery_state != BrowserDeliveryState::Uncertain {
+                let Ok(mut store) = store.lock() else {
+                    return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+                };
+                let settled = match store.settle_uncertain_browser_dispatch(
+                    BrowserDispatchUpdateInput {
+                        dispatch_id: &dispatch.dispatch_id,
+                        expected_generation: dispatch.expected_generation,
+                        delivery_state,
+                        generation_owner: evidence.generation_owner,
+                        updated_at: browser_epoch_ms(),
+                    },
+                ) {
+                    Ok(record) => record,
+                    Err(error)
+                        if matches!(
+                            error.as_str(),
+                            "browser_dispatch_already_settled"
+                                | "browser_dispatch_settlement_raced"
+                        ) =>
+                    {
+                        match store.browser_dispatch(&dispatch.dispatch_id) {
+                            Ok(Some(record)) => record,
+                            Ok(None) => {
+                                return json!({"ok": false, "code": "browser_dispatch_not_found"});
+                            }
+                            Err(error) => return browser_store_error(error),
+                        }
+                    }
+                    Err(error) => return browser_store_error(error),
+                };
+                let work_memory_writeback =
+                    browser_dispatch_work_memory_writeback(&mut store, &settled);
+                return json!({
+                    "ok": true,
+                    "dispatch": browser_dispatch_json(settled),
+                    "reconciled": true,
+                    "reconciliation_code": Value::Null,
+                    "work_memory_writeback": work_memory_writeback,
+                });
+            }
+            return json!({
+                "ok": true,
+                "dispatch": browser_dispatch_json(dispatch),
+                "reconciled": false,
+                "reconciliation_code": "uncertain",
+            });
+        }
+    }
+
+    json!({
+        "ok": true,
+        "dispatch": browser_dispatch_json(dispatch),
+        "reconciled": false,
+        "reconciliation_code": Value::Null,
+    })
+}
+
+fn browser_session_open(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+    let expected_generation = params
+        .get("expected_generation")
+        .and_then(Value::as_i64)
+        .unwrap();
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .unwrap();
+
+    let request_json = json!({
+        "operation": "herdr_mcp.browser_session.open",
+        "session_ref": session_ref,
+        "expected_generation": expected_generation
+    })
+    .to_string();
+    let request_hash = browser_sha256(&request_json);
+    let idempotency_digest = browser_sha256(idempotency_key);
+    let op_id = format!("op:browser_session_open:{}", &idempotency_digest[..32]);
+    let now = browser_epoch_ms();
+    let expires_at = now.saturating_add(10 * 60 * 1000);
+
+    let reservation = {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match guard.reserve_operation(
+            "browser_session.open",
+            &idempotency_digest,
+            &request_hash,
+            &op_id,
+            now,
+            expires_at,
+        ) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        }
+    };
+
+    match reservation {
+        OperationReservation::Existing(record) => {
+            if record.request_hash != request_hash {
+                return json!({
+                    "ok": false,
+                    "code": "idempotency_key_conflict",
+                    "op_id": record.op_id,
+                });
+            }
+            match record.state.as_deref() {
+                Some("pending") => {
+                    return json!({
+                        "ok": false,
+                        "code": "idempotency_in_flight",
+                        "op_id": record.op_id,
+                    });
+                }
+                Some("complete") => {
+                    let Some(result_json) = record.result_json else {
+                        return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                    };
+                    let mut replay: Value = match serde_json::from_str(&result_json) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                        }
+                    };
+                    if let Some(object) = replay.as_object_mut() {
+                        object.insert("idempotent_replay".to_owned(), json!(true));
+                        object.insert("op_id".to_owned(), json!(record.op_id));
+                    }
+                    return replay;
+                }
+                _ => {
+                    return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                }
+            }
+        }
+        OperationReservation::Reserved => {}
+    }
+
+    let evidence = match actuator {
+        Some(actuator) => match actuator.actuate(
+            BrowserOperation::SessionOpen.method(),
+            params,
+            expected_generation,
+            None,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => return browser_store_error(error),
+        },
+        None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+    };
+    let delivery_state = match browser_delivery_state_from_postcondition(
+        BrowserOperation::SessionOpen,
+        params,
+        expected_generation,
+        &evidence,
+    ) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    let mut result =
+        browser_operation_delivery_result(BrowserOperation::SessionOpen, delivery_state);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("op_id".to_owned(), json!(op_id));
+        object.insert("idempotent_replay".to_owned(), json!(false));
+    }
+    let result_json = serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned());
+    let Ok(mut guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    if let Err(error) = guard.complete_operation(
+        "browser_session.open",
+        &idempotency_digest,
+        &request_hash,
+        &result_json,
+        browser_epoch_ms(),
+        expires_at,
+    ) {
+        return json!({
+            "ok": false,
+            "code": "idempotency_completion_persist_failed",
+            "message": error,
+            "op_id": op_id,
+        });
+    }
+    result
 }
 
 fn browser_dispatch_work_memory_writeback(
@@ -1501,6 +2035,9 @@ fn browser_operation_call_with_grant(
 }
 
 fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Value) -> bool {
+    if operation == BrowserOperation::SessionOpen {
+        return true;
+    }
     if operation != BrowserOperation::DispatchSubmit {
         return !operation.is_mutation();
     }
@@ -1554,6 +2091,19 @@ fn browser_operation_call_with_grants(
         let Ok(store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
+        if operation == BrowserOperation::SessionOpen {
+            let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+            if let Ok(Some(resource)) = store_guard.browser_resource(session_ref)
+                && resource.provider != "chatgpt"
+            {
+                return json!({
+                    "ok": false,
+                    "code": "unsupported",
+                    "operation": operation.method(),
+                    "actuation_available": false,
+                });
+            }
+        }
         let alpha4_supported = browser_operation_alpha4_supported(operation, params);
         match browser_operation_actuation_decision(
             &store_guard,
@@ -1611,22 +2161,13 @@ fn browser_operation_call_with_grants(
             operation,
             caller_webchat_control_grants,
         ),
+        BrowserOperation::SessionOpen => browser_session_open(store, params, browser_actuator),
         BrowserOperation::DispatchSubmit => {
             browser_dispatch_submit(store, params, browser_actuator)
         }
         BrowserOperation::DispatchStatus => {
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
-            let Ok(store) = store.lock() else {
-                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
-            };
-            match store.browser_dispatch(dispatch_id) {
-                Ok(Some(dispatch)) => json!({
-                    "ok": true,
-                    "dispatch": browser_dispatch_json(dispatch),
-                }),
-                Ok(None) => json!({"ok": false, "code": "browser_dispatch_not_found"}),
-                Err(error) => browser_store_error(error),
-            }
+            browser_dispatch_status(store, dispatch_id, browser_actuator)
         }
         _ => {
             let expected_generation = params
@@ -1635,7 +2176,7 @@ fn browser_operation_call_with_grants(
                 .unwrap();
             let evidence = match browser_actuator {
                 Some(actuator) => {
-                    match actuator.actuate(operation.method(), params, expected_generation) {
+                    match actuator.actuate(operation.method(), params, expected_generation, None) {
                         Ok(evidence) => evidence,
                         Err(error) => return browser_store_error(error),
                     }
@@ -1946,6 +2487,9 @@ fn browser_operation_actuation_decision(
         caller_webchat_control_grants,
         params.get("expected_generation").and_then(Value::as_i64),
     )?;
+    if operation == BrowserOperation::SessionOpen && target.provider != "chatgpt" {
+        return Ok((false, Some("capability_not_allowed")));
+    }
     if decision != (true, None) || operation != BrowserOperation::DispatchSubmit {
         return Ok(decision);
     }
@@ -2032,6 +2576,9 @@ fn browser_resource_actuation_decision(
         || resource.observation_generation != provider_state.observation_generation
     {
         return Ok((false, Some("stale_capability_generation")));
+    }
+    if provider_state.adapter_protocol_version != BROWSER_ADAPTER_PROTOCOL_VERSION {
+        return Ok((false, Some("browser_adapter_protocol_unsupported")));
     }
 
     let Some(allowed) =
@@ -2754,6 +3301,202 @@ fn continuity_search_string<'a>(
     }
 }
 
+fn page_assist_call(
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "page assist params must be an object"});
+    };
+    const ALLOWED_KEYS: &[&str] = &[
+        "endpoint_ref",
+        "action",
+        "target_origin",
+        "tab_id",
+        "max_chars",
+        "generation",
+        "ref",
+        "value",
+    ];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({"ok": false, "code": "invalid_params", "message": format!("unknown page assist parameter '{key}'")});
+    }
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+    let action = match object.get("action").and_then(Value::as_str) {
+        Some(value @ ("inspect" | "click" | "fill")) => value,
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "action must be inspect, click, or fill"});
+        }
+    };
+    let target_origin_raw = match object
+        .get("target_origin")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value) if !value.is_empty() && value.len() <= 4096 => value,
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "target_origin is required"});
+        }
+    };
+    let target_url = match url::Url::parse(target_origin_raw) {
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.host_str().is_some() =>
+        {
+            url
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "target_origin must be a valid http or https origin"});
+        }
+    };
+    let target_origin = target_url.origin().ascii_serialization();
+    let tab_id = match object.get("tab_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => match value.as_i64() {
+            Some(value) if value > 0 && value <= i64::from(i32::MAX) => Some(value),
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "tab_id must be a positive integer"});
+            }
+        },
+        Some(_) => {
+            return json!({"ok": false, "code": "invalid_params", "message": "tab_id must be a positive integer"});
+        }
+    };
+    let max_chars = match object.get("max_chars") {
+        None | Some(Value::Null) => 16_384_u64,
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(value) if (1..=16_384).contains(&value) => value,
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be between 1 and 16384"});
+            }
+        },
+        Some(_) => {
+            return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be an integer"});
+        }
+    };
+    let bounded_string = |key: &str, max_chars: usize| -> Result<String, Value> {
+        match object.get(key).and_then(Value::as_str) {
+            Some(value) if !value.is_empty() && value.chars().count() <= max_chars => {
+                Ok(value.to_owned())
+            }
+            _ => Err(
+                json!({"ok": false, "code": "invalid_params", "message": format!("{key} is required and must be at most {max_chars} characters")}),
+            ),
+        }
+    };
+    let mut bridge_params = json!({
+        "endpoint_ref": endpoint_ref,
+        "action": action,
+        "target_origin": target_origin,
+    });
+    if let Some(tab_id) = tab_id {
+        bridge_params["tab_id"] = json!(tab_id);
+    }
+    match action {
+        "inspect" => {
+            bridge_params["max_chars"] = json!(max_chars);
+        }
+        "click" => {
+            let generation = match bounded_string("generation", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let element_ref = match bounded_string("ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            bridge_params["generation"] = json!(generation);
+            bridge_params["ref"] = json!(element_ref);
+        }
+        "fill" => {
+            let generation = match bounded_string("generation", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let element_ref = match bounded_string("ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let value = match object.get("value").and_then(Value::as_str) {
+                Some(value) if value.chars().count() <= 10_000 => value.to_owned(),
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "value is required and must be at most 10000 characters"});
+                }
+            };
+            bridge_params["generation"] = json!(generation);
+            bridge_params["ref"] = json!(element_ref);
+            bridge_params["value"] = json!(value);
+        }
+        _ => unreachable!(),
+    }
+    let Some(actuator) = browser_actuator else {
+        return json!({
+            "ok": false,
+            "code": "page_assist_unavailable",
+            "retryable": true,
+            "delivery_state": "not_delivered",
+        });
+    };
+    match actuator.actuate("herdr_mcp.page_assist", &bridge_params, 1, None) {
+        Ok(evidence) => {
+            if let Some(result) = evidence.result {
+                return result;
+            }
+            if !evidence.browser_online || !evidence.command_accepted {
+                return json!({
+                    "ok": false,
+                    "code": "page_assist_unavailable",
+                    "retryable": true,
+                    "delivery_state": "not_delivered",
+                });
+            }
+            json!({
+                "ok": false,
+                "code": "page_assist_delivery_unknown",
+                "retryable": false,
+                "delivery_state": "delivery_unknown",
+            })
+        }
+        Err(error) => json!({
+            "ok": false,
+            "code": "page_assist_unavailable",
+            "message": error,
+            "retryable": true,
+            "delivery_state": "not_delivered",
+        }),
+    }
+}
+
 fn config_dir() -> std::path::PathBuf {
     crate::paths::RuntimePaths::discover()
         .map(|paths| paths.config_dir)
@@ -3275,6 +4018,38 @@ mod tests {
         assert_eq!(resumed["turns"].as_array().unwrap().len(), 2);
         assert_eq!(resumed["turns"][0]["provider"], "chatgpt");
         assert_eq!(resumed["turns"][1]["provider"], "gemini");
+        assert_eq!(resumed["coverage"]["result_completeness"], "complete");
+        assert_eq!(resumed["coverage"]["source_verification"], "unverified");
+        assert_eq!(resumed["coverage"]["display_truncated"], false);
+        assert!(
+            resumed["coverage"]["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "source_revision_unverified")
+        );
+
+        let tight_resume = work_memory_call(
+            &store,
+            "work_memory.resume",
+            &json!({
+                "project_ref": "project:herdr-mcp",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_cccccccccccccccccccccccccccccccc",
+                "max_turns": 1
+            }),
+        );
+        assert_eq!(tight_resume["ok"], true);
+        assert_eq!(tight_resume["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(tight_resume["coverage"]["result_completeness"], "complete");
+        assert_eq!(tight_resume["coverage"]["display_truncated"], true);
+        assert!(
+            tight_resume["coverage"]["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "display_page_truncated")
+        );
 
         let searched = work_memory_call(
             &store,
@@ -3289,6 +4064,124 @@ mod tests {
         assert_eq!(searched["ok"], true);
         assert_eq!(searched["hits"].as_array().unwrap().len(), 1);
         assert_eq!(searched["hits"][0]["source_kind"], "evidence");
+        assert_eq!(searched["coverage"]["result_completeness"], "complete");
+        assert_eq!(searched["coverage"]["source_verification"], "unverified");
+    }
+
+    #[test]
+    fn work_memory_search_cursor_freezes_boundary_and_rejects_tampering() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let bound = work_memory_call(
+            &store,
+            "work_memory.bind",
+            &json!({
+                "continuity_id": "wm:cursor",
+                "project_ref": "project:cursor",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "provider": "chatgpt",
+                "session_ref": "cursor-session",
+                "bound_at": 1,
+            }),
+        );
+        assert_eq!(bound["ok"], true);
+
+        for index in 1..=3 {
+            let appended = work_memory_call(
+                &store,
+                "work_memory.append_evidence",
+                &json!({
+                    "continuity_id": "wm:cursor",
+                    "kind": "result",
+                    "content": format!("stable-cursor-keyword evidence-{index}"),
+                    "created_at": 10 + index,
+                }),
+            );
+            assert_eq!(appended["ok"], true);
+        }
+
+        let first = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({
+                "project_ref": "project:cursor",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "query": "stable-cursor-keyword",
+                "limit": 2
+            }),
+        );
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["hits"].as_array().unwrap().len(), 2);
+        assert_eq!(first["coverage"]["result_completeness"], "complete");
+        assert_eq!(first["coverage"]["display_truncated"], true);
+        let cursor = first["cursor"].as_str().unwrap().to_owned();
+
+        let appended_later = work_memory_call(
+            &store,
+            "work_memory.append_evidence",
+            &json!({
+                "continuity_id": "wm:cursor",
+                "kind": "result",
+                "content": "stable-cursor-keyword evidence-4-later",
+                "created_at": 20,
+            }),
+        );
+        assert_eq!(appended_later["ok"], true);
+
+        let continued = work_memory_call(&store, "work_memory.search", &json!({"cursor": cursor}));
+        assert_eq!(continued["ok"], true);
+        assert_eq!(continued["hits"].as_array().unwrap().len(), 1);
+        assert!(
+            continued["hits"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("evidence-1")
+        );
+        assert!(!continued.to_string().contains("evidence-4-later"));
+        assert!(continued["cursor"].is_null());
+
+        let replay = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({"cursor": first["cursor"]}),
+        );
+        assert_eq!(replay, continued);
+
+        let fresh = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({
+                "project_ref": "project:cursor",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "query": "stable-cursor-keyword",
+                "limit": 1
+            }),
+        );
+        assert_eq!(fresh["ok"], true);
+        assert!(
+            fresh["hits"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("evidence-4-later")
+        );
+
+        let conflict = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({"cursor": first["cursor"], "limit": 1}),
+        );
+        assert_eq!(conflict["code"], "work_memory_cursor_conflict");
+
+        let mut tampered = first["cursor"].as_str().unwrap().to_owned();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == '0' { '1' } else { '0' });
+        let tampered_result =
+            work_memory_call(&store, "work_memory.search", &json!({"cursor": tampered}));
+        assert_eq!(tampered_result["code"], "work_memory_cursor_invalid");
     }
 
     #[test]
@@ -3812,6 +4705,161 @@ mod tests {
         assert_eq!(status["dispatch"]["delivery_state"], "resource_unavailable");
         assert!(!status.to_string().contains("delivery-session-hidden"));
 
+        struct UncertainThenReconcileActuator {
+            reconcile_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl BrowserActuator for UncertainThenReconcileActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert!(dispatch_id.is_some());
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                Ok(evidence)
+            }
+
+            fn reconcile_dispatch(
+                &self,
+                dispatch_id: &str,
+                expected_generation: i64,
+            ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+                assert!(dispatch_id.starts_with("bd_"));
+                self.reconcile_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: None,
+                }))
+            }
+        }
+        let reconcile_actuator = UncertainThenReconcileActuator {
+            reconcile_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let reconcile_params = json!({
+            "session_ref": session_ref,
+            "message": "dispatch with delayed evidence",
+            "expected_generation": 7,
+            "idempotency_key": "delivery-reconcile-idempotency-key"
+        });
+        let uncertain = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &reconcile_params,
+            true,
+            Some(&reconcile_actuator),
+        );
+        assert_eq!(uncertain["ok"], false);
+        assert_eq!(uncertain["code"], "uncertain");
+        assert_eq!(uncertain["dispatch"]["delivery_state"], "uncertain");
+        let reconcile_dispatch_id = uncertain["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let reconciled = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.status",
+            &json!({"dispatch_id": reconcile_dispatch_id}),
+            &[],
+            Some(&reconcile_actuator),
+            None,
+        );
+        assert_eq!(reconciled["ok"], true);
+        assert_eq!(reconciled["reconciled"], true);
+        assert_eq!(reconciled["dispatch"]["delivery_state"], "applied");
+        assert_eq!(
+            reconcile_actuator
+                .reconcile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let settled_status = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.status",
+            &json!({"dispatch_id": reconcile_dispatch_id}),
+            &[],
+            Some(&reconcile_actuator),
+            None,
+        );
+        assert_eq!(settled_status["dispatch"]["delivery_state"], "applied");
+        assert_eq!(settled_status["reconciled"], false);
+        assert_eq!(
+            reconcile_actuator
+                .reconcile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "terminal status must not consume or request a second reconciliation"
+        );
+
+        struct ConcurrentSettlementActuator {
+            store: Arc<Mutex<StateStore>>,
+        }
+        impl BrowserActuator for ConcurrentSettlementActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let dispatch_id = dispatch_id.expect("dispatch identity is required");
+                self.store
+                    .lock()
+                    .unwrap()
+                    .settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                        dispatch_id,
+                        expected_generation,
+                        delivery_state: BrowserDeliveryState::Applied,
+                        generation_owner: Some(expected_generation),
+                        updated_at: browser_epoch_ms(),
+                    })
+                    .unwrap();
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.resource_available = true;
+                Ok(evidence)
+            }
+        }
+        let settlement_race_params = json!({
+            "session_ref": session_ref,
+            "message": "status settlement wins before submit timeout writeback",
+            "expected_generation": 7,
+            "idempotency_key": "delivery-settlement-race-idempotency-key"
+        });
+        let settlement_race = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &settlement_race_params,
+            true,
+            Some(&ConcurrentSettlementActuator {
+                store: store.clone(),
+            }),
+        );
+        assert_eq!(settlement_race["ok"], true);
+        assert!(settlement_race["code"].is_null());
+        assert_eq!(settlement_race["dispatch"]["delivery_state"], "applied");
+
         struct AppliedActuator;
         impl BrowserActuator for AppliedActuator {
             fn actuate(
@@ -3819,6 +4867,7 @@ mod tests {
                 _operation: &str,
                 _params: &Value,
                 expected_generation: i64,
+                _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 Ok(BrowserPostconditionEvidence {
                     observed_generation: expected_generation,
@@ -3836,6 +4885,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    result: None,
                 })
             }
         }
@@ -3946,6 +4996,7 @@ mod tests {
                 _operation: &str,
                 _params: &Value,
                 expected_generation: i64,
+                _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(BrowserPostconditionEvidence {
@@ -3964,6 +5015,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    result: None,
                 })
             }
         }
@@ -4148,14 +5200,6 @@ mod tests {
                 }),
             ),
             (
-                "herdr_mcp.browser_session.open",
-                json!({
-                    "session_ref": "br_session",
-                    "expected_generation": 7,
-                    "idempotency_key": "unsupported-session-open"
-                }),
-            ),
-            (
                 "herdr_mcp.browser_message.append",
                 json!({
                     "session_ref": "br_session",
@@ -4229,6 +5273,488 @@ mod tests {
                 "idempotency_key": "supported-plain-dispatch"
             })
         ));
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::SessionOpen,
+            &json!({
+                "session_ref": "br_session",
+                "expected_generation": 7,
+                "idempotency_key": "supported-session-open"
+            })
+        ));
+        assert!(
+            !browser_operation_alpha4_supported(
+                BrowserOperation::SessionCreate,
+                &json!({
+                    "endpoint_ref": "be_alpha4",
+                    "provider": "chatgpt",
+                    "account_ref": "br_account",
+                    "display_label": "Conversation",
+                    "expected_generation": 7,
+                    "idempotency_key": "still-unsupported-session-create"
+                })
+            ),
+            "browser_session.create must remain unsupported"
+        );
+    }
+
+    #[test]
+    fn browser_session_open_unique_and_durable_idempotency_regression() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (session_ref, other_session_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-open-unique-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "account-hidden-unique",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-hidden-unique",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            let other_session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-hidden-unique-2",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            (session.resource_ref, other_session.resource_ref)
+        };
+
+        struct SessionOpenActuator {
+            calls: AtomicUsize,
+            expected_session_ref: String,
+        }
+        impl BrowserActuator for SessionOpenActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, "herdr_mcp.browser_session.open");
+                assert_eq!(expected_generation, 7);
+                assert!(dispatch_id.is_none());
+                // Must never carry a message payload; only opaque refs + generation + idempotency.
+                assert!(params.get("message").is_none());
+                assert!(params.get("selector").is_none());
+                assert_eq!(
+                    params.get("session_ref").and_then(Value::as_str).unwrap(),
+                    self.expected_session_ref
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: None,
+                })
+            }
+        }
+
+        let actuator = SessionOpenActuator {
+            calls: AtomicUsize::new(0),
+            expected_session_ref: session_ref.clone(),
+        };
+        let params = json!({
+            "session_ref": session_ref,
+            "expected_generation": 7,
+            "idempotency_key": "session-open-unique-1"
+        });
+        let first = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["delivery_state"], "applied");
+        assert_eq!(first["operation"], "herdr_mcp.browser_session.open");
+        assert_eq!(first["idempotent_replay"], false);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        // Same key + same request replays without a second tab activation.
+        let replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["delivery_state"], "applied");
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["op_id"], first["op_id"]);
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            1,
+            "idempotent replay must not invoke browser actuation again"
+        );
+
+        // Same key + different request conflicts (different session_ref with same key).
+        let conflict2 = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": other_session_ref,
+                "expected_generation": 7,
+                "idempotency_key": "session-open-unique-1"
+            }),
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(conflict2["code"], "idempotency_key_conflict");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        // Pending/uncertain must not auto-repeat.
+        {
+            let mut guard = store.lock().unwrap();
+            let pending_digest = browser_sha256("session-open-pending-key");
+            let pending_request = browser_sha256(&json!({"operation":"herdr_mcp.browser_session.open","session_ref":session_ref,"expected_generation":7}).to_string());
+            let pending_op_id = format!("op:browser_session_open:{}", &pending_digest[..32]);
+            let now = browser_epoch_ms();
+            let expires = now + 10 * 60 * 1000;
+            guard
+                .reserve_operation(
+                    "browser_session.open",
+                    &pending_digest,
+                    &pending_request,
+                    &pending_op_id,
+                    now,
+                    expires,
+                )
+                .unwrap();
+        }
+        let in_flight = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 7,
+                "idempotency_key": "session-open-pending-key"
+            }),
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(in_flight["code"], "idempotency_in_flight");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        // Ensure no message was ever submitted via the session.open path.
+        assert_eq!(replay["idempotent_replay"], true);
+    }
+
+    #[test]
+    fn browser_session_open_fails_closed_on_missing_stale_and_non_chatgpt() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, session_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-open-failclosed-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "account-failclosed",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-failclosed",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref.clone(), session.resource_ref.clone())
+        };
+
+        struct NoopActuator;
+        impl BrowserActuator for NoopActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(BrowserPostconditionEvidence::resource_unavailable(
+                    expected_generation,
+                ))
+            }
+        }
+
+        // Missing resource
+        let missing = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": format!("br_{}", "f".repeat(64)),
+                "expected_generation": 7,
+                "idempotency_key": "missing-session"
+            }),
+            true,
+            Some(&NoopActuator),
+        );
+        assert_eq!(missing["code"], "browser_resource_not_found");
+
+        // Stale generation
+        let stale = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 999,
+                "idempotency_key": "stale-gen"
+            }),
+            true,
+            Some(&NoopActuator),
+        );
+        assert_eq!(stale["code"], "stale_capability_generation");
+
+        // Non-ChatGPT provider remains unsupported even with same session.open capability.
+        let (gemini_session_ref, grants) = {
+            let mut guard = store.lock().unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "gemini",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 15,
+                })
+                .unwrap();
+            let gemini_account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "gemini",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "gemini-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 16,
+                })
+                .unwrap();
+            let gemini_session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "gemini",
+                    kind: "session",
+                    parent_ref: Some(&gemini_account.resource_ref),
+                    native_identity: "gemini-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 17,
+                })
+                .unwrap();
+            // Create a grant for gemini account but request from same endpoint/provider.
+            // Directly test the provider gate via a gemini grant.
+            let grants = vec![BrowserCallerGrant {
+                endpoint_ref: endpoint_ref.clone(),
+                provider: "gemini".to_owned(),
+                account_ref: gemini_account.resource_ref.clone(),
+            }];
+            (gemini_session.resource_ref, grants)
+        };
+        let gemini_result = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &json!({
+                "session_ref": gemini_session_ref,
+                "expected_generation": 7,
+                "idempotency_key": "gemini-session-open"
+            }),
+            &grants,
+            Some(&NoopActuator),
+            None,
+        );
+        assert_eq!(gemini_result["code"], "unsupported");
+    }
+
+    #[test]
+    fn browser_session_create_remains_unsupported_regression() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-create-unsupported-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "account-create-unsupported",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        };
+        let result = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": account_ref,
+                "display_label": "Conversation",
+                "expected_generation": 7,
+                "idempotency_key": "create-still-unsupported"
+            }),
+            true,
+            None,
+        );
+        assert_eq!(result["code"], "unsupported");
+        assert_eq!(result["operation"], "herdr_mcp.browser_session.create");
     }
 
     #[test]
@@ -4389,6 +5915,7 @@ mod tests {
                 _operation: &str,
                 _params: &Value,
                 expected_generation: i64,
+                _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 assert!(
                     self.gate.try_lock().is_err(),
@@ -4406,6 +5933,7 @@ mod tests {
                 _operation: &str,
                 _params: &Value,
                 _expected_generation: i64,
+                _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 panic!("explicit unsupported mutations must not reach browser actuation")
             }
@@ -4524,6 +6052,97 @@ mod tests {
             None,
         );
         assert_eq!(stale["code"], "stale_capability_generation");
+    }
+
+    #[test]
+    fn browser_adapter_protocol_skew_fails_closed_after_generation_fence() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceRecord,
+        };
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed: "beta1-protocol-skew-profile",
+                browser_family: "chrome",
+                extension_version: "0.1.90",
+                observed_at: 10,
+            })
+            .unwrap();
+        store
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                expected_revision: 0,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: false,
+                tool_bridge_mutation_allowed: false,
+                observed_at: 11,
+            })
+            .unwrap();
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 2,
+                observation_generation: 7,
+                capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                observed_at: 12,
+            })
+            .unwrap();
+        let account_ref = format!("br_{}", "9".repeat(64));
+        let resource = BrowserResourceRecord {
+            resource_ref: account_ref.clone(),
+            endpoint_ref: endpoint.endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            kind: "account".to_owned(),
+            parent_ref: None,
+            native_identity_sha256: "a".repeat(64),
+            display_label: None,
+            observation_generation: 7,
+            first_observed_at: 12,
+            last_observed_at: 12,
+        };
+        let grants = [BrowserCallerGrant {
+            endpoint_ref: endpoint.endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref,
+        }];
+        assert_eq!(
+            browser_resource_actuation_decision(
+                &store,
+                "composer.submit",
+                &resource,
+                &grants,
+                Some(7),
+            )
+            .unwrap(),
+            (false, Some("browser_adapter_protocol_unsupported"))
+        );
+
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 3,
+                observation_generation: 8,
+                capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                observed_at: 13,
+            })
+            .unwrap();
+        assert_eq!(
+            browser_resource_actuation_decision(
+                &store,
+                "composer.submit",
+                &resource,
+                &grants,
+                Some(7),
+            )
+            .unwrap(),
+            (false, Some("stale_capability_generation")),
+            "generation mismatch remains the primary pre-dispatch fence"
+        );
     }
 
     #[test]
@@ -4739,5 +6358,65 @@ mod tests {
 
         std::fs::remove_dir_all(&config_dir).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn page_assist_requires_exact_caller_grant_and_returns_extension_result() {
+        struct PanicActuator;
+        impl BrowserActuator for PanicActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("caller grant rejection must happen before browser actuation")
+            }
+        }
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "action": "inspect",
+            "target_origin": "https://example.com",
+            "max_chars": 4096
+        });
+        let denied = page_assist_call(&params, &[], Some(&PanicActuator));
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["code"], "caller_grant_missing");
+        assert_eq!(denied["delivery_state"], "not_delivered");
+
+        struct ResultActuator;
+        impl BrowserActuator for ResultActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, "herdr_mcp.page_assist");
+                assert!(dispatch_id.is_none());
+                assert_eq!(params["target_origin"], "https://example.com");
+                assert_eq!(params["max_chars"], 4096);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "generation": "pa:test",
+                    "text": "visible page text"
+                }));
+                Ok(evidence)
+            }
+        }
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let allowed = page_assist_call(&params, &grants, Some(&ResultActuator));
+        assert_eq!(allowed["ok"], true);
+        assert_eq!(allowed["generation"], "pa:test");
+        assert_eq!(allowed["text"], "visible page text");
     }
 }

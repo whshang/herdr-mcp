@@ -19,6 +19,7 @@
 #![allow(dead_code)]
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -621,7 +622,9 @@ pub struct WorkMemoryResumeRecord {
     pub retention_policy: String,
     pub checkpoint: Option<WorkMemoryCheckpointRecord>,
     pub turns: Vec<WorkMemoryTurnRecord>,
+    pub turns_truncated: bool,
     pub evidence: Vec<WorkMemoryEvidenceRecord>,
+    pub evidence_truncated: bool,
     pub evidence_refs: Vec<WorkMemoryPortableEvidenceRef>,
     pub updated_at: i64,
 }
@@ -631,6 +634,30 @@ pub struct WorkMemorySearchHit {
     pub source_kind: String,
     pub source_id: String,
     pub excerpt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemorySearchBoundary {
+    pub continuity_id: String,
+    pub checkpoint_revision: i64,
+    pub through_evidence_id: Option<String>,
+    pub max_fts_rowid: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemorySearchPage {
+    pub hits: Vec<WorkMemorySearchHit>,
+    pub boundary: WorkMemorySearchBoundary,
+    pub next_offset: usize,
+    pub has_more: bool,
+    pub has_portable_source_claims: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkMemorySearchPageOptions<'a> {
+    pub limit: usize,
+    pub offset: usize,
+    pub expected_boundary: Option<&'a WorkMemorySearchBoundary>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2084,7 +2111,8 @@ impl StateStore {
                 return Err("work_memory_checkpoint_corrupt".to_owned());
             }
         }
-        let limit = i64::try_from(max_turns.clamp(1, 64)).unwrap_or(64);
+        let requested_turns = max_turns.clamp(1, 64);
+        let limit = i64::try_from(requested_turns.saturating_add(1)).unwrap_or(65);
         let mut turn_stmt = self
             .conn
             .prepare(
@@ -2112,9 +2140,14 @@ impl StateStore {
         let mut turns = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot decode work memory turn: {error}"))?;
+        let mut turns_truncated = turns.len() > requested_turns;
+        if turns_truncated {
+            turns.truncate(requested_turns);
+        }
         turns.reverse();
         let mut turn_bytes = turns.iter().map(|turn| turn.text.len()).sum::<usize>();
         while turns.len() > 1 && turn_bytes > 64 * 1024 {
+            turns_truncated = true;
             turn_bytes = turn_bytes.saturating_sub(turns[0].text.len());
             turns.remove(0);
         }
@@ -2125,7 +2158,7 @@ impl StateStore {
                         portable_repo_id, portable_commit_sha, portable_path,
                         portable_line_start, portable_line_end, created_at
                  FROM continuity_evidence WHERE continuity_id = ?1
-                 ORDER BY created_at DESC LIMIT 24",
+                 ORDER BY created_at DESC LIMIT 25",
             )
             .map_err(|error| format!("cannot prepare work memory evidence: {error}"))?;
         let evidence_rows = evidence_stmt
@@ -2146,9 +2179,13 @@ impl StateStore {
                 ))
             })
             .map_err(|error| format!("cannot query work memory evidence: {error}"))?;
-        let raw_evidence = evidence_rows
+        let mut raw_evidence = evidence_rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot decode work memory evidence: {error}"))?;
+        let mut evidence_truncated = raw_evidence.len() > 24;
+        if evidence_truncated {
+            raw_evidence.truncate(24);
+        }
         let mut evidence = Vec::with_capacity(raw_evidence.len());
         for (
             evidence_id,
@@ -2190,6 +2227,7 @@ impl StateStore {
             .map(|item| item.content.len())
             .sum::<usize>();
         while evidence.len() > 1 && evidence_bytes > 64 * 1024 {
+            evidence_truncated = true;
             evidence_bytes = evidence_bytes.saturating_sub(evidence[0].content.len());
             evidence.remove(0);
         }
@@ -2206,7 +2244,9 @@ impl StateStore {
             retention_policy,
             checkpoint,
             turns,
+            turns_truncated,
             evidence,
+            evidence_truncated,
             evidence_refs,
             updated_at,
         }))
@@ -2259,6 +2299,185 @@ impl StateStore {
             .map_err(|error| format!("cannot query work memory search: {error}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot decode work memory search: {error}"))
+    }
+
+    pub fn work_memory_search_page(
+        &self,
+        project_ref: &str,
+        repo_id: &str,
+        work_chain_id: &str,
+        query: &str,
+        options: WorkMemorySearchPageOptions<'_>,
+    ) -> Result<Option<WorkMemorySearchPage>, String> {
+        validate_work_memory_partition_identity(project_ref, repo_id, work_chain_id)?;
+        let query = work_memory_fts_query(query)?;
+        let partition = self
+            .conn
+            .query_row(
+                "SELECT continuity_id, checkpoint_revision FROM continuity_chains
+                 WHERE project_ref = ?1 AND repo_id = ?2 AND work_chain_id = ?3
+                   AND status = 'active'",
+                params![project_ref, repo_id, work_chain_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve work memory partition: {error}"))?;
+        let Some((continuity_id, current_checkpoint_revision)) = partition else {
+            return Ok(None);
+        };
+
+        let current_max_fts_rowid = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM continuity_memory_fts
+                 WHERE continuity_id = ?1",
+                [&continuity_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("cannot read work memory search boundary: {error}"))?;
+
+        let boundary = match options.expected_boundary {
+            Some(boundary) => {
+                if boundary.continuity_id != continuity_id {
+                    return Err("work_memory_cursor_partition_mismatch".to_owned());
+                }
+                if boundary.max_fts_rowid < 0 || current_max_fts_rowid < boundary.max_fts_rowid {
+                    return Err("work_memory_cursor_boundary_unavailable".to_owned());
+                }
+                if boundary.checkpoint_revision > 0 {
+                    let checkpoint_exists = self
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM continuity_checkpoints
+                             WHERE continuity_id = ?1 AND checkpoint_revision = ?2
+                               AND verified = 1",
+                            params![continuity_id, boundary.checkpoint_revision],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("cannot validate work memory cursor checkpoint: {error}")
+                        })?;
+                    if checkpoint_exists.is_none() {
+                        return Err("work_memory_cursor_boundary_unavailable".to_owned());
+                    }
+                }
+                if let Some(evidence_id) = boundary.through_evidence_id.as_deref() {
+                    let evidence_exists = self
+                        .conn
+                        .query_row(
+                            "SELECT 1 FROM continuity_memory_fts
+                             WHERE continuity_id = ?1 AND source_kind = 'evidence'
+                               AND source_id = ?2 AND rowid <= ?3",
+                            params![continuity_id, evidence_id, boundary.max_fts_rowid],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("cannot validate work memory cursor evidence: {error}")
+                        })?;
+                    if evidence_exists.is_none() {
+                        return Err("work_memory_cursor_boundary_unavailable".to_owned());
+                    }
+                }
+                boundary.clone()
+            }
+            None => {
+                let through_evidence_id = self
+                    .conn
+                    .query_row(
+                        "SELECT source_id FROM continuity_memory_fts
+                         WHERE continuity_id = ?1 AND source_kind = 'evidence'
+                           AND rowid <= ?2
+                         ORDER BY rowid DESC LIMIT 1",
+                        params![continuity_id, current_max_fts_rowid],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("cannot read work memory evidence boundary: {error}")
+                    })?;
+                WorkMemorySearchBoundary {
+                    continuity_id: continuity_id.clone(),
+                    checkpoint_revision: current_checkpoint_revision,
+                    through_evidence_id,
+                    max_fts_rowid: current_max_fts_rowid,
+                }
+            }
+        };
+
+        let limit = options.limit.clamp(1, 20);
+        let sql_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(21);
+        let sql_offset =
+            i64::try_from(options.offset).map_err(|_| "work_memory_cursor_invalid".to_owned())?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_kind, source_id,
+                        snippet(continuity_memory_fts, 3, '', '', '…', 24)
+                 FROM continuity_memory_fts
+                 WHERE continuity_memory_fts MATCH ?1 AND continuity_id = ?2
+                   AND rowid <= ?3
+                 ORDER BY rowid DESC
+                 LIMIT ?4 OFFSET ?5",
+            )
+            .map_err(|error| format!("cannot prepare stable work memory search: {error}"))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    query,
+                    continuity_id,
+                    boundary.max_fts_rowid,
+                    sql_limit,
+                    sql_offset
+                ],
+                |row| {
+                    Ok(WorkMemorySearchHit {
+                        source_kind: row.get(0)?,
+                        source_id: row.get(1)?,
+                        excerpt: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("cannot query stable work memory search: {error}"))?;
+        let mut hits = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode stable work memory search: {error}"))?;
+        let has_more = hits.len() > limit;
+        if has_more {
+            hits.truncate(limit);
+        }
+
+        let has_portable_source_claims = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM continuity_memory_fts AS f
+                    JOIN continuity_evidence AS e
+                      ON e.continuity_id = f.continuity_id
+                     AND e.evidence_id = f.source_id
+                    WHERE continuity_memory_fts MATCH ?1
+                      AND f.continuity_id = ?2
+                      AND f.source_kind = 'evidence'
+                      AND f.rowid <= ?3
+                      AND e.portable_repo_id IS NOT NULL
+                      AND e.portable_commit_sha IS NOT NULL
+                      AND e.portable_path IS NOT NULL
+                 )",
+                params![query, continuity_id, boundary.max_fts_rowid],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("cannot inspect work memory source coverage: {error}"))?
+            != 0;
+
+        Ok(Some(WorkMemorySearchPage {
+            next_offset: options.offset.saturating_add(hits.len()),
+            hits,
+            boundary,
+            has_more,
+            has_portable_source_claims,
+        }))
     }
 
     pub fn register_browser_endpoint(
@@ -2952,6 +3171,76 @@ impl StateStore {
             .and_then(decode_browser_dispatch)?;
         tx.commit()
             .map_err(|error| format!("cannot commit browser dispatch update: {error}"))?;
+        Ok(record)
+    }
+
+    pub fn settle_uncertain_browser_dispatch(
+        &mut self,
+        input: BrowserDispatchUpdateInput<'_>,
+    ) -> Result<BrowserDispatchRecord, String> {
+        validate_browser_dispatch_id(input.dispatch_id)?;
+        if input.expected_generation < 1 {
+            return Err("browser_expected_generation_invalid".to_owned());
+        }
+        if input.delivery_state == BrowserDeliveryState::Uncertain {
+            return Err("browser_dispatch_settlement_not_terminal".to_owned());
+        }
+        if input
+            .generation_owner
+            .is_some_and(|owner| owner != input.expected_generation)
+        {
+            return Err("browser_generation_owner_mismatch".to_owned());
+        }
+        if input.updated_at < 0 {
+            return Err("browser_updated_at_invalid".to_owned());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser dispatch settlement: {error}"))?;
+        let current = read_browser_dispatch_by_ref(&tx, input.dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())?;
+        if current.expected_generation != input.expected_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        let current_record = decode_browser_dispatch(current)?;
+        if current_record.delivery_state != BrowserDeliveryState::Uncertain {
+            if current_record.delivery_state == input.delivery_state
+                && current_record.generation_owner == input.generation_owner
+            {
+                tx.commit().map_err(|error| {
+                    format!("cannot commit existing browser dispatch settlement: {error}")
+                })?;
+                return Ok(current_record);
+            }
+            return Err("browser_dispatch_already_settled".to_owned());
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE browser_dispatches
+                 SET delivery_state = ?2, generation_owner = ?3,
+                     updated_at = MAX(updated_at, ?4)
+                 WHERE dispatch_id = ?1 AND expected_generation = ?5
+                   AND delivery_state = 'uncertain'",
+                params![
+                    input.dispatch_id,
+                    input.delivery_state.as_str(),
+                    input.generation_owner,
+                    input.updated_at,
+                    input.expected_generation,
+                ],
+            )
+            .map_err(|error| format!("cannot settle browser dispatch: {error}"))?;
+        if changed != 1 {
+            return Err("browser_dispatch_settlement_raced".to_owned());
+        }
+        let record = read_browser_dispatch_by_ref(&tx, input.dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())
+            .and_then(decode_browser_dispatch)?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser dispatch settlement: {error}"))?;
         Ok(record)
     }
 }
@@ -3787,6 +4076,16 @@ pub struct RuntimeGenerationRecord {
     pub deactivated_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationTransitionRecord {
+    pub timestamp_ms: i64,
+    pub previous_generation: Option<String>,
+    pub new_generation: Option<String>,
+    pub previous_source_commit: Option<String>,
+    pub new_source_commit: Option<String>,
+    pub trigger: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceRollbackRecord {
     pub rollback_id: String,
@@ -4109,6 +4408,32 @@ impl StateStore {
         rollback_id: Option<&str>,
         now_ms: i64,
     ) -> Result<(), String> {
+        self.activate_runtime_generation_inner(generation_id, rollback_id, now_ms, None)
+    }
+
+    pub fn activate_runtime_generation_with_transition(
+        &mut self,
+        generation_id: &str,
+        rollback_id: Option<&str>,
+        now_ms: i64,
+        transition: &GenerationTransitionRecord,
+    ) -> Result<(), String> {
+        if transition.new_generation.as_deref() != Some(generation_id) {
+            return Err(format!(
+                "generation transition new_generation {:?} does not match activation {generation_id}",
+                transition.new_generation
+            ));
+        }
+        self.activate_runtime_generation_inner(generation_id, rollback_id, now_ms, Some(transition))
+    }
+
+    fn activate_runtime_generation_inner(
+        &mut self,
+        generation_id: &str,
+        rollback_id: Option<&str>,
+        now_ms: i64,
+        transition: Option<&GenerationTransitionRecord>,
+    ) -> Result<(), String> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4166,8 +4491,53 @@ impl StateStore {
                 ));
             }
         }
+        if let Some(transition) = transition {
+            let detail = serde_json::to_string(transition)
+                .map_err(|error| format!("cannot encode generation transition: {error}"))?;
+            if detail.len() > 512 {
+                return Err("generation transition detail exceeds service event bound".to_owned());
+            }
+            tx.execute(
+                "INSERT INTO service_events (action, outcome, generation_id, at, detail)
+                 VALUES ('generation_transition', 'committed', ?1, ?2, ?3)",
+                params![generation_id, transition.timestamp_ms, detail],
+            )
+            .map_err(|error| format!("cannot record generation transition: {error}"))?;
+        }
         tx.commit()
             .map_err(|error| format!("cannot commit generation activation: {error}"))
+    }
+
+    pub fn latest_generation_transition(
+        &self,
+    ) -> Result<Option<GenerationTransitionRecord>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT generation_id, at, detail
+                 FROM service_events
+                 WHERE action = 'generation_transition' AND outcome = 'committed'
+                 ORDER BY event_id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read latest generation transition: {error}"))?;
+        let Some((generation_id, at_ms, detail)) = row else {
+            return Ok(None);
+        };
+        let transition: GenerationTransitionRecord = serde_json::from_str(&detail)
+            .map_err(|error| format!("cannot decode latest generation transition: {error}"))?;
+        if transition.new_generation != generation_id || transition.timestamp_ms != at_ms {
+            return Err("generation transition event metadata is inconsistent".to_owned());
+        }
+        Ok(Some(transition))
     }
 
     pub fn active_runtime_generation(&self) -> Result<Option<RuntimeGenerationRecord>, String> {
@@ -4216,6 +4586,29 @@ impl StateStore {
                 params![action, outcome, generation_id, at_ms, detail],
             )
             .map_err(|error| format!("cannot record service event: {error}"))?;
+        Ok(())
+    }
+
+    pub fn record_generation_transition(
+        &self,
+        transition: &GenerationTransitionRecord,
+    ) -> Result<(), String> {
+        let detail = serde_json::to_string(transition)
+            .map_err(|error| format!("cannot encode generation transition: {error}"))?;
+        if detail.len() > 512 {
+            return Err("generation transition detail exceeds service event bound".to_owned());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO service_events (action, outcome, generation_id, at, detail)
+                 VALUES ('generation_transition', 'committed', ?1, ?2, ?3)",
+                params![
+                    transition.new_generation.as_deref(),
+                    transition.timestamp_ms,
+                    detail
+                ],
+            )
+            .map_err(|error| format!("cannot record generation transition: {error}"))?;
         Ok(())
     }
 
@@ -5090,6 +5483,49 @@ mod tests {
                 )
                 .unwrap(),
             Some(512)
+        );
+    }
+
+    #[test]
+    fn generation_transition_is_committed_with_activation_and_round_trips_all_fields() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .stage_runtime_generation("rust-old", "/runtime/old", "sha-old", "install", 10)
+            .unwrap();
+        store
+            .stage_runtime_generation("rust-new", "/runtime/new", "sha-new", "dev-sync", 20)
+            .unwrap();
+        store.activate_runtime_generation("rust-old", 30).unwrap();
+        let transition = GenerationTransitionRecord {
+            timestamp_ms: 40,
+            previous_generation: Some("rust-old".to_owned()),
+            new_generation: Some("rust-new".to_owned()),
+            previous_source_commit: Some("old-commit".to_owned()),
+            new_source_commit: Some("new-commit".to_owned()),
+            trigger: "dev_sync".to_owned(),
+        };
+        store
+            .activate_runtime_generation_with_transition("rust-new", None, 40, &transition)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_runtime_generation()
+                .unwrap()
+                .unwrap()
+                .generation_id,
+            "rust-new"
+        );
+        assert_eq!(
+            store.latest_generation_transition().unwrap(),
+            Some(transition)
+        );
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM service_events WHERE action = 'generation_transition'"
+                )
+                .unwrap(),
+            Some(1)
         );
     }
 
@@ -6734,6 +7170,106 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn late_dispatch_settlement_is_exact_generation_scoped_and_row_isolated() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, session_ref, _) =
+            browser_dispatch_fixture(&mut store, 7, "late-settlement-native");
+        let request_digest = sha256_text("late-request");
+        let message_digest = sha256_text("late-message");
+        let required_apps: [&str; 0] = [];
+        let reserve = |store: &mut StateStore, key: &str| {
+            let key_digest = sha256_text(key);
+            let BrowserDispatchReservation::Reserved(record) = store
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session_ref,
+                    request_digest: &request_digest,
+                    message_digest: &message_digest,
+                    reasoning_effort: None,
+                    required_apps: &required_apps,
+                    expected_generation: 7,
+                    idempotency_key_digest: &key_digest,
+                    work_chain_id: None,
+                    lane_id: None,
+                    created_at: 10,
+                })
+                .unwrap()
+            else {
+                panic!("expected a new browser dispatch");
+            };
+            store
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &record.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Uncertain,
+                    generation_owner: None,
+                    updated_at: 11,
+                })
+                .unwrap()
+        };
+        let first = reserve(&mut store, "late-key-1");
+        let second = reserve(&mut store, "late-key-2");
+
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 8,
+                capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                observed_at: 20,
+            })
+            .unwrap();
+
+        let settled = store
+            .settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &first.dispatch_id,
+                expected_generation: 7,
+                delivery_state: BrowserDeliveryState::Applied,
+                generation_owner: Some(7),
+                updated_at: 21,
+            })
+            .unwrap();
+        assert_eq!(settled.delivery_state, BrowserDeliveryState::Applied);
+        assert_eq!(settled.generation_owner, Some(7));
+        assert_eq!(
+            store
+                .browser_dispatch(&second.dispatch_id)
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            BrowserDeliveryState::Uncertain,
+            "late evidence may settle only its original dispatch row"
+        );
+        assert_eq!(
+            store
+                .settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &second.dispatch_id,
+                    expected_generation: 8,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(8),
+                    updated_at: 22,
+                })
+                .unwrap_err(),
+            "stale_capability_generation"
+        );
+        assert_eq!(
+            store
+                .settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &first.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::ResourceUnavailable,
+                    generation_owner: None,
+                    updated_at: 23,
+                })
+                .unwrap_err(),
+            "browser_dispatch_already_settled"
+        );
     }
 
     #[test]

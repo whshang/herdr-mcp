@@ -257,10 +257,14 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn git_toplevel_tcc_safe(snapshot: &Value, cwd: &Path) -> Option<PathBuf> {
-    if should_use_stable_broker(snapshot, cwd) {
+    if should_use_broker_for_toplevel(snapshot, cwd) {
         return broker_git_status(snapshot, cwd).map(|status| status.root);
     }
     git_toplevel(cwd)
+}
+
+fn should_use_broker_for_toplevel(snapshot: &Value, cwd: &Path) -> bool {
+    !is_herdr_managed_worktree(cwd) && should_use_stable_broker(snapshot, cwd)
 }
 
 #[derive(Debug, Clone)]
@@ -595,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn herdr_managed_worktree_is_broker_owned_without_disk_lookup() {
+    fn herdr_managed_worktree_root_discovery_does_not_require_broker() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let checkout = home
             .join(".herdr")
@@ -603,5 +607,6 @@ mod tests {
             .join("repo")
             .join("feature-not-present");
         assert!(is_herdr_managed_worktree(&checkout));
+        assert!(!should_use_broker_for_toplevel(&json!({}), &checkout));
     }
 }

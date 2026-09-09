@@ -4,7 +4,8 @@ use crate::exec_sessions::ExecRegistry;
 use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{
-    self, BrowserActuator, BrowserCallerGrant, BrowserPostconditionEvidence, RuntimeContext,
+    self, BrowserActuator, BrowserCallerGrant, BrowserPostconditionEvidence, PageAssistCallerGrant,
+    RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -40,15 +41,17 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
 const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
 const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(2);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
+const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
+const MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
-const PUSH_CACHE_POLL: Duration = Duration::from_millis(250);
 const MAX_MCP_ACTIVITY_RECORDS: usize = 2000;
 const MAX_MCP_ACTIVITY_RESULTS: usize = 50;
 const MAX_MCP_ACTIVITY_LOOKBACK_MS: u64 = 30 * 60_000;
@@ -57,24 +60,72 @@ static NEXT_BROWSER_ACTUATION: AtomicU64 = AtomicU64::new(0);
 
 const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct BrowserActuationBroker {
     inner: Arc<(Mutex<BrowserActuationState>, Condvar)>,
+    timeout: Duration,
+    late_completion_ttl: Duration,
 }
 
 #[derive(Default)]
 struct BrowserActuationState {
     queued: VecDeque<Value>,
-    pending: BTreeSet<String>,
+    pending: HashMap<String, PendingBrowserActuation>,
     completions: HashMap<String, BrowserPostconditionEvidence>,
     last_extension_poll: Option<Instant>,
 }
 
+struct PendingBrowserActuation {
+    dispatch_id: Option<String>,
+    expected_generation: i64,
+    timed_out_at: Option<Instant>,
+}
+
+impl Default for BrowserActuationBroker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
+            timeout: BROWSER_ACTUATION_TIMEOUT,
+            late_completion_ttl: BROWSER_LATE_COMPLETION_TTL,
+        }
+    }
+}
+
 impl BrowserActuationBroker {
+    #[cfg(test)]
+    fn with_durations(timeout: Duration, late_completion_ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
+            timeout,
+            late_completion_ttl,
+        }
+    }
+
+    fn prune_expired(&self, state: &mut BrowserActuationState) {
+        let expired = state
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                pending
+                    .timed_out_at
+                    .is_some_and(|timed_out_at| timed_out_at.elapsed() > self.late_completion_ttl)
+            })
+            .map(|(actuation_id, _)| actuation_id.clone())
+            .collect::<Vec<_>>();
+        for actuation_id in expired {
+            state.pending.remove(&actuation_id);
+            state.completions.remove(&actuation_id);
+            state.queued.retain(|command| {
+                command.get("actuation_id").and_then(Value::as_str) != Some(actuation_id.as_str())
+            });
+        }
+    }
+
     fn take_next_for_extension(&self) -> Option<Value> {
         let Ok(mut state) = self.inner.0.lock() else {
             return None;
         };
+        self.prune_expired(&mut state);
         state.last_extension_poll = Some(Instant::now());
         state.queued.pop_front()
     }
@@ -88,7 +139,8 @@ impl BrowserActuationBroker {
         let mut state = lock
             .lock()
             .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
-        if !state.pending.contains(actuation_id) {
+        self.prune_expired(&mut state);
+        if !state.pending.contains_key(actuation_id) {
             return Err("browser_actuation_not_pending".to_owned());
         }
         state.completions.insert(actuation_id.to_owned(), evidence);
@@ -109,6 +161,7 @@ impl BrowserActuator for BrowserActuationBroker {
         operation: &str,
         params: &Value,
         expected_generation: i64,
+        dispatch_id: Option<&str>,
     ) -> Result<BrowserPostconditionEvidence, String> {
         let actuation_id = format!(
             "ba_{:016x}",
@@ -118,6 +171,7 @@ impl BrowserActuator for BrowserActuationBroker {
         let mut state = lock
             .lock()
             .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+        self.prune_expired(&mut state);
         if !Self::extension_live(&state) {
             return Ok(BrowserPostconditionEvidence {
                 observed_generation: expected_generation,
@@ -135,9 +189,17 @@ impl BrowserActuator for BrowserActuationBroker {
                 generation_owner: None,
                 generation_status_observed: false,
                 generation_stopped: false,
+                result: None,
             });
         }
-        state.pending.insert(actuation_id.clone());
+        state.pending.insert(
+            actuation_id.clone(),
+            PendingBrowserActuation {
+                dispatch_id: dispatch_id.map(str::to_owned),
+                expected_generation,
+                timed_out_at: None,
+            },
+        );
         state.queued.push_back(json!({
             "protocol": "herdr-browser-actuation/v1",
             "actuation_id": actuation_id,
@@ -147,7 +209,7 @@ impl BrowserActuator for BrowserActuationBroker {
         }));
         ready.notify_all();
 
-        let deadline = Instant::now() + BROWSER_ACTUATION_TIMEOUT;
+        let deadline = Instant::now() + self.timeout;
         loop {
             if let Some(evidence) = state.completions.remove(&actuation_id) {
                 state.pending.remove(&actuation_id);
@@ -155,7 +217,13 @@ impl BrowserActuator for BrowserActuationBroker {
             }
             let now = Instant::now();
             if now >= deadline {
-                state.pending.remove(&actuation_id);
+                if dispatch_id.is_some() {
+                    if let Some(pending) = state.pending.get_mut(&actuation_id) {
+                        pending.timed_out_at = Some(now);
+                    }
+                } else {
+                    state.pending.remove(&actuation_id);
+                }
                 state.queued.retain(|command| {
                     command.get("actuation_id").and_then(Value::as_str)
                         != Some(actuation_id.as_str())
@@ -178,6 +246,7 @@ impl BrowserActuator for BrowserActuationBroker {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    result: None,
                 });
             }
             let timeout = deadline.saturating_duration_since(now);
@@ -186,6 +255,31 @@ impl BrowserActuator for BrowserActuationBroker {
                 .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
             state = waited.0;
         }
+    }
+
+    fn reconcile_dispatch(
+        &self,
+        dispatch_id: &str,
+        expected_generation: i64,
+    ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+        let (lock, _) = &*self.inner;
+        let mut state = lock
+            .lock()
+            .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+        self.prune_expired(&mut state);
+        let actuation_id = state.pending.iter().find_map(|(actuation_id, pending)| {
+            (pending.dispatch_id.as_deref() == Some(dispatch_id)
+                && pending.expected_generation == expected_generation)
+                .then(|| actuation_id.clone())
+        });
+        let Some(actuation_id) = actuation_id else {
+            return Ok(None);
+        };
+        let Some(evidence) = state.completions.remove(&actuation_id) else {
+            return Ok(None);
+        };
+        state.pending.remove(&actuation_id);
+        Ok(Some(evidence))
     }
 }
 
@@ -593,6 +687,7 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
             "generation_owner",
             "generation_status_observed",
             "generation_stopped",
+            "result",
         ],
     ) {
         return browser_registry_http_store_error(&code);
@@ -641,6 +736,11 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
                 _ => return Err("browser_generation_owner_invalid".to_owned()),
             },
         };
+        let actuation_result = match payload.get("result") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(_)) => payload.get("result").cloned(),
+            Some(_) => return Err("browser_actuation_result_invalid".to_owned()),
+        };
         state.browser_actuation.complete(
             actuation_id,
             BrowserPostconditionEvidence {
@@ -671,6 +771,7 @@ async fn post_extension_browser_actuation(State(state): State<AppState>, body: B
                     "generation_status_observed",
                 )?,
                 generation_stopped: browser_registry_bool(&payload, "generation_stopped")?,
+                result: actuation_result,
             },
         )
     })();
@@ -1257,6 +1358,7 @@ struct PushFilters {
 
 struct PushStreamState {
     cache: Arc<EventCache>,
+    cursor_rx: tokio::sync::watch::Receiver<u64>,
     cursor: u64,
     filters: PushFilters,
     statuses: HashMap<String, String>,
@@ -1465,6 +1567,10 @@ fn push_events_response(
     browser_actuation: BrowserActuationBroker,
     trusted_extension_ipc: bool,
 ) -> Response {
+    // Subscribe before reading the initial digest so an event racing this setup
+    // cannot be missed. At worst an already-included event causes one harmless
+    // immediate no-op wake on the first loop iteration.
+    let cursor_rx = cache.subscribe_cursor();
     let digest = cache.digest_since(u64::MAX);
     let agents = push_agent_views(&digest.agents);
     let statuses = agents
@@ -1478,6 +1584,7 @@ fn push_events_response(
         .collect();
     let state = PushStreamState {
         cache,
+        cursor_rx,
         cursor: digest.cursor,
         filters,
         statuses,
@@ -1515,7 +1622,15 @@ fn push_events_response(
         }
 
         loop {
-            tokio::time::sleep(PUSH_CACHE_POLL).await;
+            let heartbeat_wait = SSE_HEARTBEAT.saturating_sub(state.last_heartbeat.elapsed());
+            tokio::select! {
+                changed = state.cursor_rx.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                _ = tokio::time::sleep(heartbeat_wait) => {}
+            }
             let digest = state.cache.digest_since(state.cursor);
             state.cursor = digest.cursor;
             let current_agents = push_agent_views(&digest.agents);
@@ -2069,6 +2184,19 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     };
+    let caller_page_assist_grants = match trusted_edge_page_assist_grants(&state, &headers) {
+        Ok(grants) => grants,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid trusted caller grant context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -2122,6 +2250,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // The workstation bearer authenticates only TCP transport. Browser business
             // authority is admitted exclusively from the trusted Unix IPC handoff above.
             caller_webchat_control_grants: &caller_webchat_control_grants,
+            caller_page_assist_grants: &caller_page_assist_grants,
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
         };
@@ -2305,8 +2434,50 @@ fn trusted_edge_webchat_control_grants(
     Ok(grants)
 }
 
+fn trusted_edge_page_assist_grants(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Vec<PageAssistCallerGrant>, ()> {
+    if !state.trusted_extension_ipc {
+        return Ok(Vec::new());
+    }
+    let Some(raw) = headers.get(EDGE_PAGE_ASSIST_GRANTS_HEADER) else {
+        return Ok(Vec::new());
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES {
+        return Err(());
+    }
+    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
+    let items = value.as_array().ok_or(())?;
+    if items.len() > 32 {
+        return Err(());
+    }
+    let mut grants = Vec::with_capacity(items.len());
+    for item in items {
+        let object = item.as_object().ok_or(())?;
+        if object.len() != 1 || !object.contains_key("endpoint_ref") {
+            return Err(());
+        }
+        let endpoint_ref = object
+            .get("endpoint_ref")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        if !valid_browser_grant_ref(endpoint_ref, 96) {
+            return Err(());
+        }
+        grants.push(PageAssistCallerGrant {
+            endpoint_ref: endpoint_ref.to_owned(),
+        });
+    }
+    Ok(grants)
+}
+
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
-    if !state.trusted_extension_ipc || !headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER) {
+    if !state.trusted_extension_ipc
+        || (!headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER)
+            && !headers.contains_key(EDGE_PAGE_ASSIST_GRANTS_HEADER))
+    {
         return Ok(());
     }
     let expected = headers
@@ -3077,6 +3248,7 @@ mod tests {
                 "herdr_mcp.browser_dispatch.submit",
                 &json!({"session_ref":"br_test","message":"hello"}),
                 7,
+                None,
             )
         });
         let command = loop {
@@ -3095,6 +3267,133 @@ mod tests {
         assert_eq!(observed.generation_owner, Some(7));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn browser_actuation_timeout_retains_only_exact_dispatch_late_completion() {
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(20),
+            Duration::from_millis(250),
+        );
+        assert!(broker.take_next_for_extension().is_none());
+        let dispatch_id = format!("bd_{}", "a".repeat(64));
+        let expected_dispatch_id = dispatch_id.clone();
+        let broker_for_task = broker.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            broker_for_task.actuate(
+                "herdr_mcp.browser_dispatch.submit",
+                &json!({"session_ref":"br_test","message":"hello"}),
+                7,
+                Some(&expected_dispatch_id),
+            )
+        });
+        let command = loop {
+            if let Some(command) = broker.take_next_for_extension() {
+                break command;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        let actuation_id = command["actuation_id"].as_str().unwrap().to_owned();
+        let timed_out = task.await.unwrap().unwrap();
+        assert!(timed_out.command_accepted);
+        assert!(!timed_out.accepted_message_observed);
+
+        let late = BrowserPostconditionEvidence {
+            observed_generation: 7,
+            command_accepted: true,
+            browser_online: true,
+            resource_available: true,
+            rejected: false,
+            stable_resource_ref_observed: true,
+            lifecycle_observed: true,
+            canonical_url_observed: true,
+            accepted_message_observed: true,
+            message_baseline_advanced: false,
+            reasoning_effort_readback: None,
+            required_apps_readback: Vec::new(),
+            generation_owner: Some(7),
+            generation_status_observed: true,
+            generation_stopped: false,
+            result: None,
+        };
+        broker.complete(&actuation_id, late.clone()).unwrap();
+        assert!(
+            broker
+                .reconcile_dispatch(&dispatch_id, 8)
+                .unwrap()
+                .is_none(),
+            "a newer generation must not consume old-generation evidence"
+        );
+        assert_eq!(
+            broker.reconcile_dispatch(&dispatch_id, 7).unwrap(),
+            Some(late)
+        );
+        assert!(
+            broker
+                .reconcile_dispatch(&dispatch_id, 7)
+                .unwrap()
+                .is_none(),
+            "late completion is one-use settlement evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_actuation_late_completion_expires_boundedly() {
+        let broker = BrowserActuationBroker::with_durations(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        assert!(broker.take_next_for_extension().is_none());
+        let dispatch_id = format!("bd_{}", "b".repeat(64));
+        let expected_dispatch_id = dispatch_id.clone();
+        let broker_for_task = broker.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            broker_for_task.actuate(
+                "herdr_mcp.browser_dispatch.submit",
+                &json!({"session_ref":"br_test","message":"hello"}),
+                7,
+                Some(&expected_dispatch_id),
+            )
+        });
+        let command = loop {
+            if let Some(command) = broker.take_next_for_extension() {
+                break command;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        let actuation_id = command["actuation_id"].as_str().unwrap().to_owned();
+        let _ = task.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            broker.complete(
+                &actuation_id,
+                BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: false,
+                    browser_online: true,
+                    resource_available: false,
+                    rejected: false,
+                    stable_resource_ref_observed: false,
+                    lifecycle_observed: false,
+                    canonical_url_observed: false,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: None,
+                }
+            ),
+            Err("browser_actuation_not_pending".to_owned())
+        );
+        assert!(
+            broker
+                .reconcile_dispatch(&dispatch_id, 7)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3144,6 +3443,47 @@ mod tests {
             trusted_edge_runtime_generation_fence(&trusted_state, &headers),
             Err(()),
             "grant-bearing trusted IPC without a reserved generation fails closed"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn page_assist_grant_header_is_trusted_ipc_only_and_shape_validated() {
+        let root = test_root("page-assist-caller-grant-boundary");
+        let tcp_state = test_state(&root.join("tcp"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            EDGE_PAGE_ASSIST_GRANTS_HEADER,
+            HeaderValue::from_static(
+                r#"[{"endpoint_ref":"be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+            ),
+        );
+        assert_eq!(
+            trusted_edge_page_assist_grants(&tcp_state, &headers),
+            Ok(Vec::new()),
+            "ordinary bearer-authenticated TCP cannot opt into Page Assist caller authority"
+        );
+
+        let mut trusted_state = test_state(&root.join("trusted"));
+        trusted_state.trusted_extension_ipc = true;
+        assert_eq!(
+            trusted_edge_page_assist_grants(&trusted_state, &headers),
+            Ok(vec![PageAssistCallerGrant {
+                endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+            }])
+        );
+
+        headers.insert(
+            EDGE_PAGE_ASSIST_GRANTS_HEADER,
+            HeaderValue::from_static(
+                r#"[{"endpoint_ref":"be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","origin":"https://example.com"}]"#,
+            ),
+        );
+        assert_eq!(
+            trusted_edge_page_assist_grants(&trusted_state, &headers),
+            Err(()),
+            "reserved caller authority accepts only the exact endpoint_ref tuple"
         );
         std::fs::remove_dir_all(root).ok();
     }
@@ -3381,8 +3721,10 @@ mod tests {
     #[test]
     fn push_transition_emits_only_new_work_and_working_to_settled() {
         let cache = Arc::new(EventCache::from_snapshot_for_test(json!({})));
+        let cursor_rx = cache.subscribe_cursor();
         let mut state = PushStreamState {
             cache,
+            cursor_rx,
             cursor: 0,
             filters: PushFilters::default(),
             statuses: HashMap::new(),
@@ -3892,7 +4234,12 @@ mod tests {
         });
         let response = app
             .clone()
-            .oneshot(rpc_request(Method::POST, "/mcp", Some(initialize), &[]))
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(initialize.clone()),
+                &[],
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -3905,6 +4252,33 @@ mod tests {
         assert!(!session.is_empty());
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(list.clone()),
+                &[("mcp-session-id", session.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Repeating initialize on a live stateful transport session must not
+        // allocate a replacement session or poison the existing one.
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(initialize.clone()),
+                &[("mcp-session-id", session.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_none());
+
         let response = app
             .clone()
             .oneshot(rpc_request(
@@ -3934,6 +4308,38 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"]["code"], -32001);
+
+        // A stale/failed session can recover by starting a fresh initialize
+        // lifecycle without restarting the healthy runtime.
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(initialize.clone()),
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let retry_session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert_ne!(retry_session, session);
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::DELETE,
+                "/mcp",
+                None,
+                &[("mcp-session-id", retry_session.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         let response = app
             .clone()
@@ -3979,6 +4385,24 @@ mod tests {
                 "clientInfo": {"name": "ChatGPT", "version": "1"}
             }
         });
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(openai_initialize.clone()),
+                &[
+                    ("mcp-session-id", "poison"),
+                    ("user-agent", "openai-mcp/1.0.0"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_none());
+
+        // ChatGPT/OpenAI is explicitly stateless across repeated initialize
+        // events, even if the client sends a stale transport-session header.
         let response = app
             .clone()
             .oneshot(rpc_request(

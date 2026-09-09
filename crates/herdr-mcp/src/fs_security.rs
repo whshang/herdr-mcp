@@ -36,8 +36,72 @@ pub fn managed_roots_from(topology: &ProjectTopology) -> Vec<PathBuf> {
 }
 
 pub fn validate_existing(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
+    if let Ok(resolved) = resolve_input(input)
+        && let Some(root) = target_scoped_herdr_worktree_root(snapshot, &resolved)
+    {
+        return validate_existing_with_roots(&[root], input);
+    }
     let roots = managed_roots(snapshot);
     validate_existing_with_roots(&roots, input)
+}
+
+fn target_scoped_herdr_worktree_root(snapshot: &Value, resolved: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    target_scoped_worktree_root_under(snapshot, resolved, &home.join(".herdr/worktrees"))
+}
+
+fn target_scoped_worktree_root_under(
+    snapshot: &Value,
+    resolved: &Path,
+    worktrees_root: &Path,
+) -> Option<PathBuf> {
+    if !resolved.is_absolute() || !resolved.starts_with(worktrees_root) {
+        return None;
+    }
+
+    let mut current = resolved.to_path_buf();
+    let root = loop {
+        if current == worktrees_root {
+            return None;
+        }
+        if current.join(".git").exists() {
+            break current;
+        }
+        if !current.pop() || !current.starts_with(worktrees_root) {
+            return None;
+        }
+    };
+
+    let live_cwd_declares_root = ["panes", "agents"].into_iter().any(|key| {
+        snapshot
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                item.get("cwd")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("foreground_cwd").and_then(Value::as_str))
+            })
+            .map(Path::new)
+            .any(|cwd| cwd.starts_with(&root))
+    });
+    let live_workspace_declares_root = snapshot
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|workspace| workspace.get("worktree").and_then(Value::as_object))
+        .filter_map(|worktree| {
+            worktree
+                .get("checkout_path")
+                .and_then(Value::as_str)
+                .or_else(|| worktree.get("path").and_then(Value::as_str))
+        })
+        .map(Path::new)
+        .any(|checkout| checkout == root);
+
+    (live_cwd_declares_root || live_workspace_declares_root).then_some(root)
 }
 
 /// Validate an existing path using a routing topology already derived for
@@ -99,7 +163,7 @@ fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<Manage
             "reason": "outside_managed_roots",
             "path": resolved.to_string_lossy(),
             "managed_roots": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
-            "hint": "only paths inside git-backed project roots visible in the live snapshot are accessible",
+            "hint": outside_managed_roots_hint(),
         }));
     };
     if denied_secret_path(&resolved) {
@@ -159,7 +223,7 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
             "reason": "outside_managed_roots",
             "path": resolved.to_string_lossy(),
             "managed_roots": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
-            "hint": "only paths inside git-backed project roots visible in the live snapshot are accessible",
+            "hint": outside_managed_roots_hint(),
         }));
     };
     if denied_secret_path(&resolved) {
@@ -218,6 +282,17 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
         resolved,
         real,
     })
+}
+
+/// Shared actionable hint for `outside_managed_roots` failures.
+///
+/// A path is rejected because it is not inside a git-backed project root
+/// visible in the live Herdr snapshot. When the snapshot exposes no managed
+/// roots, the hint must tell the user to open/create a Herdr workspace or pane
+/// whose cwd is inside the intended Git repository, keep it available, then
+/// retry. A coding agent is not required for this step.
+pub fn outside_managed_roots_hint() -> &'static str {
+    "only paths inside git-backed project roots visible in the live snapshot are accessible; open or create a Herdr workspace/pane whose cwd is inside the intended Git repository and keep it available, then retry (no coding agent required)"
 }
 
 pub fn denied_secret_path(path: &Path) -> bool {
@@ -404,6 +479,59 @@ mod tests {
     }
 
     #[test]
+    fn target_scoped_worktree_root_requires_live_snapshot_ownership() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let worktrees_root = std::env::temp_dir().join(format!(
+            "herdr-mcp-worktree-scope-{}-{timestamp}",
+            std::process::id()
+        ));
+        let root = worktrees_root.join("rc");
+        let file = root.join("src/lib.rs");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            root.join(".git"),
+            "gitdir: /protected/repo/.git/worktrees/rc\n",
+        )
+        .unwrap();
+        fs::write(&file, "hello\n").unwrap();
+
+        let live = json!({
+            "panes": [
+                {"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root},
+                {"pane_id": "w2:p1", "workspace_id": "w2", "cwd": "/Users/example/Documents/unrelated"}
+            ],
+            "agents": []
+        });
+        assert_eq!(
+            target_scoped_worktree_root_under(&live, &file, &worktrees_root),
+            Some(root.clone())
+        );
+
+        let declared = json!({
+            "workspaces": [{"workspace_id": "w1", "worktree": {"checkout_path": root}}],
+            "panes": [{"pane_id": "w2:p1", "workspace_id": "w2", "cwd": "/tmp/unrelated"}],
+            "agents": []
+        });
+        assert_eq!(
+            target_scoped_worktree_root_under(&declared, &file, &worktrees_root),
+            Some(root.clone())
+        );
+
+        let unrelated = json!({
+            "panes": [{"pane_id": "w2:p1", "workspace_id": "w2", "cwd": "/tmp/unrelated"}],
+            "agents": []
+        });
+        assert_eq!(
+            target_scoped_worktree_root_under(&unrelated, &file, &worktrees_root),
+            None
+        );
+        fs::remove_dir_all(worktrees_root).unwrap();
+    }
+
+    #[test]
     fn accepts_new_target_only_when_parent_is_managed_and_real() {
         let root = repo();
         let src = root.join("src");
@@ -471,5 +599,38 @@ mod tests {
             assert!(denied_secret_path(Path::new(path)), "{path}");
         }
         assert!(!denied_secret_path(Path::new("/repo/src/config.ts")));
+    }
+
+    #[test]
+    fn empty_managed_roots_hint_is_actionable_without_a_coding_agent() {
+        // v0.4.6 #2: when the live snapshot exposes no managed git roots, the
+        // hint must explicitly direct the user to open/create a Herdr workspace
+        // or pane inside the intended Git repository, keep it available, then
+        // retry — and must not imply a coding agent is required.
+        let hint = outside_managed_roots_hint().to_ascii_lowercase();
+        assert!(hint.contains("herdr workspace"), "{hint}");
+        assert!(hint.contains("pane"), "{hint}");
+        assert!(hint.contains("cwd"));
+        assert!(hint.contains("git repository"));
+        assert!(hint.contains("keep it available"));
+        assert!(hint.contains("retry"));
+        assert!(hint.contains("coding agent"));
+        assert!(hint.contains("no coding agent required"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_existing_file_carries_the_actionable_hint() {
+        let root = repo();
+        let outside =
+            std::env::temp_dir().join(format!("herdr-mcp-hint-{}.txt", std::process::id()));
+        fs::write(&outside, "outside").unwrap();
+        let result = validate_existing(&snapshot(&root), outside.to_str().unwrap()).unwrap_err();
+        assert_eq!(result["reason"], "outside_managed_roots");
+        let hint = result["hint"].as_str().unwrap();
+        assert!(hint.contains("Herdr workspace/pane"));
+        assert!(hint.contains("keep it available"));
+        let _ = fs::remove_file(outside);
+        fs::remove_dir_all(root).unwrap();
     }
 }

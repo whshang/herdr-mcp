@@ -26,15 +26,26 @@ export const DEFAULT_MAX_COMPLETED_RECORDS = 512;
 /** How long a completion remains replayable after settle. */
 export const DEFAULT_COMPLETED_RECORD_TTL_MS = 600_000; // 10 min
 
-/** Request timeout budget (clamped, mirrors local ≤60 s RPC convention). */
+/**
+ * Edge/Link transport timeout budget. Public tool execution remains capped at
+ * 60s, but the transport needs a small settlement margin so a 60s local tool
+ * timeout can still return its final result instead of racing the Edge timer.
+ */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const MIN_REQUEST_TIMEOUT_MS = 1_000;
-export const MAX_REQUEST_TIMEOUT_MS = 60_000;
+export const MAX_REQUEST_TIMEOUT_MS = 65_000;
+export const REQUEST_SETTLEMENT_GRACE_MS = 5_000;
+/** Legacy/current Link wire contract remains capped at the public 60s tool budget. */
+export const MAX_LINK_REQUEST_TIMEOUT_MS = 60_000;
 
 /** Link presence: after this long with no hello/heartbeat the link is stale. */
 export const DEFAULT_LINK_STALE_AFTER_MS = 45_000;
-/** Brief request-side grace for a workstation that was connected moments ago. */
-export const DEFAULT_LINK_RECONNECT_GRACE_MS = 2_000;
+/**
+ * Request-side grace for a workstation that was connected moments ago.
+ * Rust Link allows a 10 s WebSocket handshake plus bounded reconnect jitter;
+ * keep this below the 30 s request budget while covering one full handshake.
+ */
+export const DEFAULT_LINK_RECONNECT_GRACE_MS = 15_000;
 
 /**
  * Persist `last_seen` only as a low-frequency recovery checkpoint. Live

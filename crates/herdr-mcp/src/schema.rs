@@ -1,5 +1,7 @@
 use serde_json::{Map, Value};
+use std::env;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -114,16 +116,21 @@ fn validate_with_registry(
 
     if schema.empty {
         if !given.is_empty() {
-            warnings.push(ValidationIssue {
+            let issue = ValidationIssue {
                 name: "params".to_owned(),
                 message: format!(
                     "method takes no params; got: {}",
                     given.keys().cloned().collect::<Vec<_>>().join(", ")
                 ),
-            });
+            };
+            if method_is_read_only(method) {
+                warnings.push(issue);
+            } else {
+                errors.push(issue);
+            }
         }
         return ValidationResult {
-            ok: true,
+            ok: errors.is_empty(),
             errors,
             warnings,
         };
@@ -140,12 +147,15 @@ fn validate_with_registry(
 
     for (name, value) in given {
         let Some(property) = schema.properties.get(name) else {
-            warnings.push(ValidationIssue {
+            let issue = ValidationIssue {
                 name: name.clone(),
-                message: format!(
-                    "unknown param \"{name}\" (not in schema - daemon may still accept it)"
-                ),
-            });
+                message: format!("unknown param \"{name}\" (not in schema)"),
+            };
+            if method_is_read_only(method) {
+                warnings.push(issue);
+            } else {
+                errors.push(issue);
+            }
             continue;
         };
         let Some(primitive) = primitive_type(property, &registry.defs) else {
@@ -186,6 +196,44 @@ fn validate_with_registry(
         errors,
         warnings,
     }
+}
+
+// Unknown parameters can redirect a side effect when an optional target is
+// misspelled. Methods represented by the live schema therefore fail closed by
+// default; only explicit observation methods keep warning-only compatibility.
+fn method_is_read_only(method: &str) -> bool {
+    matches!(
+        method,
+        "ping"
+            | "server.agent_manifests"
+            | "session.snapshot"
+            | "workspace.list"
+            | "workspace.get"
+            | "worktree.list"
+            | "tab.list"
+            | "tab.get"
+            | "agent.list"
+            | "agent.get"
+            | "agent.read"
+            | "agent.explain"
+            | "agent.wait"
+            | "pane.layout"
+            | "pane.process_info"
+            | "layout.export"
+            | "pane.neighbor"
+            | "pane.edges"
+            | "pane.list"
+            | "pane.current"
+            | "pane.get"
+            | "pane.read"
+            | "pane.graphics.info"
+            | "events.subscribe"
+            | "events.wait"
+            | "pane.wait_for_output"
+            | "plugin.list"
+            | "plugin.action.list"
+            | "plugin.log.list"
+    )
 }
 
 #[derive(Debug)]
@@ -321,12 +369,18 @@ fn load_live_registry() -> Result<SchemaRegistry, String> {
 }
 
 fn run_schema_command() -> Result<Vec<u8>, String> {
-    let mut child = Command::new("herdr")
+    let herdr = discover_herdr_binary();
+    let mut child = Command::new(&herdr)
         .args(["api", "schema", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("cannot start `herdr api schema --json`: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "cannot start `{} api schema --json`: {error}",
+                herdr.display()
+            )
+        })?;
 
     let stdout = child
         .stdout
@@ -376,6 +430,32 @@ fn run_schema_command() -> Result<Vec<u8>, String> {
         return Err(format!("herdr schema exceeded {MAX_SCHEMA_BYTES} bytes"));
     }
     Ok(stdout)
+}
+
+fn discover_herdr_binary() -> PathBuf {
+    let explicit = env::var_os("HERDR_BIN").map(PathBuf::from);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    discover_herdr_binary_from(explicit, home, |path| path.is_file())
+}
+
+fn discover_herdr_binary_from(
+    explicit: Option<PathBuf>,
+    home: Option<PathBuf>,
+    is_file: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    let candidates = [
+        home.map(|home| home.join(".local/bin/herdr")),
+        Some(PathBuf::from("/opt/homebrew/bin/herdr")),
+        Some(PathBuf::from("/usr/local/bin/herdr")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|path| is_file(path))
+        .unwrap_or_else(|| PathBuf::from("herdr"))
 }
 
 fn read_stream(mut stream: impl Read) -> Result<Vec<u8>, String> {
@@ -487,6 +567,12 @@ mod tests {
                                 "method": {"const": "agent.start"},
                                 "params": {"$ref": "#/schemas/request/$defs/AgentStartParams"}
                             }
+                        },
+                        {
+                            "properties": {
+                                "method": {"const": "workspace.get"},
+                                "params": {"$ref": "#/schemas/request/$defs/WorkspaceGetParams"}
+                            }
                         }
                     ],
                     "$defs": {
@@ -497,6 +583,13 @@ mod tests {
                                 "workspace_id": {"type": "string"},
                                 "count": {"type": "integer"},
                                 "kind": {"enum": ["pi", "grok"]}
+                            },
+                            "required": ["workspace_id"]
+                        },
+                        "WorkspaceGetParams": {
+                            "type": "object",
+                            "properties": {
+                                "workspace_id": {"type": "string"}
                             },
                             "required": ["workspace_id"]
                         }
@@ -510,7 +603,7 @@ mod tests {
     #[test]
     fn parses_method_param_schema() {
         let registry = registry();
-        assert_eq!(registry.methods.len(), 2);
+        assert_eq!(registry.methods.len(), 3);
         assert!(registry.methods[0].empty);
         assert_eq!(registry.methods[1].required, vec!["workspace_id"]);
         assert!(registry.methods[1].properties.contains_key("kind"));
@@ -524,8 +617,22 @@ mod tests {
             "agent.start",
             &json!({"workspace_id": "w1", "count": 2, "kind": "pi", "future": true}),
         );
-        assert!(valid.ok);
-        assert_eq!(valid.warnings.len(), 1);
+        assert!(!valid.ok);
+        assert_eq!(valid.errors.len(), 1);
+        assert!(valid.warnings.is_empty());
+
+        let readonly = validate_with_registry(
+            &registry,
+            "workspace.get",
+            &json!({"workspace_id": "w1", "future": true}),
+        );
+        assert!(readonly.ok);
+        assert!(readonly.errors.is_empty());
+        assert_eq!(readonly.warnings.len(), 1);
+
+        let read_only_empty = validate_with_registry(&registry, "ping", &json!({"future": true}));
+        assert!(read_only_empty.ok);
+        assert_eq!(read_only_empty.warnings.len(), 1);
 
         let invalid = validate_with_registry(
             &registry,
@@ -541,5 +648,31 @@ mod tests {
         let result = validate_with_registry(&registry(), "future.method", &json!({}));
         assert!(result.ok);
         assert_eq!(result.warnings.len(), 1);
+    }
+
+    #[test]
+    fn schema_binary_discovery_prefers_explicit_override() {
+        let explicit = PathBuf::from("/custom/herdr");
+        let resolved = discover_herdr_binary_from(
+            Some(explicit.clone()),
+            Some(PathBuf::from("/home/test")),
+            |_| false,
+        );
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn schema_binary_discovery_finds_user_local_install_without_path() {
+        let home = PathBuf::from("/home/test");
+        let expected = home.join(".local/bin/herdr");
+        let resolved = discover_herdr_binary_from(None, Some(home), |path| path == expected);
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn schema_binary_discovery_falls_back_to_path_lookup() {
+        let resolved =
+            discover_herdr_binary_from(None, Some(PathBuf::from("/home/test")), |_| false);
+        assert_eq!(resolved, PathBuf::from("herdr"));
     }
 }

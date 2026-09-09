@@ -1,5 +1,5 @@
 use crate::paths::RuntimePaths;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use rusqlite::params;
 use rusqlite::{Connection, OptionalExtension};
 use std::fs::{self, OpenOptions};
@@ -75,7 +75,7 @@ impl UpdateStore {
         read_schema_version(&self.conn)
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub fn create_update_job(&self, record: &UpdateJobRecord) -> Result<(), String> {
         self.conn
             .execute(
@@ -101,7 +101,7 @@ impl UpdateStore {
         Ok(())
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub fn update_update_job(
         &self,
         job_id: &str,
@@ -133,7 +133,7 @@ impl UpdateStore {
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub fn set_update_worker_pid(
         &self,
         job_id: &str,
@@ -156,7 +156,7 @@ impl UpdateStore {
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub fn update_job(&self, job_id: &str) -> Result<Option<UpdateJobRecord>, String> {
         self.conn
             .query_row(
@@ -183,7 +183,7 @@ impl UpdateStore {
             .map_err(|error| format!("cannot read latest update job: {error}"))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn active_update_job(&self) -> Result<Option<UpdateJobRecord>, String> {
         self.conn
             .query_row(
@@ -314,7 +314,7 @@ fn decode_update_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpdateJobRecor
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn bounded_detail(value: Option<&str>) -> Option<String> {
     value.map(|value| {
         let mut text = value.to_owned();

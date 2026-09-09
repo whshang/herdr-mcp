@@ -6,7 +6,7 @@
 //! worker. The worker reuses `service install`, which already owns generation
 //! staging, health verification, automatic rollback, and service evidence.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::cli::ServiceCommand;
 use crate::cli::UpdateCommand;
 use crate::config::{Config, UpdateChannel};
@@ -20,24 +20,24 @@ use semver::Version;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::env;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::fs::{self, OpenOptions};
 use std::io::Read;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::Write;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::time::Duration;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::unix::process::CommandExt;
 
 const DEFAULT_RELEASES_API_URL: &str =
@@ -46,13 +46,15 @@ const RELEASES_MAX_BYTES: usize = 1024 * 1024;
 const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 const ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45);
+const METADATA_FETCH_ATTEMPTS: usize = 2;
+const METADATA_RETRY_DELAY: Duration = Duration::from_millis(750);
 const MAX_REDIRECTS: usize = 5;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const DOWNLOAD_PROGRESS_STEP_PERCENT: u64 = 5;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const UPDATE_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const UPDATE_WATCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +80,7 @@ enum AutoUpdatePolicy {
     Skip(&'static str),
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct UpdateProgress<W: Write> {
     writer: W,
     enabled: bool,
@@ -86,7 +88,7 @@ struct UpdateProgress<W: Write> {
     last_job_snapshot: Option<(String, Option<String>)>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl<W: Write> UpdateProgress<W> {
     fn new(writer: W, enabled: bool) -> Self {
         Self {
@@ -182,7 +184,8 @@ pub fn run(command: UpdateCommand) -> Result<ExitCode, String> {
 
 fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
     let channel = load_update_channel()?;
-    let plan = fetch_release_plan(manifest_override, channel)?;
+    let plan = fetch_release_plan(manifest_override, channel)
+        .map_err(|error| update_check_indeterminate_error(&error))?;
     let current = current_version()?;
     let available = plan.version > current;
     print_json(&json!({
@@ -207,6 +210,12 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         },
     }))?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn update_check_indeterminate_error(error: &str) -> String {
+    format!(
+        "could not determine whether an update is available ({error}); run `herdr-mcp update apply` to retry"
+    )
 }
 
 fn apply(manifest_override: Option<&str>) -> Result<ExitCode, String> {
@@ -257,7 +266,7 @@ fn apply_inner(
     channel_override: Option<UpdateChannel>,
     progress_enabled: bool,
 ) -> Result<ExitCode, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (
             manifest_override,
@@ -265,10 +274,13 @@ fn apply_inner(
             channel_override,
             progress_enabled,
         );
-        Err("native update apply currently requires macOS service manager".to_owned())
+        Err(
+            "native update apply is currently supported on macOS and Linux service managers"
+                .to_owned(),
+        )
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         crate::update_scheduler::ensure_updates_allowed()?;
         let channel = match channel_override {
@@ -413,13 +425,16 @@ fn status() -> Result<ExitCode, String> {
 }
 
 fn worker(job_id: &str) -> Result<ExitCode, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = job_id;
-        Err("native update worker currently requires macOS service manager".to_owned())
+        Err(
+            "native update worker is currently supported on macOS and Linux service managers"
+                .to_owned(),
+        )
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         if !valid_job_id(job_id) {
             return Err("invalid update job id".to_owned());
@@ -455,7 +470,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
         store.update_update_job(
             job_id,
             "installing",
-            Some("candidate verified; service install and launchd health gate started"),
+            Some("candidate verified; service install and health gate started"),
             None,
             now_ms_i64(),
         )?;
@@ -713,7 +728,7 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn recover_or_reject_active_update(
     store: &UpdateStore,
     paths: &RuntimePaths,
@@ -745,7 +760,7 @@ fn recover_or_reject_active_update(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn stage_release<W: Write>(
     paths: &RuntimePaths,
     plan: &ReleasePlan,
@@ -792,7 +807,7 @@ fn stage_release<W: Write>(
     Ok((job_id, binary))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn download_asset<W: Write>(
     client: &Client,
     asset: &ReleaseAsset,
@@ -866,7 +881,7 @@ fn download_asset<W: Write>(
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn watch_update_job<W: Write>(
     store: &UpdateStore,
     job_id: &str,
@@ -923,7 +938,7 @@ fn watch_update_job<W: Write>(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn verify_staged_file(path: &Path, expected_sha256: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect staged update binary: {error}"))?;
@@ -955,7 +970,7 @@ fn verify_staged_file(path: &Path, expected_sha256: &str) -> Result<(), String> 
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn probe_candidate_binary(path: &Path, expected: &Version) -> Result<(), String> {
     let output = Command::new(path)
         .arg("version")
@@ -976,7 +991,7 @@ fn probe_candidate_binary(path: &Path, expected: &Version) -> Result<(), String>
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_worker(
     paths: &RuntimePaths,
     binary: &Path,
@@ -1012,27 +1027,58 @@ fn spawn_worker(
 }
 
 fn fetch_bounded(client: &Client, url: Url, max: usize, label: &str) -> Result<Vec<u8>, String> {
-    let mut response = client
-        .get(url)
-        .send()
-        .map_err(|error| format!("{label} download failed: {}", error_kind(&error)))?;
-    validate_response(&response)?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > max as u64)
-    {
-        return Err(format!("{label} is too large"));
+    fetch_bounded_with_retry(
+        client,
+        url,
+        max,
+        label,
+        METADATA_FETCH_ATTEMPTS,
+        METADATA_RETRY_DELAY,
+    )
+}
+
+fn fetch_bounded_with_retry(
+    client: &Client,
+    url: Url,
+    max: usize,
+    label: &str,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<Vec<u8>, String> {
+    let attempts = attempts.max(1);
+    for attempt_index in 0..attempts {
+        let mut response = match client.get(url.clone()).send() {
+            Ok(response) => response,
+            Err(error) => {
+                let retryable = error.is_timeout() || error.is_connect();
+                if retryable && attempt_index + 1 < attempts {
+                    if !retry_delay.is_zero() {
+                        std::thread::sleep(retry_delay);
+                    }
+                    continue;
+                }
+                return Err(format!("{label} download failed: {}", error_kind(&error)));
+            }
+        };
+        validate_response(&response)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > max as u64)
+        {
+            return Err(format!("{label} is too large"));
+        }
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take(max as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cannot read {label}: {error}"))?;
+        if bytes.len() > max {
+            return Err(format!("{label} is too large"));
+        }
+        return Ok(bytes);
     }
-    let mut bytes = Vec::new();
-    response
-        .by_ref()
-        .take(max as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read {label}: {error}"))?;
-    if bytes.len() > max {
-        return Err(format!("{label} is too large"));
-    }
-    Ok(bytes)
+    unreachable!("metadata fetch attempts are clamped to at least one")
 }
 
 fn verify_artifact_attestation(
@@ -1150,11 +1196,15 @@ fn loopback_host(host: Option<&str>) -> bool {
 }
 
 fn current_target() -> Result<&'static str, String> {
-    match (env::consts::OS, env::consts::ARCH) {
+    target_for_platform(env::consts::OS, env::consts::ARCH)
+}
+
+fn target_for_platform(os: &str, arch: &str) -> Result<&'static str, String> {
+    match (os, arch) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
         ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         (os, arch) => Err(format!("unsupported update target {os}/{arch}")),
     }
@@ -1181,7 +1231,7 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn valid_job_id(value: &str) -> bool {
     (8..=96).contains(&value.len())
         && value
@@ -1189,14 +1239,14 @@ fn valid_job_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn binary_is_confined(paths: &RuntimePaths, binary: &Path, job_id: &str) -> bool {
     binary
         .parent()
         .is_some_and(|parent| parent == paths.config_dir.join("update").join("jobs").join(job_id))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn ensure_real_dir(path: &Path) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -1212,7 +1262,7 @@ fn ensure_real_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn cleanup_staging(binary: &Path) {
     let parent = binary.parent().map(Path::to_path_buf);
     let _ = fs::remove_file(binary);
@@ -1221,7 +1271,7 @@ fn cleanup_staging(binary: &Path) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -1230,7 +1280,7 @@ fn process_alive(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn now_ms_i64() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1280,6 +1330,59 @@ fn error_kind(error: &reqwest::Error) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn update_check_failure_is_explicitly_indeterminate() {
+        let message = update_check_indeterminate_error("release manifest download failed: timeout");
+        assert!(message.contains("could not determine whether an update is available"));
+        assert!(message.contains("release manifest download failed: timeout"));
+        assert!(message.contains("herdr-mcp update apply"));
+    }
+
+    #[test]
+    fn metadata_fetch_retries_one_transient_timeout() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let delayed = thread::spawn(move || {
+                let mut request = [0_u8; 1024];
+                let _ = first.read(&mut request);
+                thread::sleep(Duration::from_millis(100));
+            });
+
+            let (mut second, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = second.read(&mut request);
+            second
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nretry-ok",
+                )
+                .unwrap();
+            delayed.join().unwrap();
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+        let url = Url::parse(&format!("http://{address}/manifest.json")).unwrap();
+        let bytes = fetch_bounded_with_retry(
+            &client,
+            url,
+            1024,
+            "release manifest",
+            2,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(bytes, b"retry-ok");
+        server.join().unwrap();
+    }
+
     fn manifest_for(target: &str, version: &str) -> Value {
         let identity = contract::identity().unwrap();
         let name = format!("herdr-mcp-{version}-{target}");
@@ -1321,6 +1424,22 @@ mod tests {
                 "url": format!("https://github.com/whshang/herdr-mcp/releases/download/v{version}/herdr-mcp-{version}-{target}")
             }]
         })
+    }
+
+    #[test]
+    fn release_target_mapping_uses_portable_musl_for_linux_x86_64() {
+        assert_eq!(
+            target_for_platform("linux", "x86_64").unwrap(),
+            "x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            target_for_platform("macos", "aarch64").unwrap(),
+            "aarch64-apple-darwin"
+        );
+        assert_eq!(
+            target_for_platform("windows", "x86_64").unwrap(),
+            "x86_64-pc-windows-msvc"
+        );
     }
 
     #[test]
@@ -1463,7 +1582,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn manual_update_progress_reports_phases_download_and_installer_state() {
         let mut progress = UpdateProgress::new(Vec::<u8>::new(), true);
@@ -1491,8 +1610,7 @@ mod tests {
         progress.job(&job);
         progress.job(&job);
         job.state = "installing".to_owned();
-        job.detail =
-            Some("candidate verified; service install and launchd health gate started".to_owned());
+        job.detail = Some("candidate verified; service install and health gate started".to_owned());
         progress.job(&job);
         job.state = "succeeded".to_owned();
         job.detail = Some("service install committed and health gate passed".to_owned());
@@ -1509,7 +1627,7 @@ mod tests {
         assert!(output.contains("Installer succeeded"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn automatic_update_progress_stays_silent() {
         let mut progress = UpdateProgress::new(Vec::<u8>::new(), false);
@@ -1552,7 +1670,7 @@ mod tests {
         assert!(!valid_job_id("../bad"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn active_update_recovery_blocks_live_worker_and_reaps_stale_queue() {
         let root = env::temp_dir().join(format!(

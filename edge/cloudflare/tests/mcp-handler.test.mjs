@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
+import { encodeDeviceRef } from "../dist/device-refs.js";
 import { makeLimits } from "../dist/limits.js";
 import { handleMcp } from "../dist/mcp-handler.js";
 
@@ -24,6 +25,9 @@ function deps(over = {}) {
       revokeDevice: over.revokeDevice,
       approveConnector: over.approveConnector,
       revokeConnector: over.revokeConnector,
+      listAutomations: over.listAutomations,
+      revokeAutomation: over.revokeAutomation,
+      client: over.client,
       resolveDevice: over.resolveDevice,
       client: over.client,
       forward: async (_stub, body) => {
@@ -41,6 +45,122 @@ function deps(over = {}) {
 
 const req = (id, method, params = {}) => ({ jsonrpc: "2.0", id, method, params });
 const DEVICE_A = "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ";
+const DEVICE_B = "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYA";
+
+test("device-bound automation defaults to its device and rejects other selectors or refs", async () => {
+  const resolved = [];
+  const d = deps({
+    client: { automationDeviceId: DEVICE_A },
+    devices: [
+      { device_id: DEVICE_A, name: "auto-a" },
+      { device_id: DEVICE_B, name: "auto-b" },
+    ],
+    resolveDevice: async (selector) => {
+      resolved.push(selector);
+      return {
+        ok: true,
+        device_id: selector,
+        workstation_id: selector === DEVICE_A ? "ws-a" : "ws-b",
+        routing_reason: "explicit_device_id",
+      };
+    },
+  });
+
+  const implicit = await handleMcp(req(901, "tools/call", {
+    name: "herdr_call",
+    arguments: { method: "pane.read", params: JSON.stringify({ pane_id: "w1:p1", source: "recent" }) },
+  }), "legacy", d.value);
+  assert.equal(implicit.body.result.isError, undefined);
+  assert.deepEqual(resolved, [DEVICE_A], "omitted device must resolve only to the automation-bound device");
+  assert.equal(d.calls.length, 1);
+
+  const explicitOther = await handleMcp(req(902, "tools/call", {
+    name: "herdr_call",
+    arguments: { device: DEVICE_B, method: "pane.read", params: "{}" },
+  }), "legacy", d.value);
+  assert.equal(explicitOther.body.result.isError, true);
+  assert.equal(explicitOther.body.result.structuredContent.code, "automation_device_scope_violation");
+  assert.equal(explicitOther.body.result.structuredContent.delivery_state, "not_delivered");
+  assert.deepEqual(resolved, [DEVICE_A], "cross-device selector must fail before route resolution");
+  assert.equal(d.calls.length, 1, "cross-device selector must not forward");
+
+  const otherRef = encodeDeviceRef(DEVICE_B, undefined, "w2:p1");
+  const refOther = await handleMcp(req(903, "tools/call", {
+    name: "herdr_call",
+    arguments: { method: "pane.read", params: JSON.stringify({ pane_id: otherRef, source: "recent" }) },
+  }), "legacy", d.value);
+  assert.equal(refOther.body.result.isError, true);
+  assert.equal(refOther.body.result.structuredContent.code, "automation_device_scope_violation");
+  assert.equal(refOther.body.result.structuredContent.delivery_state, "not_delivered");
+  assert.deepEqual(resolved, [DEVICE_A], "cross-device ref must fail before route resolution");
+  assert.equal(d.calls.length, 1, "cross-device ref must not forward");
+
+  const fleet = await handleMcp(req(904, "tools/call", {
+    name: "herdr_devices",
+    arguments: {},
+  }), "legacy", d.value);
+  assert.equal(fleet.body.result.structuredContent.scope, "bound_device");
+  assert.equal(fleet.body.result.structuredContent.bound_device_id, DEVICE_A);
+  assert.deepEqual(fleet.body.result.structuredContent.devices.map((device) => device.device_id), [DEVICE_A]);
+});
+
+test("herdr_methods preflights private method routes without workstation delivery", async () => {
+  const cases = [
+    ["herdr_mcp.device.pair", "edge_local"],
+    ["herdr_mcp.text.read", "workstation_routed"],
+    ["herdr_mcp.skill.load", "unsupported"],
+    ["herdr_mcp.planning.advise", "unsupported"],
+  ];
+  for (const [query, route] of cases) {
+    const d = deps();
+    const response = await handleMcp(req(`route-${query}`, "tools/call", {
+      name: "herdr_methods",
+      arguments: { query },
+    }), "legacy-default", d.value);
+    assert.equal(response.body.result.structuredContent.ok, true);
+    assert.equal(response.body.result.structuredContent.methods[0].method, query);
+    assert.equal(response.body.result.structuredContent.methods[0].route, route);
+    const method = response.body.result.structuredContent.methods[0];
+    assert.ok([true, false, "unknown"].includes(method.implemented_local));
+    assert.ok([true, false, "unknown"].includes(method.available_local));
+    assert.ok([true, false, "unknown"].includes(method.edge_route_deployed));
+    assert.ok([true, false, "unknown"].includes(method.caller_routable));
+    assert.equal(typeof method.reason, "string");
+    assert.equal(response.body.result.structuredContent.source, "edge_route_preflight");
+    assert.equal(d.calls.length, 0, `${query} route preflight must not forward`);
+  }
+
+  const denied = deps({ client: { fleetAdmin: false } });
+  const deniedPair = await handleMcp(req("route-denied", "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "herdr_mcp.device.pair" },
+  }), "legacy-default", denied.value);
+  assert.equal(deniedPair.body.result.structuredContent.methods[0].edge_route_deployed, true);
+  assert.equal(deniedPair.body.result.structuredContent.methods[0].caller_routable, false);
+  assert.equal(deniedPair.body.result.structuredContent.methods[0].reason, "caller_not_authorized");
+
+  const owner = deps({ client: { fleetAdmin: true } });
+  const ownerPair = await handleMcp(req("route-owner", "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "herdr_mcp.device.pair" },
+  }), "legacy-default", owner.value);
+  assert.equal(ownerPair.body.result.structuredContent.methods[0].caller_routable, true);
+  assert.equal(ownerPair.body.result.structuredContent.methods[0].reason, "route_deployed");
+
+  const unknown = deps();
+  const response = await handleMcp(req("route-unknown", "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "herdr_mcp.unknown.future" },
+  }), "legacy-default", unknown.value);
+  assert.equal(response.body.result.structuredContent.methods[0].route, "unsupported");
+  assert.equal(response.body.result.structuredContent.methods[0].implemented_local, "unknown");
+  assert.equal(response.body.result.structuredContent.methods[0].available_local, "unknown");
+  assert.equal(response.body.result.structuredContent.methods[0].edge_route_deployed, false);
+  assert.equal(response.body.result.structuredContent.methods[0].caller_routable, false);
+  assert.equal(response.body.result.structuredContent.methods[0].reason, "edge_route_not_deployed");
+  assert.equal(response.body.result.structuredContent.methods[0].next_surface, "herdr_methods");
+  assert.equal(unknown.calls.length, 0);
+});
 
 test("initialize advertises legacy wire protocol and device-aware public identity", async () => {
   const d = deps();
@@ -117,6 +237,17 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
   assert.equal(d.calls[0].deadlineMs, 31_000);
   assert.equal(d.calls[0].trace, undefined, "browser grants must not alter non-browser MCP forwarding");
+});
+
+test("tool timeout gets transport settlement grace instead of racing the Edge deadline", async () => {
+  const d = deps();
+  const r = await handleMcp(req(8, "tools/call", {
+    name: "herdr_exec",
+    arguments: { workspace: "w2", command: "git status", timeout_ms: 60_000 },
+  }), "w1", d.value);
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].deadlineMs, 66_000);
 });
 
 test("read-only call retries across a stale generation window after supersede proved not delivered", async () => {
@@ -219,12 +350,11 @@ test("herdr_devices executes at Edge and exposes pairing hint without tools/list
   assert.equal(r.body.result.structuredContent.ok, true);
   assert.deepEqual(r.body.result.structuredContent.devices, devices);
   assert.ok(typeof r.body.result.structuredContent.pairing_hint === "string");
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr_mcp.device.pair"));
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("params='{\"ttl_seconds\":600"));
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("params is a JSON string"));
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("exact expiry"));
-  assert.ok(r.body.result.structuredContent.revoke_hint.includes("herdr_mcp.device.revoke"));
-  assert.ok(r.body.result.structuredContent.revoke_hint.includes('"confirm":true'));
+  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr-mcp worker pair"));
+  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr-mcp worker connect"));
+  assert.ok(r.body.result.structuredContent.revoke_hint.includes("herdr-mcp worker revoke <device_id>"));
+  assert.equal(r.body.result.structuredContent.pairing_hint.includes("herdr_mcp.device.pair"), false);
+  assert.equal(r.body.result.structuredContent.revoke_hint.includes("herdr_mcp.device.revoke"), false);
   assert.ok(r.body.result.structuredContent.revoke_hint.includes("Never revoke by display name"));
   assert.equal(d.calls.length, 0);
 });
@@ -271,7 +401,7 @@ test("herdr_call herdr_mcp.device.pair executes at Edge and creates pairing with
   );
   assert.ok(r.body.result.structuredContent.instructions.includes("herdr-mcp worker connect"));
   assert.ok(r.body.result.structuredContent.instructions.includes("1970-01-01T00:10:00.000Z"));
-  assert.ok(r.body.result.structuredContent.instructions.includes("no-echo prompt"));
+  assert.ok(r.body.result.structuredContent.instructions.includes("visible CLI prompt"));
   assert.deepEqual(pairingInput, { ttl_seconds: 300, name: "new-workstation" });
   assert.equal(d.calls.length, 0, "must never forward to a workstation");
   assert.equal(d.targets.length, 0);
@@ -545,8 +675,8 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
       approved = input;
       return { ok: true, client_id: "dcr-abc", approved_at_ms: 1234 };
     },
-    revokeConnector: async (clientId) => {
-      revoked = clientId;
+    revokeConnector: async (connectorId) => {
+      revoked = connectorId;
       return { ok: true };
     },
   });
@@ -585,7 +715,7 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
       name: "herdr_call",
       arguments: {
         method: "herdr_mcp.connector.revoke",
-        params: { client_id: "dcr-abc" },
+        params: { connector_id: "conn_abcdefgh" },
       },
     }),
     "legacy-default",
@@ -598,14 +728,15 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
       name: "herdr_call",
       arguments: {
         method: "herdr_mcp.connector.revoke",
-        params: { client_id: "dcr-abc", confirm: true },
+        params: { connector_id: "conn_abcdefgh", confirm: true },
       },
     }),
     "legacy-default",
     d.value,
   );
   assert.equal(revoke.body.result.structuredContent.revoked, true);
-  assert.equal(revoked, "dcr-abc");
+  assert.equal(revoked, "conn_abcdefgh");
+  assert.equal(revoke.body.result.structuredContent.connector_id, "conn_abcdefgh");
 
   const remoteGrant = await handleMcp(
     req(7391, "tools/call", {
@@ -630,8 +761,66 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
   assert.equal(remoteGrant.body.result.structuredContent.code, "connector_owner_device_required");
   assert.equal(d.calls.length, 0, "OAuth MCP callers cannot self-authorize WebChat Control");
 
+  const remotePageAssistGrant = await handleMcp(
+    req(7392, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.connector.page_assist.set",
+        device: DEVICE_A,
+        params: {
+          client_id: "dcr-abc",
+          endpoint_ref: `be_${"c".repeat(64)}`,
+          allowed: true,
+          confirm: true,
+        },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(remotePageAssistGrant.body.result.isError, true);
+  assert.equal(remotePageAssistGrant.body.result.structuredContent.code, "connector_owner_device_required");
+  assert.equal(d.calls.length, 0, "OAuth MCP callers cannot self-authorize Page Assist");
+
   const listed = await handleMcp(req(740, "tools/list", {}), "legacy-default", d.value);
   assert.equal(listed.body.result.tools.some((tool) => tool.name.includes("connector")), false);
+});
+
+test("automation list/revoke are not MCP private methods; public tools never expose automation", async () => {
+  // Automation administration is REST-only (fleet-admin). It must NOT be
+  // reachable as an MCP private method, so an approved WebChat Connector can
+  // never administer automation clients.
+  const d = deps({});
+
+  const list = await handleMcp(
+    req(741, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.automation.list", params: {} },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(list.body.result.isError, true);
+  assert.equal(list.body.result.structuredContent.code, "unknown_method");
+  assert.equal(d.calls.length, 0);
+
+  const revoke = await handleMcp(
+    req(742, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.automation.revoke",
+        params: { client_id: "svc_abcdefgh1234", confirm: true },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(revoke.body.result.isError, true);
+  assert.equal(revoke.body.result.structuredContent.code, "unknown_method");
+  assert.equal(d.calls.length, 0);
+
+  const publicTools = await handleMcp(req(744, "tools/list", {}), "legacy-default", d.value);
+  assert.equal(publicTools.body.result.tools.some((tool) => tool.name.includes("automation")), false);
 });
 
 test("explicit device routing selects one workstation and strips Edge-only device metadata", async () => {
@@ -734,6 +923,11 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
   assert.equal(r.body.result.isError, true);
   assert.equal(r.body.result.structuredContent.code, "workstation_offline");
   assert.equal(r.body.result.structuredContent.retryable, true);
+  assert.equal(
+    r.body.result.structuredContent.requires_human,
+    false,
+    "MCP normalizes transient relay errors as non-human even when an older internal envelope omits the field",
+  );
   assert.equal(r.body.result.structuredContent.delivery_state, "not_delivered");
   assert.equal(r.body.result.structuredContent.retry_after_ms, 5000);
   assert.deepEqual(r.body.result.structuredContent.details, { source: "edge-test" });
@@ -744,6 +938,50 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
     backoff_ms: [5000, 10000, 20000],
     mutation_replay: "only_after_not_delivered_or_verified_not_applied",
   });
+});
+
+test("read-only tools/call retries a non-JSON transient Edge 524 with a fresh request id", async () => {
+  let attempts = 0;
+  const d = deps({
+    forward: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response("upstream timeout", {
+          status: 524,
+          headers: { "content-type": "text/html", "retry-after": "0" },
+        });
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { recovered: true } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const r = await handleMcp(req(91, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
+  assert.equal(r.body.result.structuredContent.recovered, true);
+  assert.equal(d.calls.length, 2);
+  assert.notEqual(d.calls[0].requestId, d.calls[1].requestId, "safe read retry must use a fresh request id");
+});
+
+test("mutating tools/call never replays a non-JSON transient Edge 502", async () => {
+  const d = deps({
+    forward: async () => new Response("bad gateway", {
+      status: 502,
+      headers: { "content-type": "text/html", "retry-after": "3" },
+    }),
+  });
+  const r = await handleMcp(
+    req(92, "tools/call", { name: "herdr_prompt", arguments: { target: "w1:p1", text: "test" } }),
+    "w1",
+    d.value,
+  );
+  assert.equal(d.calls.length, 1, "ambiguous mutation must never be replayed after a gateway error");
+  assert.equal(r.body.result.isError, true);
+  assert.equal(r.body.result.structuredContent.code, "edge_http_transient");
+  assert.equal(r.body.result.structuredContent.retryable, false);
+  assert.equal(r.body.result.structuredContent.delivery_state, "delivery_unknown");
+  assert.equal(r.body.result.structuredContent.http_status, 502);
+  assert.equal(r.body.result.structuredContent.retry_after_ms, 2000);
 });
 
 test("JSON-RPC request validation and method errors preserve ids", async () => {
@@ -765,7 +1003,7 @@ test("JSON-RPC request validation and method errors preserve ids", async () => {
   assert.equal(notification.body, null);
 });
 
-test("browser private methods require explicit enrolled device selector before forwarding", async () => {
+test("browser and Page Assist private methods require explicit enrolled device selector before forwarding", async () => {
   const d = deps({
     client: {
       webchatControlGrants: [
@@ -782,6 +1020,16 @@ test("browser private methods require explicit enrolled device selector before f
           account_ref: "br_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         },
       ],
+      pageAssistGrants: [
+        {
+          device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        },
+        {
+          device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          endpoint_ref: "be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        },
+      ],
     },
     resolveDevice: async (selector) => {
       if (selector === "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV") {
@@ -792,7 +1040,7 @@ test("browser private methods require explicit enrolled device selector before f
   });
 
   // Missing device selector fails before forward
-  for (const method of ["herdr_mcp.browser_endpoint.list", "herdr_mcp.browser_resource.resolve"]) {
+  for (const method of ["herdr_mcp.browser_endpoint.list", "herdr_mcp.browser_resource.resolve", "herdr_mcp.page_assist"]) {
     const missing = await handleMcp(
       req(1, "tools/call", { name: "herdr_call", arguments: { method, params: JSON.stringify({ limit: 10 }) } }),
       "w1",
@@ -842,4 +1090,29 @@ test("browser private methods require explicit enrolled device selector before f
       account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     }],
   }, "only grants for the routed device cross the Edge -> Link handoff");
+
+  const pageAssist = await handleMcp(
+    req(4, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.page_assist",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          action: "inspect",
+          target_origin: "https://example.com",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(pageAssist.body.result.isError, undefined);
+  assert.equal(d.calls.length, 2, "Page Assist request forwards to the selected workstation");
+  assert.equal(d.calls[1].args.method, "herdr_mcp.page_assist");
+  assert.deepEqual(d.calls[1].trace, {
+    page_assist_grants: [{
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    }],
+  }, "Page Assist receives only endpoint grants for the routed device and no WebChat grant tuple");
 });

@@ -149,7 +149,7 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
         Ok(serde_json::json!({
             "ok": false,
             "implementation": "unsupported",
-            "detail": "native host install currently requires macOS",
+            "detail": "Chromium Native Messaging host installation is currently implemented on macOS; Linux core MCP/Link operation does not depend on the native host",
         }))
     }
 
@@ -2365,7 +2365,7 @@ fn failpoint_after_restore_mutation() -> Result<(), String> {
 // Edge write failing) so a retry can be proven to resume from the same durable
 // snapshot. It is macOS-test-only and has no production effect. Keeping the
 // helpers out of non-macOS test builds also prevents Linux CI from compiling
-// unused failpoint symbols after the macOS-only mutation paths are cfg'd out.
+// unused failpoint symbols after the macOS mutation paths are cfg'd out.
 #[cfg(all(test, target_os = "macos"))]
 thread_local! {
     static MUTATION_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -4558,17 +4558,22 @@ mod tests {
         let (root, paths) = fixture();
         install(&paths).unwrap();
         let lock_path = paths.mutation_lock.clone();
+        let ready_path = root.join("flock-ready");
         // Spawn a child that holds the same lock file via flock (python).
-        // Use python's fcntl.flock which maps to flock(2) on macOS.
+        // Use python's fcntl.flock which maps to flock(2) on macOS. The child
+        // publishes a fixture-only readiness marker after acquiring the lock so
+        // the assertion cannot race a loaded full-suite scheduler.
         let child = std::process::Command::new("python3")
             .arg("-c")
             .arg(
                 "import fcntl, sys, time; \
                  f=open(sys.argv[1], 'a'); \
                  fcntl.flock(f, fcntl.LOCK_EX); \
+                 open(sys.argv[2], 'w').write('locked'); \
                  time.sleep(3)",
             )
             .arg(lock_path.to_string_lossy().to_string())
+            .arg(ready_path.to_string_lossy().to_string())
             .spawn();
         let child = match child {
             Ok(c) => c,
@@ -4578,8 +4583,14 @@ mod tests {
                 return;
             }
         };
-        // Give child time to acquire flock.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let ready_deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !ready_path.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready_path.exists(),
+            "child did not signal flock acquisition before the fixture deadline"
+        );
         let start = Instant::now();
         let err = NativeHostMutationLock::acquire(&paths).unwrap_err();
         let elapsed = start.elapsed();

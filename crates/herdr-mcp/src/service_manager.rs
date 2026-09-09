@@ -1,7 +1,9 @@
-//! macOS service manager for the Rust local runtime.
+//! Platform service manager for the Rust local runtime.
 //!
-//! The default (production) launchd label stays `dev.herdr-mcp.server` so
-//! callers and the browser extension keep a single primary service identity.
+//! macOS uses launchd; Linux uses `systemd --user` when available and an
+//! ownership-checked detached user-process fallback in init-less environments.
+//! On macOS, the default production launchd label stays `dev.herdr-mcp.server`
+//! so callers and the browser extension keep a single primary service identity.
 //! Named instances (`HERDR_MCP_INSTANCE` / `--instance`) suffix labels and ports
 //! for same-uid UAT and never rewrite `~/.local/bin/herdr-mcp`.
 //! A Rust install is content-addressed under `runtime/generations/` and launchd
@@ -15,10 +17,15 @@ use serde_json::Value;
 use std::process::ExitCode;
 
 pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_service_manager::run(command)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = command;
-        Err("service_manager_currently_requires_macos".to_owned())
+        Err("service manager is currently supported on macOS and Linux".to_owned())
     }
 
     #[cfg(target_os = "macos")]
@@ -85,6 +92,7 @@ pub(crate) fn run_install_from_payload(
 /// Return the managed Rust binary targeted by the current ready rollback.
 /// This is read-only preflight data; `rollback()` independently revalidates the
 /// ledger and target immediately before mutation.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn rollback_target_runtime_binary() -> Result<Option<std::path::PathBuf>, String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -99,18 +107,54 @@ pub fn rollback_target_runtime_binary() -> Result<Option<std::path::PathBuf>, St
 
 /// Read-only service ownership snapshot for `doctor`. Never mutates launchd.
 pub fn doctor_status() -> Result<serde_json::Value, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_service_manager::doctor_status()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Ok(serde_json::json!({
             "ok": false,
             "implementation": "unsupported",
-            "detail": "service manager currently requires macOS",
+            "detail": "service manager is currently supported on macOS and Linux",
         }))
     }
 
     #[cfg(target_os = "macos")]
     {
         macos::doctor_status()
+    }
+}
+
+/// Return the active local runtime bearer only for an in-process doctor probe.
+/// The caller must never print, serialize, or otherwise expose this value.
+pub(crate) fn doctor_runtime_token() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    let managed_token = macos::doctor_runtime_token();
+
+    #[cfg(target_os = "linux")]
+    let managed_token = crate::linux_service_manager::doctor_runtime_token();
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Ok(Some(token)) = &managed_token {
+        return Ok(Some(token.clone()));
+    }
+
+    if let Ok(token) = std::env::var("HERDR_MCP_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return Ok(Some(token));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(None)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        managed_token
     }
 }
 
@@ -528,7 +572,9 @@ mod macos {
     use super::*;
     use crate::instance::InstanceId;
     use crate::paths::RuntimePaths;
-    use crate::state_store::{RuntimeGenerationRecord, ServiceRollbackRecord, StateStore};
+    use crate::state_store::{
+        GenerationTransitionRecord, RuntimeGenerationRecord, ServiceRollbackRecord, StateStore,
+    };
     use crate::user_cli;
     use plist::{Dictionary, Value as PlistValue};
     use semver::Version;
@@ -818,6 +864,8 @@ mod macos {
         adopt_node: bool,
         mutation_lock: &ServiceMutationLock,
     ) -> Result<Value, String> {
+        let trigger = crate::qualification::generation_trigger("service_install");
+        crate::qualification::ensure_generation_change_allowed_in(&paths.config_dir, &trigger)?;
         crate::update_scheduler::preflight_service_install_fence()?;
         crate::product_lifecycle::preflight_installation_identity()?;
         // Capture the exact prior integration state (identity marker,
@@ -2176,6 +2224,16 @@ mod macos {
         let generation = prepare_generation(paths)?;
         let now = now_ms_i64();
         let mut store = StateStore::open_in_dir(&paths.config_dir, "state")?;
+        let previous_generation = store
+            .active_runtime_generation()?
+            .map(|record| record.generation_id);
+        let previous_source_commit = running_source_commit(paths.port);
+        let new_source_commit = if paths.source_binary == paths.orchestrator_binary {
+            crate::runtime_meta::compiled_source_commit().map(str::to_owned)
+        } else {
+            None
+        };
+        let transition_trigger = crate::qualification::generation_trigger("service_install");
         store.stage_runtime_generation(
             &generation.generation_id,
             &generation.binary.to_string_lossy(),
@@ -2310,10 +2368,19 @@ mod macos {
                 paths.legacy_health_version.as_deref(),
                 &paths.service_label,
             )?;
-            store.activate_runtime_generation_with_rollback(
+            let transition = GenerationTransitionRecord {
+                timestamp_ms: now_ms_i64(),
+                previous_generation: previous_generation.clone(),
+                new_generation: Some(generation.generation_id.clone()),
+                previous_source_commit: previous_source_commit.clone(),
+                new_source_commit: new_source_commit.clone(),
+                trigger: transition_trigger.clone(),
+            };
+            store.activate_runtime_generation_with_transition(
                 &generation.generation_id,
                 rollback_id.as_deref(),
-                now_ms_i64(),
+                transition.timestamp_ms,
+                &transition,
             )?;
             Ok(())
         })();
@@ -2405,6 +2472,7 @@ mod macos {
             "guardian_transaction": transaction_id,
             "guardian_settled": guardian_settled,
             "evidence_recorded": evidence_recorded,
+            "generation_transition_recorded": true,
             "generation_gc_pre_pruned": pre_install_gc.pruned,
         });
         match post_install_gc {
@@ -2567,6 +2635,17 @@ mod macos {
         status(&paths)
     }
 
+    pub(super) fn doctor_runtime_token() -> Result<Option<String>, String> {
+        let paths = ServicePaths::discover()?;
+        let bytes = read_optional_bounded(&paths.plist, 256 * 1024)?;
+        let descriptor = describe_service(bytes.as_deref(), &paths)?;
+        Ok(descriptor
+            .env
+            .get("HERDR_MCP_TOKEN")
+            .cloned()
+            .filter(|value| !value.trim().is_empty()))
+    }
+
     fn status(paths: &ServicePaths) -> Result<Value, String> {
         status_with(
             paths,
@@ -2715,6 +2794,14 @@ mod macos {
         paths: &ServicePaths,
         mutation_lock: &ServiceMutationLock,
     ) -> Result<Value, String> {
+        let transition_trigger = crate::qualification::generation_trigger("service_rollback");
+        if env::var_os("HERDR_MCP_INTERNAL_GENERATION_RECOVERY").is_none() {
+            crate::qualification::ensure_generation_change_allowed_in(
+                &paths.config_dir,
+                &transition_trigger,
+            )?;
+        }
+        let current_source_commit = running_source_commit(paths.port);
         let current_bytes = read_optional_bounded(&paths.plist, 256 * 1024)?
             .ok_or_else(|| "Rust service plist is missing".to_owned())?;
         let current = require_rust_service(paths)?;
@@ -2962,6 +3049,16 @@ mod macos {
             });
         }
 
+        let transition = GenerationTransitionRecord {
+            timestamp_ms: now_ms_i64(),
+            previous_generation: Some(current_generation.clone()),
+            new_generation: previous_generation_id.clone(),
+            previous_source_commit: current_source_commit,
+            new_source_commit: running_source_commit(paths.port),
+            trigger: transition_trigger,
+        };
+        store.record_generation_transition(&transition)?;
+        let transition_evidence_recorded = true;
         let evidence_recorded = store
             .record_service_event(
                 "rollback",
@@ -2995,6 +3092,7 @@ mod macos {
             "guardian_transaction": transaction_id,
             "guardian_settled": guardian_settled,
             "evidence_recorded": evidence_recorded,
+            "generation_transition_recorded": transition_evidence_recorded,
             "native_host_runtime_synced": native_host_sync,
         }))
     }
@@ -4093,6 +4191,23 @@ mod macos {
             .filter(|response| response.status().is_success())
             .and_then(|response| response.text().ok())
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    }
+
+    fn running_source_commit(port: u16) -> Option<String> {
+        let health = fetch_health_payload(port)?;
+        let build = health.get("build")?;
+        build
+            .get("source_commit")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                build
+                    .get("commit")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty() && *value != "unknown")
+                    .map(str::to_owned)
+            })
     }
 
     fn health_once_for_generation(port: u16, expected_generation: Option<&str>) -> bool {

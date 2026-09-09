@@ -73,6 +73,7 @@ enum SessionBackend {
         spool: PaneSpoolPaths,
         stdout_offset: Mutex<u64>,
         stderr_offset: Mutex<u64>,
+        close_on_complete: bool,
     },
     Completed,
 }
@@ -162,6 +163,101 @@ fn extract_stream_tail(buffers: &Buffers, stream: StreamKind, max_bytes: usize) 
     } else {
         combined
     }
+}
+
+fn parse_summary_count(line: &str, labels: &[&str]) -> Option<u64> {
+    let trimmed = line.trim();
+    labels.iter().find_map(|label| {
+        trimmed
+            .strip_prefix(label)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+    })
+}
+
+fn release_gate_phase(command: &str, output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("[release-gate] PASS phase=")
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            let marker = "scripts/release-gate.sh";
+            let suffix = command.split_once(marker)?.1.trim();
+            Some(
+                suffix
+                    .split_whitespace()
+                    .next()
+                    .filter(|value| matches!(*value, "rust" | "node" | "hygiene" | "full"))
+                    .unwrap_or("full")
+                    .to_owned(),
+            )
+        })
+}
+
+fn completion_evidence(session: &Session, status: &SessionStatus) -> Value {
+    let (output, bytes_total) = session
+        .buffers
+        .lock()
+        .map(|buffers| {
+            let mut ordered = Vec::with_capacity(buffers.stdout_bytes + buffers.stderr_bytes);
+            for chunk in &buffers.chunks {
+                ordered.extend_from_slice(&chunk.data);
+            }
+            (
+                String::from_utf8_lossy(&ordered).into_owned(),
+                buffers.stdout_bytes.saturating_add(buffers.stderr_bytes),
+            )
+        })
+        .unwrap_or_default();
+
+    let passed = output
+        .lines()
+        .filter_map(|line| parse_summary_count(line, &["# pass ", "ℹ pass "]))
+        .sum::<u64>();
+    let failed = output
+        .lines()
+        .filter_map(|line| parse_summary_count(line, &["# fail ", "ℹ fail "]))
+        .sum::<u64>();
+    let tests = output
+        .lines()
+        .filter_map(|line| parse_summary_count(line, &["# tests ", "ℹ tests "]))
+        .sum::<u64>();
+    let first_failure = if status.exit_code == Some(0) {
+        None
+    } else {
+        output.lines().find(|line| {
+            let line = line.trim();
+            line.contains("FAILED")
+                || line.starts_with("not ok")
+                || line.contains("[release-gate] ERROR:")
+        })
+    };
+
+    let mut result = json!({
+        "phase": "completed",
+        "exit_code": status.exit_code,
+        "full_log_available": bytes_total > 0,
+        "log_session_id": session.id,
+    });
+    if let Some(object) = result.as_object_mut() {
+        if let Some(gate_phase) = release_gate_phase(&session.command, &output) {
+            object.insert("gate_phase".to_owned(), json!(gate_phase));
+        }
+        if tests > 0 || passed > 0 || failed > 0 {
+            object.insert(
+                "tests".to_owned(),
+                json!({"total": tests, "passed": passed, "failed": failed}),
+            );
+        }
+        if let Some(first_failure) = first_failure {
+            object.insert("first_failure".to_owned(), json!(first_failure.trim()));
+        }
+    }
+    result
 }
 
 fn write_session_spool(state_dir: &Path, session: &Session) -> Result<(), String> {
@@ -553,6 +649,7 @@ impl ExecRegistry {
                 spool,
                 stdout_offset: Mutex::new(0),
                 stderr_offset: Mutex::new(0),
+                close_on_complete: true,
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
@@ -583,6 +680,93 @@ impl ExecRegistry {
             "started_at": iso_from_ms(started_at_ms),
             "pid": Value::Null,
             "backend": "herdr_pane",
+            "pane_id": pane_id,
+            "phase": "started",
+            "progress": {
+                "bytes_read": 0,
+                "bytes_total": 0,
+                "elapsed_ms": 0,
+            },
+        }))
+    }
+
+    pub fn start_in_existing_pane(
+        &self,
+        cwd: &Path,
+        command: &str,
+        pane_id: &str,
+    ) -> Result<Value, String> {
+        self.prune();
+        if command.is_empty() {
+            return Err("command must not be empty".to_owned());
+        }
+        let client = self
+            .inner
+            .client
+            .clone()
+            .ok_or_else(|| "Herdr pane backend is unavailable".to_owned())?;
+        let id = new_session_id();
+        let script_path = pane_script_path(&id);
+        let spool = pane_spool_paths(&id);
+        write_pane_script(&script_path, cwd, command, &spool)?;
+        let launch_line = format!(
+            "{} {}",
+            shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
+            shell_quote(script_path.to_string_lossy().as_ref()),
+        );
+        if let Err(error) = client.call_with_timeout(
+            "pane.send_text",
+            json!({"pane_id": pane_id, "text": format!("{launch_line}\n")}),
+            PANE_RPC_TIMEOUT,
+        ) {
+            cleanup_pane_files(&script_path, &spool);
+            return Err(format!("cannot start utility pane command: {error}"));
+        }
+        let started_at_ms = now_ms();
+        let session = Arc::new(Session {
+            id: id.clone(),
+            cwd: cwd.to_path_buf(),
+            command: command.to_owned(),
+            started_at_ms,
+            pid: None,
+            backend: SessionBackend::Pane {
+                client,
+                pane_id: pane_id.to_owned(),
+                script_path,
+                spool,
+                stdout_offset: Mutex::new(0),
+                stderr_offset: Mutex::new(0),
+                close_on_complete: false,
+            },
+            buffers: Mutex::new(Buffers::default()),
+            status: Mutex::new(SessionStatus::default()),
+        });
+        if let Err(error) = self
+            .inner
+            .state_store
+            .lock()
+            .map_err(|_| "exec state store lock poisoned".to_owned())
+            .and_then(|store| store.record_pane_exec_running(&id, started_at_ms))
+        {
+            terminate_session(&session, true, None);
+            return Err(format!(
+                "cannot durably register utility exec session; utility pane was closed before return: {error}"
+            ));
+        }
+        self.inner
+            .sessions
+            .lock()
+            .map_err(|_| "exec registry lock poisoned".to_owned())?
+            .insert(id.clone(), Arc::clone(&session));
+        spawn_monitor(Arc::clone(&session), Arc::downgrade(&self.inner));
+        Ok(json!({
+            "ok": true,
+            "session_id": id,
+            "cwd": cwd.to_string_lossy(),
+            "command": command,
+            "started_at": iso_from_ms(started_at_ms),
+            "pid": Value::Null,
+            "backend": "utility_pane",
             "pane_id": pane_id,
             "phase": "started",
             "progress": {
@@ -656,6 +840,12 @@ impl ExecRegistry {
                 "elapsed_ms": elapsed_ms,
             }),
         );
+        if status.closed {
+            result.insert(
+                "completion".to_owned(),
+                completion_evidence(&session, &status),
+            );
+        }
         exec_compact::insert_compacted_or_raw(
             &mut result,
             "text",
@@ -1227,6 +1417,7 @@ fn refresh_pane_session(session: &Arc<Session>, registry: Option<&RegistryInner>
         spool,
         stdout_offset,
         stderr_offset,
+        close_on_complete,
     } = &session.backend
     else {
         return false;
@@ -1239,8 +1430,13 @@ fn refresh_pane_session(session: &Arc<Session>, registry: Option<&RegistryInner>
     let transitioned = complete_session(session, registry, Some(exit_code), None);
     if transitioned {
         cleanup_pane_files(script_path, spool);
-        let _ =
-            client.call_with_timeout("pane.close", json!({"pane_id": pane_id}), PANE_RPC_TIMEOUT);
+        if *close_on_complete {
+            let _ = client.call_with_timeout(
+                "pane.close",
+                json!({"pane_id": pane_id}),
+                PANE_RPC_TIMEOUT,
+            );
+        }
     }
     true
 }
@@ -1725,6 +1921,11 @@ mod tests {
 
     #[cfg(unix)]
     fn pane_session(id: &str) -> (Arc<Session>, PathBuf) {
+        pane_session_with_close(id, true)
+    }
+
+    #[cfg(unix)]
+    fn pane_session_with_close(id: &str, close_on_complete: bool) -> (Arc<Session>, PathBuf) {
         let socket = env::temp_dir().join(format!(
             "herdr-mcp-pane-monitor-{}-{}.sock",
             std::process::id(),
@@ -1746,11 +1947,47 @@ mod tests {
                 spool,
                 stdout_offset: Mutex::new(0),
                 stderr_offset: Mutex::new(0),
+                close_on_complete,
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
         });
         (session, socket)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_utility_pane_session_keeps_operation_output_and_does_not_close_pane() {
+        let id = format!(
+            "es_utility_owned_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (session, socket) = pane_session_with_close(&id, false);
+        let registry = registry();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_pane_exec_running(&id, session.started_at_ms)
+            .unwrap();
+        let spool = pane_spool(&session).clone();
+        fs::write(&spool.stdout, "current-command-only").unwrap();
+        fs::write(&spool.status, "0\n").unwrap();
+
+        assert!(refresh_pane_session(&session, Some(&registry.inner)));
+        let status = session_status(&session);
+        assert!(status.closed);
+        assert_eq!(status.exit_code, Some(0));
+        let buffers = session.buffers.lock().unwrap();
+        let (output, _) = read_buffer_slice(&buffers, None, 0, usize::MAX);
+        assert_eq!(output, b"current-command-only");
+        assert!(!spool.status.exists());
+        assert!(
+            !socket.exists(),
+            "utility completion must not call pane.close"
+        );
     }
 
     #[cfg(unix)]
@@ -1907,17 +2144,79 @@ mod tests {
     }
 
     #[test]
+    fn uniform_json_success_compacts_but_chunk_reads_recover_raw_bytes() {
+        let registry = registry();
+        let command = r#"awk 'BEGIN{printf "["; for(i=0;i<200;i++){if(i)printf ","; printf "{\"id\":%d,\"name\":\"worker-%03d\",\"status\":\"idle\",\"workspace\":\"w1\"}",i,i}; printf "]"}'"#;
+        let started = registry.start(Path::new("/tmp"), command).unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait_until_closed(&registry, &id, "stdout", 65_536);
+        assert_eq!(view["exit_code"], 0);
+        assert_eq!(view["truncated"], false);
+        assert_eq!(view["compacted"], true);
+        assert_eq!(view["counts"]["strategy"], "json_object_table_v1");
+        let compacted = view["text"].as_str().unwrap();
+        let total = view["bytes_total"].as_u64().unwrap() as usize;
+        assert!(compacted.len() < total);
+
+        let mut offset = 0;
+        let mut raw = String::new();
+        while offset < total {
+            let chunk = registry.read(&id, "stdout", offset, 4_096);
+            assert!(chunk.get("compacted").is_none());
+            raw.push_str(chunk["text"].as_str().unwrap());
+            let next = chunk["next_offset"].as_u64().unwrap() as usize;
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(raw.len(), total);
+        let decoded: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded.as_array().unwrap().len(), 200);
+        assert_eq!(decoded[0]["name"], "worker-000");
+        assert_eq!(decoded[199]["name"], "worker-199");
+    }
+
+    #[test]
+    fn completed_incremental_read_exposes_compact_completion_evidence() {
+        let registry = registry();
+        let started = registry
+            .start(
+                Path::new("/tmp"),
+                "printf '[release-gate] Node tests\\n# tests 12\\n# pass 12\\n# fail 0\\n[release-gate] PASS phase=node\\n'",
+            )
+            .unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let full = wait_until_closed(&registry, &id, "stdout", 65536);
+        let total = full["bytes_total"].as_u64().unwrap() as usize;
+        let incremental = registry.read(&id, "stdout", total, 1024);
+
+        assert_eq!(incremental["next_offset"], total);
+        assert_eq!(incremental["completion"]["phase"], "completed");
+        assert_eq!(incremental["completion"]["exit_code"], 0);
+        assert_eq!(incremental["completion"]["gate_phase"], "node");
+        assert_eq!(incremental["completion"]["tests"]["passed"], 12);
+        assert_eq!(incremental["completion"]["tests"]["failed"], 0);
+        assert_eq!(incremental["completion"]["full_log_available"], true);
+        assert_eq!(incremental["completion"]["log_session_id"], id);
+    }
+
+    #[test]
     fn failure_keeps_full_diagnostic_output() {
         let registry = registry();
         let started = registry
             .start(
                 Path::new("/tmp"),
-                "awk 'BEGIN{for(i=0;i<90;i++) print \"fail-\" i}'; exit 3",
+                "printf 'FAILED test_release_gate\\n'; awk 'BEGIN{for(i=0;i<90;i++) print \"fail-\" i}'; exit 3",
             )
             .unwrap();
         let id = started["session_id"].as_str().unwrap().to_owned();
         let view = wait_until_closed(&registry, &id, "stdout", 65536);
         assert_eq!(view["exit_code"], 3);
+        assert_eq!(view["completion"]["exit_code"], 3);
+        assert_eq!(
+            view["completion"]["first_failure"],
+            "FAILED test_release_gate"
+        );
+        assert_eq!(view["completion"]["full_log_available"], true);
         assert!(view.get("compacted").is_none());
         let text = view["text"].as_str().unwrap();
         assert!(text.contains("fail-0\n"));

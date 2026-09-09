@@ -14,7 +14,7 @@
 - **生产 Link 是 Rust**，执行 `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`。
 - **公共 Edge contract 为 epoch 3 / 19 actions，workstation Runtime Execution Contract 保持 epoch 2 / 18 tools**；第 19 个 `herdr_devices` 由 Edge 本地执行，不转发到 workstation。
 - **浏览器控制面是有界的**：不宣称 browser true-steer；普通终端只开放有 target fencing 的窄化 `Run command -> pane.send_input + Enter`，任意 Herdr method 仍保持 preview-only。
-- **`v0.4.3` 已发布能力可作为当前产品能力呈现**；任何尚未发布的后续特性仍必须描述为 development/upcoming，不能提前写成当前产品能力。
+- **`v0.4.8` 是当前稳定 0.4.x 产品基线**；1.0 未发布能力仍必须描述为 development/upcoming，不能提前写成当前产品能力。
 
 ## 总体目标
 
@@ -37,7 +37,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 当前执行面彼此解耦：Runtime、Browser Extension、Edge/Link Contract 可以独立演进，但必须遵守 [`release-model.md`](./release-model.md) 的兼容边界。浏览器扩展持续独立迭代，不要求仅为扩展变化发布 Rust runtime。
 
-`v0.4.3` multi-device core 已发布，其冻结设计与 release plan 已归档到 [`history/architecture/`](./history/architecture/)。当前活跃长期设计继续以 Browser Control Plane 等未完成主题为准；多设备 scheduling/admin/console 只有在后续明确立项后才进入 `_wip`。
+`v0.4.8` 已提供 Connector/OAuth exact-instance lifecycle、Automation Client、first-Worker onboarding、multi-device enrollment/admin、Linux service/credential/updater、Relay/reconnect/backpressure 与 Native Messaging/Unix-socket 等 pre-1.0 stabilization 能力。1.0 直接继承这些边界，不再另写同类机制。
 
 Herdr-MCP 1.0 当前进入分阶段纵向实现，阶段边界独立于 0.4.x 发布线。唯一正式里程碑序列如下；阶段进度台账见 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md)：
 
@@ -47,6 +47,10 @@ alpha.2  Project Work Memory
 alpha.3  Browser Endpoint / Resource Registry
 alpha.4  ChatGPT Web adapter vertical
 alpha.5  Gemini second-provider vertical
+alpha.6  Claude provider vertical
+alpha.7  Grok provider vertical
+alpha.8  bounded generic Page Assist
+alpha.9  Toolchain Efficiency（output compaction / 18-tool efficiency gate）
 beta.1   reliability / postcondition（reload/stale-view 恢复、uncertain delivery 结算）
 beta.2   multi-device / multi-endpoint / multi-account reservation + failover
 rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
@@ -54,11 +58,11 @@ rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 
 编译加速与内存/资源治理不是额外里程碑，也不引入第二调度器或状态权威。它们作为 1.0 横向工程约束随上述阶段验证：保持 Runtime / production Link / Supervisor 的可靠性边界；以 Work Memory 的 checkpoint + bounded raw tail、轻量 browser/provider resource state、aggregate byte admission、beta.2 Fleet Control resource evidence 为核心；crate/linker/allocator/Cargo profile 等优化只按 Herdr 自身 touched-file、CI、RSS/PSS 与 burst-to-idle 基准决定。活动方案见 [`_wip/v1.0-performance-resource-plan.md`](./_wip/v1.0-performance-resource-plan.md)。
 
-**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）§16.2 的表格写于 alpha.5 追加之前，只覆盖 alpha.1–4 → beta.1 → beta.2 → rc.1、不含 alpha.5。自 alpha.5 追加起，该表格不再是里程碑序列的权威，上表（本文件）才是唯一正式序列。alpha.5 存在的原因正是冻结 plan §17 WebChat gate 的 "at least two providers prove the semantic adapter seam"：单一 ChatGPT vertical（alpha.4）无法证明 adapter seam 是 provider-neutral 的，因此必须在 beta.1 reliability/postcondition 之前增加第二个 Provider（Gemini）纵向阶段。
+**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）只记录早期计划与 provenance；后续真实实现补入第二 Provider、Claude/Grok、Page Assist 与 Alpha 9，因此上表是当前唯一正式里程碑序列。alpha.5 用于满足冻结 plan §17 的 “at least two providers prove the semantic adapter seam” gate，证明 adapter seam 是 provider-neutral 的。Alpha 9 不增加工具数量；native-default `herdr_exec` 因会改变 epoch-2 明确的 VISIBLE utility-pane 语义而未在旧 hash 下发布，若未来继续该方向必须显式演进 Runtime Execution contract。
 
-1.0 以 v0.4.6 的 pre-1.0 stabilization 合同为基础，不复制其 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、planner tool-integrity、multi-device/Relay、Native Messaging local-auth、browser continuity/target-fencing 等实现。若 v0.4.6 的发布分支尚未回并 `main`，只在集成阶段吸收其已验证提交；1.0 feature branches 不另写同类机制。
+1.0 以正式 v0.4.8 的 pre-1.0 stabilization 合同为基础，不复制 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、multi-device/Relay、Linux platform support、Native Messaging local-auth 与 browser continuity/target-fencing 等实现。当前统一线见 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md)。
 
-阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)，已随 PR #315 合并。alpha.4 起尚未合并实现。alpha.5 明确位于 ChatGPT adapter 后、beta.1 reliability/postcondition 前；在 alpha.5 完成真实双 Provider UAT 以前，Work Memory 可以作为跨 Provider 状态合同实现，但不能宣称 ChatGPT/Gemini WebChat 已具备生产级跨 Provider 调度。
+阶段规格：alpha.1–alpha.9 见对应 `_wip/v1.0-*.md`；beta.1 见 [`_wip/v1.0-beta1-reliability-postcondition.md`](./_wip/v1.0-beta1-reliability-postcondition.md)；beta.2 见 [`_wip/v1.0-beta2-webchat-orchestration.md`](./_wip/v1.0-beta2-webchat-orchestration.md)。实时工程状态统一由 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md) 记录。
 
 1.0 的两个正式跨 Provider 验收场景固定为：
 

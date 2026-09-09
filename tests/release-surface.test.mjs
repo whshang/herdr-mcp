@@ -242,13 +242,14 @@ test("CI Rust gate uses a trusted-main-only shared compiler cache", async () => 
   );
 });
 
-test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 target contract", async () => {
+test("Rust release publishes authoritative macOS ARM64 + Debian-compatible Linux x64 + Windows x64 targets", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const targetContract = JSON.parse(await readFile(join(ROOT, ".github/rust-release-targets.json"), "utf8"));
   assert.deepEqual(targetContract, {
     schema_version: 1,
     targets: [
       { runner: "macos-15", target: "aarch64-apple-darwin" },
+      { runner: "ubuntu-24.04", target: "x86_64-unknown-linux-musl" },
       { runner: "windows-2025", target: "x86_64-pc-windows-msvc" },
     ],
   });
@@ -257,7 +258,9 @@ test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 targe
   assert.match(release, /needs: \[verify, targets\]/);
   assert.match(release, /matrix: \$\{\{ fromJSON\(needs\.targets\.outputs\.matrix\) \}\}/);
   assert.doesNotMatch(release, /x86_64-apple-darwin/);
-  assert.doesNotMatch(release, /unknown-linux-gnu/);
+  assert.match(release, /Install Linux musl build prerequisites/);
+  assert.match(release, /Smoke Linux release portability/);
+  assert.match(release, /Requesting program interpreter/);
 });
 
 test("tagged releases do not require paid Apple Developer signing", async () => {
@@ -372,6 +375,9 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /release manifest repository identity mismatch/);
   assert.match(recovery, /release manifest provenance identity mismatch/);
   assert.match(recovery, /release manifest targets do not match tagged target contract/);
+  assert.match(recovery, /edge = manifest\.get\("edge"\)/);
+  assert.match(recovery, /herdr-edge-\{source_version\}\.mjs/);
+  assert.match(recovery, /Edge sha256 mismatch/);
   assert.doesNotMatch(recovery, /herdr-mcp-extension-/);
   assert.match(recovery, /release_asset_count=/);
   assert.match(recovery, /steps\.verify\.outputs\.release_asset_count/);

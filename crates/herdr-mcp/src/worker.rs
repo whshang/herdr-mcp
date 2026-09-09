@@ -1,71 +1,63 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::cli::ServiceCommand;
 use crate::cli::WorkerCommand;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use crate::config::Config;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use crate::instance::InstanceId;
 #[cfg(target_os = "macos")]
 use crate::link::ownership::LINK_PROD_LABEL;
 use crate::paths::RuntimePaths;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use reqwest::blocking::{Client, Response};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-#[cfg(target_os = "macos")]
-use reqwest::redirect::Policy;
-#[cfg(any(target_os = "macos", test))]
-use serde_json::{Value, json};
-#[cfg(any(target_os = "macos", test))]
+use serde_json::Value;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use serde_json::json;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::env;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs::{self, OpenOptions};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::io::BufRead;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::io::Write;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(target_os = "macos")]
-use std::time::Duration;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
-#[cfg(any(target_os = "macos", test))]
 use time::OffsetDateTime;
-#[cfg(any(target_os = "macos", test))]
 use time::format_description::well_known::Rfc3339;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use url::Url;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::os::unix::fs::OpenOptionsExt;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 const LEGACY_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-prod-link-secret";
-#[cfg(target_os = "macos")]
-const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[cfg(target_os = "macos")]
-struct OwnerLinkIdentity {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct FleetLinkIdentity {
     edge_origin: String,
     workstation_id: String,
     credential: String,
 }
 
-#[cfg(any(target_os = "macos", test))]
-#[derive(Debug)]
-struct EnrolledCredential {
-    device_id: String,
-    workstation_id: String,
-    device_secret: String,
+#[derive(Clone, Debug)]
+pub(crate) struct EnrolledCredential {
+    pub(crate) device_id: String,
+    pub(crate) workstation_id: String,
+    pub(crate) device_secret: String,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn pairing_create_request_body(ttl_seconds: u64, name: Option<&str>) -> Value {
     match name {
         Some(name) => json!({ "ttl_seconds": ttl_seconds, "name": name }),
@@ -73,7 +65,7 @@ fn pairing_create_request_body(ttl_seconds: u64, name: Option<&str>) -> Value {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn pairing_consume_request_body(pairing_id: &str, code: &str, name: Option<&str>) -> Value {
     match name {
         Some(name) => json!({ "pairing_id": pairing_id, "code": code, "name": name }),
@@ -81,11 +73,212 @@ fn pairing_consume_request_body(pairing_id: &str, code: &str, name: Option<&str>
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn automation_create_request_body(name: &str, device: &str) -> Value {
+    json!({ "name": name, "device": device })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn connector_revoke_request_body(connector_id: &str) -> Value {
+    json!({ "connector_id": connector_id })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn connector_client_revoke_request_body(client_id: &str) -> Value {
+    json!({ "client_id": client_id })
+}
+
 fn format_pairing_expiry(expires_at_ms: u64) -> Option<String> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at_ms) * 1_000_000)
         .ok()
         .and_then(|value| value.format(&Rfc3339).ok())
+}
+
+fn inventory_now_ms() -> u64 {
+    OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .max(0)
+        .saturating_div(1_000_000)
+        .min(i128::from(u64::MAX)) as u64
+}
+
+fn readable_age(now_ms: u64, timestamp_ms: u64) -> String {
+    if timestamp_ms > now_ms {
+        return "clock skew".to_owned();
+    }
+    let seconds = now_ms.saturating_sub(timestamp_ms) / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h", seconds / (60 * 60))
+    } else if seconds < 30 * 24 * 60 * 60 {
+        format!("{}d", seconds / (24 * 60 * 60))
+    } else if seconds < 365 * 24 * 60 * 60 {
+        format!("{}mo", seconds / (30 * 24 * 60 * 60))
+    } else {
+        format!("{}y", seconds / (365 * 24 * 60 * 60))
+    }
+}
+
+fn readable_timestamp(timestamp_ms: u64, now_ms: u64) -> String {
+    let absolute = format_pairing_expiry(timestamp_ms).unwrap_or_else(|| "invalid time".to_owned());
+    let age = readable_age(now_ms, timestamp_ms);
+    if age == "clock skew" {
+        format!("{absolute} (clock skew)")
+    } else {
+        format!("{absolute} ({age} ago)")
+    }
+}
+
+fn annotate_inventory_entry(
+    entry: &mut Value,
+    created_at_ms: Option<u64>,
+    last_used_at_ms: Option<u64>,
+    now_ms: u64,
+    unknown_legacy_usage: bool,
+) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "age".to_owned(),
+        Value::String(
+            created_at_ms
+                .map(|value| readable_age(now_ms, value))
+                .unwrap_or_else(|| "unknown".to_owned()),
+        ),
+    );
+    match last_used_at_ms {
+        Some(value) => {
+            object.insert(
+                "last_used".to_owned(),
+                Value::String(readable_timestamp(value, now_ms)),
+            );
+            object.insert("usage_state".to_owned(), Value::String("used".to_owned()));
+        }
+        None if unknown_legacy_usage => {
+            object.insert(
+                "last_used".to_owned(),
+                Value::String("unknown (pre-v0.4.6)".to_owned()),
+            );
+            object.insert(
+                "usage_state".to_owned(),
+                Value::String("unknown_legacy".to_owned()),
+            );
+        }
+        None => {
+            object.insert(
+                "last_used".to_owned(),
+                Value::String("never used".to_owned()),
+            );
+            object.insert(
+                "usage_state".to_owned(),
+                Value::String("never_used".to_owned()),
+            );
+        }
+    }
+}
+
+fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
+    if let Some(devices) = payload.get_mut("devices").and_then(Value::as_array_mut) {
+        for device in devices {
+            let created = device.get("enrolled_at_ms").and_then(Value::as_u64);
+            let last_used = device.get("last_seen_at_ms").and_then(Value::as_u64);
+            annotate_inventory_entry(device, created, last_used, now_ms, false);
+        }
+    }
+    payload
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn render_connector_inventory(mut payload: Value, now_ms: u64, include_all: bool) -> Value {
+    if let Some(connectors) = payload.get_mut("connectors").and_then(Value::as_array_mut) {
+        if !include_all {
+            connectors.retain(|connector| {
+                connector.get("status").and_then(Value::as_str) != Some("revoked")
+            });
+        }
+        for connector in connectors {
+            let created = connector.get("created_at_ms").and_then(Value::as_u64);
+            let last_used = connector.get("last_used_at_ms").and_then(Value::as_u64);
+            annotate_inventory_entry(connector, created, last_used, now_ms, false);
+        }
+    }
+    if let Some(legacy) = payload
+        .get_mut("legacy_clients")
+        .and_then(Value::as_array_mut)
+    {
+        if !include_all {
+            legacy.retain(|client| {
+                client.get("registration_state").and_then(Value::as_str) != Some("revoked")
+            });
+        }
+        for client in legacy {
+            let created = client.get("created_at_ms").and_then(Value::as_u64);
+            let last_used = client.get("last_used_at_ms").and_then(Value::as_u64);
+            annotate_inventory_entry(client, created, last_used, now_ms, true);
+        }
+    }
+
+    let listed_counts = displayed_connector_token_counts(&payload);
+    if let Some(object) = payload.as_object_mut() {
+        // Preserve the Edge aggregate for backward compatibility, but make its
+        // scope explicit because the default CLI view intentionally hides
+        // revoked/history rows. The displayed-record aggregate is always
+        // directly reconcilable with the rows the operator can see.
+        object.insert(
+            "inventory_filter".to_owned(),
+            json!(if include_all { "all" } else { "actionable" }),
+        );
+        if object.contains_key("token_counts") {
+            object.insert("token_counts_scope".to_owned(), json!("all_stored"));
+        }
+        object.insert("listed_token_counts".to_owned(), listed_counts);
+        object.insert(
+            "listed_token_counts_scope".to_owned(),
+            json!("displayed_records"),
+        );
+    }
+    payload
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn displayed_connector_token_counts(payload: &Value) -> Value {
+    let mut active_access = 0_u64;
+    let mut active_refresh = 0_u64;
+    for key in ["connectors", "legacy_clients"] {
+        if let Some(entries) = payload.get(key).and_then(Value::as_array) {
+            for entry in entries {
+                active_access = active_access.saturating_add(
+                    entry
+                        .get("active_access_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+                active_refresh = active_refresh.saturating_add(
+                    entry
+                        .get("active_refresh_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+            }
+        }
+    }
+    json!({"active_access": active_access, "active_refresh": active_refresh})
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn render_automation_inventory(mut payload: Value, now_ms: u64) -> Value {
+    if let Some(automations) = payload.get_mut("automations").and_then(Value::as_array_mut) {
+        for automation in automations {
+            let created = automation.get("created_at_ms").and_then(Value::as_u64);
+            let last_used = automation.get("last_used_at_ms").and_then(Value::as_u64);
+            annotate_inventory_entry(automation, created, last_used, now_ms, false);
+        }
+    }
+    payload
 }
 
 pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
@@ -94,6 +287,8 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         return Err("Worker pairing is available only on the default Herdr instance".to_owned());
     }
     match command {
+        WorkerCommand::List => list_devices(&paths),
+        WorkerCommand::Bootstrap => crate::worker_bootstrap::run(&paths),
         WorkerCommand::Pair { ttl_seconds, name } => {
             create_pairing(&paths, ttl_seconds, name.as_deref())
         }
@@ -107,9 +302,14 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
         WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
-        WorkerCommand::ConnectorRevoke { client_id } => revoke_connector(&paths, &client_id),
+        WorkerCommand::ConnectorCancel { request_id } => cancel_connector(&paths, &request_id),
+        WorkerCommand::ConnectorList { include_all } => list_connectors(&paths, include_all),
+        WorkerCommand::ConnectorRevoke { connector_id } => revoke_connector(&paths, &connector_id),
+        WorkerCommand::ConnectorClientRevoke { client_id } => {
+            revoke_connector_client(&paths, &client_id)
+        }
         WorkerCommand::ConnectorWebChatControl {
-            client_id,
+            connector_id,
             device_id,
             endpoint_ref,
             provider,
@@ -117,17 +317,47 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             allowed,
         } => set_connector_webchat_control(
             &paths,
-            &client_id,
+            &connector_id,
             &device_id,
             &endpoint_ref,
             &provider,
             &account_ref,
             allowed,
         ),
+        WorkerCommand::ConnectorPageAssist {
+            connector_id,
+            device_id,
+            endpoint_ref,
+            allowed,
+        } => set_connector_page_assist(&paths, &connector_id, &device_id, &endpoint_ref, allowed),
+        WorkerCommand::AutomationCreate { name, device } => {
+            create_automation(&paths, &name, &device)
+        }
+        WorkerCommand::AutomationList => list_automations(&paths),
+        WorkerCommand::AutomationRotate { client_id } => rotate_automation(&paths, &client_id),
+        WorkerCommand::AutomationRevoke { client_id } => revoke_automation(&paths, &client_id),
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
+    let payload = extension_fleet_snapshot(paths)?;
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("device_inventory_unavailable");
+        return Err(format!("device inventory unavailable: {code}"));
+    }
+    let payload = render_device_inventory(payload, inventory_now_ms());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode device inventory: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "ok": false,
@@ -135,17 +365,84 @@ pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_js
     }))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
 pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let owner = resolve_owner_link_identity(paths, &config)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
+    let client = client_for_origin(&owner.edge_origin)?;
+    extension_fleet_snapshot_with_client(paths, &client)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn extension_fleet_snapshot_with_client(
+    paths: &RuntimePaths,
+    client: &Client,
+) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&owner.credential)?;
     headers.insert(
         "x-herdr-workstation",
         HeaderValue::from_str(&owner.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client
+        .get(endpoint(&owner.edge_origin, "/devices")?)
+        .headers(headers)
+        .send()
+        .map_err(|error| format!("cannot read Worker device inventory: {error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .map_err(|_| format!("Worker device inventory returned non-JSON HTTP {status}"))?;
+    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("device_inventory_unavailable");
+        return Ok(json!({
+            "ok": false,
+            "code": code,
+            "http_status": status.as_u16(),
+        }));
+    }
+    let service = crate::linux_service_manager::doctor_status().unwrap_or_else(|_| json!({}));
+    Ok(json!({
+        "ok": true,
+        "devices": payload.get("devices").cloned().unwrap_or_else(|| json!([])),
+        "observed_at_ms": payload.get("observed_at_ms").cloned().unwrap_or(Value::Null),
+        "local": {
+            "device_id": config.edge_device_id,
+            "runtime_version": crate::runtime_meta::runtime_version(),
+            "runtime_generation": service.get("generation").cloned().unwrap_or(Value::Null),
+            "link_loaded": service.get("link_loaded").cloned().unwrap_or(Value::Null),
+            "service_healthy": service.get("healthy").cloned().unwrap_or(Value::Null),
+        },
+    }))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
+    let client = client_for_origin(&owner.edge_origin)?;
+    extension_fleet_snapshot_with_client(paths, &client)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn extension_fleet_snapshot_with_client(
+    paths: &RuntimePaths,
+    client: &Client,
+) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&owner.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&owner.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client
         .get(endpoint(&owner.edge_origin, "/devices")?)
         .headers(headers)
         .send()
@@ -197,24 +494,24 @@ pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, St
     }))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn create_pairing(
     _paths: &RuntimePaths,
     _ttl_seconds: u64,
     _name: Option<&str>,
 ) -> Result<ExitCode, String> {
-    Err("worker pair currently requires macOS Keychain; refusing to create a pairing on this platform"
+    Err("worker pair is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
         .to_owned())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn create_pairing(
     paths: &RuntimePaths,
     ttl_seconds: u64,
     name: Option<&str>,
 ) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let owner = resolve_owner_link_identity(paths, &config)?;
+    let owner = resolve_fleet_link_identity(paths, &config)?;
     let endpoint = endpoint(&owner.edge_origin, "/devices/pairings")?;
     let mut headers = bearer_headers(&owner.credential)?;
     headers.insert(
@@ -222,7 +519,7 @@ fn create_pairing(
         HeaderValue::from_str(&owner.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&owner.edge_origin)?
         .post(endpoint)
         .headers(headers)
         .json(&pairing_create_request_body(ttl_seconds, name))
@@ -260,21 +557,43 @@ fn create_pairing(
     println!();
     println!("Agent prompt (copy to the new computer's Coding Agent):");
     println!(
-        "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Then enter the separately displayed 6-digit verification code at the no-echo prompt (the code is never part of the copyable command).",
+        "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Then enter the separately displayed 6-digit verification code at the visible CLI prompt (the code is never part of the copyable command).",
         pairing_address
     );
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn connect_existing_worker(
     _paths: &RuntimePaths,
     _pairing_address: &str,
     _name: Option<&str>,
 ) -> Result<ExitCode, String> {
-    Err(
-        "worker connect currently requires macOS Keychain; refusing to pair on this platform"
-            .to_owned(),
+    Err("worker connect is currently supported on macOS and Linux".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn connect_existing_worker(
+    paths: &RuntimePaths,
+    pairing_address: &str,
+    name: Option<&str>,
+) -> Result<ExitCode, String> {
+    let (edge_origin, pairing_id) = parse_pairing_address(pairing_address)?;
+    let code = read_pairing_code_tty()?;
+    connect_macos_inner(
+        paths,
+        &edge_origin,
+        &pairing_id,
+        &code,
+        name,
+        crate::credential_store::store,
+        Config::load_for_instance,
+        write_config_atomic,
+        revoke_self,
+        crate::credential_store::delete,
+        activate_connected_runtime,
+        |_paths| crate::linux_service_manager::reconcile_link(),
+        consume_pairing,
     )
 }
 
@@ -292,37 +611,92 @@ fn connect_existing_worker(
         &pairing_id,
         &code,
         name,
-        crate::macos_credential_helper::store,
+        crate::credential_store::store,
         Config::load_for_instance,
         write_config_atomic,
         revoke_self,
-        crate::macos_credential_helper::delete,
+        crate::credential_store::delete,
         activate_connected_runtime,
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
     )
 }
 
-#[cfg(not(target_os = "macos"))]
-fn revoke_device(_paths: &RuntimePaths, _device_id: &str) -> Result<ExitCode, String> {
-    Err(
-        "worker revoke currently requires macOS Keychain; refusing to revoke on this platform"
-            .to_owned(),
+#[cfg(target_os = "linux")]
+pub(crate) fn adopt_bootstrap_enrollment(
+    paths: &RuntimePaths,
+    edge_origin: &str,
+    enrolled: EnrolledCredential,
+) -> Result<ExitCode, String> {
+    connect_macos_inner(
+        paths,
+        edge_origin,
+        "bootstrap-enrollment",
+        "000000",
+        None,
+        crate::credential_store::store,
+        Config::load_for_instance,
+        write_config_atomic,
+        revoke_self,
+        crate::credential_store::delete,
+        activate_connected_runtime,
+        |_paths| crate::linux_service_manager::reconcile_link(),
+        move |_, _, _, _| Ok(enrolled.clone()),
     )
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn adopt_bootstrap_enrollment(
+    paths: &RuntimePaths,
+    edge_origin: &str,
+    enrolled: EnrolledCredential,
+) -> Result<ExitCode, String> {
+    connect_macos_inner(
+        paths,
+        edge_origin,
+        "bootstrap-enrollment",
+        "000000",
+        None,
+        crate::credential_store::store,
+        Config::load_for_instance,
+        write_config_atomic,
+        revoke_self,
+        crate::credential_store::delete,
+        activate_connected_runtime,
+        crate::link::reconcile_after_service_generation_change,
+        move |_, _, _, _| Ok(enrolled.clone()),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn adopt_bootstrap_enrollment(
+    _paths: &RuntimePaths,
+    _edge_origin: &str,
+    _enrolled: EnrolledCredential,
+) -> Result<ExitCode, String> {
+    Err("first-Worker enrollment activation is currently supported on macOS and Linux".to_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn revoke_device(_paths: &RuntimePaths, _device_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "worker revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, String> {
     let device_id = crate::config::normalize_device_id(device_id)?;
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_owner_link_identity(paths, &config)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/devices/revoke")?)
         .headers(headers)
         .json(&json!({ "device_id": device_id }))
@@ -343,28 +717,29 @@ fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, Stri
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn approve_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
     Err(
-        "connector approval currently requires the macOS enrolled-device credential backend"
+        "connector approval is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, String> {
     if request_id.trim().is_empty() || request_id.len() > 256 {
         return Err("connector approval request id is invalid".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_owner_link_identity(paths, &config)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let inspect = client()?
+    let client = client_for_origin(&identity.edge_origin)?;
+    let inspect = client
         .post(endpoint(&identity.edge_origin, "/connectors/inspect")?)
         .headers(headers.clone())
         .json(&json!({ "request_id": request_id }))
@@ -407,7 +782,7 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
         eprintln!("  expires: {expires_at}");
     }
     let code = read_pairing_code_tty()?;
-    let response = client()?
+    let response = client
         .post(endpoint(&identity.edge_origin, "/connectors/approve")?)
         .headers(headers)
         .json(&json!({ "request_id": request_id, "code": code }))
@@ -427,32 +802,74 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn revoke_connector(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn cancel_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
     Err(
-        "connector revoke currently requires the macOS enrolled-device credential backend"
+        "connector approval cancel is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
             .to_owned(),
     )
 }
 
-#[cfg(target_os = "macos")]
-fn revoke_connector(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
-    let client_id = client_id.trim();
-    if client_id.is_empty() || client_id.len() > 4096 {
-        return Err("connector client id is invalid".to_owned());
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn cancel_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, String> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() || request_id.len() > 256 {
+        return Err("connector approval request id is invalid".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_owner_link_identity(paths, &config)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(&identity.edge_origin, "/connectors/cancel")?)
+        .headers(headers)
+        .json(&json!({ "request_id": request_id }))
+        .send()
+        .map_err(|error| format!("cannot cancel Connector approval: {error}"))?;
+    let payload = parse_json_response(response, "connector approval cancel")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_cancel",
+            "request_id": request_id,
+            "connector_deleted": payload.get("connector_deleted").cloned().unwrap_or(Value::Bool(false)),
+        }))
+        .map_err(|error| format!("cannot encode connector cancel result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn revoke_connector(_paths: &RuntimePaths, _connector_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "connector revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn revoke_connector(paths: &RuntimePaths, connector_id: &str) -> Result<ExitCode, String> {
+    let connector_id = connector_id.trim();
+    if !connector_id.starts_with("conn_") || connector_id.len() > 4096 {
+        return Err("connector id must be a valid conn_ identifier".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/connectors/revoke")?)
         .headers(headers)
-        .json(&json!({ "client_id": client_id }))
+        .json(&connector_revoke_request_body(connector_id))
         .send()
         .map_err(|error| format!("cannot revoke Connector: {error}"))?;
     let payload = parse_json_response(response, "connector revoke")?;
@@ -461,17 +878,58 @@ fn revoke_connector(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, S
         serde_json::to_string_pretty(&json!({
             "ok": true,
             "action": "connector_revoke",
-            "client_id": payload.get("client_id").cloned().unwrap_or(Value::String(client_id.to_owned())),
+            "connector_id": payload.get("connector_id").cloned().unwrap_or(Value::String(connector_id.to_owned())),
         }))
         .map_err(|error| format!("cannot encode connector revoke result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn revoke_connector_client(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "connector client revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() || client_id.len() > 4096 {
+        return Err("connector client id must be non-empty and at most 4096 bytes".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(&identity.edge_origin, "/connectors/revoke")?)
+        .headers(headers)
+        .json(&connector_client_revoke_request_body(client_id))
+        .send()
+        .map_err(|error| format!("cannot revoke Connector client: {error}"))?;
+    let payload = parse_json_response(response, "connector client revoke")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_client_revoke",
+            "client_id": payload.get("client_id").cloned().unwrap_or(Value::String(client_id.to_owned())),
+        }))
+        .map_err(|error| format!("cannot encode connector client revoke result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn set_connector_webchat_control(
     _paths: &RuntimePaths,
-    _client_id: &str,
+    _connector_id: &str,
     _device_id: &str,
     _endpoint_ref: &str,
     _provider: &str,
@@ -479,28 +937,35 @@ fn set_connector_webchat_control(
     _allowed: bool,
 ) -> Result<ExitCode, String> {
     Err(
-        "connector WebChat Control currently requires the macOS enrolled-owner credential backend"
+        "connector WebChat Control requires a supported enrolled-owner credential backend"
             .to_owned(),
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn set_connector_webchat_control(
     paths: &RuntimePaths,
-    client_id: &str,
+    connector_id: &str,
     device_id: &str,
     endpoint_ref: &str,
     provider: &str,
     account_ref: &str,
     allowed: bool,
 ) -> Result<ExitCode, String> {
-    let client_id = client_id.trim();
+    let connector_id = connector_id.trim();
     let device_id = crate::config::normalize_device_id(device_id)?;
     let endpoint_ref = endpoint_ref.trim();
     let provider = provider.trim();
     let account_ref = account_ref.trim();
-    if client_id.is_empty() || client_id.len() > 4096 {
-        return Err("connector client id is invalid".to_owned());
+    if !connector_id.starts_with("conn_")
+        || connector_id.len() < 13
+        || connector_id.len() > 133
+        || !connector_id
+            .chars()
+            .skip(5)
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err("connector id is invalid".to_owned());
     }
     if endpoint_ref.is_empty()
         || endpoint_ref.len() > 96
@@ -525,21 +990,21 @@ fn set_connector_webchat_control(
         return Err("browser provider is invalid".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_owner_link_identity(paths, &config)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(
             &identity.edge_origin,
             "/connectors/webchat-control",
         )?)
         .headers(headers)
         .json(&json!({
-            "client_id": client_id,
+            "connector_id": connector_id,
             "device_id": device_id,
             "endpoint_ref": endpoint_ref,
             "provider": provider,
@@ -554,7 +1019,7 @@ fn set_connector_webchat_control(
         serde_json::to_string_pretty(&json!({
             "ok": true,
             "action": "connector_webchat_control_set",
-            "client_id": client_id,
+            "connector_id": connector_id,
             "device_id": device_id,
             "endpoint_ref": endpoint_ref,
             "provider": provider,
@@ -566,25 +1031,293 @@ fn set_connector_webchat_control(
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn rename_current_device(_paths: &RuntimePaths, _name: &str) -> Result<ExitCode, String> {
-    Err(
-        "worker rename currently requires macOS Keychain; refusing to rename on this platform"
-            .to_owned(),
-    )
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn set_connector_page_assist(
+    _paths: &RuntimePaths,
+    _connector_id: &str,
+    _device_id: &str,
+    _endpoint_ref: &str,
+    _allowed: bool,
+) -> Result<ExitCode, String> {
+    Err("connector Page Assist requires a supported enrolled-owner credential backend".to_owned())
 }
 
-#[cfg(target_os = "macos")]
-fn rename_current_device(paths: &RuntimePaths, name: &str) -> Result<ExitCode, String> {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn set_connector_page_assist(
+    paths: &RuntimePaths,
+    connector_id: &str,
+    device_id: &str,
+    endpoint_ref: &str,
+    allowed: bool,
+) -> Result<ExitCode, String> {
+    let connector_id = connector_id.trim();
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let endpoint_ref = endpoint_ref.trim();
+    if !connector_id.starts_with("conn_")
+        || connector_id.len() < 13
+        || connector_id.len() > 133
+        || !connector_id
+            .chars()
+            .skip(5)
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err("connector id is invalid".to_owned());
+    }
+    if endpoint_ref.is_empty()
+        || endpoint_ref.len() > 96
+        || endpoint_ref.chars().any(char::is_control)
+    {
+        return Err("browser endpoint ref is invalid".to_owned());
+    }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_owner_link_identity(paths, &config)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
         HeaderValue::from_str(&identity.workstation_id)
             .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
     );
-    let response = client()?
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(&identity.edge_origin, "/connectors/page-assist")?)
+        .headers(headers)
+        .json(&json!({
+            "connector_id": connector_id,
+            "device_id": device_id,
+            "endpoint_ref": endpoint_ref,
+            "allowed": allowed,
+        }))
+        .send()
+        .map_err(|error| format!("cannot change Connector Page Assist grant: {error}"))?;
+    let payload = parse_json_response(response, "connector Page Assist")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_page_assist_set",
+            "connector_id": connector_id,
+            "device_id": device_id,
+            "endpoint_ref": endpoint_ref,
+            "allowed": payload.get("allowed").cloned().unwrap_or(Value::Bool(allowed)),
+        }))
+        .map_err(|error| format!("cannot encode Connector Page Assist result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn list_connectors(_paths: &RuntimePaths, _include_all: bool) -> Result<ExitCode, String> {
+    Err(
+        "connector inventory is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn list_connectors(paths: &RuntimePaths, include_all: bool) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .get(endpoint(&identity.edge_origin, "/connectors")?)
+        .headers(headers)
+        .send()
+        .map_err(|error| format!("cannot list Connectors: {error}"))?;
+    let payload = render_connector_inventory(
+        parse_json_response(response, "connector inventory")?,
+        inventory_now_ms(),
+        include_all,
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode connector inventory: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn create_automation(
+    _paths: &RuntimePaths,
+    _name: &str,
+    _device: &str,
+) -> Result<ExitCode, String> {
+    Err("automation credential provisioning is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn create_automation(paths: &RuntimePaths, name: &str, device: &str) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(&identity.edge_origin, "/automations")?)
+        .headers(headers)
+        .json(&automation_create_request_body(name, device))
+        .send()
+        .map_err(|error| format!("cannot create automation credential: {error}"))?;
+    let payload = parse_json_response(response, "automation credential creation")?;
+    let client_id = required_string(&payload, "client_id")?;
+    let client_secret = required_string(&payload, "client_secret")?;
+    let token_endpoint = required_string(&payload, "token_endpoint")?;
+    let mcp_url = endpoint(&identity.edge_origin, "/mcp")?.to_string();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "automation_create",
+            "name": name,
+            "device": device,
+            "device_id": payload.get("device_id").cloned().unwrap_or(Value::Null),
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "token_endpoint": token_endpoint,
+            "mcp_url": mcp_url,
+            "scope": "mcp",
+            "gitlab_variables": {
+                "HERDR_MCP_URL": mcp_url,
+                "HERDR_MCP_CLIENT_ID": client_id,
+                "HERDR_MCP_CLIENT_SECRET": client_secret,
+            },
+            "secret_display": "one_time",
+        }))
+        .map_err(|error| format!("cannot encode automation credential result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn list_automations(_paths: &RuntimePaths) -> Result<ExitCode, String> {
+    Err("automation credential inventory is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn list_automations(paths: &RuntimePaths) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .get(endpoint(&identity.edge_origin, "/automations")?)
+        .headers(headers)
+        .send()
+        .map_err(|error| format!("cannot list automation credentials: {error}"))?;
+    let payload = render_automation_inventory(
+        parse_json_response(response, "automation credential inventory")?,
+        inventory_now_ms(),
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode automation credential inventory: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rotate_automation(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
+    Err("automation credential rotation is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rotate_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(&identity.edge_origin, "/automations/rotate")?)
+        .headers(headers)
+        .json(&json!({ "client_id": client_id }))
+        .send()
+        .map_err(|error| format!("cannot rotate automation credential: {error}"))?;
+    let payload = parse_json_response(response, "automation credential rotation")?;
+    let secret = required_string(&payload, "client_secret")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "automation_rotate",
+            "client_id": client_id,
+            "client_secret": secret,
+            "gitlab_variable": { "HERDR_MCP_CLIENT_SECRET": secret },
+            "secret_display": "one_time",
+        }))
+        .map_err(|error| format!("cannot encode automation rotation result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn revoke_automation(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
+    Err("automation credential revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn revoke_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(&identity.edge_origin, "/automations/revoke")?)
+        .headers(headers)
+        .json(&json!({ "client_id": client_id }))
+        .send()
+        .map_err(|error| format!("cannot revoke automation credential: {error}"))?;
+    let payload = parse_json_response(response, "automation credential revoke")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "automation_revoke",
+            "client_id": payload.get("client_id").cloned().unwrap_or(Value::String(client_id.to_owned())),
+        }))
+        .map_err(|error| format!("cannot encode automation revoke result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_current_device(_paths: &RuntimePaths, _name: &str) -> Result<ExitCode, String> {
+    Err(
+        "worker rename is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_current_device(paths: &RuntimePaths, name: &str) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
         .post(endpoint(&identity.edge_origin, "/devices/rename-self")?)
         .headers(headers)
         .json(&json!({
@@ -607,6 +1340,24 @@ fn rename_current_device(paths: &RuntimePaths, name: &str) -> Result<ExitCode, S
         .map_err(|error| format!("cannot encode device rename result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(target_os = "linux")]
+fn activate_connected_runtime(_paths: &RuntimePaths) -> Result<(), String> {
+    let code = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false })?;
+    if code != ExitCode::SUCCESS {
+        return Err(format!(
+            "Linux service install returned a non-success exit code: {code:?}"
+        ));
+    }
+    let service = crate::linux_service_manager::doctor_status()?;
+    if service.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(
+            "herdr-mcp Linux service is not healthy after worker connect activation".to_owned(),
+        );
+    }
+    crate::linux_service_manager::ensure_link_installed()?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -685,7 +1436,7 @@ fn activate_connected_runtime_inner(paths: &RuntimePaths, home: &Path) -> Result
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn compensate_after_store(
     edge_origin: &str,
@@ -701,7 +1452,7 @@ fn compensate_after_store(
     (revoked, deleted)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct ReconcileRollbackEvidence {
     revoked: bool,
@@ -712,7 +1463,7 @@ struct ReconcileRollbackEvidence {
     reconcile_error: Option<String>,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn rollback_after_reconcile_failure<H, I, J, K>(
@@ -765,7 +1516,7 @@ where
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn connect_macos_inner<F, G, H, I, J, K, L, M>(
@@ -940,14 +1691,14 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn consume_pairing(
     edge_origin: &str,
     pairing_id: &str,
     code: &str,
     name: Option<&str>,
 ) -> Result<EnrolledCredential, String> {
-    let response = client()?
+    let response = client_for_origin(edge_origin)?
         .post(endpoint(edge_origin, "/devices/pairings/consume")?)
         .header(CONTENT_TYPE, "application/json")
         .json(&pairing_consume_request_body(pairing_id, code, name))
@@ -961,9 +1712,9 @@ fn consume_pairing(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn revoke_self(edge_origin: &str, workstation_id: &str, credential: &str) -> Result<bool, String> {
-    let response = client()?
+    let response = client_for_origin(edge_origin)?
         .post(endpoint(edge_origin, "/devices/revoke-self")?)
         .headers(bearer_headers(credential)?)
         .json(&json!({ "workstation_id": workstation_id }))
@@ -973,10 +1724,10 @@ fn revoke_self(edge_origin: &str, workstation_id: &str, credential: &str) -> Res
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_owner_link_identity(
+fn resolve_fleet_link_identity(
     paths: &RuntimePaths,
     config: &Config,
-) -> Result<OwnerLinkIdentity, String> {
+) -> Result<FleetLinkIdentity, String> {
     // A current enrolled device has both the canonical device id and Edge
     // origin in config, so it must not depend on a LaunchAgent plist merely to
     // create another short-lived pairing. Older installs may still need the
@@ -989,16 +1740,38 @@ fn resolve_owner_link_identity(
         None
     };
     let (workstation_id, keychain_service, edge_origin) =
-        resolve_owner_link_fields(config, plist_env.as_ref())?;
+        resolve_fleet_link_fields(config, plist_env.as_ref())?;
     let account = current_account()?;
     let credential =
-        crate::macos_credential_helper::load(&keychain_service, &account).map_err(|error| {
-            owner_device_required_error(&format!(
-                "the enrolled owner credential is unavailable: {error}"
+        crate::credential_store::load(&keychain_service, &account).map_err(|error| {
+            enrolled_device_required_error(&format!(
+                "the enrolled device credential is unavailable: {error}"
             ))
         })?;
     let _ = paths;
-    Ok(OwnerLinkIdentity {
+    Ok(FleetLinkIdentity {
+        edge_origin,
+        workstation_id,
+        credential,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_fleet_link_identity(
+    paths: &RuntimePaths,
+    config: &Config,
+) -> Result<FleetLinkIdentity, String> {
+    let (workstation_id, credential_service, edge_origin) =
+        resolve_fleet_link_fields(config, None)?;
+    let account = current_account()?;
+    let credential =
+        crate::credential_store::load(&credential_service, &account).map_err(|error| {
+            enrolled_device_required_error(&format!(
+                "the enrolled device credential is unavailable: {error}"
+            ))
+        })?;
+    let _ = paths;
+    Ok(FleetLinkIdentity {
         edge_origin,
         workstation_id,
         credential,
@@ -1048,17 +1821,18 @@ fn production_link_environment_if_present()
     ))
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn owner_device_required_error(reason: &str) -> String {
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn enrolled_device_required_error(reason: &str) -> String {
     format!(
-        "`herdr-mcp worker pair` requires an already-enrolled Herdr owner device; {reason}. \
-On a new computer joining an existing fleet, use `herdr-mcp worker connect <pairing-address>` with a pairing created by an already-authorized device or WebChat. \
-If this is the first Herdr device, complete the first-owner Cloudflare bootstrap instead of running `worker pair`."
+        "This fleet operation requires credentials for a device already enrolled in the target Herdr Worker; {reason}. \
+Herdr devices enrolled in the same Worker have no owner/member hierarchy for fleet administration. \
+On a new computer joining an existing fleet, use `herdr-mcp worker connect <pairing-address>` with a pairing created by any enrolled device or an explicitly approved WebChat. \
+If this is the first Herdr device, complete the first-Worker Cloudflare bootstrap before using pairing or Connector administration."
     )
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn resolve_owner_link_fields(
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn resolve_fleet_link_fields(
     config: &Config,
     plist_env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<(String, String, String), String> {
@@ -1067,7 +1841,7 @@ fn resolve_owner_link_fields(
         .clone()
         .or_else(|| plist_env.and_then(|env| env.get("HERDR_WORKSTATION_ID").cloned()))
         .ok_or_else(|| {
-            owner_device_required_error("no enrolled device identity is present on this machine")
+            enrolled_device_required_error("no enrolled device identity is present on this machine")
         })?;
     let keychain_service = config
         .edge_link_keychain_service()
@@ -1079,7 +1853,7 @@ fn resolve_owner_link_fields(
             let edge_url = plist_env
                 .and_then(|env| env.get("HERDR_EDGE_URL"))
                 .ok_or_else(|| {
-                    owner_device_required_error(
+                    enrolled_device_required_error(
                         "no existing fleet Cloudflare/Edge origin is present on this machine",
                     )
                 })?;
@@ -1089,7 +1863,7 @@ fn resolve_owner_link_fields(
     Ok((workstation_id, keychain_service, edge_origin))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), String> {
     fs::create_dir_all(&paths.config_dir).map_err(|error| {
@@ -1125,16 +1899,12 @@ fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), Stri
     })
 }
 
-#[cfg(target_os = "macos")]
-fn client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .redirect(Policy::none())
-        .build()
-        .map_err(|error| format!("cannot initialize Worker HTTP client: {error}"))
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn client_for_origin(edge_origin: &str) -> Result<Client, String> {
+    crate::worker_bootstrap::client_for_edge_origin(edge_origin)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn bearer_headers(credential: &str) -> Result<HeaderMap, String> {
     if credential.is_empty() || credential.len() > 4096 || credential.chars().any(char::is_control)
     {
@@ -1148,7 +1918,7 @@ fn bearer_headers(credential: &str) -> Result<HeaderMap, String> {
     Ok(headers)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_json_response(response: Response, operation: &str) -> Result<Value, String> {
     let status = response.status();
     let payload: Value = response
@@ -1164,7 +1934,7 @@ fn parse_json_response(response: Response, operation: &str) -> Result<Value, Str
     Ok(payload)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn endpoint(origin: &str, path: &str) -> Result<Url, String> {
     let mut url = Url::parse(&normalize_edge_origin(origin)?)
         .map_err(|error| format!("invalid Worker origin: {error}"))?;
@@ -1174,7 +1944,7 @@ fn endpoint(origin: &str, path: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn normalize_edge_origin(value: &str) -> Result<String, String> {
     let mut config = Config::default();
@@ -1184,7 +1954,7 @@ fn normalize_edge_origin(value: &str) -> Result<String, String> {
         .ok_or_else(|| "Worker origin is missing".to_owned())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn origin_from_ws_url(value: &str) -> Result<String, String> {
     let mut url =
@@ -1202,7 +1972,7 @@ fn origin_from_ws_url(value: &str) -> Result<String, String> {
     normalize_edge_origin(url.as_str())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn required_string(value: &Value, key: &str) -> Result<String, String> {
     value
         .get(key)
@@ -1212,7 +1982,7 @@ fn required_string(value: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("Worker response is missing {key}"))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_pairing_id(value: &str) -> Result<(), String> {
     if !value.starts_with("pair_") {
@@ -1225,7 +1995,7 @@ fn validate_pairing_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_pairing_code(value: &str) -> Result<(), String> {
     if value.len() == 6 && value.chars().all(|ch| ch.is_ascii_digit()) {
@@ -1235,7 +2005,7 @@ fn validate_pairing_code(value: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn format_pairing_code(code: &str) -> String {
     if code.len() == 6 {
@@ -1245,7 +2015,7 @@ fn format_pairing_code(code: &str) -> String {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_pairing_address(value: &str) -> Result<(String, String), String> {
     let url = Url::parse(value).map_err(|_| "pairing address must be a valid URL".to_owned())?;
@@ -1273,7 +2043,7 @@ fn parse_pairing_address(value: &str) -> Result<(String, String), String> {
     Ok((origin, pairing_id.to_owned()))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn read_pairing_code_from<R: BufRead>(reader: &mut R) -> Result<String, String> {
     let mut line = String::new();
@@ -1285,37 +2055,22 @@ fn read_pairing_code_from<R: BufRead>(reader: &mut R) -> Result<String, String> 
     Ok(code.to_owned())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_pairing_code_tty() -> Result<String, String> {
     use std::io::IsTerminal;
     let stdin = io::stdin();
-    if !stdin.is_terminal() {
-        // Noninteractive: read a single line from stdin without echo concerns.
-        let mut reader = io::BufReader::new(stdin.lock());
-        return read_pairing_code_from(&mut reader);
+    if stdin.is_terminal() {
+        // The six-digit value is a short-lived verification code, not a
+        // password. Keep it out of argv/shell history, but let users see what
+        // they type so transcription mistakes are obvious.
+        eprint!("Enter 6-digit verification code: ");
+        let _ = io::stderr().flush();
     }
-    // Interactive TTY: disable echo while reading the code, then always restore.
-    let fd = libc::STDIN_FILENO;
-    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
-        return Err("cannot read terminal settings for pairing code input".to_owned());
-    }
-    let original = unsafe { termios.assume_init() };
-    let mut no_echo = original;
-    no_echo.c_lflag &= !libc::ECHO;
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &no_echo) } != 0 {
-        return Err("cannot disable echo for pairing code input".to_owned());
-    }
-    eprint!("Enter 6-digit verification code: ");
-    let _ = io::stderr().flush();
-    let result = read_pairing_code_from(&mut io::BufReader::new(io::stdin().lock()));
-    // Always restore echo, even on error.
-    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
-    eprintln!();
-    result
+    let mut reader = io::BufReader::new(stdin.lock());
+    read_pairing_code_from(&mut reader)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_device_secret(value: &str) -> Result<(), String> {
     let suffix = value
@@ -1327,7 +2082,7 @@ fn validate_device_secret(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn current_account() -> Result<String, String> {
     env::var("USER")
@@ -1336,7 +2091,7 @@ fn current_account() -> Result<String, String> {
         .filter(|value| {
             !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
         })
-        .ok_or_else(|| "USER is required for macOS Keychain device credentials".to_owned())
+        .ok_or_else(|| "USER is required for enrolled-device credentials".to_owned())
 }
 
 #[cfg(test)]
@@ -1348,7 +2103,7 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn print_json(value: &Value) -> Result<(), String> {
     println!(
@@ -1409,17 +2164,18 @@ mod tests {
     }
 
     #[test]
-    fn fresh_machine_cannot_be_mistaken_for_pairing_owner() {
-        let error = resolve_owner_link_fields(&Config::default(), None).unwrap_err();
-        assert!(error.contains("requires an already-enrolled Herdr owner device"));
+    fn fresh_machine_cannot_be_mistaken_for_enrolled_fleet_device() {
+        let error = resolve_fleet_link_fields(&Config::default(), None).unwrap_err();
+        assert!(error.contains("requires credentials for a device already enrolled"));
+        assert!(error.contains("no owner/member hierarchy"));
         assert!(error.contains("worker connect <pairing-address>"));
-        assert!(error.contains("first-owner Cloudflare bootstrap"));
+        assert!(error.contains("first-Worker Cloudflare bootstrap"));
         assert!(!error.contains("dev.herdr-mcp.link-prod.plist"));
         assert!(!error.contains("Io("));
     }
 
     #[test]
-    fn enrolled_config_does_not_require_link_plist_for_owner_identity() {
+    fn enrolled_config_does_not_require_link_plist_for_fleet_identity() {
         let mut config = Config::default();
         config
             .set_edge_device_id("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
@@ -1429,7 +2185,7 @@ mod tests {
             .unwrap();
 
         let (device_id, keychain_service, origin) =
-            resolve_owner_link_fields(&config, None).unwrap();
+            resolve_fleet_link_fields(&config, None).unwrap();
         assert_eq!(device_id, "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_eq!(
             keychain_service,
@@ -1439,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_owner_can_still_resolve_from_production_link_environment() {
+    fn legacy_install_can_still_resolve_from_production_link_environment() {
         let mut env = std::collections::BTreeMap::new();
         env.insert(
             "HERDR_WORKSTATION_ID".to_owned(),
@@ -1454,7 +2210,7 @@ mod tests {
             "legacy-owner-service".to_owned(),
         );
         let (device_id, keychain_service, origin) =
-            resolve_owner_link_fields(&Config::default(), Some(&env)).unwrap();
+            resolve_fleet_link_fields(&Config::default(), Some(&env)).unwrap();
         assert_eq!(device_id, "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_eq!(keychain_service, "legacy-owner-service");
         assert_eq!(origin, "https://edge.example");
@@ -1475,6 +2231,113 @@ mod tests {
     }
 
     #[test]
+    fn inventory_rendering_exposes_age_usage_and_never_used() {
+        let now = 1_000_000_000_u64;
+        let two_days_ago = now - 2 * 24 * 60 * 60 * 1_000;
+        let three_hours_ago = now - 3 * 60 * 60 * 1_000;
+
+        let connectors = render_connector_inventory(
+            json!({
+                "ok": true,
+                "connectors": [{
+                    "connector_id": "conn_example123",
+                    "client_id": "client-1",
+                    "client_name": "ChatGPT",
+                    "scope": "mcp",
+                    "created_at_ms": two_days_ago,
+                    "last_used_at_ms": null,
+                    "grant_origin": "explicit_approval",
+                    "status": "active"
+                }],
+                "legacy_clients": [{
+                    "client_id": "legacy-1",
+                    "client_name": "Old client",
+                    "created_at_ms": two_days_ago,
+                    "last_used_at_ms": null,
+                    "grant_origin": "pre_v0_4_6_legacy",
+                    "registration_state": "active_credentials"
+                }]
+            }),
+            now,
+            false,
+        );
+        assert_eq!(connectors["connectors"][0]["age"], "2d");
+        assert_eq!(connectors["connectors"][0]["last_used"], "never used");
+        assert_eq!(connectors["connectors"][0]["usage_state"], "never_used");
+        assert_eq!(
+            connectors["legacy_clients"][0]["last_used"],
+            "unknown (pre-v0.4.6)"
+        );
+        assert_eq!(
+            connectors["legacy_clients"][0]["usage_state"],
+            "unknown_legacy"
+        );
+
+        let inventory = json!({
+            "token_counts": {"active_access": 6, "active_refresh": 10},
+            "connectors": [
+                {"connector_id": "conn_active123", "status": "active", "active_access_tokens": 1, "active_refresh_tokens": 2},
+                {"connector_id": "conn_revoked123", "status": "revoked", "active_access_tokens": 2, "active_refresh_tokens": 3}
+            ],
+            "legacy_clients": [
+                {"client_id": "legacy-active", "registration_state": "active_credentials", "active_access_tokens": 1, "active_refresh_tokens": 1},
+                {"client_id": "legacy-revoked", "registration_state": "revoked", "active_access_tokens": 2, "active_refresh_tokens": 4}
+            ]
+        });
+        let filtered = render_connector_inventory(inventory.clone(), now, false);
+        assert_eq!(filtered["connectors"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["legacy_clients"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["inventory_filter"], "actionable");
+        assert_eq!(filtered["token_counts_scope"], "all_stored");
+        assert_eq!(filtered["token_counts"]["active_access"], 6);
+        assert_eq!(filtered["token_counts"]["active_refresh"], 10);
+        assert_eq!(filtered["listed_token_counts"]["active_access"], 2);
+        assert_eq!(filtered["listed_token_counts"]["active_refresh"], 3);
+        assert_eq!(filtered["listed_token_counts_scope"], "displayed_records");
+
+        let all = render_connector_inventory(inventory, now, true);
+        assert_eq!(all["connectors"].as_array().unwrap().len(), 2);
+        assert_eq!(all["legacy_clients"].as_array().unwrap().len(), 2);
+        assert_eq!(all["inventory_filter"], "all");
+        assert_eq!(all["listed_token_counts"]["active_access"], 6);
+        assert_eq!(all["listed_token_counts"]["active_refresh"], 10);
+
+        let automations = render_automation_inventory(
+            json!({
+                "automations": [{
+                    "client_id": "svc_example123",
+                    "name": "gitlab:project",
+                    "created_at_ms": two_days_ago,
+                    "last_used_at_ms": three_hours_ago
+                }]
+            }),
+            now,
+        );
+        assert_eq!(automations["automations"][0]["age"], "2d");
+        assert!(
+            automations["automations"][0]["last_used"]
+                .as_str()
+                .unwrap()
+                .contains("(3h ago)")
+        );
+
+        let devices = render_device_inventory(
+            json!({
+                "devices": [{
+                    "device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    "name": "macbook",
+                    "enrolled_at_ms": two_days_ago,
+                    "last_seen_at_ms": null
+                }]
+            }),
+            now,
+        );
+        assert_eq!(devices["devices"][0]["age"], "2d");
+        assert_eq!(devices["devices"][0]["last_used"], "never used");
+        assert_eq!(devices["devices"][0]["usage_state"], "never_used");
+    }
+
+    #[test]
     fn pairing_request_bodies_omit_unspecified_name_and_preserve_explicit_name() {
         let unnamed_create = pairing_create_request_body(600, None);
         assert_eq!(unnamed_create["ttl_seconds"], 600);
@@ -1491,6 +2354,10 @@ mod tests {
 
         let named_consume = pairing_consume_request_body(pairing_id, "123456", Some("Nathan Mac"));
         assert_eq!(named_consume["name"], "Nathan Mac");
+
+        let revoke_client = connector_client_revoke_request_body("https://legacy.example/client");
+        assert_eq!(revoke_client["client_id"], "https://legacy.example/client");
+        assert!(revoke_client.get("connector_id").is_none());
     }
 
     #[test]
@@ -1520,6 +2387,37 @@ mod tests {
 
         let mut short = std::io::Cursor::new(b"123\n".to_vec());
         assert!(read_pairing_code_from(&mut short).is_err());
+    }
+
+    #[test]
+    fn automation_create_body_is_explicitly_device_bound() {
+        let body = automation_create_request_body(
+            "gitlab:group/project:prod",
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        assert_eq!(body["name"], "gitlab:group/project:prod");
+        assert_eq!(body["device"], "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        // A unique-name selector is passed through verbatim; never resolved client-side.
+        let named = automation_create_request_body("gitlab:ci:pipeline", "build-runner-01");
+        assert_eq!(named["device"], "build-runner-01");
+    }
+
+    #[test]
+    fn connector_revoke_body_uses_connector_id_not_client_id() {
+        let body = connector_revoke_request_body("conn_abc123XYZ");
+        assert_eq!(body["connector_id"], "conn_abc123XYZ");
+        assert!(body.get("client_id").is_none());
+    }
+
+    #[test]
+    fn management_request_bodies_never_carry_enrollment_secrets() {
+        // The body builders only ever include the device selector and never a
+        // device/owner secret, so a leaked request can never expose credentials.
+        let automation = automation_create_request_body("gitlab:ci", "build-runner-01");
+        assert!(!automation.to_string().contains("secret"));
+        assert!(!automation.to_string().contains("credential"));
+        let revoke = connector_revoke_request_body("conn_abc");
+        assert!(!revoke.to_string().contains("secret"));
     }
 
     #[test]

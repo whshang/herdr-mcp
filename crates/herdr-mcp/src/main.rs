@@ -10,6 +10,7 @@ mod child_process;
 mod cli;
 mod config;
 mod contract;
+mod credential_store;
 mod dev;
 pub mod development_orchestration;
 mod device_name;
@@ -28,7 +29,10 @@ mod herdr;
 mod herdr_supervisor;
 mod inspect;
 mod instance;
+mod instance_admin;
 mod link;
+#[cfg(any(target_os = "linux", test))]
+mod linux_service_manager;
 mod local_skills;
 mod macos_credential_helper;
 mod macos_keychain;
@@ -46,6 +50,7 @@ mod product_lifecycle;
 mod progressive_skills;
 mod projects;
 mod prompt;
+mod qualification;
 mod relay;
 mod release_trust;
 mod residue;
@@ -67,17 +72,46 @@ mod text_transfer;
 mod update_scheduler;
 mod updater;
 mod updater_store;
-// Wired only from the macOS service manager; keep unit tests compiling on Linux CI.
-#[cfg(any(target_os = "macos", test))]
+// The stable PATH link is a Unix ownership primitive shared by launchd and
+// systemd-user installations.
+#[cfg(any(unix, test))]
 mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
 mod worker;
+mod worker_bootstrap;
 mod workstation;
 
-use std::process::ExitCode;
+use std::{any::Any, panic, process::ExitCode};
 
 fn main() -> ExitCode {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if !panic_payload_is_broken_pipe(info.payload()) {
+            default_hook(info);
+        }
+    }));
+    match panic::catch_unwind(main_inner) {
+        Ok(code) => code,
+        Err(payload) if panic_payload_is_broken_pipe(payload.as_ref()) => ExitCode::SUCCESS,
+        Err(payload) => panic::resume_unwind(payload),
+    }
+}
+
+fn panic_payload_is_broken_pipe(payload: &(dyn Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied());
+    message
+        .is_some_and(|message| message.contains("Broken pipe") || message.contains("os error 32"))
+}
+
+fn main_inner() -> ExitCode {
+    // Pin runtime start evidence at process entry so later cursor-reset
+    // attribution is measured against the actual process lifetime, not the
+    // first diagnostics call that happens to request build metadata.
+    let _ = runtime_meta::runtime_started_at_ms();
     match run() {
         Ok(code) => code,
         Err(error) => {
@@ -94,8 +128,16 @@ fn run() -> Result<ExitCode, String> {
         unsafe { std::env::set_var("HERDR_MCP_INSTANCE", name) };
     }
     match parsed.command {
-        cli::Command::Help => {
-            print!("{}", cli::help());
+        cli::Command::Help { section } => {
+            let text = match section {
+                cli::HelpSection::General => cli::help(),
+                cli::HelpSection::Worker => cli::worker_help(),
+                cli::HelpSection::Connector => cli::connector_help(),
+                cli::HelpSection::Automation => cli::automation_help(),
+                cli::HelpSection::Instance => cli::instance_help(),
+                cli::HelpSection::Qualification => cli::qualification_help(),
+            };
+            print!("{text}");
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Version => {
@@ -196,6 +238,8 @@ fn run() -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        cli::Command::Instance(command) => instance_admin::run(command),
+        cli::Command::Qualification(command) => qualification::run(command),
         cli::Command::Worker(command) => worker::run(command),
         cli::Command::Dev(command) => dev::run(command),
         cli::Command::Candidate { port } => {
@@ -203,7 +247,24 @@ fn run() -> Result<ExitCode, String> {
             mcp_http::serve_candidate(port)
         }
         cli::Command::Service(command) => service_lifecycle::run(command),
-        cli::Command::Update(command) => updater::run(command),
+        cli::Command::Update(command) => {
+            let trigger = match &command {
+                cli::UpdateCommand::Auto => Some("auto_update"),
+                cli::UpdateCommand::Apply { .. } => Some("manual_update"),
+                _ => None,
+            };
+            if let Some(trigger) = trigger {
+                // Fail before update network/discovery/download work. The
+                // service manager re-checks under its mutation lease before
+                // any generation replacement, so this early gate improves
+                // latency while the service boundary remains authoritative.
+                qualification::ensure_generation_change_allowed(trigger)?;
+                // Detached update workers inherit this non-secret attribution
+                // tag and the candidate service-install records it durably.
+                unsafe { std::env::set_var("HERDR_MCP_GENERATION_TRIGGER", trigger) };
+            }
+            updater::run(command)
+        }
         cli::Command::Extension(command) => match command {
             cli::ExtensionCommand::StandaloneInstall { reference } => {
                 standalone_extension::run_install(standalone_extension::StandaloneInstallOptions {
@@ -226,5 +287,18 @@ fn run() -> Result<ExitCode, String> {
                 link::run_link_migrate_runtime_control(mode)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod broken_pipe_tests {
+    use super::panic_payload_is_broken_pipe;
+
+    #[test]
+    fn broken_pipe_detection_is_narrow() {
+        let broken = "failed printing to stdout: Broken pipe (os error 32)".to_owned();
+        let ordinary = "ordinary panic".to_owned();
+        assert!(panic_payload_is_broken_pipe(&broken));
+        assert!(!panic_payload_is_broken_pipe(&ordinary));
     }
 }

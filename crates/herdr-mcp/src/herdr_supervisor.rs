@@ -10,6 +10,14 @@ use std::process::ExitCode;
 
 pub(crate) const LABEL: &str = crate::instance::DEFAULT_HERDR_SUPERVISOR_LABEL;
 
+#[cfg(target_os = "macos")]
+fn service_should_manage_supervisor(paths: &RuntimePaths) -> Result<bool, String> {
+    if paths.instance.is_named() {
+        return Ok(false);
+    }
+    Ok(!platform::shared_owned_supervisor_for_other_config(paths)?)
+}
+
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct InstallState {
@@ -38,7 +46,7 @@ pub(crate) fn run(command: HerdrSupervisorCommand) -> Result<ExitCode, String> {
                 );
                 Ok(ExitCode::SUCCESS)
             }
-            _ => Err("Herdr dependency supervisor is currently macOS-only".to_owned()),
+            _ => Err("the managed Herdr dependency supervisor is a macOS launchd integration; Linux herdr-mcp service lifecycle does not use this supervisor".to_owned()),
         }
     }
 }
@@ -46,7 +54,8 @@ pub(crate) fn run(command: HerdrSupervisorCommand) -> Result<ExitCode, String> {
 pub(crate) fn ensure_installed_for_service() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        if RuntimePaths::discover()?.instance.is_named() {
+        let paths = RuntimePaths::discover()?;
+        if !service_should_manage_supervisor(&paths)? {
             return Ok(());
         }
         platform::ensure_installed()
@@ -60,7 +69,8 @@ pub(crate) fn ensure_installed_for_service() -> Result<(), String> {
 pub(crate) fn capture_install_state_for_service() -> Result<InstallState, String> {
     #[cfg(target_os = "macos")]
     {
-        if RuntimePaths::discover()?.instance.is_named() {
+        let paths = RuntimePaths::discover()?;
+        if !service_should_manage_supervisor(&paths)? {
             return Ok(InstallState::default());
         }
         platform::install_state()
@@ -74,7 +84,8 @@ pub(crate) fn capture_install_state_for_service() -> Result<InstallState, String
 pub(crate) fn preflight_install_for_service() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        if RuntimePaths::discover()?.instance.is_named() {
+        let paths = RuntimePaths::discover()?;
+        if !service_should_manage_supervisor(&paths)? {
             return Ok(());
         }
         platform::preflight_install()
@@ -88,7 +99,8 @@ pub(crate) fn preflight_install_for_service() -> Result<(), String> {
 pub(crate) fn restore_install_state_for_service(state: InstallState) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        if RuntimePaths::discover()?.instance.is_named() {
+        let paths = RuntimePaths::discover()?;
+        if !service_should_manage_supervisor(&paths)? {
             return Ok(());
         }
         platform::restore_install_state(state)
@@ -100,6 +112,7 @@ pub(crate) fn restore_install_state_for_service(state: InstallState) -> Result<(
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) fn runtime_binary_supports_supervisor(binary: &std::path::Path) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
@@ -116,7 +129,8 @@ pub(crate) fn runtime_binary_supports_supervisor(binary: &std::path::Path) -> Re
 pub(crate) fn reconcile_after_service_rollback() -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
-        if RuntimePaths::discover()?.instance.is_named() {
+        let paths = RuntimePaths::discover()?;
+        if !service_should_manage_supervisor(&paths)? {
             return Ok(false);
         }
         platform::reconcile_after_service_rollback()
@@ -144,7 +158,8 @@ pub(crate) fn doctor_line() -> String {
 pub(crate) fn remove_for_service() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        if RuntimePaths::discover()?.instance.is_named() {
+        let paths = RuntimePaths::discover()?;
+        if !service_should_manage_supervisor(&paths)? {
             return Ok(());
         }
         platform::uninstall(false).map(|_| ())
@@ -1175,6 +1190,48 @@ mod platform {
         Ok(bytes)
     }
 
+    pub(super) fn shared_owned_supervisor_for_other_config(
+        runtime: &RuntimePaths,
+    ) -> Result<bool, String> {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "cannot determine HOME for Herdr supervisor".to_owned())?;
+        let plist = home
+            .join("Library/LaunchAgents")
+            .join(format!("{LABEL}.plist"));
+        if !plist.exists() {
+            return Ok(false);
+        }
+        let value = PlistValue::from_file(&plist)
+            .map_err(|error| format!("cannot parse existing supervisor plist: {error}"))?;
+        let Some(owner_config) = owned_config_root_from_plist(&value) else {
+            return Ok(false);
+        };
+        Ok(owner_config != runtime.config_dir)
+    }
+
+    pub(super) fn owned_config_root_from_plist(value: &PlistValue) -> Option<PathBuf> {
+        let dict = value.as_dictionary()?;
+        if dict.get("Label").and_then(PlistValue::as_string) != Some(LABEL) {
+            return None;
+        }
+        let args = dict.get("ProgramArguments")?.as_array()?;
+        let args = args
+            .iter()
+            .map(PlistValue::as_string)
+            .collect::<Option<Vec<_>>>()?;
+        if args.len() != 3 || args[1] != "herdr-supervisor" || args[2] != "run" {
+            return None;
+        }
+        let environment = dict.get("EnvironmentVariables")?.as_dictionary()?;
+        let owner_config = PathBuf::from(environment.get("HERDR_MCP_CONFIG_DIR")?.as_string()?);
+        let expected_binary = owner_config.join("runtime/current/herdr-mcp");
+        if Path::new(args[0]) != expected_binary {
+            return None;
+        }
+        Some(owner_config)
+    }
+
     fn owned_plist(paths: &SupervisorPaths) -> Result<bool, String> {
         let value = PlistValue::from_file(&paths.plist)
             .map_err(|error| format!("cannot parse existing supervisor plist: {error}"))?;
@@ -1265,6 +1322,57 @@ mod tests {
         assert_eq!(
             install_disposition(false, true, false, false).unwrap(),
             InstallDisposition::WritePlist
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_supervisor_owner_requires_matching_config_root_and_runtime_argv() {
+        use plist::{Dictionary, Value as PlistValue};
+        use std::path::PathBuf;
+
+        let owner = PathBuf::from("/tmp/herdr-owned-config");
+        let mut environment = Dictionary::new();
+        environment.insert(
+            "HERDR_MCP_CONFIG_DIR".to_owned(),
+            PlistValue::String(owner.to_string_lossy().into_owned()),
+        );
+        let mut dict = Dictionary::new();
+        dict.insert("Label".to_owned(), PlistValue::String(LABEL.to_owned()));
+        dict.insert(
+            "ProgramArguments".to_owned(),
+            PlistValue::Array(vec![
+                PlistValue::String(
+                    owner
+                        .join("runtime/current/herdr-mcp")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                PlistValue::String("herdr-supervisor".to_owned()),
+                PlistValue::String("run".to_owned()),
+            ]),
+        );
+        dict.insert(
+            "EnvironmentVariables".to_owned(),
+            PlistValue::Dictionary(environment),
+        );
+        let valid = PlistValue::Dictionary(dict.clone());
+        assert_eq!(
+            platform::owned_config_root_from_plist(&valid),
+            Some(owner.clone())
+        );
+
+        dict.insert(
+            "ProgramArguments".to_owned(),
+            PlistValue::Array(vec![
+                PlistValue::String("/tmp/foreign/herdr-mcp".to_owned()),
+                PlistValue::String("herdr-supervisor".to_owned()),
+                PlistValue::String("run".to_owned()),
+            ]),
+        );
+        assert_eq!(
+            platform::owned_config_root_from_plist(&PlistValue::Dictionary(dict)),
+            None
         );
     }
 

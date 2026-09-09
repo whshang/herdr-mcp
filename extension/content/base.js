@@ -94,6 +94,8 @@ class BaseAdapter {
 // outside the page DOM and cannot be automated by the extension.
 const H2W_PERMISSION_DIALOG_RE = /(允许|授权|权限|同意|allow|permission|grant|approve)/i;
 const H2W_ALLOW_BUTTON_RE = /^(ok|yes|continue)$/i;
+const H2W_PERSISTENT_ALLOW_BUTTON_RE = /^(始终允许|always allow)$/i;
+const H2W_HERDR_APP_RE = /\bherdr\b/i;
 const H2W_DENY_BUTTON_RE = /(拒绝|取消|不允许|deny|decline|block|no\b)/i;
 function isPermissionDialogText(text) {
   return H2W_PERMISSION_DIALOG_RE.test(text || "");
@@ -106,6 +108,11 @@ function isAllowButtonText(text) {
   if (/^(允许|同意|授权|allow|approve|grant)/i.test(t)) return true;
   if (H2W_ALLOW_BUTTON_RE.test(t)) return true; // Whole words: ok/yes/continue.
   return false;
+}
+function isPersistentAllowButtonText(text) {
+  const t = String(text || "").trim();
+  if (!t || t.length > 24) return false;
+  return H2W_PERSISTENT_ALLOW_BUTTON_RE.test(t);
 }
 function isDenyButtonText(text) {
   const t = String(text || "").trim();
@@ -143,6 +150,9 @@ function textExcludingButtons(node) {
   return out;
 }
 function nonButtonText(node) { return textExcludingButtons(node); }
+function isHerdrPermissionCard(card) {
+  return H2W_HERDR_APP_RE.test(nonButtonText(card));
+}
 
 // Require an explicit deny or cancel action.
 function hasDenyButton(card) {
@@ -205,7 +215,7 @@ function dialogCardForButton(btn) {
 }
 
 // Whether this button is safe to auto-click as Allow.
-function isClickableAllowButton(btn) {
+function isClickableAllowButton(btn, labelPredicate = isAllowButtonText) {
   if (!btn) return false;
   if (btn.isConnected === false) return false;
   const hasAttr = typeof btn.hasAttribute === "function";
@@ -224,13 +234,20 @@ function isClickableAllowButton(btn) {
   // Require explicit affirmative text.
   const label = buttonLabel(btn);
   if (!label) return false;
-  return isAllowButtonText(label);
+  return labelPredicate(label);
 }
 
 // Find a clickable Allow action and its permission card within root.
 function findAllowAction(root) {
   const doc = root || document;
   const btns = qsa(doc, BUTTON_SELECTOR);
+  // Pass 0: for Herdr's ChatGPT permission card, prefer the explicit persistent
+  // action when present. Other apps keep the existing one-time Allow behavior.
+  for (const b of btns) {
+    if (!isClickableAllowButton(b, isPersistentAllowButtonText)) continue;
+    const card = preciseCardForButton(b);
+    if (card && isHerdrPermissionCard(card)) return { button: b, card };
+  }
   // Pass 1: exact ChatGPT tool-action path.
   for (const b of btns) {
     if (!isClickableAllowButton(b)) continue;
@@ -267,6 +284,8 @@ function createPermissionClicker() {
 window.__H2W_PERMISSION__ = {
   isPermissionDialogText,
   isAllowButtonText,
+  isPersistentAllowButtonText,
+  isHerdrPermissionCard,
   isDenyButtonText,
   buttonLabel,
   nonButtonText,

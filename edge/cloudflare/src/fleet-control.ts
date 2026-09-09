@@ -59,12 +59,12 @@ const METHOD_FIELDS: Record<FleetControlMethod, { required: string[]; optional?:
   "herdr_mcp.planner_lease.takeover": { required: ["work_chain_id", "expected_chain_revision", "expected_lease_generation", "idempotency_key", "reason"], optional: ["ttl_ms"] },
   "herdr_mcp.execution_lane.create": {
     required: ["work_chain_id", "expected_chain_revision", "expected_lease_generation", "idempotency_key", "device_id", "repo_id", "base_commit", "branch_ref"],
-    optional: ["file_scope", "runtime_scope", "agent_ref", "status", "validation_summary"],
+    optional: ["file_scope", "runtime_scope", "agent_ref", "status", "validation_summary", "webchat_binding"],
   },
   "herdr_mcp.execution_lane.inspect": { required: ["lane_id"] },
   "herdr_mcp.execution_lane.update": {
     required: ["work_chain_id", "expected_chain_revision", "expected_lease_generation", "expected_lane_generation", "lane_id", "idempotency_key"],
-    optional: ["status", "validation_summary", "reassign", "device_id"],
+    optional: ["status", "validation_summary", "reassign", "device_id", "webchat_binding"],
   },
 };
 
@@ -88,6 +88,19 @@ const FIELD_SCHEMAS: Record<string, Record<string, unknown>> = {
   status: { type: "string", enum: ["planned", "active", "blocked", "completed", "cancelled"] },
   reassign: { type: "boolean" },
   validation_summary: { type: ["string", "null"], maxLength: 4096 },
+  webchat_binding: {
+    type: ["object", "null"],
+    properties: {
+      endpoint_ref: { type: "string", minLength: 1, maxLength: 96 },
+      provider: { type: "string", minLength: 1, maxLength: 32 },
+      account_ref: { type: "string", minLength: 1, maxLength: 96 },
+      space_ref: { type: ["string", "null"], minLength: 1, maxLength: 96 },
+      session_ref: { type: "string", minLength: 1, maxLength: 96 },
+      observation_generation: { type: "integer", minimum: 1 },
+    },
+    required: ["endpoint_ref", "provider", "account_ref", "session_ref", "observation_generation"],
+    additionalProperties: false,
+  },
   summary: { type: "string", minLength: 1, maxLength: 8192 },
   checkpoint_json: { type: "string", minLength: 2, maxLength: 65536 },
   checkpoint_sha256: { type: "string", pattern: "^[0-9a-fA-F]{64}$" },
@@ -212,8 +225,20 @@ export interface ExecutionLaneRecord {
   status: "planned" | "active" | "blocked" | "completed" | "cancelled";
   validation_summary: string | null;
   validation_refs: string[];
+  webchat_binding: WebChatLaneBinding | null;
   created_at_ms: number;
   updated_at_ms: number;
+}
+
+export interface WebChatLaneBinding {
+  schema_version: 1;
+  endpoint_ref: string;
+  provider: string;
+  account_ref: string;
+  space_ref: string | null;
+  session_ref: string;
+  observation_generation: number;
+  bound_at_ms: number;
 }
 
 interface IdempotencyRecord {
@@ -250,6 +275,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function boundedString(value: unknown, max = MAX_STRING): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= max;
+}
+
+function browserOpaqueRef(value: unknown, prefix: "bep_" | "br_"): value is string {
+  return typeof value === "string" && new RegExp(`^${prefix}[0-9a-f]{64}$`).test(value);
 }
 
 function integer(value: unknown, min = 0): value is number {
@@ -446,8 +475,41 @@ function normalizeLane(value: unknown): ExecutionLaneRecord | null {
   if (!(value.agent_ref === null || boundedString(value.agent_ref, 1024))) return null;
   if (value.status !== "planned" && value.status !== "active" && value.status !== "blocked" && value.status !== "completed" && value.status !== "cancelled") return null;
   if (!(value.validation_summary === null || boundedString(value.validation_summary, 4096))) return null;
+  const webchatBinding = normalizeStoredWebChatBinding(value.webchat_binding);
+  if (value.webchat_binding !== undefined && value.webchat_binding !== null && !webchatBinding) return null;
   if (!integer(value.created_at_ms, 0) || !integer(value.updated_at_ms, 0)) return null;
-  return { ...value, file_scope: fileScope, runtime_scope: runtimeScope, validation_refs: validationRefs } as unknown as ExecutionLaneRecord;
+  return { ...value, file_scope: fileScope, runtime_scope: runtimeScope, validation_refs: validationRefs, webchat_binding: webchatBinding } as unknown as ExecutionLaneRecord;
+}
+
+function normalizeStoredWebChatBinding(value: unknown): WebChatLaneBinding | null {
+  if (value === undefined || value === null) return null;
+  if (!isRecord(value) || value.schema_version !== 1) return null;
+  if (!browserOpaqueRef(value.endpoint_ref, "bep_") || !boundedString(value.provider, 32) || !browserOpaqueRef(value.account_ref, "br_")) return null;
+  if (!(value.space_ref === null || browserOpaqueRef(value.space_ref, "br_"))) return null;
+  if (!browserOpaqueRef(value.session_ref, "br_") || !integer(value.observation_generation, 1) || !integer(value.bound_at_ms, 0)) return null;
+  return value as unknown as WebChatLaneBinding;
+}
+
+function normalizeWebChatBindingInput(value: unknown, nowMs: number): WebChatLaneBinding | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (!isRecord(value)) return undefined;
+  const allowed = new Set(["endpoint_ref", "provider", "account_ref", "space_ref", "session_ref", "observation_generation"]);
+  if (Object.keys(value).some((key) => !allowed.has(key))) return undefined;
+  if (!browserOpaqueRef(value.endpoint_ref, "bep_") || !boundedString(value.provider, 32) || !browserOpaqueRef(value.account_ref, "br_")) return undefined;
+  const spaceRef = value.space_ref === undefined || value.space_ref === null ? null : browserOpaqueRef(value.space_ref, "br_") ? value.space_ref : undefined;
+  if (spaceRef === undefined) return undefined;
+  if (!browserOpaqueRef(value.session_ref, "br_") || !integer(value.observation_generation, 1)) return undefined;
+  return {
+    schema_version: 1,
+    endpoint_ref: value.endpoint_ref,
+    provider: value.provider,
+    account_ref: value.account_ref,
+    space_ref: spaceRef,
+    session_ref: value.session_ref,
+    observation_generation: value.observation_generation,
+    bound_at_ms: nowMs,
+  };
 }
 
 function normalizeIdempotency(value: unknown): IdempotencyRecord | null {
@@ -779,6 +841,8 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
         if (!runtimeScope) return error("invalid_params", { field: "runtime_scope" });
         const status = params.status === undefined ? "planned" : params.status;
         if (status !== "planned" && status !== "active") return error("invalid_lane_status");
+        const webchatBinding = normalizeWebChatBindingInput(params.webchat_binding, nowMs);
+        if (params.webchat_binding !== undefined && webchatBinding === undefined) return error("invalid_params", { field: "webchat_binding" });
         const reservationKey = await laneReservationStorageKey(repoId, branchRef);
         const reservation = normalizeLaneReservation(await tx.get(reservationKey));
         if (reservation) {
@@ -789,7 +853,7 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
           await tx.delete(reservationKey);
         }
         const laneId = newOpaqueId("lane");
-        const lane: ExecutionLaneRecord = { schema_version: 1, lane_id: laneId, work_chain_id: id, lane_generation: 1, device_id: params.device_id, repo_id: repoId, base_commit: params.base_commit.toLowerCase(), branch_ref: branchRef, file_scope: fileScope, runtime_scope: runtimeScope, owner_principal: principal, agent_ref: boundedString(params.agent_ref, 1024) ? params.agent_ref : null, status, validation_summary: boundedString(params.validation_summary, 4096) ? params.validation_summary : null, validation_refs: [], created_at_ms: nowMs, updated_at_ms: nowMs };
+        const lane: ExecutionLaneRecord = { schema_version: 1, lane_id: laneId, work_chain_id: id, lane_generation: 1, device_id: params.device_id, repo_id: repoId, base_commit: params.base_commit.toLowerCase(), branch_ref: branchRef, file_scope: fileScope, runtime_scope: runtimeScope, owner_principal: principal, agent_ref: boundedString(params.agent_ref, 1024) ? params.agent_ref : null, status, validation_summary: boundedString(params.validation_summary, 4096) ? params.validation_summary : null, validation_refs: [], webchat_binding: webchatBinding ?? null, created_at_ms: nowMs, updated_at_ms: nowMs };
         await tx.put(LANE_PREFIX + laneId, lane);
         await tx.put(reservationKey, { schema_version: 1, lane_id: laneId, work_chain_id: id, repo_id: repoId, branch_ref: branchRef, created_at_ms: nowMs } satisfies LaneReservationRecord);
         const next: WorkChainRecord = { ...chain, revision: chain.revision + 1, updated_at_ms: nowMs };
@@ -809,9 +873,16 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
         const reassign = params.reassign === true;
         const targetDeviceId = params.device_id === undefined ? lane.device_id : boundedString(params.device_id, 128) ? params.device_id : null;
         if (!targetDeviceId) return error("invalid_params", { field: "device_id" });
+        const requestedWebChatBinding = normalizeWebChatBindingInput(params.webchat_binding, nowMs);
+        if (params.webchat_binding !== undefined && requestedWebChatBinding === undefined) return error("invalid_params", { field: "webchat_binding" });
         const ownershipChanges = lane.owner_principal !== principal || targetDeviceId !== lane.device_id;
         if (ownershipChanges && !reassign) return error(lane.owner_principal !== principal ? "execution_lane_owner_mismatch" : "execution_lane_reassign_required");
         if (reassign && terminalLane(lane.status)) return error("execution_lane_terminal");
+        if (targetDeviceId !== lane.device_id
+          && (lane.webchat_binding !== null || params.webchat_binding !== undefined)
+          && params.webchat_binding !== null) {
+          return error("execution_lane_webchat_unbind_required");
+        }
         if (reassign) {
           const targetDevice = normalizeDeviceRecord(await tx.get(DEVICE_PREFIX + targetDeviceId));
           if (!targetDevice) return error("device_not_found");
@@ -819,7 +890,7 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
         }
         const validationSummary = params.validation_summary === undefined ? lane.validation_summary : params.validation_summary === null ? null : boundedString(params.validation_summary, 4096) ? params.validation_summary : undefined;
         if (validationSummary === undefined) return error("invalid_params");
-        const nextLane: ExecutionLaneRecord = { ...lane, lane_generation: lane.lane_generation + 1, device_id: targetDeviceId, owner_principal: reassign ? principal : lane.owner_principal, status: nextStatus, validation_summary: validationSummary, updated_at_ms: nowMs };
+        const nextLane: ExecutionLaneRecord = { ...lane, lane_generation: lane.lane_generation + 1, device_id: targetDeviceId, owner_principal: reassign ? principal : lane.owner_principal, status: nextStatus, validation_summary: validationSummary, webchat_binding: params.webchat_binding === undefined ? lane.webchat_binding : requestedWebChatBinding ?? null, updated_at_ms: nowMs };
         await tx.put(LANE_PREFIX + lane.lane_id, nextLane);
         if (!terminalLane(lane.status) && terminalLane(nextLane.status)) {
           await tx.delete(await laneReservationStorageKey(lane.repo_id, lane.branch_ref));

@@ -100,6 +100,16 @@
       <label id="lab_experimental_deepseek" for="experimentalDeepSeekEnabled">Enable chat.deepseek.com integration</label>
       <div class="hint" id="hint_experimental_deepseek"></div>
     </div>
+    <div class="switch-row">
+      <input type="checkbox" id="experimentalGeminiEnabled">
+      <label id="lab_experimental_gemini" for="experimentalGeminiEnabled">Enable gemini.google.com integration</label>
+      <div class="hint" id="hint_experimental_gemini"></div>
+    </div>
+    <div class="switch-row">
+      <input type="checkbox" id="experimentalGrokEnabled">
+      <label id="lab_experimental_grok" for="experimentalGrokEnabled">Enable grok.com integration</label>
+      <div class="hint" id="hint_experimental_grok"></div>
+    </div>
   </section>
 
   <section class="card">
@@ -124,6 +134,14 @@
     <label id="lab_llm_skip">No-send keywords (done tokens)</label>
     <textarea id="llmJudgeSkipKeywords" style="height:72px"></textarea>
     <div class="hint" id="hint_llm_skip"></div>
+  </section>
+
+  <section class="card">
+    <h2 id="title_page_assist">Page Assist</h2>
+    <div class="hint" id="hint_page_assist">Explicit per-origin permissions for generic page inspection and interaction.</div>
+    <label id="lab_page_assist_origins">Allowed origins (one per line, e.g. https://example.com)</label>
+    <textarea id="pageAssistOrigins" placeholder="https://example.com" style="height:72px"></textarea>
+    <div class="hint" id="hint_page_assist_origins">Permissions are requested directly from this settings page when saving.</div>
   </section>
 
   <section class="card">

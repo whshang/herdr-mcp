@@ -1,5 +1,7 @@
 use serde_json::{Map, Value, json};
 
+const AMBIGUOUS_CONTEXT_CANDIDATE_LIMIT: usize = 8;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PatchOp {
     Add {
@@ -189,6 +191,11 @@ pub fn apply_update_hunks(
             ));
         }
         if matches.len() > 1 {
+            let candidate_start_lines = matches
+                .iter()
+                .take(AMBIGUOUS_CONTEXT_CANDIDATE_LIMIT)
+                .map(|start| start + 1)
+                .collect::<Vec<_>>();
             return Err(PatchError::new(
                 "PATCH_CONTEXT_AMBIGUOUS",
                 format!(
@@ -199,9 +206,14 @@ pub fn apply_update_hunks(
             .with_detail("path", json!(file_path))
             .with_detail("hunk_index", json!(index))
             .with_detail("match_count", json!(matches.len()))
+            .with_detail("candidate_start_lines", json!(candidate_start_lines))
+            .with_detail(
+                "candidate_lines_truncated",
+                json!(matches.len() > AMBIGUOUS_CONTEXT_CANDIDATE_LIMIT),
+            )
             .with_detail(
                 "retry_hint",
-                json!("Include additional unchanged context lines."),
+                json!("Read around candidate_start_lines, then include enough unchanged context to identify exactly one location."),
             ));
         }
         let start = matches[0];
@@ -314,10 +326,24 @@ mod tests {
 
     #[test]
     fn ambiguous_context_is_rejected() {
-        let error = apply_update_hunks("x\nx\n", &[vec!["-x".to_owned(), "+y".to_owned()]], "f")
-            .unwrap_err();
+        let error = apply_update_hunks(
+            "x\nx\nx\nx\nx\nx\nx\nx\nx\n",
+            &[vec!["-x".to_owned(), "+y".to_owned()]],
+            "f",
+        )
+        .unwrap_err();
         assert_eq!(error.code, "PATCH_CONTEXT_AMBIGUOUS");
-        assert_eq!(error.details["match_count"], 2);
+        assert_eq!(error.details["match_count"], 9);
+        assert_eq!(
+            error.details["candidate_start_lines"],
+            json!([1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert_eq!(error.details["candidate_lines_truncated"], true);
+        assert!(
+            error.details["retry_hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("candidate_start_lines"))
+        );
     }
 
     #[test]

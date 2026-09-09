@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "linux", allow(dead_code))]
+
 use crate::cli::ServiceCommand;
 #[cfg(target_os = "macos")]
 use crate::native_host_install;
@@ -38,6 +40,12 @@ where
 }
 
 pub(crate) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
+    #[cfg(target_os = "linux")]
+    {
+        service_manager::run(command)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     match command {
         ServiceCommand::Install { adopt_node } => run_install(adopt_node),
         ServiceCommand::Rollback => run_rollback(),
