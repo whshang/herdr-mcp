@@ -50,7 +50,7 @@ for (const r of referenced) {
   ok(existsSync(path.join(EXT, r)), `manifest reference exists: ${r}`);
 }
 ok(manifest.background?.type === "module", "background is a module worker");
-ok(manifest.content_scripts.length === 2
+ok(manifest.content_scripts.length === 3
     && manifest.content_scripts.every((entry) => !entry.matches.some((match) => /z\.ai|deepseek/.test(match))),
   "manifest keeps only always-on ChatGPT/Claude scripts; experimental sites register dynamically");
 ok(manifest.permissions?.includes("nativeMessaging"), "manifest enables Chrome Native Messaging for automatic local authentication");
@@ -72,6 +72,7 @@ const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const rustNativeHostSource = readFileSync(path.join(EXT, "..", "crates", "herdr-mcp", "src", "native_host.rs"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
+const chatGptPerfMainSource = readFileSync(path.join(EXT, "content", "chatgpt-perf-main.js"), "utf8");
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
@@ -81,6 +82,7 @@ const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
 ok(manifest.version === "0.1.90", "manifest version stays aligned with the browser product build");
+ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
 ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.90"'), "background version matches manifest");
 ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.90"'), "content version matches manifest");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
@@ -267,6 +269,29 @@ ok(
   "JSON bridge keeps running past round 12 until the assistant returns a non-tool answer",
 );
 ok(
+  jsonBridgeSource.includes('type: "h2w_json_bridge_call_batch"')
+    && jsonBridgeSource.includes("const MAX_BATCH_CALLS = 24")
+    && jsonBridgeSource.includes("if (calls.length > MAX_BATCH_CALLS)")
+    && !jsonBridgeSource.includes("Promise.all(chunk.map(callTool))")
+    && backgroundSource.includes('msg?.type === "h2w_json_bridge_call_batch"')
+    && backgroundSource.includes("const JSON_BRIDGE_MAX_PARALLEL = 4")
+    && backgroundSource.includes("jsonBridgeNativeBatch")
+    && localAuthSource.includes("localHerdrBatchFetch")
+    && rustNativeHostSource.includes('"request_batch"')
+    && rustNativeHostSource.includes("MAX_NATIVE_REQUEST_BATCH_PARALLEL"),
+  "JSON bridge collapses each bounded model tool wave into one content/background/native batch with bounded workstation concurrency and legacy fallback",
+);
+const chatGptPerfScript = manifest.content_scripts.find((entry) => entry.js?.includes("content/chatgpt-perf-main.js"));
+ok(
+  chatGptPerfScript?.matches?.includes("https://chatgpt.com/*")
+    && chatGptPerfScript?.run_at === "document_start"
+    && chatGptPerfScript?.world === "MAIN"
+    && chatGptPerfMainSource.includes('const EXTERNAL_API = "__CHATGPT_CM_PERF_FIX__"')
+    && chatGptPerfMainSource.includes('announced?.classList.contains("cm-announced")')
+    && chatGptPerfMainSource.includes('scroller?.classList.contains("cm-scroller")'),
+  "ChatGPT installs a MAIN-world document-start exact-fingerprint CodeMirror batch mount and yields to the known userscript",
+);
+ok(
   jsonBridgeSource.includes("root.parentElement.insertBefore(bar, root)")
     && jsonBridgeSource.includes('root.style.display = expanded ? originalDisplay : "none"')
     && !jsonBridgeSource.includes("root.insertBefore(bar, root.firstChild)"),
@@ -287,7 +312,10 @@ ok(
   "effective automation gives the compact HUD one deterministic light-green Auto-on treatment",
 );
 ok(
-  manifest.content_scripts.find((cs) => cs.matches?.includes("https://chatgpt.com/*"))?.js?.includes("context-pressure.js"),
+  manifest.content_scripts.some((cs) => cs.matches?.includes("https://chatgpt.com/*")
+    && cs.js?.includes("context-pressure.js")
+    && cs.js?.includes("content/wake.js")
+    && cs.js.indexOf("context-pressure.js") < cs.js.indexOf("content/wake.js")),
   "ChatGPT loads the classic context-pressure policy before wake.js",
 );
 ok(
@@ -812,10 +840,12 @@ ok(optionsHtml.includes('id="manualContinueMessage"')
     && optionsSource.includes('"progressTemplate", "manualContinueMessage", "automationMode"')
     && optionsSource.includes('manualContinueMessage: $("manualContinueMessage").value.trim() || t("manual_continue_message")')
     && backgroundSource.includes('function configuredManualContinueMessage()')
-    && backgroundSource.includes('const nudgeText = configuredManualContinueMessage();')
+    && backgroundSource.includes('function autoGoalContinueMessage()')
+    && backgroundSource.includes('const nudgeText = autoGoalContinueMessage();')
     && backgroundSource.includes('template: configuredManualContinueMessage(),')
-    && zhLocale.manual_continue_message !== "继续",
-  "manual Continue and bounded Auto fallback use one editable preset message instead of a bare Continue token");
+    && zhLocale.manual_continue_message !== "继续"
+    && zhLocale.auto_goal_loop_instruction.includes("下一步：我会继续完成剩余工作"),
+  "manual Continue stays editable while no-judge Auto adds one explicit remaining-work signal for bounded goal chaining");
 const wakeDocEn = readFileSync(path.join(EXT, "..", "docs", "i18n", "en", "browser-continuity.md"), "utf8");
 const wakeDocZh = readFileSync(path.join(EXT, "..", "docs", "i18n", "zh-CN", "browser-continuity.md"), "utf8");
 ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
@@ -1035,7 +1065,7 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
   "handoff commit migrates queued user messages to every supported target cutover path");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js",
+const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/gemini.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {
@@ -1576,6 +1606,7 @@ ok(looksLikeSubstantiveReply(
   "I ran herdr_inspect and herdr_exec. The MCP server is healthy and all panes are idle. Next I will run the pytest suite for convex."
 ), "long prose reply is substantive");
 ok(assistantDeclaresPendingWork("当前已经定位。\n\n下一步\n\n我会继续做两件事：读取 request id，然后修最小范围。"), "explicit Chinese self-declared next work is pending");
+ok(assistantDeclaresPendingWork("下一步：我会继续完成剩余工作。"), "Auto goal-loop Chinese marker is recognized as pending");
 ok(assistantDeclaresPendingWork("Validation is not yet complete.\nNext: I will run the production smoke test."), "explicit English self-declared next work is pending");
 ok(!assistantDeclaresPendingWork("处理已经完成。下一步建议用户可以考虑补充更多监控。"), "optional next-step advice is not forced pending");
 ok(shouldAutoContinueWithoutLlm("请检查并继续", "本轮已经完成。"), "no-LLM Auto sends one bounded fallback after an ordinary turn");
