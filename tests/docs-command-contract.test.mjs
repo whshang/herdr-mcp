@@ -140,3 +140,20 @@ test("continuity guide stays no-ID and fail-closed while README only links the f
     assert.match(read(rel), /browser-continuity\.md/);
   }
 });
+
+test("current CLI references document native language and output contracts", () => {
+  for (const locale of ["en", "zh-CN", "ja"]) {
+    const doc = read("docs/i18n/" + locale + "/cli-reference.md");
+    for (const command of ["status --json", "status --details", "doctor --json", "doctor --details",
+      "lang auto", "lang zh-CN", "help agent", "help advanced", "--help-all"]) {
+      assert.ok(doc.includes("herdr-mcp " + command), command);
+    }
+    assert.match(doc, /HERDR_MCP_LANG/);
+    assert.match(doc, /LC_MESSAGES/);
+    assert.match(doc, /AppleLanguages/);
+    assert.match(doc, /300/);
+    assert.match(doc, /scan --json/);
+    assert.match(doc, /authenticated_remote_mcp: "not_probed"/);
+    assert.match(doc, /overall: "pass"/);
+  }
+});

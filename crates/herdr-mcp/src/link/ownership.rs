@@ -736,8 +736,7 @@ fn agent_json(agent: &LinkAgentView, home: &Path) -> Value {
 }
 
 /// Compact one-line doctor LAYER summary.
-pub fn doctor_layer_summary(home: &Path, config_dir: &Path) -> String {
-    let report = collect_status_report(home, config_dir);
+pub fn doctor_layer_summary(report: &Value) -> String {
     let owner = report
         .get("production_owner")
         .and_then(Value::as_str)

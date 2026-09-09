@@ -1,6 +1,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpSection {
     General,
+    Agent,
+    Advanced,
+    All,
     Worker,
     Connector,
     Automation,
@@ -16,6 +19,9 @@ pub enum Command {
     Version,
     Status,
     Doctor,
+    Lang {
+        preference: Option<String>,
+    },
     Uninstall,
     Reinstall,
     DocumentsProbe,
@@ -224,10 +230,20 @@ pub enum UpdateCommand {
     Worker { job_id: String },
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    #[default]
+    Human,
+    Details,
+    Json,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Parsed {
     /// Optional `--instance NAME` / `-i NAME` (sugar for `HERDR_MCP_INSTANCE`).
     pub instance: Option<String>,
+    pub lang: Option<crate::locale::Locale>,
+    pub output: OutputMode,
     pub command: Command,
 }
 
@@ -236,12 +252,38 @@ where
     I: IntoIterator<Item = String>,
 {
     let args = args.into_iter().collect::<Vec<_>>();
-    let (instance, args) = strip_instance_flag(&args)?;
+    let (lang, args) = crate::locale::strip_lang_flag(&args)?;
+    let (instance, mut args) = strip_instance_flag(&args)?;
+    let mut output = OutputMode::Human;
+    if matches!(args.first().map(String::as_str), Some("status" | "doctor")) {
+        if matches!(&args[1..], [flag] if flag == "--help" || flag == "-h") {
+            return Ok(Parsed {
+                instance,
+                lang,
+                output,
+                command: Command::Help {
+                    section: HelpSection::General,
+                },
+            });
+        }
+        output = match &args[1..] {
+            [] => OutputMode::Human,
+            [flag] if flag == "--json" => OutputMode::Json,
+            [flag] if flag == "--details" => OutputMode::Details,
+            _ => return Err("usage: status|doctor [--json|--details]".to_owned()),
+        };
+        args.truncate(1);
+    }
     let command = parse_command(&args)?;
     if instance.is_some() && matches!(command, Command::Instance(_)) {
         return Err("--instance cannot be combined with instance list/reap".to_owned());
     }
-    Ok(Parsed { instance, command })
+    Ok(Parsed {
+        instance,
+        lang,
+        output,
+        command,
+    })
 }
 
 fn strip_instance_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
@@ -288,7 +330,31 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         });
     };
 
+    if args == ["--help-all"] {
+        return Ok(Command::Help {
+            section: HelpSection::All,
+        });
+    }
+    if args == ["help", "agent"] {
+        return Ok(Command::Help {
+            section: HelpSection::Agent,
+        });
+    }
+    if args == ["help", "advanced"] {
+        return Ok(Command::Help {
+            section: HelpSection::Advanced,
+        });
+    }
     match command {
+        "lang" => match &args[1..] {
+            [] => Ok(Command::Lang { preference: None }),
+            [value] if value == "auto" || crate::locale::Locale::explicit(value).is_some() => {
+                Ok(Command::Lang {
+                    preference: Some(value.clone()),
+                })
+            }
+            _ => Err("usage: herdr-mcp lang [auto|en|zh-CN|ja]".to_owned()),
+        },
         "help" | "-h" | "--help" => no_extra(
             args,
             Command::Help {
@@ -328,7 +394,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "extension-host" => parse_extension_host(&args[1..]),
         "artifact" => parse_artifact(&args[1..]),
         "link" => parse_link(&args[1..]),
-        value => Err(format!("unknown command '{value}'\n\n{}", help())),
+        value => Err(format!("unknown command '{value}'; use herdr-mcp --help")),
     }
 }
 
@@ -1436,124 +1502,68 @@ fn parse_extension_host(args: &[String]) -> Result<Command, String> {
     }
 }
 
-pub fn help() -> &'static str {
-    "Herdr MCP native runtime\n\n\
-User path:\n\
-  herdr-mcp install\n\
-  herdr-mcp status\n\
-  herdr-mcp doctor  (exit 0 = no known failure in probed layers; E2E readiness is DOCTOR_JSON.overall)\n\
-  herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
-  herdr-mcp scan [--json] [--refresh] [--probe]\n\
-  herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
-  herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
-  herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
-  herdr-mcp worker bootstrap  (macOS/Linux first device; guided Cloudflare Worker + enrollment bootstrap)\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS/Linux enrolled device; creates pairing for another computer)\n\
-  herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS/Linux; uses the platform credential store and reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
-  herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
-  herdr-mcp connector list  (enrolled-device credential; non-secret connector inventory)\n\
-  herdr-mcp connector approve <approval-request-id>  (macOS/Linux enrolled device; reads the 6-digit code interactively, never argv)\n\
-  herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
-  herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
-  herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm  (macOS/Linux enrolled owner device)\n\
-  herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
-  herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
-  herdr-mcp automation list\n\
-  herdr-mcp automation rotate <client-id> --confirm\n\
-  herdr-mcp automation revoke <client-id> --confirm\n\
-  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
-  herdr-mcp extension standalone <install [--ref REF]|status>\n\
-  herdr-mcp rollback  (macOS product rollback; Linux service rollback is not exposed)\n\
-  herdr-mcp reinstall  (macOS product lifecycle; Linux repair uses herdr-mcp install)\n\
-  herdr-mcp uninstall  (macOS product lifecycle; Linux removal uses service uninstall)\n\n\
-Same-machine UAT isolation (macOS launchd path):\n\
-  herdr-mcp --instance uat install\n\
-  HERDR_MCP_INSTANCE=uat herdr-mcp doctor\n\
-  Named macOS instances use distinct LaunchAgent labels, a non-8772 port, and\n\
-  ~/.config/herdr-mcp-<name>. They never rewrite ~/.local/bin/herdr-mcp.\n\n\
-Advanced / internal:\n\
-  herdr-mcp version\n\
-  herdr-mcp config [path|show|init [--edge-origin https://host]|set-edge-origin https://host]\n\
-  herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
-  herdr-mcp herdr-supervisor <install|status|enable|disable|start|stop|uninstall>\n\
-  herdr-mcp link status\n\
-  herdr-mcp link run\n\
-  herdr-mcp link install\n\
-  herdr-mcp link uninstall\n\
-  herdr-mcp link cutover [--dry-run|--execute|--rollback]\n\
-  herdr-mcp link seal [status|record --dual-uat|record --rollback-uat|--dry-run|--execute]\n\
-  herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n\
-  herdr-mcp tcc-broker <install [--force]|status|uninstall>\n\
-  herdr-mcp native-host <install|status|uninstall|rollback>\n\
-  herdr-mcp native-host dev <enable [PATH]|disable>\n\
-  herdr-mcp native-host use <store|standalone|dev>\n\
-  herdr-mcp extension-host [chrome-extension://.../]\n\
-  herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME | --signed-url] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
-  (--signed-url imports a safe signed HTTPS URL directly; R2 relay objects use
-  HERDR_ARTIFACT_CAPABILITY, which is never a CLI arg)\n\
-  herdr-mcp dev [status]\n\
-  herdr-mcp dev sync [--dry-run] [--allow-dirty]\n\
-  herdr-mcp dev rollback\n\
-  herdr-mcp candidate [--port 8873]\n\n\
-Prefer top-level install/status/doctor/permissions/scan/update for normal lifecycle on both\n\
-macOS and Linux. macOS also exposes product rollback/reinstall/uninstall; on Linux use install\n\
-for repair and service uninstall for explicit service removal. Use service ... otherwise only for\n\
-advanced service control (for example macOS service install --adopt-node). link status is read-only ownership/gates reporting.\n\
-On Linux, link install/reconcile activates the enrolled production Link through the Linux\n\
-service manager; Linux Link removal follows the Linux service lifecycle. On macOS, link\n\
-run/install/uninstall retain the candidate LaunchAgent dev.herdr-mcp.link-rust-candidate soak path\n\
-used by the launchd migration machinery. Candidate defaults to an epoch-2 Edge (edge-prod) and refuses install\n\
-when Edge /health is still epoch 1. macOS link cutover defaults to dry-run plan/validate only;\n\
---execute / --rollback\n\
-require HERDR_LINK_CUTOVER_I_UNDERSTAND=1, mutate only link-prod via\n\
-bootout/bootstrap (never the forbidden launchd submission path), and --rollback clears any active\n\
-production_ready seal. link seal writes an auditable evidence artifact; it never\n\
-auto-flips from LaunchAgent ownership alone (HERDR_LINK_SEAL_I_UNDERSTAND=1 for\n\
---execute). link migrate-runtime-control prepares a\n\
-Rust-compatible runtime-control-prod generation (default dry-run; --write-staging\n\
-writes a pending sibling; --apply rewrites the live control file only with\n\
-HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"
-}
-
-pub fn worker_help() -> &'static str {
-    "Herdr MCP device / worker management\n\n\
-Use bootstrap only when no Herdr Worker/fleet exists yet. The other management\n\
-commands require an enrolled-device credential.\n\n\
-  herdr-mcp worker bootstrap\n\
-      Guides the first computer through Cloudflare authorization, creates or\n\
-      safely resumes one release-matched Worker, enrolls the canonical device,\n\
-      removes the temporary operator credential, starts the production Link,\n\
-      and succeeds only when link status reports operational_ready=true.\n\n\
-  herdr-mcp device list\n      Lists the non-secret enrolled-device inventory and local Link/runtime\n      alignment. herdr-mcp worker list is a compatibility alias.\n\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]\n      Creates a pairing address for another computer to enroll.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine on macOS or Linux; uses the platform credential store and reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
-}
-
-pub fn connector_help() -> &'static str {
-    "Herdr MCP connector management (OAuth connectors registered against the fleet)\n\n\
-All of these require the credential of a device already enrolled in the fleet;\nthere is no WebChat delegated admin path. Secrets are never echoed or written\nto argv.\n\n\
-  herdr-mcp connector list [--all]\n      Lists current/actionable Connector state by default. --all also includes\n      revoked Connector instances and legacy client/grant tombstones retained\n      for audit and credential fencing.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector cancel <approval-request-id>\n      Cancels a pending or approved-but-never-used request so the OAuth flow can be restarted.\n      Refuses cancellation after credentials have been issued.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes only that Connector instance and its attributed credentials.\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Client-level kill switch: revokes every Connector/grant for that OAuth client\n      and invalidates its issued access/refresh credentials.\n"
-}
-
-pub fn automation_help() -> &'static str {
-    "Herdr MCP automation (CI/service principal) management\n\n\
-All of these require the credential of a device already enrolled in the fleet.\n\n\
-  herdr-mcp automation create --name NAME --device <device-id-or-unique-name>\n      Creates one CI/service principal explicitly bound to the given device.\n      --name and --device are both required and may appear in either order; a\n      target device is never auto-chosen. The secret is shown once.\n\n  herdr-mcp automation list\n      Lists the automation clients and their bound devices.\n\n  herdr-mcp automation rotate <client-id> --confirm\n      Rotates the client secret (old secret invalidated immediately).\n\n  herdr-mcp automation revoke <client-id> --confirm\n      Revokes the automation client (immediate).\n"
-}
-
-pub fn instance_help() -> &'static str {
-    "Herdr MCP validation instance management\n\n\
-The default production instance is shown for comparison but is read-only and\ncan never be reaped. Only named validation instances are cleanup targets.\n\n\
-  herdr-mcp instance list\n      Lists the default plus recognized named instances with label, port, config\n      root, artifact age, loaded/running state, pid, and orphan state.\n\n  herdr-mcp instance reap <name> --confirm\n      Runs the existing ownership-checked product uninstall for exactly one\n      named instance. It never targets ~/.config/herdr-mcp or runtime releases.\n"
-}
-
-pub fn qualification_help() -> &'static str {
-    "Herdr MCP release qualification generation lock\n\n\
-  herdr-mcp qualification lock\n      Holds the current runtime generation. Auto-update and service generation\n      replacement fail closed until the lock is removed.\n\n  herdr-mcp qualification status\n      Shows whether the local qualification lock is active.\n\n  herdr-mcp qualification unlock\n      Releases the qualification lock and restores normal generation changes.\n"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_language_output_modes_and_advanced_help() {
+        let parsed = parse(args(&["--lang", "zh", "doctor", "--json"])).unwrap();
+        assert_eq!(parsed.lang, Some(crate::locale::Locale::ZhCn));
+        assert_eq!(parsed.output, OutputMode::Json);
+        assert_eq!(parsed.command, Command::Doctor);
+        assert_eq!(
+            parse(args(&["status", "--details", "--lang=ja"]))
+                .unwrap()
+                .output,
+            OutputMode::Details
+        );
+        assert_eq!(
+            parse(args(&["lang", "auto"])).unwrap().command,
+            Command::Lang {
+                preference: Some("auto".into())
+            }
+        );
+        assert!(parse(args(&["lang"])).is_ok());
+        assert!(parse(args(&["lang", "zh-CN"])).is_ok());
+        assert_eq!(
+            parse(args(&["help", "agent"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Agent
+            }
+        );
+        assert_eq!(
+            parse(args(&["help", "advanced"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Advanced
+            }
+        );
+        assert_eq!(
+            parse(args(&["--help-all"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::All
+            }
+        );
+        for health_help in [["status", "--help"], ["doctor", "-h"]] {
+            assert_eq!(
+                parse(args(&health_help)).unwrap().command,
+                Command::Help {
+                    section: HelpSection::General
+                }
+            );
+        }
+        for invalid in [
+            vec!["doctor", "--json", "--details"],
+            vec!["status", "--details", "--json"],
+            vec!["status", "--json", "--json"],
+            vec!["--lang"],
+            vec!["--lang=de"],
+            vec!["--lang=en", "--lang=ja"],
+            vec!["lang", "de"],
+        ] {
+            assert!(parse(args(&invalid)).is_err(), "{invalid:?}");
+        }
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -2481,65 +2491,5 @@ mod tests {
         );
         assert!(parse(args(&["qualification"])).is_err());
         assert!(parse(args(&["qualification", "pause"])).is_err());
-    }
-
-    #[test]
-    fn help_documents_user_path_ahead_of_service() {
-        let text = help();
-        for needle in [
-            "herdr-mcp install",
-            "herdr-mcp status",
-            "herdr-mcp doctor",
-            "herdr-mcp permissions",
-            "herdr-mcp scan",
-            "herdr-mcp instance list",
-            "herdr-mcp qualification <lock|unlock|status>",
-            "herdr-mcp connector list",
-            "herdr-mcp connector approve",
-            "herdr-mcp connector revoke",
-            "herdr-mcp connector webchat-control",
-            "herdr-mcp connector page-assist",
-            "herdr-mcp automation create",
-            "herdr-mcp automation list",
-            "herdr-mcp connector revoke <connector-id> --confirm",
-            "herdr-mcp automation create --name NAME --device <device-id-or-unique-name>",
-            "herdr-mcp update",
-            "herdr-mcp rollback",
-            "herdr-mcp uninstall",
-        ] {
-            assert!(
-                text.contains(needle),
-                "help missing user-path command: {needle}"
-            );
-        }
-        assert!(text.contains("E2E readiness is DOCTOR_JSON.overall"));
-        assert!(text.contains("worker bootstrap  (macOS/Linux first device"));
-        assert!(text.contains("worker connect <pairing-address> [--name NAME]  (macOS/Linux"));
-        assert!(
-            text.contains("connector approve <approval-request-id>  (macOS/Linux enrolled device")
-        );
-        assert!(!text.contains("worker connect <pairing-address> [--name NAME]  (macOS only"));
-        assert!(text.contains("User path:"));
-        assert!(text.contains("Advanced / internal:"));
-        assert!(text.contains("herdr-mcp link status"));
-        assert!(text.contains("herdr-mcp link run"));
-        assert!(text.contains("herdr-mcp link install"));
-        assert!(text.contains("herdr-mcp link uninstall"));
-        assert!(text.contains("herdr-mcp link cutover"));
-        assert!(text.contains("herdr-mcp link migrate-runtime-control"));
-        assert!(text.contains("dev.herdr-mcp.link-rust-candidate"));
-        assert!(text.contains("dry-run plan/validate only"));
-        assert!(text.contains("HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1"));
-        let install = text.find("herdr-mcp install").expect("install");
-        let service = text.find("herdr-mcp service").expect("service");
-        assert!(
-            install < service,
-            "user-path install must appear before advanced service"
-        );
-        let user_slice = &text[..service];
-        assert!(
-            !user_slice.contains("herdr-mcp service install"),
-            "user path must not require service install"
-        );
     }
 }

@@ -34,6 +34,7 @@ mod link;
 #[cfg(any(target_os = "linux", test))]
 mod linux_service_manager;
 mod local_skills;
+mod locale;
 mod macos_credential_helper;
 mod macos_keychain;
 mod macos_permissions;
@@ -129,15 +130,14 @@ fn run() -> Result<ExitCode, String> {
     }
     match parsed.command {
         cli::Command::Help { section } => {
-            let text = match section {
-                cli::HelpSection::General => cli::help(),
-                cli::HelpSection::Worker => cli::worker_help(),
-                cli::HelpSection::Connector => cli::connector_help(),
-                cli::HelpSection::Automation => cli::automation_help(),
-                cli::HelpSection::Instance => cli::instance_help(),
-                cli::HelpSection::Qualification => cli::qualification_help(),
-            };
-            print!("{text}");
+            print!("{}", locale::help(section, locale::resolve(parsed.lang)));
+            Ok(ExitCode::SUCCESS)
+        }
+        cli::Command::Lang { preference } => {
+            if let Some(value) = preference {
+                locale::save_preference(&locale::preference_path()?, &value)?;
+            }
+            println!("{}", locale::resolve(parsed.lang).code());
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Version => {
@@ -153,17 +153,24 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Status => {
             let paths = paths::RuntimePaths::discover()?;
             let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-            status::print_status(&paths, &config);
+            status::print_status(&paths, &config, parsed.output, locale::resolve(parsed.lang));
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Doctor => {
             let paths = paths::RuntimePaths::discover()?;
             let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-            Ok(if status::print_doctor(&paths, &config) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(2)
-            })
+            Ok(
+                if status::print_doctor(
+                    &paths,
+                    &config,
+                    parsed.output,
+                    locale::resolve(parsed.lang),
+                ) {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                },
+            )
         }
         cli::Command::Uninstall => product_lifecycle::uninstall(),
         cli::Command::Reinstall => product_lifecycle::reinstall(),

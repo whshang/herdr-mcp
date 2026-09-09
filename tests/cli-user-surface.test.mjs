@@ -39,7 +39,7 @@ test("README keeps the exhaustive runtime CLI out of the primary user path", () 
   }
 });
 
-test("cargo-built herdr-mcp --help lists the user path ahead of service", () => {
+test("cargo-built herdr-mcp --help separates ordinary and advanced commands", () => {
   // Only the worktree build artifact reflects this PR. Do not query runtime/current.
   const candidates = [
     path.join(ROOT, "target", "debug", "herdr-mcp"),
@@ -51,7 +51,7 @@ test("cargo-built herdr-mcp --help lists the user path ahead of service", () => 
     return;
   }
 
-  const result = spawnSync(binary, ["--help"], { encoding: "utf8" });
+  const result = spawnSync(binary, ["--lang", "en", "--help"], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const text = `${result.stdout}${result.stderr}`;
   for (const command of [
@@ -65,11 +65,29 @@ test("cargo-built herdr-mcp --help lists the user path ahead of service", () => 
   ]) {
     assert.match(text, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
-  assert.match(text, /User path:/);
-  assert.match(text, /Advanced \/ internal:/);
-  const install = text.indexOf("herdr-mcp install");
-  const service = text.indexOf("herdr-mcp service");
-  assert.ok(install >= 0 && service > install, "user-path install must precede service");
+  assert.match(text, /Setup & health/);
+  assert.doesNotMatch(text, /herdr-mcp scan|qualification|instance reap|link cutover|tcc-broker|native-host dev|candidate/);
+  assert.doesNotMatch(text, /--json|--details/);
+  assert.match(text, /help agent/);
+  assert.match(text, /help advanced/);
+  for (const args of [["doctor", "--help"], ["status", "-h"]]) {
+    const help = spawnSync(binary, ["--lang", "en", ...args], { encoding: "utf8" });
+    assert.equal(help.status, 0, help.stderr || help.stdout);
+    assert.match(help.stdout, /Setup & health/);
+  }
+  const agent = spawnSync(binary, ["--lang", "en", "help", "agent"], { encoding: "utf8" });
+  assert.equal(agent.status, 0, agent.stderr);
+  assert.match(agent.stdout, /scan --json/);
+  assert.match(agent.stdout, /must not parse localized human text/);
+  const all = spawnSync(binary, ["--lang", "en", "--help-all"], { encoding: "utf8" });
+  assert.equal(all.status, 0, all.stderr);
+  assert.match(all.stdout, /Setup & health/);
+  assert.match(all.stdout, /Agent & automation output/);
+  assert.match(all.stdout, /Advanced maintenance/);
+  const advanced = spawnSync(binary, ["--lang", "en", "help", "advanced"], { encoding: "utf8" });
+  assert.equal(advanced.status, 0, advanced.stderr);
+  assert.match(advanced.stdout, /link cutover/);
+  assert.match(advanced.stdout, /HERDR_LINK_CUTOVER_I_UNDERSTAND=1/);
 });
 
 test("worker connect owns local service and enrolled production Link activation", () => {

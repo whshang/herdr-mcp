@@ -1,6 +1,8 @@
+use crate::cli::OutputMode;
 use crate::config::Config;
 use crate::herdr::HerdrClient;
 use crate::herdr_supervisor;
+use crate::locale::{self, Locale};
 use crate::macos_privacy;
 use crate::native_host_install;
 use crate::native_tools;
@@ -92,61 +94,157 @@ fn collect(paths: &RuntimePaths, config: &Config) -> StatusReport {
     }
 }
 
-pub fn print_status(paths: &RuntimePaths, config: &Config) {
-    let report = collect(paths, config);
-    println!("Herdr MCP {}", crate::runtime_meta::runtime_version());
-    println!(
-        "runtime channel: {}",
-        crate::runtime_meta::runtime_channel()
-    );
-    println!(
-        "runtime source: {}{}",
-        crate::runtime_meta::compiled_source_commit().unwrap_or("release"),
-        if crate::runtime_meta::compiled_source_dirty() {
-            " (dirty)"
-        } else {
-            ""
-        }
-    );
-    println!("config: {}", paths.config_file.display());
-    println!(
-        "runtime: {}",
-        runtime_label(report.runtime, config.runtime_port)
-    );
-    println!(
-        "herdr transport: {}",
-        if report.herdr_transport_reachable {
-            "reachable"
-        } else {
-            "unreachable"
-        }
-    );
-    println!(
-        "tcc broker: {}",
-        crate::tcc_broker::status_line(&paths.config_dir)
-    );
-    println!("update channel: {}", config.update_channel.as_str());
-    println!(
-        "update checks: {}",
-        if config.update_check {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    println!(
-        "auto update scheduler: {}",
-        crate::update_scheduler::status_line()
-    );
-    println!("lifecycle residue: {}", crate::residue::status_line());
-    println!(
-        "relay pool: {}",
-        crate::link::relay_manifest::status_line(paths, unix_now_seconds())
-    );
-    println!("relay use: {}", crate::link::RELAY_POLICY_DESCRIPTION);
+/// A collected report is rendered without performing any further probes.
+#[derive(Debug)]
+struct CliReport {
+    facts: Value,
+    details: Vec<String>,
 }
 
-pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
+impl CliReport {
+    fn render(&self, mode: OutputMode, language: Locale, doctor: bool) -> String {
+        locale::render_report(&self.facts, &self.details, mode, language, doctor)
+    }
+}
+
+fn pass_code(pass: bool) -> &'static str {
+    if pass { "pass" } else { "fail" }
+}
+
+fn aggregate_check(states: &[&str]) -> &'static str {
+    if states.contains(&"fail") {
+        "fail"
+    } else if states.contains(&"unconfigured") {
+        "unconfigured"
+    } else if states.iter().all(|s| *s == "not_applicable") {
+        "not_applicable"
+    } else if states
+        .iter()
+        .any(|s| !matches!(*s, "pass" | "not_applicable"))
+    {
+        "not_probed"
+    } else {
+        "pass"
+    }
+}
+
+fn browser_states(
+    native_messaging: &Result<Value, String>,
+    ipc: &SocketView,
+) -> (&'static str, &'static str) {
+    let browser_state = match native_messaging {
+        Ok(v) if v["implementation"] == "unsupported" => "not_applicable",
+        Ok(v) if v["ok"] == true => "pass",
+        Ok(v)
+            if v["owned_manifest_count"].as_u64().unwrap_or(0) == 0
+                && v["wrapper_ok"] != true
+                && v["runtime_binary_ok"] != true =>
+        {
+            "unconfigured"
+        }
+        _ => "fail",
+    };
+    let ipc_state = if browser_state == "not_applicable" {
+        "not_applicable"
+    } else {
+        match ipc {
+            SocketView::Present { .. } => "pass",
+            SocketView::Absent => "not_probed",
+            SocketView::Invalid { .. } => "fail",
+        }
+    };
+    (browser_state, ipc_state)
+}
+
+fn scheduler_code(value: &Value) -> &'static str {
+    if value["skipped"] == true {
+        "not_applicable"
+    } else if value["ok"] == true {
+        "enabled"
+    } else if value["present"] == false {
+        "not_installed"
+    } else if value["owned"] == true && value["loaded"] == false {
+        "not_loaded"
+    } else {
+        "unknown"
+    }
+}
+
+pub fn print_status(paths: &RuntimePaths, config: &Config, mode: OutputMode, language: Locale) {
+    let report = collect(paths, config);
+    let service = service_manager::doctor_status();
+    let service_ok = service
+        .as_ref()
+        .is_ok_and(|v| v["healthy"] == true && v["loaded"] == true)
+        && matches!(report.runtime, RuntimeHealth::Healthy(_));
+    let link = collect_link(paths, &service);
+    let edge = resolve_edge_config(config);
+    let scheduler_snapshot = crate::update_scheduler::status_snapshot();
+    let scheduler = scheduler_snapshot
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|_| json!({}));
+    let facts = json!({
+        "version": crate::runtime_meta::runtime_version(),
+        "overall": pass_code(service_ok && report.herdr_transport_reachable && (edge.is_none() || link_state(&link) != "fail")),
+        "service_health": pass_code(service_ok),
+        "herdr": pass_code(report.herdr_transport_reachable),
+        "link": if edge.is_none() { "unconfigured" } else { link_state(&link) },
+        "cloud": if edge.is_some() { "configured" } else { "unconfigured" },
+        "update_channel": config.update_channel.as_str(),
+        "update_checks": if config.update_check { "enabled" } else { "disabled" },
+        "scheduler": scheduler_code(&scheduler),
+    });
+    let details = vec![
+        format!(
+            "runtime channel: {}",
+            crate::runtime_meta::runtime_channel()
+        ),
+        format!(
+            "runtime source: {} dirty={}",
+            crate::runtime_meta::compiled_source_commit().unwrap_or("release"),
+            crate::runtime_meta::compiled_source_dirty()
+        ),
+        format!("config: {}", paths.config_file.display()),
+        format!(
+            "runtime: {}",
+            runtime_label(report.runtime, config.runtime_port)
+        ),
+        format!(
+            "runtime ownership: {}",
+            format_local_runtime_layer(paths, config, report.runtime)
+        ),
+        format!("service: {}", format_service_layer(&service)),
+        format!(
+            "tcc broker: {}",
+            crate::tcc_broker::status_line(&paths.config_dir)
+        ),
+        format!("link: {link}"),
+        format!(
+            "auto update scheduler: {}",
+            crate::update_scheduler::status_line(&scheduler_snapshot)
+        ),
+        format!("edge: {}", format_edge_configured_layer(&edge, config)),
+        format!("lifecycle residue: {}", crate::residue::status_line()),
+        format!(
+            "relay pool: {}",
+            crate::link::relay_manifest::status_line(paths, unix_now_seconds())
+        ),
+        format!("relay use: {}", crate::link::RELAY_POLICY_DESCRIPTION),
+    ];
+    print!(
+        "{}",
+        CliReport { facts, details }.render(mode, language, false)
+    );
+}
+
+pub fn print_doctor(
+    paths: &RuntimePaths,
+    config: &Config,
+    mode: OutputMode,
+    language: Locale,
+) -> bool {
+    let mut details = Vec::new();
     let report = collect(paths, config);
     let runtime_healthy = matches!(report.runtime, RuntimeHealth::Healthy(_));
     let methods_result = native_tools::methods("");
@@ -176,8 +274,8 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let documents_permission = macos_privacy::probe_documents_permission(&paths.config_dir);
     let code_identity = macos_privacy::probe_code_identity();
     let authenticated_local_mcp = probe_authenticated_local_mcp(config.runtime_port);
-    println!("Herdr MCP doctor");
-    println!(
+    details.push("Herdr MCP doctor".to_owned());
+    details.push(format!(
         "runtime provenance: channel={} version={} source={}{}",
         crate::runtime_meta::runtime_channel(),
         crate::runtime_meta::runtime_version(),
@@ -187,31 +285,97 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         } else {
             ""
         }
+    ));
+    collect_check(&mut details, "runtime endpoint", runtime_healthy);
+    collect_check(
+        &mut details,
+        "Herdr local transport",
+        report.herdr_transport_reachable,
     );
-    print_check("runtime endpoint", runtime_healthy);
-    print_check("Herdr local transport", report.herdr_transport_reachable);
-    print_check("Herdr API schema", schema_healthy);
-    print_check("validated Herdr RPC", native_call_healthy);
-    print_check("Herdr snapshot state", snapshot_healthy);
-    print_check("Herdr inspect projection", inspect_healthy);
-    print_check("Herdr event cache", event_cache.healthy);
+    collect_check(&mut details, "Herdr API schema", schema_healthy);
+    collect_check(&mut details, "validated Herdr RPC", native_call_healthy);
+    collect_check(&mut details, "Herdr snapshot state", snapshot_healthy);
+    collect_check(&mut details, "Herdr inspect projection", inspect_healthy);
+    collect_check(&mut details, "Herdr event cache", event_cache.healthy);
     let macos_permissions = crate::macos_permissions::collect_status();
-    println!("{}", documents_permission.doctor_line());
-    println!(
-        "{}",
-        crate::macos_permissions::doctor_layer_from(&macos_permissions)
-    );
-    println!("{}", crate::tcc_broker::doctor_line(&paths.config_dir));
-    println!("{}", code_identity.doctor_line());
-    println!("{}", herdr_supervisor::doctor_line());
-    println!("{}", crate::child_process::doctor_line());
-    let remote = print_layer_ownership(paths, config, &report);
-    println!(
+    details.push(documents_permission.doctor_line());
+    details.push(crate::macos_permissions::doctor_layer_from(
+        &macos_permissions,
+    ));
+    details.push(crate::tcc_broker::doctor_line(&paths.config_dir));
+    details.push(code_identity.doctor_line());
+    details.push(herdr_supervisor::doctor_line());
+    details.push(crate::child_process::doctor_line());
+    let service = service_manager::doctor_status();
+    let native_messaging = native_host_install::doctor_status();
+    let ipc = inspect_unix_socket(&paths.config_dir.join("extension.sock"));
+    let link = collect_link(paths, &service);
+    details.push(format!(
+        "LAYER herdr {}",
+        format_herdr_layer(paths, &report)
+    ));
+    details.push(format!(
+        "LAYER local-runtime {}",
+        format_local_runtime_layer(paths, config, report.runtime)
+    ));
+    details.push(format!("LAYER service {}", format_service_layer(&service)));
+    details.push(format!(
+        "LAYER local-ipc {}",
+        format_local_ipc_layer(paths, &ipc)
+    ));
+    details.push(format!(
+        "LAYER native-messaging {}",
+        format_native_messaging_layer(&native_messaging)
+    ));
+    details.push(format!(
+        "LAYER link {}",
+        if cfg!(target_os = "macos") {
+            crate::link::doctor_layer_summary(&link)
+        } else {
+            link.to_string()
+        }
+    ));
+    details.push(format!(
+        "LAYER link-transport {}",
+        format_link_transport_layer(paths, config)
+    ));
+    details.push(format!(
+        "LAYER relay-pool {}",
+        crate::link::relay_manifest::status_line(paths, unix_now_seconds())
+    ));
+    let edge = resolve_edge_config(config);
+    details.push(format!(
+        "LAYER edge {}",
+        format_edge_configured_layer(&edge, config)
+    ));
+    let remote = edge
+        .as_ref()
+        .map(probe_edge_remote)
+        .unwrap_or(RemoteProbeReport::absent());
+    details.push(format!("LAYER edge-reachable {}", remote.edge_reachable));
+    details.push(format!("LAYER oauth-metadata {}", remote.oauth_metadata));
+    details.push(format!("LAYER mcp-endpoint {}", remote.mcp_endpoint));
+    details.push(format!(
+        "LAYER update-state {}",
+        format_update_state_layer(paths)
+    ));
+    details.push(crate::residue::doctor_line());
+    details.push(format!(
         "LAYER authenticated-local-mcp {}",
         authenticated_local_mcp.detail
+    ));
+    details.push(
+        "LAYER authenticated-remote-mcp not_probed reason=no-connector-oauth-credential".to_owned(),
     );
-    println!("LAYER authenticated-remote-mcp not_probed reason=no-connector-oauth-credential");
-    let service_health = runtime_healthy
+    let service_ok = service
+        .as_ref()
+        .is_ok_and(|v| v["healthy"] == true && v["loaded"] == true);
+    let (browser_state, ipc_state) = browser_states(&native_messaging, &ipc);
+    let service_health = (edge.is_none() || link_state(&link) != "fail")
+        && runtime_healthy
+        && service_ok
+        && browser_state != "fail"
+        && ipc_state != "fail"
         && report.herdr_transport_reachable
         && schema_healthy
         && native_call_healthy
@@ -224,44 +388,74 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
             .map(crate::macos_permissions::report_doctor_pass)
             .unwrap_or(true);
     let readiness = overall_readiness(service_health, authenticated_local_mcp.state, &remote);
-    println!(
-        "READINESS service_health={} authenticated_local_mcp={} authenticated_remote_mcp=not_probed overall={}",
+    details.push(format!(
+        "READINESS service_health={} authenticated_local_mcp={} authenticated_remote_mcp=not_probed end_to_end_readiness={}",
         if service_health { "pass" } else { "fail" },
         authenticated_local_mcp.state.as_str(),
         readiness.as_str()
-    );
-    println!(
-        "DOCTOR_JSON {}",
-        json!({
-            "service_health": if service_health { "pass" } else { "fail" },
-            "authenticated_local_mcp": authenticated_local_mcp.state.as_str(),
-            "authenticated_remote_mcp": "not_probed",
-            "edge_reachable": remote.edge_state.as_str(),
-            "oauth_metadata": remote.oauth_state.as_str(),
-            "mcp_surface": remote.mcp_surface_state.as_str(),
-            "overall": readiness.as_str(),
-        })
-    );
-    println!("INFO config {}", paths.config_file.display());
-    println!("INFO state {}", paths.config_dir.display());
-    println!("INFO dev-state {}", paths.dev_state_dir.display());
+    ));
+    let permissions_ok = documents_permission.doctor_pass()
+        && macos_permissions
+            .as_ref()
+            .map(crate::macos_permissions::report_doctor_pass)
+            .unwrap_or(true);
+    let herdr_ok = report.herdr_transport_reachable
+        && schema_healthy
+        && native_call_healthy
+        && snapshot_healthy
+        && inspect_healthy
+        && event_cache.healthy;
+    let facts = json!({
+        "version": crate::runtime_meta::runtime_version(),
+        "service_health": pass_code(service_health),
+        "herdr": pass_code(herdr_ok),
+        "permissions": if !cfg!(target_os = "macos") { "not_applicable" }
+            else if macos_permissions.is_err() { "not_probed" }
+            else { pass_code(permissions_ok) },
+        "browser_integration": aggregate_check(&[browser_state, ipc_state]),
+        "cloud_health": if edge.is_none() { "unconfigured" } else { aggregate_check(&[remote.edge_state.as_str(), remote.oauth_state.as_str(), remote.mcp_surface_state.as_str()]) },
+        "browser": browser_state,
+        "local_ipc": ipc_state,
+        "link": if remote.edge_state == DiagnosticState::NotProbed { "unconfigured" } else { link_state(&link) },
+        "authenticated_local_mcp": authenticated_local_mcp.state.as_str(),
+        "authenticated_remote_mcp": "not_probed",
+        "remote_reason": "no_connector_oauth_credential",
+        "edge_reachable": remote.edge_state.as_str(),
+        "oauth_metadata": remote.oauth_state.as_str(),
+        "mcp_surface": remote.mcp_surface_state.as_str(),
+        "overall": pass_code(readiness != OverallReadiness::Fail),
+        "next_step": if !runtime_healthy || !service_ok { "repair_local" }
+            else if !herdr_ok { "connect_herdr" }
+            else if !permissions_ok { "permissions_setup" }
+            else if readiness == OverallReadiness::Fail { "inspect_details" }
+            else { "verify_remote_mcp" },
+    });
+    details.push(format!("INFO config {}", paths.config_file.display()));
+    details.push(format!("INFO state {}", paths.config_dir.display()));
+    details.push(format!("INFO dev-state {}", paths.dev_state_dir.display()));
     if let Some(socket) = &paths.herdr_socket {
-        println!("INFO herdr-socket {}", socket.display());
+        details.push(format!("INFO herdr-socket {}", socket.display()));
     }
-    println!("INFO update-channel {}", config.update_channel.as_str());
+    details.push(format!(
+        "INFO update-channel {}",
+        config.update_channel.as_str()
+    ));
     if let Some(count) = methods_result["count"].as_u64() {
-        println!("INFO herdr-methods {count}");
+        details.push(format!("INFO herdr-methods {count}"));
     }
     if let Ok(snapshot_result) = &snapshot_result {
-        println!("INFO snapshot-source {}", snapshot_result.source.as_str());
-        println!(
+        details.push(format!(
+            "INFO snapshot-source {}",
+            snapshot_result.source.as_str()
+        ));
+        details.push(format!(
             "INFO snapshot-counts workspaces={} panes={} agents={}",
             snapshot::collection_count(&snapshot_result.value, "workspaces"),
             snapshot::collection_count(&snapshot_result.value, "panes"),
             snapshot::collection_count(&snapshot_result.value, "agents")
-        );
+        ));
     }
-    println!(
+    details.push(format!(
         "INFO event-cache cursor={} events={} agents={} workspaces={} panes={} stream-events={} reconcile={} mode={}",
         event_cache.cursor,
         event_cache.digest_events,
@@ -271,53 +465,19 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         event_cache.stream_events,
         event_cache.needs_reconcile,
         event_cache.mode
-    );
+    ));
     if let Some(last_event_at) = &event_cache.last_event_at {
-        println!("INFO event-cache-last-event {last_event_at}");
+        details.push(format!("INFO event-cache-last-event {last_event_at}"));
     }
     if let Some(error) = &event_cache.error {
-        println!("WARN event-cache {error}");
+        details.push(format!("WARN event-cache {error}"));
     }
 
+    print!(
+        "{}",
+        CliReport { facts, details }.render(mode, language, true)
+    );
     service_health && readiness != OverallReadiness::Fail
-}
-
-/// Product-layer ownership map. Local probes always run. When Edge is
-/// configured locally, doctor also runs bounded credential-free HTTPS probes.
-fn print_layer_ownership(
-    paths: &RuntimePaths,
-    config: &Config,
-    report: &StatusReport,
-) -> RemoteProbeReport {
-    println!("LAYER herdr {}", format_herdr_layer(paths, report));
-    println!(
-        "LAYER local-runtime {}",
-        format_local_runtime_layer(paths, config, report.runtime)
-    );
-    println!("LAYER service {}", format_service_layer());
-    println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
-    println!("LAYER native-messaging {}", format_native_messaging_layer());
-    println!("LAYER link {}", format_link_layer(paths));
-    println!(
-        "LAYER link-transport {}",
-        format_link_transport_layer(paths, config)
-    );
-    println!(
-        "LAYER relay-pool {}",
-        crate::link::relay_manifest::status_line(paths, unix_now_seconds())
-    );
-    let edge = resolve_edge_config(config);
-    println!("LAYER edge {}", format_edge_configured_layer(&edge, config));
-    let remote = edge
-        .as_ref()
-        .map(probe_edge_remote)
-        .unwrap_or(RemoteProbeReport::absent());
-    println!("LAYER edge-reachable {}", remote.edge_reachable);
-    println!("LAYER oauth-metadata {}", remote.oauth_metadata);
-    println!("LAYER mcp-endpoint {}", remote.mcp_endpoint);
-    println!("LAYER update-state {}", format_update_state_layer(paths));
-    println!("{}", crate::residue::doctor_line());
-    remote
 }
 
 fn unix_now_seconds() -> i64 {
@@ -368,8 +528,8 @@ fn format_local_runtime_layer(
     }
 }
 
-fn format_service_layer() -> String {
-    match service_manager::doctor_status() {
+fn format_service_layer(service: &Result<Value, String>) -> String {
+    match service {
         Ok(value) => {
             let implementation = value
                 .get("implementation")
@@ -402,13 +562,13 @@ fn format_service_layer() -> String {
                 "{ownership} implementation={implementation} loaded={loaded} healthy={healthy} label={label} generation={generation}"
             )
         }
-        Err(error) => format!("error detail={}", compact_detail(&error)),
+        Err(error) => format!("error detail={}", compact_detail(error)),
     }
 }
 
-fn format_local_ipc_layer(paths: &RuntimePaths) -> String {
+fn format_local_ipc_layer(paths: &RuntimePaths, socket: &SocketView) -> String {
     let path = paths.config_dir.join("extension.sock");
-    match inspect_unix_socket(&path) {
+    match socket {
         SocketView::Present { mode } => {
             format!("owned present mode={mode:04o} path={}", path.display())
         }
@@ -419,8 +579,8 @@ fn format_local_ipc_layer(paths: &RuntimePaths) -> String {
     }
 }
 
-fn format_native_messaging_layer() -> String {
-    match native_host_install::doctor_status() {
+fn format_native_messaging_layer(status: &Result<Value, String>) -> String {
+    match status {
         Ok(value) => {
             let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
             let owned = value
@@ -459,13 +619,50 @@ fn format_native_messaging_layer() -> String {
                 "{ownership}{stale} manifests={owned} wrapper_ok={wrapper_ok} runtime_binary_ok={runtime_ok} runtime_matches_current={runtime_matches} version_consistent={version_consistent}"
             )
         }
-        Err(error) => format!("error detail={}", compact_detail(&error)),
+        Err(error) => format!("error detail={}", compact_detail(error)),
     }
 }
 
-fn format_link_layer(paths: &RuntimePaths) -> String {
-    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    crate::link::doctor_layer_summary(&home, &paths.config_dir)
+fn collect_link(paths: &RuntimePaths, service: &Result<Value, String>) -> Value {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = service;
+        let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+        crate::link::ownership::collect_status_report(&home, &paths.config_dir)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = paths;
+        // Reuse the exact systemd/process owner already inspected by service status.
+        json!({
+            "state": link_state_from_service(service),
+            "verification": "service_owner_only"
+        })
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn link_state_from_service(service: &Result<Value, String>) -> &'static str {
+    match service {
+        Ok(value) if value["link_loaded"] == true => "pass",
+        Ok(value) if value["link_loaded"] == false => "fail",
+        _ => "not_probed",
+    }
+}
+
+fn link_state(link: &Value) -> &'static str {
+    match link["state"].as_str() {
+        Some("pass" | "running") => "pass",
+        Some("fail") => "fail",
+        Some("unconfigured") => "unconfigured",
+        Some("not_probed") => "not_probed",
+        Some(_) => "not_probed",
+        None => match link["operational_ready"].as_bool() {
+            Some(true) => "pass",
+            Some(false) => "fail",
+            None => "not_probed",
+        },
+    }
 }
 
 fn format_link_transport_layer(paths: &RuntimePaths, config: &Config) -> String {
@@ -1279,13 +1476,154 @@ fn runtime_label(health: RuntimeHealth, port: u16) -> String {
     }
 }
 
-fn print_check(label: &str, pass: bool) {
-    println!("{} {label}", if pass { "PASS" } else { "FAIL" });
+fn collect_check(details: &mut Vec<String>, label: &str, pass: bool) {
+    details.push(format!("{} {label}", if pass { "PASS" } else { "FAIL" }));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_one_report_as_localized_human_details_and_stable_json() {
+        let report = CliReport {
+            facts: json!({
+                "version": "1.0.0", "overall": "pass", "service_health": "pass",
+                "herdr": "pass", "authenticated_local_mcp": "pass",
+                "authenticated_remote_mcp": "not_probed", "next_step": "verify_remote_mcp",
+                "permissions": "not_applicable",
+                "browser": "pass", "local_ipc": "pass", "browser_integration": aggregate_check(&["pass", "pass"]),
+                "edge_reachable": "pass", "oauth_metadata": "pass", "mcp_surface": "pass",
+                "cloud_health": aggregate_check(&["pass", "pass", "pass"]), "link": "pass",
+                "update_channel": "stable", "scheduler": "enabled"
+            }),
+            details: vec![
+                "LAYER source=abc generation=rust-abc path=/private/runtime".into(),
+                "INFO config /private/config".into(),
+            ],
+        };
+        let mut baseline = None;
+        for (language, heading, remote) in [
+            (Locale::En, "Overall", "Not verified"),
+            (Locale::ZhCn, "整体状态", "未验证"),
+            (Locale::Ja, "全体の状態", "未検証"),
+        ] {
+            let human = report.render(OutputMode::Human, language, true);
+            assert!(human.contains(heading));
+            assert!(human.contains(remote));
+            assert!(human.lines().next().unwrap().contains(language.text(
+                "Health check",
+                "健康检查",
+                "ヘルスチェック"
+            )));
+            assert!(human.lines().count() <= 11);
+            assert!(human.contains(locale::label(language, "browser_integration")));
+            assert!(human.contains(locale::label(language, "cloud_health")));
+            for hidden in ["local_ipc", "oauth_metadata", "mcp_surface", "permissions"] {
+                assert!(!human.contains(locale::label(language, hidden)), "{hidden}");
+            }
+            assert!(
+                !report
+                    .render(OutputMode::Human, language, false)
+                    .contains("This device")
+            );
+            for noise in [
+                "LAYER",
+                "INFO",
+                "DOCTOR_JSON",
+                "source=",
+                "generation=",
+                "/private",
+            ] {
+                assert!(!human.contains(noise), "{noise}");
+                assert!(
+                    !report
+                        .render(OutputMode::Human, language, false)
+                        .contains(noise)
+                );
+            }
+            assert!(
+                report
+                    .render(OutputMode::Details, language, true)
+                    .contains("generation=rust-abc")
+            );
+            let machine: Value =
+                serde_json::from_str(&report.render(OutputMode::Json, language, true)).unwrap();
+            assert_eq!(machine["authenticated_remote_mcp"], "not_probed");
+            assert_eq!(machine["overall"], "pass");
+            assert!(machine.get("details").is_none());
+            assert!(machine.get("scheduler_state").is_none());
+            assert!(machine.get("device").is_none());
+            for field in [
+                "browser",
+                "local_ipc",
+                "edge_reachable",
+                "oauth_metadata",
+                "mcp_surface",
+            ] {
+                assert_eq!(machine[field], "pass");
+            }
+            assert!(!machine.to_string().contains("/private"));
+            if let Some(expected) = &baseline {
+                assert_eq!(&machine, expected);
+            }
+            baseline = Some(machine);
+        }
+        assert_eq!(aggregate_check(&["pass", "fail"]), "fail");
+        assert_eq!(aggregate_check(&["pass", "not_probed"]), "not_probed");
+        assert_eq!(
+            aggregate_check(&["unconfigured", "not_probed"]),
+            "unconfigured"
+        );
+        let mut failed = report;
+        failed.facts["overall"] = json!("fail");
+        failed.facts["next_step"] = json!("repair_local");
+        assert!(
+            failed
+                .render(OutputMode::Human, Locale::En, true)
+                .contains("herdr-mcp install")
+        );
+    }
+
+    #[test]
+    fn normalizes_cross_platform_link_and_browser_states() {
+        assert_eq!(
+            link_state_from_service(&Ok(json!({"link_loaded": true}))),
+            "pass"
+        );
+        assert_eq!(
+            link_state_from_service(&Ok(json!({"link_loaded": false}))),
+            "fail"
+        );
+        assert_eq!(
+            link_state_from_service(&Err("unavailable".into())),
+            "not_probed"
+        );
+        assert_eq!(link_state(&json!({"state": "running"})), "pass");
+        assert_eq!(link_state(&json!({"state": "unexpected"})), "not_probed");
+        assert_eq!(link_state(&json!({"operational_ready": true})), "pass");
+        assert_eq!(link_state(&json!({})), "not_probed");
+
+        let unsupported = Ok(json!({"implementation": "unsupported", "ok": false}));
+        assert_eq!(
+            browser_states(&unsupported, &SocketView::Absent),
+            ("not_applicable", "not_applicable")
+        );
+        let configured = Ok(json!({"ok": true}));
+        assert_eq!(
+            browser_states(&configured, &SocketView::Absent),
+            ("pass", "not_probed")
+        );
+        assert_eq!(
+            browser_states(
+                &configured,
+                &SocketView::Invalid {
+                    detail: "bad".into()
+                }
+            ),
+            ("pass", "fail")
+        );
+    }
 
     #[test]
     fn parses_http_status_line() {

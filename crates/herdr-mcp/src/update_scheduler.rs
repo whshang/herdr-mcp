@@ -77,8 +77,8 @@ pub(crate) fn product_uninstall_preflight() -> Result<bool, String> {
     }
 }
 
-pub(crate) fn status_line() -> String {
-    match status_snapshot() {
+pub(crate) fn status_line(snapshot: &Result<Value, String>) -> String {
+    match snapshot {
         Ok(value) => {
             if value.get("skipped").and_then(Value::as_bool) == Some(true) {
                 return match value.get("reason").and_then(Value::as_str) {
@@ -426,7 +426,7 @@ fn ensure_real_dir(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn status_snapshot() -> Result<Value, String> {
+pub(crate) fn status_snapshot() -> Result<Value, String> {
     Ok(json!({
         "ok": true,
         "present": false,
@@ -438,7 +438,7 @@ fn status_snapshot() -> Result<Value, String> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn status_snapshot() -> Result<Value, String> {
+pub(crate) fn status_snapshot() -> Result<Value, String> {
     Ok(json!({
         "ok": true,
         "present": false,
@@ -450,7 +450,7 @@ fn status_snapshot() -> Result<Value, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn status_snapshot() -> Result<Value, String> {
+pub(crate) fn status_snapshot() -> Result<Value, String> {
     let paths = RuntimePaths::discover()?;
     if paths.instance.is_named() {
         return Ok(json!({

@@ -6,6 +6,37 @@
 
 herdr-mcp 的命令可以按用途理解，而不是按 `bin/` 文件名死记。
 
+## 人类输出、JSON 与诊断详情
+
+~~~bash
+herdr-mcp --help
+herdr-mcp status
+herdr-mcp status --json
+herdr-mcp status --details
+herdr-mcp doctor
+herdr-mcp doctor --json
+herdr-mcp doctor --details
+herdr-mcp help agent
+herdr-mcp help advanced
+herdr-mcp --help-all
+~~~
+
+默认帮助按安装与健康检查、设备、连接器、自动化、更新与修复分组。参数详见 `worker --help`、`connector --help`、`automation --help`。维护与 UAT、实例清理、qualification、Link cutover/seal/migration、native-host 开发和 candidate 命令放在高级帮助中。所有语言的命令名均保持英文。
+
+`status` 显示版本、整体状态、Herdr 连接、Link/云端可用情况及更新通道和调度。云端“已配置”仅表示本地配置证据。`doctor` 检查服务与运行时、Herdr、适用的系统权限、浏览器与本地集成、已配置的云端端点、本地 MCP 认证。默认 doctor 将浏览器与 IPC 合并为 `browser_integration`，将 Edge/OAuth/公共 MCP 合并为 `cloud_health`；不适用的权限行隐藏。JSON 和开发者详情保留各项检查。两者默认输出简洁的本地化信息。status 不推断设备注册状态，设备清单使用 `herdr-mcp device list`。`--details` 增加维护诊断、归属层、来源、版本代际和路径。`--json` 仅输出一个包含语义事实的紧凑 JSON 文档，字段名和状态码固定为英文，不带 `DOCTOR_JSON` 前缀。`--json` 与 `--details` 互斥。三种输出使用同一份采集结果。
+
+doctor 退出码 **0** 表示已探测层未发现已知故障，**2** 表示存在已知故障。公共 Edge/OAuth/MCP 检查不发送连接器凭据。`authenticated_remote_mcp: "not_probed"` 与 `remote_reason: "no_connector_oauth_credential"` 明确表示尚未验证远程认证，此状态不算失败。`overall: "pass"` 只表示 doctor 所覆盖的检查没有发现已知故障，并不表示已证明远程端到端认证就绪；已知故障返回 `overall: "fail"`。`next_step` 提供后续动作建议。使用已认证的 MCP 客户端调用验证远程链路。平台不支持 Native Messaging 时，浏览器/IPC 事实为 `not_applicable`，默认人类输出不显示浏览器集成行。Agent/自动化判断必须读取语义字段，不得解析本地化人类文本。JSON 不包含开发者 `details` 数组、路径与来源或 `scheduler_state`；取证信息使用 `--details`。
+
+General 面向普通用户，`help agent` 面向 Agent/自动化，`help advanced` 面向开发者与 UAT。`--help-all` 包含三类帮助。`scan` 仅列入 Agent 帮助。Agent 指引要求使用固定英文 JSON 字段、状态码和错误码，禁止解析本地化文本。
+
+~~~bash
+herdr-mcp help agent
+herdr-mcp status --json
+herdr-mcp doctor --json
+herdr-mcp scan --json [--refresh] [--probe]
+herdr-mcp device list
+~~~
+
 ## 日常管理：`herdr-mcp`
 
 普通用户应使用 GitHub Release 安装的原生 Rust CLI：
@@ -192,13 +223,19 @@ herdr-mcp watchdog status
 
 ## UI 语言
 
-```bash
+~~~bash
+herdr-mcp lang
 herdr-mcp lang en
-herdr-mcp lang zh
+herdr-mcp lang zh-CN
 herdr-mcp lang ja
-```
+herdr-mcp lang auto
+herdr-mcp --lang ja doctor
+HERDR_MCP_LANG=zh-CN herdr-mcp status
+~~~
 
-用于项目本机管理界面/相关 UI 语言设置。浏览器扩展也支持 en / 简体中文 / 日本語。
+原生 CLI 支持 `en`、`zh-CN`、`ja`，兼容旧别名 `zh`。优先级为全局 `--lang` > `HERDR_MCP_LANG` > `~/.config/herdr-mcp/ui.json` 中保存的偏好 > 首个非空的 `LC_ALL` / `LC_MESSAGES` / `LANG` > POSIX 缺失时的有时限 macOS 首选语言查询 > 英语。非空 `HERDR_MCP_LANG` 具有决定权：不支持的值直接选择英语，不再继续采用更低优先级的保存偏好或系统语言。支持 `ja_JP.UTF-8`、`zh_CN.UTF-8` 等系统区域格式；首个非空 POSIX 设置具有决定权，`C`、`de_DE` 等不支持的语言直接使用英语，不查询 macOS。更高优先级来源均缺失时，macOS 执行一次 `/usr/bin/defaults read -g AppleLanguages`：等待上限 300 ms，终止宽限最多 250 ms，输出最多保留 8 KiB，结束后回收子进程。失败、超时或没有支持的语言时回退英语。按列表顺序将 `zh-Hans` / `zh-Hant` / `zh-*` 映射为 `zh-CN`，`ja-*` 映射为 `ja`，`en-*` 映射为 `en`。不增加依赖或常驻进程。
+
+`lang` 显示当前有效语言。`lang auto` 仅清除保存的显式语言偏好。语言策略由原生 Rust 统一管理，保留 JSON 中其他字段；中文保存为 `zh`，兼容旧 Bash 入口。保留旧 `HERDR_MCP_UI_CFG` 文件路径覆盖能力。`--lang ja` 与 `--lang=ja` 均可放在命令前后，不保存偏好。帮助及默认 status/doctor 输出本地化；技术诊断和其他命令输出可保持英文。浏览器扩展语言独立设置。
 
 ## 浏览器 Native Messaging Host
 

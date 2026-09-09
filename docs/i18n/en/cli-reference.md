@@ -4,6 +4,37 @@
 
 This page covers **herdr-mcp** commands only. For Herdr workspace, pane, agent and session commands, use the official [Herdr CLI reference](https://herdr.dev/docs/cli-reference/).
 
+## Human output, JSON and diagnostics
+
+~~~bash
+herdr-mcp --help
+herdr-mcp status
+herdr-mcp status --json
+herdr-mcp status --details
+herdr-mcp doctor
+herdr-mcp doctor --json
+herdr-mcp doctor --details
+herdr-mcp help agent
+herdr-mcp help advanced
+herdr-mcp --help-all
+~~~
+
+Default help groups setup/health, devices, connectors, automation and updates/repair. Use `worker --help`, `connector --help` and `automation --help` for arguments. Maintainer and UAT commands, instance cleanup, qualification, Link cutover/seal/migration, native-host development and candidate commands appear in advanced help. Commands remain English in every language.
+
+`status` shows version, overall state, Herdr connection, Link/cloud availability and update channel/scheduler. Cloud “configured” is local configuration evidence, not an authenticated remote check. `doctor` checks service/runtime, Herdr, applicable platform permissions, browser/local integration, configured cloud endpoints and authenticated local MCP. The human doctor view combines browser/IPC into `browser_integration` and Edge/OAuth/public MCP into `cloud_health`, and omits permissions when not applicable. Individual checks remain in JSON and developer details. Both use concise localized human output by default. Status omits inferred device enrollment; use `herdr-mcp device list` for inventory. `--details` adds maintainer diagnostics, ownership layers, provenance, generations and paths. `--json` emits exactly one compact JSON document containing semantic facts with stable English keys and status codes; it does not print a `DOCTOR_JSON` prefix. `--json` and `--details` are mutually exclusive. All three render the same collected facts.
+
+Doctor exit **0** means no known failure in the probed layers; exit **2** means a known failure. Public Edge/OAuth/MCP checks never send a Connector credential. `authenticated_remote_mcp: "not_probed"` and `remote_reason: "no_connector_oauth_credential"` explicitly mean remote authentication has not been verified. This is a non-failure: `overall: "pass"` means the checks represented by doctor found no known failure, not that authenticated end-to-end remote readiness has been proven. A known failure yields `overall: "fail"`. Use `next_step` for the suggested action and an authenticated MCP client call to verify the remote path. On platforms where Native Messaging is unsupported, browser/IPC facts are `not_applicable` and the combined browser line is omitted from human output. Agent/automation consumers must use semantic fields and must not parse localized human text. JSON excludes the developer `details` array, paths/provenance and `scheduler_state`; forensic evidence belongs to `--details`.
+
+General help serves ordinary users; `help agent` serves Agents/automation; `help advanced` serves developers and UAT. `--help-all` includes all three. `scan` is listed in Agent help, not General help. Agent guidance requires stable English JSON keys/status/error codes and prohibits parsing localized text.
+
+~~~bash
+herdr-mcp help agent
+herdr-mcp status --json
+herdr-mcp doctor --json
+herdr-mcp scan --json [--refresh] [--probe]
+herdr-mcp device list
+~~~
+
 ## Daily runtime management
 
 The normal user path is the native Rust CLI installed from a GitHub Release:
@@ -179,13 +210,19 @@ The watchdog protects herdr-mcp availability. It does not treat every transient 
 
 ## UI language
 
-```bash
+~~~bash
+herdr-mcp lang
 herdr-mcp lang en
-herdr-mcp lang zh
+herdr-mcp lang zh-CN
 herdr-mcp lang ja
-```
+herdr-mcp lang auto
+herdr-mcp --lang ja doctor
+HERDR_MCP_LANG=zh-CN herdr-mcp status
+~~~
 
-The browser extension also supports English, Simplified Chinese and Japanese.
+Native CLI human languages are `en`, `zh-CN` and `ja`; legacy `zh` is accepted. Precedence is global `--lang` > `HERDR_MCP_LANG` > saved `~/.config/herdr-mcp/ui.json` preference > the first non-empty `LC_ALL` / `LC_MESSAGES` / `LANG` > bounded macOS preferred-language lookup when POSIX is absent > English. `HERDR_MCP_LANG` is authoritative when non-empty: unsupported values select English instead of falling through to lower-priority saved/system settings. System locale forms such as `ja_JP.UTF-8` and `zh_CN.UTF-8` are recognized. The first non-empty POSIX locale is authoritative: `C` and unsupported values such as `de_DE` choose English without querying macOS. When all higher-priority sources are absent, macOS runs `/usr/bin/defaults read -g AppleLanguages` once, with a 300 ms wait limit, up to 250 ms termination grace, at most 8 KiB retained output, and child reaping. Failure, timeout or an unsupported list falls back to English. The ordered list maps `zh-Hans` / `zh-Hant` / `zh-*` to `zh-CN`, `ja-*` to `ja` and `en-*` to `en`. No dependency or resident process is added.
+
+`lang` shows the effective language. `lang auto` removes only the saved explicit language preference. Native Rust owns this policy and preserves other JSON fields; Chinese is stored as `zh` for compatibility with the old Bash entrypoint. `HERDR_MCP_UI_CFG` remains available as the legacy preference-file override. `--lang` accepts either `--lang ja` or `--lang=ja` before or after the command and does not persist a preference. Help and default status/doctor output are localized; detailed technical evidence and other command output can remain English. Browser extension language is separate.
 
 ## Browser Native Messaging host
 
