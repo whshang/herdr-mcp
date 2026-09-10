@@ -17,11 +17,11 @@
 
 按以下顺序判断，不要反复询问：
 
-- 用户已经给出 pairing address：这是**加入已有 Worker**，跳到 §5。
+- 用户已经给出 pairing address：这是**加入已有 Herdr Worker**，跳到 §5。
 - 本机已有有效的 Herdr device identity：保留现有 fleet，只做修复/验证，不新建 Worker。
-- 否则按**第一台 Worker**准备；拿到 Cloudflare Token 后，bootstrap 预检若发现该 Account 已有 Herdr Worker，则停止新 Worker mutation，要求由任意已登记设备创建 pairing，再走 §5。
-- **绝不能**在全新、尚未登记的电脑上运行 `herdr-mcp worker pair` 来探测 fleet。
-- existing-fleet 修复失败时不得 fallback 到随机后缀 Worker、第二套 R2 或第二个 Connector。
+- 否则按**第一台 Worker**准备；拿到 Cloudflare Token 后列出 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts`，若该 Account 已有 Herdr Worker，则停止新 Worker mutation，要求由任意已登记设备创建 pairing，再走 §5。
+- 绝不能在当前正在安装的这台电脑上运行 `herdr-mcp worker pair` 来探测 fleet。
+- existing-fleet 修复失败时禁止 fallback 到随机后缀 Worker、第二个 R2 桶或第二个 Connector，除非用户明确改变 fleet 意图。
 
 ## 3. 本机安装阶段
 
@@ -41,13 +41,13 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-如果 `~/.local/bin/herdr-mcp` 已存在但交互 shell 找不到它，只修复 PATH，不重复安装或创建第二个 CLI owner。
+如果 `~/.local/bin/herdr-mcp` 已存在但交互 shell 找不到它，记为 `installed_but_not_on_shell_path`，修复用户 PATH 后用新 shell 验证。不要重复安装，也不要创建第二个 PATH owner。只有实际需要修 PATH 时再打开[故障排查](troubleshooting.md)。
 
-macOS 若 `permissions`/`doctor` 明确要求 Full Disk Access/TCC，由用户本人完成系统授权后继续验证；不要用 `sudo` 替代。Linux 使用 release 自带的受支持 user-service / process backend，不套用 macOS launchd 假设。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
+macOS 在 Cloudflare 工作之前执行 `herdr-mcp permissions status` 和 `herdr-mcp permissions verify`。出现 `needs_setup`，或 `doctor` 明确要求完全磁盘访问（Full Disk Access/TCC）时，由用户本人给稳定 broker 授权后再验证；不要用 `sudo` 替代。Linux 使用 release 自带的受支持 user-service / process backend，不套用 macOS launchd 假设。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
 
 ## 4. 第一台 Worker：Cloudflare + bootstrap
 
-需要 Token 时打开 <https://dash.cloudflare.com/profile/api-tokens>。推荐 Cloudflare 的 **Edit Cloudflare Workers** 模板，限定到本次使用的 Account；核心路径需要 Workers Scripts 等 Worker 管理权限。**Workers R2 Storage 是可选能力**，只有用户明确启用 artifact relay 时才增加，不得因为 R2 未开通而阻塞安装。
+需要 Token 时打开 <https://dash.cloudflare.com/profile/api-tokens>。推荐 Cloudflare 的 **Edit Cloudflare Workers** 模板并限定到本次使用的 Account。自定义 Token 的核心预检需要 **Account Settings → Read** 和 **Workers Scripts → Write/Edit**。Token 验证有效但 `workers/subdomain` 返回 403 时，指出缺少的权限，不要无根据扩大权限。**核心安装不需要 R2**，Workers Free、没绑卡也应可完成；只有用户明确启用 artifact relay 时才增加 Workers R2 Storage。
 
 Token 仅放入当前进程的 `CLOUDFLARE_API_TOKEN` 或交给 `worker bootstrap` 的隐藏输入。不要把 Token 写进命令行字面量、配置仓库或普通日志。
 
@@ -77,6 +77,8 @@ herdr-mcp worker connect "<pairing-address>"
 
 CLI 要求 6 位验证码时再向用户索取。设备显示名默认来自电脑名；只有用户明确要求时才传 `--name`。这一流程不部署新 Worker、不创建第二个 Connector，也不需要把现有 fleet 的长期秘密复制到新电脑。
 
+登记后的身份使用不可变的 `device_id`，例如 `dev_01ARZ3NDEKTSV4RRFFQ69G5FAV`：`dev_` 加 26 字符 ULID。显示名与身份分开管理。**不要**自造 `WORKSTATION_ID`，也不要从 hostname 推导身份。
+
 详见[加入已有 fleet](existing-worker-connect.md)。
 
 ## 6. Link 与网络
@@ -89,7 +91,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-没有 Custom Domain 时，Link 自己负责选择 `workers.dev` 网络路径：先直连，再使用已有本地代理，仍不可达时使用内置签名共享 Relay。Agent 不需要自己拼网络路径，也不需要配置 Relay 服务商或 Relay URL。如果本机无法直连 `workers.dev`，不要重新部署 Worker；`link status` 显示 Relay 路径健康，并且公网 origin 的真实认证 MCP 请求能够往返当前工作站，就可以通过这部分验收。配置了 Custom Domain 时按已选定入口验证，不为了让探测成功而修改系统网络。
+没有 Custom Domain 时，Link 自己负责选择 `workers.dev` 网络路径：先直连，再使用已有本地代理，仍不可达时使用内置签名共享 Relay。Agent 不需要自己拼网络路径，也不需要配置 Relay 服务商或 Relay URL。用 `GET /health` 区分 Worker 代码健康和 hostname/DNS/网络路径故障；同一个 Worker 的其它 hostname 正常时，绝不用重新部署 Worker 来修这个 hostname，用户有域名时优先把 Custom Domain 作为长期公网入口。`link status` 显示 Relay 路径健康，并且公网 origin 的真实认证 MCP 请求能够往返当前工作站，就可以通过这部分验收。Link transport 不得静默改写 OAuth issuer 或已经选定的 public MCP origin，也不要为了让探测成功而修改系统网络。
 
 ## 7. 最终验收
 

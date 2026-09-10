@@ -17,11 +17,11 @@
 
 Resolve this in order without repeatedly questioning the user:
 
-- A pairing address was already supplied: this machine is **joining an existing Worker**; go to §5.
-- This machine already has a valid Herdr device identity: preserve the existing fleet and repair/verify it instead of creating another Worker.
-- Otherwise prepare for a **first Worker**. After a Cloudflare Token is available, bootstrap preflight must stop new-Worker mutation if that Account already contains a Herdr Worker; require a pairing from any enrolled device and continue at §5.
-- **Never** run `herdr-mcp worker pair` on a fresh, unenrolled machine as a fleet-discovery probe.
-- An existing-fleet repair failure must never fall back to a random-suffixed Worker, second R2 bucket, or second Connector.
+- A pairing address was already supplied: this machine is **joining an existing Herdr Worker**; go to §5.
+- This machine is already enrolled: preserve the existing fleet and repair/verify it instead of creating another Worker.
+- Otherwise prepare for a **first Worker**. After a Cloudflare Token is available, list `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts`; if that Account already contains a Herdr Worker, stop new-Worker mutation, require a pairing from an enrolled device, and continue at §5.
+- Never run `herdr-mcp worker pair` on the computer currently being installed as a fleet-discovery probe.
+- Never fall back to a random-suffixed Worker, second R2 bucket, or second Connector unless the user explicitly changes fleet intent.
 
 ## 3. Local installation phase
 
@@ -41,13 +41,13 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-If `~/.local/bin/herdr-mcp` already exists but the interactive shell cannot resolve it, fix PATH instead of reinstalling or creating a second CLI owner.
+If `~/.local/bin/herdr-mcp` exists but the interactive shell cannot resolve it, classify this as `installed_but_not_on_shell_path`, repair the user's PATH, and verify a fresh shell. Do not reinstall or create a second PATH owner. Use [Troubleshooting](troubleshooting.md) only if the PATH repair is needed.
 
-On macOS, if `permissions`/`doctor` explicitly requires Full Disk Access/TCC, let the user approve the system prompt and then verify again; do not substitute `sudo`. Linux uses the supported release user-service/process backend and must not inherit macOS launchd assumptions. Normal installation does not require Node.js, Wrangler, npm, or Cargo.
+On macOS, verify `herdr-mcp permissions status` and `herdr-mcp permissions verify` before Cloudflare work. If either reports `needs_setup` or `doctor` requires Full Disk Access/TCC, let the user approve the stable broker in System Settings and verify again; do not substitute `sudo`. Linux uses the supported release user-service/process backend and must not inherit macOS launchd assumptions. Normal installation does not require Node.js, Wrangler, npm, or Cargo.
 
 ## 4. First Worker: Cloudflare + bootstrap
 
-When a Token is required, open <https://dash.cloudflare.com/profile/api-tokens>. Prefer Cloudflare's **Edit Cloudflare Workers** template scoped to the Account being used; the core path requires Workers Scripts and related Worker-management permissions. **Workers R2 Storage is optional** and is added only when the user explicitly enables artifact relay. R2 must never block the core install.
+When a Token is required, open <https://dash.cloudflare.com/profile/api-tokens>. Prefer Cloudflare's **Edit Cloudflare Workers** template scoped to the Account being used. For a custom token, the core preflight needs **Account Settings → Read** and **Workers Scripts → Write/Edit**. If the token verifies as valid but `workers/subdomain` returns 403, report the missing permission and do not inflate the token scope. **Core install does not require R2** and must work on Workers Free with no payment method; add Workers R2 Storage only when the user explicitly enables artifact relay.
 
 Keep the Token only in the current process as `CLOUDFLARE_API_TOKEN` or provide it through the hidden `worker bootstrap` input. Do not put the Token in a command-line literal, repository config, or ordinary log.
 
@@ -77,6 +77,8 @@ herdr-mcp worker connect "<pairing-address>"
 
 Ask for the six-digit verification code only when the CLI requests it. The display name defaults from the computer name; pass `--name` only when the user explicitly wants a different name. This path does not deploy another Worker, create another Connector, or copy a fleet-wide long-lived secret to the new machine.
 
+The enrolled identity is an immutable `device_id`, for example `dev_01ARZ3NDEKTSV4RRFFQ69G5FAV`: `dev_` plus a 26-character ULID. Keep the display name separate from identity. Do **not** invent a `WORKSTATION_ID` from the hostname.
+
 See [join an existing fleet](existing-worker-connect.md) for detail.
 
 ## 6. Link and network
@@ -89,7 +91,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-Without a Custom Domain, Link owns the supported `workers.dev` path selection: direct access first, then an already-configured local proxy, then the built-in signed shared Relay when needed. The Agent does not reconstruct that transport ladder or configure a Relay provider/URL. If this workstation cannot reach `workers.dev` directly, do not redeploy the Worker: a healthy Relay-selected Link plus a successful public-origin authenticated MCP round trip is valid acceptance evidence. With a Custom Domain, verify the already-selected origin; do not modify system networking just to make a probe succeed.
+Without a Custom Domain, Link owns the supported `workers.dev` path selection: direct access first, then an already-configured local proxy, then the built-in signed shared Relay when needed. The Agent does not reconstruct that transport ladder or configure a Relay provider/URL. Use `GET /health` to separate Worker-code health from hostname/DNS/network-path failures. If another hostname for the same Worker is healthy, never redeploy the Worker solely to fix the failing hostname; prefer the Custom Domain when the user owns one. A healthy Relay-selected Link plus a successful public-origin authenticated MCP round trip is valid acceptance evidence. Link transport must not silently rewrite the OAuth issuer or selected public MCP origin. Do not modify system networking just to make a probe succeed.
 
 ## 7. Final acceptance
 

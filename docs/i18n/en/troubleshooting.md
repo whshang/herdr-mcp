@@ -58,9 +58,10 @@ If local HTTP works but `herdr_inspect` cannot see real workspaces, investigate 
 ```bash
 ls -l ~/.local/bin/herdr-mcp
 zsh -ic 'command -v herdr-mcp'
+zsh -lc 'command -v herdr-mcp'
 ```
 
-A present binary with an empty `command -v` result is `installed_but_not_on_shell_path`, not a missing installation. Export `~/.local/bin` for the current process, persist the same line idempotently in the shell startup file, and do not reinstall or create a second PATH owner.
+A present binary with an empty `command -v` result is `installed_but_not_on_shell_path`, not a missing installation. Run `export PATH="$HOME/.local/bin:$PATH"` for the current process. For zsh, persist the same line idempotently with `line='export PATH="$HOME/.local/bin:$PATH"'` and `grep -Fqx "$line" "$HOME/.zprofile" 2>/dev/null || printf '\n%s\n' "$line" >> "$HOME/.zprofile"`. Do not reinstall or create a second PATH owner.
 
 ### Can Edge see the workstation?
 

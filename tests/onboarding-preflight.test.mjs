@@ -38,16 +38,17 @@ test("PATH preflight separates the installed binary from the interactive-shell P
   for (const rel of AGENT_INSTALL) {
     const doc = read(rel);
     assert.match(doc, /installed_but_not_on_shell_path/);
-    assert.match(doc, /zsh -ic 'command -v herdr-mcp'/);
-    assert.match(doc, /zsh -lc 'command -v herdr-mcp'/);
-    // Self-heal first, persist to the login-shell owner, and avoid a second PATH owner.
-    assert.match(doc, /export PATH="\$HOME\/\.local\/bin:\$PATH"/);
-    assert.match(doc, /grep -Fqx[^\n]*\.zprofile/);
     assert.match(doc, /second PATH owner|第二个 PATH owner/);
+    assert.doesNotMatch(doc, /grep -Fqx|zsh -ic/);
   }
-  const triage = read("docs/i18n/en/troubleshooting.md");
-  assert.match(triage, /installed_but_not_on_shell_path/);
-  assert.match(triage, /not a missing installation/);
+  for (const rel of ["docs/i18n/en/troubleshooting.md", "docs/i18n/zh-CN/troubleshooting.md"]) {
+    const triage = read(rel);
+    assert.match(triage, /installed_but_not_on_shell_path/);
+    assert.match(triage, /zsh -ic 'command -v herdr-mcp'/);
+    assert.match(triage, /zsh -lc 'command -v herdr-mcp'/);
+    assert.match(triage, /export PATH="\$HOME\/\.local\/bin:\$PATH"/);
+    assert.match(triage, /grep -Fqx[^\n]*\.zprofile/);
+  }
 });
 
 test("macOS TCC/FDA readiness is verified before background setup, not after install", () => {
