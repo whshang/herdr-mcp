@@ -34,7 +34,7 @@ jobs:
 
   windows:
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       CARGO_INCREMENTAL: "0"
       HERDR_MCP_BUILD_CHANNEL: dev
@@ -51,6 +51,27 @@ jobs:
       - name: Build Windows UAT candidate
         shell: pwsh
         run: cargo +1.97.1 build --locked --release -p herdr-mcp --target x86_64-pc-windows-msvc
+      - name: Windows user-process lifecycle smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $candidate = (Resolve-Path "target/x86_64-pc-windows-msvc/release/herdr-mcp.exe").Path
+          try {
+            & $candidate install
+            if ($LASTEXITCODE -ne 0) { throw "Windows install smoke failed" }
+            $status = (& $candidate service status | ConvertFrom-Json)
+            if ($status.implementation -ne "rust-windows-process-user") { throw "unexpected Windows service implementation" }
+            if (-not $status.autostart_registered) { throw "HKCU login autostart was not registered" }
+            if (-not $status.loaded) { throw "Windows runtime process is not active" }
+            if (-not $status.healthy) { throw "Windows runtime process is not healthy" }
+            $runValue = & reg.exe query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "Herdr MCP Runtime"
+            if ($LASTEXITCODE -ne 0 -or ($runValue -join "`n") -notmatch "service start") { throw "HKCU Run registration is missing or invalid" }
+            & schtasks.exe /Query /TN "Herdr MCP Runtime" *> $null
+            if ($LASTEXITCODE -eq 0) { throw "legacy scheduled task was unexpectedly created" }
+          }
+          finally {
+            & $candidate service uninstall *> $null
+          }
       - name: Stage Windows UAT bundle
         shell: pwsh
         run: |
