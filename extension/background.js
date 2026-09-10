@@ -47,7 +47,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.90";
+const H2W_SCRIPT_VERSION = "0.1.91";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -2567,6 +2567,8 @@ async function handleBrowserActuation(command) {
       resource_available: true,
       result,
     }).catch(() => {});
+    return;
+  }
   if (operation === "herdr_mcp.browser_session.create") {
     const providerCreate = String(params.provider || "");
     const accountRefCreate = String(params.account_ref || "");

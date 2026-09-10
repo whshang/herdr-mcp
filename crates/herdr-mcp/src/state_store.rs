@@ -7564,14 +7564,12 @@ mod tests {
             "browser_endpoints",
             "browser_provider_state",
             "browser_resources",
+            "browser_resource_locators",
+            "browser_session_reservations",
             "browser_dispatches",
         ] {
             assert!(tables.contains(&table.to_owned()), "missing {table}");
         }
-        assert!(
-            !tables.iter().any(|table| table.contains("reservation")),
-            "browser reservation remains out of scope"
-        );
         drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
@@ -7579,7 +7577,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v7_to_v8_adds_only_dispatch_table_and_preserves_browser_registry() {
+    fn schema_v7_upgrades_through_v11_and_preserves_browser_registry() {
         let path = temp_db_path();
         let endpoint_ref;
         let session_ref;
@@ -7642,7 +7640,7 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(store.browser_endpoint(&endpoint_ref).unwrap().is_some());
         assert!(store.browser_resource(&session_ref).unwrap().is_some());
         let tables_after = store.table_names().unwrap();
@@ -7651,7 +7649,14 @@ mod tests {
             .filter(|table| !tables_before.contains(table))
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(new_tables, vec!["browser_dispatches"]);
+        assert_eq!(
+            new_tables,
+            vec![
+                "browser_dispatches",
+                "browser_resource_locators",
+                "browser_session_reservations"
+            ]
+        );
         assert!(!tables_after.contains(&"browser_delivery_events".to_owned()));
         drop(store);
         std::fs::remove_file(&path).ok();

@@ -100,6 +100,7 @@ impl Drop for BrowserMutationPermit<'_> {
             active.remove(&self.key);
         }
     }
+}
 
 pub struct RuntimeContext<'a> {
     pub client: &'a HerdrClient,
@@ -5932,6 +5933,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: true,
+                    result: None,
                 })
             }
         }
@@ -6034,6 +6036,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    result: None,
                 })
             }
 
@@ -6061,6 +6064,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: true,
+                    result: None,
                 }))
             }
         }
@@ -6316,7 +6320,7 @@ mod tests {
     }
 
     #[test]
-    fn alpha4_browser_mutation_support_matrix_is_frozen() {
+    fn beta2_browser_mutation_support_matrix_is_frozen() {
         let cases = [
             (
                 "herdr_mcp.browser_space.create",
@@ -6362,14 +6366,6 @@ mod tests {
                     "required_apps": ["herdr"],
                     "expected_generation": 7,
                     "idempotency_key": "unsupported-apps"
-                }),
-            ),
-            (
-                "herdr_mcp.browser_dispatch.stop",
-                json!({
-                    "dispatch_id": "bd_alpha4",
-                    "expected_generation": 7,
-                    "idempotency_key": "unsupported-stop"
                 }),
             ),
             (
@@ -6936,6 +6932,7 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
+                    result: None,
                 }
             }
 
@@ -7931,6 +7928,7 @@ mod tests {
                     generation_owner: None,
                     generation_status_observed: false,
                     generation_stopped: false,
+                    result: None,
                 })
             }
         }
@@ -8033,6 +8031,4 @@ mod tests {
         assert_eq!(replay["idempotent_replay"], true);
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
     }
-
-
 }

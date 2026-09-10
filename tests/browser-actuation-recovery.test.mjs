@@ -233,7 +233,7 @@ test("A to B to A registration cannot resurrect an older A response", async () =
   assert.equal(harness.state().generation, 12);
 });
 
-test("ChatGPT session.open is the only supported existing-view open (create stays unsupported)", () => {
+test("ChatGPT session.open is the only supported existing-view open", () => {
   assert.match(backgroundSource, /capabilities:\s*\{\s*operations:\s*provider === "chatgpt"/);
   assert.match(backgroundSource, /"session\.open"/);
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
@@ -251,14 +251,14 @@ test("background session.open recovers unique target via recoverBrowserSessionTa
   assert.doesNotMatch(segment, /insertMainWorld|performWake|tabs\.reload|executeScript/);
   // Must fail closed on missing/duplicate/stale/provider mismatch.
   assert.match(segment, /observedGeneration/);
-  assert.match(segment, /provider !== "chatgpt"/);
+  assert.match(segment, /providerOpen !== "chatgpt"/);
 });
 
 test("content script session.open verifies identity, generation, route, canonical readiness and never submits", () => {
   const start = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_session.open")');
   assert.ok(start >= 0, "wake must handle session.open");
-  const dispatchStart = wakeSource.indexOf('if (command?.operation !== "herdr_mcp.browser_dispatch.submit")', start);
-  const segment = wakeSource.slice(start, dispatchStart >= 0 ? dispatchStart : start + 3000);
+  const stopStart = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_dispatch.stop")', start);
+  const segment = wakeSource.slice(start, stopStart >= 0 ? stopStart : start + 3000);
   assert.match(segment, /registeredBrowserSessionRef/);
   assert.match(segment, /registeredBrowserGeneration/);
   assert.match(segment, /registeredConvKey/);
@@ -270,14 +270,6 @@ test("content script session.open verifies identity, generation, route, canonica
   assert.match(segment, /lifecycle_observed\s*=\s*true/);
   assert.match(segment, /canonical_url_observed\s*=\s*true/);
   assert.match(segment, /command_accepted\s*=\s*true/);
-});
-
-test("browser_session.create remains unsupported and never reaches browser actuation", () => {
-  // Background must not have a dedicated create branch, and Rust matrix keeps it unsupported.
-  assert.equal(backgroundSource.includes('herdr_mcp.browser_session.create') && backgroundSource.includes('if (operation === "herdr_mcp.browser_session.create")'), false);
-  assert.match(wakeSource, /herdr_mcp\.browser_dispatch\.submit/);
-  // Ensure the capability snapshot for non-chatgpt never advertises session.open.
-  assert.match(backgroundSource, /provider === "chatgpt"\s*\?/);
 });
 
 test("ChatGPT session.open can restore a disposable view from a local canonical locator", () => {
