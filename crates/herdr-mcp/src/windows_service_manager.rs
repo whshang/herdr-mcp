@@ -1,19 +1,41 @@
 use crate::cli::ServiceCommand;
 use crate::config::Config;
 use crate::paths::RuntimePaths;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, FILETIME,
+    GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, GetProcessTimes, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    WaitForSingleObject,
+};
 
-const IMPLEMENTATION: &str = "rust-windows-task-user";
+const IMPLEMENTATION: &str = "rust-windows-process-user";
 const RUNTIME_TOKEN_SERVICE: &str = "herdr-mcp-local-runtime";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const PROCESS_RECORD_SCHEMA: u32 = 1;
+const PROCESS_RECORD_MAX_BYTES: u64 = 16 * 1024;
 const HEALTH_BUDGET: Duration = Duration::from_secs(12);
+const PROCESS_STOP_BUDGET_MS: u32 = 5_000;
+const RUNTIME_KIND: &str = "runtime";
+const LINK_KIND: &str = "link";
 
 #[derive(Debug, Clone)]
 struct WindowsPaths {
@@ -22,10 +44,14 @@ struct WindowsPaths {
     current_dir: PathBuf,
     current_binary: PathBuf,
     current_generation: PathBuf,
+    runtime_process: PathBuf,
+    link_process: PathBuf,
+    link_enabled: PathBuf,
     port: u16,
     herdr_socket: PathBuf,
-    runtime_task: String,
-    link_task: String,
+    run_value_name: String,
+    link_label: String,
+    instance_name: Option<String>,
 }
 
 impl WindowsPaths {
@@ -43,14 +69,51 @@ impl WindowsPaths {
             generations_dir: runtime_root.join("generations"),
             current_binary: current_dir.join("herdr-mcp.exe"),
             current_generation: current_dir.join("generation"),
+            runtime_process: runtime_root.join("windows-runtime-process.json"),
+            link_process: runtime_root.join("windows-link-process.json"),
+            link_enabled: runtime_root.join("windows-link-enabled"),
             current_dir,
             port: runtime.instance.default_port(),
             herdr_socket: runtime
                 .herdr_socket
                 .ok_or_else(|| "Windows Herdr named-pipe path is unavailable".to_owned())?,
-            runtime_task: format!("Herdr MCP Runtime{suffix}"),
-            link_task: format!("Herdr MCP Link{suffix}"),
+            run_value_name: format!("Herdr MCP Runtime{suffix}"),
+            link_label: format!("Herdr MCP Link{suffix}"),
+            instance_name: runtime.instance.name().map(str::to_owned),
         })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManagedProcessRecord {
+    schema_version: u32,
+    kind: String,
+    pid: u32,
+    creation_time_100ns: u64,
+    generation: String,
+}
+
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct OwnedRegistryKey(HKEY);
+
+impl Drop for OwnedRegistryKey {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
     }
 }
 
@@ -65,30 +128,24 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
         ServiceCommand::Status => print_json(&status_value()?)?,
         ServiceCommand::Start => {
             let paths = WindowsPaths::discover()?;
-            require_task(&paths.runtime_task)?;
-            task_run(&paths.runtime_task)?;
-            wait_for_health(&paths)?;
-            if task_exists(&paths.link_task) {
-                task_run(&paths.link_task)?;
-            }
+            require_autostart(&paths)?;
+            start_runtime(&paths)?;
+            start_enabled_link(&paths)?;
             print_json(&status_value()?)?;
         }
         ServiceCommand::Stop => {
             let paths = WindowsPaths::discover()?;
-            task_end_if_present(&paths.link_task)?;
-            task_end_if_present(&paths.runtime_task)?;
+            stop_managed_process(&paths.link_process, LINK_KIND)?;
+            stop_managed_process(&paths.runtime_process, RUNTIME_KIND)?;
             print_json(&status_value()?)?;
         }
         ServiceCommand::Restart => {
             let paths = WindowsPaths::discover()?;
-            require_task(&paths.runtime_task)?;
-            task_end_if_present(&paths.link_task)?;
-            task_end_if_present(&paths.runtime_task)?;
-            task_run(&paths.runtime_task)?;
-            wait_for_health(&paths)?;
-            if task_exists(&paths.link_task) {
-                task_run(&paths.link_task)?;
-            }
+            require_autostart(&paths)?;
+            stop_managed_process(&paths.link_process, LINK_KIND)?;
+            stop_managed_process(&paths.runtime_process, RUNTIME_KIND)?;
+            start_runtime(&paths)?;
+            start_enabled_link(&paths)?;
             print_json(&status_value()?)?;
         }
         ServiceCommand::Uninstall => uninstall()?,
@@ -107,21 +164,25 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
 
 pub fn doctor_status() -> Result<Value, String> {
     let paths = WindowsPaths::discover()?;
-    let loaded = task_exists(&paths.runtime_task);
+    let autostart_registered = autostart_registered(&paths)?;
+    let loaded = managed_process_active(&paths.runtime_process, RUNTIME_KIND)?;
     let healthy = health_once(paths.port);
-    let link_loaded = task_exists(&paths.link_task);
+    let link_enabled = link_enabled(&paths)?;
+    let link_loaded = managed_process_active(&paths.link_process, LINK_KIND)?;
     let generation = current_generation(&paths);
     Ok(json!({
-        "ok": loaded && healthy,
+        "ok": autostart_registered && loaded && healthy,
         "implementation": IMPLEMENTATION,
         "loaded": loaded,
         "healthy": healthy,
-        "label": paths.runtime_task,
+        "label": paths.run_value_name,
+        "autostart_registered": autostart_registered,
         "generation": generation,
         "current_target": generation,
         "runtime_current": paths.current_binary,
+        "link_enabled": link_enabled,
         "link_loaded": link_loaded,
-        "link_label": paths.link_task,
+        "link_label": paths.link_label,
     }))
 }
 
@@ -174,8 +235,8 @@ pub fn install_link() -> Result<(), String> {
 
 pub fn uninstall_link() -> Result<(), String> {
     let paths = WindowsPaths::discover()?;
-    task_end_if_present(&paths.link_task)?;
-    task_delete_if_present(&paths.link_task)
+    stop_managed_process(&paths.link_process, LINK_KIND)?;
+    set_link_enabled(&paths, false)
 }
 
 pub fn print_link_status() -> Result<ExitCode, String> {
@@ -183,8 +244,9 @@ pub fn print_link_status() -> Result<ExitCode, String> {
     print_json(&json!({
         "ok": true,
         "implementation": IMPLEMENTATION,
-        "loaded": task_exists(&paths.link_task),
-        "label": paths.link_task,
+        "loaded": managed_process_active(&paths.link_process, LINK_KIND)?,
+        "enabled": link_enabled(&paths)?,
+        "label": paths.link_label,
         "generation": current_generation(&paths),
     }))?;
     Ok(ExitCode::SUCCESS)
@@ -211,10 +273,16 @@ pub fn reconcile_link() -> Result<(), String> {
         format!("Windows Link activation cannot load enrolled device credential: {error}")
     })?;
     runtime_token()?;
-    let command = task_command(&paths.current_binary, &["link", "run"])?;
-    task_end_if_present(&paths.link_task)?;
-    task_create(&paths.link_task, &command)?;
-    task_run(&paths.link_task)
+
+    let was_enabled = link_enabled(&paths)?;
+    set_link_enabled(&paths, true)?;
+    if let Err(error) = start_link(&paths) {
+        if !was_enabled {
+            set_link_enabled(&paths, false).ok();
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn install() -> Result<(), String> {
@@ -244,40 +312,40 @@ fn install() -> Result<(), String> {
 
     ensure_runtime_token()?;
     let previous_generation = current_generation(&paths);
+    let previous_autostart = read_run_value(&paths.run_value_name)?;
+    let expected_autostart = autostart_command(&paths)?;
+    if let Some(existing) = previous_autostart.as_deref()
+        && existing != expected_autostart
+    {
+        return Err(format!(
+            "HKCU Run value '{}' already exists with an unexpected command; refusing to overwrite it",
+            paths.run_value_name
+        ));
+    }
+    let previous_link_enabled = link_enabled(&paths)?;
 
-    task_end_if_present(&paths.link_task)?;
-    task_end_if_present(&paths.runtime_task)?;
+    stop_managed_process(&paths.link_process, LINK_KIND)?;
+    stop_managed_process(&paths.runtime_process, RUNTIME_KIND)?;
     activate_generation(&paths, &generation_binary, &generation_id, &sha)?;
 
-    let service_command = task_command(
-        &paths.current_binary,
-        &["candidate", "--port", &paths.port.to_string()],
-    )?;
     let activation = (|| -> Result<(), String> {
-        task_create(&paths.runtime_task, &service_command)?;
-        task_run(&paths.runtime_task)?;
-        wait_for_health(&paths)?;
+        set_run_value(&paths.run_value_name, &expected_autostart)?;
+        start_runtime(&paths)?;
         reconcile_link()?;
         Ok(())
     })();
     if let Err(error) = activation {
-        task_end_if_present(&paths.link_task).ok();
-        task_end_if_present(&paths.runtime_task).ok();
+        stop_managed_process(&paths.link_process, LINK_KIND).ok();
+        stop_managed_process(&paths.runtime_process, RUNTIME_KIND).ok();
         restore_generation(&paths, previous_generation.as_deref())?;
+        restore_run_value(&paths.run_value_name, previous_autostart.as_deref())?;
+        set_link_enabled(&paths, previous_link_enabled)?;
         if previous_generation.is_some() {
-            task_create(
-                &paths.runtime_task,
-                &task_command(
-                    &paths.current_binary,
-                    &["candidate", "--port", &paths.port.to_string()],
-                )?,
-            )?;
-            task_run(&paths.runtime_task)?;
-            wait_for_health(&paths)?;
-            reconcile_link()?;
+            start_runtime(&paths)?;
+            start_enabled_link(&paths)?;
         } else {
-            task_delete_if_present(&paths.runtime_task)?;
-            task_delete_if_present(&paths.link_task)?;
+            remove_process_record(&paths.runtime_process).ok();
+            remove_process_record(&paths.link_process).ok();
         }
         return Err(format!(
             "Windows service install failed and the previous active generation was restored: {error}"
@@ -290,24 +358,24 @@ fn install() -> Result<(), String> {
         "implementation": IMPLEMENTATION,
         "generation": generation_id,
         "runtime_current": paths.current_binary,
-        "runtime_task": paths.runtime_task,
-        "link_reconciled": task_exists(&paths.link_task),
+        "autostart": paths.run_value_name,
+        "link_reconciled": managed_process_active(&paths.link_process, LINK_KIND)?,
         "runtime_token_printed": false,
     }))
 }
 
 fn uninstall() -> Result<(), String> {
     let paths = WindowsPaths::discover()?;
-    task_end_if_present(&paths.link_task)?;
-    task_end_if_present(&paths.runtime_task)?;
-    task_delete_if_present(&paths.link_task)?;
-    task_delete_if_present(&paths.runtime_task)?;
+    stop_managed_process(&paths.link_process, LINK_KIND)?;
+    stop_managed_process(&paths.runtime_process, RUNTIME_KIND)?;
+    remove_autostart_if_owned(&paths)?;
+    set_link_enabled(&paths, false)?;
     print_json(&json!({
         "ok": true,
         "action": "service_uninstall",
         "implementation": IMPLEMENTATION,
-        "runtime_task_removed": true,
-        "link_task_removed": true,
+        "autostart_removed": true,
+        "link_disabled": true,
         "credentials_preserved": true,
         "runtime_generations_preserved": true,
     }))
@@ -318,15 +386,583 @@ fn status_value() -> Result<Value, String> {
     Ok(json!({
         "ok": true,
         "implementation": IMPLEMENTATION,
-        "label": paths.runtime_task,
-        "loaded": task_exists(&paths.runtime_task),
+        "label": paths.run_value_name,
+        "autostart_registered": autostart_registered(&paths)?,
+        "loaded": managed_process_active(&paths.runtime_process, RUNTIME_KIND)?,
         "healthy": health_once(paths.port),
         "generation": current_generation(&paths),
         "current_target": current_generation(&paths),
         "runtime_current": paths.current_binary,
-        "link_loaded": task_exists(&paths.link_task),
-        "link_label": paths.link_task,
+        "link_enabled": link_enabled(&paths)?,
+        "link_loaded": managed_process_active(&paths.link_process, LINK_KIND)?,
+        "link_label": paths.link_label,
     }))
+}
+
+fn start_runtime(paths: &WindowsPaths) -> Result<(), String> {
+    let port = paths.port.to_string();
+    let spawned = start_managed_process(
+        paths,
+        RUNTIME_KIND,
+        &["candidate", "--port", &port],
+        &paths.runtime_process,
+    )?;
+    if let Err(error) = wait_for_health(paths) {
+        if spawned {
+            stop_managed_process(&paths.runtime_process, RUNTIME_KIND).ok();
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn start_link(paths: &WindowsPaths) -> Result<(), String> {
+    if !health_once(paths.port) {
+        return Err("Windows Link activation requires a healthy local runtime".to_owned());
+    }
+    start_managed_process(paths, LINK_KIND, &["link", "run"], &paths.link_process)?;
+    thread::sleep(Duration::from_millis(250));
+    if managed_process_active(&paths.link_process, LINK_KIND)? {
+        Ok(())
+    } else {
+        Err("Windows Link process exited during startup".to_owned())
+    }
+}
+
+fn start_enabled_link(paths: &WindowsPaths) -> Result<(), String> {
+    if link_enabled(paths)? {
+        start_link(paths)?;
+    }
+    Ok(())
+}
+
+fn start_managed_process(
+    paths: &WindowsPaths,
+    kind: &str,
+    args: &[&str],
+    record_path: &Path,
+) -> Result<bool, String> {
+    if let Some(record) = read_process_record(record_path, kind)? {
+        if process_record_active(&record)? {
+            return Ok(false);
+        }
+        remove_process_record(record_path)?;
+    }
+    let generation = current_generation(paths)
+        .ok_or_else(|| "Windows runtime/current generation marker is missing".to_owned())?;
+    if !paths.current_binary.is_file() {
+        return Err("Windows runtime/current binary is missing".to_owned());
+    }
+
+    let mut command = Command::new(&paths.current_binary);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .env_remove("CLOUDFLARE_API_TOKEN")
+        .env_remove("CLOUDFLARE_ACCOUNT_ID")
+        .env_remove("HERDR_MCP_TOKEN");
+    if let Some(instance) = paths.instance_name.as_deref() {
+        command.env("HERDR_MCP_INSTANCE", instance);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot start Windows {kind} process: {error}"))?;
+    let creation_time_100ns = process_creation_time_from_handle(child.as_raw_handle() as HANDLE)
+        .map_err(|error| {
+            let _ = child.kill();
+            format!("cannot identify Windows {kind} process: {error}")
+        })?;
+    let record = ManagedProcessRecord {
+        schema_version: PROCESS_RECORD_SCHEMA,
+        kind: kind.to_owned(),
+        pid: child.id(),
+        creation_time_100ns,
+        generation,
+    };
+    if let Err(error) = write_process_record(record_path, &record) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    drop(child);
+    Ok(true)
+}
+
+fn managed_process_active(path: &Path, kind: &str) -> Result<bool, String> {
+    let Some(record) = read_process_record(path, kind)? else {
+        return Ok(false);
+    };
+    process_record_active(&record)
+}
+
+fn process_record_active(record: &ManagedProcessRecord) -> Result<bool, String> {
+    let Some(handle) = open_process(
+        record.pid,
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+    )?
+    else {
+        return Ok(false);
+    };
+    let wait = unsafe { WaitForSingleObject(handle.0, 0) };
+    if wait == WAIT_OBJECT_0 {
+        return Ok(false);
+    }
+    if wait != WAIT_TIMEOUT {
+        return Err(format!(
+            "cannot inspect Windows process {} wait state: {wait}",
+            record.pid
+        ));
+    }
+    Ok(process_creation_time_from_handle(handle.0)? == record.creation_time_100ns)
+}
+
+fn stop_managed_process(path: &Path, kind: &str) -> Result<bool, String> {
+    let Some(record) = read_process_record(path, kind)? else {
+        return Ok(false);
+    };
+    let Some(handle) = open_process(
+        record.pid,
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+    )?
+    else {
+        remove_process_record(path)?;
+        return Ok(false);
+    };
+    let wait = unsafe { WaitForSingleObject(handle.0, 0) };
+    if wait == WAIT_OBJECT_0 {
+        remove_process_record(path)?;
+        return Ok(false);
+    }
+    if wait != WAIT_TIMEOUT {
+        return Err(format!(
+            "cannot inspect Windows {kind} process {} wait state: {wait}",
+            record.pid
+        ));
+    }
+    let actual_creation = process_creation_time_from_handle(handle.0)?;
+    if actual_creation != record.creation_time_100ns {
+        remove_process_record(path)?;
+        return Ok(false);
+    }
+    if unsafe { TerminateProcess(handle.0, 0) } == 0 {
+        return Err(format!(
+            "cannot stop Windows {kind} process {}: Win32 error {}",
+            record.pid,
+            unsafe { GetLastError() }
+        ));
+    }
+    let wait = unsafe { WaitForSingleObject(handle.0, PROCESS_STOP_BUDGET_MS) };
+    if wait != WAIT_OBJECT_0 {
+        return Err(format!(
+            "Windows {kind} process {} did not stop within {}ms (wait={wait})",
+            record.pid, PROCESS_STOP_BUDGET_MS
+        ));
+    }
+    remove_process_record(path)?;
+    Ok(true)
+}
+
+fn open_process(pid: u32, access: u32) -> Result<Option<OwnedHandle>, String> {
+    let handle = unsafe { OpenProcess(access, 0, pid) };
+    if !handle.is_null() {
+        return Ok(Some(OwnedHandle(handle)));
+    }
+    let error = unsafe { GetLastError() };
+    if error == ERROR_INVALID_PARAMETER {
+        Ok(None)
+    } else {
+        Err(format!(
+            "cannot open managed Windows process {pid}: Win32 error {error}"
+        ))
+    }
+}
+
+fn process_creation_time_from_handle(handle: HANDLE) -> Result<u64, String> {
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return Err(format!(
+            "GetProcessTimes failed with Win32 error {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    Ok(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+}
+
+fn read_process_record(path: &Path, kind: &str) -> Result<Option<ManagedProcessRecord>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect Windows {kind} process record {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > PROCESS_RECORD_MAX_BYTES
+    {
+        return Err(format!(
+            "Windows {kind} process record is not a bounded regular file: {}",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| format!("cannot read Windows {kind} process record: {error}"))?;
+    let record: ManagedProcessRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid Windows {kind} process record: {error}"))?;
+    if record.schema_version != PROCESS_RECORD_SCHEMA
+        || record.kind != kind
+        || record.pid == 0
+        || record.creation_time_100ns == 0
+        || !valid_generation_id(&record.generation)
+    {
+        return Err(format!("invalid Windows {kind} process record fields"));
+    }
+    Ok(Some(record))
+}
+
+fn write_process_record(path: &Path, record: &ManagedProcessRecord) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Windows process record has no parent directory".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create Windows process record directory: {error}"))?;
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec(record)
+        .map_err(|error| format!("cannot encode Windows process record: {error}"))?;
+    fs::write(&temp, bytes)
+        .map_err(|error| format!("cannot stage Windows process record: {error}"))?;
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|error| format!("cannot replace Windows process record: {error}"))?;
+    }
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("cannot activate Windows process record: {error}")
+    })
+}
+
+fn remove_process_record(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot remove Windows process record {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn autostart_command(paths: &WindowsPaths) -> Result<String, String> {
+    let binary = paths
+        .current_binary
+        .to_str()
+        .ok_or_else(|| "Windows runtime path is not valid UTF-8".to_owned())?;
+    let mut args = vec![quote_windows_arg(binary)];
+    if let Some(instance) = paths.instance_name.as_deref() {
+        args.push("--instance".to_owned());
+        args.push(quote_windows_arg(instance));
+    }
+    args.push("service".to_owned());
+    args.push("start".to_owned());
+    Ok(args.join(" "))
+}
+
+fn quote_windows_arg(value: &str) -> String {
+    if !value.is_empty() && !value.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return value.to_owned();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+fn require_autostart(paths: &WindowsPaths) -> Result<(), String> {
+    if autostart_registered(paths)? {
+        Ok(())
+    } else {
+        Err("Windows user autostart is not installed; run `herdr-mcp install`".to_owned())
+    }
+}
+
+fn autostart_registered(paths: &WindowsPaths) -> Result<bool, String> {
+    Ok(read_run_value(&paths.run_value_name)?.as_deref()
+        == Some(autostart_command(paths)?.as_str()))
+}
+
+fn remove_autostart_if_owned(paths: &WindowsPaths) -> Result<(), String> {
+    let Some(existing) = read_run_value(&paths.run_value_name)? else {
+        return Ok(());
+    };
+    if existing != autostart_command(paths)? {
+        return Err(format!(
+            "HKCU Run value '{}' is not owned by this installation; refusing to delete it",
+            paths.run_value_name
+        ));
+    }
+    delete_run_value(&paths.run_value_name)
+}
+
+fn restore_run_value(name: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        Some(value) => set_run_value(name, value),
+        None => delete_run_value(name),
+    }
+}
+
+fn open_run_key_read() -> Result<Option<OwnedRegistryKey>, String> {
+    let subkey = wide_z(RUN_KEY);
+    let mut key: HKEY = std::ptr::null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "cannot open HKCU Run key for read: Win32 error {status}"
+        ));
+    }
+    Ok(Some(OwnedRegistryKey(key)))
+}
+
+fn open_run_key_write() -> Result<OwnedRegistryKey, String> {
+    let subkey = wide_z(RUN_KEY);
+    let mut key: HKEY = std::ptr::null_mut();
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "cannot open HKCU Run key for write: Win32 error {status}"
+        ));
+    }
+    Ok(OwnedRegistryKey(key))
+}
+
+fn read_run_value(name: &str) -> Result<Option<String>, String> {
+    let Some(key) = open_run_key_read()? else {
+        return Ok(None);
+    };
+    read_registry_string(key.0, name)
+}
+
+fn read_registry_string(key: HKEY, name: &str) -> Result<Option<String>, String> {
+    let name_w = wide_z(name);
+    let mut value_type = 0u32;
+    let mut byte_len = 0u32;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name_w.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            std::ptr::null_mut(),
+            &mut byte_len,
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "cannot query HKCU Run value '{name}': Win32 error {status}"
+        ));
+    }
+    if value_type != REG_SZ || byte_len == 0 || byte_len > 16 * 1024 || byte_len % 2 != 0 {
+        return Err(format!("HKCU Run value '{name}' is not a bounded REG_SZ"));
+    }
+    let mut data = vec![0u16; byte_len as usize / 2];
+    let mut actual_len = byte_len;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name_w.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            data.as_mut_ptr().cast::<u8>(),
+            &mut actual_len,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "cannot read HKCU Run value '{name}': Win32 error {status}"
+        ));
+    }
+    if actual_len % 2 != 0 || actual_len as usize > data.len() * 2 {
+        return Err(format!(
+            "HKCU Run value '{name}' returned an invalid length"
+        ));
+    }
+    data.truncate(actual_len as usize / 2);
+    while data.last() == Some(&0) {
+        data.pop();
+    }
+    String::from_utf16(&data)
+        .map(Some)
+        .map_err(|_| format!("HKCU Run value '{name}' is not valid UTF-16"))
+}
+
+fn set_run_value(name: &str, value: &str) -> Result<(), String> {
+    let key = open_run_key_write()?;
+    let name_w = wide_z(name);
+    let value_w = wide_z(value);
+    let bytes = value_w
+        .len()
+        .checked_mul(2)
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or_else(|| "HKCU Run value is too large".to_owned())?;
+    let status = unsafe {
+        RegSetValueExW(
+            key.0,
+            name_w.as_ptr(),
+            0,
+            REG_SZ,
+            value_w.as_ptr().cast::<u8>(),
+            bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "cannot set HKCU Run value '{name}': Win32 error {status}"
+        ));
+    }
+    let observed = read_registry_string(key.0, name)?;
+    if observed.as_deref() != Some(value) {
+        return Err(format!(
+            "HKCU Run value '{name}' failed read-after-write verification"
+        ));
+    }
+    Ok(())
+}
+
+fn delete_run_value(name: &str) -> Result<(), String> {
+    let Some(key) = open_run_key_read_write()? else {
+        return Ok(());
+    };
+    let name_w = wide_z(name);
+    let status = unsafe { RegDeleteValueW(key.0, name_w.as_ptr()) };
+    if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+        return Err(format!(
+            "cannot delete HKCU Run value '{name}': Win32 error {status}"
+        ));
+    }
+    Ok(())
+}
+
+fn open_run_key_read_write() -> Result<Option<OwnedRegistryKey>, String> {
+    let subkey = wide_z(RUN_KEY);
+    let mut key: HKEY = std::ptr::null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            &mut key,
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "cannot open HKCU Run key for mutation: Win32 error {status}"
+        ));
+    }
+    Ok(Some(OwnedRegistryKey(key)))
+}
+
+fn wide_z(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn link_enabled(paths: &WindowsPaths) -> Result<bool, String> {
+    match fs::symlink_metadata(&paths.link_enabled) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "Windows Link enable marker is not a regular file: {}",
+            paths.link_enabled.display()
+        )),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect Windows Link enable marker: {error}"
+        )),
+    }
+}
+
+fn set_link_enabled(paths: &WindowsPaths, enabled: bool) -> Result<(), String> {
+    if !enabled {
+        return match fs::remove_file(&paths.link_enabled) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("cannot remove Windows Link enable marker: {error}")),
+        };
+    }
+    let parent = paths
+        .link_enabled
+        .parent()
+        .ok_or_else(|| "Windows Link enable marker has no parent".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create Windows Link state directory: {error}"))?;
+    let temp = paths
+        .link_enabled
+        .with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temp, b"1\n")
+        .map_err(|error| format!("cannot stage Windows Link enable marker: {error}"))?;
+    if paths.link_enabled.exists() {
+        fs::remove_file(&paths.link_enabled)
+            .map_err(|error| format!("cannot replace Windows Link enable marker: {error}"))?;
+    }
+    fs::rename(&temp, &paths.link_enabled).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("cannot activate Windows Link enable marker: {error}")
+    })
 }
 
 fn activate_generation(
@@ -428,94 +1064,6 @@ fn current_account() -> Result<String, String> {
         .ok_or_else(|| "USERNAME is required for Windows service management".to_owned())
 }
 
-fn task_command(binary: &Path, args: &[&str]) -> Result<String, String> {
-    let binary = binary
-        .to_str()
-        .ok_or_else(|| "Windows runtime path is not valid UTF-8".to_owned())?;
-    if binary.contains('"') {
-        return Err("Windows runtime path contains an unsupported quote".to_owned());
-    }
-    let mut command = format!("\"{binary}\"");
-    for arg in args {
-        if arg.is_empty()
-            || arg
-                .bytes()
-                .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
-        {
-            return Err(format!("unsupported Windows task argument: {arg}"));
-        }
-        command.push(' ');
-        command.push_str(arg);
-    }
-    Ok(command)
-}
-
-fn task_create(name: &str, command: &str) -> Result<(), String> {
-    schtasks(&[
-        "/Create", "/SC", "ONLOGON", "/TN", name, "/TR", command, "/F",
-    ])
-}
-
-fn task_run(name: &str) -> Result<(), String> {
-    schtasks(&["/Run", "/TN", name])
-}
-
-fn task_exists(name: &str) -> bool {
-    Command::new("schtasks.exe")
-        .args(["/Query", "/TN", name])
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn task_end_if_present(name: &str) -> Result<(), String> {
-    if !task_exists(name) {
-        return Ok(());
-    }
-    let _ = Command::new("schtasks.exe")
-        .args(["/End", "/TN", name])
-        .output();
-    Ok(())
-}
-
-fn task_delete_if_present(name: &str) -> Result<(), String> {
-    if task_exists(name) {
-        schtasks(&["/Delete", "/TN", name, "/F"])?;
-    }
-    Ok(())
-}
-
-fn require_task(name: &str) -> Result<(), String> {
-    if task_exists(name) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Windows scheduled task '{name}' is not installed; run `herdr-mcp install`"
-        ))
-    }
-}
-
-fn schtasks(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("schtasks.exe")
-        .args(args)
-        .output()
-        .map_err(|error| format!("cannot execute schtasks.exe: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let detail = if !stderr.is_empty() { stderr } else { stdout };
-    Err(format!(
-        "schtasks.exe {} failed{}",
-        args.first().copied().unwrap_or("operation"),
-        if detail.is_empty() {
-            String::new()
-        } else {
-            format!(": {detail}")
-        }
-    ))
-}
-
 fn wait_for_health(paths: &WindowsPaths) -> Result<(), String> {
     let deadline = Instant::now() + HEALTH_BUDGET;
     while Instant::now() < deadline {
@@ -586,4 +1134,62 @@ fn print_json(value: &Value) -> Result<(), String> {
     stdout
         .write_all(b"\n")
         .map_err(|error| format!("cannot write Windows service result: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_name(prefix: &str) -> String {
+        format!("{prefix}-{}", std::process::id())
+    }
+
+    #[test]
+    fn hkcu_run_value_round_trip_requires_no_machine_scope() {
+        let name = unique_test_name("Herdr MCP UAT");
+        let value = r#"\"C:\Windows\System32\cmd.exe\" /c exit"#;
+        delete_run_value(&name).unwrap();
+        set_run_value(&name, value).unwrap();
+        assert_eq!(read_run_value(&name).unwrap().as_deref(), Some(value));
+        delete_run_value(&name).unwrap();
+        assert_eq!(read_run_value(&name).unwrap(), None);
+    }
+
+    #[test]
+    fn detached_process_record_stops_only_the_exact_process() {
+        let root = env::temp_dir().join(unique_test_name("herdr-mcp-process-test"));
+        fs::create_dir_all(&root).unwrap();
+        let record_path = root.join("process.json");
+        let binary = PathBuf::from("powershell.exe");
+        let mut child = Command::new(&binary)
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let record = ManagedProcessRecord {
+            schema_version: PROCESS_RECORD_SCHEMA,
+            kind: "test".to_owned(),
+            pid: child.id(),
+            creation_time_100ns: process_creation_time_from_handle(child.as_raw_handle() as HANDLE)
+                .unwrap(),
+            generation: "rust-test".to_owned(),
+        };
+        write_process_record(&record_path, &record).unwrap();
+        drop(child);
+        assert!(managed_process_active(&record_path, "test").unwrap());
+        assert!(stop_managed_process(&record_path, "test").unwrap());
+        assert!(!record_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn windows_argument_quoting_handles_spaces_and_quotes() {
+        assert_eq!(quote_windows_arg("plain"), "plain");
+        assert_eq!(quote_windows_arg("two words"), "\"two words\"");
+        assert_eq!(quote_windows_arg(""), "\"\"");
+        assert_eq!(quote_windows_arg("a\\\"b"), "\"a\\\\\\\"b\"");
+    }
 }
