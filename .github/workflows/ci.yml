@@ -51,6 +51,37 @@ jobs:
       - name: Build Windows UAT candidate
         shell: pwsh
         run: cargo +1.97.1 build --locked --release -p herdr-mcp --target x86_64-pc-windows-msvc
+      - name: Start pinned Herdr 0.9.0 server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64.zip"
+          $root = Join-Path $env:RUNNER_TEMP "herdr-0.9.0"
+          Invoke-WebRequest -Uri "https://github.com/herdrdev/herdr/releases/download/v0.9.0/herdr-windows-x86_64.zip" -OutFile $archive
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = "b4508c445de1c1a68c760a01735da2aba2fa214b2aafd4b07f732e49b2a64b11"
+          if ($actual -ne $expected) { throw "Herdr 0.9.0 Windows archive SHA-256 mismatch" }
+          Expand-Archive -Path $archive -DestinationPath $root -Force
+          $herdr = Get-ChildItem -Path $root -Filter herdr.exe -File -Recurse | Select-Object -First 1
+          if (-not $herdr) { throw "herdr.exe missing from Herdr 0.9.0 Windows archive" }
+          "HERDR_UAT_BIN=$($herdr.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $stdout = Join-Path $env:RUNNER_TEMP "herdr-server.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "herdr-server.stderr.log"
+          $server = Start-Process -FilePath $herdr.FullName -ArgumentList @("server") -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          $ready = $false
+          for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            Start-Sleep -Milliseconds 250
+            & $herdr.FullName status server *> $null
+            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+            if ($server.HasExited) { break }
+          }
+          if (-not $ready) {
+            Write-Host "--- Herdr stdout ---"
+            if (Test-Path $stdout) { Get-Content $stdout }
+            Write-Host "--- Herdr stderr ---"
+            if (Test-Path $stderr) { Get-Content $stderr }
+            throw "Herdr 0.9.0 headless server did not become ready"
+          }
       - name: Windows user-process lifecycle smoke
         shell: pwsh
         run: |
@@ -71,6 +102,7 @@ jobs:
           }
           finally {
             & $candidate service uninstall *> $null
+            if ($env:HERDR_UAT_BIN) { & $env:HERDR_UAT_BIN server stop *> $null }
           }
       - name: Stage Windows UAT bundle
         shell: pwsh
