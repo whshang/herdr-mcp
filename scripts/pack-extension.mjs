@@ -1,14 +1,10 @@
 #!/usr/bin/env node
 /**
- * Build a deterministic zip of extension/ for Chrome Web Store upload or
- * explicit maintainer UAT.
+ * Build deterministic browser-extension packages.
  *
- * Maintainer-only Chrome Web Store / explicit unpacked-UAT packaging utility.
- * Output: herdr-mcp-extension-<manifest.version>.zip (+ .sha256 sidecar).
- * Zip root contains manifest.json at top level, as required for Store upload.
- *
- * This artifact is NOT an end-user herdr-mcp Release asset and is never installed
- * into ~/.config/herdr-mcp/extension by the normal product path.
+ * store: Chrome Web Store upload package, source manifest unchanged.
+ * standalone: GitHub/manual package with the public fixed standalone manifest
+ * key injected in-memory without mutating extension/manifest.json.
  */
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -38,8 +34,39 @@ export function extensionZipName(version) {
   return `herdr-mcp-extension-${version}.zip`;
 }
 
-export function extensionSha256Name(version) {
-  return `${extensionZipName(version)}.sha256`;
+export function standaloneExtensionZipName(version) {
+  return `herdr-mcp-extension-standalone-${version}.zip`;
+}
+
+export function packageZipName(version, channel = "store") {
+  if (channel === "store") return extensionZipName(version);
+  if (channel === "standalone") return standaloneExtensionZipName(version);
+  throw new Error(`unsupported extension package channel: ${channel}`);
+}
+
+export function extensionSha256Name(version, channel = "store") {
+  return `${packageZipName(version, channel)}.sha256`;
+}
+
+export function injectManifestKey(sourceText, key) {
+  const manifest = JSON.parse(sourceText);
+  if (!key || typeof key !== "string") throw new Error("standalone manifest key is missing");
+  if (typeof manifest?.key === "string") {
+    if (manifest.key !== key) throw new Error("manifest contains a conflicting key");
+    return sourceText;
+  }
+  if (Object.prototype.hasOwnProperty.call(manifest || {}, "key")) {
+    throw new Error("manifest contains a non-string key");
+  }
+  let closing = sourceText.length - 1;
+  while (closing >= 0 && /\s/.test(sourceText[closing])) closing -= 1;
+  if (closing < 0 || sourceText[closing] !== "}") throw new Error("manifest has no closing object brace");
+  let last = closing - 1;
+  while (last >= 0 && /\s/.test(sourceText[last])) last -= 1;
+  if (last < 0 || sourceText[last] === "{" || sourceText[last] === ",") {
+    throw new Error("manifest has no final property");
+  }
+  return `${sourceText.slice(0, last + 1)},${sourceText.slice(last + 1, closing)}  "key": ${JSON.stringify(key)}\n${sourceText.slice(closing)}`;
 }
 
 function shouldSkip(name) {
@@ -99,7 +126,7 @@ export async function buildDeterministicZip(files) {
   let offset = 0;
 
   for (const file of files) {
-    const data = await readFile(file.abs);
+    const data = file.data ?? await readFile(file.abs);
     const nameBuf = Buffer.from(file.rel, "utf8");
     const crc = crc32(data);
     const size = data.length;
@@ -162,6 +189,7 @@ export async function packExtension({
   outDir,
   extensionDir,
   writeSidecar = true,
+  channel = "store",
 } = {}) {
   const resolvedRoot = root || process.cwd();
   const src = extensionDir || join(resolvedRoot, "extension");
@@ -171,7 +199,8 @@ export async function packExtension({
   if (!info?.isDirectory()) {
     throw new Error(`extension directory missing: ${src}`);
   }
-  const version = readExtensionVersion(await readFile(manifestPath, "utf8"));
+  const manifestText = await readFile(manifestPath, "utf8");
+  const version = readExtensionVersion(manifestText);
   const files = await listExtensionFiles(src);
   if (files.length === 0) {
     throw new Error("extension directory has no packable files");
@@ -180,10 +209,25 @@ export async function packExtension({
     throw new Error("extension pack must include manifest.json at zip root");
   }
 
+  if (!["store", "standalone"].includes(channel)) {
+    throw new Error(`unsupported extension package channel: ${channel}`);
+  }
+  if (channel === "standalone") {
+    const contractPath = join(resolvedRoot, "contracts", "browser-extension-standalone.json");
+    const contract = JSON.parse(await readFile(contractPath, "utf8"));
+    const key = String(contract?.standalone?.manifest_key || "").trim();
+    const extensionId = String(contract?.standalone?.extension_id || "").trim();
+    if (!/^[a-p]{32}$/.test(extensionId)) {
+      throw new Error("standalone extension contract has invalid extension_id");
+    }
+    const manifestFile = files.find((file) => file.rel === "manifest.json");
+    manifestFile.data = Buffer.from(injectManifestKey(manifestText, key), "utf8");
+  }
+
   const zipBytes = await buildDeterministicZip(files);
   const sha256 = createHash("sha256").update(zipBytes).digest("hex");
-  const zipName = extensionZipName(version);
-  const shaName = extensionSha256Name(version);
+  const zipName = packageZipName(version, channel);
+  const shaName = extensionSha256Name(version, channel);
   await mkdir(dest, { recursive: true });
   const zipPath = join(dest, zipName);
   await writeFile(zipPath, zipBytes, { mode: 0o644 });
@@ -193,6 +237,7 @@ export async function packExtension({
   }
   return {
     version,
+    channel,
     zipName,
     sha256Name: shaName,
     zipPath,
@@ -210,10 +255,11 @@ async function main() {
   };
   const root = value("--root") || process.cwd();
   const outDir = value("--out-dir") || join(root, "release-assets");
+  const channel = value("--channel") || "store";
   const writeSidecar = !args.includes("--no-sidecar");
-  const result = await packExtension({ root, outDir, writeSidecar });
+  const result = await packExtension({ root, outDir, writeSidecar, channel });
   process.stdout.write(
-    `${result.zipName} version=${result.version} files=${result.fileCount} size=${result.size} sha256=${result.sha256}\n`,
+    `${result.zipName} channel=${result.channel} version=${result.version} files=${result.fileCount} size=${result.size} sha256=${result.sha256}\n`,
   );
 }
 

@@ -333,6 +333,8 @@
   "cc_devices_empty": "没有已注册设备。",
   "cc_devices_not_available": "设备列表暂不可用",
   "cc_devices_owner_required": "当前电脑没有可用的 Worker fleet 凭据，无法读取完整设备列表。",
+  "cc_devices_native_owner_inactive": "当前扩展不是 Herdr Native Host 的活动版本，已保持待机且不会接管页面。当前扩展 ID：{id}。开发/UAT 请保留活动 Dev Extension；仅在明确切换发布通道时再执行 native-host use。可先运行 `herdr-mcp native-host status` 查看当前 owner。",
+  "cc_devices_native_host_missing": "当前浏览器没有可用的 Herdr Native Host。先运行 `herdr-mcp native-host status` 检查活动通道和安装状态，再按明确目标选择 Dev、Standalone 或 Store。",
   "cc_devices_runtime_unavailable": "当前本机 Runtime 尚未提供 0.4.5 设备视图。",
   "cc_devices_unavailable": "读取 Worker 设备失败：{error}",
   "cc_device_this": "本机",

@@ -185,6 +185,54 @@ test("extension treats Chromium native-host admission denial as standby", async 
   }
 });
 
+test("localhost proxy rejects inactive native-host ownership", async () => {
+  const oldChrome = globalThis.chrome;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(_host, _message, callback) {
+        globalThis.chrome.runtime.lastError = {
+          message: "Access to the specified native messaging host is forbidden.",
+        };
+        callback(undefined);
+        globalThis.chrome.runtime.lastError = null;
+      },
+    },
+  };
+  try {
+    await assert.rejects(
+      localHerdrFetch("http://127.0.0.1:8772/extension/fleet"),
+      /native-origin-not-active/,
+    );
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("extension normalizes a missing native host", async () => {
+  const oldChrome = globalThis.chrome;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(_host, _message, callback) {
+        globalThis.chrome.runtime.lastError = {
+          message: "Specified native messaging host not found.",
+        };
+        callback(undefined);
+        globalThis.chrome.runtime.lastError = null;
+      },
+    },
+  };
+  try {
+    await assert.rejects(
+      localHerdrFetch("http://127.0.0.1:8772/extension/fleet"),
+      /native-host-not-installed/,
+    );
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
 test("generated-image capture forwards only the strict non-secret artifact shape", async () => {
   const oldChrome = globalThis.chrome;
   let seen = null;

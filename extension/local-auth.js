@@ -14,6 +14,11 @@ function isNativeAdmissionDenied(message) {
     || text.includes("permission denied");
 }
 
+function isNativeHostMissing(message) {
+  const text = String(message || "").toLowerCase();
+  return text.includes("native messaging host") && text.includes("not found");
+}
+
 function nativeMessage(message) {
   return new Promise((resolve) => {
     if (!globalThis.chrome?.runtime?.sendNativeMessage) {
@@ -24,6 +29,10 @@ function nativeMessage(message) {
       chrome.runtime.sendNativeMessage(HERDR_NATIVE_HOST, message, (response) => {
         const err = chrome.runtime.lastError?.message;
         if (err) {
+          if (isNativeHostMissing(err)) {
+            resolve({ ok: false, error: "native-host-not-installed" });
+            return;
+          }
           if (isNativeAdmissionDenied(err)) {
             resolve({ ok: true, active: false, reason: "native-origin-not-active" });
             return;
@@ -116,6 +125,9 @@ export async function localHerdrFetch(input, init = {}) {
     type: "request",
     ...nativeRequestPayload(input, init),
   });
+  if (response?.active === false && response?.reason === "native-origin-not-active") {
+    throw new Error("native-origin-not-active");
+  }
   if (response?.ok !== true) {
     throw new Error(String(response?.error || "native-host-request-failed"));
   }
@@ -139,6 +151,9 @@ export async function localHerdrBatchFetch(requests = []) {
     return { ok: false, error: "native-request-batch-invalid", detail: String(error?.message || error || "") };
   }
   const response = await nativeMessage({ type: "request_batch", requests: encoded });
+  if (response?.active === false && response?.reason === "native-origin-not-active") {
+    return { ok: false, error: "native-origin-not-active" };
+  }
   if (response?.ok !== true) {
     return { ok: false, error: String(response?.error || "native-host-request-batch-failed") };
   }

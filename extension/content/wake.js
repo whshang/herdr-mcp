@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.90";
+const H2W_CONTENT_VERSION = "0.1.92";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -3425,9 +3425,18 @@ const H2W_CONTENT_VERSION = "0.1.90";
   let renderedHerdrTitle = "";
   let titleSnapshot = null;
   let titleObserver = null;
+  const STATUS_FAVICON_ATTR = "data-herdr-status-favicon";
+  const STATUS_FAVICONS = Object.freeze({
+    new_conversation: "🆕",
+    working: "⚙️",
+    waiting: "💬",
+    timeout: "⏰",
+    over_context: "🧠",
+  });
 
   function cleanConversationTitle(value) {
     return normText(value)
+      .replace(/^(?:⏳|🔴|⚙️|🔄|🚨|🧠|⚠️|👀|💤|⚪)\s*-\s*/u, "")
       .replace(/\s+[-–—|]\s+(ChatGPT|Claude|DeepSeek|Z\.AI)$/i, "")
       .trim();
   }
@@ -3438,7 +3447,7 @@ const H2W_CONTENT_VERSION = "0.1.90";
     nativeConversationTitle = cleanConversationTitle(current) || current;
   }
 
-  function titleStatusIcon(hud, state) {
+  function pageStatusKey(hud, state) {
     const health = String(conversationHealth?.state || "");
     const continuity = String(hud?.continuity?.state || "");
     const handoff = String(hud?.handoff?.status || "");
@@ -3446,26 +3455,43 @@ const H2W_CONTENT_VERSION = "0.1.90";
     const workspaceWorking = state === "working"
       || bindings.some((binding) => binding?.status === "working" || Number(binding?.working_count) > 0);
 
-    // The tab title answers a human question: "what needs my attention here?"
-    // It deliberately does not expose the internal state-machine labels.
-    if (isComposerGenerating() || health === "reply_waiting") return "⏳";
-    if (state === "offline" || state === "failed" || health === "failed" || handoff === "failed") return "🔴";
-    if (workspaceWorking) return "⚙️";
-    if (["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoff)
-      || ["recovery_message_sent", "reload_pending", "recovering"].includes(health)
-      || continuity === "handoff_prepare") return "🔄";
-    if (health === "rollover_required" || ["high_risk", "rollover_required"].includes(continuity)) return "🚨";
-    if (continuity === "context_warning") return "🧠";
-    if (state === "blocked" || ["reply_suspect", "rollover_recommended"].includes(health)
-      || continuity === "rollover_recommended" || handoff === "seed_uncertain") return "⚠️";
-    if (state === "done") return "👀";
-    if (state === "idle") return "💤";
-    return "⚪";
+    if (ADAPTER.name === "chatgpt" && !chatGptConversationId()) return "new_conversation";
+    if (health === "rollover_required"
+      || ["context_warning", "high_risk", "rollover_recommended", "rollover_required"].includes(continuity)) {
+      return "over_context";
+    }
+    if (["reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended"].includes(health)
+      || state === "offline" || state === "failed" || health === "failed" || handoff === "failed"
+      || handoff === "seed_uncertain") return "timeout";
+    if (isComposerGenerating() || workspaceWorking
+      || ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoff)
+      || continuity === "handoff_prepare") return "working";
+    return "waiting";
+  }
+
+  function statusFaviconDataUrl(statusKey) {
+    const emoji = STATUS_FAVICONS[statusKey] || STATUS_FAVICONS.waiting;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">${emoji}</text></svg>`;
+    return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+  }
+
+  function syncDocumentFavicon(statusKey) {
+    const head = document.head || document.documentElement;
+    if (!head) return;
+    let link = head.querySelector?.(`link[${STATUS_FAVICON_ATTR}]`) || null;
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      link.setAttribute(STATUS_FAVICON_ATTR, "1");
+      head.appendChild(link);
+    }
+    const href = statusFaviconDataUrl(statusKey);
+    if (link.getAttribute("href") !== href) link.setAttribute("href", href);
   }
 
   function syncDocumentTitle(hud, state) {
     captureNativeConversationTitle();
-    const status = titleStatusIcon(hud, state);
+    syncDocumentFavicon(pageStatusKey(hud, state));
     const project = chatGptDomProjectTitle()
       || hud?.active_workspace_label
       || hud?.workspace_label
@@ -3473,7 +3499,7 @@ const H2W_CONTENT_VERSION = "0.1.90";
       || hudLabels?.states?.unbound
       || "unbound";
     const conversation = chatGptDomConversationTitle() || nativeConversationTitle || ADAPTER.name || "conversation";
-    const next = [status, project, conversation].map((value) => normText(value)).filter(Boolean).join("-");
+    const next = [project, conversation].map((value) => normText(value)).filter(Boolean).join("-");
     titleSnapshot = { hud, state };
     if (!next || document.title === next) {
       renderedHerdrTitle = next;

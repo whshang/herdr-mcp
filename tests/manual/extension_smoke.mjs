@@ -81,10 +81,10 @@ const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-mod
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
-ok(manifest.version === "0.1.90", "manifest version stays aligned with the browser product build");
+ok(manifest.version === "0.1.92", "manifest version stays aligned with the browser product build");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.90"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.90"'), "content version matches manifest");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.92"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.92"'), "content version matches manifest");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
     && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY')
@@ -158,41 +158,37 @@ ok(wakeSource.includes("syncDocumentTitle")
     && wakeSource.includes('.join("-")')
     && wakeSource.includes("chatGptDomConversationTitle")
     && wakeSource.includes("chatGptDomProjectTitle")
-    && wakeSource.includes("titleStatusIcon")
+    && wakeSource.includes("syncDocumentFavicon(pageStatusKey(hud, state))")
+    && wakeSource.includes("const next = [project, conversation]")
+    && !wakeSource.includes("titleStatusIcon")
     && backgroundSource.includes("active_workspace_label: labels[0] || null")
     && backgroundSource.includes("liveSession = state?.ok"),
-  "page title is composed dynamically as emoji-workspace-conversation");
-ok(wakeSource.includes('if (isComposerGenerating() || health === "reply_waiting") return "⏳"')
-    && wakeSource.includes('if (state === "offline" || state === "failed" || health === "failed" || handoff === "failed") return "🔴"')
-    && wakeSource.includes('if (workspaceWorking) return "⚙️"')
-    && wakeSource.includes('return "🔄"')
-    && wakeSource.includes('return "🚨"')
-    && wakeSource.includes('return "🧠"')
-    && wakeSource.includes('["reply_suspect", "rollover_recommended"].includes(health)')
-    && wakeSource.includes('handoff === "seed_uncertain") return "⚠️"')
-    && wakeSource.includes('if (state === "done") return "👀"')
-    && wakeSource.includes('if (state === "idle") return "💤"')
-    && wakeSource.includes('return "⚪"'),
-  "title status icon covers generating/working/transition/context/risk/attention/offline/review/idle/unknown");
+  "page title is composed dynamically as workspace-conversation without an emoji prefix");
+ok(wakeSource.includes(".replace(/^(?:⏳|🔴|⚙️|🔄|🚨|🧠|⚠️|👀|💤|⚪)"),
+  "legacy emoji-prefixed titles are cleaned before the new plain title is composed");
+ok(wakeSource.includes('new_conversation: "🆕"')
+    && wakeSource.includes('working: "⚙️"')
+    && wakeSource.includes('waiting: "💬"')
+    && wakeSource.includes('timeout: "⏰"')
+    && wakeSource.includes('over_context: "🧠"')
+    && wakeSource.includes('const STATUS_FAVICON_ATTR = "data-herdr-status-favicon"')
+    && wakeSource.includes('data:image/svg+xml,${encodeURIComponent(svg)}')
+    && wakeSource.includes('link.rel = "icon"'),
+  "favicon covers new/working/waiting/timeout/over-context without external assets");
 const titleStatusSource = wakeSource.slice(
-  wakeSource.indexOf("function titleStatusIcon"),
-  wakeSource.indexOf("function syncDocumentTitle"),
+  wakeSource.indexOf("function pageStatusKey"),
+  wakeSource.indexOf("function statusFaviconDataUrl"),
 );
 const titlePriorityPositions = [
-  'isComposerGenerating() || health === "reply_waiting"',
-  'state === "offline"',
-  "if (workspaceWorking)",
-  '"summary_requested"',
-  'health === "rollover_required"',
-  'continuity === "context_warning"',
-  'handoff === "seed_uncertain"',
-  'state === "done"',
-  'state === "idle"',
-  'return "⚪"',
+  'return "new_conversation"',
+  'return "over_context"',
+  'return "timeout"',
+  'return "working"',
+  'return "waiting"',
 ].map((marker) => titleStatusSource.indexOf(marker));
 ok(titlePriorityPositions.every((position) => position >= 0)
     && titlePriorityPositions.every((position, index) => index === 0 || position > titlePriorityPositions[index - 1]),
-  "title status priority keeps page activity and hard failures ahead of stale workspace/terminal states");
+  "favicon status priority keeps new conversation and over-context ahead of timeout/activity/waiting");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),

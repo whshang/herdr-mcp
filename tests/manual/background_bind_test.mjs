@@ -379,7 +379,7 @@ globalThis.chrome = {
                 endpoint_ref: "bep_test",
                 device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 browser_family: "chrome",
-                extension_version: "0.1.90",
+                extension_version: "0.1.92",
                 consent: {
                   webchat_control: body.webchat_control_allowed === true,
                   tool_bridge: body.tool_bridge_allowed === true,
@@ -741,7 +741,7 @@ ok(await waitForTest(() => browserRegistryRequests.length === 1),
 const browserRegister = browserRegistryRequests[0] || {};
 ok(browserRegister.operation === "endpoint.register"
     && browserRegister.browser_family === "chrome"
-    && browserRegister.extension_version === "0.1.90"
+    && browserRegister.extension_version === "0.1.92"
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
   "browser endpoint registration carries one opaque profile seed and product identity",
   JSON.stringify(browserRegister));

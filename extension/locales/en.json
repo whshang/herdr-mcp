@@ -333,6 +333,8 @@
   "cc_devices_empty": "No registered devices.",
   "cc_devices_not_available": "Device inventory unavailable",
   "cc_devices_owner_required": "This computer does not have a usable Worker fleet credential to read the full device inventory.",
+  "cc_devices_native_owner_inactive": "This extension is not the active Herdr Native Host version. It stays in standby and will not control the page. Current extension ID: {id}. During development/UAT, keep the active Dev Extension selected; switch channels only when you explicitly intend to. Run `herdr-mcp native-host status` to inspect the current owner first.",
+  "cc_devices_native_host_missing": "No usable Herdr Native Host is installed for this browser. Run `herdr-mcp native-host status` to inspect the active channel and installation state before explicitly selecting Dev, Standalone, or Store.",
   "cc_devices_runtime_unavailable": "The current local runtime does not expose the 0.4.5 device inventory view yet.",
   "cc_devices_unavailable": "Could not read Worker devices: {error}",
   "cc_device_this": "this device",

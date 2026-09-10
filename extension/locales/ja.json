@@ -333,6 +333,8 @@
   "cc_devices_empty": "登録済みデバイスはありません。",
   "cc_devices_not_available": "デバイス一覧を利用できません",
   "cc_devices_owner_required": "このコンピューターには利用可能な Worker fleet 資格情報がないため、完全なデバイス一覧を読み取れません。",
+  "cc_devices_native_owner_inactive": "この拡張機能は現在の Herdr Native Host のアクティブ版ではありません。スタンバイのままページ制御を行いません。現在の拡張機能 ID: {id}。開発/UAT 中はアクティブな Dev Extension を維持し、配布チャネルを明示的に切り替える場合だけ owner を変更してください。先に `herdr-mcp native-host status` で現在の owner を確認できます。",
+  "cc_devices_native_host_missing": "このブラウザーでは利用可能な Herdr Native Host が見つかりません。`herdr-mcp native-host status` でアクティブチャネルとインストール状態を確認してから、Dev、Standalone、Store を明示的に選択してください。",
   "cc_devices_runtime_unavailable": "現在のローカル Runtime はまだ 0.4.5 のデバイス表示を提供していません。",
   "cc_devices_unavailable": "Worker デバイスの読み取りに失敗しました: {error}",
   "cc_device_this": "このデバイス",

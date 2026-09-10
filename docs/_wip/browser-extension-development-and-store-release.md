@@ -462,7 +462,7 @@ Store ID 与 Native Messaging origin 是一次性身份边界：production ident
 
 `0.1.76+` 开发源码会在启动控制路径前查询 Native Host `identity`。当前 active build 能通过 Chromium admission 获得 identity；同机安装但 inactive 的 Store/Dev build 会在 Chromium 层被拒绝并进入 standby，不启动共享 push stream，也不渲染 operational HUD。切换 active owner 后，已经存在的旧 Native Messaging request/stream 也会由 Rust Native Host 重新核对当前受管 manifest；持续 SSE stream 最迟在下一次 1 秒 owner-fence tick 或下一帧时失效，避免旧连接跨切换继续拥有本地控制权。该机制不要求修改已经提交审核的 `0.1.75` Store candidate。
 
-这个共存契约要求两份同时启用的扩展都升级到 `0.1.76+`。历史 `0.1.75` 是首次 Store 审核候选；当前源码已经推进到 `0.1.90`。当前 0.1.89 的 Public 可见性更新审核应撤回，并由通过完整 Store gate 的 0.1.90 包一次性替代；不再按历史候选逐版补发。不要为了兼容旧 Store build 新增 `management` 权限、修改 Chrome Preferences 或自动禁用另一份扩展。
+这个共存契约要求两份同时启用的扩展都升级到 `0.1.76+`。历史 `0.1.75` 是首次 Store 审核候选；已发布的 `0.1.91` standalone artifact 保持不变。v1.0 typed-browser 与 0.1.91 compatibility/perf/standalone packaging 从 `0.1.92` 起进入同一后继源码线；Store、Standalone、Dev 保持各自 identity，能力不再分叉。不要为了兼容旧 build 新增 `management` 权限、修改 Chrome Preferences 或自动禁用另一份扩展。
 
 官方 Native Messaging 规则：
 
@@ -489,19 +489,28 @@ Store ID 与 Native Messaging origin 是一次性身份边界：production ident
 维护者本地开发推荐流程：
 
 ```bash
-# clone/check out repo 后，Chrome Developer mode → Load unpacked → 选择 ./extension
+# 1. 在用于 UAT 的持久浏览器 profile 中，通过 extensions 页面 Load unpacked 一次并选择 ./extension。
+#    ego lite / Chromium / Chrome for Testing 都应复用这个 profile；不要依赖一次性的
+#    --load-extension / --disable-extensions-except 启动参数维持 Dev Extension。
+
+# 2. 登记同一个绝对路径对应的 Dev identity，并明确切到 Dev owner。
 herdr-mcp native-host dev enable ./extension
+herdr-mcp native-host use dev
 herdr-mcp native-host status
 
-# 同机 Store build 与 Dev build 可保留；只切换 Herdr active owner
+# 3. 浏览器重启后先验证：同一 profile 仍加载该 unpacked path；status 仍显示 active_channel=dev，
+#    active extension ID 与浏览器中的 Dev Extension ID 一致；目标页刷新后再做 Browser Registry/dispatch UAT。
+
+# 同机 Store / Standalone / Dev build 可以保留；只在明确切换发布通道时改变 active owner。
 herdr-mcp native-host use store
+herdr-mcp native-host use standalone
 herdr-mcp native-host use dev
 
 # 不再使用该 Dev identity
 herdr-mcp native-host dev disable
 ```
 
-如果移动了 unpacked extension 的绝对路径，必须重新执行 `dev enable`，因为 Chromium 的 unpacked ID 与加载路径相关。
+如果移动了 unpacked extension 的绝对路径，必须重新执行 `dev enable`，因为 Chromium 的 unpacked ID 与加载路径相关。普通浏览器重启后 Dev Extension 消失，视为 profile 没有持久安装该 unpacked path；重新在 extensions 页面 Load unpacked 到该 profile，避免用启动参数制造临时加载状态。
 
 `use store` / `use dev` 切换后，刷新已经打开的 ChatGPT / Claude / z.ai / DeepSeek 页面。0.1.76 的 page-owner gate 在 content script 注入最前面执行；刷新后 newly-active build 才会接管页面，inactive build 会在注册监听器、Queue owner 或 HUD 之前直接退出。
 
