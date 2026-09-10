@@ -160,40 +160,34 @@ const PRIVATE_METHOD_ROUTES = [
   { method: "herdr_mcp.device.revoke", route: "edge_local", next_surface: "herdr_call" },
   { method: "herdr_mcp.connector.approve", route: "edge_local", next_surface: "herdr_call" },
   { method: "herdr_mcp.connector.revoke", route: "edge_local", next_surface: "herdr_call" },
-  { method: "herdr_mcp.text.read", route: "workstation_routed", next_surface: "herdr_call" },
-  { method: "herdr_mcp.text.write", route: "workstation_routed", next_surface: "herdr_call" },
-  { method: "herdr_mcp.skill.list", route: "unsupported", available_on: "local_runtime" },
-  { method: "herdr_mcp.skill.describe", route: "unsupported", available_on: "local_runtime" },
-  { method: "herdr_mcp.skill.load", route: "unsupported", available_on: "local_runtime" },
-  { method: "herdr_mcp.planning.advise", route: "unsupported", available_on: "local_runtime" },
-  { method: "herdr_mcp.github.status", route: "unsupported", available_on: "local_runtime" },
 ] as const;
+
+const EDGE_RESERVED_PRIVATE_METHOD_PREFIXES = [
+  "herdr_mcp.device.",
+  "herdr_mcp.connector.",
+  "herdr_mcp.automation.",
+  "herdr_mcp.work_chain.",
+  "herdr_mcp.planner_lease.",
+  "herdr_mcp.execution_lane.",
+] as const;
+
+function isEdgeReservedPrivateMethod(method: string): boolean {
+  return EDGE_RESERVED_PRIVATE_METHOD_PREFIXES.some((prefix) => method.startsWith(prefix));
+}
 
 function privateMethodCapability(
   entry: (typeof PRIVATE_METHOD_ROUTES)[number],
   client?: McpClientContext,
 ): Record<string, unknown> {
-  if (entry.route === "unsupported") {
-    return {
-      ...entry,
-      implemented_local: entry.available_on === "local_runtime" ? true : "unknown",
-      available_local: "unknown",
-      edge_route_deployed: false,
-      caller_routable: false,
-      scope: entry.available_on === "local_runtime" ? "workstation_local_only" : "unknown",
-      reason: entry.available_on === "local_runtime" ? "workstation_local_only" : "edge_route_not_deployed",
-    };
-  }
-  const requiresFleetAdmin = entry.route === "edge_local";
-  const callerRoutable = requiresFleetAdmin ? client?.fleetAdmin === true : true;
+  const callerRoutable = client?.fleetAdmin === true;
   return {
     ...entry,
-    implemented_local: entry.route === "workstation_routed" ? "unknown" : false,
-    available_local: "unknown",
+    implemented_local: false,
+    available_local: false,
     edge_route_deployed: true,
     caller_routable: callerRoutable,
-    owner_device_only: requiresFleetAdmin,
-    scope: entry.route === "edge_local" ? "edge_local" : "edge_to_workstation",
+    owner_device_only: true,
+    scope: "edge_local",
     reason: callerRoutable ? "route_deployed" : "caller_not_authorized",
   };
 }
@@ -211,6 +205,7 @@ function privateMethodRoutePreflight(
   if (methods.length > 0) {
     return { ok: true, count: methods.length, methods, source: "edge_route_preflight" };
   }
+  if (!isEdgeReservedPrivateMethod(query.trim())) return null;
   return {
     ok: true,
     count: 1,
@@ -427,6 +422,12 @@ export async function handleMcp(
     }
 
     if (name === "herdr_methods") {
+      if (typeof args.query === "string" && /work_chain|planner_lease|execution_lane|fleet/i.test(args.query)) {
+        const methods = discoverFleetControlMethods(args.query);
+        if (methods.length > 0) {
+          return rpcResult(id, callToolResult({ ok: true, count: methods.length, methods, source: "edge_fleet_control_v1" }));
+        }
+      }
       const preflight = privateMethodRoutePreflight(args.query, deps.client);
       if (preflight) return rpcResult(id, callToolResult(preflight));
     }
@@ -466,11 +467,6 @@ export async function handleMcp(
           callToolResult({ ok: false, code: "device_registry_unavailable", retryable: true }, true),
         );
       }
-    }
-
-    if (name === "herdr_methods" && typeof args.query === "string" && /work_chain|planner_lease|execution_lane|fleet/i.test(args.query)) {
-      const methods = discoverFleetControlMethods(args.query);
-      return rpcResult(id, callToolResult({ ok: true, count: methods.length, methods, source: "edge_fleet_control_v1" }));
     }
 
     const localMethod = name === "herdr_call" && typeof args.method === "string" ? args.method : null;
@@ -888,28 +884,21 @@ export async function handleMcp(
       }, true));
     }
 
-    // Unknown Edge-private namespaces fail closed rather than routing to a
-    // workstation. A removed or mistyped herdr_mcp.* private method must never
-    // be forwarded as ordinary MCP work, so a WebChat Connector cannot use an
-    // obsolete/unknown private method to reach the fleet control plane. The
-    // text.read/write methods are legitimate workstation-routed transfers and
-    // pass through to normal routing below.
-    if (localMethod !== null && localMethod.startsWith("herdr_mcp.")) {
-      if (localMethod !== "herdr_mcp.text.read"
-          && localMethod !== "herdr_mcp.text.write"
-          && localMethod !== "herdr_mcp.page_assist"
-          && !localMethod.startsWith("herdr_mcp.browser_")) {
-        return rpcResult(id, callToolResult({
-          ok: false,
-          code: "unknown_method",
-          message: `${localMethod} is not a known Edge-local herdr_mcp private method; it is not forwarded to any workstation. If it is a fleet-administration action, run the corresponding herdr-mcp command on an enrolled computer.`,
-          retryable: false,
-          delivery_state: "not_delivered",
-          failure_layer: "edge_routing",
-          route: "unsupported",
-          next_surface: "herdr_methods",
-        }, true));
-      }
+    // Edge-owned administration namespaces stay fail-closed at the Edge.
+    // Other herdr_mcp.* methods route to the selected workstation, whose local
+    // registry is the authority and rejects unknown local methods before the
+    // Herdr core socket is ever called.
+    if (localMethod !== null && isEdgeReservedPrivateMethod(localMethod)) {
+      return rpcResult(id, callToolResult({
+        ok: false,
+        code: "unknown_method",
+        message: `${localMethod} is not a known Edge-authority herdr_mcp private method and was not forwarded to a workstation.`,
+        retryable: false,
+        delivery_state: "not_delivered",
+        failure_layer: "edge_routing",
+        route: "unsupported",
+        next_surface: "herdr_methods",
+      }, true));
     }
 
     const selectorValue = args.device;
