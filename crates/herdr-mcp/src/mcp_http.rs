@@ -964,6 +964,7 @@ fn extension_browser_resource_observe(
             "parent_ref",
             "native_identity",
             "display_label",
+            "canonical_url",
             "observation_generation",
             "observed_at",
         ],
@@ -974,6 +975,10 @@ fn extension_browser_resource_observe(
     let parent_ref = browser_registry_optional_string(payload, "parent_ref", 96)?;
     let native_identity = browser_registry_string(payload, "native_identity", 1024)?;
     let display_label = browser_registry_optional_string(payload, "display_label", 256)?;
+    let canonical_url = browser_registry_optional_string(payload, "canonical_url", 2048)?;
+    if canonical_url.is_some_and(|value| !value.starts_with("https://")) {
+        return Err("browser_canonical_url_invalid".to_owned());
+    }
     let observation_generation = browser_registry_positive_i64(payload, "observation_generation")?;
     let mut store = state
         .state_store
@@ -989,6 +994,17 @@ fn extension_browser_resource_observe(
         observation_generation,
         observed_at,
     })?;
+    if let Some(canonical_url) = canonical_url {
+        if kind != "session" {
+            return Err("browser_canonical_url_kind_invalid".to_owned());
+        }
+        store.upsert_browser_resource_locator(
+            &resource.resource_ref,
+            canonical_url,
+            observation_generation,
+            observed_at,
+        )?;
+    }
     Ok(json!({
         "ok": true,
         "resource": browser_resource_http_json(resource),
@@ -3097,6 +3113,40 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert!(!result.to_string().contains("native-account-do-not-return"));
         assert!(result["resource"].get("native_identity_sha256").is_none());
+        let account_ref = result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let session = json!({
+            "operation": "resource.observe",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "session",
+            "parent_ref": account_ref,
+            "native_identity": "session-http-locator-1",
+            "display_label": null,
+            "canonical_url": "https://chatgpt.com/c/session-http-locator-1",
+            "observation_generation": 1,
+            "observed_at": 1004
+        });
+        let response = app.clone().oneshot(request(session)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let session_result: Value = serde_json::from_slice(&body).unwrap();
+        let session_ref = session_result["resource"]["resource_ref"].as_str().unwrap();
+        let locator = store
+            .lock()
+            .unwrap()
+            .browser_resource_locator(session_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            locator.canonical_url,
+            "https://chatgpt.com/c/session-http-locator-1"
+        );
+        assert_eq!(locator.observation_generation, 1);
 
         let endpoint = store
             .lock()

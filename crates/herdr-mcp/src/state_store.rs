@@ -797,6 +797,14 @@ pub struct BrowserResourceRecord {
     pub last_observed_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserResourceLocatorRecord {
+    pub resource_ref: String,
+    pub canonical_url: String,
+    pub observation_generation: i64,
+    pub observed_at: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BrowserResourceResolveInput<'a> {
     pub endpoint_ref: &'a str,
@@ -2911,6 +2919,86 @@ impl StateStore {
             .map_err(|error| format!("cannot commit browser resource: {error}"))?;
         self.browser_resource(&resource_ref)?
             .ok_or_else(|| "browser_resource_not_found".to_owned())
+    }
+
+    pub fn upsert_browser_resource_locator(
+        &mut self,
+        resource_ref: &str,
+        canonical_url: &str,
+        observation_generation: i64,
+        observed_at: i64,
+    ) -> Result<BrowserResourceLocatorRecord, String> {
+        validate_browser_resource_ref(resource_ref)?;
+        if canonical_url.is_empty()
+            || canonical_url.len() > 2048
+            || canonical_url != canonical_url.trim()
+            || canonical_url.chars().any(char::is_control)
+            || !canonical_url.starts_with("https://")
+        {
+            return Err("browser_canonical_url_invalid".to_owned());
+        }
+        if observation_generation < 1 {
+            return Err("browser_observation_generation_invalid".to_owned());
+        }
+        if observed_at < 0 {
+            return Err("browser_observed_at_invalid".to_owned());
+        }
+        let resource = self
+            .browser_resource(resource_ref)?
+            .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+        if resource.kind != "session" {
+            return Err("browser_resource_kind_mismatch".to_owned());
+        }
+        let provider_state = self
+            .browser_provider_state(&resource.endpoint_ref, &resource.provider)?
+            .ok_or_else(|| "browser_capability_unknown".to_owned())?;
+        if provider_state.observation_generation != observation_generation
+            || resource.observation_generation != observation_generation
+        {
+            return Err("stale_capability_generation".to_owned());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO browser_resource_locators(
+                    resource_ref, canonical_url, observation_generation, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(resource_ref) DO UPDATE SET
+                    canonical_url = excluded.canonical_url,
+                    observation_generation = excluded.observation_generation,
+                    observed_at = MAX(browser_resource_locators.observed_at, excluded.observed_at)",
+                params![
+                    resource_ref,
+                    canonical_url,
+                    observation_generation,
+                    observed_at
+                ],
+            )
+            .map_err(|error| format!("cannot store browser resource locator: {error}"))?;
+        self.browser_resource_locator(resource_ref)?
+            .ok_or_else(|| "browser_resource_locator_not_found".to_owned())
+    }
+
+    pub fn browser_resource_locator(
+        &self,
+        resource_ref: &str,
+    ) -> Result<Option<BrowserResourceLocatorRecord>, String> {
+        validate_browser_resource_ref(resource_ref)?;
+        self.conn
+            .query_row(
+                "SELECT resource_ref, canonical_url, observation_generation, observed_at
+                 FROM browser_resource_locators WHERE resource_ref = ?1",
+                params![resource_ref],
+                |row| {
+                    Ok(BrowserResourceLocatorRecord {
+                        resource_ref: row.get(0)?,
+                        canonical_url: row.get(1)?,
+                        observation_generation: row.get(2)?,
+                        observed_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser resource locator: {error}"))
     }
 
     pub fn browser_resource(

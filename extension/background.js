@@ -1725,6 +1725,7 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
     parent_ref: parentRef,
     native_identity: pageInfo.conversation_id,
     display_label: null,
+    canonical_url: pageInfo.convKey,
     observation_generation: observationGeneration,
     observed_at: Date.now(),
   });
@@ -2536,20 +2537,64 @@ async function handleBrowserActuation(command) {
   }
   if (operation === "herdr_mcp.browser_session.open") {
     const sessionRefOpen = String(params.session_ref || "");
+    const providerOpen = String(params.provider || "");
+    const canonicalUrl = String(params.canonical_url || "");
+    if (providerOpen !== "chatgpt" || !sessionRefOpen) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration),
+      );
+      return;
+    }
     let targetOpen = browserSessionTargets.get(sessionRefOpen);
-    let recoveredOpen = null;
     if (!targetOpen) {
-      recoveredOpen = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration);
-      targetOpen = recoveredOpen.target;
+      const recovered = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration);
+      targetOpen = recovered.target;
+      if (!targetOpen && canonicalUrl) {
+        const canonicalInfo = browserConversationInfo(providerOpen, canonicalUrl);
+        if (!canonicalInfo?.conversation_id) {
+          await postBrowserActuationEvidence(
+            actuationId,
+            unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+          );
+          return;
+        }
+        let createdTab = null;
+        try {
+          createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
+        } catch (_) {}
+        if (!createdTab?.id) {
+          await postBrowserActuationEvidence(
+            actuationId,
+            unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+          );
+          return;
+        }
+        const deadline = Date.now() + 8000;
+        do {
+          targetOpen = browserSessionTargets.get(sessionRefOpen);
+          if (targetOpen?.tabId === createdTab.id) break;
+          targetOpen = null;
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        } while (Date.now() < deadline);
+        if (!targetOpen) {
+          await postBrowserActuationEvidence(actuationId, {
+            ...unavailableBrowserActuationEvidence(expectedGeneration),
+            command_accepted: true,
+            resource_available: true,
+          }).catch(() => {});
+          return;
+        }
+      }
       if (!targetOpen) {
         await postBrowserActuationEvidence(
           actuationId,
-          unavailableBrowserActuationEvidence(expectedGeneration, recoveredOpen.observedGeneration),
+          unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
         );
         return;
       }
     }
-    if (targetOpen.observationGeneration !== expectedGeneration || targetOpen.provider !== "chatgpt") {
+    if (targetOpen.observationGeneration !== expectedGeneration || targetOpen.provider !== providerOpen) {
       await postBrowserActuationEvidence(
         actuationId,
         unavailableBrowserActuationEvidence(expectedGeneration, targetOpen.observationGeneration),
@@ -2558,7 +2603,7 @@ async function handleBrowserActuation(command) {
     }
     let tabOpen = null;
     try { tabOpen = await chrome.tabs.get(targetOpen.tabId); } catch (_) {}
-    const liveOpen = browserConversationInfo(targetOpen.provider || "chatgpt", tabOpen?.url || "");
+    const liveOpen = browserConversationInfo(providerOpen, tabOpen?.url || "");
     if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
       browserSessionTargets.delete(sessionRefOpen);
       await postBrowserActuationEvidence(

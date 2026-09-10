@@ -279,3 +279,24 @@ test("browser_session.create remains unsupported and never reaches browser actua
   // Ensure the capability snapshot for non-chatgpt never advertises session.open.
   assert.match(backgroundSource, /provider === "chatgpt"\s*\?/);
 });
+
+test("ChatGPT session.open can restore a disposable view from a local canonical locator", () => {
+  const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
+  assert.ok(start >= 0, "session.open branch must exist in handleBrowserActuation");
+  const end = backgroundSource.indexOf("\n  const sessionRef = String(params.session_ref", start);
+  const segment = backgroundSource.slice(start, end >= 0 ? end : start + 9000);
+  assert.match(segment, /recoverBrowserSessionTarget/);
+  assert.match(segment, /canonical_url/);
+  assert.match(segment, /chrome\.tabs\.create\(\{ url: canonicalUrl, active: true \}\)/);
+  assert.match(segment, /chrome\.tabs\.update\(targetOpen\.tabId, \{ active: true, autoDiscardable: false \}\)/);
+  assert.doesNotMatch(segment, /performWake|insertMainWorld|dispatchEnterSubmit|findSendButton/);
+
+  const contentStart = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_session.open")');
+  const contentEnd = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_dispatch.stop")', contentStart);
+  const contentSegment = wakeSource.slice(contentStart, contentEnd);
+  assert.match(contentSegment, /registeredBrowserSessionRef/);
+  assert.match(contentSegment, /registeredBrowserGeneration/);
+  assert.match(contentSegment, /providerCanonicalConversationObserved/);
+  assert.match(contentSegment, /canonical_url_observed\s*=\s*true/);
+  assert.doesNotMatch(contentSegment, /performWake|findSendButton|dispatchEnterSubmit/);
+});
