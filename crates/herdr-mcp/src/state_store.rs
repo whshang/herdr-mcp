@@ -33,7 +33,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -396,6 +396,62 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_dispatches_idempotency
     ON browser_dispatches(endpoint_ref, provider, operation, idempotency_key_digest);
 "#;
 
+/// Migration 9: local-only browser lifecycle locators and pending session
+/// reservations for beta.2 WebChat orchestration.
+///
+/// Browser Registry resource identity remains unchanged: canonical URLs are
+/// explicitly disposable local locators, not provider identity. A pending
+/// session reservation exists only until the provider exposes a stable native
+/// session identity after the first real assignment is submitted.
+const MIGRATION_V9: &str = r#"
+CREATE TABLE IF NOT EXISTS browser_resource_locators (
+    resource_ref            TEXT PRIMARY KEY NOT NULL,
+    canonical_url           TEXT NOT NULL,
+    observation_generation  INTEGER NOT NULL,
+    observed_at             INTEGER NOT NULL,
+    FOREIGN KEY (resource_ref) REFERENCES browser_resources(resource_ref) ON DELETE CASCADE,
+    CHECK (observation_generation > 0)
+);
+
+CREATE TABLE IF NOT EXISTS browser_session_reservations (
+    reservation_ref         TEXT PRIMARY KEY NOT NULL,
+    endpoint_ref            TEXT NOT NULL,
+    provider                TEXT NOT NULL,
+    account_ref             TEXT NOT NULL,
+    space_ref               TEXT,
+    display_label           TEXT NOT NULL,
+    expected_generation     INTEGER NOT NULL,
+    idempotency_key_digest  TEXT NOT NULL,
+    state                   TEXT NOT NULL,
+    session_ref             TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL,
+    expires_at              INTEGER NOT NULL,
+    FOREIGN KEY (endpoint_ref) REFERENCES browser_endpoints(endpoint_ref) ON DELETE CASCADE,
+    FOREIGN KEY (account_ref) REFERENCES browser_resources(resource_ref),
+    FOREIGN KEY (space_ref) REFERENCES browser_resources(resource_ref),
+    FOREIGN KEY (session_ref) REFERENCES browser_resources(resource_ref),
+    CHECK (expected_generation > 0),
+    CHECK (expires_at > created_at),
+    CHECK (state IN ('pending', 'materialized', 'cancelled', 'expired')),
+    CHECK ((state = 'materialized' AND session_ref IS NOT NULL)
+        OR (state != 'materialized' AND session_ref IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_session_reservations_idempotency
+    ON browser_session_reservations(endpoint_ref, provider, idempotency_key_digest);
+"#;
+
+/// Migration 10: durable parent linkage for control operations against a
+/// previously submitted browser dispatch. This lets a stop attempt survive a
+/// lost response without overwriting the original submit state while the stop
+/// outcome is still uncertain.
+const MIGRATION_V10: &str = r#"
+ALTER TABLE browser_dispatches ADD COLUMN parent_dispatch_id TEXT
+    REFERENCES browser_dispatches(dispatch_id);
+CREATE INDEX IF NOT EXISTS idx_browser_dispatches_parent
+    ON browser_dispatches(parent_dispatch_id, operation, updated_at DESC);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -407,6 +463,8 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V6,
     MIGRATION_V7,
     MIGRATION_V8,
+    MIGRATION_V9,
+    MIGRATION_V10,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -799,6 +857,7 @@ pub struct BrowserDispatchReserveInput<'a> {
     pub required_apps: &'a [&'a str],
     pub expected_generation: i64,
     pub idempotency_key_digest: &'a str,
+    pub parent_dispatch_id: Option<&'a str>,
     pub work_chain_id: Option<&'a str>,
     pub lane_id: Option<&'a str>,
     pub created_at: i64,
@@ -826,6 +885,7 @@ pub struct BrowserDispatchRecord {
     pub required_apps: Vec<String>,
     pub expected_generation: i64,
     pub idempotency_key_digest: String,
+    pub parent_dispatch_id: Option<String>,
     pub delivery_state: BrowserDeliveryState,
     pub generation_owner: Option<i64>,
     pub work_chain_id: Option<String>,
@@ -2989,6 +3049,9 @@ impl StateStore {
         validate_browser_digest(input.request_digest, "request_digest")?;
         validate_browser_digest(input.message_digest, "message_digest")?;
         validate_browser_digest(input.idempotency_key_digest, "idempotency_key_digest")?;
+        if let Some(parent_dispatch_id) = input.parent_dispatch_id {
+            validate_browser_dispatch_id(parent_dispatch_id)?;
+        }
         if input.expected_generation < 1 {
             return Err("browser_expected_generation_invalid".to_owned());
         }
@@ -3038,6 +3101,7 @@ impl StateStore {
                 || existing.reasoning_effort.as_deref() != input.reasoning_effort
                 || existing.required_apps_json != required_apps_json
                 || existing.expected_generation != input.expected_generation
+                || existing.parent_dispatch_id.as_deref() != input.parent_dispatch_id
                 || existing.work_chain_id.as_deref() != input.work_chain_id
                 || existing.lane_id.as_deref() != input.lane_id
             {
@@ -3062,16 +3126,27 @@ impl StateStore {
             input.target_session_ref,
             input.expected_generation,
         )?;
+        if let Some(parent_dispatch_id) = input.parent_dispatch_id {
+            let parent = read_browser_dispatch_by_ref(&tx, parent_dispatch_id)?
+                .ok_or_else(|| "browser_parent_dispatch_not_found".to_owned())?;
+            if parent.endpoint_ref != input.endpoint_ref
+                || parent.provider != input.provider
+                || parent.target_session_ref != input.target_session_ref
+                || parent.expected_generation != input.expected_generation
+            {
+                return Err("browser_parent_dispatch_scope_mismatch".to_owned());
+            }
+        }
         tx.execute(
             "INSERT INTO browser_dispatches(
                     dispatch_id, endpoint_ref, provider, operation,
                     target_session_ref, request_digest, message_digest,
                     reasoning_effort, required_apps_json, expected_generation,
-                    idempotency_key_digest, delivery_state, generation_owner,
-                    work_chain_id, lane_id, created_at, updated_at
+                    idempotency_key_digest, parent_dispatch_id, delivery_state,
+                    generation_owner, work_chain_id, lane_id, created_at, updated_at
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    'not_applied', NULL, ?12, ?13, ?14, ?14
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    'not_applied', NULL, ?13, ?14, ?15, ?15
                  )",
             params![
                 dispatch_id,
@@ -3085,6 +3160,7 @@ impl StateStore {
                 required_apps_json,
                 input.expected_generation,
                 input.idempotency_key_digest,
+                input.parent_dispatch_id,
                 input.work_chain_id,
                 input.lane_id,
                 input.created_at,
@@ -3243,6 +3319,69 @@ impl StateStore {
             .map_err(|error| format!("cannot commit browser dispatch settlement: {error}"))?;
         Ok(record)
     }
+
+    pub fn mark_browser_dispatch_stopped_from_child(
+        &mut self,
+        stop_dispatch_id: &str,
+        updated_at: i64,
+    ) -> Result<BrowserDispatchRecord, String> {
+        validate_browser_dispatch_id(stop_dispatch_id)?;
+        if updated_at < 0 {
+            return Err("browser_updated_at_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser stop parent update: {error}"))?;
+        let stop = read_browser_dispatch_by_ref(&tx, stop_dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())?;
+        let parent_dispatch_id = stop
+            .parent_dispatch_id
+            .as_deref()
+            .ok_or_else(|| "browser_stop_parent_missing".to_owned())?;
+        if stop.operation != "browser_dispatch.stop" || stop.delivery_state != "stopped" {
+            return Err("browser_stop_not_confirmed".to_owned());
+        }
+        let parent = read_browser_dispatch_by_ref(&tx, parent_dispatch_id)?
+            .ok_or_else(|| "browser_parent_dispatch_not_found".to_owned())?;
+        if parent.operation != "browser_dispatch.submit"
+            || parent.endpoint_ref != stop.endpoint_ref
+            || parent.provider != stop.provider
+            || parent.target_session_ref != stop.target_session_ref
+            || parent.expected_generation != stop.expected_generation
+            || parent.generation_owner != Some(stop.expected_generation)
+        {
+            return Err("browser_stop_parent_scope_mismatch".to_owned());
+        }
+        let parent_state = BrowserDeliveryState::parse(&parent.delivery_state)?;
+        if parent_state == BrowserDeliveryState::Stopped {
+            let record = decode_browser_dispatch(parent)?;
+            tx.commit().map_err(|error| {
+                format!("cannot commit existing browser stop parent update: {error}")
+            })?;
+            return Ok(record);
+        }
+        if parent_state != BrowserDeliveryState::Applied {
+            return Err("browser_dispatch_not_stoppable".to_owned());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE browser_dispatches
+                 SET delivery_state = 'stopped', updated_at = MAX(updated_at, ?2)
+                 WHERE dispatch_id = ?1 AND delivery_state = 'applied'",
+                params![parent_dispatch_id, updated_at],
+            )
+            .map_err(|error| format!("cannot mark browser dispatch stopped: {error}"))?;
+        if changed != 1 {
+            return Err("browser_dispatch_stop_parent_raced".to_owned());
+        }
+        let record = read_browser_dispatch_by_ref(&tx, parent_dispatch_id)?
+            .ok_or_else(|| "browser_parent_dispatch_not_found".to_owned())
+            .and_then(decode_browser_dispatch)?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser stop parent update: {error}"))?;
+        Ok(record)
+    }
 }
 
 #[derive(Debug)]
@@ -3258,6 +3397,7 @@ struct StoredBrowserDispatch {
     required_apps_json: String,
     expected_generation: i64,
     idempotency_key_digest: String,
+    parent_dispatch_id: Option<String>,
     delivery_state: String,
     generation_owner: Option<i64>,
     work_chain_id: Option<String>,
@@ -3269,8 +3409,8 @@ struct StoredBrowserDispatch {
 const BROWSER_DISPATCH_SELECT: &str = "SELECT dispatch_id, endpoint_ref, provider, operation,
             target_session_ref, request_digest, message_digest,
             reasoning_effort, required_apps_json, expected_generation,
-            idempotency_key_digest, delivery_state, generation_owner,
-            work_chain_id, lane_id, created_at, updated_at
+            idempotency_key_digest, parent_dispatch_id, delivery_state,
+            generation_owner, work_chain_id, lane_id, created_at, updated_at
      FROM browser_dispatches";
 
 fn decode_stored_browser_dispatch(
@@ -3288,12 +3428,13 @@ fn decode_stored_browser_dispatch(
         required_apps_json: row.get(8)?,
         expected_generation: row.get(9)?,
         idempotency_key_digest: row.get(10)?,
-        delivery_state: row.get(11)?,
-        generation_owner: row.get(12)?,
-        work_chain_id: row.get(13)?,
-        lane_id: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
+        parent_dispatch_id: row.get(11)?,
+        delivery_state: row.get(12)?,
+        generation_owner: row.get(13)?,
+        work_chain_id: row.get(14)?,
+        lane_id: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -3345,6 +3486,7 @@ fn decode_browser_dispatch(stored: StoredBrowserDispatch) -> Result<BrowserDispa
         required_apps,
         expected_generation: stored.expected_generation,
         idempotency_key_digest: stored.idempotency_key_digest,
+        parent_dispatch_id: stored.parent_dispatch_id,
         delivery_state,
         generation_owner: stored.generation_owner,
         work_chain_id: stored.work_chain_id,
@@ -6077,18 +6219,18 @@ mod tests {
     }
 
     #[test]
-    fn schema_seven_binary_refuses_v8_and_requires_compatible_rollback_state() {
+    fn schema_eight_binary_refuses_v10_and_requires_compatible_rollback_state() {
         let path = temp_db_path();
         {
             let store = StateStore::open(&path).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 8);
+            assert_eq!(store.schema_version().unwrap(), 10);
         }
-        let mut schema_seven_connection = open_connection(Some(&path)).unwrap();
-        let error = migrate_to(&mut schema_seven_connection, 7, &MIGRATIONS[..7]).unwrap_err();
-        assert!(error.contains("newer than this binary supports (7)"));
-        assert!(error.contains("schema-7 database backup"));
-        assert!(error.contains("schema-8-capable binary"));
-        drop(schema_seven_connection);
+        let mut schema_eight_connection = open_connection(Some(&path)).unwrap();
+        let error = migrate_to(&mut schema_eight_connection, 8, &MIGRATIONS[..8]).unwrap_err();
+        assert!(error.contains("newer than this binary supports (8)"));
+        assert!(error.contains("schema-8 database backup"));
+        assert!(error.contains("schema-10-capable binary"));
+        drop(schema_eight_connection);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
@@ -7030,6 +7172,85 @@ mod tests {
     }
 
     #[test]
+    fn schema_v8_upgrades_through_v10_without_losing_browser_registry() {
+        let path = temp_db_path();
+        let endpoint_ref;
+        let session_ref;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(8) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '8')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            endpoint_ref =
+                browser_opaque_ref("bep_", &["browser-endpoint-v1", "device-v8", "profile-v8"]);
+            session_ref = browser_opaque_ref(
+                "br_",
+                &[
+                    "browser-resource-v1",
+                    &endpoint_ref,
+                    "chatgpt",
+                    "session",
+                    "",
+                    "native-v8",
+                ],
+            );
+            conn.execute(
+                "INSERT INTO browser_endpoints(
+                    endpoint_ref, device_id, browser_family, extension_version,
+                    first_observed_at, last_observed_at
+                 ) VALUES (?1, 'device-v8', 'chrome', '0.1.90', 1, 1)",
+                [&endpoint_ref],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_provider_state(
+                    endpoint_ref, provider, adapter_protocol_version,
+                    observation_generation, capabilities_json, observed_at
+                 ) VALUES (?1, 'chatgpt', 1, 8, '{\"operations\":[]}', 1)",
+                [&endpoint_ref],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_resources(
+                    resource_ref, endpoint_ref, provider, kind, parent_ref,
+                    native_identity_sha256, observation_generation,
+                    first_observed_at, last_observed_at
+                 ) VALUES (?1, ?2, 'chatgpt', 'session', '', ?3, 8, 1, 1)",
+                params![session_ref, endpoint_ref, sha256_text("native-v8")],
+            )
+            .unwrap();
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 10);
+        assert!(store.browser_endpoint(&endpoint_ref).unwrap().is_some());
+        assert!(store.browser_resource(&session_ref).unwrap().is_some());
+        let tables = store.table_names().unwrap();
+        assert!(tables.contains(&"browser_resource_locators".to_owned()));
+        assert!(tables.contains(&"browser_session_reservations".to_owned()));
+        assert!(tables.contains(&"browser_dispatches".to_owned()));
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM pragma_table_info('browser_dispatches') WHERE name = 'parent_dispatch_id'",
+                )
+                .unwrap(),
+            Some(1)
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn browser_dispatch_replay_is_durable_conflicting_and_provider_neutral() {
         const RAW_NATIVE_IDENTITY: &str = "sentinel-provider-native-identity-987";
         const RAW_MESSAGE: &str = "sentinel raw browser message must never persist";
@@ -7056,6 +7277,7 @@ mod tests {
                 required_apps: &required_apps,
                 expected_generation: 7,
                 idempotency_key_digest: &idempotency_key_digest,
+                parent_dispatch_id: None,
                 work_chain_id: Some("wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 lane_id: Some("lane-alpha"),
                 created_at: 10,
@@ -7119,6 +7341,7 @@ mod tests {
                     required_apps: &required_apps,
                     expected_generation: 7,
                     idempotency_key_digest: &idempotency_key_digest,
+                    parent_dispatch_id: None,
                     work_chain_id: Some("wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                     lane_id: Some("lane-alpha"),
                     created_at: 99,
@@ -7194,6 +7417,7 @@ mod tests {
                     required_apps: &required_apps,
                     expected_generation: 7,
                     idempotency_key_digest: &key_digest,
+                    parent_dispatch_id: None,
                     work_chain_id: None,
                     lane_id: None,
                     created_at: 10,
@@ -7309,6 +7533,7 @@ mod tests {
                 required_apps: &required_apps,
                 expected_generation: 7,
                 idempotency_key_digest: &idempotency_key_digest,
+                parent_dispatch_id: None,
                 work_chain_id: None,
                 lane_id: None,
                 created_at: 10,
@@ -7379,6 +7604,7 @@ mod tests {
                         required_apps: &required_apps,
                         expected_generation: 7,
                         idempotency_key_digest: &idempotency_key_digest,
+                        parent_dispatch_id: None,
                         work_chain_id: None,
                         lane_id: None,
                         created_at: 10,

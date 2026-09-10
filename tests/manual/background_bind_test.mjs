@@ -741,7 +741,7 @@ ok(await waitForTest(() => browserRegistryRequests.length === 1),
 const browserRegister = browserRegistryRequests[0] || {};
 ok(browserRegister.operation === "endpoint.register"
     && browserRegister.browser_family === "chrome"
-    && browserRegister.extension_version === "0.1.90"
+    && browserRegister.extension_version === "0.1.91"
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
   "browser endpoint registration carries one opaque profile seed and product identity",
   JSON.stringify(browserRegister));
@@ -1017,6 +1017,7 @@ console.log("\n[Gemini browser registry observation]");
   ok(observed.length === 3
       && observed[0]?.operation === "provider.observe"
       && observed[0]?.provider === "gemini"
+      && observed[0]?.capabilities?.operations?.includes("generation.stop")
       && observed[1]?.operation === "resource.observe"
       && observed[1]?.kind === "account"
       && observed[1]?.parent_ref === null

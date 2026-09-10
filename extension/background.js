@@ -1681,8 +1681,8 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
     capabilities: { operations: provider === "chatgpt"
-        ? ["composer.submit", "generation.status", "session.inspect", "session.open"]
-        : ["composer.submit", "generation.status", "session.inspect"] },
+        ? ["composer.submit", "generation.status", "generation.stop", "session.inspect", "session.open"]
+        : ["composer.submit", "generation.status", "generation.stop", "session.inspect"] },
     observed_at: Date.now(),
   });
   const account = await postBrowserRegistry({

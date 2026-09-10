@@ -1389,6 +1389,34 @@ const H2W_CONTENT_VERSION = "0.1.90";
     if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)) {
       return { ...evidence, resource_available: false };
     }
+    if (command?.operation === "herdr_mcp.browser_dispatch.stop") {
+      const candidates = typeof ADAPTER.getStopButtonCandidates === "function"
+        ? ADAPTER.getStopButtonCandidates()
+        : [];
+      const stopButton = candidates.find((button) => {
+        if (!ADAPTER.elementVisible(button) || button?.disabled === true) return false;
+        return button?.getAttribute?.("aria-disabled") !== "true";
+      });
+      if (!stopButton || !isTurnInProgress()) {
+        return { ...evidence, rejected: true };
+      }
+      stopButton.click();
+      evidence.command_accepted = true;
+      evidence.generation_owner = expectedGeneration;
+      const deadline = Date.now() + 6000;
+      do {
+        const remaining = typeof ADAPTER.getStopButtonCandidates === "function"
+          ? ADAPTER.getStopButtonCandidates().some((button) => ADAPTER.elementVisible(button))
+          : false;
+        if (!remaining && !isTurnInProgress()) {
+          evidence.generation_status_observed = true;
+          evidence.generation_stopped = true;
+          return evidence;
+        }
+        await wait(200);
+      } while (Date.now() < deadline);
+      return evidence;
+    }
     if (command?.operation !== "herdr_mcp.browser_dispatch.submit") {
       return { ...evidence, rejected: true };
     }

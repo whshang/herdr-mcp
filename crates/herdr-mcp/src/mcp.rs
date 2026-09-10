@@ -1603,6 +1603,7 @@ fn browser_dispatch_submit(
         required_apps: &required_apps,
         expected_generation,
         idempotency_key_digest: &idempotency_key_digest,
+        parent_dispatch_id: None,
         work_chain_id,
         lane_id,
         created_at: now,
@@ -1702,6 +1703,183 @@ fn browser_dispatch_submit(
     })
 }
 
+fn browser_dispatch_stop(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let parent_dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
+    let expected_generation = params
+        .get("expected_generation")
+        .and_then(Value::as_i64)
+        .unwrap();
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .unwrap();
+    let now = browser_epoch_ms();
+    let idempotency_key_digest = browser_sha256(idempotency_key);
+    let request_digest = browser_sha256(
+        &json!({
+            "operation": "browser_dispatch.stop",
+            "dispatch_id": parent_dispatch_id,
+            "expected_generation": expected_generation,
+        })
+        .to_string(),
+    );
+    let empty_digest = browser_sha256("");
+
+    let Ok(mut store_guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let parent = match store_guard.browser_dispatch(parent_dispatch_id) {
+        Ok(Some(dispatch)) => dispatch,
+        Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
+        Err(error) => return browser_store_error(error),
+    };
+    if parent.operation != "browser_dispatch.submit" {
+        return json!({"ok": false, "code": "browser_dispatch_not_stoppable"});
+    }
+    if parent.expected_generation != expected_generation {
+        return json!({"ok": false, "code": "stale_capability_generation"});
+    }
+    if parent.delivery_state == BrowserDeliveryState::Stopped {
+        return json!({
+            "ok": true,
+            "code": Value::Null,
+            "operation": BrowserOperation::DispatchStop.method(),
+            "delivery_state": BrowserDeliveryState::Stopped.as_str(),
+            "target_dispatch": browser_dispatch_json(parent),
+            "replayed": true,
+        });
+    }
+    if parent.delivery_state != BrowserDeliveryState::Applied
+        || parent.generation_owner != Some(expected_generation)
+    {
+        return json!({"ok": false, "code": "browser_dispatch_not_stoppable"});
+    }
+
+    let reservation = store_guard.reserve_browser_dispatch(BrowserDispatchReserveInput {
+        endpoint_ref: &parent.endpoint_ref,
+        provider: &parent.provider,
+        operation: "browser_dispatch.stop",
+        target_session_ref: &parent.target_session_ref,
+        request_digest: &request_digest,
+        message_digest: &empty_digest,
+        reasoning_effort: None,
+        required_apps: &[],
+        expected_generation,
+        idempotency_key_digest: &idempotency_key_digest,
+        parent_dispatch_id: Some(parent_dispatch_id),
+        work_chain_id: parent.work_chain_id.as_deref(),
+        lane_id: parent.lane_id.as_deref(),
+        created_at: now,
+    });
+    let reserved = match reservation {
+        Ok(BrowserDispatchReservation::Existing(stop_dispatch)) => {
+            let success = stop_dispatch.delivery_state == BrowserDeliveryState::Stopped;
+            let target_dispatch = if success {
+                match store_guard
+                    .mark_browser_dispatch_stopped_from_child(&stop_dispatch.dispatch_id, now)
+                {
+                    Ok(dispatch) => dispatch,
+                    Err(error) => return browser_store_error(error),
+                }
+            } else {
+                parent
+            };
+            return json!({
+                "ok": success,
+                "code": if success { Value::Null } else { json!(stop_dispatch.delivery_state.as_str()) },
+                "operation": BrowserOperation::DispatchStop.method(),
+                "delivery_state": stop_dispatch.delivery_state.as_str(),
+                "dispatch": browser_dispatch_json(stop_dispatch),
+                "target_dispatch": browser_dispatch_json(target_dispatch),
+                "replayed": true,
+            });
+        }
+        Ok(BrowserDispatchReservation::Reserved(dispatch)) => dispatch,
+        Err(error) => return browser_store_error(error),
+    };
+
+    if let Err(error) = store_guard.update_browser_dispatch(BrowserDispatchUpdateInput {
+        dispatch_id: &reserved.dispatch_id,
+        expected_generation,
+        delivery_state: BrowserDeliveryState::Uncertain,
+        generation_owner: None,
+        updated_at: now,
+    }) {
+        return browser_store_error(error);
+    }
+    drop(store_guard);
+
+    let evidence = match actuator {
+        Some(actuator) => match actuator.actuate(
+            BrowserOperation::DispatchStop.method(),
+            params,
+            expected_generation,
+            Some(&reserved.dispatch_id),
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => return browser_store_error(error),
+        },
+        None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+    };
+    let delivery_state = match browser_delivery_state_from_postcondition(
+        BrowserOperation::DispatchStop,
+        params,
+        expected_generation,
+        &evidence,
+    ) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    let Ok(mut store) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let stop_dispatch = if delivery_state == BrowserDeliveryState::Uncertain {
+        match store.browser_dispatch(&reserved.dispatch_id) {
+            Ok(Some(dispatch)) => dispatch,
+            Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
+            Err(error) => return browser_store_error(error),
+        }
+    } else {
+        match store.settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+            dispatch_id: &reserved.dispatch_id,
+            expected_generation,
+            delivery_state,
+            generation_owner: evidence.generation_owner,
+            updated_at: browser_epoch_ms(),
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(error) => return browser_store_error(error),
+        }
+    };
+    let target_dispatch = if delivery_state == BrowserDeliveryState::Stopped {
+        match store.mark_browser_dispatch_stopped_from_child(
+            &stop_dispatch.dispatch_id,
+            browser_epoch_ms(),
+        ) {
+            Ok(dispatch) => dispatch,
+            Err(error) => return browser_store_error(error),
+        }
+    } else {
+        parent
+    };
+    let work_memory_writeback = browser_dispatch_work_memory_writeback(&mut store, &stop_dispatch);
+    let success = delivery_state == BrowserDeliveryState::Stopped;
+    json!({
+        "ok": success,
+        "code": if success { Value::Null } else { json!(delivery_state.as_str()) },
+        "operation": BrowserOperation::DispatchStop.method(),
+        "delivery_state": delivery_state.as_str(),
+        "dispatch": browser_dispatch_json(stop_dispatch),
+        "target_dispatch": browser_dispatch_json(target_dispatch),
+        "replayed": false,
+        "work_memory_writeback": work_memory_writeback,
+    })
+}
+
 fn browser_dispatch_status(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     dispatch_id: &str,
@@ -1729,8 +1907,20 @@ fn browser_dispatch_status(
             Err(error) => return browser_store_error(error),
         };
         if let Some(evidence) = evidence {
+            let operation = match dispatch.operation.as_str() {
+                "browser_dispatch.submit" => BrowserOperation::DispatchSubmit,
+                "browser_dispatch.stop" => BrowserOperation::DispatchStop,
+                _ => {
+                    return json!({
+                        "ok": true,
+                        "dispatch": browser_dispatch_json(dispatch),
+                        "reconciled": false,
+                        "reconciliation_code": "unsupported_dispatch_operation",
+                    });
+                }
+            };
             let delivery_state = match browser_delivery_state_from_postcondition(
-                BrowserOperation::DispatchSubmit,
+                operation,
                 &json!({}),
                 dispatch.expected_generation,
                 &evidence,
@@ -1776,11 +1966,25 @@ fn browser_dispatch_status(
                     }
                     Err(error) => return browser_store_error(error),
                 };
+                let target_dispatch = if operation == BrowserOperation::DispatchStop
+                    && settled.delivery_state == BrowserDeliveryState::Stopped
+                {
+                    match store.mark_browser_dispatch_stopped_from_child(
+                        &settled.dispatch_id,
+                        browser_epoch_ms(),
+                    ) {
+                        Ok(record) => Some(browser_dispatch_json(record)),
+                        Err(error) => return browser_store_error(error),
+                    }
+                } else {
+                    None
+                };
                 let work_memory_writeback =
                     browser_dispatch_work_memory_writeback(&mut store, &settled);
                 return json!({
                     "ok": true,
                     "dispatch": browser_dispatch_json(settled),
+                    "target_dispatch": target_dispatch,
                     "reconciled": true,
                     "reconciliation_code": Value::Null,
                     "work_memory_writeback": work_memory_writeback,
@@ -2035,7 +2239,10 @@ fn browser_operation_call_with_grant(
 }
 
 fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Value) -> bool {
-    if operation == BrowserOperation::SessionOpen {
+    if matches!(
+        operation,
+        BrowserOperation::SessionOpen | BrowserOperation::DispatchStop
+    ) {
         return true;
     }
     if operation != BrowserOperation::DispatchSubmit {
@@ -2169,6 +2376,7 @@ fn browser_operation_call_with_grants(
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
             browser_dispatch_status(store, dispatch_id, browser_actuator)
         }
+        BrowserOperation::DispatchStop => browser_dispatch_stop(store, params, browser_actuator),
         _ => {
             let expected_generation = params
                 .get("expected_generation")
@@ -2825,6 +3033,7 @@ fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) ->
         "reasoning_effort": dispatch.reasoning_effort,
         "required_apps": dispatch.required_apps,
         "expected_generation": dispatch.expected_generation,
+        "parent_dispatch_id": dispatch.parent_dispatch_id,
         "delivery_state": dispatch.delivery_state.as_str(),
         "generation_owner": dispatch.generation_owner,
         "work_chain_id": dispatch.work_chain_id,
@@ -3144,8 +3353,19 @@ fn browser_required_string<'a>(
         return Err(json!({"ok": false, "code": format!("browser_{field}_required")}));
     };
     let value = value.trim();
-    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+    if value.is_empty() || value.chars().any(char::is_control) {
         return Err(json!({"ok": false, "code": format!("browser_{field}_invalid")}));
+    }
+    if value.len() > max_bytes {
+        return Err(json!({
+            "ok": false,
+            "code": format!("browser_{field}_invalid"),
+            "limit": {
+                "kind": "max_bytes",
+                "max_bytes": max_bytes,
+                "actual_bytes": value.len(),
+            }
+        }));
     }
     Ok(value)
 }
@@ -4558,6 +4778,21 @@ mod tests {
             }),
         );
         assert_eq!(arbitrary_json["code"], "browser_operation_params_invalid");
+
+        let oversized = browser_operation_call(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "x".repeat(262_145),
+                "expected_generation": 7,
+                "idempotency_key": "dispatch-oversized-1"
+            }),
+        );
+        assert_eq!(oversized["code"], "browser_message_invalid");
+        assert_eq!(oversized["limit"]["kind"], "max_bytes");
+        assert_eq!(oversized["limit"]["max_bytes"], 262_144);
+        assert_eq!(oversized["limit"]["actual_bytes"], 262_145);
     }
 
     #[test]
@@ -4680,7 +4915,7 @@ mod tests {
                     provider: "chatgpt",
                     adapter_protocol_version: 1,
                     observation_generation: 7,
-                    capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                    capabilities_json: r#"{"operations":["composer.submit","generation.stop"]}"#,
                     observed_at: 11,
                 })
                 .unwrap();
@@ -5032,6 +5267,229 @@ mod tests {
             }),
         );
         assert_eq!(evidence_search["hits"].as_array().unwrap().len(), 1);
+
+        struct StopActuator {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl BrowserActuator for StopActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::DispatchStop.method());
+                assert!(dispatch_id.is_some_and(|value| value.starts_with("bd_")));
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: true,
+                })
+            }
+        }
+        let stop_actuator = StopActuator {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let stop_params = json!({
+            "dispatch_id": applied_dispatch_id,
+            "expected_generation": 7,
+            "idempotency_key": "stop-applied-dispatch-1"
+        });
+        let stopped = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &stop_params,
+            true,
+            Some(&stop_actuator),
+        );
+        assert_eq!(stopped["ok"], true);
+        assert_eq!(stopped["delivery_state"], "stopped");
+        assert_eq!(
+            stopped["dispatch"]["parent_dispatch_id"],
+            applied_dispatch_id
+        );
+        assert_eq!(stopped["target_dispatch"]["delivery_state"], "stopped");
+        assert_eq!(
+            stop_actuator
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let stopped_replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &stop_params,
+            true,
+            Some(&stop_actuator),
+        );
+        assert_eq!(stopped_replay["ok"], true);
+        assert_eq!(stopped_replay["replayed"], true);
+        assert_eq!(
+            stop_actuator
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "replaying a confirmed stop must not click Stop again"
+        );
+
+        let second_params = json!({
+            "session_ref": session_ref,
+            "message": "dispatch before delayed stop",
+            "expected_generation": 7,
+            "idempotency_key": "delivery-before-delayed-stop",
+            "work_chain_id": "wc_dddddddddddddddddddddddddddddddd",
+            "lane_id": "lane-browser"
+        });
+        let second = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &second_params,
+            true,
+            Some(&AppliedActuator),
+        );
+        assert_eq!(second["dispatch"]["delivery_state"], "applied");
+        let second_dispatch_id = second["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        struct DelayedStopActuator {
+            actuate_calls: std::sync::atomic::AtomicUsize,
+            reconcile_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl BrowserActuator for DelayedStopActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::DispatchStop.method());
+                assert!(dispatch_id.is_some_and(|value| value.starts_with("bd_")));
+                self.actuate_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                })
+            }
+
+            fn reconcile_dispatch(
+                &self,
+                dispatch_id: &str,
+                expected_generation: i64,
+            ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+                assert!(dispatch_id.starts_with("bd_"));
+                self.reconcile_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: true,
+                }))
+            }
+        }
+        let delayed_stop_actuator = DelayedStopActuator {
+            actuate_calls: std::sync::atomic::AtomicUsize::new(0),
+            reconcile_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let delayed_stop_params = json!({
+            "dispatch_id": second_dispatch_id,
+            "expected_generation": 7,
+            "idempotency_key": "stop-delayed-dispatch-1"
+        });
+        let uncertain_stop = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &delayed_stop_params,
+            true,
+            Some(&delayed_stop_actuator),
+        );
+        assert_eq!(uncertain_stop["ok"], false);
+        assert_eq!(uncertain_stop["delivery_state"], "uncertain");
+        let stop_dispatch_id = uncertain_stop["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let uncertain_replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &delayed_stop_params,
+            true,
+            Some(&delayed_stop_actuator),
+        );
+        assert_eq!(uncertain_replay["replayed"], true);
+        assert_eq!(uncertain_replay["delivery_state"], "uncertain");
+        assert_eq!(
+            delayed_stop_actuator
+                .actuate_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an uncertain stop replay must not send a second Stop command"
+        );
+
+        let reconciled_stop = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.status",
+            &json!({"dispatch_id": stop_dispatch_id}),
+            &[],
+            Some(&delayed_stop_actuator),
+            None,
+        );
+        assert_eq!(reconciled_stop["reconciled"], true);
+        assert_eq!(reconciled_stop["dispatch"]["delivery_state"], "stopped");
+        assert_eq!(
+            reconciled_stop["target_dispatch"]["delivery_state"],
+            "stopped"
+        );
+        assert_eq!(
+            delayed_stop_actuator
+                .reconcile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]
