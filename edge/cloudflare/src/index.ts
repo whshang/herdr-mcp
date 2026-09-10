@@ -494,12 +494,16 @@ export default {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
-      const input: { ttl_seconds?: number; name?: string; worker_context: string; require_empty_fleet?: boolean } = {
+      const input: { ttl_seconds?: number; name?: string; worker_context: string; require_empty_fleet?: boolean; recover_device_id?: string } = {
         worker_context: pairingWorkerContext(env),
       };
       if (parsed.value.ttl_seconds !== undefined) input.ttl_seconds = parsed.value.ttl_seconds as number;
       if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
       if (parsed.value.require_empty_fleet === true) input.require_empty_fleet = true;
+      if (parsed.value.recover_device_id !== undefined) {
+        if (typeof parsed.value.recover_device_id !== "string") return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+        input.recover_device_id = parsed.value.recover_device_id;
+      }
       const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
       const result = await createPairingSession(registry, input);
       return result.ok

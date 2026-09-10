@@ -99,6 +99,7 @@ pub enum WorkerCommand {
     Pair {
         ttl_seconds: u64,
         name: Option<String>,
+        recover_device_id: Option<String>,
     },
     Connect {
         pairing_address: String,
@@ -988,6 +989,7 @@ fn validate_automation_client_id(client_id: &str) -> Result<(), String> {
 fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
     let mut ttl_seconds = 600_u64;
     let mut name = None;
+    let mut recover_device_id = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1013,6 +1015,13 @@ fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
                 );
                 index += 2;
             }
+            "--recover-device" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--recover-device requires an immutable device_id".to_owned())?;
+                recover_device_id = Some(crate::config::normalize_device_id(value)?);
+                index += 2;
+            }
             "--code" | "--pin" => {
                 return Err(
                     "pairing codes are never accepted on argv; the new device enters the code interactively"
@@ -1030,7 +1039,11 @@ fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
             }
         }
     }
-    Ok(Command::Worker(WorkerCommand::Pair { ttl_seconds, name }))
+    Ok(Command::Worker(WorkerCommand::Pair {
+        ttl_seconds,
+        name,
+        recover_device_id,
+    }))
 }
 
 fn parse_worker_connect(args: &[String]) -> Result<Command, String> {
@@ -1467,7 +1480,7 @@ User path:\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
   herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
   herdr-mcp worker bootstrap  (macOS/Linux first device; guided Cloudflare Worker + enrollment bootstrap)\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS/Linux enrolled device; creates pairing for another computer)\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]  (macOS/Linux enrolled device; creates pairing or exact-device credential recovery)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS/Linux; uses the platform credential store and reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
   herdr-mcp connector list  (enrolled-device credential; non-secret connector inventory)\n\
@@ -1741,6 +1754,7 @@ mod tests {
             Command::Worker(WorkerCommand::Pair {
                 ttl_seconds: 120,
                 name: Some("mac-b".to_owned()),
+                recover_device_id: None,
             })
         );
         assert_eq!(
@@ -1763,6 +1777,7 @@ mod tests {
             Command::Worker(WorkerCommand::Pair {
                 ttl_seconds: 600,
                 name: None,
+                recover_device_id: None,
             })
         );
         assert_eq!(
@@ -1837,10 +1852,26 @@ mod tests {
         assert!(parse(args(&["worker", "pair", "--ttl-seconds", "900"])).is_err());
         assert!(parse(args(&["worker", "pair", "--ttl-seconds", "59"])).is_err());
         assert_eq!(
+            parse(args(&[
+                "worker",
+                "pair",
+                "--recover-device",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::Pair {
+                ttl_seconds: 600,
+                name: None,
+                recover_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            })
+        );
+        assert_eq!(
             parse(args(&["worker", "pair"])).unwrap().command,
             Command::Worker(WorkerCommand::Pair {
                 ttl_seconds: 600,
                 name: None,
+                recover_device_id: None,
             })
         );
         assert_eq!(

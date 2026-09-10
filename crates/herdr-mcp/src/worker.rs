@@ -58,11 +58,19 @@ pub(crate) struct EnrolledCredential {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn pairing_create_request_body(ttl_seconds: u64, name: Option<&str>) -> Value {
-    match name {
-        Some(name) => json!({ "ttl_seconds": ttl_seconds, "name": name }),
-        None => json!({ "ttl_seconds": ttl_seconds }),
+fn pairing_create_request_body(
+    ttl_seconds: u64,
+    name: Option<&str>,
+    recover_device_id: Option<&str>,
+) -> Value {
+    let mut body = json!({ "ttl_seconds": ttl_seconds });
+    if let Some(name) = name {
+        body["name"] = json!(name);
     }
+    if let Some(device_id) = recover_device_id {
+        body["recover_device_id"] = json!(device_id);
+    }
+    body
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -289,9 +297,16 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     match command {
         WorkerCommand::List => list_devices(&paths),
         WorkerCommand::Bootstrap => crate::worker_bootstrap::run(&paths),
-        WorkerCommand::Pair { ttl_seconds, name } => {
-            create_pairing(&paths, ttl_seconds, name.as_deref())
-        }
+        WorkerCommand::Pair {
+            ttl_seconds,
+            name,
+            recover_device_id,
+        } => create_pairing(
+            &paths,
+            ttl_seconds,
+            name.as_deref(),
+            recover_device_id.as_deref(),
+        ),
         WorkerCommand::Connect {
             pairing_address,
             name,
@@ -512,6 +527,7 @@ fn create_pairing(
     paths: &RuntimePaths,
     ttl_seconds: u64,
     name: Option<&str>,
+    recover_device_id: Option<&str>,
 ) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let owner = resolve_fleet_link_identity(paths, &config)?;
@@ -525,7 +541,11 @@ fn create_pairing(
     let response = client_for_origin(&owner.edge_origin)?
         .post(endpoint)
         .headers(headers)
-        .json(&pairing_create_request_body(ttl_seconds, name))
+        .json(&pairing_create_request_body(
+            ttl_seconds,
+            name,
+            recover_device_id,
+        ))
         .send()
         .map_err(|error| format!("cannot create device pairing: {error}"))?;
     let payload = parse_json_response(response, "device pairing creation")?;
@@ -2559,12 +2579,19 @@ mod tests {
 
     #[test]
     fn pairing_request_bodies_omit_unspecified_name_and_preserve_explicit_name() {
-        let unnamed_create = pairing_create_request_body(600, None);
+        let unnamed_create = pairing_create_request_body(600, None, None);
         assert_eq!(unnamed_create["ttl_seconds"], 600);
         assert!(unnamed_create.get("name").is_none());
 
-        let named_create = pairing_create_request_body(600, Some("Nathan Mac"));
+        let named_create = pairing_create_request_body(600, Some("Nathan Mac"), None);
         assert_eq!(named_create["name"], "Nathan Mac");
+
+        let recovery_create =
+            pairing_create_request_body(600, None, Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert_eq!(
+            recovery_create["recover_device_id"],
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
 
         let pairing_id = "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let unnamed_consume = pairing_consume_request_body(pairing_id, "123456", None);
