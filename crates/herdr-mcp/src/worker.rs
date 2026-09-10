@@ -578,7 +578,7 @@ pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_js
     }))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let owner = resolve_fleet_link_identity(paths, &config)?;
@@ -586,7 +586,7 @@ pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, St
     extension_fleet_snapshot_with_client(paths, &client)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn extension_fleet_snapshot_with_client(
     paths: &RuntimePaths,
     client: &Client,
@@ -619,7 +619,10 @@ pub(crate) fn extension_fleet_snapshot_with_client(
             "http_status": status.as_u16(),
         }));
     }
+    #[cfg(target_os = "linux")]
     let service = crate::linux_service_manager::doctor_status().unwrap_or_else(|_| json!({}));
+    #[cfg(target_os = "windows")]
+    let service = crate::windows_service_manager::doctor_status().unwrap_or_else(|_| json!({}));
     Ok(json!({
         "ok": true,
         "devices": payload.get("devices").cloned().unwrap_or_else(|| json!([])),

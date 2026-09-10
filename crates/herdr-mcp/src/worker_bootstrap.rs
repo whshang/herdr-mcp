@@ -1520,7 +1520,7 @@ fn verify_current_device_inventory(
     expected: Option<&str>,
     _edge_http: &EdgeHttpClient,
 ) -> Result<(), String> {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     let payload = crate::worker::extension_fleet_snapshot_with_client(paths, &_edge_http.client)?;
     if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err("authenticated device inventory is unavailable after bootstrap".to_owned());
