@@ -137,9 +137,9 @@ If new conversations see 18 tools and an old one sees 17, the server is usually 
 
 This is no longer a ChatGPT schema problem. If ChatGPT received a structured `workstation_offline` result, the ChatGPT → MCP Edge path was alive enough to return that result; Edge did not have a usable Link WebSocket for the selected workstation. The browser extension does not make this decision.
 
-On v0.4.3+, recovery is layered rather than "restart everything":
+Current recovery is layered rather than "restart everything":
 
-1. A recently connected workstation gets up to **2 seconds** of process-local reconnect grace at Edge. A validated Link `hello` wakes the pending request immediately. This grace does not write Durable Object storage or alarms.
+1. A recently connected workstation gets up to **15 seconds** of process-local reconnect grace at Edge. A validated Link `hello` wakes the pending request immediately. This grace does not write Durable Object storage or alarms.
 2. If the workstation is still unavailable, Edge returns machine-readable recovery metadata: `retryable=true`, `delivery_state=not_delivered`, `retry_after_ms=5000`, and a read-only `herdr_inspect` probe policy with 5s / 10s / 20s backoff.
 3. The local Link keeps its normal reconnect/backoff loop. A successful Online transition clears the prolonged-offline timer.
 4. If the Link cannot become Online continuously for **300 seconds**, it exits with diagnostic evidence so launchd `KeepAlive` can start a fresh `dev.herdr-mcp.link-prod` process.
