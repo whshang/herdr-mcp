@@ -54,7 +54,9 @@ herdr-mcp status
 
 `install` 会把不可变 generation 放到 `~/.config/herdr-mcp/runtime/` 并让用户 PATH 入口指向 `runtime/current/herdr-mcp`。普通用户不要用 git clone、`npm` 或 `cargo` 安装本机 runtime。
 
-x86_64 Debian 使用静态 `x86_64-unknown-linux-musl` Release 产物。安装器优先使用 `systemd --user`，没有 user systemd manager 时使用托管用户进程 backend。macOS 使用用户级 LaunchAgent，完全磁盘访问授予稳定 TCC broker；`sudo` 不能替代这项权限。平台服务与常驻细节见 [CLI 参考](cli-reference.md)和[故障排查](troubleshooting.md)。本地 doctor 不健康时先解决 runtime / Herdr 问题，再部署公网 Edge。
+x86_64 Debian 使用静态 `x86_64-unknown-linux-musl` Release 产物。安装器优先使用 `systemd --user`，没有 user systemd manager 时使用托管用户进程 backend。macOS 使用用户级 LaunchAgent，完全磁盘访问只授予稳定的 macOS 专用 broker：`~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`；Linux 与 Windows 不使用这套 TCC/FDA 路径，`sudo` 也不能替代 macOS 隐私权限。
+
+macOS 需要授权时执行 `herdr-mcp permissions setup`，在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中开启上述 broker，再执行 `herdr-mcp permissions verify`。broker compatibility 升级必须显式执行 `permissions setup --upgrade-broker`，保留回滚证据，并在 code identity 变化时接受一次新的人工授权；普通 runtime generation 更新不得替换 broker。host-capable broker 授权后还必须验证 `~/Documents` 下真实 Herdr pane/worktree 的 `getcwd`/Git；只验证 `herdr_git` 不足以证明 native 路径已经统一到 broker responsibility。平台服务与常驻细节见 [CLI 参考](cli-reference.md)和[故障排查](troubleshooting.md)。本地 doctor 不健康时先解决 runtime / Herdr 问题，再部署公网 Edge。
 
 ## 第二步：部署稳定公网 Edge
 

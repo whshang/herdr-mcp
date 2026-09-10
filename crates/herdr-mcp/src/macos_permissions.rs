@@ -285,7 +285,11 @@ fn run_setup(upgrade_broker: bool) -> Result<ExitCode, String> {
     let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
     let upgrade = tcc_broker::upgrade_status(&config_dir);
     if upgrade_broker && upgrade.update_available {
-        tcc_broker::install(&config_dir, true)?;
+        if upgrade.update_requires_reauthorization {
+            tcc_broker::migrate_for_explicit_reauthorization(&config_dir)?;
+        } else {
+            tcc_broker::install(&config_dir, true)?;
+        }
     }
     let sync = preserve_or_install_broker(&config_dir)?;
     println!("broker: {}", sync.path.display());
@@ -415,6 +419,7 @@ fn run_verify() -> Result<ExitCode, String> {
         let ok = report.state == PermissionState::Granted;
         if ok {
             clear_authorization_required(&config_dir)?;
+            tcc_broker::finalize_explicit_reauthorization(&config_dir)?;
         }
         Ok(if ok {
             ExitCode::SUCCESS
@@ -689,27 +694,13 @@ enum ProbeOutcome {
 
 #[cfg(target_os = "macos")]
 fn probe_protected_path(broker: &Path) -> ProbeOutcome {
-    use crate::child_process;
-    use std::process::{Command, Stdio};
-
-    let executable = if broker.is_file() {
-        broker.to_path_buf()
-    } else {
+    if !broker.is_file() {
         return ProbeOutcome::Failed;
-    };
-    let mut command = Command::new(executable);
-    command
-        .arg("__documents-probe")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    child_process::configure_process_group(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => return ProbeOutcome::Failed,
-    };
-    let _registration = child_process::register_owned_child("macos-permissions-probe", &child);
-    match child_process::wait_bounded(&mut child, PROBE_TIMEOUT) {
+    }
+    // Use the same responsibility-disclaimed launch boundary as real MCP
+    // broker requests. A normal Command::spawn here can inherit Full Disk
+    // Access from Terminal and falsely report the broker as authorized.
+    match tcc_broker::run_disclaimed_documents_probe(broker, PROBE_TIMEOUT) {
         Ok(Some(status)) if status.success() => ProbeOutcome::Granted,
         Ok(Some(status)) if status.code() == Some(77) => ProbeOutcome::Denied,
         Ok(Some(status)) if status.code() == Some(66) => ProbeOutcome::NotPresent,
@@ -936,6 +927,15 @@ mod tests {
         let target = tcc_broker::broker_path(&config);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"existing-stable-broker").unwrap();
+        fs::write(
+            tcc_broker::broker_metadata_path(&config),
+            format!(
+                "{{\"schema_version\":1,\"compat_revision\":{},\"preferred_signing_identifier\":\"{}\"}}",
+                tcc_broker::BROKER_COMPAT_REVISION,
+                tcc_broker::BROKER_SIGNING_IDENTIFIER
+            ),
+        )
+        .unwrap();
         let sync = preserve_or_install_broker(&config).unwrap();
         assert!(!sync.broker_update_available);
         assert_eq!(

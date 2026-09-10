@@ -43,7 +43,9 @@ herdr-mcp doctor
 
 如果 `~/.local/bin/herdr-mcp` 已存在但交互 shell 找不到它，记为 `installed_but_not_on_shell_path`，修复用户 PATH 后用新 shell 验证。不要重复安装，也不要创建第二个 PATH owner。只有实际需要修 PATH 时再打开[故障排查](troubleshooting.md)。
 
-macOS 在 Cloudflare 工作之前执行 `herdr-mcp permissions status` 和 `herdr-mcp permissions verify`。出现 `needs_setup`，或 `doctor` 明确要求完全磁盘访问（Full Disk Access/TCC）时，由用户本人给稳定 broker 授权后再验证；不要用 `sudo` 替代。Linux 使用 release 自带的受支持 user-service / process backend，不套用 macOS launchd 假设。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
+macOS 在 Cloudflare 工作之前执行 `herdr-mcp permissions status` 和 `herdr-mcp permissions verify`。授权目标固定为 macOS 专用的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`；Linux 与 Windows 不走 TCC/FDA 流程。需要授权时，ChatGPT / 安装 Agent 必须把用户实际带到“系统设置 → 隐私与安全性 → 完全磁盘访问权限”，必要时明确指导点击 `+`、按 `Command+Shift+G` 并粘贴上述 broker 路径，然后重新执行 `permissions verify`。Touch ID / 密码确认属于必须保留的 macOS 人工边界，不能绕过；`sudo` 不能替代。
+
+只有 responsibility-isolated broker probe 成功才算授权完成，不能因为父级 Terminal 自己已有权限就出现假阳性。若看到 `broker_update_available: true`，普通 runtime 更新继续保留旧 broker；仅在明确的 broker compatibility migration 时执行 `herdr-mcp permissions setup --upgrade-broker`。host-capable broker 完成授权后，还必须验证 `~/Documents` 下真实 Herdr pane/worktree 的 `getcwd`/Git，不得只验证 `herdr_git`。Linux 使用 release 自带的受支持 user-service / process backend，不套用 macOS launchd 假设。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
 
 ## 4. 第一台 Worker：Cloudflare + bootstrap
 

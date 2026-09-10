@@ -55,7 +55,9 @@ herdr-mcp status
 
 `install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and points the user PATH entry at `runtime/current/herdr-mcp`. Normal users do not install the local runtime with a git clone, `npm`, or `cargo`.
 
-On x86_64 Debian, use the static `x86_64-unknown-linux-musl` release asset. The installer prefers `systemd --user`; when no user systemd manager exists it uses the managed user-process backend. On macOS, the service is a user LaunchAgent and Full Disk Access is granted to the stable TCC broker. `sudo` does not replace that permission. Platform-specific service and persistence details live in [CLI reference](cli-reference.md) and [Troubleshooting](troubleshooting.md). Do not add public Edge while the local doctor is unhealthy.
+On x86_64 Debian, use the static `x86_64-unknown-linux-musl` release asset. The installer prefers `systemd --user`; when no user systemd manager exists it uses the managed user-process backend. On macOS, the service is a user LaunchAgent and Full Disk Access is granted only to the stable macOS-only broker at `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`; Linux and Windows do not use that TCC/FDA path. `sudo` does not replace macOS privacy permission.
+
+When macOS authorization is required, run `herdr-mcp permissions setup`, enable that exact broker in **System Settings → Privacy & Security → Full Disk Access**, then rerun `herdr-mcp permissions verify`. A compatibility upgrade is explicit: `permissions setup --upgrade-broker` preserves rollback evidence and may require one new human authorization, while ordinary runtime generation updates must not replace the broker. After a host-capable broker is authorized, verify both the MCP broker path and a native Herdr pane/worktree under `~/Documents`; `herdr_git` alone is not sufficient to prove the `getcwd`/Git boundary. Platform-specific service and persistence details live in [CLI reference](cli-reference.md) and [Troubleshooting](troubleshooting.md). Do not add public Edge while the local doctor is unhealthy.
 
 ## Step 2: deploy the public Edge
 

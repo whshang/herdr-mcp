@@ -26,7 +26,9 @@
    herdr-mcp worker connect "<pairing-address>"
    ```
 
-   CLI は**6 桁のコードの入力を求めます**。対話端末では入力した数字を通常どおり表示するため、打ち間違いを確認できます。コードは**コマンドライン引数にはならない**ため、shell history には残りません。
+   このコンピュータが同じ Worker にまだ登録されていない場合、CLI は**6 桁のコードの入力を求めます**。対話端末では入力した数字を通常どおり表示するため、打ち間違いを確認できます。コードは**コマンドライン引数にはならない**ため、shell history には残りません。
+
+   すでに登録済みの同じ端末が**同じ Worker**へ再度 `worker connect` する場合、この操作は冪等です。ローカルの永続設定にその Worker の既存 `device_id` があり、Worker 側でもその device が `active` と確認できれば、既存 enrollment を再利用します。6 桁コードの入力、新しい pairing の consume、新しい device identity の作成や上書きは行いません。同じ Worker のローカル enrollment が残っていても遠隔側で active でなければ fail closed とし、暗黙に 2 つ目の `device_id` を作成しません。別 Worker への接続だけが通常の新規 pairing 経路を続行します。
 
    デフォルトでは、参加するコンピュータがプラットフォームから取得したコンピュータ名/hostname が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
 
