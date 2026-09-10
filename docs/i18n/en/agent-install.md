@@ -57,7 +57,17 @@ herdr-mcp permissions verify
 herdr-mcp doctor
 ```
 
-Treat a `doctor` permission result of `needs_setup`, `denied`, `unknown`, or `timeout` as a pause-and-fix point now, not as healthy. Completing Full Disk Access for the stable TCC broker once, up front, is what avoids repeated path-by-path permission prompts later during runtime, Herdr socket, and project access. Do not substitute `sudo` for the broker approval.
+Treat a `doctor` permission result of `needs_setup`, `denied`, `unknown`, or `timeout` as a pause-and-fix point now, not as healthy. Completing Full Disk Access for the stable TCC broker once, up front, avoids repeated authorization for MCP file/Git tools as rotating runtime generations change. The broker does not proxy arbitrary shell execution; Herdr panes/Agents that directly access macOS protected folders remain governed by the TCC boundary of their execution host. Do not substitute `sudo` for the broker approval.
+
+When macOS requires authorization for `herdr-mcp-broker`, the ChatGPT / Web AI performing installation or troubleshooting **must teach the user the concrete UI steps**, not merely return `denied`, a path, or “enable Full Disk Access”:
+
+1. Run `herdr-mcp permissions setup` first so Herdr opens **System Settings → Privacy & Security → Full Disk Access** when possible.
+2. Tell the user that the only broker target is `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`; it is a macOS-only long-lived component, not a temporary file and not a rotating runtime generation.
+3. If `herdr-mcp-broker` is already listed, enable its toggle. If it is absent, choose `+`, press `Command+Shift+G` in the file picker, paste `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`, select it, and confirm the addition.
+4. If macOS requests Touch ID, the login password, or administrator confirmation, explain that this is the operating system's explicit TCC approval and must not be bypassed by Herdr or an Agent.
+5. After the user finishes, the Agent must rerun `herdr-mcp permissions verify`. Authorization is complete only when the command reports `status: granted` / `probe: granted`; if it still reports `denied`, continue diagnosis instead of reinstalling the runtime or recreating device enrollment.
+
+Linux and Windows do not use this TCC / Full Disk Access flow and must not be told to install or authorize `herdr-mcp-broker`.
 
 Node.js is **not required for ordinary installation or first-Worker bootstrap**. The release already contains a CI-built Edge artifact, and `herdr-mcp worker bootstrap` deploys it directly through Cloudflare API. Node/Wrangler remain contributor and maintainer tooling only.
 

@@ -40,6 +40,26 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 标记的 `Latest` stable Release 为准。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。v0.4.3+ 的安装流程继续保持同一个 broker compatibility revision，并在会轮换的 runtime service 启动前先确保固定 broker 已存在。macOS 交互式首次安装会直接打开 **完全磁盘访问（Full Disk Access）**，但授权动作仍必须由用户本人在系统设置中确认；`herdr-mcp permissions setup` 可再次打开同一设置页，`herdr-mcp permissions verify` 用于验证。普通 runtime generation 更新不会重写同 revision 的 broker。当前最充分的 clean-machine **existing-fleet 安装**证据来自 2026-09-08 的 v0.4.8 Apple Silicon UAT：精确 Release 产物 → Full Disk Access/TCC 验证 → 短期 `worker connect` → service/Link/generation/credential 检查 → `doctor` → ChatGPT 实际路由到该设备的 Herdr 调用。clean first-Worker bootstrap 仍属于发布后 production acceptance 的独立项目。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续。从 v0.4.8 发布线开始，GitHub Releases 也正式提供面向 x86_64 Debian 服务器的静态 `x86_64-unknown-linux-musl` runtime；该产物不依赖宿主机 glibc，目标覆盖 Debian 11/12/13 一类服务器环境。Linux 上的 `herdr-mcp install` 在正常用户会话优先使用 `systemd --user` 管理本地 runtime 与 production Link；如果环境没有 user systemd manager/bus，则使用受 PID + `/proc` start time 校验保护的 detached 用户进程 backend。首台设备的 `worker bootstrap`、已有 fleet 的 `worker pair` / `worker connect`、设备与 Connector 管理、Automation 管理统一使用 Linux 用户私有 credential store，不再假设 macOS Keychain。`update apply` / `update auto` 复用同一套 attestation 校验、native updater 与 Linux 事务安装器；Linux 不安装 macOS 的 launchd 每日 scheduler，如需周期检查由外部 scheduler 调用即可。浏览器 Native Messaging 与 macOS 隐私/TCC 集成仍属于 macOS 专属能力。
 
+### macOS 的 `herdr-mcp-broker` 是什么
+
+`herdr-mcp-broker` 是 **macOS 专用**的稳定 TCC / 完全磁盘访问权限代理；Linux 和 Windows 不安装、也不需要这个组件。它在 v0.4.2 引入，v0.4.3 补齐首次安装和升级时的生命周期管理。固定安装路径是 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`。
+
+它存在的原因是 macOS 会把 `Documents`、`Desktop`、`Downloads` 等目录的隐私权限绑定到相对稳定的代码身份。`runtime/generations/rust-*` 会随着 herdr-mcp 升级持续轮换，如果每个 generation 都直接申请完全磁盘访问，升级后就可能再次触发授权。普通 runtime 更新因此不会重写同一个 broker compatibility revision；只有 broker 自身确实发生不兼容升级时，才允许通过显式的 broker upgrade 流程替换它。
+
+broker 只代理经过 Herdr 安全门禁的受保护目录文件和 Git 操作，例如 `fs_read`、`fs_list`、`fs_grep`、`fs_edit`、`fs_write`、`fs_patch` 和 `git`。它**不是任意 shell 执行器**，也不会因为获得完全磁盘访问就自动替所有 Herdr pane、Pi、Codex 或其它 Agent 的任意子进程绕过 macOS TCC；这些交互式执行路径仍由 Herdr 自身的进程/终端权限边界负责。
+
+交互式首次安装会先安装这个固定 broker，再在需要时自动打开“系统设置 → 隐私与安全性 → 完全磁盘访问权限”。macOS 不允许 herdr-mcp 静默给自己授权，用户仍需手动开启 `herdr-mcp-broker` 的开关。非交互式安装只准备 broker，不会强行打开系统设置。安装或排障时使用：
+
+```bash
+herdr-mcp permissions status
+herdr-mcp permissions setup
+herdr-mcp permissions verify
+```
+
+`verify` 返回 `granted` 后，才把 broker 所负责的受保护目录 MCP 文件/Git 路径视为可用；`sudo` 不能替代 TCC 授权。
+
+如果安装由 ChatGPT / Web AI 协助执行，模型必须直接指导用户完成 macOS UI，而不是只显示命令或报错：打开“隐私与安全性 → 完全磁盘访问权限”；已有 `herdr-mcp-broker` 时打开开关；没有时点击 `+`，在文件选择器按 `Command+Shift+G` 并输入 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker` 后添加。Touch ID / 密码确认必须由用户本人完成。随后由 Agent 重新运行 `herdr-mcp permissions verify`，以 `status: granted` / `probe: granted` 作为唯一完成判据。
+
 macOS 的 v0.4.3 还把生产设备凭据从会轮换的 runtime 代码中分离出来：Keychain 读写统一经过固定的 `~/.config/herdr-mcp/herdr-mcp-credential-helper`。已有安装第一次迁移到这个 helper 时，macOS 可能只需要一次明确的钥匙串授权；该预检发生在 service / Link mutation 之前，弹窗被忽略或拒绝时会直接中止，不会进入反复重启 Link、反复弹窗的状态。普通 runtime 升级会保留同 compatibility revision 的 helper，因此每个新的 `runtime/generations/rust-*` 不再分别成为新的 Keychain client。这个 credential helper 与上面的完全磁盘访问 / TCC broker 是两个独立的稳定身份。
 
 如果这台机器仍运行 **v0.4.2**，请先执行一次 `herdr-mcp update apply` 完成升级。v0.4.2 binary 的 bare `herdr-mcp update` 仍是只读检查，并会输出同样的 `next_action`；从 v0.4.3 起，bare `herdr-mcp update` 才会直接执行升级。两种路径都不需要重新配对设备，也不需要删除或重建 ChatGPT Connector。
@@ -59,7 +79,7 @@ herdr-mcp update check
 
 x86_64 Debian 服务器应使用 `herdr-mcp-<version>-x86_64-unknown-linux-musl` 产物，先通过 release manifest 校验 checksum / attestation，再把该候选 binary 放到可执行位置并运行 `herdr-mcp install`。安装器会把当前 binary 复制为 `~/.config/herdr-mcp/runtime/` 下的不可变 generation，维护 `runtime/current` 与用户 CLI 链接，整个流程默认不需要 root。正常 Debian 登录/服务器环境使用 `systemd --user` 安装 `herdr-mcp.service` 和 `herdr-mcp-link.service`，systemd unit 不写入设备凭据或本地 MCP bearer。若 `systemctl --user` 没有可用 manager/bus（例如无 init 的开发容器），`rust-process-user` backend 会用同一 managed generation 启动 detached runtime 与 Link，并记录 PID + Linux process start time 后才认领该进程。该 fallback 在当前宿主机/容器生命周期内可跨 shell/SSH 退出存活，但不能替代 init system：崩溃重启、开机或容器重启后的自启动必须交给外层 supervisor。正常长期服务器仍优先使用 systemd；若发行版会在最后一个登录会话结束后停止 user manager，而又要求 Herdr 持续在线，应按本机运维策略开启 systemd user lingering。已有 fleet 创建短期 pairing 后，在 Debian 上执行 `herdr-mcp worker connect "<pairing-address>"`：每设备凭据写入用户私有 credential store（目录 `0700`、常规凭据文件 `0600`），Edge/device 配置按事务更新，然后启动托管 service 与 Link。注册完成的 Linux 设备可以执行依赖已注册设备 bearer 的设备与 Connector owner 操作。`herdr-mcp doctor` 通过后才算 Debian 安装闭环完成。
 
-macOS 上服务仍然是普通用户级 LaunchAgent；不需要 `sudo`，而且管理员权限本身也不能替代 TCC 授权。需要授予完全磁盘访问的是固定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`，不是持续变化的 `runtime/generations/rust-*`。非交互式安装会先准备好 broker，但不会强行打开系统设置；如果尚未授权，在用户终端执行一次 `herdr-mcp permissions setup` 即可。
+macOS 上服务仍然是普通用户级 LaunchAgent；不需要 `sudo`，而且管理员权限本身也不能替代 TCC 授权。MCP 文件/Git 路径的完全磁盘访问目标是固定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`，不是持续变化的 `runtime/generations/rust-*`。非交互式安装会先准备好 broker，但不会强行打开系统设置；如果尚未授权，在用户终端执行一次 `herdr-mcp permissions setup` 即可。Herdr pane / Agent 的任意 shell 执行不经过这个 broker，若它们直接访问 macOS 受保护目录，应按对应 Herdr/终端执行主体的 TCC 边界排障，不要误把 broker 的 `granted` 当作所有子进程都已获得权限。
 
 ## 第二步：先把本地 runtime 跑通
 

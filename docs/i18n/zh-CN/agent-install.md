@@ -59,7 +59,17 @@ herdr-mcp permissions verify
 herdr-mcp doctor
 ```
 
-`doctor` 权限结果为 `needs_setup`、`denied`、`unknown` 或 `timeout` 时，现在就停下来修复，不得当作健康。提前一次性完成稳定 TCC broker 的完全磁盘访问授权，才能避免之后 runtime、Herdr socket、项目访问反复逐路径弹权限。不要用 `sudo` 代替 broker 授权。
+`doctor` 权限结果为 `needs_setup`、`denied`、`unknown` 或 `timeout` 时，现在就停下来修复，不得当作健康。提前一次性完成稳定 TCC broker 的完全磁盘访问授权，可以避免 MCP 文件/Git 工具随着 rotating runtime generation 反复触发授权。broker 不代理任意 shell；Herdr pane / Agent 直接访问 macOS 受保护目录时仍受其执行宿主的 TCC 边界约束。不要用 `sudo` 代替 broker 授权。
+
+当 macOS 需要为 `herdr-mcp-broker` 授权时，负责安装或排障的 ChatGPT / Web AI **必须主动把用户教到会操作为止**，不能只返回 `denied`、文件路径或一句“请开启完全磁盘访问”。按下面顺序引导：
+
+1. 先执行 `herdr-mcp permissions setup`，让 Herdr 尽可能直接打开“系统设置 → 隐私与安全性 → 完全磁盘访问权限”。
+2. 明确告诉用户唯一需要授权的 broker 路径是 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`；这是 macOS 专用的长期稳定组件，不是临时文件，也不是 rotating runtime。
+3. 如果列表里已经有 `herdr-mcp-broker`，让用户把右侧开关打开；如果没有，点击 `+`，在文件选择器中按 `Command+Shift+G`，粘贴 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`，选择该文件并确认添加。
+4. 如果 macOS 要求 Touch ID、登录密码或管理员确认，明确说明这是系统 TCC 的人工授权步骤，Herdr/Agent 不能也不应绕过。
+5. 用户完成后，Agent 必须自己重新执行 `herdr-mcp permissions verify`。只有看到 `status: granted` / `probe: granted` 才能宣告授权完成；仍是 `denied` 时继续排查，不能让用户重复安装 runtime 或重新配对设备。
+
+Linux 和 Windows 不执行这套 TCC / Full Disk Access 流程，也不应要求安装 `herdr-mcp-broker`。
 
 普通安装和第一台 Worker 引导**不需要 Node.js**。Release 已包含 CI 构建好的 Edge artifact，`herdr-mcp worker bootstrap` 会通过 Cloudflare API 直接部署；Node/Wrangler 只保留给贡献者和维护者。
 

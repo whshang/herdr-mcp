@@ -572,6 +572,61 @@ fn connect_existing_worker(
     Err("worker connect is currently supported on macOS and Linux".to_owned())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn existing_enrollment_for_worker(
+    config: &Config,
+    requested_origin: &str,
+) -> Result<Option<String>, String> {
+    let (Some(existing_origin), Some(device_id)) = (
+        config.edge_public_origin.as_deref(),
+        config.edge_device_id.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    if normalize_edge_origin(existing_origin)? != normalize_edge_origin(requested_origin)? {
+        return Ok(None);
+    }
+    Ok(Some(crate::config::normalize_device_id(device_id)?))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn reuse_existing_worker_enrollment(
+    paths: &RuntimePaths,
+    edge_origin: &str,
+) -> Result<Option<ExitCode>, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let Some(device_id) = existing_enrollment_for_worker(&config, edge_origin)? else {
+        return Ok(None);
+    };
+    let snapshot = extension_fleet_snapshot(paths)?;
+    let active = snapshot.get("ok").and_then(Value::as_bool) == Some(true)
+        && snapshot
+            .get("devices")
+            .and_then(Value::as_array)
+            .is_some_and(|devices| {
+                devices.iter().any(|device| {
+                    device.get("device_id").and_then(Value::as_str) == Some(device_id.as_str())
+                        && device.get("authorization").and_then(Value::as_str) == Some("active")
+                })
+            });
+    if !active {
+        return Err(format!(
+            "existing enrollment {device_id} is not active on Worker {edge_origin}; refusing to create a second device identity"
+        ));
+    }
+    print_json(&json!({
+        "ok": true,
+        "action": "worker_connect",
+        "device_id": device_id,
+        "workstation_id": device_id,
+        "edge_origin": edge_origin,
+        "pairing_consumed": false,
+        "reused_existing_enrollment": true,
+        "secret_printed": false,
+    }))?;
+    Ok(Some(ExitCode::SUCCESS))
+}
+
 #[cfg(target_os = "linux")]
 fn connect_existing_worker(
     paths: &RuntimePaths,
@@ -579,6 +634,9 @@ fn connect_existing_worker(
     name: Option<&str>,
 ) -> Result<ExitCode, String> {
     let (edge_origin, pairing_id) = parse_pairing_address(pairing_address)?;
+    if let Some(exit_code) = reuse_existing_worker_enrollment(paths, &edge_origin)? {
+        return Ok(exit_code);
+    }
     let code = read_pairing_code_tty()?;
     connect_macos_inner(
         paths,
@@ -604,6 +662,9 @@ fn connect_existing_worker(
     name: Option<&str>,
 ) -> Result<ExitCode, String> {
     let (edge_origin, pairing_id) = parse_pairing_address(pairing_address)?;
+    if let Some(exit_code) = reuse_existing_worker_enrollment(paths, &edge_origin)? {
+        return Ok(exit_code);
+    }
     let code = read_pairing_code_tty()?;
     connect_macos_inner(
         paths,
@@ -2192,6 +2253,25 @@ mod tests {
             "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
         );
         assert_eq!(origin, "https://edge.example");
+    }
+
+    #[test]
+    fn same_worker_reuses_existing_device_identity() {
+        const DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut config = Config::default();
+        config.set_edge_device_id(DEVICE_ID).unwrap();
+        config
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+
+        assert_eq!(
+            existing_enrollment_for_worker(&config, "https://edge.example/").unwrap(),
+            Some(DEVICE_ID.to_owned())
+        );
+        assert_eq!(
+            existing_enrollment_for_worker(&config, "https://other.example").unwrap(),
+            None
+        );
     }
 
     #[test]
