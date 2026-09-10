@@ -2653,6 +2653,46 @@ fn browser_capability_snapshot_allows(capabilities_json: &str, operation: &str) 
     )
 }
 
+fn browser_public_capabilities(capabilities_json: &str) -> Value {
+    let parsed = serde_json::from_str::<Value>(capabilities_json).unwrap_or_else(|_| json!({}));
+    let operations = parsed
+        .get("operations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    json!({
+        "schema_version": 1,
+        "operations": operations,
+        "input_contract": {
+            "message": {
+                "accepted_modalities": ["text"],
+                "max_bytes": 262_144,
+                "control_characters": "rejected"
+            },
+            "attachments": {
+                "supported": false,
+                "reason": "not_exposed_by_browser_dispatch_contract"
+            },
+            "required_apps": {
+                "max_items": 32,
+                "item_max_bytes": 64
+            },
+            "reasoning_effort": {
+                "values": ["economy", "balanced", "thorough"],
+                "requires_operation": "composer.set_reasoning"
+            }
+        },
+        "provider_dynamic_limits": {
+            "message_bytes": {"status": "unknown"},
+            "attachment_count": {"status": "unknown"},
+            "turn_timeout_ms": {"status": "unknown"},
+            "output_modalities": {"status": "unknown"},
+            "model_effort_combinations": {"status": "unknown"}
+        }
+    })
+}
+
 fn browser_required_generation(params: &Value) -> Result<i64, Value> {
     match params.get("expected_generation").and_then(Value::as_i64) {
         Some(value) if value >= 1 => Ok(value),
@@ -2865,7 +2905,7 @@ fn browser_registry_call_with_grants(
                                 "provider": state.provider,
                                 "adapter_protocol_version": state.adapter_protocol_version,
                                 "observation_generation": state.observation_generation,
-                                "capabilities": serde_json::from_str::<Value>(&state.capabilities_json).unwrap_or_else(|_| json!({})),
+                                "capabilities": browser_public_capabilities(&state.capabilities_json),
                                 "observed_at": state.observed_at,
                             })
                         }).collect::<Vec<_>>()
@@ -4247,6 +4287,23 @@ mod tests {
         assert_eq!(inspected["ok"], true);
         assert_eq!(inspected["provider_states"][0]["provider"], "chatgpt");
         assert_eq!(inspected["provider_states"][0]["observation_generation"], 7);
+        assert_eq!(
+            inspected["provider_states"][0]["capabilities"]["schema_version"],
+            1
+        );
+        assert_eq!(
+            inspected["provider_states"][0]["capabilities"]["operations"][0],
+            "identity.inspect"
+        );
+        assert_eq!(
+            inspected["provider_states"][0]["capabilities"]["input_contract"]["message"]["max_bytes"],
+            262_144
+        );
+        assert_eq!(
+            inspected["provider_states"][0]["capabilities"]["provider_dynamic_limits"]["turn_timeout_ms"]
+                ["status"],
+            "unknown"
+        );
 
         let resolved = browser_registry_call(
             &store,
