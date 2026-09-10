@@ -805,22 +805,6 @@ impl EventCache {
         self.shared.stream_live.load(Ordering::Acquire)
     }
 
-    pub fn wait_stream_connected(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if self.shared.stream_connected.load(Ordering::Acquire) {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        self.shared.stream_connected.load(Ordering::Acquire)
-    }
-
-    /// Classify cache health without waiting.
-    ///
-    /// Temporary `!stream_live` / `needs_reconcile` without a transport error is
-    /// `Reconciling`, not `Failed`. Sticky `last_error` while the stream is down
-    /// remains a hard failure.
     pub fn classify_health(&self) -> EventCacheHealth {
         let ready = self.shared.ready.lock().ok().is_some_and(|ready| *ready);
         let stream_live = self.shared.stream_live.load(Ordering::Acquire);
