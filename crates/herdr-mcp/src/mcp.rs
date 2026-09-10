@@ -40,6 +40,7 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
     "2024-10-07",
 ];
 const BROWSER_ADAPTER_PROTOCOL_VERSION: i64 = 1;
+const BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS: i64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserCallerGrant {
@@ -53,6 +54,53 @@ pub struct PageAssistCallerGrant {
     pub endpoint_ref: String,
 }
 
+#[derive(Default)]
+pub struct BrowserMutationAdmission {
+    active_accounts: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserMutationScope {
+    endpoint_ref: String,
+    provider: String,
+    account_ref: String,
+}
+
+struct BrowserMutationPermit<'a> {
+    admission: &'a BrowserMutationAdmission,
+    key: String,
+}
+
+impl BrowserMutationAdmission {
+    fn reserve<'a>(
+        &'a self,
+        scope: &BrowserMutationScope,
+    ) -> Result<Option<BrowserMutationPermit<'a>>, String> {
+        let key = format!(
+            "{}\u{0}{}\u{0}{}",
+            scope.endpoint_ref, scope.provider, scope.account_ref
+        );
+        let mut active = self
+            .active_accounts
+            .lock()
+            .map_err(|_| "browser_mutation_admission_unavailable".to_owned())?;
+        if !active.insert(key.clone()) {
+            return Ok(None);
+        }
+        Ok(Some(BrowserMutationPermit {
+            admission: self,
+            key,
+        }))
+    }
+}
+
+impl Drop for BrowserMutationPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.admission.active_accounts.lock() {
+            active.remove(&self.key);
+        }
+    }
+
 pub struct RuntimeContext<'a> {
     pub client: &'a HerdrClient,
     pub cache: &'a EventCache,
@@ -64,6 +112,7 @@ pub struct RuntimeContext<'a> {
     pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
+    pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -245,13 +294,14 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     context.browser_actuator,
                 )
             } else if BrowserOperation::parse(method).is_some() {
-                browser_operation_call_with_grants(
+                browser_operation_call_with_controls(
                     context.state_store,
                     method,
                     &params,
                     context.caller_webchat_control_grants,
                     context.browser_actuator,
                     context.browser_mutation_gate,
+                    context.browser_mutation_admission,
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
@@ -2674,6 +2724,7 @@ fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Valu
         && browser_required_apps(params, true).is_ok_and(|apps| apps.is_empty())
 }
 
+#[cfg(test)]
 fn browser_operation_call_with_grants(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
@@ -2681,6 +2732,26 @@ fn browser_operation_call_with_grants(
     caller_webchat_control_grants: &[BrowserCallerGrant],
     browser_actuator: Option<&dyn BrowserActuator>,
     browser_mutation_gate: Option<&std::sync::RwLock<()>>,
+) -> Value {
+    browser_operation_call_with_controls(
+        store,
+        method,
+        params,
+        caller_webchat_control_grants,
+        browser_actuator,
+        browser_mutation_gate,
+        None,
+    )
+}
+
+fn browser_operation_call_with_controls(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+    browser_mutation_gate: Option<&std::sync::RwLock<()>>,
+    browser_mutation_admission: Option<&BrowserMutationAdmission>,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
         return json!({"ok": false, "code": "unknown_local_method", "method": method});
@@ -2716,7 +2787,7 @@ fn browser_operation_call_with_grants(
         None
     };
 
-    if operation.is_mutation() {
+    let mutation_scope = if operation.is_mutation() {
         let Ok(store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
@@ -2773,7 +2844,34 @@ fn browser_operation_call_with_grants(
             }
             Err(error) => return browser_store_error(error),
         }
-    }
+        match browser_operation_mutation_scope(&store_guard, operation, params) {
+            Ok(scope) => Some(scope),
+            Err(error) => return browser_store_error(error),
+        }
+    } else {
+        None
+    };
+
+    let _mutation_permit = match (browser_mutation_admission, mutation_scope.as_ref()) {
+        (Some(admission), Some(scope)) => match admission.reserve(scope) {
+            Ok(Some(permit)) => Some(permit),
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "code": "browser_account_backpressure",
+                    "retryable": true,
+                    "resource_key": format!(
+                        "{}:{}:{}",
+                        scope.endpoint_ref, scope.provider, scope.account_ref
+                    ),
+                    "limit": 1,
+                    "retry_after_ms": BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS,
+                });
+            }
+            Err(error) => return browser_store_error(error),
+        },
+        _ => None,
+    };
 
     match operation {
         BrowserOperation::SpaceInspect => browser_operation_inspect_resource(
@@ -3182,6 +3280,54 @@ fn browser_operation_actuation_decision(
         }
     }
     Ok((true, None))
+}
+
+fn browser_operation_mutation_scope(
+    store: &StateStore,
+    operation: BrowserOperation,
+    params: &Value,
+) -> Result<BrowserMutationScope, String> {
+    let target = match operation {
+        BrowserOperation::SpaceCreate | BrowserOperation::SessionCreate => {
+            browser_operation_resource(
+                store,
+                params.get("account_ref").and_then(Value::as_str).unwrap(),
+                "account",
+            )?
+        }
+        BrowserOperation::SpaceOpen => browser_operation_resource(
+            store,
+            params.get("space_ref").and_then(Value::as_str).unwrap(),
+            "space",
+        )?,
+        BrowserOperation::SessionOpen
+        | BrowserOperation::MessageAppend
+        | BrowserOperation::ComposerSetReasoning
+        | BrowserOperation::ComposerSetApps
+        | BrowserOperation::DispatchSubmit => browser_operation_resource(
+            store,
+            params.get("session_ref").and_then(Value::as_str).unwrap(),
+            "session",
+        )?,
+        BrowserOperation::DispatchStop => {
+            let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
+            let dispatch = store
+                .browser_dispatch(dispatch_id)?
+                .ok_or_else(|| "browser_dispatch_not_found".to_owned())?;
+            browser_operation_resource(store, &dispatch.target_session_ref, "session")?
+        }
+        BrowserOperation::SpaceInspect
+        | BrowserOperation::SessionInspect
+        | BrowserOperation::DispatchStatus => {
+            return Err("browser_operation_not_mutating".to_owned());
+        }
+    };
+    let account_ref = browser_resource_account_ref(store, &target)?;
+    Ok(BrowserMutationScope {
+        endpoint_ref: target.endpoint_ref,
+        provider: target.provider,
+        account_ref,
+    })
 }
 
 fn browser_operation_resource(
@@ -7196,6 +7342,47 @@ mod tests {
                 panic!("explicit unsupported mutations must not reach browser actuation")
             }
         }
+        let admission = BrowserMutationAdmission::default();
+        let same_account_scope = BrowserMutationScope {
+            endpoint_ref: endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: account_ref.clone(),
+        };
+        let same_account_permit = admission
+            .reserve(&same_account_scope)
+            .unwrap()
+            .expect("first account mutation reserves its slot");
+        let backpressured = browser_operation_call_with_controls(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            &exact_grants,
+            Some(&PanicActuator),
+            None,
+            Some(&admission),
+        );
+        assert_eq!(backpressured["code"], "browser_account_backpressure");
+        assert_eq!(backpressured["retryable"], true);
+        assert_eq!(backpressured["limit"], 1);
+        assert_eq!(
+            backpressured["retry_after_ms"],
+            BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS
+        );
+        assert_eq!(
+            backpressured["resource_key"],
+            format!("{endpoint_ref}:chatgpt:{account_ref}")
+        );
+        let other_account_permit = admission
+            .reserve(&BrowserMutationScope {
+                endpoint_ref: endpoint_ref.clone(),
+                provider: "chatgpt".to_owned(),
+                account_ref: format!("br_{}", "f".repeat(64)),
+            })
+            .unwrap()
+            .expect("an unrelated account keeps independent admission capacity");
+        drop(other_account_permit);
+        drop(same_account_permit);
+
         let mutation_gate = RwLock::new(());
         let gated_attempt = browser_operation_call_with_grants(
             &store,

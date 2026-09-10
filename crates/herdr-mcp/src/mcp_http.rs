@@ -4,8 +4,8 @@ use crate::exec_sessions::ExecRegistry;
 use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{
-    self, BrowserActuator, BrowserCallerGrant, BrowserPostconditionEvidence, PageAssistCallerGrant,
-    RuntimeContext,
+    self, BrowserActuator, BrowserCallerGrant, BrowserMutationAdmission,
+    BrowserPostconditionEvidence, PageAssistCallerGrant, RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -441,6 +441,7 @@ struct AppState {
     local_device_id: Option<String>,
     browser_actuation: BrowserActuationBroker,
     browser_mutation_gate: Arc<RwLock<()>>,
+    browser_mutation_admission: Arc<BrowserMutationAdmission>,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -510,6 +511,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             local_device_id,
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
+            browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -2288,6 +2290,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             caller_page_assist_grants: &caller_page_assist_grants,
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
+            browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -2851,6 +2854,7 @@ mod tests {
             local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
+            browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
         }
     }
 
