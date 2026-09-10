@@ -209,13 +209,14 @@ ok(wakeSource.includes("captureSubmitAckBaseline")
     && wakeSource.includes("latestUser !== baseline?.userTurn")
     && wakeSource.includes('ADAPTER.name === "chatgpt" ? 8000 : 4000'),
   "ChatGPT submit acknowledgement accepts the Send-button transition or matching new user turn before ProseMirror clears");
-ok(wakeSource.includes("maybeRecoverDisconnectedReply")
+ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes("连接已中断")
-    && wakeSource.includes("waiting for (?:the )?full response")
-    && wakeSource.includes("chatgpt_disconnected")
-    && wakeSource.includes("{ ...safety, streaming: false }")
+    && wakeSource.includes("消息发送超时，请重试")
+    && wakeSource.includes("explicit_error_reload_attempt")
+    && wakeSource.includes("explicit_error_continue_attempt")
+    && wakeSource.includes('performWake({ template: "继续", autoAllow: false, recovery: true })')
     && wakeSource.includes("(assistantChanged || curLen > lastAsstLen)"),
-  "ChatGPT disconnected-stream placeholders stop faking progress and allow one bounded reload without resubmitting the user task");
+  "ChatGPT explicit transport failures stop faking progress and use one bounded reload followed by at most one safe Continue");
 ok(backgroundSource.includes("idleNudgeInFlight")
     && backgroundSource.includes("assistantDeclaresPendingWork")
     && backgroundSource.includes("scheduleIdleNudgeRetry(convKey, 30000)")
