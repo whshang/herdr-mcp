@@ -53,7 +53,7 @@ Delegate when a task genuinely benefits from **independent reasoning, real paral
 
 A bounded delegation has a clear problem, working directory, allowed mutation scope, acceptance evidence, and stopping condition. The Web planner still owns integration and re-checks Git, tests, and runtime facts after the worker finishes.
 
-Worker choice, fallback order, long-running execution, and timeout/retry safety have one SSOT: [Worker fallbacks](worker-fallbacks.md). This page intentionally does not maintain a second worker-selection policy.
+Agent selection, alternate-worker order, long-running execution, and timeout/retry safety have one SSOT: [Agent delegation](worker-fallbacks.md). This page does not maintain a second selection policy.
 
 ## 4. Use worktrees for real parallel edits
 
@@ -229,5 +229,5 @@ Related reading:
 
 - [Architecture](architecture.md)
 - [Browser continuity](browser-continuity.md)
-- [Worker fallbacks](worker-fallbacks.md)
+- [Agent delegation](worker-fallbacks.md)
 - [Troubleshooting](troubleshooting.md)

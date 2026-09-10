@@ -82,7 +82,7 @@ git diff --check
 .github/workflows/ci.yml
 ```
 
-CI 的目的不是“部署一切”，而是给各个平面提供共享证据。
+CI 给各个平面提供共享证据，范围不扩展到“部署一切”。
 
 典型 gate 包括：
 
@@ -267,4 +267,4 @@ new ChatGPT conversation snapshot
 - Extension：真实目标站点上的 binding/Auto/recovery smoke；
 - Contract：新会话拿到预期 tools snapshot。
 
-自动化的价值不是少看几个日志，而是把每类变更的**验证边界和回滚边界固定下来**。
+自动化把每类变更的**验证边界和回滚边界固定下来**，减少重复人工检查。

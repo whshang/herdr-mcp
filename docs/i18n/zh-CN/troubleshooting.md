@@ -2,7 +2,7 @@
 
 *从本机到网页逐层定位问题，再决定是否需要重启。*
 
-herdr-mcp 的链路横跨本机 runtime、Herdr、workstation link、Cloudflare Edge、OAuth、MCP 和浏览器。最快的排障方式不是“把所有东西重启一遍”，而是先确认故障在哪一层。
+herdr-mcp 的链路横跨本机 runtime、Herdr、workstation link、Cloudflare Edge、OAuth、MCP 和浏览器。排障时先确认故障所在层级，避免一开始把所有组件全部重启。
 
 推荐始终按这个顺序：
 

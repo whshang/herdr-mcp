@@ -58,7 +58,7 @@ The CLI then prompts for the 6-digit code as normal visible terminal input so yo
 
 By default, the joining computer registers the platform-reported computer/host name as the device display name. Use `--name "<device-name>"` only when the user explicitly wants a different initial name. A `worker pair --name ...` value supplied by the pairing creator is also an explicit override and takes precedence.
 
-After the pairing is consumed, `worker connect` installs/starts the local `herdr-mcp` service and ensures the enrolled Rust production Link is created and loaded. On macOS that lifecycle is owned by launchd. On a normal Linux login/server environment Herdr prefers `systemd --user`; when no user systemd manager/bus exists (for example an init-less development container), it falls back to a detached per-user process backend with PID plus `/proc` start-time identity checks so lifecycle commands never kill an unrelated reused PID. The fallback survives the invoking shell exiting, but it cannot provide systemd-style restart-on-crash or boot/container-restart persistence; use the surrounding container/host supervisor if that persistence is required. The command still reports success only after the local service is healthy and the production Link uses the new device identity; any activation failure triggers remote revoke plus local credential/config compensation.
+After the pairing is consumed, `worker connect` installs/starts the local service and reconciles the enrolled Rust production Link. macOS uses launchd; Linux prefers `systemd --user` and uses the managed user-process backend when no user systemd manager is available. The command succeeds only after the local service and Link are healthy; activation failure revokes the incomplete enrollment and restores local credential/config state.
 
 For an Agent-assisted setup, paste this sentence on the new computer:
 
@@ -77,6 +77,8 @@ herdr-mcp link status
 ```
 
 Then ask ChatGPT to call `herdr_devices` and confirm the new device is online under the same Worker.
+
+If this computer cannot reach `workers.dev` directly, keep the same enrollment. `link status` may show the supported local-proxy or shared-Relay path; a healthy Link is the relevant result. See [Troubleshooting](troubleshooting.md) only if Link cannot become healthy.
 
 To explicitly rename the current enrolled computer later, run:
 

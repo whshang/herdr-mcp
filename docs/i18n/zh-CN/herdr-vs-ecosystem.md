@@ -92,7 +92,7 @@ Web AI
 
 临时小任务、调研和架构讨论保持轻量；复杂开发再组合多个本地 worker。若强制所有请求都经过另一个 Coding Agent，Web 模型会变成第二个 planner 的 UI，引入额外延迟和上下文转述。
 
-## 完整闭环是差异点
+## 端到端工作链是差异点
 
 大多数 Coding MCP server 只解决下行方向：
 
@@ -106,7 +106,7 @@ Web AI → MCP/OAuth → Edge → outbound link → herdr-mcp → files / Git / 
 Herdr events → herdr-mcp → 本地 IPC / Native Messaging → browser extension → Web conversation
 ```
 
-浏览器扩展在首次安装时可选，但它对无人值守长任务、页面恢复和跨会话接力是闭环所需的第二条通道。没有它，标准 MCP 无法在本地 Agent 完成后让已经静止的 Web 会话自动开启新的一轮。
+浏览器扩展在首次安装时可选。无人值守长任务、页面恢复和跨会话接力需要这条第二通道；没有它，标准 MCP 无法在本地 Agent 完成后让已经静止的 Web 会话自动开启新的一轮。
 
 ## 该吸收、复用和避免什么
 

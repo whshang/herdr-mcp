@@ -89,7 +89,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-Without a Custom Domain, the Link uses the project's supported `workers.dev` direct path, any already-configured local proxy, and the qualified shared Relay fallback. The Agent does not need to reconstruct that transport ladder. With a Custom Domain, verify the already-selected origin; do not modify system networking just to make a probe turn green.
+Without a Custom Domain, Link owns the supported `workers.dev` path selection: direct access first, then an already-configured local proxy, then the built-in signed shared Relay when needed. The Agent does not reconstruct that transport ladder or configure a Relay provider/URL. If this workstation cannot reach `workers.dev` directly, do not redeploy the Worker: a healthy Relay-selected Link plus a successful public-origin authenticated MCP round trip is valid acceptance evidence. With a Custom Domain, verify the already-selected origin; do not modify system networking just to make a probe succeed.
 
 ## 7. Final acceptance
 

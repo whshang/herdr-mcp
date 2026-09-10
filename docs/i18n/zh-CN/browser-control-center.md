@@ -4,7 +4,7 @@
 
 浏览器控制中心把 Herdr 的 workspace / pane / Agent 运行现场放进 Chrome Side Panel。
 
-它解决的不是“让浏览器替你写代码”，而是一个更基础的问题：
+它解决一个更基础的问题：
 
 > 当网页 AI、本地 Agent、测试进程和终端同时工作时，怎样始终知道**哪一个现场正在发生什么，以及下一条人工控制明确指向哪里**？
 
@@ -229,7 +229,7 @@ Side Panel 不是孤立功能。之前规划的页面性能/自愈能力已经�
 
 ## 为什么任意 Herdr API 仍只做 Preview
 
-浏览器控制最难的不是“把字节写进终端”，而是保证：目标是不是原目标、失败是否已投递、重试会不会重复 mutation、pane 后面的 session 是否已换，以及 MV3 reload 后还能否判断 delivery phase。
+浏览器控制的难点在于同时保证：目标仍是原目标、失败的投递状态可判断、重试不会重复 mutation、pane 后面的 session 变化可识别，以及 MV3 reload 后仍能判断 delivery phase。
 
 Prompt 通过 Rust target fencing + `agent.prompt` idempotency 满足这些契约；终端路径现在只开放一个窄化的 `terminal_input -> pane.send_input + Enter` 动作，并复用同一 target fencing、禁止 uncertain 自动重试。任意 Herdr 方法的作用面仍然过广，因此继续 fail-closed / Preview-only。
 

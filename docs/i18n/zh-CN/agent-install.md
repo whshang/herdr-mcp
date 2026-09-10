@@ -89,7 +89,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-没有 Custom Domain 时，Link 会使用项目已支持的 `workers.dev` 直连、已有本地代理和 qualified shared Relay fallback；Agent 不需要自己拼 transport ladder。配置了 Custom Domain 时按已选定入口验证，不为了“探测变绿”改系统网络。
+没有 Custom Domain 时，Link 自己负责选择 `workers.dev` 网络路径：先直连，再使用已有本地代理，仍不可达时使用内置签名共享 Relay。Agent 不需要自己拼网络路径，也不需要配置 Relay 服务商或 Relay URL。如果本机无法直连 `workers.dev`，不要重新部署 Worker；`link status` 显示 Relay 路径健康，并且公网 origin 的真实认证 MCP 请求能够往返当前工作站，就可以通过这部分验收。配置了 Custom Domain 时按已选定入口验证，不为了让探测成功而修改系统网络。
 
 ## 7. 最终验收
 

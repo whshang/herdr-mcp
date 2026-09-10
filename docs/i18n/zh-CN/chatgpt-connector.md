@@ -37,7 +37,7 @@ ChatGPT 能完成 initialize / discovery / `tools/list`。
 
 这三层可以独立失败。所以“设置页面显示已连接”并不等于“当前聊天已经能改代码”。
 
-最可靠的验收不是看一个绿色连接状态，而是在**新会话**里执行一次真实 `herdr_inspect`。
+最可靠的验收是在**新会话**里执行一次真实 `herdr_inspect`，直接确认工作站数据可达。
 
 ## 创建 Connector / Custom MCP App
 

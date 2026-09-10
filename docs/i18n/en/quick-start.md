@@ -11,19 +11,13 @@ Do not redeploy Edge, reinstall the runtime, or add the browser extension just t
 Open a new ChatGPT conversation and ask:
 
 ```text
-Inspect the current Herdr workspaces and Git status. Read only; do not modify anything.
+Show the current Herdr workspace and whether its managed project has uncommitted changes. Use one read-only baseline and do not modify anything.
 ```
 
 A healthy path looks like:
 
 ```text
 herdr_inspect
-  ↓
-select a real managed Git root
-  ↓
-herdr_git status
-  ↓
-herdr_fs_read / herdr_fs_grep
   ↓
 answer from workstation facts
 ```
@@ -37,13 +31,13 @@ If this step reports `workstation_offline`, zero tools, an OAuth loop, or a mana
 Choose a safe, easy-to-verify change such as a documentation correction, a test fixture, or a narrowly scoped configuration edit. Ask the Web planner to:
 
 ```text
-Check Git first, read the target file, make this one small change, run the most relevant verification, and finish with the diff and result. Do not delegate to a local agent.
+Reuse the current workspace. Read only the Git/file state needed for this change, make one small edit, and combine the relevant verification and final diff where safe. Do not delegate to a local agent.
 ```
 
-The desired loop is:
+The desired shape is:
 
 ```text
-inspect → read → patch → test → diff
+reuse baseline → focused read → patch → verification + diff
 ```
 
 This proves the Web planner can perform deterministic work directly instead of turning every edit into another Coding Agent task.
@@ -56,7 +50,7 @@ Delegate only when independent reasoning, parallel investigation, or a longer ex
 Investigate the root cause of this failing test and implement the narrowest fix. Keep unrelated files unchanged, then re-check the Git diff and tests yourself.
 ```
 
-The worker's final prose is not the source of truth. The Web planner should re-read repository state, tests, and runtime facts before accepting the result. Worker selection, timeout, and fallback rules live in [Worker fallbacks](worker-fallbacks.md).
+The worker's final prose is not the source of truth. The Web planner should re-read repository state, tests, and runtime facts before accepting the result. Agent selection, timeout, and alternate-worker rules live in [Agent delegation](worker-fallbacks.md).
 
 ## 4. Add the browser extension only for long-running Web work
 
@@ -71,7 +65,7 @@ Keep Auto off on first use and verify binding and live state manually. See [Brow
 
 ## 5. What counts as a successful first experience
 
-The minimum acceptance is not merely “the service is healthy.” All four should be true:
+The minimum acceptance requires all four:
 
 1. Web AI can read the real Herdr workplace and repository;
 2. a small deterministic edit is verified and visible in the real Git diff;

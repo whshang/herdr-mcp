@@ -1004,6 +1004,7 @@ impl ProgressiveSkillService {
                 "default_shape": "baseline -> independent read wave -> execution bundle -> verification wave -> event/delta follow-up only when change is expected",
                 "rules": [
                     "treat herdr_inspect as an aggregate baseline for runtime, workspace, pane, Agent, project-root, and dirty-state facts; do not immediately rebuild those same views with separate list/status calls",
+                    "load herdr_skill only when detailed operating policy or Agent control is needed; unless native Herdr CLI semantics matter, request include_native_reference=false",
                     "group independent reads into one dependency-aware wave instead of serial call/replan loops",
                     "when deterministic shell/Git arguments are already known and share one safety boundary, execute them in one bounded herdr_exec and perform intermediate local checks inside that call instead of returning to the model after every command",
                     "load multiple required Skill ids in one herdr_mcp.skill.load call and keep unchanged Skill content sticky",

@@ -30,10 +30,10 @@ Cloudflare Edge
 ### 推奨：Agent に一文だけ渡す
 
 ```text
-Herdr と herdr-mcp をインストールしてください。https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md を最後まで読み、現在の Stable GitHub Release を使って Cloudflare と ChatGPT まで設定してください。Cloudflare account に適切な active zone がある場合は専用 Custom Domain を優先し、ない場合は workers.dev を維持してください。R2 は任意のままにし、workstation の network path を自動検証し、私自身のログイン・Cloudflare Token 作成・ChatGPT 認可が必要な場面だけ停止してください。
+Herdr と herdr-mcp を https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md に従ってインストールしてください。依存関係を先に整理し、自動化できる処理はできるだけまとめて実行し、現在の Stable GitHub Release を使ってください。私自身のログイン、認可、Cloudflare Account/domain の選択が必要な場面だけ停止してください。
 ```
 
-Agent は `workers.dev` で Worker を bootstrap し、適切な Cloudflare zone があれば OAuth/Connector を固定する前に Custom Domain を推奨・設定します。その後 workstation Link と ChatGPT 認可を進め、実際の network path と MCP request を検証します。domain がなくてもインストールは停止せず、必要なら Link が direct `workers.dev` → 既存 local proxy → qualified shared Relay の順で自動 fallback します。
+Agent は Herdr と herdr-mcp をインストールし、Worker と最終公開入口を設定し、workstation Link と ChatGPT 認可を進め、実際の MCP request で検証します。domain は必須ではありません。このコンピュータから `workers.dev` へ直接到達できない場合、Link は既存 local proxy と組み込み shared Relay を自動的に利用できます。
 
 ### 手動インストール
 
@@ -51,11 +51,11 @@ Cloudflare が安定した公開 MCP/OAuth 入口を提供し、各開発マシ�
 
 [Cloudflare setup](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 
-### Shared Relay は公開入口ではなくフォールバックです
+### Link のネットワーク代替経路
 
-Herdr-MCP は通常 workstation Link を直接接続します。自分の Cloudflare Custom Domain を設定している場合、共有 Relay Pool は使用しません。Custom Domain がない場合は、まず Worker の `workers.dev` へ直接接続し、検証済みのローカル proxy があれば次にそれを試し、それらが利用できない場合だけ Herdr の Relay Pool へ自動 fallback します。fresh install には v0.4.5 の中国本土 no-proxy UAT で検証した Deno/Supabase baseline が含まれ、新しい有効な signed pool cache があれば baseline を置き換えます。
+Herdr-MCP は workstation Link の直接接続を優先します。`workers.dev` を使う経路がローカルネットワークから到達できない場合、Link は既存 local proxy と組み込み signed shared Relay を順に利用できます。選択は自動で行われ、通常の利用者が Relay provider や Relay URL を設定する必要はありません。
 
-Relay は MCP/OAuth URL やデバイス identity を置き換えず、汎用 proxy にもなりません。認証済みの `herdr-link` WebSocket を、自分の `workers.dev` Worker へ転送するだけです。本番 Pool は独立した Deno / Supabase failure domain を使い、デバイス単位の sticky・capacity-weighted selection と bounded failover を行います。長時間接続の大部分は Deno が担当し、Hosted Edge Function の lifetime と Free quota がより厳しい Supabase は少量の capacity share と完全な fallback を担当します。通常の利用者が両 provider のアカウントや Relay URL を設定する必要はありません。
+Relay は認証済み workstation Link だけを自分の Worker へ転送します。MCP/OAuth URL と device identity は変わりません。`herdr-mcp doctor` と `herdr-mcp link status` で実際の経路を確認してください。
 
 ## 複数コンピュータをまとめて操作する
 
@@ -98,7 +98,7 @@ Herdr は Worker control plane で pairing を作成するため、その操作�
 開発タスクでは、次のようなデフォルト prompt が有効です。
 
 ```text
-変更前に live Herdr workspace と Git 状態を確認してください。既存の dirty worktree は分離したままにしてください。決定的な read、Git check、patch、bounded command は直接実行し、独立または長時間の作業は有効なら利用可能な Coding Agent に委譲してください。完了報告の前に final diff を確認し、関連 test を実行してください。
+変更前に、この作業に必要な live Herdr/Git 状態だけを確認し、短い依存関係の計画を先に作ってください。無関係な dirty work は分離し、まず 1 本の作業レーンを完了し、必要な Skill だけを読み込んでください。独立 read と同じ安全境界の決定的 command はまとめ、status 確認や polling を思考の区切りとして使わないでください。新しい evidence が次の判断を変える時だけ再計画し、最小限の変更後に関連 diff、test、実際の境界を検証してください。
 ```
 
 リスクの高い変更では対象、安全制約、acceptance criteria を明記してください。調査だけなら read-only と指定します。

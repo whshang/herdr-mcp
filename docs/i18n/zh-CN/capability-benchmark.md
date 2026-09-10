@@ -2,7 +2,7 @@
 
 *设计取舍：什么该吸收，什么不该复制。*
 
-这篇面向 Maintainer / Contributor。它不是“谁功能更多”的产品对比，而是一份长期 ADR：当我们看到 Herdr、coding-tools-mcp、其它 MCP bridge 或新的 Coding Agent 能力时，判断它应该进入 herdr-mcp、复用原生能力，还是明确不做。
+这篇面向 Maintainer / Contributor，是一份长期 ADR，不做“谁功能更多”的产品对比。看到 Herdr、coding-tools-mcp、其它 MCP bridge 或新的 Coding Agent 能力时，用它判断该能力应进入 herdr-mcp、复用原生能力，还是明确不做。
 
 核心问题只有一个：
 
@@ -79,7 +79,7 @@ Herdr 原生 Socket API 很丰富，而且会持续演进。
 
 这类操作通常是确定性的，不需要额外启动本地 Agent。
 
-设计目标不是让 Agent “代替终端”，而是让 Web planner 像工程师一样直接使用终端和仓库事实。
+设计目标是让 Web planner 像工程师一样直接使用终端和仓库事实，Agent 只承担适合委派的工作。
 
 ## 取舍三：长命令拥有自己的生命周期
 
@@ -116,7 +116,7 @@ HTTP/MCP request 和实际命令生命周期不是一回事。
 
 ## 取舍五：Mutation 的失败语义比“自动重试”更重要
 
-远程开发最危险的不是一次失败，而是**动作已经发生、客户端却以为没发生**。
+远程开发的高风险场景是：**动作已经发生、客户端却以为没发生**。
 
 因此 herdr-mcp 倾向吸收：
 
@@ -206,7 +206,7 @@ workstation → browser conversation
 
 任何本地 Agent 都可能成为有用 worker：Pi、Cline、OpenCode、DSH 或未来的新工具。
 
-选择标准不是品牌，而是：
+选择看这些因素：
 
 - 能否无头/自动化运行；
 - 是否有稳定的状态或输出边界；
@@ -216,7 +216,7 @@ workstation → browser conversation
 
 herdr-mcp 不再为每种 Agent 建一个专门 MCP tool。Herdr-native Agent 优先走 `herdr_prompt`；非 Herdr CLI 在必要时通过长 exec session 使用。
 
-详见 [Worker 备选](worker-fallbacks.md)。
+详见 [Agent 调度](worker-fallbacks.md)。
 
 ## 当前能力矩阵
 

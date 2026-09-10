@@ -204,7 +204,7 @@ The durable selection criteria are:
 
 Herdr-native workers use `herdr_prompt`; external CLIs can use long exec sessions when appropriate.
 
-See [Worker fallbacks](worker-fallbacks.md).
+See [Agent delegation](worker-fallbacks.md).
 
 ## Current decision matrix
 
