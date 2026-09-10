@@ -1,33 +1,33 @@
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use crate::cli::ServiceCommand;
 use crate::cli::WorkerCommand;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use crate::config::Config;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use crate::instance::InstanceId;
 #[cfg(target_os = "macos")]
 use crate::link::ownership::LINK_PROD_LABEL;
 use crate::paths::RuntimePaths;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use reqwest::blocking::{Client, Response};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use serde_json::json;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::env;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use std::fs::{self, OpenOptions};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::io;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use std::io::BufRead;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use std::io::Write;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
@@ -36,16 +36,16 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use url::Url;
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 const LEGACY_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-prod-link-secret";
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 struct FleetLinkIdentity {
     edge_origin: String,
     workstation_id: String,
@@ -60,7 +60,7 @@ pub(crate) struct EnrolledCredential {
     pub(crate) recovered_existing: bool,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn pairing_create_request_body(
     ttl_seconds: u64,
     name: Option<&str>,
@@ -76,7 +76,7 @@ fn pairing_create_request_body(
     body
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn pairing_consume_request_body(pairing_id: &str, code: &str, name: Option<&str>) -> Value {
     match name {
         Some(name) => json!({ "pairing_id": pairing_id, "code": code, "name": name }),
@@ -84,17 +84,17 @@ fn pairing_consume_request_body(pairing_id: &str, code: &str, name: Option<&str>
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn automation_create_request_body(name: &str, device: &str) -> Value {
     json!({ "name": name, "device": device })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn connector_revoke_request_body(connector_id: &str) -> Value {
     json!({ "connector_id": connector_id })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn connector_client_revoke_request_body(client_id: &str) -> Value {
     json!({ "client_id": client_id })
 }
@@ -203,7 +203,7 @@ fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
     payload
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn render_connector_inventory(mut payload: Value, now_ms: u64, include_all: bool) -> Value {
     if let Some(connectors) = payload.get_mut("connectors").and_then(Value::as_array_mut) {
         if !include_all {
@@ -255,7 +255,7 @@ fn render_connector_inventory(mut payload: Value, now_ms: u64, include_all: bool
     payload
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn displayed_connector_token_counts(payload: &Value) -> Value {
     let mut active_access = 0_u64;
     let mut active_refresh = 0_u64;
@@ -280,7 +280,7 @@ fn displayed_connector_token_counts(payload: &Value) -> Value {
     json!({"active_access": active_access, "active_refresh": active_refresh})
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn render_automation_inventory(mut payload: Value, now_ms: u64) -> Value {
     if let Some(automations) = payload.get_mut("automations").and_then(Value::as_array_mut) {
         for automation in automations {
@@ -570,7 +570,7 @@ fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "ok": false,
@@ -707,7 +707,7 @@ pub(crate) fn extension_fleet_snapshot_with_client(
     }))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn create_pairing(
     _paths: &RuntimePaths,
     _ttl_seconds: u64,
@@ -717,7 +717,7 @@ fn create_pairing(
         .to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn create_pairing(
     paths: &RuntimePaths,
     ttl_seconds: u64,
@@ -781,7 +781,7 @@ fn create_pairing(
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn connect_existing_worker(
     _paths: &RuntimePaths,
     _pairing_address: &str,
@@ -975,7 +975,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
     )
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub(crate) fn adopt_bootstrap_enrollment(
     _paths: &RuntimePaths,
     _edge_origin: &str,
@@ -984,7 +984,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
     Err("first-Worker enrollment activation is currently supported on macOS and Linux".to_owned())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn revoke_device(_paths: &RuntimePaths, _device_id: &str) -> Result<ExitCode, String> {
     Err(
         "worker revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
@@ -992,7 +992,7 @@ fn revoke_device(_paths: &RuntimePaths, _device_id: &str) -> Result<ExitCode, St
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, String> {
     let device_id = crate::config::normalize_device_id(device_id)?;
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
@@ -1054,7 +1054,7 @@ fn ensure_connector_local_runtime_ready() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn approve_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
     Err(
         "connector approval is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
@@ -1062,7 +1062,7 @@ fn approve_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCod
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, String> {
     if request_id.trim().is_empty() || request_id.len() > 256 {
         return Err("connector approval request id is invalid".to_owned());
@@ -1140,7 +1140,7 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn cancel_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
     Err(
         "connector approval cancel is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
@@ -1148,7 +1148,7 @@ fn cancel_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn cancel_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, String> {
     let request_id = request_id.trim();
     if request_id.is_empty() || request_id.len() > 256 {
@@ -1182,7 +1182,7 @@ fn cancel_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, 
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn revoke_connector(_paths: &RuntimePaths, _connector_id: &str) -> Result<ExitCode, String> {
     Err(
         "connector revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
@@ -1190,7 +1190,7 @@ fn revoke_connector(_paths: &RuntimePaths, _connector_id: &str) -> Result<ExitCo
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn revoke_connector(paths: &RuntimePaths, connector_id: &str) -> Result<ExitCode, String> {
     let connector_id = connector_id.trim();
     if !connector_id.starts_with("conn_") || connector_id.len() > 4096 {
@@ -1223,7 +1223,7 @@ fn revoke_connector(paths: &RuntimePaths, connector_id: &str) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn revoke_connector_client(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
     Err(
         "connector client revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
@@ -1231,7 +1231,7 @@ fn revoke_connector_client(_paths: &RuntimePaths, _client_id: &str) -> Result<Ex
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
     let client_id = client_id.trim();
     if client_id.is_empty() || client_id.len() > 4096 {
@@ -1264,7 +1264,7 @@ fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<Exit
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn connector_planner_control(
     _paths: &RuntimePaths,
     _action: &str,
@@ -1321,7 +1321,7 @@ fn set_connector_webchat_control(
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn set_connector_webchat_control(
     paths: &RuntimePaths,
     connector_id: &str,
@@ -1410,7 +1410,7 @@ fn set_connector_webchat_control(
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn set_connector_page_assist(
     _paths: &RuntimePaths,
     _connector_id: &str,
@@ -1421,7 +1421,7 @@ fn set_connector_page_assist(
     Err("connector Page Assist requires a supported enrolled-owner credential backend".to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn set_connector_page_assist(
     paths: &RuntimePaths,
     connector_id: &str,
@@ -1483,7 +1483,7 @@ fn set_connector_page_assist(
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn list_connectors(_paths: &RuntimePaths, _include_all: bool) -> Result<ExitCode, String> {
     Err(
         "connector inventory is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
@@ -1491,7 +1491,7 @@ fn list_connectors(_paths: &RuntimePaths, _include_all: bool) -> Result<ExitCode
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn list_connectors(paths: &RuntimePaths, include_all: bool) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
@@ -1519,7 +1519,7 @@ fn list_connectors(paths: &RuntimePaths, include_all: bool) -> Result<ExitCode, 
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn create_automation(
     _paths: &RuntimePaths,
     _name: &str,
@@ -1528,7 +1528,7 @@ fn create_automation(
     Err("automation credential provisioning is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn create_automation(paths: &RuntimePaths, name: &str, device: &str) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
@@ -1574,12 +1574,12 @@ fn create_automation(paths: &RuntimePaths, name: &str, device: &str) -> Result<E
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn list_automations(_paths: &RuntimePaths) -> Result<ExitCode, String> {
     Err("automation credential inventory is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn list_automations(paths: &RuntimePaths) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
@@ -1606,12 +1606,12 @@ fn list_automations(paths: &RuntimePaths) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn rotate_automation(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
     Err("automation credential rotation is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn rotate_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
@@ -1644,12 +1644,12 @@ fn rotate_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, 
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn revoke_automation(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
     Err("automation credential revoke is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend".to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn revoke_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
@@ -1678,7 +1678,7 @@ fn revoke_automation(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, 
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn rename_current_device(_paths: &RuntimePaths, _name: &str) -> Result<ExitCode, String> {
     Err(
         "worker rename is supported on macOS and Linux enrolled devices; this platform has no supported enrolled-device credential backend"
@@ -1686,7 +1686,7 @@ fn rename_current_device(_paths: &RuntimePaths, _name: &str) -> Result<ExitCode,
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn rename_current_device(paths: &RuntimePaths, name: &str) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_enrolled_device_identity(paths, &config)?;
@@ -1842,7 +1842,7 @@ fn activate_connected_runtime_inner(paths: &RuntimePaths, home: &Path) -> Result
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn compensate_after_store(
     edge_origin: &str,
@@ -1858,7 +1858,7 @@ fn compensate_after_store(
     (revoked, deleted)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct ReconcileRollbackEvidence {
     revoked: bool,
@@ -1869,7 +1869,7 @@ struct ReconcileRollbackEvidence {
     reconcile_error: Option<String>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn rollback_after_reconcile_failure<H, I, J, K>(
@@ -1922,7 +1922,7 @@ where
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn connect_macos_inner<F, G, H, I, J, K, L, M>(
@@ -2149,7 +2149,7 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn consume_pairing(
     edge_origin: &str,
     pairing_id: &str,
@@ -2174,7 +2174,7 @@ fn consume_pairing(
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn revoke_self(edge_origin: &str, workstation_id: &str, credential: &str) -> Result<bool, String> {
     let response = client_for_origin(edge_origin)?
         .post(endpoint(edge_origin, "/devices/revoke-self")?)
@@ -2303,6 +2303,28 @@ fn resolve_enrolled_device_identity(
     })
 }
 
+#[cfg(target_os = "windows")]
+fn resolve_fleet_link_identity(
+    paths: &RuntimePaths,
+    config: &Config,
+) -> Result<FleetLinkIdentity, String> {
+    let (workstation_id, credential_service, edge_origin) =
+        resolve_fleet_link_fields(config, None)?;
+    let account = current_account()?;
+    let credential =
+        crate::credential_store::load(&credential_service, &account).map_err(|error| {
+            enrolled_device_required_error(&format!(
+                "the enrolled device credential is unavailable: {error}"
+            ))
+        })?;
+    let _ = paths;
+    Ok(FleetLinkIdentity {
+        edge_origin,
+        workstation_id,
+        credential,
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn production_link_environment_if_present()
 -> Result<Option<std::collections::BTreeMap<String, String>>, String> {
@@ -2385,7 +2407,7 @@ fn resolve_owner_link_fields(
     Ok((workstation_id, credential_service.to_owned(), edge_origin))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn enrolled_device_required_error(reason: &str) -> String {
     format!(
         "This fleet operation requires credentials for a device already enrolled in the target Herdr Worker; {reason}. \
@@ -2395,7 +2417,7 @@ If this is the first Herdr device, complete the first-Worker Cloudflare bootstra
     )
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn resolve_fleet_link_fields(
     config: &Config,
     plist_env: Option<&std::collections::BTreeMap<String, String>>,
@@ -2427,7 +2449,7 @@ fn resolve_fleet_link_fields(
     Ok((workstation_id, keychain_service, edge_origin))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), String> {
     fs::create_dir_all(&paths.config_dir).map_err(|error| {
@@ -2463,12 +2485,12 @@ fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), Stri
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn client_for_origin(edge_origin: &str) -> Result<Client, String> {
     crate::worker_bootstrap::client_for_edge_origin(edge_origin)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn bearer_headers(credential: &str) -> Result<HeaderMap, String> {
     if credential.is_empty() || credential.len() > 4096 || credential.chars().any(char::is_control)
     {
@@ -2482,7 +2504,7 @@ fn bearer_headers(credential: &str) -> Result<HeaderMap, String> {
     Ok(headers)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn parse_json_response(response: Response, operation: &str) -> Result<Value, String> {
     let status = response.status();
     let payload: Value = response
@@ -2498,7 +2520,7 @@ fn parse_json_response(response: Response, operation: &str) -> Result<Value, Str
     Ok(payload)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn endpoint(origin: &str, path: &str) -> Result<Url, String> {
     let mut url = Url::parse(&normalize_edge_origin(origin)?)
         .map_err(|error| format!("invalid Worker origin: {error}"))?;
@@ -2508,7 +2530,7 @@ fn endpoint(origin: &str, path: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn normalize_edge_origin(value: &str) -> Result<String, String> {
     let mut config = Config::default();
@@ -2518,7 +2540,7 @@ fn normalize_edge_origin(value: &str) -> Result<String, String> {
         .ok_or_else(|| "Worker origin is missing".to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn origin_from_ws_url(value: &str) -> Result<String, String> {
     let mut url =
@@ -2536,7 +2558,7 @@ fn origin_from_ws_url(value: &str) -> Result<String, String> {
     normalize_edge_origin(url.as_str())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn required_string(value: &Value, key: &str) -> Result<String, String> {
     value
         .get(key)
@@ -2546,7 +2568,7 @@ fn required_string(value: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("Worker response is missing {key}"))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_pairing_id(value: &str) -> Result<(), String> {
     if !value.starts_with("pair_") {
@@ -2559,7 +2581,7 @@ fn validate_pairing_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_pairing_code(value: &str) -> Result<(), String> {
     if value.len() == 6 && value.chars().all(|ch| ch.is_ascii_digit()) {
@@ -2569,7 +2591,7 @@ fn validate_pairing_code(value: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn format_pairing_code(code: &str) -> String {
     if code.len() == 6 {
@@ -2579,7 +2601,7 @@ fn format_pairing_code(code: &str) -> String {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_pairing_address(value: &str) -> Result<(String, String), String> {
     let url = Url::parse(value).map_err(|_| "pairing address must be a valid URL".to_owned())?;
@@ -2607,7 +2629,7 @@ fn parse_pairing_address(value: &str) -> Result<(String, String), String> {
     Ok((origin, pairing_id.to_owned()))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn read_pairing_code_from<R: BufRead>(reader: &mut R) -> Result<String, String> {
     let mut line = String::new();
@@ -2619,7 +2641,7 @@ fn read_pairing_code_from<R: BufRead>(reader: &mut R) -> Result<String, String> 
     Ok(code.to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn read_pairing_code_tty() -> Result<String, String> {
     use std::io::IsTerminal;
     let stdin = io::stdin();
@@ -2634,7 +2656,7 @@ fn read_pairing_code_tty() -> Result<String, String> {
     read_pairing_code_from(&mut reader)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_device_secret(value: &str) -> Result<(), String> {
     let suffix = value
@@ -2646,16 +2668,17 @@ fn validate_device_secret(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn current_account() -> Result<String, String> {
-    env::var("USER")
+    let variable = if cfg!(windows) { "USERNAME" } else { "USER" };
+    env::var(variable)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| {
             !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
         })
-        .ok_or_else(|| "USER is required for enrolled-device credentials".to_owned())
+        .ok_or_else(|| format!("{variable} is required for enrolled-device credentials"))
 }
 
 #[cfg(test)]
@@ -2667,7 +2690,7 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn print_json(value: &Value) -> Result<(), String> {
     println!(
