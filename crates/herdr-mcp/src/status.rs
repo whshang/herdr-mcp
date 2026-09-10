@@ -394,7 +394,7 @@ fn format_service_layer() -> String {
                 .get("generation")
                 .and_then(Value::as_str)
                 .unwrap_or("-");
-            let ownership = if implementation == "rust" && loaded {
+            let ownership = if implementation.starts_with("rust") && loaded {
                 "owned"
             } else if implementation == "missing" {
                 "absent"
@@ -862,6 +862,18 @@ fn read_runtime_generation(current: &Path) -> Result<Option<String>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("cannot stat runtime/current: {error}")),
         Ok(metadata) => {
+            #[cfg(target_os = "windows")]
+            if metadata.is_dir() {
+                let marker = current.join("generation");
+                let generation = fs::read_to_string(&marker).map_err(|error| {
+                    format!("cannot read runtime/current generation marker: {error}")
+                })?;
+                let generation = generation.trim();
+                if !generation.starts_with("rust-") {
+                    return Err(format!("unmanaged generation marker {generation}"));
+                }
+                return Ok(Some(generation.to_owned()));
+            }
             if !metadata.file_type().is_symlink() {
                 return Err("runtime/current is not a symlink".to_owned());
             }

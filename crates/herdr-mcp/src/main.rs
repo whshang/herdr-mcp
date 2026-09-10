@@ -73,6 +73,8 @@ mod text_transfer;
 mod update_scheduler;
 mod updater;
 mod updater_store;
+#[cfg(target_os = "windows")]
+mod windows_service_manager;
 // The stable PATH link is a Unix ownership primitive shared by launchd and
 // systemd-user installations.
 #[cfg(any(unix, test))]
@@ -245,6 +247,8 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Worker(command) => worker::run(command),
         cli::Command::Dev(command) => dev::run(command),
         cli::Command::Candidate { port } => {
+            #[cfg(target_os = "windows")]
+            windows_service_manager::prepare_candidate_environment(port)?;
             eprintln!("{}", child_process::reap_confirmed_orphans_on_boot());
             mcp_http::serve_candidate(port)
         }
@@ -279,10 +283,39 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
         cli::Command::ArtifactImport(args) => artifact_import::run(args),
         cli::Command::Link(command) => match command {
-            cli::LinkCommand::Status => link::run_link_status(),
+            cli::LinkCommand::Status => {
+                #[cfg(target_os = "windows")]
+                {
+                    windows_service_manager::print_link_status()
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    link::run_link_status()
+                }
+            }
             cli::LinkCommand::Run => link::run_link(),
-            cli::LinkCommand::Install => link::run_link_install(),
-            cli::LinkCommand::Uninstall => link::run_link_uninstall(),
+            cli::LinkCommand::Install => {
+                #[cfg(target_os = "windows")]
+                {
+                    windows_service_manager::install_link()?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    link::run_link_install()
+                }
+            }
+            cli::LinkCommand::Uninstall => {
+                #[cfg(target_os = "windows")]
+                {
+                    windows_service_manager::uninstall_link()?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    link::run_link_uninstall()
+                }
+            }
             cli::LinkCommand::Cutover { mode } => link::run_link_cutover(mode),
             cli::LinkCommand::Seal { mode } => link::run_link_seal(mode),
             cli::LinkCommand::MigrateRuntimeControl { mode } => {

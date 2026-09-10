@@ -994,6 +994,13 @@ fn bounded_positive(value: Option<f64>, fallback: f64, min: f64, max: f64) -> u6
 }
 
 fn current_generation_from_link(link: &Path) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    if link.is_dir() {
+        return fs::read_to_string(link.join("generation"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+    }
     let target = fs::read_link(link).ok()?;
     target
         .file_name()

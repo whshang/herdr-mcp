@@ -188,7 +188,15 @@ fn load_link_token_from_keychain(
             crate::credential_store::load(&service, &username).map_err(DaemonConfigError::Message)
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        {
+            let username = optional_trimmed(env_map, "USERNAME").unwrap_or_else(current_username);
+            let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
+                .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
+            crate::credential_store::load(&service, &username).map_err(DaemonConfigError::Message)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             let _ = env_map;
             Err(DaemonConfigError::Message(
@@ -233,7 +241,14 @@ fn load_runtime_token_from_server_plist(
                 .map_err(DaemonConfigError::Message)
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        {
+            let _ = env_map;
+            crate::windows_service_manager::runtime_token_for_link()
+                .map_err(DaemonConfigError::Message)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             let _ = env_map;
             Err(DaemonConfigError::Message(
@@ -277,6 +292,15 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn current_username() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        return env::var("USERNAME")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned());
+    }
+    #[cfg(not(target_os = "windows"))]
     Command::new("id")
         .arg("-un")
         .output()
