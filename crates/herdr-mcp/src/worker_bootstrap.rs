@@ -1371,6 +1371,7 @@ fn create_and_consume_first_pairing(
         device_id: required_string(&payload, "device_id")?,
         workstation_id: required_string(&payload, "workstation_id")?,
         device_secret: required_string(&payload, "device_secret")?,
+        recovered_existing: false,
     })
 }
 

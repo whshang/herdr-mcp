@@ -160,6 +160,123 @@ pub(crate) fn reconcile_after_service_generation_change(
     }
 }
 
+/// Explicitly switch an enrolled macOS production Link to a device-specific
+/// Keychain service after a credential-repair verifier has been committed at
+/// the Worker. Ordinary generation refresh deliberately preserves credential
+/// ownership; only this recovery path may change it.
+#[cfg(target_os = "macos")]
+pub(crate) fn switch_prod_link_credential_service(
+    paths: &RuntimePaths,
+    device_id: &str,
+    keychain_service: &str,
+) -> Result<(), String> {
+    if paths.instance.is_named() {
+        return Err("credential repair is available only on the default Herdr instance".to_owned());
+    }
+    let normalized = crate::config::normalize_device_id(device_id)?;
+    let expected_service = format!("herdr-edge-link-{normalized}");
+    if keychain_service != expected_service {
+        return Err(
+            "credential repair refused a Keychain service that does not match the enrolled device"
+                .to_owned(),
+        );
+    }
+    let home =
+        home_dir().ok_or_else(|| "HOME is required for Link credential repair".to_owned())?;
+    let launchd = RealLaunchd;
+    let Some(prod) = ensure_enrolled_rust_prod_link(&home, paths, &launchd)? else {
+        return Err("credential repair requires an owned enrolled production Link".to_owned());
+    };
+    if prod.implementation != LinkImplementation::Rust
+        || !program_points_at_managed_runtime(&prod.program_arguments, &home)
+    {
+        return Err("credential repair refuses to mutate a non-owned production Link".to_owned());
+    }
+
+    let original = fs::read(&prod.plist_path)
+        .map_err(|error| format!("cannot read {}: {error}", prod.plist_path.display()))?;
+    rewrite_prod_plist_credential_identity(&prod.plist_path, &normalized, keychain_service)?;
+
+    if prod.loaded {
+        launchd.bootout_prod(LINK_PROD_LABEL)?;
+    }
+    if let Err(error) = launchd.bootstrap_prod(&prod.plist_path, LINK_PROD_LABEL) {
+        let _ = atomic_write(&prod.plist_path, &original, 0o600);
+        let rollback = launchd.bootstrap_prod(&prod.plist_path, LINK_PROD_LABEL);
+        return Err(format!(
+            "production Link credential-service reload failed: {error}; plist_restored=true rollback_loaded={}",
+            rollback.is_ok()
+        ));
+    }
+
+    let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, LINK_PROD_LABEL);
+    let output = Command::new("/bin/launchctl")
+        .args(["print", target.as_str()])
+        .output()
+        .map_err(|error| format!("cannot inspect reloaded production Link: {error}"))?;
+    if !output.status.success() {
+        return Err("production Link was reloaded but launchd state is unreadable".to_owned());
+    }
+    let loaded = parse_launchd_environment_value(
+        &String::from_utf8_lossy(&output.stdout),
+        "HERDR_LINK_KEYCHAIN_SERVICE",
+    );
+    if loaded.as_deref() != Some(keychain_service) {
+        return Err(format!(
+            "production Link credential service did not converge after reload (expected {keychain_service}, observed {})",
+            loaded.as_deref().unwrap_or("missing")
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rewrite_prod_plist_credential_identity(
+    plist_path: &Path,
+    device_id: &str,
+    keychain_service: &str,
+) -> Result<bool, String> {
+    let original = fs::read(plist_path)
+        .map_err(|error| format!("cannot read {}: {error}", plist_path.display()))?;
+    let mut plist = PlistValue::from_reader(std::io::Cursor::new(&original))
+        .map_err(|error| format!("cannot parse {}: {error}", plist_path.display()))?;
+    let dict = plist
+        .as_dictionary_mut()
+        .ok_or_else(|| "prod Link plist root must be a dict".to_owned())?;
+    if dict.get("Label").and_then(PlistValue::as_string) != Some(LINK_PROD_LABEL) {
+        return Err("credential repair refused a foreign production Link plist".to_owned());
+    }
+    let env = dict
+        .get_mut("EnvironmentVariables")
+        .and_then(PlistValue::as_dictionary_mut)
+        .ok_or_else(|| "production Link plist has no environment".to_owned())?;
+    let unchanged = env
+        .get("HERDR_WORKSTATION_ID")
+        .and_then(PlistValue::as_string)
+        == Some(device_id)
+        && env
+            .get("HERDR_LINK_KEYCHAIN_SERVICE")
+            .and_then(PlistValue::as_string)
+            == Some(keychain_service);
+    if unchanged {
+        return Ok(false);
+    }
+    env.insert(
+        "HERDR_WORKSTATION_ID".to_owned(),
+        PlistValue::String(device_id.to_owned()),
+    );
+    env.insert(
+        "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+        PlistValue::String(keychain_service.to_owned()),
+    );
+    let mut encoded = Vec::new();
+    plist
+        .to_writer_xml(&mut encoded)
+        .map_err(|error| format!("cannot encode prod Link plist: {error}"))?;
+    atomic_write(plist_path, &encoded, 0o600)?;
+    Ok(true)
+}
+
 /// Remove a production Link that was created by the current higher-level
 /// transaction after that transaction has failed. Callers must only invoke
 /// this when they captured evidence that link-prod did not exist before the
@@ -871,10 +988,13 @@ fn refresh_prod_plist_generation(
             "HERDR_WORKSTATION_ID".to_owned(),
             PlistValue::String(device_id),
         );
-        env_out.insert(
-            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
-            PlistValue::String(keychain_service),
-        );
+        // Runtime generation refresh must not change credential ownership.
+        if !env_out.contains_key("HERDR_LINK_KEYCHAIN_SERVICE") {
+            env_out.insert(
+                "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+                PlistValue::String(keychain_service),
+            );
+        }
     }
     for (key, value) in inherited_proxy_env() {
         if !env_out.contains_key(&key) {
@@ -1062,6 +1182,10 @@ mod tests {
             "HERDR_RUNTIME_VERSION".to_owned(),
             PlistValue::String("0.4.2".to_owned()),
         );
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            PlistValue::String("herdr-edge-prod-link-secret".to_owned()),
+        );
         let mut root_dict = Dictionary::new();
         root_dict.insert(
             "Label".to_owned(),
@@ -1111,8 +1235,76 @@ mod tests {
         assert_eq!(
             env.get("HERDR_LINK_KEYCHAIN_SERVICE")
                 .and_then(PlistValue::as_string),
-            Some("herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            Some("herdr-edge-prod-link-secret")
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_credential_repair_rewrites_only_the_owned_link_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-link-credential-repair-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let plist_path = root.join("link-prod.plist");
+        let mut env = Dictionary::new();
+        env.insert(
+            "HERDR_RUNTIME_GENERATION".to_owned(),
+            PlistValue::String("rust-stable".to_owned()),
+        );
+        env.insert(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            PlistValue::String("dev_01OLD000000000000000000000".to_owned()),
+        );
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            PlistValue::String("herdr-edge-prod-link-secret".to_owned()),
+        );
+        let mut root_dict = Dictionary::new();
+        root_dict.insert(
+            "Label".to_owned(),
+            PlistValue::String(LINK_PROD_LABEL.to_owned()),
+        );
+        root_dict.insert(
+            "EnvironmentVariables".to_owned(),
+            PlistValue::Dictionary(env),
+        );
+        let mut bytes = Vec::new();
+        PlistValue::Dictionary(root_dict)
+            .to_writer_xml(&mut bytes)
+            .unwrap();
+        std::fs::write(&plist_path, bytes).unwrap();
+
+        let device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let service = format!("herdr-edge-link-{device_id}");
+        assert!(rewrite_prod_plist_credential_identity(&plist_path, device_id, &service).unwrap());
+        let updated = PlistValue::from_file(&plist_path).unwrap();
+        let env = updated
+            .as_dictionary()
+            .unwrap()
+            .get("EnvironmentVariables")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            env.get("HERDR_WORKSTATION_ID")
+                .and_then(PlistValue::as_string),
+            Some(device_id)
+        );
+        assert_eq!(
+            env.get("HERDR_LINK_KEYCHAIN_SERVICE")
+                .and_then(PlistValue::as_string),
+            Some(service.as_str())
+        );
+        assert_eq!(
+            env.get("HERDR_RUNTIME_GENERATION")
+                .and_then(PlistValue::as_string),
+            Some("rust-stable")
+        );
+        assert!(!rewrite_prod_plist_credential_identity(&plist_path, device_id, &service).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 

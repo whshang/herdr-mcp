@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 import worker from "../dist/index.js";
 import { buildLinkAuthProtocol } from "../dist/auth.js";
@@ -942,6 +943,7 @@ test("pairing consume is unauthenticated, single-use, and returns the device sec
   const first = await worker.fetch(post("/devices/pairings/consume", consumeBody), env);
   assert.equal(first.status, 200);
   const credential = await first.json();
+  assert.equal(credential.recovered_existing, false);
   assert.match(credential.device_id, /^dev_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
   assert.equal(credential.workstation_id, credential.device_id, "device_id must be canonical workstation identity");
   assert.match(credential.credential_id, /^cred_[0-9a-f]{32}$/);
@@ -951,6 +953,105 @@ test("pairing consume is unauthenticated, single-use, and returns the device sec
   const replay = await worker.fetch(post("/devices/pairings/consume", consumeBody), env);
   assert.equal(replay.status, 401);
   assert.equal((await replay.json()).code, "pairing_rejected");
+});
+
+test("recovery pairing rotates one active device credential without changing device identity", async () => {
+  const { env } = makeEnv();
+  const original = await pair(env, "recover-me");
+
+  const before = await (await worker.fetch(get("/devices", "owner-secret"), env)).json();
+  const create = await worker.fetch(post(
+    "/devices/pairings",
+    { ttl_seconds: 60, recover_device_id: original.device_id },
+    "owner-secret",
+  ), env);
+  assert.equal(create.status, 200);
+  const session = await create.json();
+
+  const consume = await worker.fetch(post(
+    "/devices/pairings/consume",
+    { pairing_id: session.pairing_id, code: session.code },
+  ), env);
+  assert.equal(consume.status, 200);
+  const recovered = await consume.json();
+  assert.equal(recovered.device_id, original.device_id);
+  assert.equal(recovered.workstation_id, original.workstation_id);
+  assert.equal(recovered.recovered_existing, true);
+  assert.notEqual(recovered.credential_id, original.credential_id);
+  assert.notEqual(recovered.device_secret, original.device_secret);
+
+  const after = await (await worker.fetch(get("/devices", "owner-secret"), env)).json();
+  assert.equal(after.devices.length, before.devices.length);
+  assert.equal(after.devices.find((device) => device.device_id === original.device_id)?.name, "recover-me");
+
+  const oldCredential = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    original.workstation_id,
+    original.device_secret,
+  ), env);
+  assert.equal(oldCredential.status, 401);
+
+  const newCredential = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    recovered.workstation_id,
+    recovered.device_secret,
+  ), env);
+  assert.equal(newCredential.status, 200);
+
+  const replay = await worker.fetch(post(
+    "/devices/pairings/consume",
+    { pairing_id: session.pairing_id, code: session.code },
+  ), env);
+  assert.equal(replay.status, 401);
+  assert.equal((await replay.json()).code, "pairing_rejected");
+});
+
+test("fleet-admin verifier rebind repairs one existing device without receiving its secret", async () => {
+  const { env } = makeEnv();
+  const original = await pair(env, "rebind-me");
+  const replacementSecret = "devsec_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+  const verifier = createHash("sha256").update(replacementSecret).digest("hex");
+
+  const before = await (await worker.fetch(get("/devices", "owner-secret"), env)).json();
+  const rebind = await worker.fetch(post(
+    "/devices/credential-rebind",
+    { device_id: original.device_id, credential_verifier_sha256: verifier },
+    "owner-secret",
+  ), env);
+  assert.equal(rebind.status, 200);
+  const rebound = await rebind.json();
+  assert.equal(rebound.device_id, original.device_id);
+  assert.equal(JSON.stringify(rebound).includes(replacementSecret), false);
+  assert.equal(JSON.stringify(rebound).includes("device_secret"), false);
+
+  const after = await (await worker.fetch(get("/devices", "owner-secret"), env)).json();
+  assert.equal(after.devices.length, before.devices.length);
+  assert.equal(after.devices.find((device) => device.device_id === original.device_id)?.name, "rebind-me");
+
+  const oldCredential = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    original.workstation_id,
+    original.device_secret,
+  ), env);
+  assert.equal(oldCredential.status, 401);
+
+  const repairedCredential = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    original.workstation_id,
+    replacementSecret,
+  ), env);
+  assert.equal(repairedCredential.status, 200);
+
+  const denied = await worker.fetch(post(
+    "/devices/credential-rebind",
+    { device_id: original.device_id, credential_verifier_sha256: verifier },
+  ), env);
+  assert.equal(denied.status, 401);
+  assert.equal((await denied.json()).code, "credential_rebind_admin_required");
 });
 
 test("all enrolled device credentials are equal fleet-admin channels for pairing creation", async () => {

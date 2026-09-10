@@ -99,6 +99,7 @@ pub enum WorkerCommand {
     Pair {
         ttl_seconds: u64,
         name: Option<String>,
+        recover_device_id: Option<String>,
     },
     Connect {
         pairing_address: String,
@@ -110,6 +111,12 @@ pub enum WorkerCommand {
     Revoke {
         device_id: String,
     },
+    CredentialRepairPrepare,
+    CredentialRepairApply {
+        device_id: String,
+        credential_verifier_sha256: String,
+    },
+    CredentialRepairFinalize,
     ConnectorApprove {
         request_id: String,
     },
@@ -648,10 +655,14 @@ fn parse_worker(args: &[String]) -> Result<Command, String> {
         Some("connect") => parse_worker_connect(&args[1..]),
         Some("rename") => parse_worker_rename(&args[1..]),
         Some("revoke") => parse_worker_revoke(&args[1..]),
+        Some("credential-repair") => parse_worker_credential_repair(&args[1..]),
         Some(value) => Err(format!(
-            "unknown worker command '{value}' (expected list, bootstrap, pair, connect, rename, or revoke)"
+            "unknown worker command '{value}' (expected list, bootstrap, pair, connect, rename, revoke, or credential-repair)"
         )),
-        None => Err("worker requires list, bootstrap, pair, connect, rename, or revoke".to_owned()),
+        None => Err(
+            "worker requires list, bootstrap, pair, connect, rename, revoke, or credential-repair"
+                .to_owned(),
+        ),
     }
 }
 
@@ -988,6 +999,7 @@ fn validate_automation_client_id(client_id: &str) -> Result<(), String> {
 fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
     let mut ttl_seconds = 600_u64;
     let mut name = None;
+    let mut recover_device_id = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1013,6 +1025,13 @@ fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
                 );
                 index += 2;
             }
+            "--recover-device" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--recover-device requires an immutable device_id".to_owned())?;
+                recover_device_id = Some(crate::config::normalize_device_id(value)?);
+                index += 2;
+            }
             "--code" | "--pin" => {
                 return Err(
                     "pairing codes are never accepted on argv; the new device enters the code interactively"
@@ -1030,7 +1049,11 @@ fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
             }
         }
     }
-    Ok(Command::Worker(WorkerCommand::Pair { ttl_seconds, name }))
+    Ok(Command::Worker(WorkerCommand::Pair {
+        ttl_seconds,
+        name,
+        recover_device_id,
+    }))
 }
 
 fn parse_worker_connect(args: &[String]) -> Result<Command, String> {
@@ -1102,6 +1125,41 @@ fn parse_worker_rename(args: &[String]) -> Result<Command, String> {
     let name = crate::device_name::normalize_device_display_name(name)
         .ok_or_else(|| "device name must contain 1..128 UTF-16 code units".to_owned())?;
     Ok(Command::Worker(WorkerCommand::Rename { name }))
+}
+
+fn parse_worker_credential_repair(args: &[String]) -> Result<Command, String> {
+    match args {
+        [action] if action == "prepare" => Ok(Command::Worker(WorkerCommand::CredentialRepairPrepare)),
+        [action, confirm] if action == "finalize" && confirm == "--confirm" => {
+            Ok(Command::Worker(WorkerCommand::CredentialRepairFinalize))
+        }
+        [action, device_id, verifier, confirm]
+            if action == "apply" && confirm == "--confirm" =>
+        {
+            let device_id = crate::config::normalize_device_id(device_id)?;
+            if verifier.len() != 64
+                || !verifier.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err("credential repair verifier must be exactly 64 lowercase hexadecimal characters".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::CredentialRepairApply {
+                device_id,
+                credential_verifier_sha256: verifier.clone(),
+            }))
+        }
+        [action, ..] if action == "finalize" => Err(
+            "worker credential-repair finalize requires --confirm because it switches the production Link credential service"
+                .to_owned(),
+        ),
+        [action, ..] if action == "apply" => Err(
+            "worker credential-repair apply requires: <device-id> <sha256-verifier> --confirm"
+                .to_owned(),
+        ),
+        _ => Err(
+            "worker credential-repair requires prepare, apply <device-id> <sha256-verifier> --confirm, or finalize --confirm"
+                .to_owned(),
+        ),
+    }
 }
 
 fn parse_worker_revoke(args: &[String]) -> Result<Command, String> {
@@ -1467,7 +1525,7 @@ User path:\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
   herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
   herdr-mcp worker bootstrap  (macOS/Linux first device; guided Cloudflare Worker + enrollment bootstrap)\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS/Linux enrolled device; creates pairing for another computer)\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]  (macOS/Linux enrolled device; creates pairing or exact-device credential recovery)\n  herdr-mcp worker credential-repair prepare|apply|finalize  (advanced headless repair; device secret never leaves the target machine)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS/Linux; uses the platform credential store and reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
   herdr-mcp connector list  (enrolled-device credential; non-secret connector inventory)\n\
@@ -1545,7 +1603,7 @@ commands require an enrolled-device credential.\n\n\
       removes the temporary operator credential, starts the production Link,\n\
       and succeeds only when link status reports operational_ready=true.\n\n\
   herdr-mcp device list\n      Lists the non-secret enrolled-device inventory and local Link/runtime\n      alignment. herdr-mcp worker list is a compatibility alias.\n\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]\n      Creates a pairing address for another computer to enroll.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine on macOS or Linux; uses the platform credential store and reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]\n      Creates a pairing address for another computer to enroll. --recover-device\n      binds a one-time recovery pairing to an existing active device and preserves\n      its immutable device_id.\n\n  herdr-mcp worker credential-repair prepare\n      Advanced headless recovery on the broken device: generates/stages a new\n      local device secret and prints only its SHA-256 verifier, never the secret.\n\n  herdr-mcp worker credential-repair apply <device-id> <sha256-verifier> --confirm\n      Run from another enrolled fleet-admin device. Rebinds only the target\n      device verifier; the target device secret never crosses machines.\n\n  herdr-mcp worker credential-repair finalize --confirm\n      Run back on the repaired device. Commits the staged local secret, explicitly\n      switches the owned production Link to the device-specific credential service,\n      verifies launchd convergence, then deletes staging.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine on macOS or Linux; uses the platform credential store and reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
 }
 
 pub fn connector_help() -> &'static str {
@@ -1741,6 +1799,7 @@ mod tests {
             Command::Worker(WorkerCommand::Pair {
                 ttl_seconds: 120,
                 name: Some("mac-b".to_owned()),
+                recover_device_id: None,
             })
         );
         assert_eq!(
@@ -1763,6 +1822,7 @@ mod tests {
             Command::Worker(WorkerCommand::Pair {
                 ttl_seconds: 600,
                 name: None,
+                recover_device_id: None,
             })
         );
         assert_eq!(
@@ -1837,12 +1897,73 @@ mod tests {
         assert!(parse(args(&["worker", "pair", "--ttl-seconds", "900"])).is_err());
         assert!(parse(args(&["worker", "pair", "--ttl-seconds", "59"])).is_err());
         assert_eq!(
+            parse(args(&[
+                "worker",
+                "pair",
+                "--recover-device",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::Pair {
+                ttl_seconds: 600,
+                name: None,
+                recover_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            })
+        );
+        assert_eq!(
             parse(args(&["worker", "pair"])).unwrap().command,
             Command::Worker(WorkerCommand::Pair {
                 ttl_seconds: 600,
                 name: None,
+                recover_device_id: None,
             })
         );
+        assert_eq!(
+            parse(args(&["worker", "credential-repair", "prepare"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::CredentialRepairPrepare)
+        );
+        assert_eq!(
+            parse(args(&[
+                "worker",
+                "credential-repair",
+                "apply",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--confirm",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::CredentialRepairApply {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                credential_verifier_sha256:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "worker",
+                "credential-repair",
+                "finalize",
+                "--confirm"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::CredentialRepairFinalize)
+        );
+        assert!(
+            parse(args(&[
+                "worker",
+                "credential-repair",
+                "apply",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ]))
+            .is_err()
+        );
+        assert!(parse(args(&["worker", "credential-repair", "finalize"])).is_err());
         assert_eq!(
             parse(args(&["dev", "--dry-run"])).unwrap().command,
             Command::Dev(DevCommand::Sync {
@@ -2587,6 +2708,18 @@ mod tests {
         assert!(text.contains("E2E readiness is DOCTOR_JSON.overall"));
         assert!(text.contains("worker bootstrap  (macOS/Linux first device"));
         assert!(text.contains("worker connect <pairing-address> [--name NAME]  (macOS/Linux"));
+        assert!(text.contains("worker credential-repair prepare|apply|finalize"));
+        let worker = worker_help();
+        assert!(worker.contains(
+            "worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]"
+        ));
+        assert!(worker.contains("worker credential-repair prepare"));
+        assert!(
+            worker
+                .contains("worker credential-repair apply <device-id> <sha256-verifier> --confirm")
+        );
+        assert!(worker.contains("worker credential-repair finalize --confirm"));
+        assert!(worker.contains("device secret never crosses machines"));
         assert!(
             text.contains("connector approve <approval-request-id>  (macOS/Linux enrolled device")
         );

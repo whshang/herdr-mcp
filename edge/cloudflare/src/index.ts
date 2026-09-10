@@ -7,6 +7,7 @@
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
  *   GET  /devices                         fleet-admin device inventory
+ *   POST /devices/credential-rebind      fleet-admin verifier-only credential repair
  *   POST /devices/pairings               fleet-admin pairing session creation
  *   POST /devices/pairings/consume       one-time pairing consumption by a new device
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
@@ -46,6 +47,7 @@ import {
   ensureLegacyDeviceRegistration,
   listPublicDevices,
   renameRegisteredDevice,
+  rebindRegisteredDeviceCredential,
   resolveDeviceRouteWithContext,
   revokeRegisteredDevice,
   resolveDeviceRoute,
@@ -486,6 +488,30 @@ export default {
       }
     }
 
+    if (request.method === "POST" && url.pathname === "/devices/credential-rebind") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "credential_rebind_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)
+        || typeof parsed.value.device_id !== "string"
+        || typeof parsed.value.credential_verifier_sha256 !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const keys = Object.keys(parsed.value);
+      if (keys.some((key) => key !== "device_id" && key !== "credential_verifier_sha256")) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const result = await rebindRegisteredDeviceCredential(registry, {
+        device_id: parsed.value.device_id,
+        credential_verifier_sha256: parsed.value.credential_verifier_sha256,
+      });
+      return result.ok
+        ? noStoreJsonResponse({ ok: true, device_id: result.device_id, credential_id: result.credential_id, updated_at_ms: result.updated_at_ms })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
+    }
+
     if (request.method === "POST" && url.pathname === "/devices/pairings") {
       const fleetAdmin = await authenticateFleetAdmin(request, env);
       if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "pairing_admin_required" }, 401);
@@ -494,12 +520,16 @@ export default {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
-      const input: { ttl_seconds?: number; name?: string; worker_context: string; require_empty_fleet?: boolean } = {
+      const input: { ttl_seconds?: number; name?: string; worker_context: string; require_empty_fleet?: boolean; recover_device_id?: string } = {
         worker_context: pairingWorkerContext(env),
       };
       if (parsed.value.ttl_seconds !== undefined) input.ttl_seconds = parsed.value.ttl_seconds as number;
       if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
       if (parsed.value.require_empty_fleet === true) input.require_empty_fleet = true;
+      if (parsed.value.recover_device_id !== undefined) {
+        if (typeof parsed.value.recover_device_id !== "string") return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+        input.recover_device_id = parsed.value.recover_device_id;
+      }
       const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
       const result = await createPairingSession(registry, input);
       return result.ok
@@ -534,6 +564,7 @@ export default {
             workstation_id: result.credential.workstation_id,
             credential_id: result.credential.credential_id,
             device_secret: result.credential.device_secret,
+            recovered_existing: result.credential.recovered_existing,
           })
         : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
     }

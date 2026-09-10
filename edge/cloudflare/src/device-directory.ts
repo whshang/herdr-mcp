@@ -16,6 +16,7 @@ export interface PairedDeviceCredential {
   workstation_id: string;
   credential_id: string;
   device_secret: string;
+  recovered_existing: boolean;
 }
 
 export type DeviceCredentialAuthCode =
@@ -33,7 +34,7 @@ export type DeviceCredentialAuthResult =
 
 export async function createPairingSession(
   registry: FetchStub,
-  input: { ttl_seconds?: number; name?: string; worker_context: string; require_empty_fleet?: boolean },
+  input: { ttl_seconds?: number; name?: string; worker_context: string; require_empty_fleet?: boolean; recover_device_id?: string },
 ): Promise<{ ok: true; pairing: PairingSession } | { ok: false; code: string; status: number }> {
   const response = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
     method: "POST",
@@ -74,7 +75,7 @@ export async function consumePairingSession(
       status: response.status,
     };
   }
-  if (!isRecord(body) || body.ok !== true || typeof body.device_id !== "string" || typeof body.workstation_id !== "string" || typeof body.credential_id !== "string" || typeof body.device_secret !== "string") {
+  if (!isRecord(body) || body.ok !== true || typeof body.device_id !== "string" || typeof body.workstation_id !== "string" || typeof body.credential_id !== "string" || typeof body.device_secret !== "string" || (body.recovered_existing !== undefined && typeof body.recovered_existing !== "boolean")) {
     return { ok: false, code: "invalid_registry_response", status: 503 };
   }
   return {
@@ -84,7 +85,43 @@ export async function consumePairingSession(
       workstation_id: body.workstation_id,
       credential_id: body.credential_id,
       device_secret: body.device_secret,
+      recovered_existing: body.recovered_existing === true,
     },
+  };
+}
+
+export async function rebindRegisteredDeviceCredential(
+  registry: FetchStub,
+  input: { device_id: string; credential_verifier_sha256: string },
+): Promise<
+  | { ok: true; device_id: string; credential_id: string; updated_at_ms: number }
+  | { ok: false; code: string; status: number }
+> {
+  const deviceId = normalizeDeviceId(input.device_id);
+  if (deviceId === null || deviceId !== input.device_id || !/^[0-9a-f]{64}$/.test(input.credential_verifier_sha256)) {
+    return { ok: false, code: "invalid_credential_rebind", status: 400 };
+  }
+  const response = await registry.fetch(new Request("https://registry.internal/internal/devices/credential-rebind", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  }));
+  const body: unknown = await response.json();
+  if (!response.ok) {
+    return {
+      ok: false,
+      code: isRecord(body) && typeof body.code === "string" ? body.code : "credential_rebind_failed",
+      status: response.status,
+    };
+  }
+  if (!isRecord(body) || body.ok !== true || typeof body.device_id !== "string" || typeof body.credential_id !== "string" || typeof body.updated_at_ms !== "number") {
+    return { ok: false, code: "invalid_registry_response", status: 503 };
+  }
+  return {
+    ok: true,
+    device_id: body.device_id,
+    credential_id: body.credential_id,
+    updated_at_ms: body.updated_at_ms,
   };
 }
 

@@ -16,6 +16,8 @@ use serde_json::Value;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use serde_json::json;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
+use sha2::{Digest, Sha256};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::env;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs::{self, OpenOptions};
@@ -55,14 +57,23 @@ pub(crate) struct EnrolledCredential {
     pub(crate) device_id: String,
     pub(crate) workstation_id: String,
     pub(crate) device_secret: String,
+    pub(crate) recovered_existing: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn pairing_create_request_body(ttl_seconds: u64, name: Option<&str>) -> Value {
-    match name {
-        Some(name) => json!({ "ttl_seconds": ttl_seconds, "name": name }),
-        None => json!({ "ttl_seconds": ttl_seconds }),
+fn pairing_create_request_body(
+    ttl_seconds: u64,
+    name: Option<&str>,
+    recover_device_id: Option<&str>,
+) -> Value {
+    let mut body = json!({ "ttl_seconds": ttl_seconds });
+    if let Some(name) = name {
+        body["name"] = json!(name);
     }
+    if let Some(device_id) = recover_device_id {
+        body["recover_device_id"] = json!(device_id);
+    }
+    body
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -289,9 +300,16 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     match command {
         WorkerCommand::List => list_devices(&paths),
         WorkerCommand::Bootstrap => crate::worker_bootstrap::run(&paths),
-        WorkerCommand::Pair { ttl_seconds, name } => {
-            create_pairing(&paths, ttl_seconds, name.as_deref())
-        }
+        WorkerCommand::Pair {
+            ttl_seconds,
+            name,
+            recover_device_id,
+        } => create_pairing(
+            &paths,
+            ttl_seconds,
+            name.as_deref(),
+            recover_device_id.as_deref(),
+        ),
         WorkerCommand::Connect {
             pairing_address,
             name,
@@ -301,6 +319,12 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         }
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
+        WorkerCommand::CredentialRepairPrepare => prepare_device_credential_repair(&paths),
+        WorkerCommand::CredentialRepairApply {
+            device_id,
+            credential_verifier_sha256,
+        } => apply_device_credential_repair(&paths, &device_id, &credential_verifier_sha256),
+        WorkerCommand::CredentialRepairFinalize => finalize_device_credential_repair(&paths),
         WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
         WorkerCommand::ConnectorCancel { request_id } => cancel_connector(&paths, &request_id),
         WorkerCommand::ConnectorList { include_all } => list_connectors(&paths, include_all),
@@ -340,6 +364,169 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::AutomationRotate { client_id } => rotate_automation(&paths, &client_id),
         WorkerCommand::AutomationRevoke { client_id } => revoke_automation(&paths, &client_id),
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn credential_repair_staging_service(device_id: &str) -> String {
+    format!("herdr-edge-link-recovery-{device_id}")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn device_secret_verifier(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn new_local_device_secret() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("cannot generate credential-repair secret: {error}"))?;
+    let mut out = String::with_capacity(64 + "devsec_".len());
+    out.push_str("devsec_");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}")
+            .map_err(|_| "cannot encode credential-repair secret".to_owned())?;
+    }
+    Ok(out)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn prepare_device_credential_repair(_paths: &RuntimePaths) -> Result<ExitCode, String> {
+    Err("credential repair is supported on macOS and Linux enrolled devices".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let device_id = config
+        .edge_device_id
+        .as_deref()
+        .ok_or_else(|| "credential repair requires an enrolled device_id".to_owned())?;
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let account = current_account()?;
+    let staging_service = credential_repair_staging_service(&device_id);
+    let secret = new_local_device_secret()?;
+    validate_device_secret(&secret)?;
+    crate::credential_store::store(&staging_service, &account, &secret)?;
+    let verifier = device_secret_verifier(&secret);
+    print_json(&json!({
+        "ok": true,
+        "action": "credential_repair_prepare",
+        "device_id": device_id,
+        "credential_verifier_sha256": verifier,
+        "staged": true,
+        "secret_printed": false,
+        "next": "run worker credential-repair apply from another enrolled fleet-admin device",
+    }))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn apply_device_credential_repair(
+    _paths: &RuntimePaths,
+    _device_id: &str,
+    _verifier: &str,
+) -> Result<ExitCode, String> {
+    Err("credential repair is supported on macOS and Linux enrolled devices".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn apply_device_credential_repair(
+    paths: &RuntimePaths,
+    device_id: &str,
+    verifier: &str,
+) -> Result<ExitCode, String> {
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    if verifier.len() != 64
+        || !verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(
+            "credential repair verifier must be exactly 64 lowercase hexadecimal characters"
+                .to_owned(),
+        );
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(
+            &identity.edge_origin,
+            "/devices/credential-rebind",
+        )?)
+        .headers(headers)
+        .json(&json!({
+            "device_id": device_id,
+            "credential_verifier_sha256": verifier,
+        }))
+        .send()
+        .map_err(|error| format!("cannot apply device credential repair: {error}"))?;
+    let payload = parse_json_response(response, "device credential repair")?;
+    print_json(&json!({
+        "ok": true,
+        "action": "credential_repair_apply",
+        "device_id": payload.get("device_id").and_then(Value::as_str).unwrap_or(&device_id),
+        "updated_at_ms": payload.get("updated_at_ms").and_then(Value::as_u64),
+        "secret_printed": false,
+        "next": "run worker credential-repair finalize on the repaired device",
+    }))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn finalize_device_credential_repair(_paths: &RuntimePaths) -> Result<ExitCode, String> {
+    Err("credential repair is supported on macOS and Linux enrolled devices".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn finalize_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let device_id = config
+        .edge_device_id
+        .as_deref()
+        .ok_or_else(|| "credential repair requires an enrolled device_id".to_owned())?;
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let target_service = config.edge_link_keychain_service().ok_or_else(|| {
+        "credential repair requires a device-specific credential service".to_owned()
+    })?;
+    let expected_service = format!("herdr-edge-link-{device_id}");
+    if target_service != expected_service {
+        return Err("configured credential service does not match the enrolled device".to_owned());
+    }
+    let account = current_account()?;
+    let staging_service = credential_repair_staging_service(&device_id);
+    let secret = crate::credential_store::load(&staging_service, &account)
+        .map_err(|error| format!("cannot load staged credential repair secret: {error}"))?;
+    validate_device_secret(&secret)?;
+    crate::credential_store::store(&target_service, &account, &secret).map_err(|error| {
+        format!("cannot commit repaired credential to the device service: {error}")
+    })?;
+
+    #[cfg(target_os = "macos")]
+    crate::link::switch_prod_link_credential_service(paths, &device_id, &target_service)?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service_manager::reconcile_link()?;
+
+    crate::credential_store::delete(&staging_service, &account).map_err(|error| {
+        format!("credential repair succeeded but staging cleanup failed: {error}")
+    })?;
+    print_json(&json!({
+        "ok": true,
+        "action": "credential_repair_finalize",
+        "device_id": device_id,
+        "credential_service": target_service,
+        "staging_deleted": true,
+        "secret_printed": false,
+    }))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
@@ -512,6 +699,7 @@ fn create_pairing(
     paths: &RuntimePaths,
     ttl_seconds: u64,
     name: Option<&str>,
+    recover_device_id: Option<&str>,
 ) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let owner = resolve_fleet_link_identity(paths, &config)?;
@@ -525,7 +713,11 @@ fn create_pairing(
     let response = client_for_origin(&owner.edge_origin)?
         .post(endpoint)
         .headers(headers)
-        .json(&pairing_create_request_body(ttl_seconds, name))
+        .json(&pairing_create_request_body(
+            ttl_seconds,
+            name,
+            recover_device_id,
+        ))
         .send()
         .map_err(|error| format!("cannot create device pairing: {error}"))?;
     let payload = parse_json_response(response, "device pairing creation")?;
@@ -1588,47 +1780,78 @@ where
     L: Fn(&RuntimePaths) -> Result<(), String>,
     M: Fn(&str, &str, &str, Option<&str>) -> Result<EnrolledCredential, String>,
 {
+    // Snapshot the local binding before consuming the one-time pairing. The
+    // server marker is authoritative, while the same-device local binding is
+    // a mixed-version safety fence: an existing device must never be revoked
+    // merely because an older Edge omitted recovered_existing.
+    let previous_config_result = load_config(&paths.config_file, &paths.instance);
     let enrolled = consume(edge_origin, pairing_id, code, name)?;
     let device_id = crate::config::normalize_device_id(&enrolled.device_id)?;
+    let recovered_existing = enrolled.recovered_existing
+        || previous_config_result
+            .as_ref()
+            .ok()
+            .and_then(|config| config.edge_device_id.as_deref())
+            == Some(device_id.as_str());
     if enrolled.workstation_id != device_id {
-        let _ = revoke_fn(
-            edge_origin,
-            &enrolled.workstation_id,
-            &enrolled.device_secret,
-        );
+        if !recovered_existing {
+            let _ = revoke_fn(
+                edge_origin,
+                &enrolled.workstation_id,
+                &enrolled.device_secret,
+            );
+        }
         return Err(
             "Worker returned a workstation identity that does not match the immutable device_id"
                 .to_owned(),
         );
     }
     if let Err(error) = validate_device_secret(&enrolled.device_secret) {
-        let _ = revoke_fn(edge_origin, &device_id, &enrolled.device_secret);
+        if !recovered_existing {
+            let _ = revoke_fn(edge_origin, &device_id, &enrolled.device_secret);
+        }
         return Err(error);
     }
 
     let account = match current_account() {
         Ok(a) => a,
         Err(error) => {
-            let _ = revoke_fn(edge_origin, &device_id, &enrolled.device_secret);
+            if !recovered_existing {
+                let _ = revoke_fn(edge_origin, &device_id, &enrolled.device_secret);
+            }
             return Err(error);
         }
     };
     let keychain_service = format!("herdr-edge-link-{device_id}");
     if let Err(error) = store_secret(&keychain_service, &account, &enrolled.device_secret) {
+        if recovered_existing {
+            return Err(format!(
+                "cannot persist the recovered credential for existing device {device_id}; the device was not revoked, but its Worker verifier has rotated, so create another recovery pairing: {error}"
+            ));
+        }
         let revoked = revoke_fn(edge_origin, &device_id, &enrolled.device_secret).unwrap_or(false);
         return Err(format!(
             "cannot persist the new device credential; remote compensation revoked={revoked}: {error}"
         ));
     }
 
+    // New-device enrollment failures after durable secret storage revoke the
+    // newly-created remote device and remove its local credential. Existing-
+    // device recovery is different: the remote identity predates this attempt,
+    // so failures preserve the rotated credential and never revoke the device.
     // Any failure after the secret is durably stored must revoke the remote device
     // and delete the local Keychain credential to avoid orphans. No secret is ever
     // printed in the error.
     // Retain the previous local binding so a post-write failure can roll the
     // transaction back instead of leaving config/plist bound to a revoked device.
-    let previous_config = match load_config(&paths.config_file, &paths.instance) {
+    let previous_config = match previous_config_result {
         Ok(c) => c,
         Err(error) => {
+            if recovered_existing {
+                return Err(format!(
+                    "local config unavailable after credential recovery for existing device {device_id}; the device was not revoked and the recovered credential was preserved: {error}"
+                ));
+            }
             let (revoked, deleted) = compensate_after_store(
                 edge_origin,
                 &device_id,
@@ -1645,6 +1868,11 @@ where
     };
     let mut config = previous_config.clone();
     if let Err(error) = config.set_edge_public_origin(edge_origin) {
+        if recovered_existing {
+            return Err(format!(
+                "config origin update failed after credential recovery for existing device {device_id}; the device was not revoked and the recovered credential was preserved: {error}"
+            ));
+        }
         let (revoked, deleted) = compensate_after_store(
             edge_origin,
             &device_id,
@@ -1659,6 +1887,11 @@ where
         ));
     }
     if let Err(error) = config.set_edge_device_id(&device_id) {
+        if recovered_existing {
+            return Err(format!(
+                "config device update failed after credential recovery for existing device {device_id}; the device was not revoked and the recovered credential was preserved: {error}"
+            ));
+        }
         let (revoked, deleted) = compensate_after_store(
             edge_origin,
             &device_id,
@@ -1673,6 +1906,11 @@ where
         ));
     }
     if let Err(error) = write_config(paths, &config) {
+        if recovered_existing {
+            return Err(format!(
+                "config write failed after credential recovery for existing device {device_id}; the device was not revoked and the recovered credential was preserved: {error}"
+            ));
+        }
         let (revoked, deleted) = compensate_after_store(
             edge_origin,
             &device_id,
@@ -1688,6 +1926,11 @@ where
     }
 
     if let Err(error) = activate(paths) {
+        if recovered_existing {
+            return Err(format!(
+                "existing device {device_id} credential recovery was persisted, but the local runtime could not be activated: {error}; the device was not revoked and the recovered credential/config were preserved for repair"
+            ));
+        }
         // The config is durably written, but the local runtime/production Link
         // could not be made ready. Roll the whole local transaction back: exact remote
         // revoke-self, local Keychain deletion, best-effort atomic restore of the
@@ -1727,6 +1970,7 @@ where
         "edge_origin": edge_origin,
         "keychain_service": keychain_service,
         "pairing_consumed": true,
+        "recovered_existing": recovered_existing,
         "secret_printed": false,
         "service_ready": true,
         "link_ready": true,
@@ -1753,6 +1997,10 @@ fn consume_pairing(
         device_id: required_string(&payload, "device_id")?,
         workstation_id: required_string(&payload, "workstation_id")?,
         device_secret: required_string(&payload, "device_secret")?,
+        recovered_existing: payload
+            .get("recovered_existing")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -2261,6 +2509,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_secret_verifier_is_lowercase_sha256_without_exposing_secret() {
+        let secret = "devsec_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let verifier = device_secret_verifier(secret);
+        assert_eq!(verifier.len(), 64);
+        assert!(
+            verifier
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_ne!(verifier, secret);
+        assert_eq!(
+            verifier,
+            "639b0a222f754d2ada9b701c05d329e84424ca54f4bb1dc82feab6f42f6daf3f"
+        );
+    }
+
+    #[test]
     fn secret_validators_are_strict_and_never_accept_argv_shaped_garbage() {
         assert!(validate_pairing_code("000000").is_ok());
         assert!(validate_pairing_code("123456").is_ok());
@@ -2559,12 +2824,19 @@ mod tests {
 
     #[test]
     fn pairing_request_bodies_omit_unspecified_name_and_preserve_explicit_name() {
-        let unnamed_create = pairing_create_request_body(600, None);
+        let unnamed_create = pairing_create_request_body(600, None, None);
         assert_eq!(unnamed_create["ttl_seconds"], 600);
         assert!(unnamed_create.get("name").is_none());
 
-        let named_create = pairing_create_request_body(600, Some("Nathan Mac"));
+        let named_create = pairing_create_request_body(600, Some("Nathan Mac"), None);
         assert_eq!(named_create["name"], "Nathan Mac");
+
+        let recovery_create =
+            pairing_create_request_body(600, None, Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert_eq!(
+            recovery_create["recover_device_id"],
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
 
         let pairing_id = "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let unnamed_consume = pairing_consume_request_body(pairing_id, "123456", None);
@@ -2917,6 +3189,7 @@ mod tests {
                 device_id: NEW_DEVICE_ID.to_owned(),
                 workstation_id: NEW_DEVICE_ID.to_owned(),
                 device_secret: DEVICE_SECRET.to_owned(),
+                recovered_existing: false,
             })
         };
 
@@ -2970,6 +3243,179 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_existing_store_failure_never_revokes_device() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        const DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const DEVICE_SECRET: &str =
+            "devsec_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let dir = env::temp_dir().join(format!(
+            "herdr-worker-recovery-store-failure-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let paths = crate::paths::RuntimePaths {
+            config_dir: dir.clone(),
+            config_file: dir.join("config.toml"),
+            dev_state_dir: dir.join("dev-state"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+        let previous_config = Config {
+            edge_public_origin: Some("https://edge.example".to_owned()),
+            edge_device_id: Some(DEVICE_ID.to_owned()),
+            ..Config::default()
+        };
+        let revoke_calls = Rc::new(Cell::new(0_u32));
+        let delete_calls = Rc::new(Cell::new(0_u32));
+        let revoke_calls_hook = revoke_calls.clone();
+        let delete_calls_hook = delete_calls.clone();
+        let load_config = move |_: &Path, _: &InstanceId| Ok(previous_config.clone());
+        let store_secret = |_: &str, _: &str, _: &str| -> Result<(), String> {
+            Err("simulated Keychain write failure".to_owned())
+        };
+        let write_config = |_: &RuntimePaths, _: &Config| Ok(());
+        let revoke = move |_: &str, _: &str, _: &str| -> Result<bool, String> {
+            revoke_calls_hook.set(revoke_calls_hook.get() + 1);
+            Ok(true)
+        };
+        let delete = move |_: &str, _: &str| -> Result<(), String> {
+            delete_calls_hook.set(delete_calls_hook.get() + 1);
+            Ok(())
+        };
+        let activate = |_: &RuntimePaths| Ok(());
+        let reconcile = |_: &RuntimePaths| Ok(());
+        let consume = |_: &str, _: &str, _: &str, _: Option<&str>| {
+            Ok(EnrolledCredential {
+                device_id: DEVICE_ID.to_owned(),
+                workstation_id: DEVICE_ID.to_owned(),
+                device_secret: DEVICE_SECRET.to_owned(),
+                recovered_existing: true,
+            })
+        };
+
+        let error = connect_macos_inner(
+            &paths,
+            "https://edge.example",
+            "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "000000",
+            None,
+            store_secret,
+            load_config,
+            write_config,
+            revoke,
+            delete,
+            activate,
+            reconcile,
+            consume,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("device was not revoked"));
+        assert!(error.contains("another recovery pairing"));
+        assert!(!error.contains("devsec_"));
+        assert_eq!(revoke_calls.get(), 0);
+        assert_eq!(delete_calls.get(), 0);
+    }
+
+    #[test]
+    fn recovered_existing_activation_failure_preserves_device_and_credential() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        const DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const DEVICE_SECRET: &str =
+            "devsec_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let dir = env::temp_dir().join(format!(
+            "herdr-worker-recovery-activation-failure-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let paths = crate::paths::RuntimePaths {
+            config_dir: dir.clone(),
+            config_file: dir.join("config.toml"),
+            dev_state_dir: dir.join("dev-state"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+        let previous_config = Config {
+            edge_public_origin: Some("https://edge.example".to_owned()),
+            edge_device_id: Some(DEVICE_ID.to_owned()),
+            ..Config::default()
+        };
+        let store_calls = Rc::new(Cell::new(0_u32));
+        let revoke_calls = Rc::new(Cell::new(0_u32));
+        let delete_calls = Rc::new(Cell::new(0_u32));
+        let reconcile_calls = Rc::new(Cell::new(0_u32));
+        let store_hook = store_calls.clone();
+        let revoke_hook = revoke_calls.clone();
+        let delete_hook = delete_calls.clone();
+        let reconcile_hook = reconcile_calls.clone();
+        let load_config = move |_: &Path, _: &InstanceId| Ok(previous_config.clone());
+        let store_secret = move |service: &str, _: &str, secret: &str| -> Result<(), String> {
+            assert_eq!(service, format!("herdr-edge-link-{DEVICE_ID}"));
+            assert_eq!(secret, DEVICE_SECRET);
+            store_hook.set(store_hook.get() + 1);
+            Ok(())
+        };
+        let write_config = |_: &RuntimePaths, config: &Config| -> Result<(), String> {
+            assert_eq!(config.edge_device_id.as_deref(), Some(DEVICE_ID));
+            Ok(())
+        };
+        let revoke = move |_: &str, _: &str, _: &str| -> Result<bool, String> {
+            revoke_hook.set(revoke_hook.get() + 1);
+            Ok(true)
+        };
+        let delete = move |_: &str, _: &str| -> Result<(), String> {
+            delete_hook.set(delete_hook.get() + 1);
+            Ok(())
+        };
+        let activate = |_: &RuntimePaths| -> Result<(), String> {
+            Err("simulated activation failure".to_owned())
+        };
+        let reconcile = move |_: &RuntimePaths| -> Result<(), String> {
+            reconcile_hook.set(reconcile_hook.get() + 1);
+            Ok(())
+        };
+        let consume = |_: &str, _: &str, _: &str, _: Option<&str>| {
+            Ok(EnrolledCredential {
+                device_id: DEVICE_ID.to_owned(),
+                workstation_id: DEVICE_ID.to_owned(),
+                device_secret: DEVICE_SECRET.to_owned(),
+                // Deliberately false: the local same-device binding is the
+                // mixed-version safety fence when an older Edge omits the bit.
+                recovered_existing: false,
+            })
+        };
+
+        let error = connect_macos_inner(
+            &paths,
+            "https://edge.example",
+            "pair_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "000000",
+            None,
+            store_secret,
+            load_config,
+            write_config,
+            revoke,
+            delete,
+            activate,
+            reconcile,
+            consume,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("device was not revoked"));
+        assert!(error.contains("credential/config were preserved"));
+        assert!(!error.contains("devsec_"));
+        assert_eq!(store_calls.get(), 1);
+        assert_eq!(revoke_calls.get(), 0);
+        assert_eq!(delete_calls.get(), 0);
+        assert_eq!(reconcile_calls.get(), 0);
     }
 
     #[test]
@@ -3033,6 +3479,7 @@ mod tests {
                 device_id: NEW_DEVICE_ID.to_owned(),
                 workstation_id: NEW_DEVICE_ID.to_owned(),
                 device_secret: DEVICE_SECRET.to_owned(),
+                recovered_existing: false,
             })
         };
 
