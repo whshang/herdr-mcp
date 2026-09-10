@@ -1056,20 +1056,94 @@ test("lane lifecycle is fenced, reassign is explicit, and terminal lanes cannot 
   assert.equal(replacement.ok, true);
 });
 
-test("fleet authority survives DO instance reconstruction and leaves legacy device state readable", async () => {
+test("fleet authority preserves execution provenance across reconstruction and WebChat route changes", async () => {
   const storage = new FakeStorage();
   await putDevice(storage, device(DEVICE_A));
   const first = makeRegistry(storage).registry;
   const created = await createChain(first, "persist-chain");
   const acquired = await acquire(first, created.chain, "persist-lease");
+  const originalBinding = {
+    endpoint_ref: "bep_" + "a".repeat(64),
+    provider: "chatgpt",
+    account_ref: "br_" + "b".repeat(64),
+    space_ref: null,
+    session_ref: "br_" + "c".repeat(64),
+    observation_generation: 7,
+  };
+  const createdLane = await call(first, "herdr_mcp.execution_lane.create", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: acquired.chain.revision,
+    expected_lease_generation: 1,
+    idempotency_key: "persist-lane",
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: "feat/persist-lane",
+    webchat_binding: originalBinding,
+  }, PRINCIPAL_A, 2000);
+  assert.equal(createdLane.ok, true);
 
   const second = makeRegistry(storage).registry;
-  const inspected = await call(second, "herdr_mcp.work_chain.inspect", { work_chain_id: created.chain.work_chain_id }, PRINCIPAL_B, 2000);
+  const inspected = await call(second, "herdr_mcp.work_chain.inspect", { work_chain_id: created.chain.work_chain_id }, PRINCIPAL_B, 2001);
   assert.equal(inspected.ok, true);
-  assert.equal(inspected.chain.revision, acquired.chain.revision);
+  assert.equal(inspected.chain.revision, createdLane.chain.revision);
   assert.equal(inspected.chain.planner_lease.generation, 1);
 
-  const deviceResponse = await second.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`));
+  const laneAfterRestart = await call(second, "herdr_mcp.execution_lane.inspect", {
+    lane_id: createdLane.lane.lane_id,
+  }, PRINCIPAL_B, 2001);
+  assert.equal(laneAfterRestart.ok, true);
+  assert.deepEqual({
+    work_chain_id: laneAfterRestart.lane.work_chain_id,
+    device_id: laneAfterRestart.lane.device_id,
+    repo_id: laneAfterRestart.lane.repo_id,
+    base_commit: laneAfterRestart.lane.base_commit,
+    branch_ref: laneAfterRestart.lane.branch_ref,
+    owner_principal: laneAfterRestart.lane.owner_principal,
+  }, {
+    work_chain_id: created.chain.work_chain_id,
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: "feat/persist-lane",
+    owner_principal: PRINCIPAL_A,
+  });
+  assert.equal(laneAfterRestart.lane.webchat_binding.provider, "chatgpt");
+
+  const rebound = await call(second, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: createdLane.chain.revision,
+    expected_lease_generation: 1,
+    lane_id: createdLane.lane.lane_id,
+    expected_lane_generation: createdLane.lane.lane_generation,
+    idempotency_key: "persist-lane-gemini-route",
+    webchat_binding: {
+      endpoint_ref: "bep_" + "d".repeat(64),
+      provider: "gemini",
+      account_ref: "br_" + "e".repeat(64),
+      space_ref: null,
+      session_ref: "br_" + "f".repeat(64),
+      observation_generation: 11,
+    },
+  }, PRINCIPAL_A, 2002);
+  assert.equal(rebound.ok, true);
+  assert.equal(rebound.lane.webchat_binding.provider, "gemini");
+  assert.equal(rebound.lane.repo_id, laneAfterRestart.lane.repo_id);
+  assert.equal(rebound.lane.base_commit, laneAfterRestart.lane.base_commit);
+  assert.equal(rebound.lane.branch_ref, laneAfterRestart.lane.branch_ref);
+  assert.equal(rebound.lane.work_chain_id, laneAfterRestart.lane.work_chain_id);
+  assert.equal(rebound.lane.device_id, laneAfterRestart.lane.device_id);
+  assert.equal(rebound.lane.owner_principal, laneAfterRestart.lane.owner_principal);
+
+  const third = makeRegistry(storage).registry;
+  const persistedRoute = await call(third, "herdr_mcp.execution_lane.inspect", { lane_id: createdLane.lane.lane_id }, PRINCIPAL_B, 2003);
+  assert.equal(persistedRoute.ok, true);
+  assert.equal(persistedRoute.lane.webchat_binding.provider, "gemini");
+  assert.equal(persistedRoute.lane.repo_id, "github.com/whshang/herdr-mcp");
+  assert.equal(persistedRoute.lane.branch_ref, "feat/persist-lane");
+  assert.equal(persistedRoute.lane.work_chain_id, created.chain.work_chain_id);
+
+  const deviceResponse = await third.fetch(new Request("https://registry.internal/internal/devices/" + DEVICE_A));
   assert.equal(deviceResponse.status, 200);
   assert.equal((await deviceResponse.json()).device.device_id, DEVICE_A);
 });
