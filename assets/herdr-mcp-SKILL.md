@@ -64,9 +64,11 @@ Use the cheapest deterministic layer that can complete the task.
 
 ## 1A. Latency-aware tool scheduling
 
-Group the next tools into a small dependency-aware **wave** instead of calling one tool and replanning after every result. Round trips and model re-entry are real costs.
+Before the first remote call, form the next dependency-aware **wave** from facts already known. A call must earn its round trip by doing at least one of three things: obtain evidence that can change a decision, execute work whose arguments/safety boundary are already known, or verify a falsifiable acceptance boundary. Do not call one tool merely to create the thought that determines the next obvious tool call.
 
-- After one `herdr_inspect` establishes workspace/pane/root identities, reuse those exact IDs and paths. Do not rediscover state that has not become stale.
+Within a wave, do not re-enter model planning between deterministic steps whose arguments and safety are already known. Put same-boundary shell/Git steps plus their local checks into one bounded `herdr_exec` when that is safer and cheaper than N remote calls. Re-plan only when new evidence changes later arguments/safety, a human action is required, or mutation delivery becomes uncertain.
+
+- Treat one `herdr_inspect` as the aggregate baseline for runtime, workspace, pane, Agent, project-root, and dirty-state facts. Reuse those exact IDs and paths instead of immediately rebuilding the same view with separate workspace/pane/agent/status calls.
 - Independent read-only operations should be issued concurrently when the client supports parallel tool calls. Examples: project-instruction reads, independent greps, Git facts, and unrelated file reads. Only serialize when one result determines the next call's arguments or safety decision.
 - Large `herdr_git status`/`diff`/`log`, successful large `herdr_exec` output, and `herdr_fs_grep` are already compacted (counts, directory or file grouping, exec head/tail). Plan from `counts`/`compacted` and the summarized `output`; do not re-call the same scope hoping for a full dump unless a specific path still needs detail.
 - Long build/test/process work belongs in `herdr_exec_start` / `herdr_exec_read`, not the visible utility pane or a blocking `herdr_exec`. The same rule applies to any command expected to need repeated polling across model turns. Treat the utility pane as a short-command / human-visible interaction surface, not durable evidence storage for a long test. `herdr_exec_start` returns `phase=started` plus `progress`; later waves poll `herdr_exec_read(offset=next_offset)` and read `progress` (`bytes_read`, `bytes_total`, `elapsed_ms`) until `phase=completed` (same moment as `running=false`), then record the final `exit_code`. Keep the `session_id` so a later model turn can continue reading the same session. If workstation `boot_id` or runtime identity changes, first inspect whether that session still exists; never infer the final exit code from stale pane scrollback.
@@ -75,7 +77,7 @@ Group the next tools into a small dependency-aware **wave** instead of calling o
 - For GitHub repository settings, PR mergeability, Auto-merge, required checks, and external deployment statuses, prefer `herdr_call(method="herdr_mcp.github.status", ...)` when the progressive bootstrap advertises it. It performs a fresh local authenticated `gh` read instead of trusting a possibly stale Connector projection. Pass the returned `fingerprint` back as `previous_fingerprint` while monitoring; unchanged state returns a compact `changed=false` response. Do not use `gh run watch` for planner polling when this method is available because its repeated full-screen snapshots waste context without adding evidence.
 - After the first state baseline, prefer `herdr_since(cursor)` for incremental workspace/agent changes instead of repeatedly calling full `herdr_inspect`.
 - Before doing a manual multi-call Git worktree/branch cleanup audit, prefer `herdr_call(method="herdr_mcp.cleanup.preview", params={"project_root":"<managed-root>"})` when the progressive bootstrap advertises it. The read-only preview aggregates worktrees/branches, dirty state, target reachability, live Herdr workspace/Agent occupancy, fresh GitHub branch identity, and open PR references without fetching or deleting anything. Treat `safe_to_delete=true` as conservative evidence, not mutation authority: re-check immediately before the actual lifecycle mutation, keep dirty/unmerged/occupied resources, and use an OID lease for remote branch deletion. A stale target ref or unavailable GitHub/resource evidence fails closed.
-- Treat Edge/Worker calls as a real shared request budget. A Web planner should optimize **logical work per remote call**, not create a call-per-thought loop: combine same-boundary deterministic shell/Git checks into one bounded `herdr_exec`; issue independent reads as one concurrent wave; batch Skill ids in one load; reuse `previous_fingerprint`, `next_offset`, and continuity/state cursors; and prefer compact summary methods over reconstructing the same answer with several calls. Do not poll an idle Agent, workspace, PR, or long task unless enough time or an event has passed for actionable state to have changed. When the live runtime says JSON-RPC batch or multi-operation arguments are unavailable, coalesce work through the existing supported operations rather than inventing a protocol batch. Mutation idempotency/delivery fencing and the final falsifiable verification still take precedence over saving a request.
+- Treat Edge/Worker calls as a real shared request budget. Optimize **logical work per remote call**: combine same-boundary deterministic work, batch Skill ids, reuse `previous_fingerprint` / `next_offset` / continuity cursors, and prefer compact private summary methods. Start long work once and read deltas only when completion or actionable progress could plausibly have changed. When the live runtime says JSON-RPC batch or multi-operation arguments are unavailable, coalesce through supported operations rather than inventing an unsafe protocol batch. Mutation fencing and final verification still outrank request savings.
 - Use `herdr_exec_read(offset=next_offset)` as a delta read. Never restart at offset 0 unless earlier output is actually needed again.
 - Prefer one `herdr_fs_patch` for a coherent multi-file mutation instead of a chain of tiny edits. Mutations in the same project remain ordered by default; independent isolated mutation lanes may proceed in parallel.
 - Do not call `herdr_methods` before every `herdr_call`; discover only the method/schema that is unknown, then reuse the known schema during the task.
@@ -84,11 +86,12 @@ Group the next tools into a small dependency-aware **wave** instead of calling o
 Target shape:
 
 ```text
-inspect once
-  -> independent read-only wave
-  -> ordered mutation(s) / long exec_start sessions
-  -> validation wave (exec_read deltas, git/grep compact views)
-  -> since(cursor) for incremental follow-up
+plan from known facts
+  -> one aggregate baseline when needed
+  -> one independent read wave
+  -> one or more safety-bounded execution bundles
+  -> one validation wave
+  -> event/delta follow-up only when change is expected
 ```
 
 Before discussing prior or multi-device project work, load `workstation-control` and resolve its `device -> project/workspace -> continuity/history -> live Git/runtime` sequence. When material product/engineering decisions remain unresolved after facts are read, load `requirements-grilling`. For non-trivial lane planning, load `development-orchestration`; it owns the five-beat execution cadence and Required/Advisory semantics, while `herdr_mcp.planning.advise` exposes compact machine-readable levels and live resource/candidate evidence.

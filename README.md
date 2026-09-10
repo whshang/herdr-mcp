@@ -30,7 +30,7 @@ The model keeps planning. Your computers keep the real state. Small tasks can ru
 ### Recommended: paste one sentence to your Agent
 
 ```text
-Install Herdr and herdr-mcp for me by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end: use the current stable GitHub Release, configure Cloudflare and ChatGPT, prefer a dedicated Cloudflare Custom Domain when my account already has one suitable active zone (otherwise keep workers.dev), keep R2 optional, verify the workstation network path, and pause only when I must personally sign in, create a Cloudflare Token, or authorize ChatGPT.
+Install Herdr and herdr-mcp by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md: plan dependencies first, combine all currently automatable work into as few safe execution steps as possible, use the current Stable GitHub Release, and pause only when I must personally sign in, authorize, or choose a Cloudflare Account/domain.
 ```
 
 The Agent checks the machine, installs Herdr and herdr-mcp, bootstraps the Worker on `workers.dev`, recommends/finalizes a Custom Domain before OAuth when your Cloudflare account has a suitable zone, starts the workstation connection, guides you through ChatGPT authorization, tests the actual network path, and proves the setup with a real MCP request. No domain is required: without one, the Link transparently falls back from direct `workers.dev` to an already-configured local proxy and then to the qualified shared Relay baseline when necessary.

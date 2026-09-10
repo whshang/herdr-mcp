@@ -1,128 +1,55 @@
 # Agent 安装
 
-*端到端 Agent 安装协议、Cloudflare 公网入口选择与可靠 Link 配置。*
+*给 Coding Agent 的最小端到端执行合同。人工细节见[安装手册](install.md)，故障诊断见[排障](troubleshooting.md)。*
 
-> **执行角色：Agent。** 本页是 herdr-mcp 普通工作站安装的唯一权威执行合同。Agent 直接读取并执行本文，不需要用户再把本文包装成一段“发给某个 Coding Agent”的提示词。用户只承担 Cloudflare 本人登录/API Token、无法自动判断的 Account 选择、ChatGPT Connector/OAuth 等必须本人完成的授权步骤。[安装参考](install.md) 只用于人工/运维查阅。
+> **执行角色：Agent。** 读取本页后直接执行。不要为了安装而递归阅读所有链接文档；只有遇到对应 blocker 时再打开详细手册。用户只负责必须由本人完成的登录、系统授权、Cloudflare Token 创建/账户或域名选择、ChatGPT OAuth。
 
-> 当前约束：完整的后台服务自动安装路径以 **macOS Apple Silicon** 为第一正式平台。Windows 可有 Release artifact 作为 preview。不要发明未支持的 Linux lifecycle 包装。Edge 部署可临时使用 Node/`wrangler`；本机 MCP runtime **必须**来自 GitHub Releases，而不是 `git clone` + `npm ci`。
+## 1. 执行规则
 
-## 0. Agent 合同
+1. **先规划，再调用。** 在第一次 mutation 前先在模型内部列清：当前机器/fleet 状态、必须由用户完成的边界、各步骤依赖关系和最终验收。把当前已知、互不依赖的读取组成一轮；同一项目、同一安全边界内的确定性 shell/Git 步骤尽量放进一个有界执行调用，并在该调用内部完成必要的局部校验。只有当结果会改变下一步参数/安全判断、需要用户动作，或 mutation 交付结果不确定时才重新规划。不要每执行一条命令就重新 `status`，也不要为了证明“没有变化”而轮询。
+2. **不破坏已有工作。** 禁止对无关 checkout 做 `reset --hard`、`clean -fd`、覆盖 dirty 文件或重建现有 fleet。
+3. **普通安装只用当前 Stable GitHub Release。** 不 clone 本仓库，不用 `npm`/`cargo` 构建本机 runtime；源码开发是另一条流程。
+4. **秘密只短暂使用。** Cloudflare Token 不回显、不写 Git、普通日志或 shell history；只通过当前进程环境或 CLI 隐藏输入传递。最终不要把本机 `HERDR_MCP_TOKEN` 或 Cloudflare Token 放进 ChatGPT。
+5. **不修改用户网络环境。** 可以复用已经存在的代理/网络配置，但不得自行切代理、改系统 DNS、改网络节点或创建通用代理。
+6. **只在人类边界暂停。** 可自动判断和执行的步骤继续做；需要 Cloudflare 登录/Token、macOS 权限确认、多个 Account/zone 无法安全选择，或 ChatGPT OAuth 时再一次性提示用户。
 
-1. 能自动化的 shell 步骤直接执行；只在 Cloudflare 交互登录 / API Token 创建、确实无法安全推断的 Account/zone 选择，或用户意图尚不明确时一次性确认是否采用推荐 Custom Domain，才暂停。
-2. 不破坏已有工作。禁止对无关 checkout 做 `reset --hard`、`clean -fd` 或覆盖用户修改。
-3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP 身份始终使用该入口。`workers.dev` 是零域名的 **bootstrap** 路径。所选 Cloudflare Account 只有一个明显 active zone 时，优先把 Custom Domain `herdr-mcp.<zone>` 作为稳定 production identity；有多个 materially different zones 时只问一次用哪个 zone；没有 active zone、用户不想使用、或 hostname 已与现有记录冲突时，直接继续 `workers.dev`，不得阻塞安装。Cloudflare Custom Domain 会自动创建对应 Worker DNS 记录和证书，正常路径不需要通用 DNS Write。Link transport 不得因后续连通性修复而静默改写已经选定的 OAuth issuer。
-4. Cloudflare Token 是高敏凭据。禁止回显或写入仓库、`.env`、普通日志、截图、shell history。优先进程环境注入；若必须落临时文件，用 mode `0600` 并在部署后立刻删除。用户可以把 Token 粘贴到当前 Agent 会话继续安装，不增加额外安全确认关卡，也不要用“绝对不能发到对话里”阻断安装。
-5. 每个 mutation 后先验证再继续。出错时先判断 mutation 是否已经提交，再决定是否重试。
-6. **不要**用 clone 本仓库或 `npm`/`cargo` 安装本机 MCP runtime，除非用户明确要求贡献者/从源码开发会话。
-7. 如果网络、登录状态或第三方服务不可用，停止并向用户报告 blocker；不要自行搭代理、切网络节点、修改系统代理或发明绕过路径。
+## 2. 先判断：第一台 Worker 还是加入已有 fleet
 
-## 0.5 Fleet 分类——只问一个快问题，默认第一台 Worker
+按以下顺序判断，不要反复询问：
 
-默认按**首次安装 / 第一台 Worker** 处理。不能因为本地 `~/.config/herdr-mcp` 目录为空就推断 fleet 意图，也不要反复盘问用户。
+- 用户已经给出 pairing address：这是**加入已有 Worker**，跳到 §5。
+- 本机已有有效的 Herdr device identity：保留现有 fleet，只做修复/验证，不新建 Worker。
+- 否则按**第一台 Worker**准备；拿到 Cloudflare Token 后，bootstrap 预检若发现该 Account 已有 Herdr Worker，则停止新 Worker mutation，要求由任意已登记设备创建 pairing，再走 §5。
+- **绝不能**在全新、尚未登记的电脑上运行 `herdr-mcp worker pair` 来探测 fleet。
+- existing-fleet 修复失败时不得 fallback 到随机后缀 Worker、第二套 R2 或第二个 Connector。
 
-- 如果用户已经提供 Herdr pairing address，这台电脑就是加入已有 Worker：安装/验证本机 runtime 与当前平台需要的权限后，执行 `herdr-mcp worker connect "<pairing-address>"`。跳过 Worker/R2/Connector 创建。
-- 否则先做能自动判断的事，而不是问：检查本机 runtime 是否已有已登记的 device identity；拿到 Cloudflare Token 后列出 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts` 看是否已有 Herdr Worker。若检测到已有 fleet，切换到[既有 fleet 流程](existing-worker-connect.md)。
-- 只有当无法自动检测到 fleet、用户也没给 pairing address 时，才只问一个问题：**创建第一个 Herdr Worker，还是加入已有 Herdr Worker？** 选择**加入已有 Worker** 必须先由已登记设备给出 pairing；选择**创建第一套 Worker**（默认）才继续 Cloudflare bootstrap，并仅在确实需要 Cloudflare 授权时暂停。
-- **绝不能**在当前正在安装的这台新电脑上执行 `herdr-mcp worker pair` 来“探测是否已有 fleet”。`worker pair` 必须先有凭据证明本机已经加入目标 Worker。全新机器如果既没有已登记的 device identity，也没有已有 Edge origin，应 fail closed，明确提示“首个 Worker 初始化”或“用 pairing address 执行 `worker connect`”，而不是暴露缺失平台 service/credential backend 的底层错误。
-- pairing、旧 Worker 升级、hostname 连通性或权限失败都仍属于 existing-fleet 修复路径。除非用户明确改变 fleet 意图，否则禁止 fallback 到随机后缀的新 Worker、R2 桶或 Connector。
+## 3. 本机安装阶段
 
-## 1. 前置条件
-
-运行 `herdr --version` 与 `herdr api schema >/dev/null`。需要可用的 `herdr` 与 Herdr socket（默认 `~/.config/herdr/herdr.sock`，或显式 `HERDR_SOCKET_PATH`）。若 Herdr 本身未安装/未运行，停下来并引导用户到 <https://herdr.dev>；herdr-mcp 不替代 Herdr。
-
-如果 Herdr 缺失，Agent 直接安装官方稳定版：
+先检查 `herdr`。缺失时安装官方稳定版：
 
 ```bash
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-Windows 使用 `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"`。安装后重新检查健康状态。
+Windows 使用官方 `install.ps1`。安装后验证 `herdr --version` 与 `herdr api schema`。
 
-**并行开始创建 Cloudflare Token。** 下载/安装 Herdr 与 herdr-mcp 的同时，打开 <https://dash.cloudflare.com/profile/api-tokens>（或把该 URL 交给用户），让 Token 在到达 §4 前就已就绪，减少串行等待。
-
-### PATH preflight：实际可执行文件与 shell PATH 分开检测
-
-在任何安装步骤之前做一次，安装完成后再做一次：
-
-1. 检查真实二进制：`ls -l ~/.local/bin/herdr-mcp ~/.local/bin/herdr`，存在则先用绝对路径执行。
-2. 单独检查用户交互 shell 的 PATH：`zsh -ic 'command -v herdr-mcp'`（或用户的登录 shell）。二进制存在但 `command -v` 为空，属于 **`installed_but_not_on_shell_path`**，不是「未安装」——不要重装，也不要制造第二个 PATH owner 或指向仓库的用户 CLI。
-3. 按顺序自修复：先 `export PATH="$HOME/.local/bin:$PATH"` 让当前进程不被阻塞；再持久化修复。zsh 使用 `line='export PATH="$HOME/.local/bin:$PATH"'`，并执行 `grep -Fqx "$line" "$HOME/.zprofile" 2>/dev/null || printf '\n%s\n' "$line" >> "$HOME/.zprofile"`；不能因为启动文件里出现其它 `.local/bin` 文本就误判精确 PATH 条目已经存在。如果不应修改 shell 启动配置，明确说明原因，并继续使用绝对路径。
-4. 继续之前分别证明：当前 shell 执行 `herdr-mcp --version`，新的交互 shell 执行 `zsh -ic 'command -v herdr && herdr --version'`，新的登录 shell 执行 `zsh -lc 'command -v herdr-mcp'`。否则 Agent 会话结束后就可能出现 `command not found`。
-
-### macOS 权限 preflight：在后台服务安装之前验证 TCC/FDA
-
-权限检查要放在 onboarding 前段——Cloudflare 工作之前——而不是装完才发现：
+然后从 <https://github.com/whshang/herdr-mcp/releases> 取得当前 **Latest stable** 的平台二进制，放入用户 `PATH`（推荐 `~/.local/bin/herdr-mcp`），并执行：
 
 ```bash
-herdr-mcp permissions status
-herdr-mcp permissions verify
-herdr-mcp doctor
-```
-
-`doctor` 权限结果为 `needs_setup`、`denied`、`unknown` 或 `timeout` 时，现在就停下来修复，不得当作健康。提前一次性完成稳定 TCC broker 的完全磁盘访问授权，才能避免之后 runtime、Herdr socket、项目访问反复逐路径弹权限。不要用 `sudo` 代替 broker 授权。
-
-普通安装和第一台 Worker 引导**不需要 Node.js**。Release 已包含 CI 构建好的 Edge artifact，`herdr-mcp worker bootstrap` 会通过 Cloudflare API 直接部署；Node/Wrangler 只保留给贡献者和维护者。
-
-规范公网 MCP URL 示例：`https://herdr-edge-device.username.workers.dev/mcp` 与 `https://herdr-mcp.example.com/mcp`。
-
-## 2. 从 GitHub Releases 安装原生 runtime（主路径）
-
-1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载当前 stable 平台二进制，以 GitHub 标记的 `Latest` stable Release 为准。只有明确测试 preview channel 时才选择 prerelease 标签。
-2. 放到 `PATH`（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。
-3. 执行：
-
-```bash
+herdr-mcp --version
 herdr-mcp install
 herdr-mcp doctor
-herdr-mcp status
-herdr-mcp update          # 下载并应用下一版 stable release
 ```
 
-`install` 会在 `~/.config/herdr-mcp/runtime/` 写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 指到 `runtime/current/herdr-mcp`。`herdr-mcp update` 是正常的一步升级入口；只有运维明确需要只读检查是否有新版本时才使用 `herdr-mcp update check`。优先使用以上顶层命令。不要把 `herdr-mcp service install` 写成普通安装主路径。
+如果 `~/.local/bin/herdr-mcp` 已存在但交互 shell 找不到它，只修复 PATH，不重复安装或创建第二个 CLI owner。
 
-macOS v0.4.3+ 首次安装还会准备固定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`。如果是交互式安装且尚未获得完全磁盘访问，系统设置会打开一次，由用户本人给这个 broker 授权。不要尝试用 `sudo` 代替这一步；`doctor` 若返回 `needs_setup`、`denied`、`unknown` 或 `timeout`，不得当作健康。应提示用户完成完全磁盘访问，然后重新执行 `herdr-mcp permissions verify` 和 `herdr-mcp doctor`。普通 runtime generation 更新会保留同一个 broker，不应再次要求授权。
+macOS 若 `permissions`/`doctor` 明确要求 Full Disk Access/TCC，由用户本人完成系统授权后继续验证；不要用 `sudo` 替代。Linux 使用 release 自带的受支持 user-service / process backend，不套用 macOS launchd 假设。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
 
-只有明确测试 prerelease build 时才使用 `update.channel = "preview"`。当前 stable runtime 使用默认 `stable` channel 即可。
+## 4. 第一台 Worker：Cloudflare + bootstrap
 
-## 3. 在内存中生成身份，不要打印秘密
+需要 Token 时打开 <https://dash.cloudflare.com/profile/api-tokens>。推荐 Cloudflare 的 **Edit Cloudflare Workers** 模板，限定到本次使用的 Account；核心路径需要 Workers Scripts 等 Worker 管理权限。**Workers R2 Storage 是可选能力**，只有用户明确启用 artifact relay 时才增加，不得因为 R2 未开通而阻塞安装。
 
-在 Agent 内存中生成：`HERDR_MCP_TOKEN` 与 `LINK_SHARED_SECRET`。**不要**自造 `WORKSTATION_ID`/device id。设备身份契约归 runtime 所有：不可变的 `device_id` 形如 `dev_` + 一个 canonical 26 字符 Crockford ULID（例如 `dev_01ARZ3NDEKTSV4RRFFQ69G5FAV`），在 onboarding/pairing 时自动生成。hostname 派生的自由格式 workstation 标识只是遗留部署变量，不是设备身份——pairing 会生成并校验真正的那个。
-
-人类可读的电脑名（例如 macOS Computer Name）是独立的显示名。它默认作为 `worker connect` 的 `--name`，之后可用 `worker rename` 改名，永远不会改变不可变的 `device_id`。
-
-`herdr-mcp worker bootstrap` 会在 runtime 内部按同一套有界 DNS-label 规则从本机电脑名派生 Worker 名。Agent 不需要源码 checkout、Node.js 或单独生成 `WORKER_NAME`。Cloudflare Worker 命名与 canonical `dev_<ULID>` 设备身份继续使用不同语法；bootstrap 生成的秘密不会出现在普通输出中。
-
-## 4. Cloudflare 授权
-
-有浏览器控制时打开 <https://dash.cloudflare.com/profile/api-tokens>；否则把该 URL 交给用户。
-
-最简单支持路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板。**Account Resources** 选本次安装使用的单个 Account，**Zone Resources** 选 **All zones**。该模板已经包含推荐 Custom Domain route 所需的 Worker script 与 **Workers Routes Write** 权限，不需要通用 DNS Write。**核心安装不需要 R2**，不能因为未开通 R2 或账户没绑卡而失败。只有用户明确启用可选 artifact relay（§6）时才加 Account → **Workers R2 Storage → Edit**。不要超出所选路径实际需要的权限。
-
-更紧的自定义 token 至少保留 Account → **Workers Scripts → Write/Edit**、Account → **Account Settings → Read**、User → **Memberships → Read**、User → **User Details → Read**。读取账户 `workers.dev` subdomain 需要 `Account Settings → Read`。要发现并绑定 Custom Domain，再增加 Zone → **Zone → Read** 与 Zone → **Workers Routes → Write/Edit**，能限定到目标 zone 时就不要放大范围。正常 Custom Domain 路径**不要**增加 Zone → DNS Write。用户之后启用 artifact relay 时再加 Account → **Workers R2 Storage → Edit**。
-
-用户可以把 Token 粘贴到当前 Agent 会话继续安装。Agent 不得回显、不得写入 Git 或普通日志，只能注入当前进程。不增加额外安全确认关卡。
-
-## 5. Token 到达后的 Cloudflare 预检
-
-API Token fallback 只放在当前进程环境或 bootstrap 的隐藏输入中，绝不能写成命令行字面量。`herdr-mcp worker bootstrap` 会验证 `/user/tokens/verify`、解析 Account 与 `workers.dev` subdomain、检查已有 Worker scripts，并直接通过 Cloudflare API 完成部署；普通 onboarding 不运行 Wrangler。
-
-- 一个 Account → 自动选择；
-- 多个 Account → 只问要用哪个 Account 名；
-- Token 无效/权限不足 → 停止 mutation 并指出具体缺哪个权限。
-
-Token 可以验证为**有效**（`/user/tokens/verify` 返回 active）却仍在具体调用上得到 `403`——这说明缺权限，不是 token 坏了。先把失败调用映射到权限，再补授权，不要盲目重建一个更大的 token：
-
-- `GET .../workers/subdomain` 返回 403 → 缺 **Account Settings → Read**；
-- Worker Script upload / Workers Scripts 调用失败 → 缺 **Workers Scripts → Edit**；
-- R2 桶 provisioning 失败 → 未授予可选的 **Workers R2 Storage → Edit**（核心安装本来就不需要；只有用户明确启用 artifact relay 时才算错误）。
-
-按权限诊断，不要无根据扩大权限；补齐权限之前不要重试 mutation。
-
-**部署前的已有 Worker 检测。** 拿到 `ACCOUNT_ID` 后先列 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts`。如果那里已有 Herdr Worker，立即停止部署路径，切换到[多设备控制](existing-worker-connect.md)的既有 fleet 流程（由任意已登记设备创建 pairing，本机执行 `worker connect`）。绝不能拿当前这台全新机器执行 `worker pair` 来探测 fleet。只有 §0 得到明确「第一台」答复后才允许部署新 Worker。
-
-选定 Account 后，bootstrap 只在进程内存里保留 account id 与 Cloudflare credential。它通过 Cloudflare API 读取或创建账户 `workers.dev` subdomain，已有 subdomain 永不改名。canonical `workers.dev` origin 为 `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`。
-
-## 6. 通过已安装 runtime 部署 Edge
+Token 仅放入当前进程的 `CLOUDFLARE_API_TOKEN` 或交给 `worker bootstrap` 的隐藏输入。不要把 Token 写进命令行字面量、配置仓库或普通日志。
 
 直接运行：
 
@@ -130,86 +57,56 @@ Token 可以验证为**有效**（`/user/tokens/verify` 返回 active）却仍�
 herdr-mcp worker bootstrap
 ```
 
-普通 first-Worker 路径不需要源码 checkout、`wrangler.user.toml`、Node.js、npm 或用户侧 Wrangler。Release pipeline 已提前构建 `herdr-edge-<version>.mjs`。bootstrap 会下载精确匹配的 release manifest 与 Edge artifact，要求 release source commit 与当前 runtime 一致，校验大小、SHA-256 和 GitHub artifact attestation，再通过 Cloudflare Worker API 直接上传模块。
+这个命令负责 Cloudflare API 预检、Account / `workers.dev` subdomain、现有 Herdr Worker 检测、release manifest 与 `herdr-edge-<version>.mjs` artifact attestation、Worker/DO bootstrap、首台 canonical device enrollment、credential 保存以及 production Link 对齐。普通用户路径不运行 Wrangler，也不需要源码 checkout。
 
-对真正空的 Herdr setup，同一个命令继续完成整个状态机：配置三个 Durable Object bindings 与首次 migrations，写入非秘密 Worker variables，启用 Worker `workers.dev` subdomain，配置 cron trigger，provision bootstrap secrets，创建并消费首次 pairing，把 canonical `dev_<ULID>` credential 写入本机，删除临时 operator credential，安装/对齐 production Link，并要求最终 readiness 全部通过。Worker 代码只部署一次；canonical device enrollment 不会触发第二次 Worker 部署。
+公网入口只在 Connector 创建前确定一次：
 
-**R2 继续可选且默认关闭。** 核心 Worker upload 不含 `ARTIFACT_BUCKET` binding，不要求 R2 subscription 或绑卡。可选 artifact relay 在核心安装健康后作为独立 operator 操作处理。
+- Account 只有一个明显合适的 active zone，优先使用专用 Custom Domain，例如 `https://herdr-mcp.example.com/mcp`；
+- 多个 materially different zones 时只问一次用户选哪个；
+- 没有合适 zone、用户不想使用或 hostname 冲突时，直接保留 `workers.dev`，例如 `https://herdr-edge-device.username.workers.dev/mcp`。
 
-bootstrap 先证明 `workers.dev` origin。选定的 Cloudflare Account 有合适 active zone 且用户希望使用稳定 Custom Domain 时，在创建 ChatGPT Connector 前按 Cloudflare Custom Domain 文档固化最终 public origin。Worker 代码部署与 public-origin/DNS 修改继续分开；不要让 Connector 先绑定一个 origin 再静默迁移。
+正常 Custom Domain 路径不要求通用 DNS Write。后续网络修复不得静默改变已经选定的 OAuth/MCP public origin。
 
-绝不能覆盖无关的已有 Worker。mutation gate 打开前先分类已有 scripts：属于本次但未完成的 bootstrap 就恢复；已有 Herdr fleet 就切到 pairing/connect；所有权不明确就 fail closed。
+## 5. 加入已有 Worker
 
-## 7. macOS 本机 MCP 服务所有权
-
-优先使用已安装的 Release 二进制路径：
+已登记设备先生成 pairing；新电脑只消费 pairing：
 
 ```bash
-herdr-mcp install
+herdr-mcp worker connect "<pairing-address>"
+```
+
+CLI 要求 6 位验证码时再向用户索取。设备显示名默认来自电脑名；只有用户明确要求时才传 `--name`。这一流程不部署新 Worker、不创建第二个 Connector，也不需要把现有 fleet 的长期秘密复制到新电脑。
+
+详见[加入已有 fleet](existing-worker-connect.md)。
+
+## 6. Link 与网络
+
+`worker bootstrap` / `worker connect` 会建立单设备凭据并对齐 production Link。Agent 只需要验证：
+
+```bash
 herdr-mcp status
 herdr-mcp doctor
+herdr-mcp link status
 ```
 
-不要重建指向仓库的 `~/.local/bin/herdr-mcp` bridge。不要把 LaunchAgent 指到 git checkout 或 `target/*/herdr-mcp`。
+没有 Custom Domain 时，Link 会使用项目已支持的 `workers.dev` 直连、已有本地代理和 qualified shared Relay fallback；Agent 不需要自己拼 transport ladder。配置了 Custom Domain 时按已选定入口验证，不为了“探测变绿”改系统网络。
 
-macOS 正常安装已由托管服务 `dev.herdr-mcp.herdr-supervisor` 保持 Herdr server 可用，不要让普通用户手动运行 `herdr server`。
+## 7. 最终验收
 
-浏览器扩展 / Native Messaging 仍是可选项，不是第一条 ChatGPT 闭环的必需。扩展通道与 Runtime DEV/PROD 分开建模：**STORE / STANDALONE / DEV**。
+把读操作尽量合并成一轮最终验证，不要在每个安装步骤后重复同一组检查。完成必须同时证明：
 
-- STORE：普通用户默认，Chrome Web Store 固定身份与更新。
-- STANDALONE：v0.4.3+ 的 GitHub/手动固定身份 package；Store 不可用或用户明确要求独立分发时使用。
-- DEV：仅源码开发，Load unpacked repo/worktree `extension/`，ID 路径派生。
+- `herdr-mcp status` / `doctor` 健康；
+- `herdr-mcp link status` 显示已登记 production Link 在线；
+- canonical public origin 的 `/health` 与 OAuth discovery 正常；
+- 本机存在 canonical `dev_<ULID>` device identity；
+- 一条真实认证 MCP 请求能够从公网 origin 往返到当前工作站。
 
-Agent 必须先读取当前 runtime 实际支持的 `native-host` 命令；v0.4.2 只有 Store/DEV，不得虚构 standalone。STANDALONE 是独立于源码开发的分发通道，DEV 仍仅用于源码开发。托管 Chromium Native Messaging host 当前属于 macOS 集成；Linux 的核心 runtime / Link / Connector 不依赖它，因此 Linux 跳过 native-host 安装。macOS 上支持该能力的 runtime 使用 `herdr-mcp native-host use standalone` 显式切换。选择并安装通道后执行：
+随后引导用户在 ChatGPT 中开启需要的 Developer Mode，使用最终 `.../mcp` 地址创建 `herdr` Connector 并完成 OAuth。ChatGPT 授权是最后一个必须由用户本人完成的边界。
 
-```bash
-herdr-mcp native-host status
-```
+Chrome 扩展 / Native Messaging 是可选增强，不是核心 Connector 安装前置。用户需要浏览器连续工作、接力或 Control Center 时再按[扩展文档](extension.md)安装；扩展分发和开发细节留在扩展文档中。
 
-状态应明确显示预期 active channel / extension identity，并确认 Native Host runtime 与当前 runtime generation 一致。详见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
+## 8. 清理与报告
 
-## 8. macOS/Linux 持久 Herdr Link
+结束时 unset `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`，删除临时凭据文件。只报告非敏感事实：runtime version、device name/id（可缩短展示）、Worker 名、最终 public origin、Link 状态、`/health`、OAuth 与 MCP E2E 结果。
 
-v0.4.8 的正常已登记设备不要再手工配置 `LINK_SHARED_SECRET`。`worker bootstrap` / `worker connect` 会创建单设备凭据，并写入平台 credential backend：macOS 使用 Keychain，Linux 使用用户私有的 `0700`/`0600` credential store。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link lifecycle。不要把 production Link 所有权留在仓库 Bash 包装上。
-
-Agent 应该自己探测网络可达性，而不是让用户先选择 transport。执行 `herdr-mcp doctor`、`herdr-mcp link status`，并对最终 public origin / backing `workers.dev` 做有界 `/health` 探测。Link 会复用用户环境里**已经存在**的代理配置，识别优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 也会读取现有 `scutil --proxy` 状态（HTTPS、HTTP、SOCKS）。支持 `socks5://`/`socks5h://`（remote-DNS 语义），不支持代理认证；macOS PAC 只检测不执行。
-
-transport 选择默认无感完成：配置了 Custom Domain 时，Link 使用这条稳定 direct path，不使用共享 Relay Pool；没有 Custom Domain 时，依次尝试 direct `workers.dev` → 已经配置并验证的本地代理 → 内置已验收的 Herdr Relay baseline（Deno 为主、Supabase fallback），若本机存在更新且有效的签名 Relay Pool cache，则完整覆盖 baseline。用户不需要 Deno/Supabase 账号，也不需要配置 Relay URL。不要为了让探测变绿而自行修改系统代理、网络节点、DNS 或已经选定的公网 identity。
-
-## 9. 验证闭环
-
-验证本机 `server/discover`、`herdr-mcp status`、`herdr-mcp doctor`、Link status、Worker `/health`、公网 `/mcp`、OAuth discovery，并同时记录 bootstrap `workers.dev` origin 与最终 canonical public origin。选择了 Custom Domain 就必须在注册 Connector 前证明该 hostname；最终使用 `workers.dev` 时，则证明公网 identity 健康，并确认 `link status` 能看到可用的自动 fallback ladder / Relay candidate pool。doctor 可在不发送 token 的前提下探测 Edge `/health`、OAuth metadata、`/mcp`；永远不要打印 token。
-
-**完成条件。** 只有以下全部成立，安装才算完成：
-
-- **runtime/permissions：**`herdr-mcp status` 与 `herdr-mcp doctor` 健康，macOS 权限（TCC/FDA）已授予；
-- **Link：**`herdr-mcp link status` 显示已登记的生产 Link 在线；
-- **Edge/OAuth：**canonical public origin 通过 `/health` 与 OAuth discovery，ChatGPT Connector 已注册到该 origin；
-- **canonical device：**本机有不可变 `device_id` 并已加入 Worker；
-- **authenticated MCP E2E：**一条真实认证的 MCP 请求通过公网 origin 往返到工作站成功；
-- **operational_ready：**工作站上报可运行状态。
-
-cutover seal 是 maintainer-only 的产物；普通安装不产生也不需要它。
-
-### 区分 Worker 健康与 hostname/网络路径健康
-
-一类探测证明不了两件事，要分开读：
-
-- **Worker 代码健康**：origin 对 `GET /health` 返回 200，未认证的 `GET /mcp` 返回预期的 401。这证明已部署的 Worker、路由与 OAuth metadata——无论哪个 hostname 应答。
-- **hostname/DNS/网络路径故障**：超时、DNS 解析失败、TLS/SNI 失败或被过滤，而同一 Worker 的另一个 hostname 可用（例如 `*.workers.dev` 超时而该 Worker 的 Custom Domain 返回 200，或相反）。这是传输路径问题，不是 Worker 缺陷：绝不用重新部署 Worker 或创建第二个 Worker/R2/Connector 来「修」它。
-
-所选 Cloudflare Account 已有 active zone 时，优先建议专用 Custom Domain 作为稳定 production origin，并在客户端接入前完成配置；没有合适 zone 或用户不使用时，继续以 `workers.dev` 为 production origin，网络路径问题由 Link 自动 fallback（direct → 已验证本地代理 → qualified shared Relay）。连通性修复不得顺带改名或迁移 OAuth issuer。
-
-## 10. 清理 bootstrap Token
-
-Unset `CLOUDFLARE_API_TOKEN` 与 `CLOUDFLARE_ACCOUNT_ID`，删除临时凭据文件和不再需要的临时 Edge checkout。不要把 Token 拷进项目配置。若是一次性 Token，建议吊销；否则迁到专用密钥管理/CI secret。
-
-## 11. 最终报告
-
-只回报非敏感事实：已安装 runtime generation/version、本机 MCP 状态、Herdr Link 状态、Cloudflare Account 名 + 缩短 ID、Worker 名、bootstrap `workers.dev` origin、最终 canonical public origin（Custom Domain 或 `workers.dev`）、所选 Link transport/fallback readiness、`/health`、`/mcp`。
-
-最后引导用户开启 ChatGPT Developer mode，用 `/mcp` 创建自定义 MCP Connector 并完成 OAuth。永远不要把本机 `HERDR_MCP_TOKEN` 或 Cloudflare Token 粘贴进 ChatGPT。
-
-## 附录：仅开发者从源码
-
-只有在用户明确要求开发 herdr-mcp 本身时，才允许 clone + `npm`/`cargo`。该路径不得作为普通工作站的主 runtime 安装。
+遇到权限、网络、OAuth、已有 Worker ownership 或 mutation 交付不确定时，进入对应[安装手册](install.md)或[排障](troubleshooting.md)章节；不要把整份维护手册提前搬进执行上下文。

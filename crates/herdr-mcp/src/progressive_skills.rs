@@ -995,14 +995,22 @@ impl ProgressiveSkillService {
             "request_budget": {
                 "goal": "minimize Edge/Worker round trips without weakening mutation safety or verification",
                 "default_strategy": "coalesce logical work into the fewest high-value supported calls",
+                "planning_gate": "before the first remote call, derive the next dependency-aware call wave from facts already known",
+                "call_admission": [
+                    "obtain evidence that can change the next decision",
+                    "execute work whose arguments and safety boundary are already known",
+                    "verify a falsifiable acceptance boundary"
+                ],
+                "default_shape": "baseline -> independent read wave -> execution bundle -> verification wave -> event/delta follow-up only when change is expected",
                 "rules": [
-                    "inspect once, then use herdr_since only when a workspace/Agent change is expected",
-                    "group independent reads into one dependency-aware wave instead of serial inspect/read/replan loops",
-                    "combine coherent deterministic shell/Git steps in one bounded herdr_exec when they share the same project and safety boundary",
+                    "treat herdr_inspect as an aggregate baseline for runtime, workspace, pane, Agent, project-root, and dirty-state facts; do not immediately rebuild those same views with separate list/status calls",
+                    "group independent reads into one dependency-aware wave instead of serial call/replan loops",
+                    "when deterministic shell/Git arguments are already known and share one safety boundary, execute them in one bounded herdr_exec and perform intermediate local checks inside that call instead of returning to the model after every command",
                     "load multiple required Skill ids in one herdr_mcp.skill.load call and keep unchanged Skill content sticky",
                     "reuse github.status previous_fingerprint and exec_read next_offset; unchanged state and already-read output are not fetched again",
                     "prefer summary private methods such as cleanup.preview over rebuilding the same view with many MCP calls",
-                    "do not poll idle state or emit planner heartbeats; poll long work only at a cadence where completion or actionable progress could have changed",
+                    "start long work once and read only deltas when completion or actionable progress could plausibly have changed; do not poll idle state or emit planner heartbeats",
+                    "re-plan only when a result changes later arguments or safety, a human action is required, or mutation delivery is uncertain",
                     "use protocol/server-side batching only when live capabilities advertise it; never simulate unsafe mutation batching"
                 ],
                 "capability_source": "live runtime context is authoritative for JSON-RPC batch, multi-operation arguments, and concurrency"
@@ -2379,6 +2387,21 @@ mod tests {
         assert_eq!(
             bootstrap["request_budget"]["default_strategy"],
             "coalesce logical work into the fewest high-value supported calls"
+        );
+        assert_eq!(
+            bootstrap["request_budget"]["planning_gate"],
+            "before the first remote call, derive the next dependency-aware call wave from facts already known"
+        );
+        assert_eq!(
+            bootstrap["request_budget"]["call_admission"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            bootstrap["request_budget"]["default_shape"],
+            "baseline -> independent read wave -> execution bundle -> verification wave -> event/delta follow-up only when change is expected"
         );
         assert_eq!(
             bootstrap["request_budget"]["capability_source"],

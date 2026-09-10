@@ -30,7 +30,7 @@ Cloudflare Edge
 ### 推荐：给 Agent 一句话
 
 ```text
-帮我安装 Herdr 和 herdr-mcp，请完整按照 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 执行：使用当前 Stable GitHub Release，完成 Cloudflare 和 ChatGPT 配置；如果我的 Cloudflare 账户已有合适的 active zone，优先使用专用 Custom Domain，否则保留 workers.dev；R2 保持可选；自动检测工作站网络路径，只在必须由我本人登录、创建 Cloudflare Token 或授权 ChatGPT 时暂停。
+帮我安装 Herdr 和 herdr-mcp，按 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 执行：先规划依赖，再尽量合并执行所有可自动化步骤；使用当前 Stable GitHub Release，只在必须由我本人登录、授权或选择 Cloudflare Account/域名时暂停。
 ```
 
 Agent 会检查电脑环境、安装 Herdr 和 herdr-mcp，先用 `workers.dev` bootstrap Worker；Cloudflare Account 有合适 zone 时，会在 OAuth/Connector 固化前优先建议并完成 Custom Domain；随后启动开发机连接、指导你完成 ChatGPT 授权，自动验证实际网络路径，并用真实 MCP 请求验收。没有域名也不会卡住：Link 会在需要时从 direct `workers.dev` 无感切到已有本地代理，再到已验收的共享 Relay fallback。

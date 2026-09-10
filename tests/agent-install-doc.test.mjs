@@ -47,21 +47,18 @@ test("Agent install resolves fleet existence before any Cloudflare mutation", ()
   const en = read("docs/i18n/en/agent-install.md");
   const zh = read("docs/i18n/zh-CN/agent-install.md");
 
-  assert.ok(en.indexOf("Fleet classification") >= 0);
-  assert.ok(en.indexOf("Fleet classification") < en.indexOf("## 4. Cloudflare authorization"));
-  assert.ok(zh.indexOf("Fleet 分类") >= 0);
-  assert.ok(zh.indexOf("Fleet 分类") < zh.indexOf("## 4. Cloudflare 授权"));
+  assert.ok(en.indexOf("first Worker or existing fleet") >= 0);
+  assert.ok(en.indexOf("first Worker or existing fleet") < en.indexOf("## 4. First Worker"));
+  assert.ok(zh.indexOf("第一台 Worker 还是加入已有 fleet") >= 0);
+  assert.ok(zh.indexOf("第一台 Worker 还是加入已有 fleet") < zh.indexOf("## 4. 第一台 Worker"));
 
   for (const doc of [en, zh]) {
     assert.match(doc, /herdr-mcp worker pair/);
     assert.match(doc, /herdr-mcp worker connect "<pairing-address>"/);
     assert.match(doc, /(?:default|默认)[^\n]*--name|--name[^\n]*(?:default|默认)/i);
-    assert.match(doc, /~\/\.config\/herdr-mcp/);
-    assert.match(doc, /export PATH="\$HOME\/\.local\/bin:\$PATH"/);
-    assert.match(doc, /grep -Fqx/);
-    assert.match(doc, /zsh -ic 'command -v herdr && herdr --version'/);
     assert.match(doc, /random-suffixed Worker|随机后缀[^\n]*Worker/);
     assert.match(doc, /first[- ](?:Worker|fleet)|第一(?:台|套)[^\n]*Worker/i);
+    assert.doesNotMatch(doc, /grep -Fqx|zsh -ic/);
   }
 
   for (const rel of ["docs/i18n/en/existing-worker-connect.md", "docs/i18n/zh-CN/existing-worker-connect.md"]) {
@@ -75,32 +72,27 @@ test("Agent install resolves fleet existence before any Cloudflare mutation", ()
 
 test("Agent install guide makes the bootstrap Token ephemeral and DNS-free", () => {
   const en = read("docs/i18n/en/agent-install.md");
-  assert.match(en, /Never echo it/);
+  assert.match(en, /Never echo a Cloudflare Token/);
   assert.match(en, /shell history/);
   assert.match(en, /Unset `CLOUDFLARE_API_TOKEN`/);
-  assert.match(en, /No Zone\/DNS mutation is required/);
+  assert.match(en, /does not require generic DNS Write/);
 });
 
-test("maintainer install keeps deterministic Worker/bootstrap details while end-user entry stays short", () => {
+test("Agent install stays concise while preserving the executable bootstrap contract", () => {
   for (const rel of ["docs/i18n/en/agent-install.md", "docs/i18n/zh-CN/agent-install.md"]) {
     const doc = read(rel);
-    assert.match(doc, /GitHub Releases/);
+    assert.ok(doc.length < 10_000, `${rel} should stay a compact execution contract`);
+    assert.match(doc, /GitHub Releases?/);
     assert.match(doc, /herdr-mcp install/);
     assert.doesNotMatch(doc, /## 2\.[^\n]*\n[\s\S]*?git clone https:\/\/github\.com\/whshang\/herdr-mcp/);
     assert.match(doc, /herdr-mcp worker bootstrap/);
     assert.doesNotMatch(doc, /scripts\/cloudflare-worker-name\.mjs/);
     assert.doesNotMatch(doc, /npx wrangler/);
-    assert.match(doc, /WORKER_NAME/);
-    assert.match(doc, /ACCOUNT_SUBDOMAIN/);
     assert.match(doc, /Cloudflare[^\n]*API/);
-    assert.match(doc, /Chrome Web Store/);
-    assert.match(doc, /STANDALONE/);
-    assert.match(doc, /DEV/);
-    assert.match(doc, /v0\.4\.2/);
     assert.match(doc, /extension/);
-    assert.match(doc, /herdr-mcp native-host status/);
     assert.match(doc, /Native Messaging/);
     assert.match(doc, /HERDR_MCP_TOKEN/);
+    assert.doesNotMatch(doc, /native-host use standalone|HERDR_LINK_PROXY|STANDALONE|v0\.4\.2/);
   }
   for (const rel of ["docs/i18n/en/install.md", "docs/i18n/zh-CN/install.md"]) {
     const doc = read(rel);
@@ -118,7 +110,7 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
   }
 });
 
-test("quick Agent protocols automate Herdr/runtime and preserve STORE STANDALONE DEV boundaries", () => {
+test("quick Agent protocols plan once, batch safe work, and keep optional details out of the hot path", () => {
   for (const rel of [
     "docs/i18n/en/agent-install.md",
     "docs/i18n/zh-CN/agent-install.md",
@@ -126,20 +118,18 @@ test("quick Agent protocols automate Herdr/runtime and preserve STORE STANDALONE
     const doc = read(rel);
     assert.match(doc, /herdr\.dev\/install\.(?:sh|ps1)/);
     assert.match(doc, /GitHub Releases?/);
-    assert.match(doc, /HERDR_LINK_PROXY/);
-    assert.match(doc, /Chrome Web Store/);
-    assert.match(doc, /STANDALONE/);
-    assert.match(doc, /DEV/);
-    assert.match(doc, /v0\.4\.2/);
-    assert.match(doc, /native-host use standalone/);
+    assert.match(doc, /Plan before calling tools|先规划，再调用/);
+    assert.match(doc, /one bounded execution call|一个有界执行调用/);
+    assert.match(doc, /Re-plan only|只有当结果会改变/);
     assert.doesNotMatch(doc, /herdr-mcp-extension/);
     assert.doesNotMatch(doc, /cp -R extension|ln -s .*extension/);
-    assert.match(doc, /source-development|源码开发/);
-    assert.match(doc, /Do not build a proxy|不要自行搭代理/);
+    assert.match(doc, /source development|源码开发/);
+    assert.match(doc, /Do not change the user's network environment|不修改用户网络环境/);
     assert.match(doc, /herdr-edge-device\.username\.workers\.dev\/mcp/);
     assert.match(doc, /herdr-mcp\.example\.com\/mcp/);
     assert.match(doc, /workers\.dev/);
     assert.match(doc, /custom domain|自定义域名/i);
+    assert.doesNotMatch(doc, /HERDR_LINK_PROXY|HTTPS_PROXY|ALL_PROXY|native-host use standalone/);
     assert.doesNotMatch(doc, /second-mac-agent-prompt/);
   }
 });
