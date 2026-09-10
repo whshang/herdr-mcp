@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,7 @@ const RUNTIME_TOKEN_SERVICE: &str = "herdr-mcp-local-runtime";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const PROCESS_RECORD_SCHEMA: u32 = 1;
 const PROCESS_RECORD_MAX_BYTES: u64 = 16 * 1024;
+const STARTUP_LOG_TAIL_BYTES: u64 = 8 * 1024;
 const HEALTH_BUDGET: Duration = Duration::from_secs(12);
 const PROCESS_STOP_BUDGET_MS: u32 = 5_000;
 const RUNTIME_KIND: &str = "runtime";
@@ -46,6 +47,8 @@ struct WindowsPaths {
     current_generation: PathBuf,
     runtime_process: PathBuf,
     link_process: PathBuf,
+    runtime_log: PathBuf,
+    link_log: PathBuf,
     link_enabled: PathBuf,
     port: u16,
     herdr_socket: PathBuf,
@@ -71,6 +74,8 @@ impl WindowsPaths {
             current_generation: current_dir.join("generation"),
             runtime_process: runtime_root.join("windows-runtime-process.json"),
             link_process: runtime_root.join("windows-link-process.json"),
+            runtime_log: runtime_root.join("windows-runtime-startup.log"),
+            link_log: runtime_root.join("windows-link-startup.log"),
             link_enabled: runtime_root.join("windows-link-enabled"),
             current_dir,
             port: runtime.instance.default_port(),
@@ -406,6 +411,7 @@ fn start_runtime(paths: &WindowsPaths) -> Result<(), String> {
         RUNTIME_KIND,
         &["candidate", "--port", &port],
         &paths.runtime_process,
+        &paths.runtime_log,
     )?;
     if let Err(error) = wait_for_health(paths) {
         if spawned {
@@ -420,7 +426,13 @@ fn start_link(paths: &WindowsPaths) -> Result<(), String> {
     if !health_once(paths.port) {
         return Err("Windows Link activation requires a healthy local runtime".to_owned());
     }
-    start_managed_process(paths, LINK_KIND, &["link", "run"], &paths.link_process)?;
+    start_managed_process(
+        paths,
+        LINK_KIND,
+        &["link", "run"],
+        &paths.link_process,
+        &paths.link_log,
+    )?;
     thread::sleep(Duration::from_millis(250));
     if managed_process_active(&paths.link_process, LINK_KIND)? {
         Ok(())
@@ -441,6 +453,7 @@ fn start_managed_process(
     kind: &str,
     args: &[&str],
     record_path: &Path,
+    log_path: &Path,
 ) -> Result<bool, String> {
     if let Some(record) = read_process_record(record_path, kind)? {
         if process_record_active(&record)? {
@@ -454,12 +467,16 @@ fn start_managed_process(
         return Err("Windows runtime/current binary is missing".to_owned());
     }
 
+    let log = open_startup_log(log_path, kind)?;
+    let stderr = log
+        .try_clone()
+        .map_err(|error| format!("cannot clone Windows {kind} startup log handle: {error}"))?;
     let mut command = Command::new(&paths.current_binary);
     command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
         .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
         .env_remove("CLOUDFLARE_API_TOKEN")
         .env_remove("CLOUDFLARE_ACCOUNT_ID")
@@ -1070,12 +1087,58 @@ fn wait_for_health(paths: &WindowsPaths) -> Result<(), String> {
         if health_once(paths.port) {
             return Ok(());
         }
+        if !managed_process_active(&paths.runtime_process, RUNTIME_KIND)? {
+            return Err(format!(
+                "Windows Herdr MCP runtime exited before becoming healthy on 127.0.0.1:{}{}",
+                paths.port,
+                startup_log_diagnostic(&paths.runtime_log)
+            ));
+        }
         thread::sleep(Duration::from_millis(250));
     }
     Err(format!(
-        "Windows Herdr MCP runtime did not become healthy on 127.0.0.1:{}",
-        paths.port
+        "Windows Herdr MCP runtime did not become healthy on 127.0.0.1:{}{}",
+        paths.port,
+        startup_log_diagnostic(&paths.runtime_log)
     ))
+}
+
+fn open_startup_log(path: &Path, kind: &str) -> Result<File, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create Windows {kind} log directory: {error}"))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| format!("cannot open Windows {kind} startup log: {error}"))
+}
+
+fn startup_log_diagnostic(path: &Path) -> String {
+    match read_startup_log_tail(path) {
+        Ok(text) if text.trim().is_empty() => String::new(),
+        Ok(text) => format!("; startup log tail: {}", text.trim()),
+        Err(error) => format!("; startup log unavailable: {error}"),
+    }
+}
+
+fn read_startup_log_tail(path: &Path) -> Result<String, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+        .len();
+    let start = len.saturating_sub(STARTUP_LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("cannot seek {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(STARTUP_LOG_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn health_once(port: u16) -> bool {
