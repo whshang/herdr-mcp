@@ -12,7 +12,7 @@
 
 为了实现上述用户可见功能，扩展在受支持的 Web AI 页面上可能处理：
 
-- **网站内容与个人通信内容：** 为连续工作、排队消息、对话接力/恢复、可选 LLM 分析，以及下文所述的用户触发接力兜底所需的对话文本和页面状态。
+- **网站内容与个人通信内容：** 为连续工作、排队消息、对话接力/恢复、可选 LLM 分析，以及下文所述的用户触发接力备用路径所需的对话文本和页面状态。
 - **网页访问活动：** 当前受支持站点的 URL、由 URL 推导出的 conversation/project 标识，以及把当前页面与 Herdr workspace 对应起来所需的有限导航状态。扩展不会建立或出售通用浏览历史画像。
 - **用户活动：** 回合生成/提交/结束/恢复时间、扩展开关状态，以及判断连续工作或恢复动作何时可以安全执行所需的有限交互状态。
 - **认证信息：** 当用户主动配置可选的 OpenAI-compatible LLM endpoint 时，用户提供给该 endpoint 的 API Key。
@@ -41,7 +41,7 @@
 
 1. **同一台电脑上的本地 Herdr / herdr-mcp。** 通过 Native Messaging 向已安装的 native host 发送有界请求并读取实时 workspace 状态；这部分通信留在用户自己的电脑上。
 2. **受支持与实验性的 Web AI 网站。** 扩展只在产品文档声明的浏览器页面上运行，用于观察当前对话状态并执行用户可见的连续工作/恢复交互。ChatGPT 是主要支持面，Claude 使用文档所述适配器；z.ai 与 DeepSeek 属于实验性集成，默认关闭，只有用户在 Herdr 设置中显式开启对应开关并授予 Chrome 对该精确站点的访问权限后才会注册其 content script。
-3. **用户主动配置的 LLM endpoint，仅用于已配置的 LLM 功能。** 如果用户配置了 OpenAI-compatible LLM endpoint，用户在保存或测试配置时，Chrome 会请求对该 endpoint 精确 origin 的访问权限；授权后，扩展才可为了可选的回合后分析，把相关的 user/assistant 文本和用户提供的 API credential 发往该 endpoint。如果对话接力由用户主动触发，或由用户已经开启的 Auto 策略触发，而当前 Web AI 会话已经达到硬性单次对话上限、接力摘要 prompt 无法提交，或主摘要路径已经停止但仍未得到有效 packet，扩展可改为把有界的源会话 transcript 发往同一个已配置 endpoint，由它生成 handoff packet。兜底 transcript 只包含扩展选取的 user/assistant 对话文本，并受扩展 handoff 上限约束（当前最多 70,000 字符；需要截断时保留早期任务背景和近期操作状态）。该 endpoint 由用户自行选择，默认不是由 Herdr 发布者选择或运营；该 endpoint Provider 自身的隐私与数据保留条款适用。
+3. **用户主动配置的 LLM endpoint，仅用于已配置的 LLM 功能。** 如果用户配置了 OpenAI-compatible LLM endpoint，用户在保存或测试配置时，Chrome 会请求对该 endpoint 精确 origin 的访问权限；授权后，扩展才可为了可选的回合后分析，把相关的 user/assistant 文本和用户提供的 API credential 发往该 endpoint。如果对话接力由用户主动触发，或由用户已经开启的 Auto 策略触发，而当前 Web AI 会话已经达到硬性单次对话上限、接力摘要 prompt 无法提交，或主摘要路径已经停止但仍未得到有效 packet，扩展可改为把有界的源会话 transcript 发往同一个已配置 endpoint，由它生成 handoff packet。备用 transcript 只包含扩展选取的 user/assistant 对话文本，并受扩展 handoff 上限约束（当前最多 70,000 字符；需要截断时保留早期任务背景和近期操作状态）。该 endpoint 由用户自行选择，默认由用户决定，Herdr 发布者不替用户选择或运营该 endpoint；该 endpoint Provider 自身的隐私与数据保留条款适用。
 
 扩展不会出售用户数据，不会把用户数据发送给广告网络，也不会为了无关画像、信用评估或放贷目的转移数据。
 

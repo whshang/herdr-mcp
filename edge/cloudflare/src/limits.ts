@@ -38,7 +38,11 @@ export const REQUEST_SETTLEMENT_GRACE_MS = 5_000;
 /** Legacy/current Link wire contract remains capped at the public 60s tool budget. */
 export const MAX_LINK_REQUEST_TIMEOUT_MS = 60_000;
 
-/** Link presence: after this long with no hello/heartbeat the link is stale. */
+/**
+ * Persisted/legacy Link presence fallback. An attached Hibernation WebSocket
+ * is authoritative for live presence, so a sparse application heartbeat may
+ * legitimately be older than this threshold while the socket remains active.
+ */
 export const DEFAULT_LINK_STALE_AFTER_MS = 45_000;
 /**
  * Request-side grace for a workstation that was connected moments ago.

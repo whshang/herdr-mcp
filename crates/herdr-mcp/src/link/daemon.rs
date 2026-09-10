@@ -41,7 +41,10 @@ pub const LEGACY_EPOCH1_CONTRACT_HASH: &str =
     "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
 
 const DAEMON_TRANSPORT_PING_MS: i64 = 15_000;
-const DAEMON_HEARTBEAT_MS: i64 = 60_000;
+// Transport liveness is covered by RFC WebSocket ping/pong. Keep the
+// application heartbeat aligned with the Edge recovery-checkpoint cadence so
+// an idle Link does not wake the hibernated workstation DO every minute.
+const DAEMON_HEARTBEAT_MS: i64 = 300_000;
 const DAEMON_MAX_SILENCE_MS: i64 = 60_000;
 const DAEMON_REQUEST_TIMEOUT_MS: u64 = 60_000;
 const DAEMON_DRAIN_MS: u64 = 5_000;

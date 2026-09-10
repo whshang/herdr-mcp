@@ -345,7 +345,7 @@ pub fn pointer() -> Value {
         "project_bundled": PROJECT_BUNDLED_SOURCE,
         "native_reference": NATIVE_LOCAL_SOURCE,
         "self_update": "herdr-self-update",
-        "hint": "Remote-planner policy first; live runtime/update context is generated per call; release-matched native Herdr skill is appended as scoped reference. refresh=true rechecks project policy upstream.",
+        "hint": "Load remote-planner policy when the task needs detailed operating rules or Agent control. Use include_native_reference=false unless native Herdr CLI semantics are specifically needed. refresh=true rechecks project policy upstream.",
     })
 }
 

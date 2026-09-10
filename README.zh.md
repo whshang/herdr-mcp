@@ -30,10 +30,10 @@ Cloudflare Edge
 ### 推荐：给 Agent 一句话
 
 ```text
-帮我安装 Herdr 和 herdr-mcp，请完整按照 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 执行：使用当前 Stable GitHub Release，完成 Cloudflare 和 ChatGPT 配置；如果我的 Cloudflare 账户已有合适的 active zone，优先使用专用 Custom Domain，否则保留 workers.dev；R2 保持可选；自动检测工作站网络路径，只在必须由我本人登录、创建 Cloudflare Token 或授权 ChatGPT 时暂停。
+帮我安装 Herdr 和 herdr-mcp，按 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 执行：先规划依赖，再尽量合并执行所有可自动化步骤；使用当前 Stable GitHub Release，只在必须由我本人登录、授权或选择 Cloudflare Account/域名时暂停。
 ```
 
-Agent 会检查电脑环境、安装 Herdr 和 herdr-mcp，先用 `workers.dev` bootstrap Worker；Cloudflare Account 有合适 zone 时，会在 OAuth/Connector 固化前优先建议并完成 Custom Domain；随后启动开发机连接、指导你完成 ChatGPT 授权，自动验证实际网络路径，并用真实 MCP 请求验收。没有域名也不会卡住：Link 会在需要时从 direct `workers.dev` 无感切到已有本地代理，再到已验收的共享 Relay fallback。
+Agent 会检查电脑环境、安装 Herdr 和 herdr-mcp、创建 Worker、确定最终公网入口、启动工作站 Link、指导 ChatGPT 授权，并用真实 MCP 请求完成验收。域名不是必需项。如果当前电脑无法直连 `workers.dev`，Link 会自动尝试已有本地代理和内置共享 Relay 备用路径。
 
 ### 手动安装
 
@@ -51,11 +51,11 @@ Cloudflare 提供稳定的公网 MCP/OAuth 入口，每台开发机主动向外�
 
 [Cloudflare 配置](docs/i18n/zh-CN/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 
-### Shared Relay 只是兜底中转，不是你的公网入口
+### Link 网络备用路径
 
-Herdr-MCP 默认让开发机 Link 尽量直连。只要你配置了自己的 Cloudflare Custom Domain，就不会使用公共 Relay Pool。没有 Custom Domain 时，Link 会先直连该 Worker 的 `workers.dev`，存在已验证的本地代理时再尝试本地代理；只有这些路径都不可用时，才会自动进入 Herdr 维护的 Relay Pool。全新安装内置 v0.4.5 中国大陆真实裸网 UAT 已验收的 Deno/Supabase baseline；本机存在更新且有效的签名 Pool cache 时会完整覆盖这个 baseline。
+Herdr-MCP 优先让工作站 Link 直连。使用 `workers.dev` 时，如果本机网络无法访问，Link 会继续尝试已有本地代理和内置签名共享 Relay。选择过程自动完成，普通用户无需配置 Relay 服务商或 Relay URL。
 
-Relay 不会替换你的 MCP/OAuth 地址，不接管设备身份，也不是通用代理。它只把已经经过 Herdr 身份认证的 `herdr-link` WebSocket 转发到你自己的 `workers.dev` Worker。正式 Pool 使用 Deno 与 Supabase 两个独立故障域，按设备做 sticky、容量加权的稳定分片，并支持有界 failover。Deno 承担绝大多数长期连接；Supabase 因 Hosted Edge Function 生命周期和 Free 额度更紧，只承担少量容量分片并作为完整备用。普通用户无需注册这两个平台，也无需填写 Relay URL。
+Relay 只承载已认证的工作站 Link，MCP/OAuth 地址和设备身份保持不变。用 `herdr-mcp doctor` 与 `herdr-mcp link status` 验证当前路径；网络问题的具体判断见[故障排查](docs/i18n/zh-CN/troubleshooting.md)。
 
 ## 群控多台电脑
 
@@ -98,7 +98,7 @@ Herdr 会在 Worker 控制面创建 pairing，这个动作不需要路由到某�
 开发任务可以使用这类默认提示词：
 
 ```text
-修改前先检查实时 Herdr workspace 和 Git 状态。已有 dirty worktree 保持隔离。确定性的读取、Git 检查、patch 和有限命令直接执行；独立或耗时任务适合时交给可用 Coding Agent 并行完成。结束前检查最终 diff，并运行相关测试后再汇报。
+动手前只检查本任务需要的实时 Herdr/Git 状态，并先形成简短依赖计划。隔离无关 dirty work。默认单线做完，只加载必要 Skill；能一起做的独立读取和同一安全边界的确定性命令尽量合并，不把 status 检查或轮询当作思考步骤。只有新证据改变后续决策时才重新规划。做最小充分修改，最后检查相关 diff、测试和实际边界。
 ```
 
 高风险修改再补充目标、安全约束和验收标准；调查类任务明确要求只读。

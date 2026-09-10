@@ -30,10 +30,10 @@ The model keeps planning. Your computers keep the real state. Small tasks can ru
 ### Recommended: paste one sentence to your Agent
 
 ```text
-Install Herdr and herdr-mcp for me by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end: use the current stable GitHub Release, configure Cloudflare and ChatGPT, prefer a dedicated Cloudflare Custom Domain when my account already has one suitable active zone (otherwise keep workers.dev), keep R2 optional, verify the workstation network path, and pause only when I must personally sign in, create a Cloudflare Token, or authorize ChatGPT.
+Install Herdr and herdr-mcp by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md: plan dependencies first, combine all currently automatable work into as few safe execution steps as possible, use the current Stable GitHub Release, and pause only when I must personally sign in, authorize, or choose a Cloudflare Account/domain.
 ```
 
-The Agent checks the machine, installs Herdr and herdr-mcp, bootstraps the Worker on `workers.dev`, recommends/finalizes a Custom Domain before OAuth when your Cloudflare account has a suitable zone, starts the workstation connection, guides you through ChatGPT authorization, tests the actual network path, and proves the setup with a real MCP request. No domain is required: without one, the Link transparently falls back from direct `workers.dev` to an already-configured local proxy and then to the qualified shared Relay baseline when necessary.
+The Agent checks the machine, installs Herdr and herdr-mcp, bootstraps the Worker, configures the final public origin, starts the workstation Link, guides ChatGPT authorization, and proves the setup with a real MCP request. A domain is optional. If this computer cannot reach `workers.dev` directly, the Link can use an already-configured local proxy or the built-in shared Relay automatically.
 
 ### Manual installation
 
@@ -51,11 +51,11 @@ Cloudflare provides the stable public MCP/OAuth entry while every development co
 
 [Cloudflare setup](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 
-### Shared Relay is fallback transport, not your public endpoint
+### Link network fallback
 
-Herdr-MCP normally keeps the workstation Link direct. If you configured your own Cloudflare Custom Domain, the shared Relay Pool is not used. Without a Custom Domain, the Link tries the Worker `workers.dev` origin directly, then a validated local proxy when one exists; only when those paths are unavailable does it fall back automatically to the Herdr-operated Relay Pool. Fresh installs carry the exact Deno/Supabase baseline qualified by the v0.4.5 mainland-China no-proxy UAT; a newer valid signed pool cache can replace that baseline.
+Herdr-MCP prefers a direct workstation Link. When the selected path uses `workers.dev` and the local network cannot reach it, Link can reuse an existing local proxy and then the built-in signed shared Relay. Selection is automatic; normal users do not configure a Relay provider or Relay URL.
 
-The Relay does not replace your MCP/OAuth address, terminate your device identity, or turn Herdr into a generic proxy. It only forwards the already-authenticated `herdr-link` WebSocket to your own `workers.dev` Worker. The production pool uses independent Deno and Supabase failure domains with sticky, capacity-weighted per-device selection and bounded failover. Deno carries the large majority of long-lived connections; Supabase receives a small capacity share and remains a full fallback because its hosted Edge Function lifetime and Free-plan invocation budget are tighter. Normal users do not create either provider account or configure a Relay URL.
+Relay carries only the authenticated workstation Link to your own Worker. Your MCP/OAuth URL and device identity stay unchanged. Use `herdr-mcp doctor` and `herdr-mcp link status` to verify the selected path; see [Troubleshooting](docs/i18n/en/troubleshooting.md) for network-specific diagnosis.
 
 ## Control multiple computers
 
@@ -98,7 +98,7 @@ The new computer joins the existing Worker and ChatGPT connection. It does not c
 For development work, a strong default prompt is:
 
 ```text
-Inspect the live Herdr workspace and Git state before changing anything. Keep existing dirty worktrees isolated. Do deterministic reads, Git checks, patches, and bounded commands directly. Delegate independent or long-running work to available coding agents when that improves throughput. Verify the final diff and run the relevant tests before reporting completion.
+Before changing anything, inspect only the live Herdr/Git state needed for this task and form a short dependency plan. Keep unrelated dirty work isolated. Finish one lane before adding agents and load only the Skills the task needs. Batch independent reads and same-boundary deterministic commands; do not use status checks or polling as thinking steps. Re-plan only when new evidence changes the next decision. Make the smallest sufficient change, then verify the relevant diff, tests, and real boundary.
 ```
 
 For risky changes, state the target, safety constraints, and acceptance criteria. For investigation, explicitly request read-only work.

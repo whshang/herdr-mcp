@@ -240,7 +240,7 @@ Herdr workspace
 
 - 有新的非空摘要时才优先发送；
 - 没有新内容时，不因为计时器到了就刷屏；
-- 超过 `progressFallbackSec` 可以发送一次兜底状态；
+- 超过 `progressFallbackSec` 可以发送一次备用状态；
 - 上一次已发送摘要和时间会持久保存，Service Worker 重启后也能去重。
 
 ### settled
@@ -462,7 +462,7 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
 
 ## handoff packet 应该包含什么
 
-接力摘要的目的不是复述整段聊天，而是让新 planner 能继续工作。
+接力摘要用于让新 planner 继续工作，只保留继续任务需要的上下文。
 
 建议保留：
 

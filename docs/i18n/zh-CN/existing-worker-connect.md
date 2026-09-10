@@ -58,7 +58,7 @@ herdr-mcp worker connect "<pairing-address>"
 
 默认情况下，新加入电脑会自动使用平台报告的电脑名/hostname 作为 device display name。只有用户明确希望使用其他名字时，才传 `--name "<device-name>"`。如果创建配对时显式使用了 `worker pair --name ...`，它同样属于用户覆盖，并优先于新电脑自动读取的名称。
 
-配对被消费后，`worker connect` 会自动安装/启动本机 `herdr-mcp` 服务，并确保当前设备对应的 Rust production Link 已创建并加载。macOS 由 launchd 管理；正常 Linux 登录/服务器环境优先使用 `systemd --user`。如果当前环境没有可用的 user systemd manager/bus（例如无 init 的开发容器），Herdr 会退回到 detached 用户进程 backend，并用 PID + Linux `/proc` start time 精确确认进程身份，避免 PID 复用时误杀其他进程。该 fallback 在宿主机/容器仍运行时可跨 shell/SSH 退出继续工作，但不提供 systemd 的崩溃自动重启或开机/容器重启后自启动能力；如需要长期常驻，应由 systemd 或外层容器/主机 supervisor 负责。只有本机 service 健康、production Link 使用新的设备身份时命令才返回成功；启动失败仍会执行远端 revoke，并补偿清理本地 credential / config。
+配对被消费后，`worker connect` 会自动安装/启动本机服务并对齐当前设备的 Rust production Link。macOS 使用 launchd；Linux 优先使用 `systemd --user`，没有 user systemd manager 时使用托管用户进程 backend。只有本机服务与 Link 都健康时命令才返回成功；启动失败会撤销未完成的设备登记，并恢复本地 credential/config 状态。
 
 使用 Agent 安装时，可以直接把这一句话发给新电脑上的 Coding Agent：
 
@@ -77,6 +77,8 @@ herdr-mcp link status
 ```
 
 然后让 ChatGPT 调用 `herdr_devices`，确认新设备已经出现在同一个 Worker 中并处于在线状态。
+
+如果这台电脑无法直连 `workers.dev`，保持现有设备登记，不要重新配对或创建 Worker。`link status` 可以显示项目支持的本地代理或共享 Relay 路径；Link 健康即可。Link 无法恢复时再进入[故障排查](troubleshooting.md)。
 
 以后只有用户明确要求改名时，才运行：
 

@@ -2,7 +2,7 @@
 
 *从本机到网页逐层定位问题，再决定是否需要重启。*
 
-herdr-mcp 的链路横跨本机 runtime、Herdr、workstation link、Cloudflare Edge、OAuth、MCP 和浏览器。最快的排障方式不是“把所有东西重启一遍”，而是先确认故障在哪一层。
+herdr-mcp 的链路横跨本机 runtime、Herdr、workstation link、Cloudflare Edge、OAuth、MCP 和浏览器。排障时先确认故障所在层级，避免一开始把所有组件全部重启。
 
 推荐始终按这个顺序：
 
@@ -48,7 +48,17 @@ herdr --version
 herdr api schema >/dev/null
 ```
 
-如果本地 HTTP 正常但 `herdr_inspect` 看不到任何真实 workspace，继续检查 `HERDR_SOCKET_PATH` 和 Herdr daemon，而不是先重装 ChatGPT Connector。
+如果本地 HTTP 正常但 `herdr_inspect` 看不到任何真实 workspace，继续检查 `HERDR_SOCKET_PATH` 和 Herdr daemon，先不要重装 ChatGPT Connector。
+
+### 二进制已安装但 shell 找不到吗
+
+```bash
+ls -l ~/.local/bin/herdr-mcp
+zsh -ic 'command -v herdr-mcp'
+zsh -lc 'command -v herdr-mcp'
+```
+
+二进制存在但 `command -v` 为空时，状态是 `installed_but_not_on_shell_path`。当前进程先执行 `export PATH="$HOME/.local/bin:$PATH"`。zsh 使用 `line='export PATH="$HOME/.local/bin:$PATH"'`，再执行 `grep -Fqx "$line" "$HOME/.zprofile" 2>/dev/null || printf '\n%s\n' "$line" >> "$HOME/.zprofile"`，保证只写入一次。不要重复安装，也不要创建第二个 PATH owner。
 
 ### 3. Edge 能看到 workstation 吗
 

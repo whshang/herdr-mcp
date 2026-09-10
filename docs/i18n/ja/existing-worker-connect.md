@@ -30,7 +30,7 @@
 
    デフォルトでは、参加するコンピュータがプラットフォームから取得したコンピュータ名/hostname が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
 
-   ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。macOS は launchd、通常の Linux login/server 環境は `systemd --user` を優先します。user systemd manager/bus が存在しない init-less container などでは、PID と Linux `/proc` start time で所有プロセスを厳密に識別する detached user-process backend にフォールバックします。この fallback は host/container が動作している間は shell/SSH 終了後も継続しますが、systemd の crash restart や boot/container restart 後の自動起動は提供しません。長期常駐が必要な場合は systemd または外側の supervisor を使用してください。ローカル service が healthy で、production Link が新しい device identity を使用していることを確認できた場合のみ成功を返し、失敗時は remote revoke とローカル credential / config の補償を実行します。
+   ペアリング消費後、`worker connect` はローカル service を起動し、登録済み Rust production Link を整合させます。macOS は launchd、Linux は `systemd --user` を優先し、user systemd manager がない場合は managed user-process backend を使います。ローカル service と Link が healthy になった場合だけ成功を返し、起動失敗時は未完了の登録を revoke してローカル credential/config を復元します。
 
 3. 成功すると、一時的なペアリングが高エントロピーのデバイス単位資格情報と交換されます。macOS は最終資格情報を Keychain に、Linux は上記のユーザー専用 credential store に保存します。ペアリングコード/セッションは即座に使用不能になります。参加デバイスでは、Cloudflare デプロイ資格情報も旧来の `LINK_SHARED_SECRET` も使用されません。
 
@@ -51,6 +51,8 @@ herdr-mcp link status
 ```
 
 結果として得られる不変な `device_id`、Link の online/healthy、ローカルバインドの成功を確認してください。
+
+このコンピュータから `workers.dev` に直接到達できない場合も、同じ device 登録を維持してください。`link status` で既存 local proxy または shared Relay の経路が healthy なら再登録は不要です。
 
 後から現在の登録済みコンピュータを明示的に改名する場合だけ、次を実行します:
 

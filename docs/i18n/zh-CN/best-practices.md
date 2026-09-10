@@ -38,7 +38,7 @@ herdr-mcp 的理想工作方式是：**Web 模型负责理解目标、做决策�
 
 一次好的委派应该有明确的问题边界、工作目录、允许修改范围、验收证据和停止条件。Web planner 保留总体拆分、优先级和最终验收权，并在 worker 完成后重新检查 Git、测试和运行状态。
 
-具体 worker 怎么选、首选 worker 不可用怎么办、长任务如何运行、timeout 后如何避免重复 mutation，统一见 [Worker 备选](worker-fallbacks.md)。本页不维护第二套 worker 顺序和 fallback 规则。
+Agent 怎么选、首选 Agent 不可用时如何切换、长任务如何运行、timeout 后如何避免重复 mutation，统一见 [Agent 调度](worker-fallbacks.md)。本页不维护第二套选择规则。
 
 ## 4. 并行开发要隔离工作区
 

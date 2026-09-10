@@ -128,6 +128,7 @@ test("herdr_methods keeps Edge authority local and routes workstation-local disc
     "herdr_mcp.skill.load",
     "herdr_mcp.planning.advise",
     "herdr_mcp.github.status",
+    "herdr_mcp.cleanup.preview",
     "herdr_mcp.text.read",
     "herdr_mcp.browser_endpoint.list",
     "herdr_mcp.future.read_only",
@@ -181,6 +182,7 @@ test("herdr_call routes workstation-local private methods to the runtime and kee
     "herdr_mcp.skill.describe",
     "herdr_mcp.planning.advise",
     "herdr_mcp.github.status",
+    "herdr_mcp.cleanup.preview",
     "herdr_mcp.future.read_only",
   ]) {
     const d = deps();

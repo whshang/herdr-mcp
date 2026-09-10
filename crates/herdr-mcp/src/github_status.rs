@@ -165,7 +165,7 @@ fn managed_project_root(snapshot: &Value, root_raw: &str) -> Result<PathBuf, Val
         })
 }
 
-fn github_repository(root: &Path) -> Result<String, Value> {
+pub(crate) fn github_repository(root: &Path) -> Result<String, Value> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -224,7 +224,7 @@ fn parse_github_repository(remote: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-fn find_gh() -> Option<PathBuf> {
+pub(crate) fn find_gh() -> Option<PathBuf> {
     if let Some(path) = env::var_os("PATH") {
         for directory in env::split_paths(&path) {
             let candidate = directory.join(if cfg!(windows) { "gh.exe" } else { "gh" });
@@ -244,7 +244,7 @@ fn find_gh() -> Option<PathBuf> {
     None
 }
 
-fn run_gh_json(gh: &Path, root: &Path, args: &[&str]) -> Result<Value, Value> {
+pub(crate) fn run_gh_json(gh: &Path, root: &Path, args: &[&str]) -> Result<Value, Value> {
     run_gh_json_inner(gh, root, args, &[])
 }
 

@@ -38,11 +38,9 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 标记的 `Latest` stable Release 为准。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。v0.4.3+ 的安装流程继续保持同一个 broker compatibility revision，并在会轮换的 runtime service 启动前先确保固定 broker 已存在。macOS 交互式首次安装会直接打开 **完全磁盘访问（Full Disk Access）**，但授权动作仍必须由用户本人在系统设置中确认；`herdr-mcp permissions setup` 可再次打开同一设置页，`herdr-mcp permissions verify` 用于验证。普通 runtime generation 更新不会重写同 revision 的 broker。当前最充分的 clean-machine **existing-fleet 安装**证据来自 2026-09-08 的 v0.4.8 Apple Silicon UAT：精确 Release 产物 → Full Disk Access/TCC 验证 → 短期 `worker connect` → service/Link/generation/credential 检查 → `doctor` → ChatGPT 实际路由到该设备的 Herdr 调用。clean first-Worker bootstrap 仍属于发布后 production acceptance 的独立项目。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续。从 v0.4.8 发布线开始，GitHub Releases 也正式提供面向 x86_64 Debian 服务器的静态 `x86_64-unknown-linux-musl` runtime；该产物不依赖宿主机 glibc，目标覆盖 Debian 11/12/13 一类服务器环境。Linux 上的 `herdr-mcp install` 在正常用户会话优先使用 `systemd --user` 管理本地 runtime 与 production Link；如果环境没有 user systemd manager/bus，则使用受 PID + `/proc` start time 校验保护的 detached 用户进程 backend。首台设备的 `worker bootstrap`、已有 fleet 的 `worker pair` / `worker connect`、设备与 Connector 管理、Automation 管理统一使用 Linux 用户私有 credential store，不再假设 macOS Keychain。`update apply` / `update auto` 复用同一套 attestation 校验、native updater 与 Linux 事务安装器；Linux 不安装 macOS 的 launchd 每日 scheduler，如需周期检查由外部 scheduler 调用即可。浏览器 Native Messaging 与 macOS 隐私/TCC 集成仍属于 macOS 专属能力。
+当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 都支持 macOS 与 Linux。macOS 使用稳定的 Full Disk Access/TCC broker 与 Keychain credential helper；Linux 优先使用 `systemd --user`，不可用时使用托管用户进程 backend。Browser Native Messaging 与 macOS 隐私/TCC 仍属于 macOS 专属能力。Windows Release artifact 仍按 release notes 标注的 preview 范围使用。
 
-macOS 的 v0.4.3 还把生产设备凭据从会轮换的 runtime 代码中分离出来：Keychain 读写统一经过固定的 `~/.config/herdr-mcp/herdr-mcp-credential-helper`。已有安装第一次迁移到这个 helper 时，macOS 可能只需要一次明确的钥匙串授权；该预检发生在 service / Link mutation 之前，弹窗被忽略或拒绝时会直接中止，不会进入反复重启 Link、反复弹窗的状态。普通 runtime 升级会保留同 compatibility revision 的 helper，因此每个新的 `runtime/generations/rust-*` 不再分别成为新的 Keychain client。这个 credential helper 与上面的完全磁盘访问 / TCC broker 是两个独立的稳定身份。
-
-如果这台机器仍运行 **v0.4.2**，请先执行一次 `herdr-mcp update apply` 完成升级。v0.4.2 binary 的 bare `herdr-mcp update` 仍是只读检查，并会输出同样的 `next_action`；从 v0.4.3 起，bare `herdr-mcp update` 才会直接执行升级。两种路径都不需要重新配对设备，也不需要删除或重建 ChatGPT Connector。
+旧版本安装按[Runtime 自升级](runtime-self-upgrade.md)原地升级。已有 Worker、设备关系和健康的 ChatGPT Connector 不需要为了升级当前 runtime 重新创建。
 
 ## 第一步：安装原生 herdr-mcp runtime
 
@@ -52,27 +50,13 @@ macOS 的 v0.4.3 还把生产设备凭据从会轮换的 runtime 代码中分离
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update check
 ```
 
 `install` 会把不可变 generation 放到 `~/.config/herdr-mcp/runtime/` 并让用户 PATH 入口指向 `runtime/current/herdr-mcp`。普通用户不要用 git clone、`npm` 或 `cargo` 安装本机 runtime。
 
-x86_64 Debian 服务器应使用 `herdr-mcp-<version>-x86_64-unknown-linux-musl` 产物，先通过 release manifest 校验 checksum / attestation，再把该候选 binary 放到可执行位置并运行 `herdr-mcp install`。安装器会把当前 binary 复制为 `~/.config/herdr-mcp/runtime/` 下的不可变 generation，维护 `runtime/current` 与用户 CLI 链接，整个流程默认不需要 root。正常 Debian 登录/服务器环境使用 `systemd --user` 安装 `herdr-mcp.service` 和 `herdr-mcp-link.service`，systemd unit 不写入设备凭据或本地 MCP bearer。若 `systemctl --user` 没有可用 manager/bus（例如无 init 的开发容器），`rust-process-user` backend 会用同一 managed generation 启动 detached runtime 与 Link，并记录 PID + Linux process start time 后才认领该进程。该 fallback 在当前宿主机/容器生命周期内可跨 shell/SSH 退出存活，但不能替代 init system：崩溃重启、开机或容器重启后的自启动必须交给外层 supervisor。正常长期服务器仍优先使用 systemd；若发行版会在最后一个登录会话结束后停止 user manager，而又要求 Herdr 持续在线，应按本机运维策略开启 systemd user lingering。已有 fleet 创建短期 pairing 后，在 Debian 上执行 `herdr-mcp worker connect "<pairing-address>"`：每设备凭据写入用户私有 credential store（目录 `0700`、常规凭据文件 `0600`），Edge/device 配置按事务更新，然后启动托管 service 与 Link。注册完成的 Linux 设备可以执行依赖已注册设备 bearer 的设备与 Connector owner 操作。`herdr-mcp doctor` 通过后才算 Debian 安装闭环完成。
+x86_64 Debian 使用静态 `x86_64-unknown-linux-musl` Release 产物。安装器优先使用 `systemd --user`，没有 user systemd manager 时使用托管用户进程 backend。macOS 使用用户级 LaunchAgent，完全磁盘访问授予稳定 TCC broker；`sudo` 不能替代这项权限。平台服务与常驻细节见 [CLI 参考](cli-reference.md)和[故障排查](troubleshooting.md)。本地 doctor 不健康时先解决 runtime / Herdr 问题，再部署公网 Edge。
 
-macOS 上服务仍然是普通用户级 LaunchAgent；不需要 `sudo`，而且管理员权限本身也不能替代 TCC 授权。需要授予完全磁盘访问的是固定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`，不是持续变化的 `runtime/generations/rust-*`。非交互式安装会先准备好 broker，但不会强行打开系统设置；如果尚未授权，在用户终端执行一次 `herdr-mcp permissions setup` 即可。
-
-## 第二步：先把本地 runtime 跑通
-
-至少确认：
-
-```bash
-herdr-mcp doctor
-herdr-mcp status
-```
-
-如果本地 doctor 不健康，不要继续部署公网 Edge。先解决本机 runtime / Herdr 问题。
-
-## 第三步：部署稳定公网 Edge
+## 第二步：部署稳定公网 Edge
 
 如果 ChatGPT 需要从公网访问工作站，使用 Cloudflare Worker 提供稳定 OAuth/MCP 入口。保持 `workers.dev` 作为零域名 bootstrap/诊断 origin；但如果选定的 Cloudflare Account 已有合适的 active zone，应在 Connector/OAuth 授权前优先使用 `herdr-mcp.example.com` 这类专用 Custom Domain 作为长期稳定身份。没有合适 zone 或用户不采用自定义域名时，继续使用 `workers.dev`，不要阻塞安装。
 
@@ -96,25 +80,16 @@ herdr-mcp worker bootstrap
 
 普通 bootstrap 合同见 [Agent 协助安装](agent-install.md)。[Cloudflare Edge 部署](cloudflare-edge-deployment.md) 中的源码/Wrangler 流程只保留给维护者与深度运维。
 
-## 第四步：安装并验证 Herdr Link
+## 第三步：验证 Herdr Link
 
 ```bash
-herdr-mcp link install
+herdr-mcp doctor
 herdr-mcp link status
 ```
 
-如果 `workers.dev` 在当前网络不可达，优先复用已有代理：
+如果当前工作站无法直连 `workers.dev`，不要重新部署 Worker。Link 自己负责支持的路径选择，可以复用已有本地代理，也可以使用内置签名共享 Relay。先用 `doctor` 与 `link status` 验证结果；只有这些检查确认存在网络故障时，再进入[故障排查](troubleshooting.md)。代理与 PAC 的细节留在排障页，不占用正常安装主流程。
 
-```text
-HERDR_LINK_PROXY
-HTTPS_PROXY / https_proxy
-HTTP_PROXY / http_proxy
-ALL_PROXY / all_proxy
-```
-
-支持 `socks5://` 与 `socks5h://`（始终按 `socks5h` remote-DNS 语义拨号，`workers.dev` 由代理解析）；不支持代理认证。macOS 也会读取 `scutil --proxy`（HTTPS、HTTP、SOCKS）；PAC 只检测不执行，仅配置 PAC 时 Link 直连。不要还没验证代理就把网络问题扩大成 DNS / Custom Domain 变更。
-
-## 第五步：验证公网路径
+## 第四步：验证公网路径
 
 ```bash
 herdr-mcp doctor
@@ -125,7 +100,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 未带 OAuth 的 `/mcp` 返回 `401` 可以是正确结果。真正的成功标准是：runtime 健康、Link 已连接、Edge `/health` 正常、OAuth metadata 可访问。
 
-## 第六步：在 ChatGPT 添加 herdr Connector
+## 第五步：在 ChatGPT 添加 herdr Connector
 
 这一步需要用户本人操作。让 Coding Agent 暂停并指导：
 
@@ -142,13 +117,13 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 分析我的 Herdr 里有哪些项目。只读，不要修改。
 ```
 
-如果 `herdr_inspect` 能返回真实工作站数据，基础闭环就已经可用。
+如果 `herdr_inspect` 能返回真实工作站数据，基础连接已经可用。
 
 详见 [ChatGPT Connector](chatgpt-connector.md)。
 
-## 第七步：需要浏览器连续工作时再装扩展
+## 第六步：需要浏览器连续工作时再装扩展
 
-浏览器扩展用于 Side Panel 控制中心、workspace binding、长对话连续性和“排队”下一轮消息。它不是基础 MCP 闭环的必需项。
+浏览器扩展用于 Side Panel 控制中心、workspace binding、长对话连续性和“排队”下一轮消息。基础 MCP 连接不依赖它。
 
 扩展分为三种身份：**STORE / STANDALONE / DEV**。v0.4.2 的 Native Host 只支持 Store/DEV ownership；v0.4.3+ 增加固定身份的 STANDALONE，作为正式手动/GitHub 分发路径。
 

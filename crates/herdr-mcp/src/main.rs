@@ -7,6 +7,7 @@ mod capability_probe;
 mod capability_resolver;
 mod capability_scan;
 mod child_process;
+mod cleanup_preview;
 mod cli;
 mod config;
 mod contract;
