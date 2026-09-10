@@ -32,6 +32,49 @@ jobs:
       - name: Rust release gate
         run: scripts/release-gate.sh rust
 
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      HERDR_MCP_BUILD_CHANNEL: dev
+      HERDR_MCP_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build Windows UAT candidate
+        shell: pwsh
+        run: cargo +1.97.1 build --locked --release -p herdr-mcp --target x86_64-pc-windows-msvc
+      - name: Stage Windows UAT bundle
+        shell: pwsh
+        run: |
+          $line = Select-String -Path crates/herdr-mcp/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $line) { throw "cannot resolve herdr-mcp version" }
+          $version = $line.Matches[0].Groups[1].Value
+          $edgeOut = Join-Path $env:RUNNER_TEMP "herdr-edge"
+          New-Item -ItemType Directory -Force -Path $edgeOut, "windows-uat" | Out-Null
+          npx --yes wrangler@4.129.0 deploy --dry-run --outdir $edgeOut --config edge/cloudflare/wrangler.user.example.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item "target/x86_64-pc-windows-msvc/release/herdr-mcp.exe" "windows-uat/herdr-mcp.exe"
+          Copy-Item (Join-Path $edgeOut "index.js") "windows-uat/herdr-edge-$version.mjs"
+          @(
+            "commit=$env:GITHUB_SHA"
+            "version=$version"
+            "channel=dev"
+          ) | Set-Content -Encoding ascii "windows-uat/BUILD.txt"
+          & "windows-uat/herdr-mcp.exe" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-uat
+          path: windows-uat/*
+          if-no-files-found: error
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
