@@ -16,6 +16,8 @@ use serde_json::Value;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use serde_json::json;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
+use sha2::{Digest, Sha256};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::env;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs::{self, OpenOptions};
@@ -317,6 +319,12 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         }
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
+        WorkerCommand::CredentialRepairPrepare => prepare_device_credential_repair(&paths),
+        WorkerCommand::CredentialRepairApply {
+            device_id,
+            credential_verifier_sha256,
+        } => apply_device_credential_repair(&paths, &device_id, &credential_verifier_sha256),
+        WorkerCommand::CredentialRepairFinalize => finalize_device_credential_repair(&paths),
         WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
         WorkerCommand::ConnectorCancel { request_id } => cancel_connector(&paths, &request_id),
         WorkerCommand::ConnectorList { include_all } => list_connectors(&paths, include_all),
@@ -356,6 +364,169 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::AutomationRotate { client_id } => rotate_automation(&paths, &client_id),
         WorkerCommand::AutomationRevoke { client_id } => revoke_automation(&paths, &client_id),
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn credential_repair_staging_service(device_id: &str) -> String {
+    format!("herdr-edge-link-recovery-{device_id}")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn device_secret_verifier(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn new_local_device_secret() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("cannot generate credential-repair secret: {error}"))?;
+    let mut out = String::with_capacity(64 + "devsec_".len());
+    out.push_str("devsec_");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}")
+            .map_err(|_| "cannot encode credential-repair secret".to_owned())?;
+    }
+    Ok(out)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn prepare_device_credential_repair(_paths: &RuntimePaths) -> Result<ExitCode, String> {
+    Err("credential repair is supported on macOS and Linux enrolled devices".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let device_id = config
+        .edge_device_id
+        .as_deref()
+        .ok_or_else(|| "credential repair requires an enrolled device_id".to_owned())?;
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let account = current_account()?;
+    let staging_service = credential_repair_staging_service(&device_id);
+    let secret = new_local_device_secret()?;
+    validate_device_secret(&secret)?;
+    crate::credential_store::store(&staging_service, &account, &secret)?;
+    let verifier = device_secret_verifier(&secret);
+    print_json(&json!({
+        "ok": true,
+        "action": "credential_repair_prepare",
+        "device_id": device_id,
+        "credential_verifier_sha256": verifier,
+        "staged": true,
+        "secret_printed": false,
+        "next": "run worker credential-repair apply from another enrolled fleet-admin device",
+    }))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn apply_device_credential_repair(
+    _paths: &RuntimePaths,
+    _device_id: &str,
+    _verifier: &str,
+) -> Result<ExitCode, String> {
+    Err("credential repair is supported on macOS and Linux enrolled devices".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn apply_device_credential_repair(
+    paths: &RuntimePaths,
+    device_id: &str,
+    verifier: &str,
+) -> Result<ExitCode, String> {
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    if verifier.len() != 64
+        || !verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(
+            "credential repair verifier must be exactly 64 lowercase hexadecimal characters"
+                .to_owned(),
+        );
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(
+            &identity.edge_origin,
+            "/devices/credential-rebind",
+        )?)
+        .headers(headers)
+        .json(&json!({
+            "device_id": device_id,
+            "credential_verifier_sha256": verifier,
+        }))
+        .send()
+        .map_err(|error| format!("cannot apply device credential repair: {error}"))?;
+    let payload = parse_json_response(response, "device credential repair")?;
+    print_json(&json!({
+        "ok": true,
+        "action": "credential_repair_apply",
+        "device_id": payload.get("device_id").and_then(Value::as_str).unwrap_or(&device_id),
+        "updated_at_ms": payload.get("updated_at_ms").and_then(Value::as_u64),
+        "secret_printed": false,
+        "next": "run worker credential-repair finalize on the repaired device",
+    }))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn finalize_device_credential_repair(_paths: &RuntimePaths) -> Result<ExitCode, String> {
+    Err("credential repair is supported on macOS and Linux enrolled devices".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn finalize_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let device_id = config
+        .edge_device_id
+        .as_deref()
+        .ok_or_else(|| "credential repair requires an enrolled device_id".to_owned())?;
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let target_service = config.edge_link_keychain_service().ok_or_else(|| {
+        "credential repair requires a device-specific credential service".to_owned()
+    })?;
+    let expected_service = format!("herdr-edge-link-{device_id}");
+    if target_service != expected_service {
+        return Err("configured credential service does not match the enrolled device".to_owned());
+    }
+    let account = current_account()?;
+    let staging_service = credential_repair_staging_service(&device_id);
+    let secret = crate::credential_store::load(&staging_service, &account)
+        .map_err(|error| format!("cannot load staged credential repair secret: {error}"))?;
+    validate_device_secret(&secret)?;
+    crate::credential_store::store(&target_service, &account, &secret).map_err(|error| {
+        format!("cannot commit repaired credential to the device service: {error}")
+    })?;
+
+    #[cfg(target_os = "macos")]
+    crate::link::switch_prod_link_credential_service(paths, &device_id, &target_service)?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service_manager::reconcile_link()?;
+
+    crate::credential_store::delete(&staging_service, &account).map_err(|error| {
+        format!("credential repair succeeded but staging cleanup failed: {error}")
+    })?;
+    print_json(&json!({
+        "ok": true,
+        "action": "credential_repair_finalize",
+        "device_id": device_id,
+        "credential_service": target_service,
+        "staging_deleted": true,
+        "secret_printed": false,
+    }))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
@@ -2336,6 +2507,23 @@ fn print_json(value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_secret_verifier_is_lowercase_sha256_without_exposing_secret() {
+        let secret = "devsec_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let verifier = device_secret_verifier(secret);
+        assert_eq!(verifier.len(), 64);
+        assert!(
+            verifier
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_ne!(verifier, secret);
+        assert_eq!(
+            verifier,
+            "639b0a222f754d2ada9b701c05d329e84424ca54f4bb1dc82feab6f42f6daf3f"
+        );
+    }
 
     #[test]
     fn secret_validators_are_strict_and_never_accept_argv_shaped_garbage() {

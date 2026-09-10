@@ -135,6 +135,9 @@ export class DeviceRegistryDO {
     if (request.method === "POST" && url.pathname === "/internal/devices/authenticate") {
       return this.authenticateDevice(request);
     }
+    if (request.method === "POST" && url.pathname === "/internal/devices/credential-rebind") {
+      return this.rebindDeviceCredential(request);
+    }
     if (request.method === "POST" && url.pathname === "/internal/devices/rename") {
       return this.renameDevice(request);
     }
@@ -406,6 +409,44 @@ export class DeviceRegistryDO {
       return json({ ok: false, code: "link_auth_failed" }, 401);
     }
     return json({ ok: true, device_id: device.device_id, credential_id: credential.credential_id });
+  }
+
+  private async rebindDeviceCredential(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!isRecord(body) || typeof body.device_id !== "string" || !isCredentialVerifier(body.credential_verifier_sha256)) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const deviceId = normalizeDeviceId(body.device_id);
+    if (deviceId === null || deviceId !== body.device_id) {
+      return json({ ok: false, code: "invalid_device_id" }, 400);
+    }
+    const verifier = body.credential_verifier_sha256;
+    const now = Date.now();
+    const result = await this.state.storage.transaction(async (tx) => {
+      const existing = parseDeviceRecord(await tx.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+      if (!existing) return { ok: false as const, code: "device_not_found" as const };
+      if (existing.authorization === "revoked") return { ok: false as const, code: "device_revoked" as const };
+      if (existing.authorization !== "active") return { ok: false as const, code: "device_suspended" as const };
+      const credentialId = newCredentialId();
+      const credential: DeviceCredentialRecord = {
+        credential_id: credentialId,
+        device_id: existing.device_id,
+        workstation_id: existing.workstation_id,
+        verifier_sha256: verifier,
+        created_at_ms: now,
+      };
+      const updated: DeviceRecord = { ...existing, credential_id: credentialId, updated_at_ms: now };
+      if (existing.credential_id) await tx.delete(CREDENTIAL_PREFIX + existing.credential_id);
+      await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
+      await tx.put(DEVICE_PREFIX + existing.device_id, updated);
+      return { ok: true as const, device_id: existing.device_id, credential_id: credentialId, updated_at_ms: now };
+    });
+    return result.ok ? json(result) : json(result, result.code === "device_not_found" ? 404 : 409);
   }
 
   private async renameDevice(request: Request): Promise<Response> {
