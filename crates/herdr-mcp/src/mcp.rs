@@ -1605,6 +1605,36 @@ fn browser_delivery_state_from_postcondition(
     }
 }
 
+/// Read the exact provider user-message identity that browser actuation proved
+/// accepted. The existing `evidence.result` object carries it, so no new
+/// top-level postcondition field is introduced. Absent/`null` means the
+/// provider did not expose a stable identity and settlement must skip rather
+/// than guess.
+fn browser_evidence_accepted_user_message_ref(
+    evidence: &BrowserPostconditionEvidence,
+) -> Result<Option<String>, String> {
+    let Some(result) = evidence.result.as_ref() else {
+        return Ok(None);
+    };
+    let Some(value) = result.get("accepted_user_message_ref") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(text) = value.as_str() else {
+        return Err("browser_evidence_accepted_user_message_invalid".to_owned());
+    };
+    if text.is_empty()
+        || text.len() > 512
+        || text != text.trim()
+        || text.chars().any(char::is_control)
+    {
+        return Err("browser_evidence_accepted_user_message_invalid".to_owned());
+    }
+    Ok(Some(text.to_owned()))
+}
+
 fn browser_dispatch_submit(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -1695,6 +1725,7 @@ fn browser_dispatch_submit(
         expected_generation,
         delivery_state: BrowserDeliveryState::Uncertain,
         generation_owner: None,
+        accepted_user_message_ref: None,
         updated_at: now,
     }) {
         return browser_store_error(error);
@@ -1725,6 +1756,10 @@ fn browser_dispatch_submit(
     let Ok(mut store) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
+    let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
+        Ok(value) => value,
+        Err(error) => return browser_store_error(error),
+    };
     let current = match store.browser_dispatch(&reserved.dispatch_id) {
         Ok(Some(dispatch)) => dispatch,
         Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
@@ -1737,6 +1772,11 @@ fn browser_dispatch_submit(
                 expected_generation,
                 delivery_state,
                 generation_owner: evidence.generation_owner,
+                accepted_user_message_ref: if delivery_state == BrowserDeliveryState::Applied {
+                    accepted_user_message_ref.as_deref()
+                } else {
+                    None
+                },
                 updated_at: now,
             }) {
                 Ok(dispatch) => dispatch,
@@ -1867,6 +1907,7 @@ fn browser_dispatch_stop(
         expected_generation,
         delivery_state: BrowserDeliveryState::Uncertain,
         generation_owner: None,
+        accepted_user_message_ref: None,
         updated_at: now,
     }) {
         return browser_store_error(error);
@@ -1909,6 +1950,7 @@ fn browser_dispatch_stop(
             expected_generation,
             delivery_state,
             generation_owner: evidence.generation_owner,
+            accepted_user_message_ref: None,
             updated_at: browser_epoch_ms(),
         }) {
             Ok(dispatch) => dispatch,
@@ -1996,6 +2038,11 @@ fn browser_dispatch_status(
                 }
             };
             if delivery_state != BrowserDeliveryState::Uncertain {
+                let accepted_user_message_ref =
+                    match browser_evidence_accepted_user_message_ref(&evidence) {
+                        Ok(value) => value,
+                        Err(error) => return browser_store_error(error),
+                    };
                 let Ok(mut store) = store.lock() else {
                     return json!({"ok": false, "code": "browser_operation_store_unavailable"});
                 };
@@ -2005,6 +2052,13 @@ fn browser_dispatch_status(
                         expected_generation: dispatch.expected_generation,
                         delivery_state,
                         generation_owner: evidence.generation_owner,
+                        accepted_user_message_ref: if operation == BrowserOperation::DispatchSubmit
+                            && delivery_state == BrowserDeliveryState::Applied
+                        {
+                            accepted_user_message_ref.as_deref()
+                        } else {
+                            None
+                        },
                         updated_at: browser_epoch_ms(),
                     },
                 ) {
@@ -2116,13 +2170,34 @@ fn browser_created_session_dispatch(
         created_at: browser_epoch_ms(),
     })?;
     let dispatch = match reservation_result {
-        BrowserDispatchReservation::Existing(dispatch) => dispatch,
+        BrowserDispatchReservation::Existing(dispatch) => {
+            // A replay may encounter a dispatch created by an older runtime or
+            // a crash-recovery path before accepted-message linkage was folded
+            // into the delivery update. Repair only that existing row here.
+            match reservation.accepted_user_message_ref.as_deref() {
+                Some(accepted_user_message_ref)
+                    if dispatch.accepted_user_message_ref.as_deref()
+                        != Some(accepted_user_message_ref) =>
+                {
+                    store.record_browser_dispatch_accepted_message(
+                        &dispatch.dispatch_id,
+                        reservation.expected_generation,
+                        accepted_user_message_ref,
+                        browser_epoch_ms(),
+                    )?
+                }
+                _ => dispatch,
+            }
+        }
         BrowserDispatchReservation::Reserved(dispatch) => {
+            // Fresh materialization persists Applied + provider user-message
+            // identity in one transaction, closing the acceptance crash window.
             store.update_browser_dispatch(BrowserDispatchUpdateInput {
                 dispatch_id: &dispatch.dispatch_id,
                 expected_generation: reservation.expected_generation,
                 delivery_state: BrowserDeliveryState::Applied,
                 generation_owner: Some(reservation.expected_generation),
+                accepted_user_message_ref: reservation.accepted_user_message_ref.as_deref(),
                 updated_at: browser_epoch_ms(),
             })?
         }
@@ -2329,6 +2404,11 @@ fn browser_session_create(
             Ok(state) => state,
             Err(error) => return browser_store_error(error),
         };
+        let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence)
+        {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        };
         let Ok(mut guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
@@ -2336,6 +2416,7 @@ fn browser_session_create(
             &reservation.reservation_ref,
             expected_generation,
             delivery_state,
+            accepted_user_message_ref.as_deref(),
             browser_epoch_ms(),
         ) {
             Ok(record) => record,
@@ -2379,6 +2460,7 @@ fn browser_session_create(
             &reservation.reservation_ref,
             expected_generation,
             BrowserDeliveryState::Uncertain,
+            None,
             browser_epoch_ms(),
         ) {
             return browser_store_error(error);
@@ -2413,6 +2495,10 @@ fn browser_session_create(
         Ok(state) => state,
         Err(error) => return browser_store_error(error),
     };
+    let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
+        Ok(value) => value,
+        Err(error) => return browser_store_error(error),
+    };
     let Ok(mut guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
@@ -2420,6 +2506,7 @@ fn browser_session_create(
         &reservation.reservation_ref,
         expected_generation,
         delivery_state,
+        accepted_user_message_ref.as_deref(),
         browser_epoch_ms(),
     ) {
         Ok(record) => record,
@@ -3671,6 +3758,14 @@ fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) ->
         "parent_dispatch_id": dispatch.parent_dispatch_id,
         "delivery_state": dispatch.delivery_state.as_str(),
         "generation_owner": dispatch.generation_owner,
+        "accepted_user_message_ref": dispatch.accepted_user_message_ref,
+        "result": {
+            "settled": dispatch.result_assistant_message_ref.is_some(),
+            "assistant_message_ref": dispatch.result_assistant_message_ref,
+            "turn_message_id": dispatch.result_turn_message_id,
+            "evidence_id": dispatch.result_evidence_id,
+            "settled_at": dispatch.result_settled_at,
+        },
         "work_chain_id": dispatch.work_chain_id,
         "lane_id": dispatch.lane_id,
         "created_at": dispatch.created_at,
@@ -5758,6 +5853,7 @@ mod tests {
                         expected_generation,
                         delivery_state: BrowserDeliveryState::Applied,
                         generation_owner: Some(expected_generation),
+                        accepted_user_message_ref: None,
                         updated_at: browser_epoch_ms(),
                     })
                     .unwrap();
@@ -6128,6 +6224,217 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    #[test]
+    fn browser_evidence_accepted_user_message_ref_is_narrowly_validated() {
+        let mut evidence = BrowserPostconditionEvidence::resource_unavailable(7);
+        assert_eq!(
+            browser_evidence_accepted_user_message_ref(&evidence).unwrap(),
+            None
+        );
+        evidence.result = Some(json!({"accepted_user_message_ref": null}));
+        assert_eq!(
+            browser_evidence_accepted_user_message_ref(&evidence).unwrap(),
+            None
+        );
+        evidence.result = Some(json!({"accepted_user_message_ref": "user-1"}));
+        assert_eq!(
+            browser_evidence_accepted_user_message_ref(&evidence)
+                .unwrap()
+                .as_deref(),
+            Some("user-1")
+        );
+        evidence.result = Some(json!({"accepted_user_message_ref": ""}));
+        assert_eq!(
+            browser_evidence_accepted_user_message_ref(&evidence).unwrap_err(),
+            "browser_evidence_accepted_user_message_invalid"
+        );
+        evidence.result = Some(json!({"accepted_user_message_ref": 7}));
+        assert_eq!(
+            browser_evidence_accepted_user_message_ref(&evidence).unwrap_err(),
+            "browser_evidence_accepted_user_message_invalid"
+        );
+    }
+
+    #[test]
+    fn browser_dispatch_result_settlement_projects_exact_worker_result() {
+        use crate::state_store::{
+            BrowserDispatchResultInput, BrowserEndpointConsentInput,
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput, WorkMemoryBindingInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let session_ref = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "result-settlement-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["composer.submit","generation.status"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "result-settlement-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "result-settlement-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            guard
+                .bind_work_memory(WorkMemoryBindingInput {
+                    continuity_id: "wm:result-settle",
+                    project_ref: "project:result-settle",
+                    repo_id: "github.com/whshang/herdr-mcp",
+                    work_chain_id: "wc_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    provider: "chatgpt",
+                    account_ref: None,
+                    space_ref: None,
+                    session_ref: &session.resource_ref,
+                    bound_at: 15,
+                })
+                .unwrap();
+            session.resource_ref
+        };
+
+        struct AppliedWithIdentityActuator;
+        impl BrowserActuator for AppliedWithIdentityActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: Some(json!({"accepted_user_message_ref": "provider-user-1"})),
+                })
+            }
+        }
+
+        let submitted = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "bounded worker assignment",
+                "expected_generation": 7,
+                "idempotency_key": "result-settlement-key",
+                "work_chain_id": "wc_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "lane_id": "lane-result"
+            }),
+            true,
+            Some(&AppliedWithIdentityActuator),
+        );
+        assert_eq!(submitted["ok"], true);
+        assert_eq!(
+            submitted["dispatch"]["accepted_user_message_ref"],
+            "provider-user-1"
+        );
+        assert_eq!(submitted["dispatch"]["result"]["settled"], false);
+        let dispatch_id = submitted["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        {
+            let mut guard = store.lock().unwrap();
+            let settled = guard
+                .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                    provider: "chatgpt",
+                    session_ref: &session_ref,
+                    expected_generation: 7,
+                    accepted_user_message_ref: "provider-user-1",
+                    assistant_message_ref: "provider-assistant-1",
+                    assistant_text: "final worker answer text",
+                    observed_at: 20,
+                })
+                .unwrap();
+            assert!(!settled.replayed);
+            assert_eq!(settled.dispatch.dispatch_id, dispatch_id);
+        }
+
+        let status = browser_operation_call(
+            &store,
+            "herdr_mcp.browser_dispatch.status",
+            &json!({"dispatch_id": dispatch_id}),
+        );
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["dispatch"]["result"]["settled"], true);
+        assert_eq!(
+            status["dispatch"]["result"]["assistant_message_ref"],
+            "provider-assistant-1"
+        );
+        assert!(
+            status["dispatch"]["result"]["evidence_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("ev_")
+        );
+        assert!(
+            !status["dispatch"]["result"]["turn_message_id"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        // The worker text lives in Work Memory, not in the planner-facing status.
+        assert!(!status.to_string().contains("final worker answer text"));
     }
 
     #[test]

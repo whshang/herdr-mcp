@@ -1498,6 +1498,21 @@ const H2W_CONTENT_VERSION = "0.1.91";
       evidence.accepted_message_observed = serverAdvanced || domAdvanced;
       evidence.message_baseline_advanced = domAdvanced;
       evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      const acceptedUserMessageRef = (afterServer?.ok ? afterServer.userMessageId : null)
+        || afterDom?.messageId
+        || null;
+      if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef) {
+        // The existing actuation evidence.result object carries the exact
+        // provider user-message identity; no new top-level field is added.
+        evidence.result = { accepted_user_message_ref: acceptedUserMessageRef };
+        if (registeredBrowserSessionRef) {
+          acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
+            generation: expectedGeneration,
+            acceptedUserMessageRef,
+            reportedAssistantRef: null,
+          });
+        }
+      }
       if (creatingSession && evidence.canonical_url_observed) {
         const currentConvKey = ADAPTER.getConversationKey();
         if (currentConvKey && (registeredConvKey !== currentConvKey || !registeredBrowserSessionRef)) {
@@ -1535,6 +1550,50 @@ const H2W_CONTENT_VERSION = "0.1.91";
     return evidence;
   }
 
+  // Report one finalized worker assistant turn with the exact provider/session/
+  // generation/user-message/assistant-message identity. Missing exact IDs skip
+  // instead of guessing; the runtime then matches the already-applied dispatch
+  // and fails closed on anything unknown or unbound. No physical tab focus is
+  // required: the identities come from the provider snapshot, not tab activity.
+  async function reportBrowserResultSettlement(serverSnapshot) {
+    if (!registeredBrowserSessionRef || !Number.isSafeInteger(registeredBrowserGeneration)) {
+      return false;
+    }
+    if (!serverSnapshot?.ok || serverSnapshot.finished !== true || !serverSnapshot.messageId) {
+      return false;
+    }
+    const acceptedUserMessageRef = (typeof serverSnapshot.userMessageId === "string" && serverSnapshot.userMessageId)
+      || acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.acceptedUserMessageRef
+      || null;
+    if (!acceptedUserMessageRef) return false;
+    const assistantMessageRef = String(serverSnapshot.messageId);
+    const assistantText = String(serverSnapshot.text || "").trim();
+    if (!assistantText) return false;
+    const pending = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+    if (pending?.reportedAssistantRef === assistantMessageRef
+        && pending?.acceptedUserMessageRef === acceptedUserMessageRef) {
+      return true;
+    }
+    const response = await sendBg({
+      type: "h2w_browser_result",
+      provider: ADAPTER.name,
+      session_ref: registeredBrowserSessionRef,
+      generation: registeredBrowserGeneration,
+      accepted_user_message_ref: String(acceptedUserMessageRef),
+      assistant_message_ref: assistantMessageRef,
+      assistant_text: assistantText,
+    });
+    if (response?.ok === true) {
+      acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
+        generation: registeredBrowserGeneration,
+        acceptedUserMessageRef: String(acceptedUserMessageRef),
+        reportedAssistantRef: assistantMessageRef,
+      });
+      return true;
+    }
+    return false;
+  }
+
   // Browser Registry identity cached by the page script survives MV3
   // service-worker suspension. It contains only Herdr opaque refs/generation,
   // never the provider account's raw native identity.
@@ -1543,6 +1602,10 @@ const H2W_CONTENT_VERSION = "0.1.91";
   let registeredBrowserGeneration = null;
   let browserRegistrationAttempt = 0;
   const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+  // Exact accepted provider user-message identity reported by the last proven
+  // browser_dispatch.submit. Used as the settlement fallback only when a live
+  // provider snapshot omits the user message id; it never invents an identity.
+  const acceptedDispatchAssignments = new Map();
 
   // ---- Message listener ----
   try {
@@ -1586,6 +1649,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
           const serverUserCurrent = Boolean(server?.ok && server.currentNodeRole === "user");
           const serverSettled = serverAssistantCurrent && server.finished === true;
           const serverOpen = serverAssistantCurrent && server.finished === false;
+          if (serverSettled) void reportBrowserResultSettlement(server).catch(() => {});
           const assistantText = serverAssistantCurrent && server.text
             ? String(server.text)
             : (serverUserCurrent ? "" : domAssistantText);
@@ -1827,6 +1891,11 @@ const H2W_CONTENT_VERSION = "0.1.91";
         const assistantFinished = server?.ok && server.finished === true
           ? true
           : (!assistantRunning && Boolean(domAssistant.text));
+        if (assistantFinished && server?.ok && server.finished === true) {
+          // A closed/reopened physical tab re-derives the same provider server
+          // snapshot, so the durable result still reaches the runtime.
+          void reportBrowserResultSettlement(server).catch(() => {});
+        }
         const submitAt = Number(
           (server?.ok ? server.userCreatedAt : null)
           || domUser.messageAt

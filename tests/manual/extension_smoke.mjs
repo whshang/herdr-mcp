@@ -1629,5 +1629,25 @@ ok(llmReplyMatchesSkipKeyword("完成。", "完成\nPASS"), "custom skip match")
 ok(interpretLlmJudgeReply("完成", { skipKeywords: "完成\nPASS" }).done === true, "custom skip → done");
 ok(interpretLlmJudgeReply("好的", { skipKeywords: "完成" }).done === false, "好的 not in custom skip → not done");
 
+console.log("\n[browser result settlement]");
+ok(backgroundSource.includes('operation: "dispatch.result"')
+    && backgroundSource.includes("postBrowserDispatchResult")
+    && backgroundSource.includes('msg?.type === "h2w_browser_result"')
+    && backgroundSource.includes("browser_result_fields_incomplete"),
+  "background posts trusted worker result settlement through the existing registry IPC");
+ok(wakeSource.includes("reportBrowserResultSettlement")
+    && wakeSource.includes("accepted_user_message_ref")
+    && wakeSource.includes('type: "h2w_browser_result"')
+    && wakeSource.includes("evidence.result = { accepted_user_message_ref: acceptedUserMessageRef }"),
+  "content reports exact settled-turn identity from provider snapshots and actuation evidence");
+const settlementSegment = wakeSource.slice(
+  wakeSource.indexOf("async function reportBrowserResultSettlement"),
+  wakeSource.indexOf("// Browser Registry identity cached by the page script"),
+);
+ok(settlementSegment.length > 0
+    && !/document\.hidden|chrome\.tabs|active: true/.test(settlementSegment)
+    && wakeSource.includes("const acceptedUserMessageRef = (afterServer?.ok ? afterServer.userMessageId : null)"),
+  "result settlement has no physical tab focus dependency");
+
 console.log(`\n=== ${failures === 0 ? "EXTENSION SMOKE ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);
