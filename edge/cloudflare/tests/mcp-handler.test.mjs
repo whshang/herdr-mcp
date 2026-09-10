@@ -104,30 +104,44 @@ test("device-bound automation defaults to its device and rejects other selectors
   assert.deepEqual(fleet.body.result.structuredContent.devices.map((device) => device.device_id), [DEVICE_A]);
 });
 
-test("herdr_methods preflights private method routes without workstation delivery", async () => {
-  const cases = [
-    ["herdr_mcp.device.pair", "edge_local"],
-    ["herdr_mcp.text.read", "workstation_routed"],
-    ["herdr_mcp.skill.load", "unsupported"],
-    ["herdr_mcp.planning.advise", "unsupported"],
-  ];
-  for (const [query, route] of cases) {
+test("herdr_methods keeps Edge authority local and routes workstation-local discovery to the runtime", async () => {
+  const edgeLocal = deps({ client: { fleetAdmin: true } });
+  const pair = await handleMcp(req("route-pair", "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "herdr_mcp.device.pair" },
+  }), "legacy-default", edgeLocal.value);
+  assert.equal(pair.body.result.structuredContent.methods[0].method, "herdr_mcp.device.pair");
+  assert.equal(pair.body.result.structuredContent.methods[0].route, "edge_local");
+  assert.equal(pair.body.result.structuredContent.source, "edge_route_preflight");
+  assert.equal(edgeLocal.calls.length, 0, "Edge-local authority discovery must not forward");
+
+  const fleet = deps();
+  const fleetMethod = await handleMcp(req("route-fleet", "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "herdr_mcp.work_chain.inspect" },
+  }), "legacy-default", fleet.value);
+  assert.equal(fleetMethod.body.result.structuredContent.methods[0].method, "herdr_mcp.work_chain.inspect");
+  assert.equal(fleetMethod.body.result.structuredContent.source, "edge_fleet_control_v1");
+  assert.equal(fleet.calls.length, 0, "Edge fleet-control discovery must not forward");
+
+  for (const query of [
+    "herdr_mcp.skill.load",
+    "herdr_mcp.planning.advise",
+    "herdr_mcp.github.status",
+    "herdr_mcp.text.read",
+    "herdr_mcp.browser_endpoint.list",
+    "herdr_mcp.future.read_only",
+  ]) {
     const d = deps();
     const response = await handleMcp(req(`route-${query}`, "tools/call", {
       name: "herdr_methods",
       arguments: { query },
     }), "legacy-default", d.value);
-    assert.equal(response.body.result.structuredContent.ok, true);
-    assert.equal(response.body.result.structuredContent.methods[0].method, query);
-    assert.equal(response.body.result.structuredContent.methods[0].route, route);
-    const method = response.body.result.structuredContent.methods[0];
-    assert.ok([true, false, "unknown"].includes(method.implemented_local));
-    assert.ok([true, false, "unknown"].includes(method.available_local));
-    assert.ok([true, false, "unknown"].includes(method.edge_route_deployed));
-    assert.ok([true, false, "unknown"].includes(method.caller_routable));
-    assert.equal(typeof method.reason, "string");
-    assert.equal(response.body.result.structuredContent.source, "edge_route_preflight");
-    assert.equal(d.calls.length, 0, `${query} route preflight must not forward`);
+    assert.equal(response.body.result.isError, undefined);
+    assert.equal(response.body.result.structuredContent.served, true);
+    assert.equal(d.calls.length, 1, `${query} discovery must route to the selected workstation`);
+    assert.equal(d.calls[0].op, "herdr_methods");
+    assert.equal(d.calls[0].args.query, query);
   }
 
   const denied = deps({ client: { fleetAdmin: false } });
@@ -147,11 +161,11 @@ test("herdr_methods preflights private method routes without workstation deliver
   assert.equal(ownerPair.body.result.structuredContent.methods[0].caller_routable, true);
   assert.equal(ownerPair.body.result.structuredContent.methods[0].reason, "route_deployed");
 
-  const unknown = deps();
-  const response = await handleMcp(req("route-unknown", "tools/call", {
+  const reserved = deps();
+  const response = await handleMcp(req("route-reserved", "tools/call", {
     name: "herdr_methods",
-    arguments: { query: "herdr_mcp.unknown.future" },
-  }), "legacy-default", unknown.value);
+    arguments: { query: "herdr_mcp.automation.future" },
+  }), "legacy-default", reserved.value);
   assert.equal(response.body.result.structuredContent.methods[0].route, "unsupported");
   assert.equal(response.body.result.structuredContent.methods[0].implemented_local, "unknown");
   assert.equal(response.body.result.structuredContent.methods[0].available_local, "unknown");
@@ -159,7 +173,36 @@ test("herdr_methods preflights private method routes without workstation deliver
   assert.equal(response.body.result.structuredContent.methods[0].caller_routable, false);
   assert.equal(response.body.result.structuredContent.methods[0].reason, "edge_route_not_deployed");
   assert.equal(response.body.result.structuredContent.methods[0].next_surface, "herdr_methods");
-  assert.equal(unknown.calls.length, 0);
+  assert.equal(reserved.calls.length, 0);
+});
+
+test("herdr_call routes workstation-local private methods to the runtime and keeps reserved namespaces at Edge", async () => {
+  for (const method of [
+    "herdr_mcp.skill.describe",
+    "herdr_mcp.planning.advise",
+    "herdr_mcp.github.status",
+    "herdr_mcp.future.read_only",
+  ]) {
+    const d = deps();
+    const response = await handleMcp(req(`call-${method}`, "tools/call", {
+      name: "herdr_call",
+      arguments: { method, params: "{}" },
+    }), "legacy-default", d.value);
+    assert.equal(response.body.result.isError, undefined, `${method} must reach the workstation runtime`);
+    assert.equal(d.calls.length, 1);
+    assert.equal(d.calls[0].op, "herdr_call");
+    assert.equal(d.calls[0].args.method, method);
+  }
+
+  const reserved = deps();
+  const response = await handleMcp(req("call-reserved", "tools/call", {
+    name: "herdr_call",
+    arguments: { method: "herdr_mcp.automation.future", params: "{}" },
+  }), "legacy-default", reserved.value);
+  assert.equal(response.body.result.isError, true);
+  assert.equal(response.body.result.structuredContent.code, "unknown_method");
+  assert.equal(response.body.result.structuredContent.delivery_state, "not_delivered");
+  assert.equal(reserved.calls.length, 0);
 });
 
 test("initialize advertises legacy wire protocol and device-aware public identity", async () => {
@@ -214,6 +257,46 @@ test("tools/list exposes runtime tools plus edge-local herdr_devices", async () 
   assert.equal(r.body.result.tools.some((tool) => tool.name === "herdr_skill"), true);
   assert.equal(r.body.result.tools.some((tool) => tool.name === "herdr_devices"), true);
   assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
+});
+
+test("all 18 workstation contract tools pass the Edge routing boundary", async () => {
+  const d = deps();
+  assert.equal(EPOCH2_CONTRACT.tools.length, 18);
+  for (const [index, tool] of EPOCH2_CONTRACT.tools.entries()) {
+    const response = await handleMcp(req(`epoch2-${index}`, "tools/call", {
+      name: tool.name,
+      arguments: {},
+    }), "legacy-default", d.value);
+    assert.equal(response.body.result.isError, undefined, `${tool.name} must not be blocked at Edge`);
+  }
+  assert.deepEqual(d.calls.map((call) => call.op), EPOCH2_CONTRACT.tools.map((tool) => tool.name));
+  assert.equal(d.calls.every((call) => call.contractEpoch === EPOCH2_CONTRACT.contract_epoch), true);
+  assert.equal(d.calls.every((call) => call.contractHash === EPOCH2_CONTRACT.contract_hash), true);
+});
+
+test("all 18 workstation contract tools honor the same explicit device route", async () => {
+  const resolved = [];
+  const d = deps({
+    resolveDevice: async (selector) => {
+      resolved.push(selector);
+      return {
+        ok: true,
+        device_id: DEVICE_A,
+        workstation_id: "ws-explicit",
+        routing_reason: "explicit_device_id",
+      };
+    },
+  });
+  for (const [index, tool] of EPOCH2_CONTRACT.tools.entries()) {
+    const response = await handleMcp(req(`epoch2-device-${index}`, "tools/call", {
+      name: tool.name,
+      arguments: { device: DEVICE_A },
+    }), "legacy-default", d.value);
+    assert.equal(response.body.result.isError, undefined, `${tool.name} explicit device route must succeed`);
+  }
+  assert.deepEqual(resolved, Array(EPOCH2_CONTRACT.tools.length).fill(DEVICE_A));
+  assert.deepEqual(d.targets, Array(EPOCH2_CONTRACT.tools.length).fill("ws-explicit"));
+  assert.equal(d.calls.every((call) => !Object.hasOwn(call.args, "device")), true);
 });
 
 test("tools/call forwards only frozen tools with epoch/hash and preserves id", async () => {
