@@ -3745,7 +3745,38 @@ fn browser_operation_inspect_resource(
     }
 }
 
+fn browser_dispatch_result_is_durable(
+    dispatch: &crate::state_store::BrowserDispatchRecord,
+) -> bool {
+    dispatch.result_assistant_message_ref.is_some()
+        && dispatch.result_turn_message_id.is_some()
+        && dispatch.result_evidence_id.is_some()
+        && dispatch.result_settled_at.is_some()
+}
+
+/// Conservative beta.2 assignment projection derived from existing authorities.
+/// `uncertain` delivery deliberately has no projected execution state: treating it
+/// as queued or submitted would invent evidence and could make failover unsafe.
+fn browser_dispatch_execution_state(
+    dispatch: &crate::state_store::BrowserDispatchRecord,
+) -> Option<&'static str> {
+    if browser_dispatch_result_is_durable(dispatch) {
+        return Some("settled");
+    }
+    match dispatch.delivery_state {
+        BrowserDeliveryState::NotApplied => Some("queued"),
+        BrowserDeliveryState::Applied => Some("submitted"),
+        BrowserDeliveryState::Uncertain => None,
+        BrowserDeliveryState::Rejected
+        | BrowserDeliveryState::BrowserOffline
+        | BrowserDeliveryState::ResourceUnavailable => Some("failed"),
+        BrowserDeliveryState::Stopped => Some("stopped"),
+    }
+}
+
 fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) -> Value {
+    let result_settled = browser_dispatch_result_is_durable(&dispatch);
+    let execution_state = browser_dispatch_execution_state(&dispatch);
     json!({
         "dispatch_id": dispatch.dispatch_id,
         "endpoint_ref": dispatch.endpoint_ref,
@@ -3759,8 +3790,9 @@ fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) ->
         "delivery_state": dispatch.delivery_state.as_str(),
         "generation_owner": dispatch.generation_owner,
         "accepted_user_message_ref": dispatch.accepted_user_message_ref,
+        "execution_state": execution_state,
         "result": {
-            "settled": dispatch.result_assistant_message_ref.is_some(),
+            "settled": result_settled,
             "assistant_message_ref": dispatch.result_assistant_message_ref,
             "turn_message_id": dispatch.result_turn_message_id,
             "evidence_id": dispatch.result_evidence_id,
@@ -5725,6 +5757,7 @@ mod tests {
         );
         assert_eq!(status["ok"], true);
         assert_eq!(status["dispatch"]["delivery_state"], "resource_unavailable");
+        assert_eq!(status["dispatch"]["execution_state"], "failed");
         assert!(!status.to_string().contains("delivery-session-hidden"));
 
         struct UncertainThenReconcileActuator {
@@ -5793,6 +5826,7 @@ mod tests {
         assert_eq!(uncertain["ok"], false);
         assert_eq!(uncertain["code"], "uncertain");
         assert_eq!(uncertain["dispatch"]["delivery_state"], "uncertain");
+        assert!(uncertain["dispatch"]["execution_state"].is_null());
         let reconcile_dispatch_id = uncertain["dispatch"]["dispatch_id"]
             .as_str()
             .unwrap()
@@ -6388,6 +6422,7 @@ mod tests {
             "provider-user-1"
         );
         assert_eq!(submitted["dispatch"]["result"]["settled"], false);
+        assert_eq!(submitted["dispatch"]["execution_state"], "submitted");
         let dispatch_id = submitted["dispatch"]["dispatch_id"]
             .as_str()
             .unwrap()
@@ -6417,6 +6452,7 @@ mod tests {
         );
         assert_eq!(status["ok"], true);
         assert_eq!(status["dispatch"]["result"]["settled"], true);
+        assert_eq!(status["dispatch"]["execution_state"], "settled");
         assert_eq!(
             status["dispatch"]["result"]["assistant_message_ref"],
             "provider-assistant-1"
