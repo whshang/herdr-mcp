@@ -942,6 +942,7 @@ test("pairing consume is unauthenticated, single-use, and returns the device sec
   const first = await worker.fetch(post("/devices/pairings/consume", consumeBody), env);
   assert.equal(first.status, 200);
   const credential = await first.json();
+  assert.equal(credential.recovered_existing, false);
   assert.match(credential.device_id, /^dev_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
   assert.equal(credential.workstation_id, credential.device_id, "device_id must be canonical workstation identity");
   assert.match(credential.credential_id, /^cred_[0-9a-f]{32}$/);
@@ -974,6 +975,7 @@ test("recovery pairing rotates one active device credential without changing dev
   const recovered = await consume.json();
   assert.equal(recovered.device_id, original.device_id);
   assert.equal(recovered.workstation_id, original.workstation_id);
+  assert.equal(recovered.recovered_existing, true);
   assert.notEqual(recovered.credential_id, original.credential_id);
   assert.notEqual(recovered.device_secret, original.device_secret);
 

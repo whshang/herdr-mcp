@@ -338,7 +338,7 @@ export class DeviceRegistryDO {
         if (existing.credential_id) await tx.delete(CREDENTIAL_PREFIX + existing.credential_id);
         await tx.put(DEVICE_PREFIX + existing.device_id, updated);
         await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
-        return { ok: true as const, device_id: existing.device_id, credential_id: credentialId, device_secret: deviceSecret };
+        return { ok: true as const, device_id: existing.device_id, credential_id: credentialId, device_secret: deviceSecret, recovered_existing: true as const };
       }
 
       const deviceId = newDeviceId(now);
@@ -366,7 +366,7 @@ export class DeviceRegistryDO {
       await tx.put(DEVICE_PREFIX + deviceId, device);
       await tx.put(WORKSTATION_PREFIX + deviceId, deviceId);
       await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
-      return { ok: true as const, device_id: deviceId, credential_id: credentialId, device_secret: deviceSecret };
+      return { ok: true as const, device_id: deviceId, credential_id: credentialId, device_secret: deviceSecret, recovered_existing: false as const };
     });
 
     if (!result.ok) return json(result, result.code === "pairing_rejected" ? 401 : 409);
@@ -376,6 +376,7 @@ export class DeviceRegistryDO {
       workstation_id: result.device_id,
       credential_id: result.credential_id,
       device_secret: result.device_secret,
+      recovered_existing: result.recovered_existing,
     });
   }
 

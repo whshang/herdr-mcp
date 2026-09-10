@@ -538,6 +538,7 @@ export default {
             workstation_id: result.credential.workstation_id,
             credential_id: result.credential.credential_id,
             device_secret: result.credential.device_secret,
+            recovered_existing: result.credential.recovered_existing,
           })
         : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
     }

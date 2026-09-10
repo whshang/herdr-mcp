@@ -16,6 +16,7 @@ export interface PairedDeviceCredential {
   workstation_id: string;
   credential_id: string;
   device_secret: string;
+  recovered_existing: boolean;
 }
 
 export type DeviceCredentialAuthCode =
@@ -74,7 +75,7 @@ export async function consumePairingSession(
       status: response.status,
     };
   }
-  if (!isRecord(body) || body.ok !== true || typeof body.device_id !== "string" || typeof body.workstation_id !== "string" || typeof body.credential_id !== "string" || typeof body.device_secret !== "string") {
+  if (!isRecord(body) || body.ok !== true || typeof body.device_id !== "string" || typeof body.workstation_id !== "string" || typeof body.credential_id !== "string" || typeof body.device_secret !== "string" || (body.recovered_existing !== undefined && typeof body.recovered_existing !== "boolean")) {
     return { ok: false, code: "invalid_registry_response", status: 503 };
   }
   return {
@@ -84,6 +85,7 @@ export async function consumePairingSession(
       workstation_id: body.workstation_id,
       credential_id: body.credential_id,
       device_secret: body.device_secret,
+      recovered_existing: body.recovered_existing === true,
     },
   };
 }

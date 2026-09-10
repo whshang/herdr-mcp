@@ -55,6 +55,7 @@ pub(crate) struct EnrolledCredential {
     pub(crate) device_id: String,
     pub(crate) workstation_id: String,
     pub(crate) device_secret: String,
+    pub(crate) recovered_existing: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -1608,47 +1609,78 @@ where
     L: Fn(&RuntimePaths) -> Result<(), String>,
     M: Fn(&str, &str, &str, Option<&str>) -> Result<EnrolledCredential, String>,
 {
+    // Snapshot the local binding before consuming the one-time pairing. The
+    // server marker is authoritative, while the same-device local binding is
+    // a mixed-version safety fence: an existing device must never be revoked
+    // merely because an older Edge omitted recovered_existing.
+    let previous_config_result = load_config(&paths.config_file, &paths.instance);
     let enrolled = consume(edge_origin, pairing_id, code, name)?;
     let device_id = crate::config::normalize_device_id(&enrolled.device_id)?;
+    let recovered_existing = enrolled.recovered_existing
+        || previous_config_result
+            .as_ref()
+            .ok()
+            .and_then(|config| config.edge_device_id.as_deref())
+            == Some(device_id.as_str());
     if enrolled.workstation_id != device_id {
-        let _ = revoke_fn(
-            edge_origin,
-            &enrolled.workstation_id,
-            &enrolled.device_secret,
-        );
+        if !recovered_existing {
+            let _ = revoke_fn(
+                edge_origin,
+                &enrolled.workstation_id,
+                &enrolled.device_secret,
+            );
+        }
         return Err(
             "Worker returned a workstation identity that does not match the immutable device_id"
                 .to_owned(),
         );
     }
     if let Err(error) = validate_device_secret(&enrolled.device_secret) {
-        let _ = revoke_fn(edge_origin, &device_id, &enrolled.device_secret);
+        if !recovered_existing {
+            let _ = revoke_fn(edge_origin, &device_id, &enrolled.device_secret);
+        }
         return Err(error);
     }
 
     let account = match current_account() {
         Ok(a) => a,
         Err(error) => {
-            let _ = revoke_fn(edge_origin, &device_id, &enrolled.device_secret);
+            if !recovered_existing {
+                let _ = revoke_fn(edge_origin, &device_id, &enrolled.device_secret);
+            }
             return Err(error);
         }
     };
     let keychain_service = format!("herdr-edge-link-{device_id}");
     if let Err(error) = store_secret(&keychain_service, &account, &enrolled.device_secret) {
+        if recovered_existing {
+            return Err(format!(
+                "cannot persist the recovered credential for existing device {device_id}; the device was not revoked, but its Worker verifier has rotated, so create another recovery pairing: {error}"
+            ));
+        }
         let revoked = revoke_fn(edge_origin, &device_id, &enrolled.device_secret).unwrap_or(false);
         return Err(format!(
             "cannot persist the new device credential; remote compensation revoked={revoked}: {error}"
         ));
     }
 
+    // New-device enrollment failures after durable secret storage revoke the
+    // newly-created remote device and remove its local credential. Existing-
+    // device recovery is different: the remote identity predates this attempt,
+    // so failures preserve the rotated credential and never revoke the device.
     // Any failure after the secret is durably stored must revoke the remote device
     // and delete the local Keychain credential to avoid orphans. No secret is ever
     // printed in the error.
     // Retain the previous local binding so a post-write failure can roll the
     // transaction back instead of leaving config/plist bound to a revoked device.
-    let previous_config = match load_config(&paths.config_file, &paths.instance) {
+    let previous_config = match previous_config_result {
         Ok(c) => c,
         Err(error) => {
+            if recovered_existing {
+                return Err(format!(
+                    "local config unavailable after credential recovery for existing device {device_id}; the device was not revoked and the recovered credential was preserved: {error}"
+                ));
+            }
             let (revoked, deleted) = compensate_after_store(
                 edge_origin,
                 &device_id,
@@ -1665,6 +1697,11 @@ where
     };
     let mut config = previous_config.clone();
     if let Err(error) = config.set_edge_public_origin(edge_origin) {
+        if recovered_existing {
+            return Err(format!(
+                "config origin update failed after credential recovery for existing device {device_id}; the device was not revoked and the recovered credential was preserved: {error}"
+            ));
+        }
         let (revoked, deleted) = compensate_after_store(
             edge_origin,
             &device_id,
@@ -1679,6 +1716,11 @@ where
         ));
     }
     if let Err(error) = config.set_edge_device_id(&device_id) {
+        if recovered_existing {
+            return Err(format!(
+                "config device update failed after credential recovery for existing device {device_id}; the device was not revoked and the recovered credential was preserved: {error}"
+            ));
+        }
         let (revoked, deleted) = compensate_after_store(
             edge_origin,
             &device_id,
@@ -1693,6 +1735,11 @@ where
         ));
     }
     if let Err(error) = write_config(paths, &config) {
+        if recovered_existing {
+            return Err(format!(
+                "config write failed after credential recovery for existing device {device_id}; the device was not revoked and the recovered credential was preserved: {error}"
+            ));
+        }
         let (revoked, deleted) = compensate_after_store(
             edge_origin,
             &device_id,
@@ -1708,6 +1755,11 @@ where
     }
 
     if let Err(error) = activate(paths) {
+        if recovered_existing {
+            return Err(format!(
+                "existing device {device_id} credential recovery was persisted, but the local runtime could not be activated: {error}; the device was not revoked and the recovered credential/config were preserved for repair"
+            ));
+        }
         // The config is durably written, but the local runtime/production Link
         // could not be made ready. Roll the whole local transaction back: exact remote
         // revoke-self, local Keychain deletion, best-effort atomic restore of the
@@ -1747,6 +1799,7 @@ where
         "edge_origin": edge_origin,
         "keychain_service": keychain_service,
         "pairing_consumed": true,
+        "recovered_existing": recovered_existing,
         "secret_printed": false,
         "service_ready": true,
         "link_ready": true,
@@ -1773,6 +1826,10 @@ fn consume_pairing(
         device_id: required_string(&payload, "device_id")?,
         workstation_id: required_string(&payload, "workstation_id")?,
         device_secret: required_string(&payload, "device_secret")?,
+        recovered_existing: payload
+            .get("recovered_existing")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -2944,6 +3001,7 @@ mod tests {
                 device_id: NEW_DEVICE_ID.to_owned(),
                 workstation_id: NEW_DEVICE_ID.to_owned(),
                 device_secret: DEVICE_SECRET.to_owned(),
+                recovered_existing: false,
             })
         };
 
@@ -2997,6 +3055,179 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_existing_store_failure_never_revokes_device() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        const DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const DEVICE_SECRET: &str =
+            "devsec_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let dir = env::temp_dir().join(format!(
+            "herdr-worker-recovery-store-failure-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let paths = crate::paths::RuntimePaths {
+            config_dir: dir.clone(),
+            config_file: dir.join("config.toml"),
+            dev_state_dir: dir.join("dev-state"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+        let previous_config = Config {
+            edge_public_origin: Some("https://edge.example".to_owned()),
+            edge_device_id: Some(DEVICE_ID.to_owned()),
+            ..Config::default()
+        };
+        let revoke_calls = Rc::new(Cell::new(0_u32));
+        let delete_calls = Rc::new(Cell::new(0_u32));
+        let revoke_calls_hook = revoke_calls.clone();
+        let delete_calls_hook = delete_calls.clone();
+        let load_config = move |_: &Path, _: &InstanceId| Ok(previous_config.clone());
+        let store_secret = |_: &str, _: &str, _: &str| -> Result<(), String> {
+            Err("simulated Keychain write failure".to_owned())
+        };
+        let write_config = |_: &RuntimePaths, _: &Config| Ok(());
+        let revoke = move |_: &str, _: &str, _: &str| -> Result<bool, String> {
+            revoke_calls_hook.set(revoke_calls_hook.get() + 1);
+            Ok(true)
+        };
+        let delete = move |_: &str, _: &str| -> Result<(), String> {
+            delete_calls_hook.set(delete_calls_hook.get() + 1);
+            Ok(())
+        };
+        let activate = |_: &RuntimePaths| Ok(());
+        let reconcile = |_: &RuntimePaths| Ok(());
+        let consume = |_: &str, _: &str, _: &str, _: Option<&str>| {
+            Ok(EnrolledCredential {
+                device_id: DEVICE_ID.to_owned(),
+                workstation_id: DEVICE_ID.to_owned(),
+                device_secret: DEVICE_SECRET.to_owned(),
+                recovered_existing: true,
+            })
+        };
+
+        let error = connect_macos_inner(
+            &paths,
+            "https://edge.example",
+            "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "000000",
+            None,
+            store_secret,
+            load_config,
+            write_config,
+            revoke,
+            delete,
+            activate,
+            reconcile,
+            consume,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("device was not revoked"));
+        assert!(error.contains("another recovery pairing"));
+        assert!(!error.contains("devsec_"));
+        assert_eq!(revoke_calls.get(), 0);
+        assert_eq!(delete_calls.get(), 0);
+    }
+
+    #[test]
+    fn recovered_existing_activation_failure_preserves_device_and_credential() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        const DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const DEVICE_SECRET: &str =
+            "devsec_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let dir = env::temp_dir().join(format!(
+            "herdr-worker-recovery-activation-failure-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let paths = crate::paths::RuntimePaths {
+            config_dir: dir.clone(),
+            config_file: dir.join("config.toml"),
+            dev_state_dir: dir.join("dev-state"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+        let previous_config = Config {
+            edge_public_origin: Some("https://edge.example".to_owned()),
+            edge_device_id: Some(DEVICE_ID.to_owned()),
+            ..Config::default()
+        };
+        let store_calls = Rc::new(Cell::new(0_u32));
+        let revoke_calls = Rc::new(Cell::new(0_u32));
+        let delete_calls = Rc::new(Cell::new(0_u32));
+        let reconcile_calls = Rc::new(Cell::new(0_u32));
+        let store_hook = store_calls.clone();
+        let revoke_hook = revoke_calls.clone();
+        let delete_hook = delete_calls.clone();
+        let reconcile_hook = reconcile_calls.clone();
+        let load_config = move |_: &Path, _: &InstanceId| Ok(previous_config.clone());
+        let store_secret = move |service: &str, _: &str, secret: &str| -> Result<(), String> {
+            assert_eq!(service, format!("herdr-edge-link-{DEVICE_ID}"));
+            assert_eq!(secret, DEVICE_SECRET);
+            store_hook.set(store_hook.get() + 1);
+            Ok(())
+        };
+        let write_config = |_: &RuntimePaths, config: &Config| -> Result<(), String> {
+            assert_eq!(config.edge_device_id.as_deref(), Some(DEVICE_ID));
+            Ok(())
+        };
+        let revoke = move |_: &str, _: &str, _: &str| -> Result<bool, String> {
+            revoke_hook.set(revoke_hook.get() + 1);
+            Ok(true)
+        };
+        let delete = move |_: &str, _: &str| -> Result<(), String> {
+            delete_hook.set(delete_hook.get() + 1);
+            Ok(())
+        };
+        let activate = |_: &RuntimePaths| -> Result<(), String> {
+            Err("simulated activation failure".to_owned())
+        };
+        let reconcile = move |_: &RuntimePaths| -> Result<(), String> {
+            reconcile_hook.set(reconcile_hook.get() + 1);
+            Ok(())
+        };
+        let consume = |_: &str, _: &str, _: &str, _: Option<&str>| {
+            Ok(EnrolledCredential {
+                device_id: DEVICE_ID.to_owned(),
+                workstation_id: DEVICE_ID.to_owned(),
+                device_secret: DEVICE_SECRET.to_owned(),
+                // Deliberately false: the local same-device binding is the
+                // mixed-version safety fence when an older Edge omits the bit.
+                recovered_existing: false,
+            })
+        };
+
+        let error = connect_macos_inner(
+            &paths,
+            "https://edge.example",
+            "pair_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "000000",
+            None,
+            store_secret,
+            load_config,
+            write_config,
+            revoke,
+            delete,
+            activate,
+            reconcile,
+            consume,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("device was not revoked"));
+        assert!(error.contains("credential/config were preserved"));
+        assert!(!error.contains("devsec_"));
+        assert_eq!(store_calls.get(), 1);
+        assert_eq!(revoke_calls.get(), 0);
+        assert_eq!(delete_calls.get(), 0);
+        assert_eq!(reconcile_calls.get(), 0);
     }
 
     #[test]
@@ -3060,6 +3291,7 @@ mod tests {
                 device_id: NEW_DEVICE_ID.to_owned(),
                 workstation_id: NEW_DEVICE_ID.to_owned(),
                 device_secret: DEVICE_SECRET.to_owned(),
+                recovered_existing: false,
             })
         };
 
