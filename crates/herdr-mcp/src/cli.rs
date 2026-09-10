@@ -133,6 +133,10 @@ pub enum WorkerCommand {
         account_ref: String,
         allowed: bool,
     },
+    ConnectorPlannerControl {
+        action: String,
+        request_id: Option<String>,
+    },
     ConnectorPageAssist {
         connector_id: String,
         device_id: String,
@@ -738,6 +742,21 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
                 client_id: client_id.to_owned(),
             }))
         }
+        Some("planner-control") => {
+            let usage = "connector planner-control requires list or <approve|revoke> <request-id> --confirm";
+            let (action, request_id) = match &args[1..] {
+                [action] if action == "list" => (action.clone(), None),
+                [action, id, confirm]
+                    if matches!(action.as_str(), "approve" | "revoke") && confirm == "--confirm"
+                        && id.starts_with("pcr_") && id.len() == 47
+                        && id[4..].chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')) =>
+                {
+                    (action.clone(), Some(id.clone()))
+                }
+                _ => return Err(usage.to_owned()),
+            };
+            Ok(Command::Worker(WorkerCommand::ConnectorPlannerControl { action, request_id }))
+        }
         Some("webchat-control") => {
             let [
                 action,
@@ -834,10 +853,10 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some(value) => Err(format!(
-            "unknown connector command '{value}' (expected list, approve, cancel, revoke, revoke-client, webchat-control, or page-assist)"
+            "unknown connector command '{value}' (expected list, approve, cancel, revoke, revoke-client, webchat-control, planner-control, or page-assist)"
         )),
         None => {
-            Err("connector requires list, approve, cancel, revoke, revoke-client, webchat-control, or page-assist".to_owned())
+            Err("connector requires list, approve, cancel, revoke, revoke-client, webchat-control, planner-control, or page-assist".to_owned())
         }
     }
 }
@@ -1455,6 +1474,7 @@ User path:\n\
   herdr-mcp connector approve <approval-request-id>  (macOS/Linux enrolled device; reads the 6-digit code interactively, never argv)\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
   herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
+  herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
   herdr-mcp connector webchat-control <allow|deny> <connector-id> <device-id> <endpoint-ref> <provider> <account-ref> --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp connector page-assist <allow|deny> <connector-id> <device-id> <endpoint-ref> --confirm  (macOS/Linux enrolled owner device)\n\
   herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
@@ -1557,6 +1577,58 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn planner_control_owner_commands() {
+        let id = format!("pcr_{}", "a".repeat(43));
+        assert_eq!(
+            parse(args(&["connector", "planner-control", "list"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorPlannerControl {
+                action: "list".to_owned(),
+                request_id: None
+            })
+        );
+        for action in ["approve", "revoke"] {
+            assert_eq!(
+                parse(args(&[
+                    "connector",
+                    "planner-control",
+                    action,
+                    &id,
+                    "--confirm"
+                ]))
+                .unwrap()
+                .command,
+                Command::Worker(WorkerCommand::ConnectorPlannerControl {
+                    action: action.to_owned(),
+                    request_id: Some(id.clone())
+                })
+            );
+            assert!(parse(args(&["connector", "planner-control", action, &id])).is_err());
+        }
+        assert!(
+            parse(args(&[
+                "connector",
+                "planner-control",
+                "claim",
+                &id,
+                "--confirm"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "connector",
+                "planner-control",
+                "approve",
+                "invalid",
+                "--confirm"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

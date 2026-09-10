@@ -308,6 +308,9 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::ConnectorClientRevoke { client_id } => {
             revoke_connector_client(&paths, &client_id)
         }
+        WorkerCommand::ConnectorPlannerControl { action, request_id } => {
+            connector_planner_control(&paths, &action, request_id.as_deref())
+        }
         WorkerCommand::ConnectorWebChatControl {
             connector_id,
             device_id,
@@ -922,6 +925,47 @@ fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<Exit
             "client_id": payload.get("client_id").cloned().unwrap_or(Value::String(client_id.to_owned())),
         }))
         .map_err(|error| format!("cannot encode connector client revoke result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn connector_planner_control(
+    _paths: &RuntimePaths,
+    _action: &str,
+    _request_id: Option<&str>,
+) -> Result<ExitCode, String> {
+    Err("planner control requires a supported enrolled-owner credential backend".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn connector_planner_control(
+    paths: &RuntimePaths,
+    action: &str,
+    request_id: Option<&str>,
+) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/planner-control",
+        )?)
+        .headers(headers)
+        .json(&json!({ "action": action, "request_id": request_id }))
+        .send()
+        .map_err(|error| format!("cannot manage planner control: {error}"))?;
+    let payload = parse_json_response(response, "planner control")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode planner control result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }

@@ -334,6 +334,20 @@ export default {
         : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "automation_client_not_found" ? 404 : 409);
     }
 
+    if (request.method === "POST" && url.pathname === "/connectors/planner-control") {
+      const ownerDevice = await authenticateOwnerDevice(request, env);
+      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)
+        || Object.keys(parsed.value).some((key) => key !== "action" && key !== "request_id")
+        || !["list", "approve", "revoke"].includes(String(parsed.value.action))
+        || (parsed.value.action !== "list" && (typeof parsed.value.request_id !== "string"
+          || !/^pcr_[A-Za-z0-9_-]{43}$/.test(parsed.value.request_id)))) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const result = await plannerControlStore(env, { ...parsed.value, owner: `device:${ownerDevice}` });
+      return noStoreJsonResponse(result, result.ok ? 200 : 403);
+    }
     if (request.method === "POST" && url.pathname === "/connectors/webchat-control") {
       const ownerDevice = await authenticateOwnerDevice(request, env);
       if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
@@ -849,9 +863,28 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           revoked_at_ms: result.revoked_at_ms,
         };
       },
-      fleetControl: async (method, params) => {
-        const authority = fleetControllerAuthority(devAuth);
+      plannerControl: async (action, params) => {
+        if (devAuth.source !== "oauth_edge" || !devAuth.clientId || !devAuth.connectorId || !devAuth.grantGeneration) {
+          return { ok: false, code: "planner_control_denied" };
+        }
+        const { claim_secret, ...input } = params;
+        return plannerControlStore(env, { ...input, action, secret: claim_secret,
+          client_id: devAuth.clientId, connector_id: devAuth.connectorId, grant_generation: devAuth.grantGeneration });
+      },
+      fleetControl: async (method, params, capability) => {
+        let authority = fleetControllerAuthority(devAuth);
+        if (!authority && capability && devAuth.source === "oauth_edge" && devAuth.connectorId && devAuth.grantGeneration) {
+          const verified = await plannerControlStore(env, { action: "verify", secret: capability,
+            client_id: devAuth.clientId, connector_id: devAuth.connectorId, grant_generation: devAuth.grantGeneration });
+          if (verified.ok && isRecord(verified.authority) && typeof verified.authority.principal === "string"
+            && verified.authority.can_force_takeover === false) {
+            authority = { principal: verified.authority.principal, can_force_takeover: false };
+          }
+        }
         if (!authority) return { ok: false, code: "fleet_control_authorization_required", retryable: false };
+        if (method === "herdr_mcp.planner_lease.takeover" && !authority.can_force_takeover) {
+          return { ok: false, code: "planner_lease_takeover_forbidden", retryable: false };
+        }
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
         const response = await registry.fetch(new Request("https://devices.internal/internal/devices/fleet-control", {
           method: "POST",
@@ -1269,6 +1302,11 @@ async function oauthClientPageAssistGrants(
   return (grant.page_assist ?? [])
     .filter((item) => item.connector_id === connectorId && item.grant_generation === grantGeneration)
     .map((item) => ({ device_id: item.device_id, endpoint_ref: item.endpoint_ref }));
+}
+
+async function plannerControlStore(env: Env, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const response = await oauthInternal(env, "/internal/oauth/planner-control", input);
+  return await response.json() as Record<string, unknown>;
 }
 
 function fleetControllerAuthority(auth: { source: string; clientId?: string }): { principal: string; can_force_takeover: boolean } | null {

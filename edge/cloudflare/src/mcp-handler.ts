@@ -92,7 +92,8 @@ export interface McpDeps {
     | { ok: true }
     | { ok: false; code: string }
   >;
-  fleetControl?(method: FleetControlMethod, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+  fleetControl?(method: FleetControlMethod, params: Record<string, unknown>, capability?: string): Promise<Record<string, unknown>>;
+  plannerControl?(action: "request" | "claim", params: Record<string, unknown>): Promise<Record<string, unknown>>;
   resolveDevice?(selector: string | undefined, args?: Record<string, unknown>): Promise<DeviceRouteResult>;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
@@ -470,8 +471,20 @@ export async function handleMcp(
     }
 
     const localMethod = name === "herdr_call" && typeof args.method === "string" ? args.method : null;
+    // Reserved credentials must never reach workstation routing or its logs.
+    if (name === "herdr_call" && (!localMethod || !isFleetControlMethod(localMethod))) {
+      let supplied = args.params;
+      if (typeof supplied === "string") {
+        try { supplied = JSON.parse(supplied); } catch { /* Normal validation handles malformed JSON. */ }
+      }
+      if (isRecord(supplied) && "_controller_capability" in supplied) {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", field: "_controller_capability" }, true));
+      }
+    }
 
-    if (localMethod && isFleetControlMethod(localMethod)) {
+    const plannerAction = localMethod === "herdr_mcp.planner_control.request" ? "request"
+      : localMethod === "herdr_mcp.planner_control.claim" ? "claim" : null;
+    if (localMethod && (isFleetControlMethod(localMethod) || plannerAction)) {
       if (args.device !== undefined) {
         return rpcResult(id, callToolResult({ ok: false, code: "device_selector_not_allowed", retryable: false, delivery_state: "not_delivered" }, true));
       }
@@ -496,6 +509,28 @@ export async function handleMcp(
         if (!isRecord(args.params)) return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", retryable: false }, true));
         methodParams = args.params;
       }
+      if (plannerAction) {
+        const fields = plannerAction === "request"
+          ? ["device_id", "endpoint_ref", "provider", "account_ref", "space_ref", "session_ref", "observation_generation"]
+          : ["request_id", "claim_secret"];
+        if (Object.keys(methodParams).some((key) => !fields.includes(key)) || fields.some((key) => !(key in methodParams))) {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params" }, true));
+        }
+        try {
+          const result = await deps.plannerControl?.(plannerAction, methodParams)
+            ?? { ok: false, code: "planner_control_denied" };
+          return rpcResult(id, callToolResult(result, result.ok === false));
+        } catch {
+          return rpcResult(id, callToolResult({ ok: false, code: "planner_control_unavailable" }, true));
+        }
+      }
+      if (!isFleetControlMethod(localMethod)) throw new Error("invalid fleet method");
+      const capability = methodParams._controller_capability;
+      methodParams = { ...methodParams };
+      delete methodParams._controller_capability;
+      if (capability !== undefined && (typeof capability !== "string" || !capability || capability.length > 128)) {
+        return rpcResult(id, callToolResult({ ok: false, code: "fleet_control_authorization_required" }, true));
+      }
       const invalidParam = invalidFleetControlParam(localMethod, methodParams);
       if (invalidParam) {
         return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", retryable: false, field: invalidParam }, true));
@@ -504,7 +539,7 @@ export async function handleMcp(
         return rpcResult(id, callToolResult({ ok: false, code: "fleet_control_unsupported", retryable: false, delivery_state: "not_delivered" }, true));
       }
       try {
-        const result = await deps.fleetControl(localMethod, methodParams);
+        const result = await deps.fleetControl(localMethod, methodParams, capability as string | undefined);
         return rpcResult(id, callToolResult(result, result.ok === false));
       } catch {
         return rpcResult(id, callToolResult({ ok: false, code: "fleet_control_unavailable", retryable: true, delivery_state: "not_delivered" }, true));
