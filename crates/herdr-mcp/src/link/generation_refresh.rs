@@ -926,6 +926,22 @@ fn evidence_fingerprint(evidence: &ConvergenceEvidence) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn legacy_owner_identity(env: &Dictionary) -> Option<(&str, &str)> {
+    let workstation_id = env
+        .get("HERDR_WORKSTATION_ID")
+        .and_then(PlistValue::as_string)?;
+    let credential_service = env
+        .get("HERDR_LINK_KEYCHAIN_SERVICE")
+        .and_then(PlistValue::as_string)?;
+    if credential_service != crate::link::run::MACOS_LINK_KEYCHAIN_SERVICE
+        || super::ladder::validate_workstation_id(workstation_id).is_err()
+    {
+        return None;
+    }
+    Some((workstation_id, credential_service))
+}
+
+#[cfg(target_os = "macos")]
 fn refresh_prod_plist_generation(
     home: &Path,
     plist_path: &Path,
@@ -984,10 +1000,12 @@ fn refresh_prod_plist_generation(
         env_out.insert("HERDR_EDGE_URL".to_owned(), PlistValue::String(edge_url));
     }
     if let Some((device_id, keychain_service)) = configured_edge_device_identity(home) {
-        env_out.insert(
-            "HERDR_WORKSTATION_ID".to_owned(),
-            PlistValue::String(device_id),
-        );
+        if legacy_owner_identity(&env_out).is_none() {
+            env_out.insert(
+                "HERDR_WORKSTATION_ID".to_owned(),
+                PlistValue::String(device_id),
+            );
+        }
         // Runtime generation refresh must not change credential ownership.
         if !env_out.contains_key("HERDR_LINK_KEYCHAIN_SERVICE") {
             env_out.insert(
@@ -1305,6 +1323,83 @@ mod tests {
             Some("rust-stable")
         );
         assert!(!rewrite_prod_plist_credential_identity(&plist_path, device_id, &service).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prod_plist_refresh_preserves_existing_legacy_owner_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-link-generation-owner-refresh-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config_dir = root.join(".config/herdr-mcp");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[edge]\npublic_origin = \"https://edge.example\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+        )
+        .unwrap();
+        let plist_path = root.join("link-prod.plist");
+        let mut env = Dictionary::new();
+        env.insert(
+            "HERDR_RUNTIME_GENERATION".to_owned(),
+            PlistValue::String("rust-old".to_owned()),
+        );
+        env.insert(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            PlistValue::String("prod-real-runtime".to_owned()),
+        );
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            PlistValue::String(crate::link::run::MACOS_LINK_KEYCHAIN_SERVICE.to_owned()),
+        );
+        let mut root_dict = Dictionary::new();
+        root_dict.insert(
+            "Label".to_owned(),
+            PlistValue::String(LINK_PROD_LABEL.to_owned()),
+        );
+        root_dict.insert(
+            "EnvironmentVariables".to_owned(),
+            PlistValue::Dictionary(env),
+        );
+        PlistValue::Dictionary(root_dict)
+            .to_file_xml(&plist_path)
+            .unwrap();
+
+        assert!(
+            refresh_prod_plist_generation(&root, &plist_path, "rust-new", Some("1.0.0-dev"))
+                .unwrap()
+        );
+        let updated = PlistValue::from_file(&plist_path).unwrap();
+        let env = updated
+            .as_dictionary()
+            .unwrap()
+            .get("EnvironmentVariables")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            env.get("HERDR_RUNTIME_GENERATION")
+                .and_then(PlistValue::as_string),
+            Some("rust-new")
+        );
+        assert_eq!(
+            env.get("HERDR_EDGE_URL").and_then(PlistValue::as_string),
+            Some("wss://edge.example/ws")
+        );
+        assert_eq!(
+            env.get("HERDR_WORKSTATION_ID")
+                .and_then(PlistValue::as_string),
+            Some("prod-real-runtime")
+        );
+        assert_eq!(
+            env.get("HERDR_LINK_KEYCHAIN_SERVICE")
+                .and_then(PlistValue::as_string),
+            Some(crate::link::run::MACOS_LINK_KEYCHAIN_SERVICE)
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
