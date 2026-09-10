@@ -62,6 +62,8 @@ export interface PageAssistGrant {
 export interface McpClientContext {
   userAgent?: string | null;
   oauthClientId?: string | null;
+  connectorId?: string | null;
+  grantGeneration?: number | null;
   authSource?: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge" | null;
   webchatControlGrants?: readonly WebChatControlGrant[];
   pageAssistGrants?: readonly PageAssistGrant[];
@@ -1076,6 +1078,16 @@ export async function handleMcp(
         .filter((grant) => grant.device_id === route.device_id)
         .map((grant) => ({ endpoint_ref: grant.endpoint_ref }))
       : [];
+    const webchatAuthorization = isBrowserPrivateMethod
+      && deps.client?.connectorId
+      && Number.isSafeInteger(deps.client.grantGeneration)
+      && Number(deps.client.grantGeneration) > 0
+      ? {
+          principal_ref: `connector:${deps.client.connectorId}`,
+          connector_id: deps.client.connectorId,
+          grant_generation: Number(deps.client.grantGeneration),
+        }
+      : null;
     const requestedToolTimeoutMs =
       typeof runtimeArgs.timeout_ms === "number" && Number.isFinite(runtimeArgs.timeout_ms)
         ? Math.max(1, runtimeArgs.timeout_ms)
@@ -1096,11 +1108,12 @@ export async function handleMcp(
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
       contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
       idempotencyKey,
-      ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0
+      ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0 || webchatAuthorization
         ? {
           trace: {
             ...(webchatControlGrants.length > 0 ? { webchat_control_grants: webchatControlGrants } : {}),
             ...(pageAssistGrants.length > 0 ? { page_assist_grants: pageAssistGrants } : {}),
+            ...(webchatAuthorization ? { webchat_authorization: webchatAuthorization } : {}),
           },
         }
         : {}),

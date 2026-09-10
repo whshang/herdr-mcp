@@ -4,8 +4,8 @@ use crate::exec_sessions::ExecRegistry;
 use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{
-    self, BrowserActuator, BrowserCallerGrant, BrowserMutationAdmission,
-    BrowserPostconditionEvidence, PageAssistCallerGrant, RuntimeContext,
+    self, BrowserActuator, BrowserCallerAuthorization, BrowserCallerGrant,
+    BrowserMutationAdmission, BrowserPostconditionEvidence, PageAssistCallerGrant, RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -47,9 +47,11 @@ const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
 const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(2);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
+const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
 const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
+const MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
@@ -2292,6 +2294,19 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     };
+    let caller_webchat_authorization = match trusted_edge_webchat_authorization(&state, &headers) {
+        Ok(authorization) => authorization,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid trusted caller authorization context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -2345,6 +2360,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // The workstation bearer authenticates only TCP transport. Browser business
             // authority is admitted exclusively from the trusted Unix IPC handoff above.
             caller_webchat_control_grants: &caller_webchat_control_grants,
+            caller_webchat_authorization: caller_webchat_authorization.as_ref(),
             caller_page_assist_grants: &caller_page_assist_grants,
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
@@ -2569,9 +2585,64 @@ fn trusted_edge_page_assist_grants(
     Ok(grants)
 }
 
+fn trusted_edge_webchat_authorization(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<BrowserCallerAuthorization>, ()> {
+    if !state.trusted_extension_ipc {
+        return Ok(None);
+    }
+    let Some(raw) = headers.get(EDGE_WEBCHAT_AUTHORIZATION_HEADER) else {
+        return Ok(None);
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES {
+        return Err(());
+    }
+    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
+    let object = value.as_object().ok_or(())?;
+    if object.len() != 3
+        || !object.contains_key("principal_ref")
+        || !object.contains_key("connector_id")
+        || !object.contains_key("grant_generation")
+    {
+        return Err(());
+    }
+    let principal_ref = object
+        .get("principal_ref")
+        .and_then(Value::as_str)
+        .ok_or(())?;
+    let connector_id = object
+        .get("connector_id")
+        .and_then(Value::as_str)
+        .ok_or(())?;
+    let grant_generation = object
+        .get("grant_generation")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or(())?;
+    if !connector_id.starts_with("conn_")
+        || connector_id.len() < 13
+        || connector_id.len() > 133
+        || !connector_id[5..]
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        || principal_ref != format!("connector:{connector_id}")
+        || principal_ref.len() > 160
+    {
+        return Err(());
+    }
+    Ok(Some(BrowserCallerAuthorization {
+        principal_ref: principal_ref.to_owned(),
+        connector_id: connector_id.to_owned(),
+        grant_generation,
+    }))
+}
+
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
     if !state.trusted_extension_ipc
         || (!headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER)
+            && !headers.contains_key(EDGE_WEBCHAT_AUTHORIZATION_HEADER)
             && !headers.contains_key(EDGE_PAGE_ASSIST_GRANTS_HEADER))
     {
         return Ok(());
@@ -3460,6 +3531,7 @@ mod tests {
                     expected_generation: 7,
                     idempotency_key_digest: &digest("result-route-key"),
                     parent_dispatch_id: None,
+                    authorization: None,
                     work_chain_id: Some(WORK_CHAIN),
                     lane_id: Some("lane-result"),
                     created_at: 16,
@@ -3474,7 +3546,6 @@ mod tests {
                     expected_generation: 7,
                     delivery_state: BrowserDeliveryState::Applied,
                     generation_owner: Some(7),
-                    accepted_user_message_ref: None,
                     updated_at: 17,
                 })
                 .unwrap();
@@ -3768,10 +3839,21 @@ mod tests {
             EDGE_EXPECTED_RUNTIME_GENERATION_HEADER,
             HeaderValue::from_static("rust-old"),
         );
+        headers.insert(
+            EDGE_WEBCHAT_AUTHORIZATION_HEADER,
+            HeaderValue::from_static(
+                r#"{"principal_ref":"connector:conn_auditconnector123","connector_id":"conn_auditconnector123","grant_generation":7}"#,
+            ),
+        );
         assert_eq!(
             trusted_edge_runtime_generation_fence(&tcp_state, &headers),
             Ok(()),
             "ordinary TCP cannot activate the trusted generation-fence path"
+        );
+        assert_eq!(
+            trusted_edge_webchat_authorization(&tcp_state, &headers),
+            Ok(None),
+            "ordinary TCP cannot inject Connector authorization provenance"
         );
 
         let mut trusted_state = test_state(&root.join("trusted"));
@@ -3786,6 +3868,15 @@ mod tests {
             trusted_edge_runtime_generation_fence(&trusted_state, &headers),
             Ok(())
         );
+        let authorization = trusted_edge_webchat_authorization(&trusted_state, &headers)
+            .unwrap()
+            .expect("trusted Unix IPC may carry verified Connector provenance");
+        assert_eq!(
+            authorization.principal_ref,
+            "connector:conn_auditconnector123"
+        );
+        assert_eq!(authorization.connector_id, "conn_auditconnector123");
+        assert_eq!(authorization.grant_generation, 7);
         headers.remove(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER);
         assert_eq!(
             trusted_edge_runtime_generation_fence(&trusted_state, &headers),

@@ -11,12 +11,13 @@ use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
-    BrowserDeliveryState, BrowserDispatchReservation, BrowserDispatchReserveInput,
-    BrowserDispatchUpdateInput, BrowserResourceResolveInput, BrowserSessionReservation,
-    BrowserSessionReservationInput, BrowserSessionReservationRecord, ContinuitySearchInput,
-    OperationReservation, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
-    WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemorySearchBoundary,
-    WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
+    BrowserDeliveryState, BrowserDispatchAuthorizationInput, BrowserDispatchReservation,
+    BrowserDispatchReserveInput, BrowserDispatchUpdateInput, BrowserResourceResolveInput,
+    BrowserSessionReservation, BrowserSessionReservationInput, BrowserSessionReservationRecord,
+    ContinuitySearchInput, OperationReservation, StateStore, WorkMemoryBindingInput,
+    WorkMemoryCheckpointInput, WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput,
+    WorkMemorySearchBoundary, WorkMemorySearchPage, WorkMemorySearchPageOptions,
+    WorkMemoryTurnInput,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
@@ -47,6 +48,13 @@ pub struct BrowserCallerGrant {
     pub endpoint_ref: String,
     pub provider: String,
     pub account_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCallerAuthorization {
+    pub principal_ref: String,
+    pub connector_id: String,
+    pub grant_generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +118,7 @@ pub struct RuntimeContext<'a> {
     pub skill: &'a SkillService,
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
     pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
+    pub caller_webchat_authorization: Option<&'a BrowserCallerAuthorization>,
     pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
@@ -303,6 +312,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     context.browser_actuator,
                     context.browser_mutation_gate,
                     context.browser_mutation_admission,
+                    context.caller_webchat_authorization,
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
@@ -1639,6 +1649,7 @@ fn browser_dispatch_submit(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
     actuator: Option<&dyn BrowserActuator>,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
 ) -> Value {
     let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
     let message = params.get("message").and_then(Value::as_str).unwrap();
@@ -1694,6 +1705,13 @@ fn browser_dispatch_submit(
         expected_generation,
         idempotency_key_digest: &idempotency_key_digest,
         parent_dispatch_id: None,
+        authorization: caller_authorization.map(|authorization| {
+            BrowserDispatchAuthorizationInput {
+                principal_ref: &authorization.principal_ref,
+                connector_id: &authorization.connector_id,
+                grant_generation: authorization.grant_generation,
+            }
+        }),
         work_chain_id,
         lane_id,
         created_at: now,
@@ -1807,6 +1825,7 @@ fn browser_dispatch_stop(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
     actuator: Option<&dyn BrowserActuator>,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
 ) -> Value {
     let parent_dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
     let expected_generation = params
@@ -1871,6 +1890,13 @@ fn browser_dispatch_stop(
         expected_generation,
         idempotency_key_digest: &idempotency_key_digest,
         parent_dispatch_id: Some(parent_dispatch_id),
+        authorization: caller_authorization.map(|authorization| {
+            BrowserDispatchAuthorizationInput {
+                principal_ref: &authorization.principal_ref,
+                connector_id: &authorization.connector_id,
+                grant_generation: authorization.grant_generation,
+            }
+        }),
         work_chain_id: parent.work_chain_id.as_deref(),
         lane_id: parent.lane_id.as_deref(),
         created_at: now,
@@ -2125,6 +2151,7 @@ fn browser_created_session_dispatch(
     store: &mut StateStore,
     reservation: &BrowserSessionReservationRecord,
     params: &Value,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
 ) -> Result<(crate::state_store::BrowserDispatchRecord, Value), String> {
     let session_ref = reservation
         .session_ref
@@ -2165,6 +2192,13 @@ fn browser_created_session_dispatch(
         expected_generation: reservation.expected_generation,
         idempotency_key_digest: &reservation.idempotency_key_digest,
         parent_dispatch_id: None,
+        authorization: caller_authorization.map(|authorization| {
+            BrowserDispatchAuthorizationInput {
+                principal_ref: &authorization.principal_ref,
+                connector_id: &authorization.connector_id,
+                grant_generation: authorization.grant_generation,
+            }
+        }),
         work_chain_id,
         lane_id,
         created_at: browser_epoch_ms(),
@@ -2217,6 +2251,7 @@ fn browser_session_create_success(
     params: &Value,
     replayed: bool,
     reconciled: bool,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
 ) -> Value {
     let reservation = match store.browser_session_reservation(reservation_ref) {
         Ok(Some(record)) => record,
@@ -2240,7 +2275,7 @@ fn browser_session_create_success(
     }
     let session_ref = reservation.session_ref.clone().unwrap();
     let (dispatch, work_memory_writeback) =
-        match browser_created_session_dispatch(store, &reservation, params) {
+        match browser_created_session_dispatch(store, &reservation, params, caller_authorization) {
             Ok(value) => value,
             Err(error) => return browser_store_error(error),
         };
@@ -2263,6 +2298,7 @@ fn browser_session_create(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
     actuator: Option<&dyn BrowserActuator>,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
 ) -> Value {
     let endpoint_ref = params.get("endpoint_ref").and_then(Value::as_str).unwrap();
     let provider = params.get("provider").and_then(Value::as_str).unwrap();
@@ -2367,6 +2403,7 @@ fn browser_session_create(
             params,
             true,
             false,
+            caller_authorization,
         );
     }
     if current_delivery == BrowserDeliveryState::Uncertain {
@@ -2429,6 +2466,7 @@ fn browser_session_create(
                 params,
                 true,
                 true,
+                caller_authorization,
             );
         }
         return json!({
@@ -2519,6 +2557,7 @@ fn browser_session_create(
             params,
             replayed,
             false,
+            caller_authorization,
         );
     }
     json!({
@@ -2829,6 +2868,7 @@ fn browser_operation_call_with_grants(
         browser_actuator,
         browser_mutation_gate,
         None,
+        None,
     )
 }
 
@@ -2840,6 +2880,7 @@ fn browser_operation_call_with_controls(
     browser_actuator: Option<&dyn BrowserActuator>,
     browser_mutation_gate: Option<&std::sync::RwLock<()>>,
     browser_mutation_admission: Option<&BrowserMutationAdmission>,
+    caller_webchat_authorization: Option<&BrowserCallerAuthorization>,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
         return json!({"ok": false, "code": "unknown_local_method", "method": method});
@@ -2976,16 +3017,29 @@ fn browser_operation_call_with_controls(
             operation,
             caller_webchat_control_grants,
         ),
-        BrowserOperation::SessionCreate => browser_session_create(store, params, browser_actuator),
+        BrowserOperation::SessionCreate => browser_session_create(
+            store,
+            params,
+            browser_actuator,
+            caller_webchat_authorization,
+        ),
         BrowserOperation::SessionOpen => browser_session_open(store, params, browser_actuator),
-        BrowserOperation::DispatchSubmit => {
-            browser_dispatch_submit(store, params, browser_actuator)
-        }
+        BrowserOperation::DispatchSubmit => browser_dispatch_submit(
+            store,
+            params,
+            browser_actuator,
+            caller_webchat_authorization,
+        ),
         BrowserOperation::DispatchStatus => {
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
             browser_dispatch_status(store, dispatch_id, browser_actuator)
         }
-        BrowserOperation::DispatchStop => browser_dispatch_stop(store, params, browser_actuator),
+        BrowserOperation::DispatchStop => browser_dispatch_stop(
+            store,
+            params,
+            browser_actuator,
+            caller_webchat_authorization,
+        ),
         _ => {
             let expected_generation = params
                 .get("expected_generation")
@@ -3787,6 +3841,9 @@ fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) ->
         "required_apps": dispatch.required_apps,
         "expected_generation": dispatch.expected_generation,
         "parent_dispatch_id": dispatch.parent_dispatch_id,
+        "authorization_principal_ref": dispatch.authorization_principal_ref,
+        "authorization_connector_id": dispatch.authorization_connector_id,
+        "authorization_grant_generation": dispatch.authorization_grant_generation,
         "delivery_state": dispatch.delivery_state.as_str(),
         "generation_owner": dispatch.generation_owner,
         "accepted_user_message_ref": dispatch.accepted_user_message_ref,
@@ -7700,6 +7757,7 @@ mod tests {
             Some(&PanicActuator),
             None,
             Some(&admission),
+            None,
         );
         assert_eq!(backpressured["code"], "browser_account_backpressure");
         assert_eq!(backpressured["retryable"], true);
