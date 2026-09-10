@@ -177,15 +177,6 @@ The Agent must inspect what the installed runtime actually supports. v0.4.2 has 
 
 On runtimes that advertise the option, `herdr-mcp extension standalone install --ref extension-vX.Y.Z --path ~/Documents/herdr-mcp/extension` keeps the managed copy under `~/.config/herdr-mcp/extensions/standalone/current` and creates only a safe user-visible symlink below HOME. An occupied explicit path fails closed instead of being overwritten; use `herdr-mcp extension standalone status` to read the exact `chrome.load_unpacked_path`.
 
-For STANDALONE, inspect `herdr-mcp --help` before constructing arguments. When the installed runtime supports `--path`, prefer an immutable extension release ref and an easy-to-find load path:
-
-```bash
-herdr-mcp extension standalone install --ref extension-vX.Y.Z --path ~/Documents/herdr-mcp/extension
-herdr-mcp extension standalone status
-```
-
-If the installed runtime is v0.4.8, it supports `--ref` but not the later `--path` option: install the exact `extension-vX.Y.Z` ref first, then follow the versioned extension guide to create the non-overwriting visible symlink or use that release's standalone ZIP. Do not replace an unsupported option with `--ref main`. When choosing a version, use the extension documentation and GitHub Releases; a manually downloaded asset must be named `herdr-mcp-extension-standalone-X.Y.Z.zip`, not the Store-upload ZIP, because the standalone asset carries the fixed standalone Chromium identity required by Native Messaging.
-
 ```bash
 herdr-mcp native-host status
 ```
