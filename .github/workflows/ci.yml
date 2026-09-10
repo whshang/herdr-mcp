@@ -71,8 +71,8 @@ jobs:
           $ready = $false
           for ($attempt = 0; $attempt -lt 20; $attempt++) {
             Start-Sleep -Milliseconds 250
-            & $herdr.FullName status server *> $null
-            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+            $serverStatus = (& $herdr.FullName status server --json | ConvertFrom-Json)
+            if ($serverStatus.running -eq $true) { $ready = $true; break }
             if ($server.HasExited) { break }
           }
           if (-not $ready) {
