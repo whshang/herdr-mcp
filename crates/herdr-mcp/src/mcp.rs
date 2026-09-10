@@ -1725,6 +1725,7 @@ fn browser_dispatch_submit(
         expected_generation,
         delivery_state: BrowserDeliveryState::Uncertain,
         generation_owner: None,
+        accepted_user_message_ref: None,
         updated_at: now,
     }) {
         return browser_store_error(error);
@@ -1755,6 +1756,10 @@ fn browser_dispatch_submit(
     let Ok(mut store) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
+    let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
+        Ok(value) => value,
+        Err(error) => return browser_store_error(error),
+    };
     let current = match store.browser_dispatch(&reserved.dispatch_id) {
         Ok(Some(dispatch)) => dispatch,
         Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
@@ -1767,6 +1772,11 @@ fn browser_dispatch_submit(
                 expected_generation,
                 delivery_state,
                 generation_owner: evidence.generation_owner,
+                accepted_user_message_ref: if delivery_state == BrowserDeliveryState::Applied {
+                    accepted_user_message_ref.as_deref()
+                } else {
+                    None
+                },
                 updated_at: now,
             }) {
                 Ok(dispatch) => dispatch,
@@ -1778,23 +1788,6 @@ fn browser_dispatch_submit(
             return json!({"ok": false, "code": "browser_dispatch_not_claimed"});
         }
         _ => current,
-    };
-    let dispatch = match browser_evidence_accepted_user_message_ref(&evidence) {
-        Ok(Some(accepted_user_message_ref))
-            if dispatch.delivery_state == BrowserDeliveryState::Applied =>
-        {
-            match store.record_browser_dispatch_accepted_message(
-                &reserved.dispatch_id,
-                expected_generation,
-                &accepted_user_message_ref,
-                now,
-            ) {
-                Ok(record) => record,
-                Err(error) => return browser_store_error(error),
-            }
-        }
-        Ok(_) => dispatch,
-        Err(error) => return browser_store_error(error),
     };
     let work_memory_writeback = browser_dispatch_work_memory_writeback(&mut store, &dispatch);
     let success = matches!(
@@ -1914,6 +1907,7 @@ fn browser_dispatch_stop(
         expected_generation,
         delivery_state: BrowserDeliveryState::Uncertain,
         generation_owner: None,
+        accepted_user_message_ref: None,
         updated_at: now,
     }) {
         return browser_store_error(error);
@@ -1956,6 +1950,7 @@ fn browser_dispatch_stop(
             expected_generation,
             delivery_state,
             generation_owner: evidence.generation_owner,
+            accepted_user_message_ref: None,
             updated_at: browser_epoch_ms(),
         }) {
             Ok(dispatch) => dispatch,
@@ -2043,6 +2038,11 @@ fn browser_dispatch_status(
                 }
             };
             if delivery_state != BrowserDeliveryState::Uncertain {
+                let accepted_user_message_ref =
+                    match browser_evidence_accepted_user_message_ref(&evidence) {
+                        Ok(value) => value,
+                        Err(error) => return browser_store_error(error),
+                    };
                 let Ok(mut store) = store.lock() else {
                     return json!({"ok": false, "code": "browser_operation_store_unavailable"});
                 };
@@ -2052,6 +2052,13 @@ fn browser_dispatch_status(
                         expected_generation: dispatch.expected_generation,
                         delivery_state,
                         generation_owner: evidence.generation_owner,
+                        accepted_user_message_ref: if operation == BrowserOperation::DispatchSubmit
+                            && delivery_state == BrowserDeliveryState::Applied
+                        {
+                            accepted_user_message_ref.as_deref()
+                        } else {
+                            None
+                        },
                         updated_at: browser_epoch_ms(),
                     },
                 ) {
@@ -2071,24 +2078,6 @@ fn browser_dispatch_status(
                             Err(error) => return browser_store_error(error),
                         }
                     }
-                    Err(error) => return browser_store_error(error),
-                };
-                let settled = match browser_evidence_accepted_user_message_ref(&evidence) {
-                    Ok(Some(accepted_user_message_ref))
-                        if operation == BrowserOperation::DispatchSubmit
-                            && settled.delivery_state == BrowserDeliveryState::Applied =>
-                    {
-                        match store.record_browser_dispatch_accepted_message(
-                            &settled.dispatch_id,
-                            settled.expected_generation,
-                            &accepted_user_message_ref,
-                            browser_epoch_ms(),
-                        ) {
-                            Ok(record) => record,
-                            Err(error) => return browser_store_error(error),
-                        }
-                    }
-                    Ok(_) => settled,
                     Err(error) => return browser_store_error(error),
                 };
                 let target_dispatch = if operation == BrowserOperation::DispatchStop
@@ -2181,13 +2170,34 @@ fn browser_created_session_dispatch(
         created_at: browser_epoch_ms(),
     })?;
     let dispatch = match reservation_result {
-        BrowserDispatchReservation::Existing(dispatch) => dispatch,
+        BrowserDispatchReservation::Existing(dispatch) => {
+            // A replay may encounter a dispatch created by an older runtime or
+            // a crash-recovery path before accepted-message linkage was folded
+            // into the delivery update. Repair only that existing row here.
+            match reservation.accepted_user_message_ref.as_deref() {
+                Some(accepted_user_message_ref)
+                    if dispatch.accepted_user_message_ref.as_deref()
+                        != Some(accepted_user_message_ref) =>
+                {
+                    store.record_browser_dispatch_accepted_message(
+                        &dispatch.dispatch_id,
+                        reservation.expected_generation,
+                        accepted_user_message_ref,
+                        browser_epoch_ms(),
+                    )?
+                }
+                _ => dispatch,
+            }
+        }
         BrowserDispatchReservation::Reserved(dispatch) => {
+            // Fresh materialization persists Applied + provider user-message
+            // identity in one transaction, closing the acceptance crash window.
             store.update_browser_dispatch(BrowserDispatchUpdateInput {
                 dispatch_id: &dispatch.dispatch_id,
                 expected_generation: reservation.expected_generation,
                 delivery_state: BrowserDeliveryState::Applied,
                 generation_owner: Some(reservation.expected_generation),
+                accepted_user_message_ref: reservation.accepted_user_message_ref.as_deref(),
                 updated_at: browser_epoch_ms(),
             })?
         }
@@ -2197,17 +2207,6 @@ fn browser_created_session_dispatch(
     {
         return Err("browser_created_session_dispatch_not_applied".to_owned());
     }
-    // Carry the accepted submit identity recorded on the reservation across the
-    // crash window between provider acceptance and this synthesized dispatch.
-    let dispatch = match reservation.accepted_user_message_ref.as_deref() {
-        Some(accepted_user_message_ref) => store.record_browser_dispatch_accepted_message(
-            &dispatch.dispatch_id,
-            reservation.expected_generation,
-            accepted_user_message_ref,
-            browser_epoch_ms(),
-        )?,
-        None => dispatch,
-    };
     let writeback = browser_dispatch_work_memory_writeback(store, &dispatch);
     Ok((dispatch, writeback))
 }
@@ -5854,6 +5853,7 @@ mod tests {
                         expected_generation,
                         delivery_state: BrowserDeliveryState::Applied,
                         generation_owner: Some(expected_generation),
+                        accepted_user_message_ref: None,
                         updated_at: browser_epoch_ms(),
                     })
                     .unwrap();

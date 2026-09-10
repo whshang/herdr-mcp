@@ -3474,6 +3474,7 @@ mod tests {
                     expected_generation: 7,
                     delivery_state: BrowserDeliveryState::Applied,
                     generation_owner: Some(7),
+                    accepted_user_message_ref: None,
                     updated_at: 17,
                 })
                 .unwrap();

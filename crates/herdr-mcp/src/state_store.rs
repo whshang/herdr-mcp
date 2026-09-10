@@ -951,6 +951,9 @@ pub struct BrowserDispatchUpdateInput<'a> {
     pub expected_generation: i64,
     pub delivery_state: BrowserDeliveryState,
     pub generation_owner: Option<i64>,
+    /// Exact accepted provider user-message identity, persisted atomically with
+    /// a proven-applied settlement. `None` leaves any recorded ref unchanged.
+    pub accepted_user_message_ref: Option<&'a str>,
     pub updated_at: i64,
 }
 
@@ -1006,7 +1009,6 @@ pub struct BrowserDispatchResultRecord {
     pub dispatch: BrowserDispatchRecord,
     pub turn_message_id: String,
     pub evidence_id: String,
-    pub evidence_sha256: String,
     pub replayed: bool,
 }
 
@@ -2083,7 +2085,6 @@ impl StateStore {
                 return Ok(BrowserDispatchResultRecord {
                     turn_message_id: dispatch.result_turn_message_id.clone().unwrap_or_default(),
                     evidence_id: dispatch.result_evidence_id.clone().unwrap_or_default(),
-                    evidence_sha256: dispatch.result_evidence_id.clone().unwrap_or_default(),
                     dispatch,
                     replayed: true,
                 });
@@ -2171,7 +2172,6 @@ impl StateStore {
             dispatch: settled,
             turn_message_id: turn.message_id,
             evidence_id: evidence.evidence_id,
-            evidence_sha256: evidence.sha256,
             replayed: changed != 1,
         })
     }
@@ -3892,6 +3892,12 @@ impl StateStore {
         if input.updated_at < 0 {
             return Err("browser_updated_at_invalid".to_owned());
         }
+        if let Some(accepted) = input.accepted_user_message_ref {
+            validate_browser_ref_text(accepted, 512, "accepted_user_message_ref")?;
+            if input.delivery_state != BrowserDeliveryState::Applied {
+                return Err("browser_dispatch_accepted_message_not_applied".to_owned());
+            }
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3907,10 +3913,19 @@ impl StateStore {
         if current.expected_generation != input.expected_generation {
             return Err("stale_capability_generation".to_owned());
         }
+        if let Some(accepted) = input.accepted_user_message_ref
+            && current
+                .accepted_user_message_ref
+                .as_deref()
+                .is_some_and(|existing| existing != accepted)
+        {
+            return Err("browser_dispatch_accepted_message_conflict".to_owned());
+        }
         let changed = tx
             .execute(
                 "UPDATE browser_dispatches
                  SET delivery_state = ?2, generation_owner = ?3,
+                     accepted_user_message_ref = COALESCE(?6, accepted_user_message_ref),
                      updated_at = MAX(updated_at, ?4)
                  WHERE dispatch_id = ?1 AND expected_generation = ?5",
                 params![
@@ -3919,6 +3934,7 @@ impl StateStore {
                     input.generation_owner,
                     input.updated_at,
                     input.expected_generation,
+                    input.accepted_user_message_ref,
                 ],
             )
             .map_err(|error| format!("cannot update browser dispatch: {error}"))?;
@@ -3953,6 +3969,9 @@ impl StateStore {
         if input.updated_at < 0 {
             return Err("browser_updated_at_invalid".to_owned());
         }
+        if let Some(accepted) = input.accepted_user_message_ref {
+            validate_browser_ref_text(accepted, 512, "accepted_user_message_ref")?;
+        }
 
         let tx = self
             .conn
@@ -3980,6 +3999,7 @@ impl StateStore {
             .execute(
                 "UPDATE browser_dispatches
                  SET delivery_state = ?2, generation_owner = ?3,
+                     accepted_user_message_ref = COALESCE(?6, accepted_user_message_ref),
                      updated_at = MAX(updated_at, ?4)
                  WHERE dispatch_id = ?1 AND expected_generation = ?5
                    AND delivery_state = 'uncertain'",
@@ -3989,6 +4009,7 @@ impl StateStore {
                     input.generation_owner,
                     input.updated_at,
                     input.expected_generation,
+                    input.accepted_user_message_ref,
                 ],
             )
             .map_err(|error| format!("cannot settle browser dispatch: {error}"))?;
@@ -8398,6 +8419,7 @@ mod tests {
                     expected_generation: 7,
                     delivery_state: BrowserDeliveryState::Uncertain,
                     generation_owner: None,
+                    accepted_user_message_ref: None,
                     updated_at: 11,
                 })
                 .unwrap()
@@ -8422,6 +8444,7 @@ mod tests {
                 expected_generation: 7,
                 delivery_state: BrowserDeliveryState::Applied,
                 generation_owner: Some(7),
+                accepted_user_message_ref: None,
                 updated_at: 21,
             })
             .unwrap();
@@ -8443,6 +8466,7 @@ mod tests {
                     expected_generation: 8,
                     delivery_state: BrowserDeliveryState::Applied,
                     generation_owner: Some(8),
+                    accepted_user_message_ref: None,
                     updated_at: 22,
                 })
                 .unwrap_err(),
@@ -8455,6 +8479,7 @@ mod tests {
                     expected_generation: 7,
                     delivery_state: BrowserDeliveryState::ResourceUnavailable,
                     generation_owner: None,
+                    accepted_user_message_ref: None,
                     updated_at: 23,
                 })
                 .unwrap_err(),
@@ -8515,6 +8540,7 @@ mod tests {
                     expected_generation: 7,
                     delivery_state: BrowserDeliveryState::Applied,
                     generation_owner: Some(8),
+                    accepted_user_message_ref: None,
                     updated_at: 11,
                 })
                 .unwrap_err(),
@@ -8526,6 +8552,7 @@ mod tests {
                 expected_generation: 7,
                 delivery_state: BrowserDeliveryState::Applied,
                 generation_owner: Some(7),
+                accepted_user_message_ref: None,
                 updated_at: 12,
             })
             .unwrap();
@@ -8548,6 +8575,7 @@ mod tests {
                     expected_generation: 7,
                     delivery_state: BrowserDeliveryState::Stopped,
                     generation_owner: Some(7),
+                    accepted_user_message_ref: None,
                     updated_at: 21,
                 })
                 .unwrap_err(),
@@ -8633,6 +8661,7 @@ mod tests {
                 expected_generation: 7,
                 delivery_state: BrowserDeliveryState::Applied,
                 generation_owner: Some(7),
+                accepted_user_message_ref: None,
                 updated_at: 11,
             })
             .unwrap();
@@ -8665,9 +8694,20 @@ mod tests {
             "distinct worker assignment text",
             "settle-key-1",
         );
-        store
-            .record_browser_dispatch_accepted_message(&dispatch_id, 7, "provider-user-1", 12)
+        let linked = store
+            .update_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &dispatch_id,
+                expected_generation: 7,
+                delivery_state: BrowserDeliveryState::Applied,
+                generation_owner: Some(7),
+                accepted_user_message_ref: Some("provider-user-1"),
+                updated_at: 12,
+            })
             .unwrap();
+        assert_eq!(
+            linked.accepted_user_message_ref.as_deref(),
+            Some("provider-user-1")
+        );
 
         let exact = store
             .settle_browser_dispatch_result(BrowserDispatchResultInput {
@@ -8843,6 +8883,7 @@ mod tests {
                     expected_generation: 7,
                     delivery_state: BrowserDeliveryState::Applied,
                     generation_owner: Some(7),
+                    accepted_user_message_ref: None,
                     updated_at: 11,
                 })
                 .unwrap();
@@ -9014,6 +9055,7 @@ mod tests {
                     expected_generation: 7,
                     delivery_state: BrowserDeliveryState::Applied,
                     generation_owner: Some(7),
+                    accepted_user_message_ref: None,
                     updated_at: 21,
                 })
                 .unwrap();
