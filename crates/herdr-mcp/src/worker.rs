@@ -418,7 +418,7 @@ fn prepare_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, St
         "credential_verifier_sha256": verifier,
         "staged": true,
         "secret_printed": false,
-        "next": "run worker credential-repair apply from another enrolled fleet-admin device",
+        "next": "on a macOS legacy-owner Link, finalize can rebind locally; otherwise run apply from another enrolled fleet-admin device before finalize",
     }))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -433,11 +433,11 @@ fn apply_device_credential_repair(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn apply_device_credential_repair(
-    paths: &RuntimePaths,
+fn rebind_device_credential_verifier(
+    identity: &FleetLinkIdentity,
     device_id: &str,
     verifier: &str,
-) -> Result<ExitCode, String> {
+) -> Result<Value, String> {
     let device_id = crate::config::normalize_device_id(device_id)?;
     if verifier.len() != 64
         || !verifier
@@ -449,8 +449,6 @@ fn apply_device_credential_repair(
                 .to_owned(),
         );
     }
-    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
@@ -469,7 +467,19 @@ fn apply_device_credential_repair(
         }))
         .send()
         .map_err(|error| format!("cannot apply device credential repair: {error}"))?;
-    let payload = parse_json_response(response, "device credential repair")?;
+    parse_json_response(response, "device credential repair")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn apply_device_credential_repair(
+    paths: &RuntimePaths,
+    device_id: &str,
+    verifier: &str,
+) -> Result<ExitCode, String> {
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let payload = rebind_device_credential_verifier(&identity, &device_id, verifier)?;
     print_json(&json!({
         "ok": true,
         "action": "credential_repair_apply",
@@ -479,6 +489,33 @@ fn apply_device_credential_repair(
         "next": "run worker credential-repair finalize on the repaired device",
     }))?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn legacy_owner_service_is_active(plist_env: &std::collections::BTreeMap<String, String>) -> bool {
+    plist_env
+        .get("HERDR_LINK_KEYCHAIN_SERVICE")
+        .map(|service| service.trim() == LEGACY_LINK_KEYCHAIN_SERVICE)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_rebind_staged_credential_with_legacy_owner(
+    paths: &RuntimePaths,
+    config: &Config,
+    device_id: &str,
+    secret: &str,
+) -> Result<bool, String> {
+    let Some(plist_env) = production_link_environment_if_present()? else {
+        return Ok(false);
+    };
+    if !legacy_owner_service_is_active(&plist_env) {
+        return Ok(false);
+    }
+    let owner = resolve_owner_link_identity(paths, config)?;
+    let verifier = device_secret_verifier(secret);
+    let _ = rebind_device_credential_verifier(&owner, device_id, &verifier)?;
+    Ok(true)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -506,6 +543,13 @@ fn finalize_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, S
     let secret = crate::credential_store::load(&staging_service, &account)
         .map_err(|error| format!("cannot load staged credential repair secret: {error}"))?;
     validate_device_secret(&secret)?;
+
+    #[cfg(target_os = "macos")]
+    let verifier_rebound_locally =
+        maybe_rebind_staged_credential_with_legacy_owner(paths, &config, &device_id, &secret)?;
+    #[cfg(target_os = "linux")]
+    let verifier_rebound_locally = false;
+
     crate::credential_store::store(&target_service, &account, &secret).map_err(|error| {
         format!("cannot commit repaired credential to the device service: {error}")
     })?;
@@ -524,6 +568,7 @@ fn finalize_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, S
         "device_id": device_id,
         "credential_service": target_service,
         "staging_deleted": true,
+        "verifier_rebound_locally": verifier_rebound_locally,
         "secret_printed": false,
     }))?;
     Ok(ExitCode::SUCCESS)
@@ -2606,6 +2651,22 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("device missing"));
         assert!(error.contains("owner missing"));
+    }
+
+    #[test]
+    fn legacy_owner_finalize_detection_is_exact() {
+        let mut env = std::collections::BTreeMap::new();
+        assert!(!legacy_owner_service_is_active(&env));
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            format!("herdr-edge-link-{}", "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        );
+        assert!(!legacy_owner_service_is_active(&env));
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            format!("  {LEGACY_LINK_KEYCHAIN_SERVICE}  "),
+        );
+        assert!(legacy_owner_service_is_active(&env));
     }
 
     #[test]
