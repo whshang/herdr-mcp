@@ -25,7 +25,10 @@ use serde_json::{Number, Value};
 use std::io::{self, Write};
 
 pub const LINK_DEFAULT_TRANSPORT_PING_MS: i64 = 15_000;
-pub const LINK_DEFAULT_HEARTBEAT_MS: i64 = 60_000;
+/// Application-level telemetry/checkpoint heartbeat. RFC WebSocket ping/pong
+/// owns transport liveness, so the JSON heartbeat can stay sparse and avoid
+/// waking a hibernated Edge Durable Object during otherwise idle periods.
+pub const LINK_DEFAULT_HEARTBEAT_MS: i64 = 300_000;
 pub const LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS: i64 = 10_000;
 pub const LINK_DEFAULT_MAX_FRAME_BYTES: usize = 262_144;
 pub const LINK_DEFAULT_MAX_SILENCE_MS: i64 = 90_000;
@@ -816,7 +819,7 @@ mod tests {
                 },
                 TransportAction::StartOnlineTimers {
                     transport_ping_ms: 15_000,
-                    heartbeat_ms: 60_000,
+                    heartbeat_ms: 300_000,
                     silence_check_ms: 30_000.0,
                 }
             ]

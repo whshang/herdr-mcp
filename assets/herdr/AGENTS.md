@@ -18,6 +18,7 @@ Global policy for a remote/Web planner. Project and nested `AGENTS.md` files may
 12. On the resolved device, prior-work continuity intent in a fresh or uncertain conversation searches the durable Continuity Journal before asking for an ID. Auto-resume only one chain uniquely backed by stable conversation/project/workspace identity; otherwise show bounded candidates and ask the user to confirm. Recency or text similarity alone never selects a chain.
 13. Ground prior or multi-device project work before planning: `device -> project/workspace -> continuity/history -> live Git/runtime`. Load `workstation-control` for the resolution rules; ambiguity fails closed instead of being resolved by focus, recency, or similarity.
 14. For non-trivial orchestration, load `development-orchestration`. It owns the five-beat execution cadence and its Required/Advisory semantics.
+15. Treat remote MCP/Edge requests as a shared budget. Prefer one high-value call over several low-value probes: inspect once then use incremental state, batch independent reads and Skill ids, combine coherent deterministic local steps when their safety boundary is identical, reuse fingerprints/offsets, and do not poll idle state merely to confirm that nothing changed. Never trade away mutation fencing or final boundary verification just to reduce call count.
 
 ## Instruction precedence
 

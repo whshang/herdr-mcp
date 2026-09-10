@@ -17,6 +17,7 @@ pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
 pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
 pub const GITHUB_STATUS_METHOD: &str = "herdr_mcp.github.status";
+pub const CLEANUP_PREVIEW_METHOD: &str = "herdr_mcp.cleanup.preview";
 pub const TEXT_READ_METHOD: &str = "herdr_mcp.text.read";
 pub const TEXT_WRITE_METHOD: &str = "herdr_mcp.text.write";
 pub const WORK_MEMORY_BIND_METHOD: &str = "work_memory.bind";
@@ -109,6 +110,18 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "project_root": {"type": "string"},
                     "pr_number": {"type": "integer", "minimum": 1},
                     "previous_fingerprint": {"type": "string"},
+                },
+                "required": ["project_root"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": CLEANUP_PREVIEW_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string"},
+                    "target_ref": {"type": "string"},
                 },
                 "required": ["project_root"],
                 "empty": false,
@@ -969,6 +982,31 @@ impl ProgressiveSkillService {
                     "previous_fingerprint": "optional fingerprint from the prior call; unchanged state returns a compact changed=false response"
                 }
             },
+            "cleanup_preview": {
+                "method": CLEANUP_PREVIEW_METHOD,
+                "effect": "read_only_fail_closed_reclaim_preview",
+                "source": "local Git + live Herdr resource snapshot + local authenticated GitHub API",
+                "params": {
+                    "project_root": "required managed git project/worktree root",
+                    "target_ref": "optional integration target; defaults to origin/main"
+                },
+                "safety": "never fetches, prunes, closes, deletes, or mutates; safe_to_delete requires fresh target/GitHub evidence, clean/reachable Git state, no open PR reference, and no live Herdr resource blockers"
+            },
+            "request_budget": {
+                "goal": "minimize Edge/Worker round trips without weakening mutation safety or verification",
+                "default_strategy": "coalesce logical work into the fewest high-value supported calls",
+                "rules": [
+                    "inspect once, then use herdr_since only when a workspace/Agent change is expected",
+                    "group independent reads into one dependency-aware wave instead of serial inspect/read/replan loops",
+                    "combine coherent deterministic shell/Git steps in one bounded herdr_exec when they share the same project and safety boundary",
+                    "load multiple required Skill ids in one herdr_mcp.skill.load call and keep unchanged Skill content sticky",
+                    "reuse github.status previous_fingerprint and exec_read next_offset; unchanged state and already-read output are not fetched again",
+                    "prefer summary private methods such as cleanup.preview over rebuilding the same view with many MCP calls",
+                    "do not poll idle state or emit planner heartbeats; poll long work only at a cadence where completion or actionable progress could have changed",
+                    "use protocol/server-side batching only when live capabilities advertise it; never simulate unsafe mutation batching"
+                ],
+                "capability_source": "live runtime context is authoritative for JSON-RPC batch, multi-operation arguments, and concurrency"
+            },
             "capability_snapshot": capability_summary_with_inventory(snapshot, inventory),
             "planning_context": planning_context_with_inventory(snapshot, inventory),
             "bytes": content.len(),
@@ -985,6 +1023,7 @@ impl ProgressiveSkillService {
             LOCAL_LOAD_METHOD => self.load_method(params),
             PLANNING_ADVISE_METHOD => self.planning_advise_method(params, snapshot),
             GITHUB_STATUS_METHOD => crate::github_status::status(params, snapshot),
+            CLEANUP_PREVIEW_METHOD => crate::cleanup_preview::preview(params, snapshot),
             TEXT_READ_METHOD => crate::text_transfer::read(params),
             TEXT_WRITE_METHOD => crate::text_transfer::write(params),
             _ => json!({
@@ -2325,6 +2364,27 @@ mod tests {
         assert_eq!(methods[0]["method"], GITHUB_STATUS_METHOD);
         assert_eq!(methods[0]["params"]["required"][0], "project_root");
 
+        let methods = local_method_schemas("cleanup");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["method"], CLEANUP_PREVIEW_METHOD);
+        assert_eq!(methods[0]["source"], "herdr_mcp_local");
+        assert_eq!(methods[0]["params"]["required"], json!(["project_root"]));
+        assert_eq!(
+            methods[0]["params"]["properties"]["target_ref"]["type"],
+            "string"
+        );
+
+        let service = ProgressiveSkillService::new();
+        let bootstrap = service.bootstrap_with_inventory(&planning_snapshot(), &[]);
+        assert_eq!(
+            bootstrap["request_budget"]["default_strategy"],
+            "coalesce logical work into the fewest high-value supported calls"
+        );
+        assert_eq!(
+            bootstrap["request_budget"]["capability_source"],
+            "live runtime context is authoritative for JSON-RPC batch, multi-operation arguments, and concurrency"
+        );
+
         let methods = local_method_schemas("work_memory.");
         assert_eq!(methods.len(), 6);
         assert_eq!(methods[0]["method"], WORK_MEMORY_BIND_METHOD);
@@ -2422,6 +2482,17 @@ mod tests {
     #[test]
     fn unknown_local_method_fails_closed() {
         let service = ProgressiveSkillService::new();
+        let cleanup = service
+            .local_call(
+                CLEANUP_PREVIEW_METHOD,
+                &json!({"project_root": "/repo", "delete": true}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(cleanup["ok"], false);
+        assert_eq!(cleanup["code"], "invalid_params");
+        assert_eq!(cleanup["unknown"], json!(["delete"]));
+
         let result = service
             .local_call("herdr_mcp.skill.nope", &json!({}), &snapshot())
             .unwrap();

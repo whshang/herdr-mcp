@@ -29,7 +29,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Session start: herdr_inspect then herdr_skill once. On fresh prior-work continue/resume intent, load herdr_skill and search durable Continuity before asking the user for an internal ID; never select a chain by recency or text similarity alone. Prefer deterministic herdr_fs_*/herdr_git/herdr_exec work before agent reasoning. Before unknown native API calls use herdr_methods, then herdr_call. Use explicit workspace/pane IDs and never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Session start: herdr_inspect then herdr_skill once. On fresh prior-work continue/resume intent, load herdr_skill and search durable Continuity before asking the user for an internal ID; never select a chain by recency or text similarity alone. Prefer deterministic herdr_fs_*/herdr_git/herdr_exec work before agent reasoning. Treat remote MCP round trips as budgeted: group independent reads into waves, combine coherent deterministic shell/Git steps into one bounded call when safety is unchanged, use herdr_since after the first inspect, reuse fingerprints and exec offsets, and never poll merely to prove that nothing changed. Before unknown native API calls use herdr_methods, then herdr_call. Use explicit workspace/pane IDs and never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
