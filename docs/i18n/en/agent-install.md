@@ -91,7 +91,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-Without a Custom Domain, try `workers.dev` directly first. On DNS failure, the CLI queries Cloudflare DNS and then Google DNS; only a candidate that passes the real TLS `/health` Herdr check may be written as a marked entry for that one hostname in the system hosts file. Unix may require an interactive `sudo` approval and Windows an elevated terminal. Then retry the direct Link path; reuse an existing local proxy if needed, with the signed shared Relay kept as the last transport. Never change system DNS, network nodes, OAuth issuer, or the selected public MCP origin. Do not redeploy a healthy Worker to repair one hostname.
+Without a Custom Domain, try `workers.dev` directly first. On DNS failure, runtimes with this recovery query Cloudflare DNS then Google DNS; only a candidate passing the real TLS `/health` Herdr check may become a marked single-host system-hosts entry. On v0.4.8, the Agent performs the same verified hosts recovery from the manual install guide before rerunning bootstrap. Unix may require interactive `sudo`; Windows may require an elevated terminal. Retry direct Link next, then an existing local proxy; keep signed shared Relay last. Never change system DNS, network nodes, OAuth issuer, or the public MCP origin.
 
 ## 7. Final acceptance
 

@@ -91,7 +91,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-没有 Custom Domain 时先直连 `workers.dev`。解析失败后，CLI 依次查询 Cloudflare DNS、Google DNS；只有候选 IP 通过真实 TLS `/health` Herdr 校验后，才允许把该 hostname 写成带 Herdr 标记的单条系统 hosts 记录。Unix 需要时由用户批准交互式 `sudo`，Windows 使用管理员终端。随后重新走 Link 直连；仍失败再复用已有本地代理，内置签名共享 Relay 只作为最后传输手段。不得改系统 DNS、网络节点、OAuth issuer 或已选 public MCP origin，也不要为单一 hostname 故障重建健康 Worker。
+没有 Custom Domain 时先直连 `workers.dev`。解析失败后，含本修复的 runtime 依次查询 Cloudflare DNS、Google DNS；候选 IP 只有通过真实 TLS `/health` Herdr 校验后，才能写成带标记的单 hostname 系统 hosts 记录。`v0.4.8` 由 Agent 先按安装手册执行同等验证与 hosts 恢复，再重跑 bootstrap。Unix 需要时由用户批准交互式 `sudo`，Windows 使用管理员终端。随后重试 Link 直连，再复用已有本地代理；内置签名共享 Relay 保持最后手段。不得改系统 DNS、网络节点、OAuth issuer 或 public MCP origin。
 
 ## 7. 最终验收
 

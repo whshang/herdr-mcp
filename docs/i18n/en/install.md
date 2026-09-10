@@ -69,7 +69,7 @@ For a manual/operator deployment, use the installed runtime too:
 herdr-mcp worker bootstrap
 ```
 
-This command owns Worker naming, release-artifact verification, direct Cloudflare API upload, secrets, first-device enrollment, and readiness verification. If a new `workers.dev` hostname cannot resolve locally, bootstrap tries Cloudflare DNS then Google DNS, verifies the returned address with the real TLS `/health` contract, and only then attempts to persist a Herdr-marked mapping for that hostname in the system hosts file. Unix may request `sudo`; Windows requires an elevated terminal when the hosts file is not writable. Failure to persist the mapping does not invalidate an already verified in-process bootstrap path. Ordinary installation does not require a source checkout, Node.js, npm, Wrangler, or `wrangler.user.toml`.
+This command owns Worker naming, release-artifact verification, direct Cloudflare API upload, secrets, first-device enrollment, and readiness verification. In runtimes containing the trusted-DNS recovery, if a new `workers.dev` hostname cannot resolve locally, bootstrap tries Cloudflare DNS then Google DNS, verifies the returned address with the real TLS `/health` contract, and only then attempts to persist a Herdr-marked mapping for that hostname in the system hosts file. Unix may request `sudo`; Windows requires an elevated terminal when the hosts file is not writable. Failure to persist the mapping does not invalidate an already verified in-process bootstrap path. Ordinary installation does not require a source checkout, Node.js, npm, Wrangler, or `wrangler.user.toml`.
 
 Keep these constraints:
 
@@ -79,6 +79,41 @@ Keep these constraints:
 - the workstation makes outbound authenticated WSS and does not expose a public local port.
 
 See [Agent-assisted installation](agent-install.md) for the ordinary bootstrap contract. [Cloudflare Edge deployment](cloudflare-edge-deployment.md) retains the source/Wrangler workflow only as a maintainer and deep-operations reference.
+
+
+### v0.4.8 `workers.dev` DNS recovery
+
+v0.4.8 predates automatic direct trusted-DNS persistence. If bootstrap has already created the Worker but fails because its `workers.dev` hostname does not resolve locally, do this before rerunning the resumable bootstrap; do not switch to the public Relay for first enrollment.
+
+```bash
+EDGE_ORIGIN="https://<worker>.<account-subdomain>.workers.dev"
+HOST="${EDGE_ORIGIN#https://}"; HOST="${HOST%%/*}"
+
+# Try Cloudflare DoH first. If its hostname also fails locally, retry the same
+# request with --resolve cloudflare-dns.com:443:1.1.1.1, then 1.0.0.1.
+curl --noproxy '*' -fsS -H 'accept: application/dns-json'   "https://cloudflare-dns.com/dns-query?name=${HOST}&type=A"
+
+# If Cloudflare DoH is unavailable, try Google DoH; the same pinned form can
+# use dns.google:443:8.8.8.8 and then 8.8.4.4.
+curl --noproxy '*' -fsS -H 'accept: application/dns-json'   "https://dns.google/resolve?name=${HOST}&type=A"
+```
+
+Choose one returned IPv4 `A` address as `IP`, then validate that address before touching hosts:
+
+```bash
+curl --noproxy '*' -fsS --resolve "${HOST}:443:${IP}" "${EDGE_ORIGIN}/health"
+```
+
+Proceed only when TLS hostname validation succeeds and `/health` identifies the expected Herdr Worker/contract. Check `/etc/hosts` first; if an unmanaged entry already names this hostname, stop instead of overwriting it. Otherwise add exactly one marked mapping, approve `sudo` yourself, and rerun bootstrap:
+
+```bash
+grep -n "${HOST}" /etc/hosts || true
+printf '%s	%s	# herdr-mcp workers.dev %s
+' "$IP" "$HOST" "$HOST" | sudo tee -a /etc/hosts >/dev/null
+herdr-mcp worker bootstrap
+```
+
+This changes only one Worker hostname. It does not change the system DNS server, proxy, network node, OAuth issuer, or MCP public origin. A later runtime containing automatic recovery can refresh its own marked entry when that mapping becomes stale.
 
 ## Step 3: verify the Herdr Link
 
