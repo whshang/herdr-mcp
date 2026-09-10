@@ -7454,7 +7454,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_upgrades_through_v6_v7_v8_without_losing_continuity() {
+    fn schema_v5_upgrades_through_v11_without_losing_continuity() {
         let path = temp_db_path();
         {
             let conn = Connection::open(&path).unwrap();
@@ -7485,7 +7485,7 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 11);
         assert_eq!(
             store
                 .scalar_i64(
