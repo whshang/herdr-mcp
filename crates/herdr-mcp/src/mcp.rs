@@ -3459,9 +3459,49 @@ fn browser_operation_inspect_resource(
                 Ok(decision) => decision,
                 Err(error) => return browser_store_error(error),
             };
+            let account_ref = match browser_resource_account_ref(&store, &resource) {
+                Ok(account_ref) => account_ref,
+                Err(error) => return browser_store_error(error),
+            };
+            let provider_state =
+                match store.browser_provider_state(&resource.endpoint_ref, &resource.provider) {
+                    Ok(provider_state) => provider_state,
+                    Err(error) => return browser_store_error(error),
+                };
+            let route_endpoint_ref = resource.endpoint_ref.clone();
+            let route_provider = resource.provider.clone();
+            let resource_observation_generation = resource.observation_generation;
+            let route_status = match provider_state.as_ref() {
+                None => "capability_unknown",
+                Some(state) if state.observation_generation != resource.observation_generation => {
+                    "stale_capability_generation"
+                }
+                Some(state)
+                    if state.adapter_protocol_version != BROWSER_ADAPTER_PROTOCOL_VERSION =>
+                {
+                    "browser_adapter_protocol_unsupported"
+                }
+                Some(_) => "current",
+            };
+            let capabilities = provider_state
+                .as_ref()
+                .map(|state| browser_public_capabilities(&state.capabilities_json))
+                .unwrap_or_else(|| json!({"status": "unknown"}));
             json!({
                 "ok": true,
                 "resource": browser_resource_json(resource),
+                "route": {
+                    "endpoint_ref": route_endpoint_ref,
+                    "provider": route_provider,
+                    "account_ref": account_ref,
+                    "configuration_source": "browser_registry_observation",
+                    "resource_observation_generation": resource_observation_generation,
+                    "provider_observation_generation": provider_state.as_ref().map(|state| state.observation_generation),
+                    "adapter_protocol_version": provider_state.as_ref().map(|state| state.adapter_protocol_version),
+                    "provider_observed_at": provider_state.as_ref().map(|state| state.observed_at),
+                    "status": route_status,
+                },
+                "capabilities": capabilities,
                 "actuation_available": actuation_available,
                 "actuation_reason": actuation_reason,
             })
@@ -7103,6 +7143,26 @@ mod tests {
         assert_eq!(inspect["ok"], true);
         assert_eq!(inspect["actuation_available"], true);
         assert!(inspect["actuation_reason"].is_null());
+        assert_eq!(inspect["route"]["endpoint_ref"], endpoint_ref);
+        assert_eq!(inspect["route"]["provider"], "chatgpt");
+        assert_eq!(inspect["route"]["account_ref"], account_ref);
+        assert_eq!(inspect["route"]["resource_observation_generation"], 7);
+        assert_eq!(inspect["route"]["provider_observation_generation"], 7);
+        assert_eq!(inspect["route"]["adapter_protocol_version"], 1);
+        assert_eq!(inspect["route"]["status"], "current");
+        assert_eq!(
+            inspect["route"]["configuration_source"],
+            "browser_registry_observation"
+        );
+        assert_eq!(inspect["capabilities"]["schema_version"], 1);
+        assert_eq!(
+            inspect["capabilities"]["input_contract"]["message"]["max_bytes"],
+            262_144
+        );
+        assert_eq!(
+            inspect["capabilities"]["provider_dynamic_limits"]["turn_timeout_ms"]["status"],
+            "unknown"
+        );
 
         struct GateProbeActuator<'a> {
             gate: &'a Mutex<()>,
@@ -7242,6 +7302,26 @@ mod tests {
                 observed_at: 16,
             })
             .unwrap();
+        let stale_inspect = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_session.inspect",
+            &json!({"session_ref": session_ref}),
+            &exact_grants,
+            None,
+            None,
+        );
+        assert_eq!(stale_inspect["ok"], true);
+        assert_eq!(stale_inspect["actuation_available"], false);
+        assert_eq!(
+            stale_inspect["actuation_reason"],
+            "stale_capability_generation"
+        );
+        assert_eq!(
+            stale_inspect["route"]["status"],
+            "stale_capability_generation"
+        );
+        assert_eq!(stale_inspect["route"]["resource_observation_generation"], 7);
+        assert_eq!(stale_inspect["route"]["provider_observation_generation"], 8);
         let stale = browser_operation_call_with_grant(
             &store,
             "herdr_mcp.browser_dispatch.submit",
