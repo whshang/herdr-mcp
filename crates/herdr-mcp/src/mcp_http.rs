@@ -32,7 +32,7 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -440,7 +440,7 @@ struct AppState {
     runtime_generation: Option<String>,
     local_device_id: Option<String>,
     browser_actuation: BrowserActuationBroker,
-    browser_mutation_gate: Arc<Mutex<()>>,
+    browser_mutation_gate: Arc<RwLock<()>>,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -509,7 +509,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
                 .filter(|value| !value.is_empty()),
             local_device_id,
             browser_actuation: BrowserActuationBroker::default(),
-            browser_mutation_gate: Arc::new(Mutex::new(())),
+            browser_mutation_gate: Arc::new(RwLock::new(())),
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -873,7 +873,7 @@ fn extension_browser_endpoint_consent(
         browser_registry_bool(payload, "tool_bridge_mutation_allowed")?;
     let _mutation_gate = state
         .browser_mutation_gate
-        .lock()
+        .write()
         .map_err(|_| "browser_mutation_gate_unavailable".to_owned())?;
     let mut store = state
         .state_store
@@ -2850,7 +2850,7 @@ mod tests {
             runtime_generation: Some("rust-caller-grant-proof".to_owned()),
             local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             browser_actuation: BrowserActuationBroker::default(),
-            browser_mutation_gate: Arc::new(Mutex::new(())),
+            browser_mutation_gate: Arc::new(RwLock::new(())),
         }
     }
 
@@ -2883,7 +2883,7 @@ mod tests {
             "tool_bridge_mutation_allowed": false
         });
 
-        let gate_guard = state.browser_mutation_gate.lock().unwrap();
+        let gate_guard = state.browser_mutation_gate.read().unwrap();
         let worker_state = state.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {

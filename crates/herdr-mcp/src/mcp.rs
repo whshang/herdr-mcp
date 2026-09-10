@@ -63,7 +63,7 @@ pub struct RuntimeContext<'a> {
     pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
     pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
-    pub browser_mutation_gate: Option<&'a std::sync::Mutex<()>>,
+    pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -2680,7 +2680,7 @@ fn browser_operation_call_with_grants(
     params: &Value,
     caller_webchat_control_grants: &[BrowserCallerGrant],
     browser_actuator: Option<&dyn BrowserActuator>,
-    browser_mutation_gate: Option<&std::sync::Mutex<()>>,
+    browser_mutation_gate: Option<&std::sync::RwLock<()>>,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
         return json!({"ok": false, "code": "unknown_local_method", "method": method});
@@ -2701,7 +2701,7 @@ fn browser_operation_call_with_grants(
     // completes before the consent revision may change.
     let _mutation_gate = if operation.is_mutation() {
         match browser_mutation_gate {
-            Some(gate) => match gate.lock() {
+            Some(gate) => match gate.read() {
                 Ok(guard) => Some(guard),
                 Err(_) => {
                     return json!({
@@ -7002,7 +7002,7 @@ mod tests {
             BrowserProviderObservationInput, BrowserResourceObservationInput,
             BrowserResourceRecord,
         };
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Mutex, RwLock};
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let (endpoint_ref, account_ref, session_ref) = {
@@ -7165,7 +7165,7 @@ mod tests {
         );
 
         struct GateProbeActuator<'a> {
-            gate: &'a Mutex<()>,
+            gate: &'a RwLock<()>,
         }
         impl BrowserActuator for GateProbeActuator<'_> {
             fn actuate(
@@ -7176,7 +7176,7 @@ mod tests {
                 _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 assert!(
-                    self.gate.try_lock().is_err(),
+                    self.gate.try_write().is_err(),
                     "the consent/mutation gate must remain held through browser actuation"
                 );
                 Ok(BrowserPostconditionEvidence::resource_unavailable(
@@ -7196,7 +7196,7 @@ mod tests {
                 panic!("explicit unsupported mutations must not reach browser actuation")
             }
         }
-        let mutation_gate = Mutex::new(());
+        let mutation_gate = RwLock::new(());
         let gated_attempt = browser_operation_call_with_grants(
             &store,
             "herdr_mcp.browser_dispatch.submit",
