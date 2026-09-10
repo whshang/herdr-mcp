@@ -156,18 +156,13 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     let mut recovered_from_stale_dev = false;
+    let mut accepted_verified_dev_drift = false;
     if let Some(state) = existing.as_mut()
         && state.channel == "dev"
         && state.dev_generation.as_deref() != Some(active_before.as_str())
     {
         let active_binary = runtime.config_dir.join("runtime/current/herdr-mcp");
         let active_version = binary_version(&active_binary)?;
-        if is_dev_runtime_version(&active_version) {
-            return Err(format!(
-                "dev runtime state drift: state expects {:?} but runtime/current is {active_before}; run `herdr-mcp dev status` before another sync",
-                state.dev_generation
-            ));
-        }
         verify_runtime_activation(&runtime, &active_before).map_err(|error| {
             format!(
                 "dev runtime state drift: state expects {:?} but runtime/current is {active_before}; active runtime fails verification: {error}",
@@ -175,7 +170,13 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             )
         })?;
 
-        if dry_run {
+        if is_dev_runtime_version(&active_version) {
+            // A verified managed DEV generation can be the immediate transactional
+            // rollback point for the next DEV sync. Keep stale source provenance
+            // untouched and never redefine the pinned PROD snapshot from DEV bytes.
+            validate_stale_dev_resync_snapshot(state, &paths)?;
+            accepted_verified_dev_drift = true;
+        } else if dry_run {
             transition_state_to_prod(
                 state,
                 &active_before,
@@ -236,6 +237,9 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
     });
     if recovered_from_stale_dev {
         plan["recovered_from_stale_dev"] = json!(true);
+    }
+    if accepted_verified_dev_drift {
+        plan["accepted_verified_dev_drift"] = json!(true);
     }
     if dry_run {
         print_json(&plan)?;
@@ -1053,6 +1057,25 @@ fn verify_snapshot(state: &DevRuntimeState) -> Result<bool, String> {
     Ok(file_sha256(path)? == state.prod_snapshot_sha256)
 }
 
+fn validate_stale_dev_resync_snapshot(
+    state: &DevRuntimeState,
+    paths: &DevPaths,
+) -> Result<(), String> {
+    if Path::new(&state.prod_snapshot_binary) != paths.prod_binary {
+        return Err(
+            "dev runtime state drift: existing DEV state points at a non-managed PROD snapshot path"
+                .to_owned(),
+        );
+    }
+    if !verify_snapshot(state)? {
+        return Err(
+            "dev runtime state drift: existing PROD snapshot is missing or fails SHA-256 validation"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn dev_paths(runtime: &RuntimePaths) -> DevPaths {
     let runtime_root = runtime.config_dir.join("runtime");
     let prod_dir = runtime_root.join("channels").join("prod");
@@ -1683,9 +1706,65 @@ mod tests {
     fn dev_runtime_version_predicate_matches_established_convention() {
         assert!(is_dev_runtime_version("0.4.3-dev"));
         assert!(is_dev_runtime_version("0.4.4-dev"));
+        assert!(is_dev_runtime_version("1.0.0-dev"));
         assert!(!is_dev_runtime_version("0.4.3"));
         assert!(!is_dev_runtime_version("0.4.4"));
         assert!(!is_dev_runtime_version("0.4.3-beta.1"));
+    }
+
+    #[test]
+    fn stale_dev_resync_requires_managed_valid_prod_snapshot_without_rewriting_provenance() {
+        let root = env::temp_dir().join(format!("herdr-mcp-dev-drift-test-{}", now_ms()));
+        let prod_dir = root.join("channels/prod");
+        fs::create_dir_all(&prod_dir).unwrap();
+        let prod_binary = prod_dir.join(executable_name("herdr-mcp"));
+        fs::write(&prod_binary, b"pinned-prod-bytes").unwrap();
+        let prod_sha = file_sha256(&prod_binary).unwrap();
+        let paths = DevPaths {
+            state: root.join("channel.json"),
+            prod_binary: prod_binary.clone(),
+            prod_dir,
+        };
+        let state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "1.0.0-dev".to_owned(),
+            source_repo: Some("/tmp/old-checkout".to_owned()),
+            source_branch: Some("old-dev".to_owned()),
+            source_commit: Some("old-commit".to_owned()),
+            source_dirty: false,
+            dev_generation: Some("rust-old-dev".to_owned()),
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "0.4.8".to_owned(),
+            prod_snapshot_binary: prod_binary.to_string_lossy().into_owned(),
+            prod_snapshot_sha256: prod_sha,
+            updated_at_ms: 100,
+        };
+        let before = state.clone();
+
+        validate_stale_dev_resync_snapshot(&state, &paths).unwrap();
+        assert_eq!(
+            state, before,
+            "verified DEV drift must not rewrite stale provenance"
+        );
+
+        let mut wrong_path = state.clone();
+        wrong_path.prod_snapshot_binary =
+            root.join("other/herdr-mcp").to_string_lossy().into_owned();
+        assert!(
+            validate_stale_dev_resync_snapshot(&wrong_path, &paths)
+                .unwrap_err()
+                .contains("non-managed PROD snapshot path")
+        );
+
+        let mut wrong_sha = state.clone();
+        wrong_sha.prod_snapshot_sha256 = "0".repeat(64);
+        assert!(
+            validate_stale_dev_resync_snapshot(&wrong_sha, &paths)
+                .unwrap_err()
+                .contains("fails SHA-256 validation")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
