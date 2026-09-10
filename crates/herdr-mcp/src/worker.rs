@@ -2306,7 +2306,7 @@ fn resolve_owner_link_identity(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn resolve_owner_link_identity(
     paths: &RuntimePaths,
     config: &Config,
@@ -2350,7 +2350,7 @@ fn resolve_enrolled_device_identity(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn resolve_enrolled_device_identity(
     paths: &RuntimePaths,
     config: &Config,
