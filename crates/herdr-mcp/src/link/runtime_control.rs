@@ -25,6 +25,7 @@ use super::runtime_generation::{
 
 const MAX_CONTROL_BYTES: u64 = 128 * 1024;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
+const LEGACY_DEFAULT_RUNTIME_GENERATION: &str = "local-mcp-active";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlError {
@@ -170,9 +171,56 @@ impl RuntimeControlLoop {
                 }),
             };
             atomic_json(&self.inner.control_path, &control_document_json(&initial))?;
+        } else {
+            self.reconcile_legacy_default_generation()?;
         }
         let _ = self.tick().await;
         Ok(())
+    }
+
+    /// Upgrade the one historical first-owner placeholder state that can no
+    /// longer be correct once daemon startup has resolved `runtime/current` to
+    /// an exact managed `rust-*` generation.
+    ///
+    /// This is intentionally narrow. Existing candidate/multi-generation
+    /// control documents, different endpoints, and an explicitly configured
+    /// placeholder base are left untouched. The migration only replaces the
+    /// single default placeholder document that otherwise re-activates
+    /// `local-mcp-active` during the first tick and immediately trips the
+    /// managed-current dispatch fence.
+    fn reconcile_legacy_default_generation(&self) -> Result<bool, String> {
+        if self.inner.base.generation == LEGACY_DEFAULT_RUNTIME_GENERATION {
+            return Ok(false);
+        }
+
+        let document = read_control_document(&self.inner.control_path).map_err(|error| {
+            format!("runtime-control: cannot inspect legacy placeholder: {error}")
+        })?;
+        if document.desired_active != LEGACY_DEFAULT_RUNTIME_GENERATION
+            || document.generations.len() != 1
+        {
+            return Ok(false);
+        }
+        let legacy = &document.generations[0];
+        if legacy.generation != LEGACY_DEFAULT_RUNTIME_GENERATION
+            || legacy.endpoint != self.inner.base.endpoint
+        {
+            return Ok(false);
+        }
+
+        let revision = document
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "runtime-control: legacy placeholder revision overflow".to_owned())?;
+        let migrated = RuntimeControlDocument {
+            schema_version: document.schema_version,
+            revision,
+            desired_active: self.inner.base.generation.clone(),
+            generations: vec![self.inner.base.clone()],
+            observation: document.observation,
+        };
+        atomic_json(&self.inner.control_path, &control_document_json(&migrated))?;
+        Ok(true)
     }
 
     pub fn start(&self) {
@@ -688,8 +736,8 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::{
-        RuntimeControlLoop, RuntimeControlLoopOptions, retryable_candidate_outcome,
-        validate_runtime_control_document,
+        RuntimeControlLoop, RuntimeControlLoopOptions, RuntimeControlObservation,
+        read_control_document, retryable_candidate_outcome, validate_runtime_control_document,
     };
     use crate::link::runtime_generation::{
         RuntimeGenerationManager, RuntimeGenerationManagerOptions, RuntimeGenerationSpec,
@@ -860,6 +908,136 @@ mod tests {
         assert!(!retryable_candidate_outcome(
             "candidate_rejected:catalog_http_404"
         ));
+    }
+
+    #[tokio::test]
+    async fn initialize_migrates_single_legacy_placeholder_to_exact_managed_base() {
+        let hash = compute_contract_hash(&catalog()).unwrap();
+        let state = Arc::new(MockState {
+            version: "1.0.0-dev".to_owned(),
+            catalog: catalog(),
+            available: AtomicBool::new(true),
+        });
+        let endpoint = serve_mock(state).await;
+        let base = RuntimeGenerationSpec {
+            generation: "rust-testmanaged01".to_owned(),
+            endpoint: endpoint.clone(),
+            expected_runtime_version: Some("1.0.0-dev".to_owned()),
+            runtime_commit: None,
+        };
+        let manager = Arc::new(
+            RuntimeGenerationManager::new(RuntimeGenerationManagerOptions::new(
+                base.clone(),
+                TOKEN,
+                &hash,
+            ))
+            .expect("manager"),
+        );
+        let dir = test_dir();
+        let control_path = dir.join("control.json");
+        let status_path = dir.join("status.json");
+        fs::write(
+            &control_path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "revision": 11,
+                "desired_active": "local-mcp-active",
+                "generations": [{
+                    "generation": "local-mcp-active",
+                    "endpoint": endpoint,
+                }],
+                "observation": { "checks": 2, "interval_ms": 250 },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loop_ = RuntimeControlLoop::new(RuntimeControlLoopOptions {
+            manager: Arc::clone(&manager),
+            base: base.clone(),
+            control_path: control_path.clone(),
+            status_path: status_path.clone(),
+            poll_interval_ms: Some(100),
+            now_ms: None,
+        });
+        loop_.initialize().await.expect("initialize");
+
+        let migrated = read_control_document(&control_path).expect("migrated control");
+        assert_eq!(migrated.revision, 12);
+        assert_eq!(migrated.desired_active, base.generation);
+        assert_eq!(migrated.generations, vec![base]);
+        assert_eq!(
+            migrated.observation,
+            Some(RuntimeControlObservation {
+                checks: 2,
+                interval_ms: 250,
+            })
+        );
+        assert_eq!(manager.active_generation_id(), "rust-testmanaged01");
+        let saved: Value =
+            serde_json::from_str(&fs::read_to_string(&status_path).unwrap()).unwrap();
+        assert_eq!(saved["processed_revision"], 12);
+        assert_eq!(saved["manager"]["active_generation"], "rust-testmanaged01");
+
+        loop_.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_placeholder_migration_does_not_overwrite_candidate_control_state() {
+        let hash = compute_contract_hash(&catalog()).unwrap();
+        let state = Arc::new(MockState {
+            version: "1.0.0-dev".to_owned(),
+            catalog: catalog(),
+            available: AtomicBool::new(true),
+        });
+        let endpoint = serve_mock(state).await;
+        let base = RuntimeGenerationSpec {
+            generation: "rust-testmanaged02".to_owned(),
+            endpoint: endpoint.clone(),
+            expected_runtime_version: Some("1.0.0-dev".to_owned()),
+            runtime_commit: None,
+        };
+        let manager = Arc::new(
+            RuntimeGenerationManager::new(RuntimeGenerationManagerOptions::new(
+                base.clone(),
+                TOKEN,
+                &hash,
+            ))
+            .expect("manager"),
+        );
+        let dir = test_dir();
+        let control_path = dir.join("control.json");
+        let status_path = dir.join("status.json");
+        let original = json!({
+            "schema_version": 1,
+            "revision": 7,
+            "desired_active": "candidate",
+            "generations": [
+                { "generation": "local-mcp-active", "endpoint": endpoint },
+                { "generation": "candidate", "endpoint": "http://127.0.0.1:8773/mcp" },
+            ],
+        });
+        fs::write(&control_path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let loop_ = RuntimeControlLoop::new(RuntimeControlLoopOptions {
+            manager,
+            base,
+            control_path: control_path.clone(),
+            status_path,
+            poll_interval_ms: Some(100),
+            now_ms: None,
+        });
+
+        assert!(
+            !loop_
+                .reconcile_legacy_default_generation()
+                .expect("reconcile")
+        );
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(&control_path).unwrap()).unwrap();
+        assert_eq!(after, original);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
