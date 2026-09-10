@@ -871,10 +871,13 @@ fn refresh_prod_plist_generation(
             "HERDR_WORKSTATION_ID".to_owned(),
             PlistValue::String(device_id),
         );
-        env_out.insert(
-            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
-            PlistValue::String(keychain_service),
-        );
+        // Runtime generation refresh must not change credential ownership.
+        if !env_out.contains_key("HERDR_LINK_KEYCHAIN_SERVICE") {
+            env_out.insert(
+                "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+                PlistValue::String(keychain_service),
+            );
+        }
     }
     for (key, value) in inherited_proxy_env() {
         if !env_out.contains_key(&key) {
@@ -1062,6 +1065,10 @@ mod tests {
             "HERDR_RUNTIME_VERSION".to_owned(),
             PlistValue::String("0.4.2".to_owned()),
         );
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            PlistValue::String("herdr-edge-prod-link-secret".to_owned()),
+        );
         let mut root_dict = Dictionary::new();
         root_dict.insert(
             "Label".to_owned(),
@@ -1111,7 +1118,7 @@ mod tests {
         assert_eq!(
             env.get("HERDR_LINK_KEYCHAIN_SERVICE")
                 .and_then(PlistValue::as_string),
-            Some("herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            Some("herdr-edge-prod-link-secret")
         );
         std::fs::remove_dir_all(root).unwrap();
     }
