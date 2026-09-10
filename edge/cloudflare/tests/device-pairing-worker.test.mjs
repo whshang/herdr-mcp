@@ -953,6 +953,58 @@ test("pairing consume is unauthenticated, single-use, and returns the device sec
   assert.equal((await replay.json()).code, "pairing_rejected");
 });
 
+test("recovery pairing rotates one active device credential without changing device identity", async () => {
+  const { env } = makeEnv();
+  const original = await pair(env, "recover-me");
+
+  const before = await (await worker.fetch(get("/devices", "owner-secret"), env)).json();
+  const create = await worker.fetch(post(
+    "/devices/pairings",
+    { ttl_seconds: 60, recover_device_id: original.device_id },
+    "owner-secret",
+  ), env);
+  assert.equal(create.status, 200);
+  const session = await create.json();
+
+  const consume = await worker.fetch(post(
+    "/devices/pairings/consume",
+    { pairing_id: session.pairing_id, code: session.code },
+  ), env);
+  assert.equal(consume.status, 200);
+  const recovered = await consume.json();
+  assert.equal(recovered.device_id, original.device_id);
+  assert.equal(recovered.workstation_id, original.workstation_id);
+  assert.notEqual(recovered.credential_id, original.credential_id);
+  assert.notEqual(recovered.device_secret, original.device_secret);
+
+  const after = await (await worker.fetch(get("/devices", "owner-secret"), env)).json();
+  assert.equal(after.devices.length, before.devices.length);
+  assert.equal(after.devices.find((device) => device.device_id === original.device_id)?.name, "recover-me");
+
+  const oldCredential = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    original.workstation_id,
+    original.device_secret,
+  ), env);
+  assert.equal(oldCredential.status, 401);
+
+  const newCredential = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    recovered.workstation_id,
+    recovered.device_secret,
+  ), env);
+  assert.equal(newCredential.status, 200);
+
+  const replay = await worker.fetch(post(
+    "/devices/pairings/consume",
+    { pairing_id: session.pairing_id, code: session.code },
+  ), env);
+  assert.equal(replay.status, 401);
+  assert.equal((await replay.json()).code, "pairing_rejected");
+});
+
 test("all enrolled device credentials are equal fleet-admin channels for pairing creation", async () => {
   const { env } = makeEnv();
   const legacyCreate = await worker.fetch(postAsWorkstation(

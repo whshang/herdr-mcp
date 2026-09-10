@@ -47,6 +47,7 @@ interface PairingRecord {
   attempts: number;
   state: "pending" | "locked";
   name: string | null;
+  recover_device_id?: string | null;
 }
 
 async function pairingStorageKey(pairingId: string): Promise<string> {
@@ -225,6 +226,21 @@ export class DeviceRegistryDO {
       const existing = await this.state.storage.list<DeviceRecord>({ prefix: DEVICE_PREFIX, limit: 1 });
       if (existing.size > 0) return json({ ok: false, code: "first_fleet_not_empty" }, 409);
     }
+    const recoverDeviceId = body.recover_device_id === undefined
+      ? null
+      : typeof body.recover_device_id === "string"
+        ? normalizeDeviceId(body.recover_device_id)
+        : null;
+    if (body.recover_device_id !== undefined && (recoverDeviceId === null || recoverDeviceId !== body.recover_device_id)) {
+      return json({ ok: false, code: "invalid_recovery_device_id" }, 400);
+    }
+    if (recoverDeviceId !== null) {
+      if (body.require_empty_fleet === true) return json({ ok: false, code: "recovery_pairing_conflict" }, 409);
+      const target = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + recoverDeviceId));
+      if (!target) return json({ ok: false, code: "device_not_found" }, 404);
+      if (target.authorization === "revoked") return json({ ok: false, code: "device_revoked" }, 409);
+      if (target.authorization !== "active") return json({ ok: false, code: "device_suspended" }, 409);
+    }
 
     const pepper = getPairingPepper(this.env);
     if (pepper === null) return json({ ok: false, code: "pairing_unavailable" }, 503);
@@ -240,6 +256,7 @@ export class DeviceRegistryDO {
       attempts: 0,
       state: "pending",
       name,
+      recover_device_id: recoverDeviceId,
     };
 
     // At most one active unconsumed pairing session per Worker: creating a new
@@ -301,6 +318,29 @@ export class DeviceRegistryDO {
         return { ok: false as const, code: "pairing_rejected" as const };
       }
 
+      const recoveryDeviceId = record.recover_device_id ?? null;
+      if (recoveryDeviceId !== null) {
+        const existing = parseDeviceRecord(await tx.get<DeviceRecord>(DEVICE_PREFIX + recoveryDeviceId));
+        if (!existing) return { ok: false as const, code: "device_not_found" as const };
+        if (existing.authorization === "revoked") return { ok: false as const, code: "device_revoked" as const };
+        if (existing.authorization !== "active") return { ok: false as const, code: "device_suspended" as const };
+        const credentialId = newCredentialId();
+        const deviceSecret = newDeviceSecret();
+        const credential: DeviceCredentialRecord = {
+          credential_id: credentialId,
+          device_id: existing.device_id,
+          workstation_id: existing.workstation_id,
+          verifier_sha256: await sha256Hex(deviceSecret),
+          created_at_ms: now,
+        };
+        const updated: DeviceRecord = { ...existing, credential_id: credentialId, updated_at_ms: now };
+        await tx.delete(storageKey);
+        if (existing.credential_id) await tx.delete(CREDENTIAL_PREFIX + existing.credential_id);
+        await tx.put(DEVICE_PREFIX + existing.device_id, updated);
+        await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
+        return { ok: true as const, device_id: existing.device_id, credential_id: credentialId, device_secret: deviceSecret };
+      }
+
       const deviceId = newDeviceId(now);
       const credentialId = newCredentialId();
       const deviceSecret = newDeviceSecret();
@@ -329,7 +369,7 @@ export class DeviceRegistryDO {
       return { ok: true as const, device_id: deviceId, credential_id: credentialId, device_secret: deviceSecret };
     });
 
-    if (!result.ok) return json(result, 401);
+    if (!result.ok) return json(result, result.code === "pairing_rejected" ? 401 : 409);
     return json({
       ok: true,
       device_id: result.device_id,
