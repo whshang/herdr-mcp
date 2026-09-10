@@ -2505,14 +2505,19 @@ const H2W_CONTENT_VERSION = "0.1.91";
     };
   }
 
-  function explicitChatGptDisconnectedReply() {
+  function explicitChatGptRecoverySignal() {
     if (ADAPTER.name !== "chatgpt") return null;
-    const text = String(lastMessageByRole("assistant") || "").replace(/\s+/g, " ").trim();
-    if (!text) return null;
-    if (!/(?:连接已中断|正在等待完整回复|connection (?:was )?(?:interrupted|lost)|waiting for (?:the )?full response)/i.test(text)) {
+    const threadError = explicitChatGptThreadError();
+    const threadText = String(threadError?.text || "").replace(/\s+/g, " ").trim();
+    if (threadText && /(?:消息发送超时，请重试。?|message (?:send )?timed out[,.;:]? please retry)/i.test(threadText)) {
+      return { kind: "send_timeout", text: threadText };
+    }
+    const assistantText = String(lastMessageByRole("assistant") || "").replace(/\s+/g, " ").trim();
+    if (!assistantText) return null;
+    if (!/(?:连接已中断。?正在等待完整回复|connection (?:was )?(?:interrupted|lost).*waiting for (?:the )?full response)/i.test(assistantText)) {
       return null;
     }
-    return { text };
+    return { kind: "disconnected_reply", text: assistantText };
   }
 
   function browserMemorySnapshot() {
@@ -2718,33 +2723,83 @@ const H2W_CONTENT_VERSION = "0.1.91";
     return false;
   }
 
-  async function maybeRecoverDisconnectedReply() {
+  async function maybeRecoverExplicitChatGptFailure() {
     if (!automationEnabled || ADAPTER.name !== "chatgpt" || !conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
-    if (!explicitChatGptDisconnectedReply()) return false;
+    const failure = explicitChatGptRecoverySignal();
+    if (!failure) return false;
+
     const now = Date.now();
-    const lastProgressAt = Number(
-      conversationHealth.last_assistant_progress_at
+    if (lastWakeNorm === normText("继续") && now - lastWakeAt < 15000) return true;
+    const turnAt = Number(
+      conversationHealth.last_user_submit_at
       || conversationHealth.reply_started_at
-      || conversationHealth.last_user_submit_at
       || 0,
     );
-    if (!lastProgressAt || now - lastProgressAt < RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.assistantStallMs) {
+    const sameTurn = Number(conversationHealth.explicit_error_turn_at || 0) === turnAt
+      && conversationHealth.explicit_error_kind === failure.kind;
+    if (!sameTurn) {
+      markConversationState({
+        ...conversationHealth,
+        explicit_error_kind: failure.kind,
+        explicit_error_turn_at: turnAt,
+        explicit_error_reload_attempt: 0,
+        explicit_error_continue_attempt: 0,
+        explicit_error_last_seen_at: now,
+      });
+    } else {
+      markConversationState({ ...conversationHealth, explicit_error_last_seen_at: now });
+    }
+
+    const safety = recoverySafetySnapshot();
+    if (safety.composerHasHumanText || safety.toolRunning || safety.permissionCardActive) return true;
+    const reloadAttempts = Number(conversationHealth.explicit_error_reload_attempt || 0);
+    if (reloadAttempts < 1) {
+      // These banners are terminal transport states. Ignore only the stale
+      // streaming/Stop affordance, but never overwrite a human draft or race a
+      // live tool/permission action. The dedicated persisted budget bounds the
+      // refresh to once for this exact failed turn.
+      markConversationState(CONVERSATION_HEALTH.markReplySuspect(
+        conversationHealth,
+        failure.kind === "send_timeout" ? "chatgpt_send_timeout" : "chatgpt_disconnected",
+      ));
+      markConversationState({
+        ...CONVERSATION_HEALTH.markReloadPending(conversationHealth),
+        explicit_error_kind: failure.kind,
+        explicit_error_turn_at: turnAt,
+        explicit_error_reload_attempt: 1,
+        explicit_error_last_seen_at: now,
+        reload_reason: failure.kind === "send_timeout" ? "chatgpt_send_timeout" : "chatgpt_disconnected",
+      });
+      await wait(100);
+      const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
+      markConversationState({
+        ...reloading,
+        explicit_error_kind: failure.kind,
+        explicit_error_turn_at: turnAt,
+        explicit_error_reload_attempt: 1,
+        explicit_error_last_seen_at: now,
+        reload_reason: failure.kind === "send_timeout" ? "chatgpt_send_timeout" : "chatgpt_disconnected",
+      });
+      await reloadAfterPersistingConversationState();
       return true;
     }
-    const safety = recoverySafetySnapshot();
-    if (safety.composerBusy || safety.toolRunning || safety.permissionCardActive) return true;
-    if (Number(conversationHealth.reload_attempt || 0) >= 1) return true;
-    // ChatGPT already reports that this response stream is disconnected. One
-    // reload reconciles the existing server-side turn; it never resubmits the
-    // user's potentially side-effecting request, so the stale Stop button must
-    // not block this bounded refresh.
-    if (!RECOVERY_CONTROLLER.canReloadSafely({ ...safety, streaming: false })) return true;
-    markConversationState(CONVERSATION_HEALTH.markReplySuspect(conversationHealth, "chatgpt_disconnected"));
-    markConversationState(CONVERSATION_HEALTH.markReloadPending(conversationHealth));
-    await wait(100);
-    const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
-    markConversationState({ ...reloading, reload_reason: "chatgpt_disconnected" });
-    await reloadAfterPersistingConversationState();
+
+    if (Number(conversationHealth.explicit_error_continue_attempt || 0) >= 1) return true;
+    if (safety.composerBusy || safety.streaming) return true;
+    const armed = markConversationState({
+      ...conversationHealth,
+      explicit_error_continue_attempt: 1,
+      explicit_error_last_seen_at: now,
+    });
+    if (!(await persistConversationHealth(armed))) {
+      markConversationState({ ...conversationHealth, explicit_error_continue_attempt: 0 });
+      return true;
+    }
+    const result = await performWake({ template: "继续", autoAllow: false, recovery: true });
+    if (!result?.ok) {
+      markConversationState({ ...conversationHealth, explicit_error_continue_attempt: 0 });
+      return true;
+    }
     return true;
   }
 
@@ -3067,8 +3122,8 @@ const H2W_CONTENT_VERSION = "0.1.91";
         // Herdr runtime becomes unreachable.
         await refreshAutomationState();
         if (await maybeRecoverPageHealth()) return;
+        if (await maybeRecoverExplicitChatGptFailure()) return;
         if (await maybeRecoverExplicitThreadError()) return;
-        if (await maybeRecoverDisconnectedReply()) return;
         const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
         if (next !== conversationHealth) markConversationState(next);
         if (await maybeRefreshStaleView()) return;

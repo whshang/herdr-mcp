@@ -410,6 +410,11 @@ test("conversation health records the persisted recovery lifecycle fields", () =
     "thread_error_retry_attempt",
     "thread_error_reload_attempt",
     "thread_error_last_seen_at",
+    "explicit_error_kind",
+    "explicit_error_turn_at",
+    "explicit_error_reload_attempt",
+    "explicit_error_continue_attempt",
+    "explicit_error_last_seen_at",
     "page_health_state",
     "page_health_checked_at",
     "page_health_high_since",
@@ -573,6 +578,16 @@ test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit
   assert.match(wake, /backend-api\/conversation/);
   assert.match(wake, /maybeRefreshStaleView\(\)/);
   assert.match(wake, /regenerate-thread-error-button/);
+  assert.match(wake, /maybeRecoverExplicitChatGptFailure\(\)/);
+  assert.match(wake, /消息发送超时，请重试/);
+  assert.match(wake, /连接已中断/);
+  assert.match(wake, /performWake\(\{ template: "继续", autoAllow: false, recovery: true \}\)/);
+  assert.match(wake, /explicit_error_reload_attempt/);
+  assert.match(wake, /explicit_error_continue_attempt/);
+  assert.ok(
+    wake.indexOf("maybeRecoverExplicitChatGptFailure()") < wake.indexOf("maybeRecoverExplicitThreadError()"),
+    "bounded explicit failure recovery must run before generic Retry-button handling",
+  );
   assert.match(wake, /maybeRecoverExplicitThreadError\(\)/);
   assert.match(wake, /thread_error_server_ahead/);
   assert.match(wake, /thread_error_delivery_unknown/);
