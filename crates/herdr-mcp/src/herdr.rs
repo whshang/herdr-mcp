@@ -91,6 +91,51 @@ fn call_socket(
         .set_write_timeout(Some(timeout))
         .map_err(|error| io_error(error, socket_path))?;
 
+    call_stream(&mut stream, socket_path, method, params)
+}
+
+#[cfg(windows)]
+pub(crate) fn connect_windows_local_stream(
+    socket_path: &Path,
+) -> std::io::Result<interprocess::local_socket::Stream> {
+    use interprocess::local_socket::{GenericNamespaced, prelude::*};
+
+    let name = socket_path.to_string_lossy().to_string();
+    let name = name.to_ns_name::<GenericNamespaced>()?;
+    interprocess::local_socket::Stream::connect(name)
+}
+
+#[cfg(windows)]
+fn call_socket(
+    socket_path: &Path,
+    timeout: Duration,
+    method: &str,
+    params: Value,
+) -> Result<Value, HerdrError> {
+    use interprocess::local_socket::traits::Stream as _;
+
+    let mut stream =
+        connect_windows_local_stream(socket_path).map_err(|error| io_error(error, socket_path))?;
+    for result in [
+        stream.set_send_timeout(Some(timeout)),
+        stream.set_recv_timeout(Some(timeout)),
+    ] {
+        match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(error) => return Err(io_error(error, socket_path)),
+        }
+    }
+
+    call_stream(&mut stream, socket_path, method, params)
+}
+
+fn call_stream(
+    stream: &mut (impl Read + Write),
+    socket_path: &Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, HerdrError> {
     let id = format!("rust-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let request = json!({
         "id": id,
@@ -106,7 +151,7 @@ fn call_socket(
         .write_all(&encoded)
         .map_err(|error| io_error(error, socket_path))?;
 
-    let line = read_bounded_line(&mut stream)?;
+    let line = read_bounded_line(stream)?;
     let envelope: Value = serde_json::from_slice(&line).map_err(|error| HerdrError {
         code: "parse_error".to_owned(),
         message: error.to_string(),
@@ -127,19 +172,6 @@ fn call_socket(
     }
 
     Ok(envelope.get("result").cloned().unwrap_or_else(|| json!({})))
-}
-
-#[cfg(windows)]
-fn call_socket(
-    _socket_path: &Path,
-    _timeout: Duration,
-    _method: &str,
-    _params: Value,
-) -> Result<Value, HerdrError> {
-    Err(HerdrError {
-        code: "unsupported_transport".to_owned(),
-        message: "Windows named-pipe transport has not landed yet".to_owned(),
-    })
 }
 
 fn read_bounded_line(reader: &mut impl Read) -> Result<Vec<u8>, HerdrError> {

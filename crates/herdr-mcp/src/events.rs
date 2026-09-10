@@ -11,6 +11,8 @@ static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 pub struct EventStream {
     #[cfg(unix)]
     stream: std::os::unix::net::UnixStream,
+    #[cfg(windows)]
+    stream: interprocess::local_socket::Stream,
     buffer: Vec<u8>,
     deadline: Instant,
 }
@@ -89,13 +91,41 @@ fn subscribe_socket(
 
 #[cfg(windows)]
 fn subscribe_socket(
-    _client: &HerdrClient,
-    _subscriptions: Vec<Value>,
-    _duration: Duration,
+    client: &HerdrClient,
+    subscriptions: Vec<Value>,
+    duration: Duration,
 ) -> Result<EventStream, HerdrError> {
-    Err(HerdrError {
-        code: "unsupported_transport".to_owned(),
-        message: "Windows named-pipe event transport has not landed yet".to_owned(),
+    use interprocess::local_socket::traits::Stream as _;
+
+    let mut stream =
+        crate::herdr::connect_windows_local_stream(client.socket_path()).map_err(stream_error)?;
+    let io_timeout = duration.min(READ_TICK).max(Duration::from_millis(10));
+    match stream.set_send_timeout(Some(io_timeout)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+        Err(error) => return Err(stream_error(error)),
+    }
+
+    let id = format!(
+        "rust-events-{}",
+        NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let request = json!({
+        "id": id,
+        "method": "events.subscribe",
+        "params": {"subscriptions": subscriptions},
+    });
+    let mut encoded = serde_json::to_vec(&request).map_err(|error| HerdrError {
+        code: "encode_error".to_owned(),
+        message: error.to_string(),
+    })?;
+    encoded.push(b'\n');
+    stream.write_all(&encoded).map_err(stream_error)?;
+
+    Ok(EventStream {
+        stream,
+        buffer: Vec::with_capacity(8192),
+        deadline: Instant::now() + duration,
     })
 }
 
@@ -149,13 +179,97 @@ fn next_event_until(
 
 #[cfg(windows)]
 fn next_event_until(
-    _stream: &mut EventStream,
-    _call_deadline: Instant,
+    stream: &mut EventStream,
+    call_deadline: Instant,
 ) -> Result<Option<Value>, HerdrError> {
-    Err(HerdrError {
-        code: "unsupported_transport".to_owned(),
-        message: "Windows named-pipe event transport has not landed yet".to_owned(),
-    })
+    loop {
+        if let Some(line) = take_line(&mut stream.buffer) {
+            if let Some(event) = parse_event_line(&line)? {
+                return Ok(Some(event));
+            }
+            continue;
+        }
+        if Instant::now() >= call_deadline {
+            return Ok(None);
+        }
+
+        match windows_named_pipe_available(&mut stream.stream)? {
+            None => return Err(event_stream_closed()),
+            Some(0) => {
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            Some(_) => {}
+        }
+
+        let mut chunk = [0_u8; 8192];
+        match stream.stream.read(&mut chunk) {
+            Ok(0) => return Err(event_stream_closed()),
+            Ok(count) => {
+                if stream.buffer.len().saturating_add(count) > MAX_EVENT_LINE_BYTES {
+                    return Err(HerdrError {
+                        code: "event_frame_too_large".to_owned(),
+                        message: format!(
+                            "events.subscribe frame exceeded {MAX_EVENT_LINE_BYTES} bytes"
+                        ),
+                    });
+                }
+                stream.buffer.extend_from_slice(&chunk[..count]);
+            }
+            Err(error) if is_windows_pipe_closed(&error) => return Err(event_stream_closed()),
+            Err(error) => return Err(stream_error(error)),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_named_pipe_available(
+    stream: &mut interprocess::local_socket::Stream,
+) -> Result<Option<u32>, HerdrError> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+
+    let interprocess::local_socket::Stream::NamedPipe(pipe) = stream;
+    let mut available = 0;
+    let ok = unsafe {
+        windows_sys::Win32::System::Pipes::PeekNamedPipe(
+            pipe.as_handle().as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        return Ok(Some(available));
+    }
+
+    let error = std::io::Error::last_os_error();
+    if is_windows_pipe_closed(&error) {
+        return Ok(None);
+    }
+    Err(stream_error(error))
+}
+
+#[cfg(windows)]
+fn is_windows_pipe_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::WriteZero
+    ) || matches!(error.raw_os_error(), Some(6 | 109 | 232 | 233))
+}
+
+#[cfg(windows)]
+fn event_stream_closed() -> HerdrError {
+    HerdrError {
+        code: "event_stream_closed".to_owned(),
+        message: "events.subscribe peer closed the stream".to_owned(),
+    }
 }
 
 fn take_line(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {

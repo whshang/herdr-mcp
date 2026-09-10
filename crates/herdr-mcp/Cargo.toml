@@ -43,5 +43,9 @@ x509-cert = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 
+[target.'cfg(windows)'.dependencies]
+interprocess = "2.4.2"
+windows-sys = { version = "0.61.2", features = ["Win32_System_Pipes"] }
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
