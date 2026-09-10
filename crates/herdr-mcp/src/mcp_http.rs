@@ -965,6 +965,7 @@ fn extension_browser_resource_observe(
             "native_identity",
             "display_label",
             "canonical_url",
+            "reservation_ref",
             "observation_generation",
             "observed_at",
         ],
@@ -976,6 +977,7 @@ fn extension_browser_resource_observe(
     let native_identity = browser_registry_string(payload, "native_identity", 1024)?;
     let display_label = browser_registry_optional_string(payload, "display_label", 256)?;
     let canonical_url = browser_registry_optional_string(payload, "canonical_url", 2048)?;
+    let reservation_ref = browser_registry_optional_string(payload, "reservation_ref", 96)?;
     if canonical_url.is_some_and(|value| !value.starts_with("https://")) {
         return Err("browser_canonical_url_invalid".to_owned());
     }
@@ -995,7 +997,7 @@ fn extension_browser_resource_observe(
         observed_at,
     })?;
     if let Some(canonical_url) = canonical_url {
-        if kind != "session" {
+        if !matches!(kind, "account" | "space" | "session") {
             return Err("browser_canonical_url_kind_invalid".to_owned());
         }
         store.upsert_browser_resource_locator(
@@ -1005,9 +1007,26 @@ fn extension_browser_resource_observe(
             observed_at,
         )?;
     }
+    let materialized_reservation = if let Some(reservation_ref) = reservation_ref {
+        if kind != "session" || !reservation_ref.starts_with("bsr_") {
+            return Err("browser_session_reservation_ref_invalid".to_owned());
+        }
+        Some(store.materialize_browser_session_reservation(
+            reservation_ref,
+            &resource.resource_ref,
+            observed_at,
+        )?)
+    } else {
+        None
+    };
     Ok(json!({
         "ok": true,
         "resource": browser_resource_http_json(resource),
+        "reservation": materialized_reservation.map(|reservation| json!({
+            "reservation_ref": reservation.reservation_ref,
+            "state": reservation.state,
+            "session_ref": reservation.session_ref,
+        })),
     }))
 }
 
@@ -3117,6 +3136,29 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let reservation_ref = {
+            let mut guard = store.lock().unwrap();
+            match guard
+                .reserve_browser_session(crate::state_store::BrowserSessionReservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    account_ref: &account_ref,
+                    space_ref: None,
+                    display_label: "HTTP materialization",
+                    expected_generation: 1,
+                    idempotency_key_digest: &"a".repeat(64),
+                    request_digest: &"b".repeat(64),
+                    created_at: 1003,
+                    expires_at: 2000,
+                })
+                .unwrap()
+            {
+                crate::state_store::BrowserSessionReservation::Reserved(record) => {
+                    record.reservation_ref
+                }
+                crate::state_store::BrowserSessionReservation::Existing(_) => unreachable!(),
+            }
+        };
 
         let session = json!({
             "operation": "resource.observe",
@@ -3128,6 +3170,7 @@ mod tests {
             "native_identity": "session-http-locator-1",
             "display_label": null,
             "canonical_url": "https://chatgpt.com/c/session-http-locator-1",
+            "reservation_ref": reservation_ref,
             "observation_generation": 1,
             "observed_at": 1004
         });
@@ -3136,6 +3179,8 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let session_result: Value = serde_json::from_slice(&body).unwrap();
         let session_ref = session_result["resource"]["resource_ref"].as_str().unwrap();
+        assert_eq!(session_result["reservation"]["state"], "materialized");
+        assert_eq!(session_result["reservation"]["session_ref"], session_ref);
         let locator = store
             .lock()
             .unwrap()
@@ -3147,6 +3192,14 @@ mod tests {
             "https://chatgpt.com/c/session-http-locator-1"
         );
         assert_eq!(locator.observation_generation, 1);
+        let materialized = store
+            .lock()
+            .unwrap()
+            .browser_session_reservation(&reservation_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(materialized.state, "materialized");
+        assert_eq!(materialized.session_ref.as_deref(), Some(session_ref));
 
         let endpoint = store
             .lock()

@@ -1350,11 +1350,29 @@ const H2W_CONTENT_VERSION = "0.1.90";
   async function performBrowserActuationCommand(command) {
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
-    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
+    const creatingSession = command?.operation === "herdr_mcp.browser_session.create";
+    if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)
+        || !Number.isSafeInteger(expectedGeneration)
+        || expectedGeneration < 1) {
       return { ...evidence, resource_available: false };
     }
     if (command?.expectedConvKey && command.expectedConvKey !== ADAPTER.getConversationKey()) {
       return { ...evidence, resource_available: false };
+    }
+    if (creatingSession) {
+      const params = command?.params && typeof command.params === "object" ? command.params : {};
+      const reservationRef = typeof params.reservation_ref === "string" ? params.reservation_ref : "";
+      if (ADAPTER.name !== "chatgpt" || !/^bsr_[0-9a-f]{64}$/.test(reservationRef)) {
+        return { ...evidence, resource_available: false };
+      }
+      try {
+        sessionStorage.setItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef);
+      } catch (_) {
+        return { ...evidence, resource_available: false };
+      }
+      evidence.stable_resource_ref_observed = false;
+      evidence.lifecycle_observed = false;
+      evidence.canonical_url_observed = false;
     }
     if (command?.operation === "herdr_mcp.browser_session.open") {
       if (ADAPTER.name !== "chatgpt") {
@@ -1417,7 +1435,7 @@ const H2W_CONTENT_VERSION = "0.1.90";
       } while (Date.now() < deadline);
       return evidence;
     }
-    if (command?.operation !== "herdr_mcp.browser_dispatch.submit") {
+    if (!creatingSession && command?.operation !== "herdr_mcp.browser_dispatch.submit") {
       return { ...evidence, rejected: true };
     }
     const params = command?.params && typeof command.params === "object" ? command.params : {};
@@ -1425,9 +1443,15 @@ const H2W_CONTENT_VERSION = "0.1.90";
     const reasoning = params.reasoning_effort;
     const requiredApps = Array.isArray(params.required_apps) ? params.required_apps : [];
     if (!message || reasoning != null || requiredApps.length > 0) {
+      if (creatingSession) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+      }
       return { ...evidence, rejected: true };
     }
     if (isTurnInProgress() || ADAPTER.inputHasContent()) {
+      if (creatingSession) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+      }
       return { ...evidence, rejected: true };
     }
 
@@ -1442,6 +1466,9 @@ const H2W_CONTENT_VERSION = "0.1.90";
       browserActuation: true,
     });
     if (!result?.ok) {
+      if (creatingSession) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+      }
       return { ...evidence, rejected: true };
     }
     evidence.command_accepted = true;
@@ -1471,6 +1498,18 @@ const H2W_CONTENT_VERSION = "0.1.90";
       evidence.accepted_message_observed = serverAdvanced || domAdvanced;
       evidence.message_baseline_advanced = domAdvanced;
       evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      if (creatingSession && evidence.canonical_url_observed) {
+        const currentConvKey = ADAPTER.getConversationKey();
+        if (currentConvKey && (registeredConvKey !== currentConvKey || !registeredBrowserSessionRef)) {
+          await registerCurrentConversation("browser-session-create").catch(() => null);
+        }
+        evidence.stable_resource_ref_observed = Boolean(
+          registeredBrowserSessionRef
+          && registeredConvKey === ADAPTER.getConversationKey()
+          && registeredBrowserGeneration === expectedGeneration,
+        );
+        evidence.lifecycle_observed = evidence.stable_resource_ref_observed;
+      }
       const assistantAdvanced = Boolean(
         afterAssistant?.messageId
         && afterAssistant.messageId !== beforeAssistant?.messageId,
@@ -1485,7 +1524,9 @@ const H2W_CONTENT_VERSION = "0.1.90";
         || assistantAdvanced
         || (afterServer?.ok && ["user", "assistant"].includes(afterServer.currentNodeRole)),
       );
-      if (evidence.accepted_message_observed && evidence.generation_status_observed) {
+      if (evidence.accepted_message_observed
+          && evidence.generation_status_observed
+          && (!creatingSession || (evidence.stable_resource_ref_observed && evidence.canonical_url_observed))) {
         evidence.generation_owner = expectedGeneration;
         return evidence;
       }
@@ -1501,6 +1542,7 @@ const H2W_CONTENT_VERSION = "0.1.90";
   let registeredBrowserSessionRef = null;
   let registeredBrowserGeneration = null;
   let browserRegistrationAttempt = 0;
+  const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
 
   // ---- Message listener ----
   try {
@@ -1878,12 +1920,18 @@ const H2W_CONTENT_VERSION = "0.1.90";
       }
       return null;
     }
+    let browserSessionReservationRef = null;
+    try {
+      const stored = sessionStorage.getItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
+      browserSessionReservationRef = /^bsr_[0-9a-f]{64}$/.test(String(stored || "")) ? stored : null;
+    } catch (_) {}
     const response = await sendBg({
       type: "h2w_register",
       convKey,
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      browserSessionReservationRef,
     });
     if (response !== null) {
       if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
@@ -1905,6 +1953,9 @@ const H2W_CONTENT_VERSION = "0.1.90";
         && response.browser_generation > 0
         ? response.browser_generation
         : null;
+      if (browserSessionReservationRef && registeredBrowserSessionRef) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+      }
       const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
       if (concreteChat) {
         await ensureConversationHealth(convKey);

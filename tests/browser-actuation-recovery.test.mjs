@@ -300,3 +300,27 @@ test("ChatGPT session.open can restore a disposable view from a local canonical 
   assert.match(contentSegment, /canonical_url_observed\s*=\s*true/);
   assert.doesNotMatch(contentSegment, /performWake|findSendButton|dispatchEnterSubmit/);
 });
+
+test("ChatGPT session.create carries one durable reservation across the new-conversation route", () => {
+  const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
+  const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);
+  assert.ok(start >= 0 && end > start, "session.create branch must precede session.open");
+  const segment = backgroundSource.slice(start, end);
+  assert.match(segment, /browserTabScopes\.get\(createdTab\.id\)/);
+  assert.match(segment, /scope\.accountRef === accountRefCreate/);
+  assert.match(segment, /scope\.spaceRef === spaceRefCreate/);
+  assert.match(segment, /chrome\.tabs\.create\(\{ url: launchUrl, active: true \}\)/);
+  assert.match(segment, /reservationRef/);
+
+  const createStart = wakeSource.indexOf('const creatingSession = command?.operation === "herdr_mcp.browser_session.create"');
+  const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);
+  const createSegment = wakeSource.slice(createStart, createEnd);
+  assert.match(createSegment, /sessionStorage\.setItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef\)/);
+  assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
+  assert.match(createSegment, /registeredBrowserSessionRef/);
+
+  const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
+  const registrationSegment = wakeSource.slice(registrationStart, registrationStart + 3500);
+  assert.match(registrationSegment, /browserSessionReservationRef/);
+  assert.match(registrationSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
+});

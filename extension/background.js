@@ -128,6 +128,7 @@ const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation";
 const BROWSER_PROFILE_SEED_STORAGE_KEY = "herdrBrowserProfileSeedV1";
 const BROWSER_OBSERVATION_GENERATION_STORAGE_KEY = "herdrBrowserObservationGenerationV1";
 const browserSessionTargets = new Map();
+const browserTabScopes = new Map();
 let browserEndpoint = null;
 let browserObservationGeneration = null;
 const AUTOMATION_MODE_MANUAL = "manual";
@@ -1666,8 +1667,15 @@ async function postBrowserRegistry(payload) {
   return parsed;
 }
 
-async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, accountNativeIdentity }) {
-  if (!tabId || !pageInfo?.conversation_id || !accountNativeIdentity) return null;
+async function observeBrowserConversation({
+  provider,
+  tabId,
+  convKey,
+  pageInfo,
+  accountNativeIdentity,
+  reservationRef = null,
+}) {
+  if (!tabId || !pageInfo || !accountNativeIdentity) return null;
   if (!["chatgpt", "gemini", "claude", "grok"].includes(provider)) return null;
   const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
   if (!endpoint?.endpoint_ref) return null;
@@ -1681,10 +1689,12 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
     capabilities: { operations: provider === "chatgpt"
-        ? ["composer.submit", "generation.status", "generation.stop", "session.inspect", "session.open"]
-        : ["composer.submit", "generation.status", "generation.stop", "session.inspect"] },
+      ? ["composer.submit", "generation.status", "generation.stop", "session.inspect", "session.open", "session.create"]
+      : ["composer.submit", "generation.status", "generation.stop", "session.inspect"] },
     observed_at: Date.now(),
   });
+  let accountLaunchUrl = null;
+  try { accountLaunchUrl = new URL(String(convKey || pageInfo.convKey || "")).origin; } catch (_) {}
   const account = await postBrowserRegistry({
     operation: "resource.observe",
     profile_seed: profileSeed,
@@ -1694,6 +1704,7 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
     parent_ref: null,
     native_identity: accountNativeIdentity,
     display_label: null,
+    canonical_url: accountLaunchUrl,
     observation_generation: observationGeneration,
     observed_at: Date.now(),
   });
@@ -1709,6 +1720,7 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
       parent_ref: parentRef,
       native_identity: pageInfo.project_id,
       display_label: null,
+      canonical_url: pageInfo.project_launch_url || pageInfo.project_key || null,
       observation_generation: observationGeneration,
       observed_at: Date.now(),
     });
@@ -1716,6 +1728,21 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
     parentRef = spaceRef || parentRef;
   }
   if (!parentRef) return null;
+  browserTabScopes.set(tabId, {
+    provider,
+    accountRef: account.resource?.resource_ref || null,
+    spaceRef,
+    observationGeneration,
+    lastSeenAt: Date.now(),
+  });
+  if (!pageInfo.conversation_id) {
+    return {
+      sessionRef: null,
+      observationGeneration,
+      accountRef: account.resource?.resource_ref || null,
+      spaceRef,
+    };
+  }
   const session = await postBrowserRegistry({
     operation: "resource.observe",
     profile_seed: profileSeed,
@@ -1726,6 +1753,7 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
     native_identity: pageInfo.conversation_id,
     display_label: null,
     canonical_url: pageInfo.convKey,
+    reservation_ref: reservationRef,
     observation_generation: observationGeneration,
     observed_at: Date.now(),
   });
@@ -1738,10 +1766,16 @@ async function observeBrowserConversation({ provider, tabId, convKey, pageInfo, 
     conversationId: pageInfo.conversation_id,
     projectId: pageInfo.project_id || null,
     observationGeneration,
+    accountRef: account.resource?.resource_ref || null,
     spaceRef,
     lastSeenAt: Date.now(),
   });
-  return { sessionRef, observationGeneration };
+  return {
+    sessionRef,
+    observationGeneration,
+    accountRef: account.resource?.resource_ref || null,
+    spaceRef,
+  };
 }
 
 function validBrowserProfileSeed(value) {
@@ -2533,6 +2567,79 @@ async function handleBrowserActuation(command) {
       resource_available: true,
       result,
     }).catch(() => {});
+  if (operation === "herdr_mcp.browser_session.create") {
+    const providerCreate = String(params.provider || "");
+    const accountRefCreate = String(params.account_ref || "");
+    const spaceRefCreate = String(params.space_ref || "");
+    const reservationRef = String(params.reservation_ref || "");
+    const launchUrl = String(params.launch_url || "");
+    if (providerCreate !== "chatgpt"
+        || !accountRefCreate
+        || !/^bsr_[0-9a-f]{64}$/.test(reservationRef)
+        || !launchUrl.startsWith("https://")) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration),
+      );
+      return;
+    }
+    let createdTab = null;
+    try {
+      createdTab = await chrome.tabs.create({ url: launchUrl, active: true });
+    } catch (_) {}
+    if (!createdTab?.id) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration),
+      );
+      return;
+    }
+    let scope = null;
+    const scopeDeadline = Date.now() + 8000;
+    do {
+      scope = browserTabScopes.get(createdTab.id) || null;
+      if (scope
+          && scope.provider === providerCreate
+          && scope.accountRef === accountRefCreate
+          && (spaceRefCreate ? scope.spaceRef === spaceRefCreate : !scope.spaceRef)
+          && scope.observationGeneration === expectedGeneration) {
+        break;
+      }
+      scope = null;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } while (Date.now() < scopeDeadline);
+    if (!scope) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration),
+      );
+      return;
+    }
+    try {
+      await protectBoundTab(createdTab.id);
+      const response = await sendBrowserActuationTabMessage(createdTab.id, {
+        type: "h2w_browser_actuation",
+        command: {
+          operation,
+          expected_generation: expectedGeneration,
+          params,
+        },
+      });
+      const evidence = response?.evidence && typeof response.evidence === "object"
+        ? response.evidence
+        : {
+            ...unavailableBrowserActuationEvidence(expectedGeneration),
+            command_accepted: true,
+            resource_available: true,
+          };
+      await postBrowserActuationEvidence(actuationId, evidence);
+    } catch (_) {
+      await postBrowserActuationEvidence(actuationId, {
+        ...unavailableBrowserActuationEvidence(expectedGeneration),
+        command_accepted: true,
+        resource_available: true,
+      }).catch(() => {});
+    }
     return;
   }
   if (operation === "herdr_mcp.browser_session.open") {
@@ -5125,7 +5232,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       let browserObservation = null;
-      if (browserPageInfo?.conversation_id && sender.tab?.id) {
+      if (browserPageInfo && sender.tab?.id && String(msg.accountNativeIdentity || "").trim()) {
         try {
           browserObservation = await observeBrowserConversation({
             provider: browserPageInfo.site,
@@ -5133,6 +5240,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             convKey: String(msg.convKey || ""),
             pageInfo: browserPageInfo,
             accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
+            reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
           });
         } catch (error) {
           callLog("browser observation failed:", error?.message || String(error));
@@ -5190,12 +5298,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           bindings: matched.map((b) => bindingView(b)),
           browser_session_ref: browserObservation?.sessionRef || null,
           browser_generation: browserObservation?.observationGeneration || null,
+          browser_account_ref: browserObservation?.accountRef || null,
+          browser_space_ref: browserObservation?.spaceRef || null,
         });
       } else {
         sendResponse({
           bound: false,
           browser_session_ref: browserObservation?.sessionRef || null,
           browser_generation: browserObservation?.observationGeneration || null,
+          browser_account_ref: browserObservation?.accountRef || null,
+          browser_space_ref: browserObservation?.spaceRef || null,
         });
       }
     })();

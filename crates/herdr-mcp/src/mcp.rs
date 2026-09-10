@@ -12,7 +12,8 @@ use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
     BrowserDeliveryState, BrowserDispatchReservation, BrowserDispatchReserveInput,
-    BrowserDispatchUpdateInput, BrowserResourceResolveInput, ContinuitySearchInput,
+    BrowserDispatchUpdateInput, BrowserResourceResolveInput, BrowserSessionReservation,
+    BrowserSessionReservationInput, BrowserSessionReservationRecord, ContinuitySearchInput,
     OperationReservation, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
     WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemorySearchBoundary,
     WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
@@ -1493,8 +1494,16 @@ fn browser_delivery_state_from_postcondition(
     }
 
     let postcondition_met = match operation {
-        BrowserOperation::SpaceCreate | BrowserOperation::SessionCreate => {
+        BrowserOperation::SpaceCreate => {
             evidence.stable_resource_ref_observed && evidence.lifecycle_observed
+        }
+        BrowserOperation::SessionCreate => {
+            evidence.stable_resource_ref_observed
+                && evidence.lifecycle_observed
+                && evidence.canonical_url_observed
+                && (evidence.accepted_message_observed || evidence.message_baseline_advanced)
+                && evidence.generation_owner == Some(expected_generation)
+                && evidence.generation_status_observed
         }
         BrowserOperation::SpaceOpen | BrowserOperation::SessionOpen => {
             evidence.stable_resource_ref_observed
@@ -2007,6 +2016,385 @@ fn browser_dispatch_status(
     })
 }
 
+fn browser_created_session_dispatch(
+    store: &mut StateStore,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+) -> Result<(crate::state_store::BrowserDispatchRecord, Value), String> {
+    let session_ref = reservation
+        .session_ref
+        .as_deref()
+        .ok_or_else(|| "browser_session_materialization_missing".to_owned())?;
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "browser_message_required".to_owned())?;
+    let reasoning_effort = params.get("reasoning_effort").and_then(Value::as_str);
+    let required_apps = browser_required_apps(params, true)
+        .map_err(|_| "browser_required_apps_invalid".to_owned())?;
+    let work_chain_id = params.get("work_chain_id").and_then(Value::as_str);
+    let lane_id = params.get("lane_id").and_then(Value::as_str);
+    let message_digest = browser_sha256(message);
+    let request_digest = browser_sha256(
+        &json!({
+            "operation": "browser_dispatch.submit",
+            "session_ref": session_ref,
+            "message_digest": message_digest,
+            "reasoning_effort": reasoning_effort,
+            "required_apps": required_apps,
+            "expected_generation": reservation.expected_generation,
+            "work_chain_id": work_chain_id,
+            "lane_id": lane_id,
+        })
+        .to_string(),
+    );
+    let reservation_result = store.reserve_browser_dispatch(BrowserDispatchReserveInput {
+        endpoint_ref: &reservation.endpoint_ref,
+        provider: &reservation.provider,
+        operation: "browser_dispatch.submit",
+        target_session_ref: session_ref,
+        request_digest: &request_digest,
+        message_digest: &message_digest,
+        reasoning_effort,
+        required_apps: &required_apps,
+        expected_generation: reservation.expected_generation,
+        idempotency_key_digest: &reservation.idempotency_key_digest,
+        parent_dispatch_id: None,
+        work_chain_id,
+        lane_id,
+        created_at: browser_epoch_ms(),
+    })?;
+    let dispatch = match reservation_result {
+        BrowserDispatchReservation::Existing(dispatch) => dispatch,
+        BrowserDispatchReservation::Reserved(dispatch) => {
+            store.update_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &dispatch.dispatch_id,
+                expected_generation: reservation.expected_generation,
+                delivery_state: BrowserDeliveryState::Applied,
+                generation_owner: Some(reservation.expected_generation),
+                updated_at: browser_epoch_ms(),
+            })?
+        }
+    };
+    if dispatch.delivery_state != BrowserDeliveryState::Applied
+        || dispatch.generation_owner != Some(reservation.expected_generation)
+    {
+        return Err("browser_created_session_dispatch_not_applied".to_owned());
+    }
+    let writeback = browser_dispatch_work_memory_writeback(store, &dispatch);
+    Ok((dispatch, writeback))
+}
+
+fn browser_session_create_success(
+    store: &mut StateStore,
+    reservation_ref: &str,
+    params: &Value,
+    replayed: bool,
+    reconciled: bool,
+) -> Value {
+    let reservation = match store.browser_session_reservation(reservation_ref) {
+        Ok(Some(record)) => record,
+        Ok(None) => return json!({"ok": false, "code": "browser_session_reservation_not_found"}),
+        Err(error) => return browser_store_error(error),
+    };
+    if reservation.state != "materialized" || reservation.delivery_state != "applied" {
+        return json!({
+            "ok": false,
+            "code": if reservation.delivery_state == "uncertain" {
+                "uncertain"
+            } else {
+                "browser_session_materialization_missing"
+            },
+            "reservation_ref": reservation.reservation_ref,
+            "reservation_state": reservation.state,
+            "delivery_state": reservation.delivery_state,
+            "replayed": replayed,
+            "reconciled": reconciled,
+        });
+    }
+    let session_ref = reservation.session_ref.clone().unwrap();
+    let (dispatch, work_memory_writeback) =
+        match browser_created_session_dispatch(store, &reservation, params) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        };
+    json!({
+        "ok": true,
+        "code": Value::Null,
+        "operation": BrowserOperation::SessionCreate.method(),
+        "reservation_ref": reservation.reservation_ref,
+        "reservation_state": reservation.state,
+        "session_ref": session_ref,
+        "delivery_state": BrowserDeliveryState::Applied.as_str(),
+        "dispatch": browser_dispatch_json(dispatch),
+        "replayed": replayed,
+        "reconciled": reconciled,
+        "work_memory_writeback": work_memory_writeback,
+    })
+}
+
+fn browser_session_create(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let endpoint_ref = params.get("endpoint_ref").and_then(Value::as_str).unwrap();
+    let provider = params.get("provider").and_then(Value::as_str).unwrap();
+    let account_ref = params.get("account_ref").and_then(Value::as_str).unwrap();
+    let space_ref = params.get("space_ref").and_then(Value::as_str);
+    let display_label = params.get("display_label").and_then(Value::as_str).unwrap();
+    let message = params.get("message").and_then(Value::as_str).unwrap();
+    let reasoning_effort = params.get("reasoning_effort").and_then(Value::as_str);
+    let required_apps = match browser_required_apps(params, true) {
+        Ok(apps) => apps,
+        Err(error) => return error,
+    };
+    let expected_generation = params
+        .get("expected_generation")
+        .and_then(Value::as_i64)
+        .unwrap();
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .unwrap();
+    let work_chain_id = params.get("work_chain_id").and_then(Value::as_str);
+    let lane_id = params.get("lane_id").and_then(Value::as_str);
+    let message_digest = browser_sha256(message);
+    let request_digest = browser_sha256(
+        &json!({
+            "operation": BrowserOperation::SessionCreate.method(),
+            "endpoint_ref": endpoint_ref,
+            "provider": provider,
+            "account_ref": account_ref,
+            "space_ref": space_ref,
+            "display_label": display_label,
+            "message_digest": message_digest,
+            "reasoning_effort": reasoning_effort,
+            "required_apps": required_apps,
+            "expected_generation": expected_generation,
+            "work_chain_id": work_chain_id,
+            "lane_id": lane_id,
+        })
+        .to_string(),
+    );
+    let idempotency_key_digest = browser_sha256(idempotency_key);
+    let now = browser_epoch_ms();
+    let expires_at = now.saturating_add(30 * 60 * 1000);
+
+    let (reservation, launch_url) = {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        let launch_ref = space_ref.unwrap_or(account_ref);
+        let locator = match guard.browser_resource_locator(launch_ref) {
+            Ok(Some(locator)) if locator.observation_generation == expected_generation => locator,
+            Ok(Some(_)) => return json!({"ok": false, "code": "stale_capability_generation"}),
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "code": "resource_unavailable",
+                    "message": "browser session creation requires an observed local account/project launcher",
+                });
+            }
+            Err(error) => return browser_store_error(error),
+        };
+        let reserved = match guard.reserve_browser_session(BrowserSessionReservationInput {
+            endpoint_ref,
+            provider,
+            account_ref,
+            space_ref,
+            display_label,
+            expected_generation,
+            idempotency_key_digest: &idempotency_key_digest,
+            request_digest: &request_digest,
+            created_at: now,
+            expires_at,
+        }) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        };
+        (reserved, locator.canonical_url)
+    };
+
+    let (reservation, replayed) = match reservation {
+        BrowserSessionReservation::Reserved(record) => (record, false),
+        BrowserSessionReservation::Existing(record) => (record, true),
+    };
+    if matches!(reservation.state.as_str(), "cancelled" | "expired") {
+        return json!({
+            "ok": false,
+            "code": format!("browser_session_reservation_{}", reservation.state),
+            "reservation_ref": reservation.reservation_ref,
+        });
+    }
+    let current_delivery = match BrowserDeliveryState::parse(&reservation.delivery_state) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    if current_delivery == BrowserDeliveryState::Applied {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        return browser_session_create_success(
+            &mut guard,
+            &reservation.reservation_ref,
+            params,
+            true,
+            false,
+        );
+    }
+    if current_delivery == BrowserDeliveryState::Uncertain {
+        let Some(actuator) = actuator else {
+            return json!({
+                "ok": false,
+                "code": "uncertain",
+                "reservation_ref": reservation.reservation_ref,
+                "reservation_state": reservation.state,
+                "delivery_state": current_delivery.as_str(),
+                "replayed": true,
+            });
+        };
+        let evidence =
+            match actuator.reconcile_dispatch(&reservation.reservation_ref, expected_generation) {
+                Ok(Some(evidence)) => evidence,
+                Ok(None) => {
+                    return json!({
+                        "ok": false,
+                        "code": "uncertain",
+                        "reservation_ref": reservation.reservation_ref,
+                        "reservation_state": reservation.state,
+                        "delivery_state": current_delivery.as_str(),
+                        "replayed": true,
+                    });
+                }
+                Err(error) => return browser_store_error(error),
+            };
+        let delivery_state = match browser_delivery_state_from_postcondition(
+            BrowserOperation::SessionCreate,
+            params,
+            expected_generation,
+            &evidence,
+        ) {
+            Ok(state) => state,
+            Err(error) => return browser_store_error(error),
+        };
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        let settled = match guard.update_browser_session_reservation_delivery(
+            &reservation.reservation_ref,
+            expected_generation,
+            delivery_state,
+            browser_epoch_ms(),
+        ) {
+            Ok(record) => record,
+            Err(error) => return browser_store_error(error),
+        };
+        if delivery_state == BrowserDeliveryState::Applied {
+            return browser_session_create_success(
+                &mut guard,
+                &settled.reservation_ref,
+                params,
+                true,
+                true,
+            );
+        }
+        return json!({
+            "ok": false,
+            "code": delivery_state.as_str(),
+            "reservation_ref": settled.reservation_ref,
+            "reservation_state": settled.state,
+            "delivery_state": settled.delivery_state,
+            "replayed": true,
+            "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
+        });
+    }
+    if current_delivery != BrowserDeliveryState::NotApplied {
+        return json!({
+            "ok": false,
+            "code": current_delivery.as_str(),
+            "reservation_ref": reservation.reservation_ref,
+            "reservation_state": reservation.state,
+            "delivery_state": current_delivery.as_str(),
+            "replayed": replayed,
+        });
+    }
+
+    {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        if let Err(error) = guard.update_browser_session_reservation_delivery(
+            &reservation.reservation_ref,
+            expected_generation,
+            BrowserDeliveryState::Uncertain,
+            browser_epoch_ms(),
+        ) {
+            return browser_store_error(error);
+        }
+    }
+    let mut actuation_params = params.clone();
+    if let Some(object) = actuation_params.as_object_mut() {
+        object.insert(
+            "reservation_ref".to_owned(),
+            json!(reservation.reservation_ref),
+        );
+        object.insert("launch_url".to_owned(), json!(launch_url));
+    }
+    let evidence = match actuator {
+        Some(actuator) => match actuator.actuate(
+            BrowserOperation::SessionCreate.method(),
+            &actuation_params,
+            expected_generation,
+            Some(&reservation.reservation_ref),
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => return browser_store_error(error),
+        },
+        None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+    };
+    let delivery_state = match browser_delivery_state_from_postcondition(
+        BrowserOperation::SessionCreate,
+        params,
+        expected_generation,
+        &evidence,
+    ) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    let Ok(mut guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let updated = match guard.update_browser_session_reservation_delivery(
+        &reservation.reservation_ref,
+        expected_generation,
+        delivery_state,
+        browser_epoch_ms(),
+    ) {
+        Ok(record) => record,
+        Err(error) => return browser_store_error(error),
+    };
+    if delivery_state == BrowserDeliveryState::Applied {
+        return browser_session_create_success(
+            &mut guard,
+            &updated.reservation_ref,
+            params,
+            replayed,
+            false,
+        );
+    }
+    json!({
+        "ok": false,
+        "code": delivery_state.as_str(),
+        "operation": BrowserOperation::SessionCreate.method(),
+        "reservation_ref": updated.reservation_ref,
+        "reservation_state": updated.state,
+        "delivery_state": updated.delivery_state,
+        "replayed": replayed,
+        "reconciled": false,
+    })
+}
+
 fn browser_session_open(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -2270,6 +2658,15 @@ fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Valu
     ) {
         return true;
     }
+    if operation == BrowserOperation::SessionCreate {
+        return params.get("provider").and_then(Value::as_str) == Some("chatgpt")
+            && params
+                .get("reasoning_effort")
+                .is_none_or(|value| value.is_null())
+            && browser_required_apps(params, true)
+                .map(|apps| apps.is_empty())
+                .unwrap_or(false);
+    }
     if operation != BrowserOperation::DispatchSubmit {
         return !operation.is_mutation();
     }
@@ -2393,6 +2790,7 @@ fn browser_operation_call_with_grants(
             operation,
             caller_webchat_control_grants,
         ),
+        BrowserOperation::SessionCreate => browser_session_create(store, params, browser_actuator),
         BrowserOperation::SessionOpen => browser_session_open(store, params, browser_actuator),
         BrowserOperation::DispatchSubmit => {
             browser_dispatch_submit(store, params, browser_actuator)
@@ -2474,8 +2872,13 @@ fn validate_browser_operation_params(
             "account_ref",
             "space_ref",
             "display_label",
+            "message",
+            "reasoning_effort",
+            "required_apps",
             "expected_generation",
             "idempotency_key",
+            "work_chain_id",
+            "lane_id",
         ],
         BrowserOperation::SessionOpen => &["session_ref", "expected_generation", "idempotency_key"],
         BrowserOperation::SessionInspect => &["session_ref"],
@@ -2551,8 +2954,13 @@ fn validate_browser_operation_params(
             browser_required_string(params, "account_ref", 96)?;
             let _ = browser_optional_string(params, "space_ref", 96)?;
             browser_required_string(params, "display_label", 256)?;
+            browser_required_string(params, "message", 262_144)?;
+            browser_required_reasoning_effort(params, true)?;
+            browser_required_apps(params, true)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
+            let _ = browser_optional_string(params, "work_chain_id", 128)?;
+            let _ = browser_optional_string(params, "lane_id", 160)?;
         }
         BrowserOperation::SessionOpen => {
             browser_required_string(params, "session_ref", 96)?;
@@ -2723,7 +3131,12 @@ fn browser_operation_actuation_decision(
     if operation == BrowserOperation::SessionOpen && target.provider != "chatgpt" {
         return Ok((false, Some("capability_not_allowed")));
     }
-    if decision != (true, None) || operation != BrowserOperation::DispatchSubmit {
+    if decision != (true, None)
+        || !matches!(
+            operation,
+            BrowserOperation::DispatchSubmit | BrowserOperation::SessionCreate
+        )
+    {
         return Ok(decision);
     }
 
@@ -2732,6 +3145,16 @@ fn browser_operation_actuation_decision(
     else {
         return Ok((false, Some("capability_unknown")));
     };
+    if operation == BrowserOperation::SessionCreate {
+        match browser_capability_snapshot_allows(
+            &provider_state.capabilities_json,
+            "composer.submit",
+        ) {
+            Some(true) => {}
+            Some(false) => return Ok((false, Some("capability_not_allowed"))),
+            None => return Ok((false, Some("capability_unknown"))),
+        }
+    }
     if params
         .get("reasoning_effort")
         .is_some_and(|value| !value.is_null())
@@ -5729,17 +6152,6 @@ mod tests {
                 }),
             ),
             (
-                "herdr_mcp.browser_session.create",
-                json!({
-                    "endpoint_ref": "be_alpha4",
-                    "provider": "chatgpt",
-                    "account_ref": "br_account",
-                    "display_label": "Conversation",
-                    "expected_generation": 7,
-                    "idempotency_key": "unsupported-session-create"
-                }),
-            ),
-            (
                 "herdr_mcp.browser_message.append",
                 json!({
                     "session_ref": "br_session",
@@ -5821,20 +6233,26 @@ mod tests {
                 "idempotency_key": "supported-session-open"
             })
         ));
-        assert!(
-            !browser_operation_alpha4_supported(
-                BrowserOperation::SessionCreate,
-                &json!({
-                    "endpoint_ref": "be_alpha4",
-                    "provider": "chatgpt",
-                    "account_ref": "br_account",
-                    "display_label": "Conversation",
-                    "expected_generation": 7,
-                    "idempotency_key": "still-unsupported-session-create"
-                })
-            ),
-            "browser_session.create must remain unsupported"
-        );
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::DispatchStop,
+            &json!({
+                "dispatch_id": "bd_alpha4",
+                "expected_generation": 7,
+                "idempotency_key": "supported-stop"
+            })
+        ));
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::SessionCreate,
+            &json!({
+                "endpoint_ref": "be_alpha4",
+                "provider": "chatgpt",
+                "account_ref": "br_account",
+                "display_label": "Conversation",
+                "message": "first assignment",
+                "expected_generation": 7,
+                "idempotency_key": "supported-session-create"
+            })
+        ));
     }
 
     #[test]
@@ -6227,7 +6645,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_session_create_remains_unsupported_regression() {
+    fn browser_session_create_requires_advertised_capability_regression() {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
             BrowserProviderObservationInput, BrowserResourceObservationInput,
@@ -6288,13 +6706,253 @@ mod tests {
                 "account_ref": account_ref,
                 "display_label": "Conversation",
                 "expected_generation": 7,
-                "idempotency_key": "create-still-unsupported"
+                "message": "first assignment",
+                "idempotency_key": "create-without-capability"
             }),
             true,
             None,
         );
-        assert_eq!(result["code"], "unsupported");
-        assert_eq!(result["operation"], "herdr_mcp.browser_session.create");
+        assert_eq!(result["code"], "capability_not_allowed");
+        assert_eq!(result["actuation_available"], false);
+    }
+
+    #[test]
+    fn browser_session_create_materializes_once_and_reconciles_uncertain_delivery() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct SessionCreateActuator {
+            store: Arc<Mutex<StateStore>>,
+            calls: AtomicUsize,
+            reconcile_calls: AtomicUsize,
+            delayed: bool,
+        }
+
+        impl SessionCreateActuator {
+            fn applied_evidence(expected_generation: i64) -> BrowserPostconditionEvidence {
+                BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: true,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                }
+            }
+
+            fn materialize(&self, params: &Value, expected_generation: i64) {
+                let reservation_ref = params["reservation_ref"].as_str().unwrap();
+                let account_ref = params["account_ref"].as_str().unwrap();
+                let native_identity = format!("created-{reservation_ref}");
+                let canonical_url = format!("https://chatgpt.com/c/{reservation_ref}");
+                let mut guard = self.store.lock().unwrap();
+                let reservation = guard
+                    .browser_session_reservation(reservation_ref)
+                    .unwrap()
+                    .unwrap();
+                let session = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &reservation.endpoint_ref,
+                        provider: &reservation.provider,
+                        kind: "session",
+                        parent_ref: Some(account_ref),
+                        native_identity: &native_identity,
+                        display_label: Some(&reservation.display_label),
+                        observation_generation: expected_generation,
+                        observed_at: 20,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &session.resource_ref,
+                        &canonical_url,
+                        expected_generation,
+                        20,
+                    )
+                    .unwrap();
+                guard
+                    .materialize_browser_session_reservation(
+                        reservation_ref,
+                        &session.resource_ref,
+                        20,
+                    )
+                    .unwrap();
+            }
+        }
+
+        impl BrowserActuator for SessionCreateActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::SessionCreate.method());
+                assert_eq!(dispatch_id, params["reservation_ref"].as_str());
+                assert_eq!(params["launch_url"], "https://chatgpt.com");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.materialize(params, expected_generation);
+                let mut evidence = Self::applied_evidence(expected_generation);
+                if self.delayed {
+                    evidence.generation_status_observed = false;
+                }
+                Ok(evidence)
+            }
+
+            fn reconcile_dispatch(
+                &self,
+                dispatch_id: &str,
+                expected_generation: i64,
+            ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+                assert!(dispatch_id.starts_with("bsr_"));
+                self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Self::applied_evidence(expected_generation)))
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-create-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create","session.open","composer.submit"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "session-create-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &account.resource_ref,
+                    "https://chatgpt.com",
+                    7,
+                    12,
+                )
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        };
+
+        let immediate = SessionCreateActuator {
+            store: store.clone(),
+            calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            delayed: false,
+        };
+        let immediate_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker A",
+            "message": "do bounded task A",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-immediate-1"
+        });
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &immediate_params,
+            true,
+            Some(&immediate),
+        );
+        assert_eq!(created["ok"], true);
+        assert!(created["session_ref"].as_str().unwrap().starts_with("br_"));
+        assert_eq!(created["dispatch"]["delivery_state"], "applied");
+        assert_eq!(immediate.calls.load(Ordering::SeqCst), 1);
+        let replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &immediate_params,
+            true,
+            Some(&immediate),
+        );
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(immediate.calls.load(Ordering::SeqCst), 1);
+
+        let delayed = SessionCreateActuator {
+            store: store.clone(),
+            calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            delayed: true,
+        };
+        let delayed_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker B",
+            "message": "do bounded task B",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-delayed-1"
+        });
+        let uncertain = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &delayed_params,
+            true,
+            Some(&delayed),
+        );
+        assert_eq!(uncertain["ok"], false);
+        assert_eq!(uncertain["delivery_state"], "uncertain");
+        assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+        let reconciled = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &delayed_params,
+            true,
+            Some(&delayed),
+        );
+        assert_eq!(reconciled["ok"], true);
+        assert_eq!(reconciled["replayed"], true);
+        assert_eq!(reconciled["reconciled"], true);
+        assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delayed.reconcile_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

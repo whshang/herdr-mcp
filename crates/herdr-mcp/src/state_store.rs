@@ -33,7 +33,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -452,6 +452,14 @@ CREATE INDEX IF NOT EXISTS idx_browser_dispatches_parent
     ON browser_dispatches(parent_dispatch_id, operation, updated_at DESC);
 "#;
 
+/// Migration 11: bind one pending browser-session reservation to the exact
+/// session-create request so an idempotency key cannot be replayed with a
+/// different first assignment after browser delivery becomes uncertain.
+const MIGRATION_V11: &str = r#"
+ALTER TABLE browser_session_reservations ADD COLUMN request_digest TEXT;
+ALTER TABLE browser_session_reservations ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'not_applied';
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -465,6 +473,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V8,
     MIGRATION_V9,
     MIGRATION_V10,
+    MIGRATION_V11,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -803,6 +812,45 @@ pub struct BrowserResourceLocatorRecord {
     pub canonical_url: String,
     pub observation_generation: i64,
     pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserSessionReservationInput<'a> {
+    pub endpoint_ref: &'a str,
+    pub provider: &'a str,
+    pub account_ref: &'a str,
+    pub space_ref: Option<&'a str>,
+    pub display_label: &'a str,
+    pub expected_generation: i64,
+    pub idempotency_key_digest: &'a str,
+    pub request_digest: &'a str,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSessionReservationRecord {
+    pub reservation_ref: String,
+    pub endpoint_ref: String,
+    pub provider: String,
+    pub account_ref: String,
+    pub space_ref: Option<String>,
+    pub display_label: String,
+    pub expected_generation: i64,
+    pub idempotency_key_digest: String,
+    pub request_digest: Option<String>,
+    pub delivery_state: String,
+    pub state: String,
+    pub session_ref: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserSessionReservation {
+    Reserved(BrowserSessionReservationRecord),
+    Existing(BrowserSessionReservationRecord),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2946,7 +2994,7 @@ impl StateStore {
         let resource = self
             .browser_resource(resource_ref)?
             .ok_or_else(|| "browser_resource_not_found".to_owned())?;
-        if resource.kind != "session" {
+        if !matches!(resource.kind.as_str(), "account" | "space" | "session") {
             return Err("browser_resource_kind_mismatch".to_owned());
         }
         let provider_state = self
@@ -2999,6 +3047,286 @@ impl StateStore {
             )
             .optional()
             .map_err(|error| format!("cannot inspect browser resource locator: {error}"))
+    }
+
+    pub fn reserve_browser_session(
+        &mut self,
+        input: BrowserSessionReservationInput<'_>,
+    ) -> Result<BrowserSessionReservation, String> {
+        validate_browser_endpoint_ref(input.endpoint_ref)?;
+        validate_browser_token(input.provider, 32, "provider")?;
+        validate_browser_resource_ref(input.account_ref)?;
+        if let Some(space_ref) = input.space_ref {
+            validate_browser_resource_ref(space_ref)?;
+        }
+        validate_browser_ref_text(input.display_label, 256, "display_label")?;
+        validate_browser_digest(input.idempotency_key_digest, "idempotency_key_digest")?;
+        validate_browser_digest(input.request_digest, "request_digest")?;
+        if input.expected_generation < 1 {
+            return Err("browser_expected_generation_invalid".to_owned());
+        }
+        if input.created_at < 0 || input.expires_at <= input.created_at {
+            return Err("browser_session_reservation_time_invalid".to_owned());
+        }
+        let account = self
+            .browser_resource(input.account_ref)?
+            .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+        if account.kind != "account"
+            || account.endpoint_ref != input.endpoint_ref
+            || account.provider != input.provider
+            || account.observation_generation != input.expected_generation
+        {
+            return Err("browser_resource_scope_mismatch".to_owned());
+        }
+        if let Some(space_ref) = input.space_ref {
+            let space = self
+                .browser_resource(space_ref)?
+                .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+            if space.kind != "space"
+                || space.endpoint_ref != input.endpoint_ref
+                || space.provider != input.provider
+                || space.parent_ref.as_deref() != Some(input.account_ref)
+                || space.observation_generation != input.expected_generation
+            {
+                return Err("browser_resource_scope_mismatch".to_owned());
+            }
+        }
+        let provider_state = self
+            .browser_provider_state(input.endpoint_ref, input.provider)?
+            .ok_or_else(|| "browser_capability_unknown".to_owned())?;
+        if provider_state.observation_generation != input.expected_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        let reservation_ref = browser_opaque_ref(
+            "bsr_",
+            &[
+                "browser-session-reservation-v1",
+                input.endpoint_ref,
+                input.provider,
+                input.idempotency_key_digest,
+            ],
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser session reservation: {error}"))?;
+        if let Some(mut existing) = read_browser_session_reservation_by_key(
+            &tx,
+            input.endpoint_ref,
+            input.provider,
+            input.idempotency_key_digest,
+        )? {
+            if existing.request_digest.as_deref() != Some(input.request_digest)
+                || existing.account_ref != input.account_ref
+                || existing.space_ref.as_deref() != input.space_ref
+                || existing.display_label != input.display_label
+                || existing.expected_generation != input.expected_generation
+            {
+                return Err("browser_session_idempotency_conflict".to_owned());
+            }
+            if existing.state == "pending" && existing.expires_at <= input.created_at {
+                tx.execute(
+                    "UPDATE browser_session_reservations
+                     SET state = 'expired', updated_at = MAX(updated_at, ?2)
+                     WHERE reservation_ref = ?1 AND state = 'pending'",
+                    params![existing.reservation_ref, input.created_at],
+                )
+                .map_err(|error| format!("cannot expire browser session reservation: {error}"))?;
+                existing = read_browser_session_reservation_by_ref(&tx, &reservation_ref)?
+                    .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+            }
+            tx.commit().map_err(|error| {
+                format!("cannot commit existing browser session reservation: {error}")
+            })?;
+            return Ok(BrowserSessionReservation::Existing(existing));
+        }
+        tx.execute(
+            "INSERT INTO browser_session_reservations(
+                reservation_ref, endpoint_ref, provider, account_ref, space_ref,
+                display_label, expected_generation, idempotency_key_digest,
+                request_digest, delivery_state, state, session_ref, created_at, updated_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'not_applied', 'pending', NULL, ?10, ?10, ?11)",
+            params![
+                reservation_ref,
+                input.endpoint_ref,
+                input.provider,
+                input.account_ref,
+                input.space_ref,
+                input.display_label,
+                input.expected_generation,
+                input.idempotency_key_digest,
+                input.request_digest,
+                input.created_at,
+                input.expires_at,
+            ],
+        )
+        .map_err(|error| format!("cannot reserve browser session: {error}"))?;
+        let record = read_browser_session_reservation_by_ref(&tx, &reservation_ref)?
+            .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser session reservation: {error}"))?;
+        Ok(BrowserSessionReservation::Reserved(record))
+    }
+
+    pub fn browser_session_reservation(
+        &self,
+        reservation_ref: &str,
+    ) -> Result<Option<BrowserSessionReservationRecord>, String> {
+        validate_browser_session_reservation_ref(reservation_ref)?;
+        self.conn
+            .query_row(
+                "SELECT reservation_ref, endpoint_ref, provider, account_ref, space_ref,
+                        display_label, expected_generation, idempotency_key_digest,
+                        request_digest, delivery_state, state, session_ref, created_at, updated_at, expires_at
+                 FROM browser_session_reservations WHERE reservation_ref = ?1",
+                params![reservation_ref],
+                decode_browser_session_reservation,
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser session reservation: {error}"))
+    }
+
+    pub fn update_browser_session_reservation_delivery(
+        &mut self,
+        reservation_ref: &str,
+        expected_generation: i64,
+        delivery_state: BrowserDeliveryState,
+        updated_at: i64,
+    ) -> Result<BrowserSessionReservationRecord, String> {
+        validate_browser_session_reservation_ref(reservation_ref)?;
+        if expected_generation < 1 {
+            return Err("browser_expected_generation_invalid".to_owned());
+        }
+        if updated_at < 0 {
+            return Err("browser_updated_at_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser session delivery update: {error}"))?;
+        let current = read_browser_session_reservation_by_ref(&tx, reservation_ref)?
+            .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+        if current.expected_generation != expected_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        require_current_browser_generation(
+            &tx,
+            &current.endpoint_ref,
+            &current.provider,
+            expected_generation,
+        )?;
+        if matches!(current.state.as_str(), "cancelled" | "expired") {
+            return Err("browser_session_reservation_not_pending".to_owned());
+        }
+        tx.execute(
+            "UPDATE browser_session_reservations
+             SET delivery_state = ?2, updated_at = MAX(updated_at, ?3)
+             WHERE reservation_ref = ?1",
+            params![reservation_ref, delivery_state.as_str(), updated_at],
+        )
+        .map_err(|error| format!("cannot update browser session delivery state: {error}"))?;
+        let record = read_browser_session_reservation_by_ref(&tx, reservation_ref)?
+            .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser session delivery update: {error}"))?;
+        Ok(record)
+    }
+
+    pub fn materialize_browser_session_reservation(
+        &mut self,
+        reservation_ref: &str,
+        session_ref: &str,
+        updated_at: i64,
+    ) -> Result<BrowserSessionReservationRecord, String> {
+        validate_browser_session_reservation_ref(reservation_ref)?;
+        validate_browser_resource_ref(session_ref)?;
+        if updated_at < 0 {
+            return Err("browser_updated_at_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser session materialization: {error}"))?;
+        let reservation = read_browser_session_reservation_by_ref(&tx, reservation_ref)?
+            .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+        if reservation.state == "materialized" {
+            if reservation.session_ref.as_deref() != Some(session_ref) {
+                return Err("browser_session_materialization_conflict".to_owned());
+            }
+            tx.commit().map_err(|error| {
+                format!("cannot commit existing browser session materialization: {error}")
+            })?;
+            return Ok(reservation);
+        }
+        if reservation.state != "pending" {
+            return Err("browser_session_reservation_not_pending".to_owned());
+        }
+        if reservation.expires_at <= updated_at {
+            return Err("browser_session_reservation_expired".to_owned());
+        }
+        require_current_browser_generation(
+            &tx,
+            &reservation.endpoint_ref,
+            &reservation.provider,
+            reservation.expected_generation,
+        )?;
+        let session = tx
+            .query_row(
+                "SELECT endpoint_ref, provider, kind, parent_ref, observation_generation
+                 FROM browser_resources WHERE resource_ref = ?1",
+                params![session_ref],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect materialized browser session: {error}"))?
+            .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+        let expected_parent = reservation
+            .space_ref
+            .as_deref()
+            .unwrap_or(&reservation.account_ref);
+        if session.0 != reservation.endpoint_ref
+            || session.1 != reservation.provider
+            || session.2 != "session"
+            || session.3 != expected_parent
+            || session.4 != reservation.expected_generation
+        {
+            return Err("browser_session_materialization_scope_mismatch".to_owned());
+        }
+        let locator_generation = tx
+            .query_row(
+                "SELECT observation_generation FROM browser_resource_locators WHERE resource_ref = ?1",
+                params![session_ref],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect materialized browser session locator: {error}"))?;
+        if locator_generation != Some(reservation.expected_generation) {
+            return Err("browser_session_materialization_locator_missing".to_owned());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE browser_session_reservations
+                 SET state = 'materialized', session_ref = ?2, updated_at = MAX(updated_at, ?3)
+                 WHERE reservation_ref = ?1 AND state = 'pending'",
+                params![reservation_ref, session_ref, updated_at],
+            )
+            .map_err(|error| format!("cannot materialize browser session reservation: {error}"))?;
+        if changed != 1 {
+            return Err("browser_session_materialization_raced".to_owned());
+        }
+        let materialized = read_browser_session_reservation_by_ref(&tx, reservation_ref)?
+            .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser session materialization: {error}"))?;
+        Ok(materialized)
     }
 
     pub fn browser_resource(
@@ -3472,6 +3800,65 @@ impl StateStore {
     }
 }
 
+fn decode_browser_session_reservation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BrowserSessionReservationRecord> {
+    Ok(BrowserSessionReservationRecord {
+        reservation_ref: row.get(0)?,
+        endpoint_ref: row.get(1)?,
+        provider: row.get(2)?,
+        account_ref: row.get(3)?,
+        space_ref: row.get(4)?,
+        display_label: row.get(5)?,
+        expected_generation: row.get(6)?,
+        idempotency_key_digest: row.get(7)?,
+        request_digest: row.get(8)?,
+        delivery_state: row.get(9)?,
+        state: row.get(10)?,
+        session_ref: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        expires_at: row.get(14)?,
+    })
+}
+
+const BROWSER_SESSION_RESERVATION_SELECT: &str = "SELECT reservation_ref, endpoint_ref, provider,
+            account_ref, space_ref, display_label, expected_generation,
+            idempotency_key_digest, request_digest, delivery_state, state, session_ref,
+            created_at, updated_at, expires_at
+     FROM browser_session_reservations";
+
+fn read_browser_session_reservation_by_ref(
+    conn: &Connection,
+    reservation_ref: &str,
+) -> Result<Option<BrowserSessionReservationRecord>, String> {
+    conn.query_row(
+        &format!("{BROWSER_SESSION_RESERVATION_SELECT} WHERE reservation_ref = ?1"),
+        [reservation_ref],
+        decode_browser_session_reservation,
+    )
+    .optional()
+    .map_err(|error| format!("cannot read browser session reservation: {error}"))
+}
+
+fn read_browser_session_reservation_by_key(
+    conn: &Connection,
+    endpoint_ref: &str,
+    provider: &str,
+    idempotency_key_digest: &str,
+) -> Result<Option<BrowserSessionReservationRecord>, String> {
+    conn.query_row(
+        &format!(
+            "{BROWSER_SESSION_RESERVATION_SELECT}
+             WHERE endpoint_ref = ?1 AND provider = ?2 AND idempotency_key_digest = ?3"
+        ),
+        params![endpoint_ref, provider, idempotency_key_digest],
+        decode_browser_session_reservation,
+    )
+    .optional()
+    .map_err(|error| format!("cannot read browser session reservation by key: {error}"))
+}
+
 #[derive(Debug)]
 struct StoredBrowserDispatch {
     dispatch_id: String,
@@ -3695,6 +4082,19 @@ fn validate_browser_resource_ref(value: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("browser_resource_ref_invalid".to_owned())
+    }
+}
+
+fn validate_browser_session_reservation_ref(value: &str) -> Result<(), String> {
+    if value.len() == 68
+        && value.starts_with("bsr_")
+        && value[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err("browser_session_reservation_ref_invalid".to_owned())
     }
 }
 
@@ -6307,17 +6707,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_eight_binary_refuses_v10_and_requires_compatible_rollback_state() {
+    fn schema_eight_binary_refuses_v11_and_requires_compatible_rollback_state() {
         let path = temp_db_path();
         {
             let store = StateStore::open(&path).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 10);
+            assert_eq!(store.schema_version().unwrap(), 11);
         }
         let mut schema_eight_connection = open_connection(Some(&path)).unwrap();
         let error = migrate_to(&mut schema_eight_connection, 8, &MIGRATIONS[..8]).unwrap_err();
         assert!(error.contains("newer than this binary supports (8)"));
         assert!(error.contains("schema-8 database backup"));
-        assert!(error.contains("schema-10-capable binary"));
+        assert!(error.contains("schema-11-capable binary"));
         drop(schema_eight_connection);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
@@ -7260,7 +7660,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v8_upgrades_through_v10_without_losing_browser_registry() {
+    fn schema_v8_upgrades_through_v11_without_losing_browser_registry() {
         let path = temp_db_path();
         let endpoint_ref;
         let session_ref;
@@ -7317,7 +7717,7 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
         assert!(store.browser_endpoint(&endpoint_ref).unwrap().is_some());
         assert!(store.browser_resource(&session_ref).unwrap().is_some());
         let tables = store.table_names().unwrap();
@@ -7331,6 +7731,14 @@ mod tests {
                 )
                 .unwrap(),
             Some(1)
+        );
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM pragma_table_info('browser_session_reservations') WHERE name IN ('request_digest', 'delivery_state')",
+                )
+                .unwrap(),
+            Some(2)
         );
         drop(store);
         std::fs::remove_file(&path).ok();
