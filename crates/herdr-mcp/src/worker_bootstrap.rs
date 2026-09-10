@@ -5,9 +5,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::io::IsTerminal;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Stdio;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,7 +34,9 @@ const PAIRING_PEPPER_SECRET: &str = "LINK_SHARED_SECRET";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEVICE_FLOW_MAX: Duration = Duration::from_secs(300);
 const TEMP_OPERATOR_TTL: Duration = Duration::from_secs(10 * 60);
-const TRUSTED_DOH_HOST: &str = "cloudflare-dns.com";
+const CLOUDFLARE_DOH_HOST: &str = "cloudflare-dns.com";
+const GOOGLE_DOH_HOST: &str = "dns.google";
+const MANAGED_HOSTS_MARKER: &str = "# herdr-mcp workers.dev";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -190,9 +196,15 @@ impl EdgeHttpClient {
         Self::build(None, Some((host, ips)))
     }
 
-    fn trusted_dns() -> Result<Self, String> {
-        let ips = trusted_doh_bootstrap_ips();
-        Self::build(None, Some((TRUSTED_DOH_HOST, &ips)))
+    fn cloudflare_dns() -> Result<Self, String> {
+        Self::build(
+            None,
+            Some((CLOUDFLARE_DOH_HOST, &cloudflare_doh_bootstrap_ips())),
+        )
+    }
+
+    fn google_dns() -> Result<Self, String> {
+        Self::build(None, Some((GOOGLE_DOH_HOST, &google_doh_bootstrap_ips())))
     }
 
     fn via_socks_resolved(
@@ -1546,7 +1558,10 @@ fn verify_health(
             match trusted_dns_direct_client(edge_origin) {
                 Ok(Some(resolved)) => {
                     match probe_health(&resolved, edge_origin, worker_name, expected_version) {
-                        Ok(()) => return Ok(resolved),
+                        Ok(()) => {
+                            report_workers_dev_hosts_recovery(edge_origin);
+                            return Ok(resolved);
+                        }
                         Err(error) if !error.may_retry_via_proxy() => {
                             return Err(error.into_message());
                         }
@@ -1603,7 +1618,10 @@ pub(crate) fn client_for_edge_origin(
 
             match trusted_dns_direct_client(edge_origin) {
                 Ok(Some(resolved)) => match probe_edge_transport(&resolved, edge_origin) {
-                    Ok(()) => return Ok(resolved.client),
+                    Ok(()) => {
+                        report_workers_dev_hosts_recovery(edge_origin);
+                        return Ok(resolved.client);
+                    }
                     Err(error) if !error.may_retry_via_proxy() => {
                         return Err(error.into_message());
                     }
@@ -1700,24 +1718,22 @@ fn trusted_dns_direct_client(edge_origin: &str) -> Result<Option<EdgeHttpClient>
         return Ok(None);
     }
 
-    // Prefer ordinary HTTPS to the trusted DoH hostname. This path still works when a
-    // network selectively blocks or poisons workers.dev in local DNS, and it requires no
-    // Herdr-specific proxy configuration.
+    // Prefer ordinary HTTPS to trusted DoH hostnames. This handles selective workers.dev
+    // poisoning without depending on a Herdr relay or a configured local proxy.
     let named_result =
         EdgeHttpClient::direct().and_then(|dns| resolve_trusted_worker_ips(&dns, &host));
     if let Ok(ips) = named_result.as_ref() {
         return EdgeHttpClient::direct_resolved(&host, ips).map(Some);
     }
 
-    // If local DNS is unavailable more broadly, bootstrap the same DoH hostname through
-    // Cloudflare's fixed anycast addresses while preserving TLS SNI/hostname validation.
-    let pinned_result =
-        EdgeHttpClient::trusted_dns().and_then(|dns| resolve_trusted_worker_ips(&dns, &host));
+    // If local DNS is unavailable more broadly, pin the DoH resolver itself to its public
+    // anycast addresses while preserving TLS SNI and hostname validation.
+    let pinned_result = resolve_pinned_trusted_worker_ips(&host);
     if let Ok(ips) = pinned_result.as_ref() {
         return EdgeHttpClient::direct_resolved(&host, ips).map(Some);
     }
 
-    // A detected local proxy is an optional final resolver path, never a prerequisite.
+    // A detected local proxy remains an optional final resolver path.
     if let Some(proxy) = crate::link::proxy::resolve_link_proxy() {
         let proxied = EdgeHttpClient::via_proxy(&proxy)?;
         if let Ok(ips) = resolve_trusted_worker_ips(&proxied, &host) {
@@ -1726,17 +1742,42 @@ fn trusted_dns_direct_client(edge_origin: &str) -> Result<Option<EdgeHttpClient>
     }
 
     Err(format!(
-        "trusted DNS fallback unavailable without a usable proxy: hostname DoH failed: {}; pinned DoH failed: {}",
+        "trusted DNS fallback unavailable: hostname DoH failed: {}; pinned DoH failed: {}",
         named_result.unwrap_err(),
         pinned_result.unwrap_err()
     ))
 }
 
-fn trusted_doh_bootstrap_ips() -> [IpAddr; 2] {
+fn cloudflare_doh_bootstrap_ips() -> [IpAddr; 2] {
     [
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
     ]
+}
+
+fn google_doh_bootstrap_ips() -> [IpAddr; 2] {
+    [
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+    ]
+}
+
+fn resolve_pinned_trusted_worker_ips(host: &str) -> Result<Vec<IpAddr>, String> {
+    let cloudflare = EdgeHttpClient::cloudflare_dns()
+        .and_then(|dns| resolve_worker_ips_with_doh(&dns, CLOUDFLARE_DOH_HOST, "/dns-query", host));
+    if let Ok(ips) = cloudflare.as_ref() {
+        return Ok(ips.clone());
+    }
+    let google = EdgeHttpClient::google_dns()
+        .and_then(|dns| resolve_worker_ips_with_doh(&dns, GOOGLE_DOH_HOST, "/resolve", host));
+    if let Ok(ips) = google.as_ref() {
+        return Ok(ips.clone());
+    }
+    Err(format!(
+        "Cloudflare DNS failed: {}; Google DNS failed: {}",
+        cloudflare.unwrap_err(),
+        google.unwrap_err()
+    ))
 }
 
 fn edge_origin_host(edge_origin: &str) -> Result<String, String> {
@@ -1756,7 +1797,29 @@ fn resolve_trusted_worker_ips(
     edge_http: &EdgeHttpClient,
     host: &str,
 ) -> Result<Vec<IpAddr>, String> {
-    let mut doh_url = format!("https://{TRUSTED_DOH_HOST}/dns-query")
+    let cloudflare =
+        resolve_worker_ips_with_doh(edge_http, CLOUDFLARE_DOH_HOST, "/dns-query", host);
+    if let Ok(ips) = cloudflare.as_ref() {
+        return Ok(ips.clone());
+    }
+    let google = resolve_worker_ips_with_doh(edge_http, GOOGLE_DOH_HOST, "/resolve", host);
+    if let Ok(ips) = google.as_ref() {
+        return Ok(ips.clone());
+    }
+    Err(format!(
+        "Cloudflare DNS failed: {}; Google DNS failed: {}",
+        cloudflare.unwrap_err(),
+        google.unwrap_err()
+    ))
+}
+
+fn resolve_worker_ips_with_doh(
+    edge_http: &EdgeHttpClient,
+    doh_host: &str,
+    doh_path: &str,
+    host: &str,
+) -> Result<Vec<IpAddr>, String> {
+    let mut doh_url = format!("https://{doh_host}{doh_path}")
         .parse::<url::Url>()
         .map_err(|_| "trusted DNS endpoint is invalid".to_owned())?;
     doh_url
@@ -1768,21 +1831,215 @@ fn resolve_trusted_worker_ips(
         .get(doh_url)
         .header(reqwest::header::ACCEPT, "application/dns-json")
         .send()
-        .map_err(|error| format!("trusted DNS query failed: {error}"))?;
+        .map_err(|error| format!("{doh_host} query failed: {error}"))?;
     if !response.status().is_success() {
         return Err(format!(
-            "trusted DNS query returned HTTP {}",
+            "{doh_host} returned HTTP {}",
             response.status().as_u16()
         ));
     }
     let payload: Value = response
         .json()
-        .map_err(|_| "trusted DNS query returned non-JSON".to_owned())?;
+        .map_err(|_| format!("{doh_host} returned non-JSON"))?;
     let ips = parse_trusted_dns_ipv4_answers(&payload);
     if ips.is_empty() {
-        return Err("trusted DNS returned no IPv4 address for Worker hostname".to_owned());
+        return Err(format!(
+            "{doh_host} returned no IPv4 address for Worker hostname"
+        ));
     }
     Ok(ips)
+}
+
+fn report_workers_dev_hosts_recovery(edge_origin: &str) {
+    match persist_workers_dev_hosts_mapping(edge_origin) {
+        Ok(true) => eprintln!(
+            "workers.dev DNS recovery: persisted a verified direct mapping in the system hosts file; subsequent Link attempts can stay on the direct route"
+        ),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "workers.dev DNS recovery: trusted-DNS direct access works, but the verified hosts mapping could not be persisted: {error}"
+        ),
+    }
+}
+
+fn persist_workers_dev_hosts_mapping(edge_origin: &str) -> Result<bool, String> {
+    let host = edge_origin_host(edge_origin)?;
+    if !host.ends_with(".workers.dev") {
+        return Ok(false);
+    }
+    let ips = EdgeHttpClient::direct()
+        .and_then(|dns| resolve_trusted_worker_ips(&dns, &host))
+        .or_else(|_| resolve_pinned_trusted_worker_ips(&host))?;
+    let resolved = EdgeHttpClient::direct_resolved(&host, &ips)?;
+    probe_edge_transport(&resolved, edge_origin).map_err(EdgeHealthProbeError::into_message)?;
+
+    let hosts_path = system_hosts_path()?;
+    let current = fs::read_to_string(&hosts_path)
+        .map_err(|error| format!("cannot read {}: {error}", hosts_path.display()))?;
+    let updated = rewrite_managed_hosts_content(&current, &host, &ips)?;
+    if updated == current {
+        return Ok(false);
+    }
+    write_system_hosts(&hosts_path, &updated)?;
+    let verified = fs::read_to_string(&hosts_path).map_err(|error| {
+        format!(
+            "cannot verify {} after update: {error}",
+            hosts_path.display()
+        )
+    })?;
+    let marker = managed_hosts_marker(&host);
+    if !verified
+        .lines()
+        .any(|line| line.trim_end().ends_with(&marker))
+    {
+        return Err(format!(
+            "{} did not contain the managed mapping after update",
+            hosts_path.display()
+        ));
+    }
+    Ok(true)
+}
+
+fn managed_hosts_marker(host: &str) -> String {
+    format!("{MANAGED_HOSTS_MARKER} {host}")
+}
+
+fn rewrite_managed_hosts_content(
+    current: &str,
+    host: &str,
+    ips: &[IpAddr],
+) -> Result<String, String> {
+    let marker = managed_hosts_marker(host);
+    let line_ending = if current.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut kept = Vec::new();
+    for line in current.lines() {
+        if line.trim_end().ends_with(&marker) {
+            continue;
+        }
+        let data = line.split('#').next().unwrap_or_default();
+        let mut fields = data.split_whitespace();
+        let _address = fields.next();
+        if fields.any(|field| field.eq_ignore_ascii_case(host)) {
+            return Err(format!(
+                "an unmanaged hosts entry already exists for {host}; refusing to overwrite it"
+            ));
+        }
+        kept.push(line);
+    }
+
+    let mut addresses = Vec::new();
+    for ip in ips.iter().copied().filter(IpAddr::is_ipv4) {
+        if !addresses.contains(&ip) {
+            addresses.push(ip);
+        }
+        if addresses.len() >= 4 {
+            break;
+        }
+    }
+    if addresses.is_empty() {
+        return Err("trusted DNS returned no IPv4 address suitable for hosts recovery".to_owned());
+    }
+
+    while kept.last().is_some_and(|line| line.is_empty()) {
+        kept.pop();
+    }
+    let mut updated = kept.join(line_ending);
+    if !updated.is_empty() {
+        updated.push_str(line_ending);
+    }
+    for ip in addresses {
+        updated.push_str(&format!("{ip}\t{host}\t{marker}{line_ending}"));
+    }
+    Ok(updated)
+}
+
+#[cfg(unix)]
+fn system_hosts_path() -> Result<PathBuf, String> {
+    Ok(PathBuf::from("/etc/hosts"))
+}
+
+#[cfg(windows)]
+fn system_hosts_path() -> Result<PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    Ok(root
+        .join("System32")
+        .join("drivers")
+        .join("etc")
+        .join("hosts"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn system_hosts_path() -> Result<PathBuf, String> {
+    Err("system hosts recovery is unsupported on this platform".to_owned())
+}
+
+#[cfg(unix)]
+fn write_system_hosts(path: &Path, content: &str) -> Result<(), String> {
+    match fs::write(path, content) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        Err(error) => return Err(format!("cannot write {}: {error}", path.display())),
+    }
+
+    let temp = std::env::temp_dir().join(format!(
+        "herdr-mcp-hosts-{}-{}.tmp",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::write(&temp, content)
+        .map_err(|error| format!("cannot prepare hosts recovery file: {error}"))?;
+
+    let try_sudo = |non_interactive: bool| -> Result<bool, String> {
+        let mut command = Command::new("sudo");
+        if non_interactive {
+            command
+                .arg("-n")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+        let status = command
+            .arg("cp")
+            .arg(&temp)
+            .arg(path)
+            .status()
+            .map_err(|error| format!("cannot run sudo for hosts recovery: {error}"))?;
+        Ok(status.success())
+    };
+
+    let mut written = try_sudo(true).unwrap_or(false);
+    if !written && io::stdin().is_terminal() && io::stderr().is_terminal() {
+        written = try_sudo(false)?;
+    }
+    let _ = fs::remove_file(&temp);
+    if written {
+        Ok(())
+    } else {
+        Err(format!(
+            "administrator approval is required to update {}; rerun the Worker bootstrap/connect command in an interactive terminal and approve the sudo prompt",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn write_system_hosts(path: &Path, content: &str) -> Result<(), String> {
+    fs::write(path, content).map_err(|error| {
+        format!(
+            "cannot update {}: {error}; rerun Worker bootstrap/connect from an elevated PowerShell or Terminal",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_system_hosts(_path: &Path, _content: &str) -> Result<(), String> {
+    Err("system hosts recovery is unsupported on this platform".to_owned())
 }
 
 fn parse_trusted_dns_ipv4_answers(payload: &Value) -> Vec<IpAddr> {
@@ -2383,10 +2640,17 @@ mod tests {
         assert!(parse_trusted_dns_ipv4_answers(&json!({"Status": 2})).is_empty());
 
         assert_eq!(
-            trusted_doh_bootstrap_ips(),
+            cloudflare_doh_bootstrap_ips(),
             [
                 "1.1.1.1".parse::<IpAddr>().unwrap(),
                 "1.0.0.1".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert_eq!(
+            google_doh_bootstrap_ips(),
+            [
+                "8.8.8.8".parse::<IpAddr>().unwrap(),
+                "8.8.4.4".parse::<IpAddr>().unwrap(),
             ]
         );
         assert!(
@@ -2396,6 +2660,38 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn managed_hosts_recovery_replaces_only_herdr_owned_entries() {
+        let host = "herdr-edge-dnsless.example.workers.dev";
+        let current =
+            format!("127.0.0.1 localhost\n203.0.113.9 {host} # herdr-mcp workers.dev {host}\n");
+        let updated = rewrite_managed_hosts_content(
+            &current,
+            host,
+            &[
+                "104.21.75.107".parse::<IpAddr>().unwrap(),
+                "172.67.221.89".parse::<IpAddr>().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(updated.contains("127.0.0.1 localhost"));
+        assert!(!updated.contains("203.0.113.9"));
+        assert!(updated.contains(&format!("104.21.75.107\t{host}")));
+        assert!(updated.contains(&format!("172.67.221.89\t{host}")));
+    }
+
+    #[test]
+    fn managed_hosts_recovery_refuses_unowned_worker_entry() {
+        let host = "herdr-edge-dnsless.example.workers.dev";
+        let error = rewrite_managed_hosts_content(
+            &format!("203.0.113.7 {host} # user managed\n"),
+            host,
+            &["104.21.75.107".parse::<IpAddr>().unwrap()],
+        )
+        .unwrap_err();
+        assert!(error.contains("unmanaged hosts entry"));
     }
 
     #[test]

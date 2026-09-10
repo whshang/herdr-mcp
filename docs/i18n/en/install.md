@@ -69,7 +69,7 @@ For a manual/operator deployment, use the installed runtime too:
 herdr-mcp worker bootstrap
 ```
 
-This command owns Worker naming, release-artifact verification, direct Cloudflare API upload, secrets, first-device enrollment, and readiness verification. Ordinary manual installation does not require a source checkout, Node.js, npm, Wrangler, or `wrangler.user.toml`.
+This command owns Worker naming, release-artifact verification, direct Cloudflare API upload, secrets, first-device enrollment, and readiness verification. If a new `workers.dev` hostname cannot resolve locally, bootstrap tries Cloudflare DNS then Google DNS, verifies the returned address with the real TLS `/health` contract, and only then attempts to persist a Herdr-marked mapping for that hostname in the system hosts file. Unix may request `sudo`; Windows requires an elevated terminal when the hosts file is not writable. Failure to persist the mapping does not invalidate an already verified in-process bootstrap path. Ordinary installation does not require a source checkout, Node.js, npm, Wrangler, or `wrangler.user.toml`.
 
 Keep these constraints:
 
@@ -87,7 +87,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-If this workstation cannot reach `workers.dev` directly, do not redeploy the Worker. Link owns the supported path selection and can reuse an already-configured local proxy or the built-in signed shared Relay. Verify the result with `doctor` and `link status`; open [Troubleshooting](troubleshooting.md) only when those checks show a real network failure. Proxy/PAC details belong there rather than in the normal install path.
+If `workers.dev` direct access fails, first let `worker bootstrap` / `worker connect` repair DNS with the verified single-host mapping above and retry direct Link. Reuse an existing local proxy only if direct transport still fails; keep the built-in signed shared Relay as the final fallback. Do not redeploy the Worker or change system DNS just to repair this hostname. Verify with `doctor` and `link status`.
 
 ## Step 4: verify the public path
 

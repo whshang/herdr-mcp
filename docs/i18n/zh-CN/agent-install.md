@@ -10,7 +10,7 @@
 2. **不破坏已有工作。** 禁止对无关 checkout 做 `reset --hard`、`clean -fd`、覆盖 dirty 文件或重建现有 fleet。
 3. **普通安装只用当前 Stable GitHub Release。** 不 clone 本仓库，不用 `npm`/`cargo` 构建本机 runtime；源码开发是另一条流程。
 4. **秘密只短暂使用。** Cloudflare Token 不回显、不写 Git、普通日志或 shell history；只通过当前进程环境或 CLI 隐藏输入传递。最终不要把本机 `HERDR_MCP_TOKEN` 或 Cloudflare Token 放进 ChatGPT。
-5. **不修改用户网络环境。** 可以复用已经存在的代理/网络配置，但不得自行切代理、改系统 DNS、改网络节点或创建通用代理。
+5. **不修改用户网络环境。** 不切代理、不改系统 DNS 或网络节点。唯一例外是 §6 中经过验证的单 Worker hosts 记录。
 6. **只在人类边界暂停。** 可自动判断和执行的步骤继续做；需要 Cloudflare 登录/Token、macOS 权限确认、多个 Account/zone 无法安全选择，或 ChatGPT OAuth 时再一次性提示用户。
 
 ## 2. 先判断：第一台 Worker 还是加入已有 fleet
@@ -91,7 +91,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-没有 Custom Domain 时，Link 自己负责选择 `workers.dev` 网络路径：先直连，再使用已有本地代理，仍不可达时使用内置签名共享 Relay。Agent 不需要自己拼网络路径，也不需要配置 Relay 服务商或 Relay URL。用 `GET /health` 区分 Worker 代码健康和 hostname/DNS/网络路径故障；同一个 Worker 的其它 hostname 正常时，绝不用重新部署 Worker 来修这个 hostname，用户有域名时优先把 Custom Domain 作为长期公网入口。`link status` 显示 Relay 路径健康，并且公网 origin 的真实认证 MCP 请求能够往返当前工作站，就可以通过这部分验收。Link transport 不得静默改写 OAuth issuer 或已经选定的 public MCP origin，也不要为了让探测成功而修改系统网络。
+没有 Custom Domain 时先直连 `workers.dev`。解析失败后，CLI 依次查询 Cloudflare DNS、Google DNS；只有候选 IP 通过真实 TLS `/health` Herdr 校验后，才允许把该 hostname 写成带 Herdr 标记的单条系统 hosts 记录。Unix 需要时由用户批准交互式 `sudo`，Windows 使用管理员终端。随后重新走 Link 直连；仍失败再复用已有本地代理，内置签名共享 Relay 只作为最后传输手段。不得改系统 DNS、网络节点、OAuth issuer 或已选 public MCP origin，也不要为单一 hostname 故障重建健康 Worker。
 
 ## 7. 最终验收
 

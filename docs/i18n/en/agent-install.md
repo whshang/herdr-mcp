@@ -10,7 +10,7 @@
 2. **Preserve existing work.** Never `reset --hard`, `clean -fd`, overwrite unrelated dirty files, or rebuild an existing fleet as an installation shortcut.
 3. **Normal installation uses the current Stable GitHub Release only.** Do not clone this repository or use `npm`/`cargo` to build the workstation runtime unless the user explicitly asked for source development.
 4. **Keep secrets ephemeral.** Never echo a Cloudflare Token or write it to Git, ordinary logs, or shell history. Pass it only through the current process environment or a hidden CLI prompt. Never put the local `HERDR_MCP_TOKEN` or Cloudflare Token into ChatGPT.
-5. **Do not change the user's network environment.** Existing proxy/network configuration may be reused, but do not switch proxies, rewrite system DNS, change network nodes, or create a generic proxy.
+5. **Do not change the user's network environment.** Do not switch proxies, rewrite system DNS, or create a generic proxy. The only recovery exception is the verified single-Worker hosts entry in §6.
 6. **Pause only at human boundaries.** Continue every step that can be determined and automated safely. Ask once when Cloudflare login/Token creation, a macOS permission approval, an ambiguous Account/zone choice, or ChatGPT OAuth actually requires the user.
 
 ## 2. Decide first: first Worker or existing fleet
@@ -91,7 +91,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-Without a Custom Domain, Link owns the supported `workers.dev` path selection: direct access first, then an already-configured local proxy, then the built-in signed shared Relay when needed. The Agent does not reconstruct that transport ladder or configure a Relay provider/URL. Use `GET /health` to separate Worker-code health from hostname/DNS/network-path failures. If another hostname for the same Worker is healthy, never redeploy the Worker solely to fix the failing hostname; prefer the Custom Domain when the user owns one. A healthy Relay-selected Link plus a successful public-origin authenticated MCP round trip is valid acceptance evidence. Link transport must not silently rewrite the OAuth issuer or selected public MCP origin. Do not modify system networking just to make a probe succeed.
+Without a Custom Domain, try `workers.dev` directly first. On DNS failure, the CLI queries Cloudflare DNS and then Google DNS; only a candidate that passes the real TLS `/health` Herdr check may be written as a marked entry for that one hostname in the system hosts file. Unix may require an interactive `sudo` approval and Windows an elevated terminal. Then retry the direct Link path; reuse an existing local proxy if needed, with the signed shared Relay kept as the last transport. Never change system DNS, network nodes, OAuth issuer, or the selected public MCP origin. Do not redeploy a healthy Worker to repair one hostname.
 
 ## 7. Final acceptance
 

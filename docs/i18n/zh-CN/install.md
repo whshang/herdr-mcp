@@ -68,7 +68,7 @@ x86_64 Debian 使用静态 `x86_64-unknown-linux-musl` Release 产物。安装�
 herdr-mcp worker bootstrap
 ```
 
-该命令负责 Worker 命名、Release artifact 校验、Cloudflare API 直接上传、secret、第一台设备 enrollment 与 readiness 验证。普通手动安装不需要源码 checkout、Node.js、npm、Wrangler 或 `wrangler.user.toml`。
+该命令负责 Worker 命名、Release artifact 校验、Cloudflare API 直接上传、secret、第一台设备 enrollment 与 readiness 验证。新建的 `workers.dev` hostname 本地解析失败时，bootstrap 先尝试 Cloudflare DNS，再尝试 Google DNS；返回 IP 必须通过真实 TLS `/health` Herdr 合同校验，之后才尝试把该 hostname 写成带 Herdr 标记的系统 hosts 记录。Unix 需要时请求 `sudo`，Windows 在 hosts 不可写时需要管理员终端；hosts 持久化失败不会推翻已经验证成功的当前 bootstrap 连接。普通安装不需要源码 checkout、Node.js、npm、Wrangler 或 `wrangler.user.toml`。
 
 同时遵守：
 
@@ -87,7 +87,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-如果当前工作站无法直连 `workers.dev`，不要重新部署 Worker。Link 自己负责支持的路径选择，可以复用已有本地代理，也可以使用内置签名共享 Relay。先用 `doctor` 与 `link status` 验证结果；只有这些检查确认存在网络故障时，再进入[故障排查](troubleshooting.md)。代理与 PAC 的细节留在排障页，不占用正常安装主流程。
+`workers.dev` 直连失败时，先让 `worker bootstrap` / `worker connect` 用上面的可信 DNS + 单 hostname hosts 记录恢复后重试直连。仍失败再复用已有本地代理；内置签名共享 Relay 只作为最后手段。不要为修复这个 hostname 重建 Worker，也不要改系统 DNS。最后用 `doctor` 与 `link status` 验证。
 
 ## 第四步：验证公网路径
 
