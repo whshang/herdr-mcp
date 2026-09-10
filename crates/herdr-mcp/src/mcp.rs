@@ -310,9 +310,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &params,
                     context.caller_webchat_control_grants,
                     context.browser_actuator,
-                    context.browser_mutation_gate,
-                    context.browser_mutation_admission,
-                    context.caller_webchat_authorization,
+                    BrowserOperationControls {
+                        mutation_gate: context.browser_mutation_gate,
+                        mutation_admission: context.browser_mutation_admission,
+                        caller_authorization: context.caller_webchat_authorization,
+                    },
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
@@ -2851,6 +2853,12 @@ fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Valu
         && browser_required_apps(params, true).is_ok_and(|apps| apps.is_empty())
 }
 
+struct BrowserOperationControls<'a> {
+    mutation_gate: Option<&'a std::sync::RwLock<()>>,
+    mutation_admission: Option<&'a BrowserMutationAdmission>,
+    caller_authorization: Option<&'a BrowserCallerAuthorization>,
+}
+
 #[cfg(test)]
 fn browser_operation_call_with_grants(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
@@ -2866,9 +2874,11 @@ fn browser_operation_call_with_grants(
         params,
         caller_webchat_control_grants,
         browser_actuator,
-        browser_mutation_gate,
-        None,
-        None,
+        BrowserOperationControls {
+            mutation_gate: browser_mutation_gate,
+            mutation_admission: None,
+            caller_authorization: None,
+        },
     )
 }
 
@@ -2878,9 +2888,7 @@ fn browser_operation_call_with_controls(
     params: &Value,
     caller_webchat_control_grants: &[BrowserCallerGrant],
     browser_actuator: Option<&dyn BrowserActuator>,
-    browser_mutation_gate: Option<&std::sync::RwLock<()>>,
-    browser_mutation_admission: Option<&BrowserMutationAdmission>,
-    caller_webchat_authorization: Option<&BrowserCallerAuthorization>,
+    controls: BrowserOperationControls<'_>,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
         return json!({"ok": false, "code": "unknown_local_method", "method": method});
@@ -2900,7 +2908,7 @@ fn browser_operation_call_with_controls(
     // observes it below; if the mutation wins, that already-authorized attempt
     // completes before the consent revision may change.
     let _mutation_gate = if operation.is_mutation() {
-        match browser_mutation_gate {
+        match controls.mutation_gate {
             Some(gate) => match gate.read() {
                 Ok(guard) => Some(guard),
                 Err(_) => {
@@ -2981,7 +2989,7 @@ fn browser_operation_call_with_controls(
         None
     };
 
-    let _mutation_permit = match (browser_mutation_admission, mutation_scope.as_ref()) {
+    let _mutation_permit = match (controls.mutation_admission, mutation_scope.as_ref()) {
         (Some(admission), Some(scope)) => match admission.reserve(scope) {
             Ok(Some(permit)) => Some(permit),
             Ok(None) => {
@@ -3021,14 +3029,14 @@ fn browser_operation_call_with_controls(
             store,
             params,
             browser_actuator,
-            caller_webchat_authorization,
+            controls.caller_authorization,
         ),
         BrowserOperation::SessionOpen => browser_session_open(store, params, browser_actuator),
         BrowserOperation::DispatchSubmit => browser_dispatch_submit(
             store,
             params,
             browser_actuator,
-            caller_webchat_authorization,
+            controls.caller_authorization,
         ),
         BrowserOperation::DispatchStatus => {
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
@@ -3038,7 +3046,7 @@ fn browser_operation_call_with_controls(
             store,
             params,
             browser_actuator,
-            caller_webchat_authorization,
+            controls.caller_authorization,
         ),
         _ => {
             let expected_generation = params
@@ -7755,9 +7763,11 @@ mod tests {
             &dispatch_params,
             &exact_grants,
             Some(&PanicActuator),
-            None,
-            Some(&admission),
-            None,
+            BrowserOperationControls {
+                mutation_gate: None,
+                mutation_admission: Some(&admission),
+                caller_authorization: None,
+            },
         );
         assert_eq!(backpressured["code"], "browser_account_backpressure");
         assert_eq!(backpressured["retryable"], true);
