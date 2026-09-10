@@ -522,7 +522,7 @@ test("release gates align with CI (build/root/edge/site/extension), never deploy
   assert.ok(cmds.some((c) => c.includes("npm ci")));
   assert.ok(cmds.some((c) => c.includes("run build")));
   assert.ok(cmds.some((c) => c.includes("--test-concurrency=1") && c.includes("tests/*.test.mjs")));
-  assert.ok(cmds.some((c) => c.includes("test:edge")));
+  assert.ok(cmds.some((c) => c.includes("test:edge:built")));
   assert.ok(cmds.some((c) => c.includes("build:site")));
   assert.ok(cmds.some((c) => c.includes("extension_smoke.mjs")));
   assert.equal(cmds.some((c) => /deploy|wrangler|publish/.test(c)), false);

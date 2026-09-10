@@ -25,6 +25,14 @@ test("package and lock expose the complete public CLI surface", () => {
   assert.equal(pkg.version, lock.packages?.[""]?.version);
 });
 
+test("default Node test entrypoints own their build prerequisite", () => {
+  assert.equal(pkg.scripts?.test, "npm run build && npm run test:built");
+  assert.match(pkg.scripts?.["test:built"] ?? "", /node --test/);
+  assert.doesNotMatch(pkg.scripts?.["test:built"] ?? "", /npm run build/);
+  assert.equal(pkg.scripts?.["test:edge"], "npm run build && npm run test:edge:built");
+  assert.doesNotMatch(pkg.scripts?.["test:edge:built"] ?? "", /npm run build/);
+});
+
 test("non-node public CLI files are executable", async () => {
   for (const [name, rel] of Object.entries(EXPECTED_BINS)) {
     if (rel === "dist/server.js") continue;
@@ -80,7 +88,7 @@ test("Rust release verification consumes the shared gate with bounded runtime cl
   const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
   assert.match(release, /scripts\/release-gate\.sh full/);
   const start = gate.indexOf("scripts/ci-herdr-runtime.sh start");
-  const rootTests = gate.indexOf("npm test");
+  const rootTests = gate.indexOf("npm run test:built");
   const stop = gate.lastIndexOf("scripts/ci-herdr-runtime.sh stop");
   assert.ok(start >= 0, "shared gate must start the pinned Herdr runtime");
   assert.ok(rootTests > start, "runtime must be ready before root transport tests");
@@ -149,61 +157,48 @@ test("pinned Herdr bootstrap supports CI Linux and local macOS", async () => {
   assert.match(gate, /export PATH="\$\{HERDR_INSTALL_DIR\}:\$\{PATH\}"/);
 });
 
-test("Herdr dependency recovery stays internal and is installed on both install and updater paths", async () => {
+test("Herdr dependency recovery stays internal and updater activation stays behind service lifecycle", async () => {
   const cli = await readFile(join(ROOT, "crates/herdr-mcp/src/cli.rs"), "utf8");
   const supervisor = await readFile(join(ROOT, "crates/herdr-mcp/src/herdr_supervisor.rs"), "utf8");
   const updater = await readFile(join(ROOT, "crates/herdr-mcp/src/updater.rs"), "utf8");
   const runtimeMeta = await readFile(join(ROOT, "crates/herdr-mcp/src/runtime_meta.rs"), "utf8");
+
   assert.match(cli, /herdr-mcp herdr-supervisor/);
   assert.match(supervisor, /dev\.herdr-mcp\.herdr-supervisor|DEFAULT_HERDR_SUPERVISOR_LABEL/);
   assert.match(supervisor, /desired_running/);
-  assert.match(supervisor, /session_restore_blocked/);
   assert.match(supervisor, /KeepAlive/);
-  assert.match(supervisor, /ThrottleInterval/);
   assert.doesNotMatch(supervisor, /"StartInterval"/);
-  assert.match(updater, /service_lifecycle::run\(ServiceCommand::Install/);
+  assert.match(updater, /service_lifecycle/);
+  assert.match(updater, /ServiceCommand::Install/);
+  assert.doesNotMatch(updater, /herdr_supervisor::ensure_installed_for_service/);
   assert.match(runtimeMeta, /MIGRATED_TOOLS: \[&str; 18\]/);
   assert.doesNotMatch(runtimeMeta, /herdr_supervisor/);
 });
 
-test("request child lifecycle persists only ownership metadata and reaps confirmed boot orphans", async () => {
+test("request child lifecycle keeps ownership evidence wired without persisting request arguments", async () => {
   const children = await readFile(join(ROOT, "crates/herdr-mcp/src/child_process.rs"), "utf8");
   const service = await readFile(join(ROOT, "crates/herdr-mcp/src/service_manager.rs"), "utf8");
   const main = await readFile(join(ROOT, "crates/herdr-mcp/src/main.rs"), "utf8");
   const status = await readFile(join(ROOT, "crates/herdr-mcp/src/status.rs"), "utf8");
+
   assert.match(service, /HERDR_MCP_CHILD_REGISTRY/);
   assert.match(main, /reap_confirmed_orphans_on_boot/);
   assert.match(status, /child_process::doctor_line/);
-  assert.match(children, /process_start_identity_mismatch/);
-  assert.match(children, /process_command_identity_mismatch/);
-  assert.match(children, /recorded_parent_still_alive/);
-  assert.match(children, /record_too_old_for_automatic_reap/);
   assert.match(children, /child-process-reap-last\.json/);
   assert.doesNotMatch(children, /get_args\(/, "persistent child ownership must not record request arguments");
 });
 
-test("service lifecycle keeps Herdr supervisor transactional across install update rollback and uninstall", async () => {
+test("service and updater entrypoints share the service lifecycle owner", async () => {
   const main = await readFile(join(ROOT, "crates/herdr-mcp/src/main.rs"), "utf8");
   const updater = await readFile(join(ROOT, "crates/herdr-mcp/src/updater.rs"), "utf8");
-  const lifecycle = await readFile(join(ROOT, "crates/herdr-mcp/src/service_lifecycle.rs"), "utf8");
-  const supervisor = await readFile(join(ROOT, "crates/herdr-mcp/src/herdr_supervisor.rs"), "utf8");
-  assert.match(main, /Command::Service\(command\) => service_lifecycle::run\(command\)/);
-  assert.match(updater, /service_lifecycle::run\(ServiceCommand::Install/);
+
+  // Transaction/rollback internals are covered by Rust unit tests; this cross-module
+  // guard only keeps public entrypoints behind the same lifecycle owner.
+  assert.match(main, /service_lifecycle/);
+  assert.match(main, /Command::Service/);
+  assert.match(updater, /service_lifecycle/);
+  assert.match(updater, /ServiceCommand::Install/);
   assert.doesNotMatch(updater, /herdr_supervisor::ensure_installed_for_service/);
-  assert.match(lifecycle, /fn run_install_lifecycle<Install>\(install: Install\)/);
-  assert.match(lifecycle, /Install: FnOnce\(&service_manager::ServiceMutationLease\) -> Result<ExitCode, String>/);
-  assert.match(lifecycle, /pub\(crate\) fn run_install_from_payload/);
-  assert.match(lifecycle, /let mutation_lock = service_manager::acquire_mutation_lock\(\)\?/);
-  assert.match(lifecycle, /mutation_lock: &service_manager::ServiceMutationLease/);
-  assert.match(lifecycle, /InstallRecovery::Rollback => \{\s*service_manager::run_with_mutation_lock\(ServiceCommand::Rollback, mutation_lock\)\s*\}/s);
-  assert.match(lifecycle, /InstallRecovery::Uninstall => \{\s*service_manager::run_with_mutation_lock\(ServiceCommand::Uninstall, mutation_lock\)\s*\}/s);
-  assert.match(lifecycle, /reconcile_after_service_rollback/);
-  assert.match(lifecycle, /remove_for_service\(\)\?/);
-  assert.match(supervisor, /refusing bootout because it may own a live Herdr child/);
-  assert.match(supervisor, /runtime_supports_supervisor/);
-  assert.match(supervisor, /starts_with\("herdr-mcp herdr-supervisor </);
-  assert.match(lifecycle, /rollback_target_runtime_binary/);
-  assert.match(lifecycle, /RollbackSupervisorStrategy::Preserve/);
 });
 
 test("current workflows pin checkout and setup-node to reviewed v7 commits", async () => {

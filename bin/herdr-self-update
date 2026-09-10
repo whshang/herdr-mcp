@@ -39,7 +39,7 @@ export const RELEASE_GATES = [
   ["npm", ["ci"]],
   ["npm", ["run", "build"]],
   [process.execPath, ["--test", "--test-concurrency=1", "tests/*.test.mjs"]],
-  ["npm", ["run", "test:edge"]],
+  ["npm", ["run", "test:edge:built"]],
   ["npm", ["run", "build:site"]],
   [process.execPath, ["tests/manual/extension_smoke.mjs"]],
 ];
@@ -499,7 +499,7 @@ export function buildPlan(args, env = process.env) {
       install: "npm ci",
       build: "npm run build",
       test: "node --test --test-concurrency=1 tests/*.test.mjs",
-      testEdge: "npm run test:edge",
+      testEdge: "npm run test:edge:built",
       site: "npm run build:site",
       extension: "node tests/manual/extension_smoke.mjs",
       deploy: "none (Edge never deployed)",

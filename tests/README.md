@@ -2,7 +2,7 @@
 
 ## Default suite (`npm test`)
 
-Runs `tests/*.test.mjs` only:
+Runs `npm run build`, then the built-runtime regression lane (`tests/*.test.mjs`) plus `tests/manual/background_bind_test.mjs`. CI/release gates that already built `dist/` use `npm run test:built` to avoid a duplicate TypeScript build.
 
 | File | Covers |
 |---|---|
@@ -17,7 +17,7 @@ Runs `tests/*.test.mjs` only:
 
 ## Manual / integration (`tests/manual/`)
 
-Not in `npm test`. Run explicitly when needed:
+Most files here are not in `npm test`; `background_bind_test.mjs` is the deliberate exception. Run the others explicitly when needed:
 
 | File | When |
 |---|---|

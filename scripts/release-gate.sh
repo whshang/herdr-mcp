@@ -123,9 +123,9 @@ run_node() {
   log 'Start isolated pinned Herdr runtime'
   setup_isolated_herdr
   log 'Node tests'
-  npm test
+  npm run test:built
   log 'Edge tests'
-  npm run test:edge
+  npm run test:edge:built
   log 'Browser extension smoke'
   node tests/manual/extension_smoke.mjs
 

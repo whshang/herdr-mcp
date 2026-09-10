@@ -32,6 +32,16 @@ function numericConstant(rel, name) {
   return Number(match[0].replaceAll("_", ""));
 }
 
+function numericArrayConstant(rel, name) {
+  const source = read(rel);
+  const line = source.split("\n").find((candidate) => candidate.includes(name));
+  assert.ok(line, `missing numeric array constant ${name} in ${rel}`);
+  const open = line.indexOf("[");
+  const close = line.indexOf("]", open + 1);
+  assert.ok(open >= 0 && close > open, `missing numeric array value for ${name} in ${rel}`);
+  return [...line.slice(open + 1, close).matchAll(/\b([\d_]+)\b/g)].map((entry) => Number(entry[1].replaceAll("_", "")));
+}
+
 function sectionAfterHeading(doc, heading) {
   const start = doc.indexOf(heading);
   assert.ok(start >= 0, `missing heading: ${heading}`);
@@ -144,19 +154,22 @@ test("standalone extension path drift diagnosis stays documented", () => {
 test("workstation_offline docs track live reconnect/recycle constants and delivery-state safety", () => {
   const edgeGraceMs = numericConstant("edge/cloudflare/src/limits.ts", "DEFAULT_LINK_RECONNECT_GRACE_MS");
   const localRecycleMs = numericConstant("crates/herdr-mcp/src/link/io_loop.rs", "LINK_DEFAULT_OFFLINE_RECYCLE_MS");
+  const retryBackoffMs = numericArrayConstant("edge/cloudflare/src/errors.ts", "WORKSTATION_OFFLINE_RETRY_BACKOFF_MS");
   assert.equal(edgeGraceMs % 1000, 0);
   assert.equal(localRecycleMs % 1000, 0);
+  assert.ok(retryBackoffMs.length > 0);
+  const retryAfter = `retry_after_ms=${retryBackoffMs[0]}`;
 
   const cases = [
-    ["docs/i18n/en/troubleshooting.md", `${edgeGraceMs / 1000} seconds`, `${localRecycleMs / 1000} seconds`, /delivery_state=not_delivered/, /retry_after_ms=5000/, /browser extension does not make this decision/],
-    ["docs/i18n/zh-CN/troubleshooting.md", `${edgeGraceMs / 1000} 秒`, `${localRecycleMs / 1000} 秒`, /not_delivered/, /retry_after_ms=5000/, /浏览器扩展不参与这个错误判定/],
+    ["docs/i18n/en/troubleshooting.md", `${edgeGraceMs / 1000} seconds`, `${localRecycleMs / 1000} seconds`, /delivery_state=not_delivered/, /browser extension does not make this decision/],
+    ["docs/i18n/zh-CN/troubleshooting.md", `${edgeGraceMs / 1000} 秒`, `${localRecycleMs / 1000} 秒`, /not_delivered/, /浏览器扩展不参与这个错误判定/],
   ];
-  for (const [rel, edgeGrace, localRecycle, notDelivered, retryAfter, extensionBoundary] of cases) {
+  for (const [rel, edgeGrace, localRecycle, notDelivered, extensionBoundary] of cases) {
     const doc = read(rel);
     assert.ok(doc.includes(edgeGrace), `${rel} must document the live Edge reconnect grace`);
     assert.ok(doc.includes(localRecycle), `${rel} must document the live local Link recycle budget`);
     assert.match(doc, notDelivered, `${rel} must document confirmed non-delivery`);
-    assert.match(doc, retryAfter, `${rel} must document machine-readable retry timing`);
+    assert.ok(doc.includes(retryAfter), `${rel} must document machine-readable retry timing`);
     assert.match(doc, extensionBoundary, `${rel} must keep browser extension outside the offline decision path`);
   }
 });
