@@ -46,6 +46,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// only when the installed broker itself must be replaced.
 pub const BROKER_COMPAT_REVISION: u32 = 2;
 /// First broker revision that can be a stable TCC parent for `herdr server`.
+#[cfg(any(target_os = "macos", test))]
 pub const HERDR_HOST_MIN_COMPAT_REVISION: u32 = 2;
 /// Stable signing identifier reserved for separately signed broker candidates.
 pub const BROKER_SIGNING_IDENTIFIER: &str = "cc.agentforme.herdr.tcc-broker";
@@ -89,6 +90,7 @@ fn previous_broker_metadata_path(config_dir: &Path) -> PathBuf {
 /// capability. Revision 1 remains valid for the original fs/git broker path;
 /// callers must keep their pre-host fallback until an explicit broker upgrade
 /// has installed revision 2 or newer.
+#[cfg(any(target_os = "macos", test))]
 pub fn installed_supports_herdr_host(config_dir: &Path) -> bool {
     status(&broker_path(config_dir)).is_some()
         && installed_compat_revision(config_dir)
@@ -138,11 +140,6 @@ pub(crate) fn herdr_host_can_wrap(config_dir: &Path, herdr_binary: &Path) -> boo
         run_disclaimed_documents_probe(&broker_path(config_dir), Duration::from_secs(2)),
         Ok(Some(status)) if status.success()
     )
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn herdr_host_can_wrap(_config_dir: &Path, _herdr_binary: &Path) -> bool {
-    false
 }
 
 fn broker_candidate_path() -> Result<PathBuf, String> {
@@ -697,6 +694,7 @@ pub fn migrate_for_explicit_reauthorization(config_dir: &Path) -> Result<bool, S
 
 /// Remove the rollback copy only after the newly installed broker has passed
 /// the responsibility-isolated permission probe.
+#[cfg(any(target_os = "macos", test))]
 pub fn finalize_explicit_reauthorization(config_dir: &Path) -> Result<(), String> {
     for path in [
         previous_broker_path(config_dir),
