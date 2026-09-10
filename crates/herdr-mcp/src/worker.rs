@@ -308,6 +308,9 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::ConnectorClientRevoke { client_id } => {
             revoke_connector_client(&paths, &client_id)
         }
+        WorkerCommand::ConnectorPlannerControl { action, request_id } => {
+            connector_planner_control(&paths, &action, request_id.as_deref())
+        }
         WorkerCommand::ConnectorWebChatControl {
             connector_id,
             device_id,
@@ -927,6 +930,47 @@ fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<Exit
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn connector_planner_control(
+    _paths: &RuntimePaths,
+    _action: &str,
+    _request_id: Option<&str>,
+) -> Result<ExitCode, String> {
+    Err("planner control requires a supported enrolled-owner credential backend".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn connector_planner_control(
+    paths: &RuntimePaths,
+    action: &str,
+    request_id: Option<&str>,
+) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(
+            &identity.edge_origin,
+            "/connectors/planner-control",
+        )?)
+        .headers(headers)
+        .json(&json!({ "action": action, "request_id": request_id }))
+        .send()
+        .map_err(|error| format!("cannot manage planner control: {error}"))?;
+    let payload = parse_json_response(response, "planner control")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode planner control result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn set_connector_webchat_control(
     _paths: &RuntimePaths,
     _connector_id: &str,
@@ -990,7 +1034,7 @@ fn set_connector_webchat_control(
         return Err("browser provider is invalid".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
@@ -1070,7 +1114,7 @@ fn set_connector_page_assist(
         return Err("browser endpoint ref is invalid".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
@@ -1310,7 +1354,7 @@ fn rename_current_device(_paths: &RuntimePaths, _name: &str) -> Result<ExitCode,
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rename_current_device(paths: &RuntimePaths, name: &str) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let identity = resolve_enrolled_device_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
     headers.insert(
         "x-herdr-workstation",
@@ -1728,6 +1772,69 @@ fn resolve_fleet_link_identity(
     paths: &RuntimePaths,
     config: &Config,
 ) -> Result<FleetLinkIdentity, String> {
+    prefer_fleet_admin_identity(resolve_enrolled_device_identity(paths, config), || {
+        resolve_owner_link_identity(paths, config)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_fleet_link_identity(
+    paths: &RuntimePaths,
+    config: &Config,
+) -> Result<FleetLinkIdentity, String> {
+    resolve_enrolled_device_identity(paths, config)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn prefer_fleet_admin_identity<T, F>(enrolled: Result<T, String>, owner: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    match enrolled {
+        Ok(identity) => Ok(identity),
+        Err(enrolled_error) => owner().map_err(|owner_error| {
+            format!(
+                "fleet administration identity unavailable: enrolled-device path failed: {enrolled_error}; production Link fallback failed: {owner_error}"
+            )
+        }),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_owner_link_identity(
+    _paths: &RuntimePaths,
+    config: &Config,
+) -> Result<FleetLinkIdentity, String> {
+    let plist_env = production_link_environment_if_present()?
+        .ok_or_else(|| "owner authority requires the production Herdr Link identity".to_owned())?;
+    let (workstation_id, credential_service, edge_origin) =
+        resolve_owner_link_fields(config, &plist_env)?;
+    let account = current_account()?;
+    let credential = crate::credential_store::load(&credential_service, &account)
+        .map_err(|error| format!("owner credential is unavailable: {error}"))?;
+    Ok(FleetLinkIdentity {
+        edge_origin,
+        workstation_id,
+        credential,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_owner_link_identity(
+    paths: &RuntimePaths,
+    config: &Config,
+) -> Result<FleetLinkIdentity, String> {
+    // Linux has no macOS LaunchAgent owner tuple to recover locally. Present
+    // the exact enrolled-device identity and let Edge's DEFAULT_WORKSTATION_ID
+    // gate decide whether this device is the configured owner.
+    resolve_enrolled_device_identity(paths, config)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_enrolled_device_identity(
+    paths: &RuntimePaths,
+    config: &Config,
+) -> Result<FleetLinkIdentity, String> {
     // A current enrolled device has both the canonical device id and Edge
     // origin in config, so it must not depend on a LaunchAgent plist merely to
     // create another short-lived pairing. Older installs may still need the
@@ -1739,11 +1846,11 @@ fn resolve_fleet_link_identity(
     } else {
         None
     };
-    let (workstation_id, keychain_service, edge_origin) =
+    let (workstation_id, credential_service, edge_origin) =
         resolve_fleet_link_fields(config, plist_env.as_ref())?;
     let account = current_account()?;
     let credential =
-        crate::credential_store::load(&keychain_service, &account).map_err(|error| {
+        crate::credential_store::load(&credential_service, &account).map_err(|error| {
             enrolled_device_required_error(&format!(
                 "the enrolled device credential is unavailable: {error}"
             ))
@@ -1757,7 +1864,7 @@ fn resolve_fleet_link_identity(
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_fleet_link_identity(
+fn resolve_enrolled_device_identity(
     paths: &RuntimePaths,
     config: &Config,
 ) -> Result<FleetLinkIdentity, String> {
@@ -1819,6 +1926,41 @@ fn production_link_environment_if_present()
             })
             .collect(),
     ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resolve_owner_link_fields(
+    config: &Config,
+    plist_env: &std::collections::BTreeMap<String, String>,
+) -> Result<(String, String, String), String> {
+    let workstation_id = plist_env
+        .get("HERDR_WORKSTATION_ID")
+        .map(|value| value.trim())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| "production Herdr Link has no valid owner workstation identity".to_owned())?
+        .to_owned();
+    let credential_service = plist_env
+        .get("HERDR_LINK_KEYCHAIN_SERVICE")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "production Herdr Link has no credential service".to_owned())?;
+    if credential_service != LEGACY_LINK_KEYCHAIN_SERVICE {
+        return Err(
+            "production Herdr Link does not use the stable owner credential service".to_owned(),
+        );
+    }
+    let edge_origin = match config.edge_public_origin.clone() {
+        Some(origin) => normalize_edge_origin(&origin)?,
+        None => {
+            let edge_url = plist_env.get("HERDR_EDGE_URL").ok_or_else(|| {
+                "production Herdr Link has no Edge origin for owner authority".to_owned()
+            })?;
+            origin_from_ws_url(edge_url)?
+        }
+    };
+    Ok((workstation_id, credential_service.to_owned(), edge_origin))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -2172,6 +2314,84 @@ mod tests {
         assert!(error.contains("first-Worker Cloudflare bootstrap"));
         assert!(!error.contains("dev.herdr-mcp.link-prod.plist"));
         assert!(!error.contains("Io("));
+    }
+
+    #[test]
+    fn fleet_admin_identity_prefers_enrolled_and_falls_back_to_owner() {
+        let mut owner_called = false;
+        let enrolled = prefer_fleet_admin_identity(Ok("device"), || {
+            owner_called = true;
+            Ok("owner")
+        })
+        .unwrap();
+        assert_eq!(enrolled, "device");
+        assert!(!owner_called);
+
+        let fallback =
+            prefer_fleet_admin_identity(Err::<&str, _>("device missing".to_owned()), || {
+                Ok("owner")
+            })
+            .unwrap();
+        assert_eq!(fallback, "owner");
+
+        let error =
+            prefer_fleet_admin_identity(Err::<&str, _>("device missing".to_owned()), || {
+                Err("owner missing".to_owned())
+            })
+            .unwrap_err();
+        assert!(error.contains("device missing"));
+        assert!(error.contains("owner missing"));
+    }
+
+    #[test]
+    fn owner_control_uses_production_owner_identity_not_enrolled_device_identity() {
+        let mut config = Config::default();
+        config
+            .set_edge_device_id("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .unwrap();
+        config
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            "prod-real-runtime".to_owned(),
+        );
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            LEGACY_LINK_KEYCHAIN_SERVICE.to_owned(),
+        );
+        env.insert(
+            "HERDR_EDGE_URL".to_owned(),
+            "wss://edge.example/ws".to_owned(),
+        );
+
+        let (workstation_id, credential_service, origin) =
+            resolve_owner_link_fields(&config, &env).unwrap();
+        assert_eq!(workstation_id, "prod-real-runtime");
+        assert_eq!(credential_service, LEGACY_LINK_KEYCHAIN_SERVICE);
+        assert_eq!(origin, "https://edge.example");
+    }
+
+    #[test]
+    fn owner_control_rejects_non_owner_credential_service() {
+        let config = Config::default();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            "prod-real-runtime".to_owned(),
+        );
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        );
+        env.insert(
+            "HERDR_EDGE_URL".to_owned(),
+            "wss://edge.example/ws".to_owned(),
+        );
+
+        let error = resolve_owner_link_fields(&config, &env).unwrap_err();
+        assert!(error.contains("stable owner credential service"));
     }
 
     #[test]

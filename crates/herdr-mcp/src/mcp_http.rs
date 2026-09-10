@@ -4,8 +4,8 @@ use crate::exec_sessions::ExecRegistry;
 use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{
-    self, BrowserActuator, BrowserCallerGrant, BrowserPostconditionEvidence, PageAssistCallerGrant,
-    RuntimeContext,
+    self, BrowserActuator, BrowserCallerGrant, BrowserMutationAdmission,
+    BrowserPostconditionEvidence, PageAssistCallerGrant, RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -32,7 +32,7 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -440,7 +440,8 @@ struct AppState {
     runtime_generation: Option<String>,
     local_device_id: Option<String>,
     browser_actuation: BrowserActuationBroker,
-    browser_mutation_gate: Arc<Mutex<()>>,
+    browser_mutation_gate: Arc<RwLock<()>>,
+    browser_mutation_admission: Arc<BrowserMutationAdmission>,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -509,7 +510,8 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
                 .filter(|value| !value.is_empty()),
             local_device_id,
             browser_actuation: BrowserActuationBroker::default(),
-            browser_mutation_gate: Arc::new(Mutex::new(())),
+            browser_mutation_gate: Arc::new(RwLock::new(())),
+            browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -873,7 +875,7 @@ fn extension_browser_endpoint_consent(
         browser_registry_bool(payload, "tool_bridge_mutation_allowed")?;
     let _mutation_gate = state
         .browser_mutation_gate
-        .lock()
+        .write()
         .map_err(|_| "browser_mutation_gate_unavailable".to_owned())?;
     let mut store = state
         .state_store
@@ -964,6 +966,8 @@ fn extension_browser_resource_observe(
             "parent_ref",
             "native_identity",
             "display_label",
+            "canonical_url",
+            "reservation_ref",
             "observation_generation",
             "observed_at",
         ],
@@ -974,6 +978,11 @@ fn extension_browser_resource_observe(
     let parent_ref = browser_registry_optional_string(payload, "parent_ref", 96)?;
     let native_identity = browser_registry_string(payload, "native_identity", 1024)?;
     let display_label = browser_registry_optional_string(payload, "display_label", 256)?;
+    let canonical_url = browser_registry_optional_string(payload, "canonical_url", 2048)?;
+    let reservation_ref = browser_registry_optional_string(payload, "reservation_ref", 96)?;
+    if canonical_url.is_some_and(|value| !value.starts_with("https://")) {
+        return Err("browser_canonical_url_invalid".to_owned());
+    }
     let observation_generation = browser_registry_positive_i64(payload, "observation_generation")?;
     let mut store = state
         .state_store
@@ -989,9 +998,37 @@ fn extension_browser_resource_observe(
         observation_generation,
         observed_at,
     })?;
+    if let Some(canonical_url) = canonical_url {
+        if !matches!(kind, "account" | "space" | "session") {
+            return Err("browser_canonical_url_kind_invalid".to_owned());
+        }
+        store.upsert_browser_resource_locator(
+            &resource.resource_ref,
+            canonical_url,
+            observation_generation,
+            observed_at,
+        )?;
+    }
+    let materialized_reservation = if let Some(reservation_ref) = reservation_ref {
+        if kind != "session" || !reservation_ref.starts_with("bsr_") {
+            return Err("browser_session_reservation_ref_invalid".to_owned());
+        }
+        Some(store.materialize_browser_session_reservation(
+            reservation_ref,
+            &resource.resource_ref,
+            observed_at,
+        )?)
+    } else {
+        None
+    };
     Ok(json!({
         "ok": true,
         "resource": browser_resource_http_json(resource),
+        "reservation": materialized_reservation.map(|reservation| json!({
+            "reservation_ref": reservation.reservation_ref,
+            "state": reservation.state,
+            "session_ref": reservation.session_ref,
+        })),
     }))
 }
 
@@ -2253,6 +2290,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             caller_page_assist_grants: &caller_page_assist_grants,
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
+            browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -2815,7 +2853,8 @@ mod tests {
             runtime_generation: Some("rust-caller-grant-proof".to_owned()),
             local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             browser_actuation: BrowserActuationBroker::default(),
-            browser_mutation_gate: Arc::new(Mutex::new(())),
+            browser_mutation_gate: Arc::new(RwLock::new(())),
+            browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
         }
     }
 
@@ -2848,7 +2887,7 @@ mod tests {
             "tool_bridge_mutation_allowed": false
         });
 
-        let gate_guard = state.browser_mutation_gate.lock().unwrap();
+        let gate_guard = state.browser_mutation_gate.read().unwrap();
         let worker_state = state.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -3097,6 +3136,74 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert!(!result.to_string().contains("native-account-do-not-return"));
         assert!(result["resource"].get("native_identity_sha256").is_none());
+        let account_ref = result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let reservation_ref = {
+            let mut guard = store.lock().unwrap();
+            match guard
+                .reserve_browser_session(crate::state_store::BrowserSessionReservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    account_ref: &account_ref,
+                    space_ref: None,
+                    display_label: "HTTP materialization",
+                    expected_generation: 1,
+                    idempotency_key_digest: &"a".repeat(64),
+                    request_digest: &"b".repeat(64),
+                    created_at: 1003,
+                    expires_at: 2000,
+                })
+                .unwrap()
+            {
+                crate::state_store::BrowserSessionReservation::Reserved(record) => {
+                    record.reservation_ref
+                }
+                crate::state_store::BrowserSessionReservation::Existing(_) => unreachable!(),
+            }
+        };
+
+        let session = json!({
+            "operation": "resource.observe",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "session",
+            "parent_ref": account_ref,
+            "native_identity": "session-http-locator-1",
+            "display_label": null,
+            "canonical_url": "https://chatgpt.com/c/session-http-locator-1",
+            "reservation_ref": reservation_ref,
+            "observation_generation": 1,
+            "observed_at": 1004
+        });
+        let response = app.clone().oneshot(request(session)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let session_result: Value = serde_json::from_slice(&body).unwrap();
+        let session_ref = session_result["resource"]["resource_ref"].as_str().unwrap();
+        assert_eq!(session_result["reservation"]["state"], "materialized");
+        assert_eq!(session_result["reservation"]["session_ref"], session_ref);
+        let locator = store
+            .lock()
+            .unwrap()
+            .browser_resource_locator(session_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            locator.canonical_url,
+            "https://chatgpt.com/c/session-http-locator-1"
+        );
+        assert_eq!(locator.observation_generation, 1);
+        let materialized = store
+            .lock()
+            .unwrap()
+            .browser_session_reservation(&reservation_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(materialized.state, "materialized");
+        assert_eq!(materialized.session_ref.as_deref(), Some(session_ref));
 
         let endpoint = store
             .lock()

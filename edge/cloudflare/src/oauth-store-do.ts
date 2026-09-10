@@ -9,6 +9,20 @@ const CODE_PREFIX = "code:";
 const APPROVAL_PREFIX = "approval:";
 const GRANT_PREFIX = "grant:";
 const CONNECTOR_PREFIX = "connector:";
+const PLANNER_PREFIX = "planner-control:";
+interface PlannerControlRecord extends OAuthWebChatControlGrant {
+  request_id: string;
+  client_id: string;
+  session_ref: string;
+  space_ref: string | null;
+  observation_generation: number;
+  status: "pending" | "approved" | "claimed";
+  expires_at_ms: number;
+  claim_digest?: string;
+  capability_digest?: string;
+  principal: string;
+  approved_by?: string;
+}
 const SIGNING_KEY = "signing:key:v1";
 const MAX_IMPORT_BYTES = 256 * 1024;
 const MAX_IMPORT_RECORDS = 512;
@@ -533,6 +547,7 @@ export class OAuthStoreDO {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/internal/oauth/")) return json({ ok: false, code: "not_found" }, 404);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/planner-control") return this.plannerControl(request);
 
     if (request.method === "GET" && url.pathname === "/internal/oauth/stats") return this.stats();
     if (request.method === "POST" && url.pathname === "/internal/oauth/import") return this.importState(request);
@@ -1049,6 +1064,101 @@ export class OAuthStoreDO {
       }
     }
     return json({ ok: false, code: "not_found" }, 404);
+  }
+
+  private async plannerControl(request: Request): Promise<Response> {
+    const input = await this.body(request);
+    if (!input) return json({ ok: false, code: "bad_request" }, 400);
+    const action = input.action;
+    const secret = randomBase64UrlToken();
+    const digest = await hashOpaqueToken(secret);
+    const presented = typeof input.secret === "string" && input.secret.length <= 128
+      ? await hashOpaqueToken(input.secret) : "";
+    let result: Record<string, unknown> = { ok: false, code: "planner_control_denied" };
+    await this.state.storage.transaction(async (txn) => {
+      const rows = await txn.list<PlannerControlRecord>({ prefix: PLANNER_PREFIX });
+      const now = Date.now();
+      for (const [key, row] of rows) {
+        if (row.expires_at_ms <= now) { await txn.delete(key); rows.delete(key); }
+      }
+      const publicRecord = (row: PlannerControlRecord) => {
+        const { claim_digest, capability_digest, ...record } = row;
+        void claim_digest; void capability_digest;
+        return record;
+      };
+      // Owner identity is supplied exclusively by the authenticated REST route.
+      if (action === "list" || action === "approve" || action === "revoke") {
+        if (typeof input.owner !== "string" || !input.owner.startsWith("device:")) return;
+        if (action === "list") {
+          result = { ok: true, requests: [...rows.values()].map(publicRecord) };
+          return;
+        }
+        const row = rows.get(PLANNER_PREFIX + input.request_id);
+        if (!row) return;
+        if (action === "revoke") {
+          await txn.delete(PLANNER_PREFIX + row.request_id);
+          result = { ok: true, request_id: row.request_id, status: "revoked" };
+          return;
+        }
+        if (row.status !== "pending") return;
+        const connector = await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + row.connector_id);
+        const grant = await txn.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + row.client_id);
+        if (!active(row, connector, grant)) return;
+        row.status = "approved";
+        row.approved_by = input.owner;
+        await txn.put(PLANNER_PREFIX + row.request_id, row);
+        result = { ok: true, request: publicRecord(row) };
+        return;
+      }
+      const connector = await txn.get<OAuthConnectorRecord>(CONNECTOR_PREFIX + input.connector_id);
+      const grant = await txn.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + input.client_id);
+      function active(tuple: OAuthWebChatControlGrant & { client_id: string }, conn: OAuthConnectorRecord | undefined, gr: OAuthConnectorGrantRecord | undefined): boolean {
+        return conn?.status === "active" && conn.client_id === tuple.client_id
+          && conn.connector_id === tuple.connector_id && conn.grant_generation === tuple.grant_generation
+          && gr?.status === "active" && (gr.webchat_control ?? []).some((g) =>
+            g.connector_id === tuple.connector_id && g.grant_generation === tuple.grant_generation
+            && g.device_id === tuple.device_id && g.endpoint_ref === tuple.endpoint_ref
+            && g.provider === tuple.provider && g.account_ref === tuple.account_ref);
+      }
+      if (action === "request") {
+        const tuple = input as unknown as PlannerControlRecord;
+        if (![input.device_id, input.endpoint_ref, input.provider, input.account_ref, input.session_ref].every((v) => boundedString(v, 96))
+          || !(input.space_ref === null || boundedString(input.space_ref, 96))
+          || !Number.isSafeInteger(input.observation_generation) || (input.observation_generation as number) < 1
+          || !active(tuple, connector, grant)) return;
+        if (rows.size >= 128 || [...rows.values()].filter((r) => r.connector_id === input.connector_id).length >= 4) {
+          result = { ok: false, code: "planner_control_capacity" }; return;
+        }
+        const requestId = `pcr_${randomBase64UrlToken()}`;
+        const row: PlannerControlRecord = {
+          request_id: requestId, client_id: tuple.client_id, connector_id: tuple.connector_id,
+          grant_generation: tuple.grant_generation, device_id: tuple.device_id, endpoint_ref: tuple.endpoint_ref,
+          provider: tuple.provider, account_ref: tuple.account_ref, session_ref: tuple.session_ref,
+          space_ref: tuple.space_ref, observation_generation: tuple.observation_generation,
+          status: "pending", expires_at_ms: now + 10 * 60_000,
+          claim_digest: digest, principal: `controller:${randomBase64UrlToken()}`,
+        };
+        await txn.put(PLANNER_PREFIX + requestId, row);
+        result = { ok: true, request: publicRecord(row), claim_secret: secret };
+        return;
+      }
+      const row = action === "claim" ? rows.get(PLANNER_PREFIX + input.request_id)
+        : action === "verify" ? [...rows.values()].find((r) => r.capability_digest === presented) : undefined;
+      if (!row || row.client_id !== input.client_id || row.connector_id !== input.connector_id
+        || row.grant_generation !== input.grant_generation || !active(row, connector, grant)) return;
+      if (action === "claim" && row.status === "approved" && row.claim_digest === presented) {
+        row.status = "claimed";
+        delete row.claim_digest;
+        row.capability_digest = digest;
+        row.expires_at_ms = now + 30 * 60_000;
+        await txn.put(PLANNER_PREFIX + row.request_id, row);
+        result = { ok: true, controller_capability: secret, expires_at_ms: row.expires_at_ms,
+          principal: row.principal, can_force_takeover: false };
+      } else if (action === "verify" && row.status === "claimed" && row.capability_digest === presented) {
+        result = { ok: true, authority: { principal: row.principal, can_force_takeover: false } };
+      }
+    });
+    return json(result, result.ok ? 200 : 403);
   }
 
   private async setWebChatControlGrant(request: Request): Promise<Response> {

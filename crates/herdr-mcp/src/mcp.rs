@@ -12,7 +12,8 @@ use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
     BrowserDeliveryState, BrowserDispatchReservation, BrowserDispatchReserveInput,
-    BrowserDispatchUpdateInput, BrowserResourceResolveInput, ContinuitySearchInput,
+    BrowserDispatchUpdateInput, BrowserResourceResolveInput, BrowserSessionReservation,
+    BrowserSessionReservationInput, BrowserSessionReservationRecord, ContinuitySearchInput,
     OperationReservation, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
     WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemorySearchBoundary,
     WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
@@ -39,6 +40,7 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
     "2024-10-07",
 ];
 const BROWSER_ADAPTER_PROTOCOL_VERSION: i64 = 1;
+const BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS: i64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserCallerGrant {
@@ -52,6 +54,54 @@ pub struct PageAssistCallerGrant {
     pub endpoint_ref: String,
 }
 
+#[derive(Default)]
+pub struct BrowserMutationAdmission {
+    active_accounts: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserMutationScope {
+    endpoint_ref: String,
+    provider: String,
+    account_ref: String,
+}
+
+struct BrowserMutationPermit<'a> {
+    admission: &'a BrowserMutationAdmission,
+    key: String,
+}
+
+impl BrowserMutationAdmission {
+    fn reserve<'a>(
+        &'a self,
+        scope: &BrowserMutationScope,
+    ) -> Result<Option<BrowserMutationPermit<'a>>, String> {
+        let key = format!(
+            "{}\u{0}{}\u{0}{}",
+            scope.endpoint_ref, scope.provider, scope.account_ref
+        );
+        let mut active = self
+            .active_accounts
+            .lock()
+            .map_err(|_| "browser_mutation_admission_unavailable".to_owned())?;
+        if !active.insert(key.clone()) {
+            return Ok(None);
+        }
+        Ok(Some(BrowserMutationPermit {
+            admission: self,
+            key,
+        }))
+    }
+}
+
+impl Drop for BrowserMutationPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.admission.active_accounts.lock() {
+            active.remove(&self.key);
+        }
+    }
+}
+
 pub struct RuntimeContext<'a> {
     pub client: &'a HerdrClient,
     pub cache: &'a EventCache,
@@ -62,7 +112,8 @@ pub struct RuntimeContext<'a> {
     pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
     pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
-    pub browser_mutation_gate: Option<&'a std::sync::Mutex<()>>,
+    pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
+    pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -244,13 +295,14 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     context.browser_actuator,
                 )
             } else if BrowserOperation::parse(method).is_some() {
-                browser_operation_call_with_grants(
+                browser_operation_call_with_controls(
                     context.state_store,
                     method,
                     &params,
                     context.caller_webchat_control_grants,
                     context.browser_actuator,
                     context.browser_mutation_gate,
+                    context.browser_mutation_admission,
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
@@ -1493,8 +1545,16 @@ fn browser_delivery_state_from_postcondition(
     }
 
     let postcondition_met = match operation {
-        BrowserOperation::SpaceCreate | BrowserOperation::SessionCreate => {
+        BrowserOperation::SpaceCreate => {
             evidence.stable_resource_ref_observed && evidence.lifecycle_observed
+        }
+        BrowserOperation::SessionCreate => {
+            evidence.stable_resource_ref_observed
+                && evidence.lifecycle_observed
+                && evidence.canonical_url_observed
+                && (evidence.accepted_message_observed || evidence.message_baseline_advanced)
+                && evidence.generation_owner == Some(expected_generation)
+                && evidence.generation_status_observed
         }
         BrowserOperation::SpaceOpen | BrowserOperation::SessionOpen => {
             evidence.stable_resource_ref_observed
@@ -1603,6 +1663,7 @@ fn browser_dispatch_submit(
         required_apps: &required_apps,
         expected_generation,
         idempotency_key_digest: &idempotency_key_digest,
+        parent_dispatch_id: None,
         work_chain_id,
         lane_id,
         created_at: now,
@@ -1702,6 +1763,183 @@ fn browser_dispatch_submit(
     })
 }
 
+fn browser_dispatch_stop(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let parent_dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
+    let expected_generation = params
+        .get("expected_generation")
+        .and_then(Value::as_i64)
+        .unwrap();
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .unwrap();
+    let now = browser_epoch_ms();
+    let idempotency_key_digest = browser_sha256(idempotency_key);
+    let request_digest = browser_sha256(
+        &json!({
+            "operation": "browser_dispatch.stop",
+            "dispatch_id": parent_dispatch_id,
+            "expected_generation": expected_generation,
+        })
+        .to_string(),
+    );
+    let empty_digest = browser_sha256("");
+
+    let Ok(mut store_guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let parent = match store_guard.browser_dispatch(parent_dispatch_id) {
+        Ok(Some(dispatch)) => dispatch,
+        Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
+        Err(error) => return browser_store_error(error),
+    };
+    if parent.operation != "browser_dispatch.submit" {
+        return json!({"ok": false, "code": "browser_dispatch_not_stoppable"});
+    }
+    if parent.expected_generation != expected_generation {
+        return json!({"ok": false, "code": "stale_capability_generation"});
+    }
+    if parent.delivery_state == BrowserDeliveryState::Stopped {
+        return json!({
+            "ok": true,
+            "code": Value::Null,
+            "operation": BrowserOperation::DispatchStop.method(),
+            "delivery_state": BrowserDeliveryState::Stopped.as_str(),
+            "target_dispatch": browser_dispatch_json(parent),
+            "replayed": true,
+        });
+    }
+    if parent.delivery_state != BrowserDeliveryState::Applied
+        || parent.generation_owner != Some(expected_generation)
+    {
+        return json!({"ok": false, "code": "browser_dispatch_not_stoppable"});
+    }
+
+    let reservation = store_guard.reserve_browser_dispatch(BrowserDispatchReserveInput {
+        endpoint_ref: &parent.endpoint_ref,
+        provider: &parent.provider,
+        operation: "browser_dispatch.stop",
+        target_session_ref: &parent.target_session_ref,
+        request_digest: &request_digest,
+        message_digest: &empty_digest,
+        reasoning_effort: None,
+        required_apps: &[],
+        expected_generation,
+        idempotency_key_digest: &idempotency_key_digest,
+        parent_dispatch_id: Some(parent_dispatch_id),
+        work_chain_id: parent.work_chain_id.as_deref(),
+        lane_id: parent.lane_id.as_deref(),
+        created_at: now,
+    });
+    let reserved = match reservation {
+        Ok(BrowserDispatchReservation::Existing(stop_dispatch)) => {
+            let success = stop_dispatch.delivery_state == BrowserDeliveryState::Stopped;
+            let target_dispatch = if success {
+                match store_guard
+                    .mark_browser_dispatch_stopped_from_child(&stop_dispatch.dispatch_id, now)
+                {
+                    Ok(dispatch) => dispatch,
+                    Err(error) => return browser_store_error(error),
+                }
+            } else {
+                parent
+            };
+            return json!({
+                "ok": success,
+                "code": if success { Value::Null } else { json!(stop_dispatch.delivery_state.as_str()) },
+                "operation": BrowserOperation::DispatchStop.method(),
+                "delivery_state": stop_dispatch.delivery_state.as_str(),
+                "dispatch": browser_dispatch_json(stop_dispatch),
+                "target_dispatch": browser_dispatch_json(target_dispatch),
+                "replayed": true,
+            });
+        }
+        Ok(BrowserDispatchReservation::Reserved(dispatch)) => dispatch,
+        Err(error) => return browser_store_error(error),
+    };
+
+    if let Err(error) = store_guard.update_browser_dispatch(BrowserDispatchUpdateInput {
+        dispatch_id: &reserved.dispatch_id,
+        expected_generation,
+        delivery_state: BrowserDeliveryState::Uncertain,
+        generation_owner: None,
+        updated_at: now,
+    }) {
+        return browser_store_error(error);
+    }
+    drop(store_guard);
+
+    let evidence = match actuator {
+        Some(actuator) => match actuator.actuate(
+            BrowserOperation::DispatchStop.method(),
+            params,
+            expected_generation,
+            Some(&reserved.dispatch_id),
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => return browser_store_error(error),
+        },
+        None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+    };
+    let delivery_state = match browser_delivery_state_from_postcondition(
+        BrowserOperation::DispatchStop,
+        params,
+        expected_generation,
+        &evidence,
+    ) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    let Ok(mut store) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let stop_dispatch = if delivery_state == BrowserDeliveryState::Uncertain {
+        match store.browser_dispatch(&reserved.dispatch_id) {
+            Ok(Some(dispatch)) => dispatch,
+            Ok(None) => return json!({"ok": false, "code": "browser_dispatch_not_found"}),
+            Err(error) => return browser_store_error(error),
+        }
+    } else {
+        match store.settle_uncertain_browser_dispatch(BrowserDispatchUpdateInput {
+            dispatch_id: &reserved.dispatch_id,
+            expected_generation,
+            delivery_state,
+            generation_owner: evidence.generation_owner,
+            updated_at: browser_epoch_ms(),
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(error) => return browser_store_error(error),
+        }
+    };
+    let target_dispatch = if delivery_state == BrowserDeliveryState::Stopped {
+        match store.mark_browser_dispatch_stopped_from_child(
+            &stop_dispatch.dispatch_id,
+            browser_epoch_ms(),
+        ) {
+            Ok(dispatch) => dispatch,
+            Err(error) => return browser_store_error(error),
+        }
+    } else {
+        parent
+    };
+    let work_memory_writeback = browser_dispatch_work_memory_writeback(&mut store, &stop_dispatch);
+    let success = delivery_state == BrowserDeliveryState::Stopped;
+    json!({
+        "ok": success,
+        "code": if success { Value::Null } else { json!(delivery_state.as_str()) },
+        "operation": BrowserOperation::DispatchStop.method(),
+        "delivery_state": delivery_state.as_str(),
+        "dispatch": browser_dispatch_json(stop_dispatch),
+        "target_dispatch": browser_dispatch_json(target_dispatch),
+        "replayed": false,
+        "work_memory_writeback": work_memory_writeback,
+    })
+}
+
 fn browser_dispatch_status(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     dispatch_id: &str,
@@ -1729,8 +1967,20 @@ fn browser_dispatch_status(
             Err(error) => return browser_store_error(error),
         };
         if let Some(evidence) = evidence {
+            let operation = match dispatch.operation.as_str() {
+                "browser_dispatch.submit" => BrowserOperation::DispatchSubmit,
+                "browser_dispatch.stop" => BrowserOperation::DispatchStop,
+                _ => {
+                    return json!({
+                        "ok": true,
+                        "dispatch": browser_dispatch_json(dispatch),
+                        "reconciled": false,
+                        "reconciliation_code": "unsupported_dispatch_operation",
+                    });
+                }
+            };
             let delivery_state = match browser_delivery_state_from_postcondition(
-                BrowserOperation::DispatchSubmit,
+                operation,
                 &json!({}),
                 dispatch.expected_generation,
                 &evidence,
@@ -1776,11 +2026,25 @@ fn browser_dispatch_status(
                     }
                     Err(error) => return browser_store_error(error),
                 };
+                let target_dispatch = if operation == BrowserOperation::DispatchStop
+                    && settled.delivery_state == BrowserDeliveryState::Stopped
+                {
+                    match store.mark_browser_dispatch_stopped_from_child(
+                        &settled.dispatch_id,
+                        browser_epoch_ms(),
+                    ) {
+                        Ok(record) => Some(browser_dispatch_json(record)),
+                        Err(error) => return browser_store_error(error),
+                    }
+                } else {
+                    None
+                };
                 let work_memory_writeback =
                     browser_dispatch_work_memory_writeback(&mut store, &settled);
                 return json!({
                     "ok": true,
                     "dispatch": browser_dispatch_json(settled),
+                    "target_dispatch": target_dispatch,
                     "reconciled": true,
                     "reconciliation_code": Value::Null,
                     "work_memory_writeback": work_memory_writeback,
@@ -1803,6 +2067,385 @@ fn browser_dispatch_status(
     })
 }
 
+fn browser_created_session_dispatch(
+    store: &mut StateStore,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+) -> Result<(crate::state_store::BrowserDispatchRecord, Value), String> {
+    let session_ref = reservation
+        .session_ref
+        .as_deref()
+        .ok_or_else(|| "browser_session_materialization_missing".to_owned())?;
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "browser_message_required".to_owned())?;
+    let reasoning_effort = params.get("reasoning_effort").and_then(Value::as_str);
+    let required_apps = browser_required_apps(params, true)
+        .map_err(|_| "browser_required_apps_invalid".to_owned())?;
+    let work_chain_id = params.get("work_chain_id").and_then(Value::as_str);
+    let lane_id = params.get("lane_id").and_then(Value::as_str);
+    let message_digest = browser_sha256(message);
+    let request_digest = browser_sha256(
+        &json!({
+            "operation": "browser_dispatch.submit",
+            "session_ref": session_ref,
+            "message_digest": message_digest,
+            "reasoning_effort": reasoning_effort,
+            "required_apps": required_apps,
+            "expected_generation": reservation.expected_generation,
+            "work_chain_id": work_chain_id,
+            "lane_id": lane_id,
+        })
+        .to_string(),
+    );
+    let reservation_result = store.reserve_browser_dispatch(BrowserDispatchReserveInput {
+        endpoint_ref: &reservation.endpoint_ref,
+        provider: &reservation.provider,
+        operation: "browser_dispatch.submit",
+        target_session_ref: session_ref,
+        request_digest: &request_digest,
+        message_digest: &message_digest,
+        reasoning_effort,
+        required_apps: &required_apps,
+        expected_generation: reservation.expected_generation,
+        idempotency_key_digest: &reservation.idempotency_key_digest,
+        parent_dispatch_id: None,
+        work_chain_id,
+        lane_id,
+        created_at: browser_epoch_ms(),
+    })?;
+    let dispatch = match reservation_result {
+        BrowserDispatchReservation::Existing(dispatch) => dispatch,
+        BrowserDispatchReservation::Reserved(dispatch) => {
+            store.update_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &dispatch.dispatch_id,
+                expected_generation: reservation.expected_generation,
+                delivery_state: BrowserDeliveryState::Applied,
+                generation_owner: Some(reservation.expected_generation),
+                updated_at: browser_epoch_ms(),
+            })?
+        }
+    };
+    if dispatch.delivery_state != BrowserDeliveryState::Applied
+        || dispatch.generation_owner != Some(reservation.expected_generation)
+    {
+        return Err("browser_created_session_dispatch_not_applied".to_owned());
+    }
+    let writeback = browser_dispatch_work_memory_writeback(store, &dispatch);
+    Ok((dispatch, writeback))
+}
+
+fn browser_session_create_success(
+    store: &mut StateStore,
+    reservation_ref: &str,
+    params: &Value,
+    replayed: bool,
+    reconciled: bool,
+) -> Value {
+    let reservation = match store.browser_session_reservation(reservation_ref) {
+        Ok(Some(record)) => record,
+        Ok(None) => return json!({"ok": false, "code": "browser_session_reservation_not_found"}),
+        Err(error) => return browser_store_error(error),
+    };
+    if reservation.state != "materialized" || reservation.delivery_state != "applied" {
+        return json!({
+            "ok": false,
+            "code": if reservation.delivery_state == "uncertain" {
+                "uncertain"
+            } else {
+                "browser_session_materialization_missing"
+            },
+            "reservation_ref": reservation.reservation_ref,
+            "reservation_state": reservation.state,
+            "delivery_state": reservation.delivery_state,
+            "replayed": replayed,
+            "reconciled": reconciled,
+        });
+    }
+    let session_ref = reservation.session_ref.clone().unwrap();
+    let (dispatch, work_memory_writeback) =
+        match browser_created_session_dispatch(store, &reservation, params) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        };
+    json!({
+        "ok": true,
+        "code": Value::Null,
+        "operation": BrowserOperation::SessionCreate.method(),
+        "reservation_ref": reservation.reservation_ref,
+        "reservation_state": reservation.state,
+        "session_ref": session_ref,
+        "delivery_state": BrowserDeliveryState::Applied.as_str(),
+        "dispatch": browser_dispatch_json(dispatch),
+        "replayed": replayed,
+        "reconciled": reconciled,
+        "work_memory_writeback": work_memory_writeback,
+    })
+}
+
+fn browser_session_create(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let endpoint_ref = params.get("endpoint_ref").and_then(Value::as_str).unwrap();
+    let provider = params.get("provider").and_then(Value::as_str).unwrap();
+    let account_ref = params.get("account_ref").and_then(Value::as_str).unwrap();
+    let space_ref = params.get("space_ref").and_then(Value::as_str);
+    let display_label = params.get("display_label").and_then(Value::as_str).unwrap();
+    let message = params.get("message").and_then(Value::as_str).unwrap();
+    let reasoning_effort = params.get("reasoning_effort").and_then(Value::as_str);
+    let required_apps = match browser_required_apps(params, true) {
+        Ok(apps) => apps,
+        Err(error) => return error,
+    };
+    let expected_generation = params
+        .get("expected_generation")
+        .and_then(Value::as_i64)
+        .unwrap();
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .unwrap();
+    let work_chain_id = params.get("work_chain_id").and_then(Value::as_str);
+    let lane_id = params.get("lane_id").and_then(Value::as_str);
+    let message_digest = browser_sha256(message);
+    let request_digest = browser_sha256(
+        &json!({
+            "operation": BrowserOperation::SessionCreate.method(),
+            "endpoint_ref": endpoint_ref,
+            "provider": provider,
+            "account_ref": account_ref,
+            "space_ref": space_ref,
+            "display_label": display_label,
+            "message_digest": message_digest,
+            "reasoning_effort": reasoning_effort,
+            "required_apps": required_apps,
+            "expected_generation": expected_generation,
+            "work_chain_id": work_chain_id,
+            "lane_id": lane_id,
+        })
+        .to_string(),
+    );
+    let idempotency_key_digest = browser_sha256(idempotency_key);
+    let now = browser_epoch_ms();
+    let expires_at = now.saturating_add(30 * 60 * 1000);
+
+    let (reservation, launch_url) = {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        let launch_ref = space_ref.unwrap_or(account_ref);
+        let locator = match guard.browser_resource_locator(launch_ref) {
+            Ok(Some(locator)) if locator.observation_generation == expected_generation => locator,
+            Ok(Some(_)) => return json!({"ok": false, "code": "stale_capability_generation"}),
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "code": "resource_unavailable",
+                    "message": "browser session creation requires an observed local account/project launcher",
+                });
+            }
+            Err(error) => return browser_store_error(error),
+        };
+        let reserved = match guard.reserve_browser_session(BrowserSessionReservationInput {
+            endpoint_ref,
+            provider,
+            account_ref,
+            space_ref,
+            display_label,
+            expected_generation,
+            idempotency_key_digest: &idempotency_key_digest,
+            request_digest: &request_digest,
+            created_at: now,
+            expires_at,
+        }) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        };
+        (reserved, locator.canonical_url)
+    };
+
+    let (reservation, replayed) = match reservation {
+        BrowserSessionReservation::Reserved(record) => (record, false),
+        BrowserSessionReservation::Existing(record) => (record, true),
+    };
+    if matches!(reservation.state.as_str(), "cancelled" | "expired") {
+        return json!({
+            "ok": false,
+            "code": format!("browser_session_reservation_{}", reservation.state),
+            "reservation_ref": reservation.reservation_ref,
+        });
+    }
+    let current_delivery = match BrowserDeliveryState::parse(&reservation.delivery_state) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    if current_delivery == BrowserDeliveryState::Applied {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        return browser_session_create_success(
+            &mut guard,
+            &reservation.reservation_ref,
+            params,
+            true,
+            false,
+        );
+    }
+    if current_delivery == BrowserDeliveryState::Uncertain {
+        let Some(actuator) = actuator else {
+            return json!({
+                "ok": false,
+                "code": "uncertain",
+                "reservation_ref": reservation.reservation_ref,
+                "reservation_state": reservation.state,
+                "delivery_state": current_delivery.as_str(),
+                "replayed": true,
+            });
+        };
+        let evidence =
+            match actuator.reconcile_dispatch(&reservation.reservation_ref, expected_generation) {
+                Ok(Some(evidence)) => evidence,
+                Ok(None) => {
+                    return json!({
+                        "ok": false,
+                        "code": "uncertain",
+                        "reservation_ref": reservation.reservation_ref,
+                        "reservation_state": reservation.state,
+                        "delivery_state": current_delivery.as_str(),
+                        "replayed": true,
+                    });
+                }
+                Err(error) => return browser_store_error(error),
+            };
+        let delivery_state = match browser_delivery_state_from_postcondition(
+            BrowserOperation::SessionCreate,
+            params,
+            expected_generation,
+            &evidence,
+        ) {
+            Ok(state) => state,
+            Err(error) => return browser_store_error(error),
+        };
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        let settled = match guard.update_browser_session_reservation_delivery(
+            &reservation.reservation_ref,
+            expected_generation,
+            delivery_state,
+            browser_epoch_ms(),
+        ) {
+            Ok(record) => record,
+            Err(error) => return browser_store_error(error),
+        };
+        if delivery_state == BrowserDeliveryState::Applied {
+            return browser_session_create_success(
+                &mut guard,
+                &settled.reservation_ref,
+                params,
+                true,
+                true,
+            );
+        }
+        return json!({
+            "ok": false,
+            "code": delivery_state.as_str(),
+            "reservation_ref": settled.reservation_ref,
+            "reservation_state": settled.state,
+            "delivery_state": settled.delivery_state,
+            "replayed": true,
+            "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
+        });
+    }
+    if current_delivery != BrowserDeliveryState::NotApplied {
+        return json!({
+            "ok": false,
+            "code": current_delivery.as_str(),
+            "reservation_ref": reservation.reservation_ref,
+            "reservation_state": reservation.state,
+            "delivery_state": current_delivery.as_str(),
+            "replayed": replayed,
+        });
+    }
+
+    {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        if let Err(error) = guard.update_browser_session_reservation_delivery(
+            &reservation.reservation_ref,
+            expected_generation,
+            BrowserDeliveryState::Uncertain,
+            browser_epoch_ms(),
+        ) {
+            return browser_store_error(error);
+        }
+    }
+    let mut actuation_params = params.clone();
+    if let Some(object) = actuation_params.as_object_mut() {
+        object.insert(
+            "reservation_ref".to_owned(),
+            json!(reservation.reservation_ref),
+        );
+        object.insert("launch_url".to_owned(), json!(launch_url));
+    }
+    let evidence = match actuator {
+        Some(actuator) => match actuator.actuate(
+            BrowserOperation::SessionCreate.method(),
+            &actuation_params,
+            expected_generation,
+            Some(&reservation.reservation_ref),
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => return browser_store_error(error),
+        },
+        None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+    };
+    let delivery_state = match browser_delivery_state_from_postcondition(
+        BrowserOperation::SessionCreate,
+        params,
+        expected_generation,
+        &evidence,
+    ) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    let Ok(mut guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let updated = match guard.update_browser_session_reservation_delivery(
+        &reservation.reservation_ref,
+        expected_generation,
+        delivery_state,
+        browser_epoch_ms(),
+    ) {
+        Ok(record) => record,
+        Err(error) => return browser_store_error(error),
+    };
+    if delivery_state == BrowserDeliveryState::Applied {
+        return browser_session_create_success(
+            &mut guard,
+            &updated.reservation_ref,
+            params,
+            replayed,
+            false,
+        );
+    }
+    json!({
+        "ok": false,
+        "code": delivery_state.as_str(),
+        "operation": BrowserOperation::SessionCreate.method(),
+        "reservation_ref": updated.reservation_ref,
+        "reservation_state": updated.state,
+        "delivery_state": updated.delivery_state,
+        "replayed": replayed,
+        "reconciled": false,
+    })
+}
+
 fn browser_session_open(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -1817,24 +2460,41 @@ fn browser_session_open(
         .get("idempotency_key")
         .and_then(Value::as_str)
         .unwrap();
-
-    let request_json = json!({
-        "operation": "herdr_mcp.browser_session.open",
-        "session_ref": session_ref,
-        "expected_generation": expected_generation
-    })
-    .to_string();
-    let request_hash = browser_sha256(&request_json);
+    let request_hash = browser_sha256(
+        &json!({
+            "operation": BrowserOperation::SessionOpen.method(),
+            "session_ref": session_ref,
+            "expected_generation": expected_generation,
+        })
+        .to_string(),
+    );
     let idempotency_digest = browser_sha256(idempotency_key);
     let op_id = format!("op:browser_session_open:{}", &idempotency_digest[..32]);
     let now = browser_epoch_ms();
     let expires_at = now.saturating_add(10 * 60 * 1000);
 
-    let reservation = {
+    let (reservation, provider, canonical_url) = {
         let Ok(mut guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
-        match guard.reserve_operation(
+        let session = match guard.browser_resource(session_ref) {
+            Ok(Some(resource)) if resource.kind == "session" => resource,
+            Ok(Some(_)) => return json!({"ok": false, "code": "browser_resource_kind_mismatch"}),
+            Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
+            Err(error) => return browser_store_error(error),
+        };
+        if session.observation_generation != expected_generation {
+            return json!({"ok": false, "code": "stale_capability_generation"});
+        }
+        let canonical_url = match guard.browser_resource_locator(session_ref) {
+            Ok(Some(locator)) if locator.observation_generation == expected_generation => {
+                Some(locator.canonical_url)
+            }
+            Ok(Some(_)) => return json!({"ok": false, "code": "stale_capability_generation"}),
+            Ok(None) => None,
+            Err(error) => return browser_store_error(error),
+        };
+        let reservation = match guard.reserve_operation(
             "browser_session.open",
             &idempotency_digest,
             &request_hash,
@@ -1844,7 +2504,8 @@ fn browser_session_open(
         ) {
             Ok(value) => value,
             Err(error) => return browser_store_error(error),
-        }
+        };
+        (reservation, session.provider, canonical_url)
     };
 
     match reservation {
@@ -1888,10 +2549,17 @@ fn browser_session_open(
         OperationReservation::Reserved => {}
     }
 
+    let mut actuation_params = params.clone();
+    if let Some(object) = actuation_params.as_object_mut() {
+        object.insert("provider".to_owned(), json!(provider));
+        if let Some(canonical_url) = canonical_url {
+            object.insert("canonical_url".to_owned(), json!(canonical_url));
+        }
+    }
     let evidence = match actuator {
         Some(actuator) => match actuator.actuate(
             BrowserOperation::SessionOpen.method(),
-            params,
+            &actuation_params,
             expected_generation,
             None,
         ) {
@@ -2035,8 +2703,20 @@ fn browser_operation_call_with_grant(
 }
 
 fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Value) -> bool {
-    if operation == BrowserOperation::SessionOpen {
+    if matches!(
+        operation,
+        BrowserOperation::SessionOpen | BrowserOperation::DispatchStop
+    ) {
         return true;
+    }
+    if operation == BrowserOperation::SessionCreate {
+        return params.get("provider").and_then(Value::as_str) == Some("chatgpt")
+            && params
+                .get("reasoning_effort")
+                .is_none_or(|value| value.is_null())
+            && browser_required_apps(params, true)
+                .map(|apps| apps.is_empty())
+                .unwrap_or(false);
     }
     if operation != BrowserOperation::DispatchSubmit {
         return !operation.is_mutation();
@@ -2045,13 +2725,34 @@ fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Valu
         && browser_required_apps(params, true).is_ok_and(|apps| apps.is_empty())
 }
 
+#[cfg(test)]
 fn browser_operation_call_with_grants(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
     params: &Value,
     caller_webchat_control_grants: &[BrowserCallerGrant],
     browser_actuator: Option<&dyn BrowserActuator>,
-    browser_mutation_gate: Option<&std::sync::Mutex<()>>,
+    browser_mutation_gate: Option<&std::sync::RwLock<()>>,
+) -> Value {
+    browser_operation_call_with_controls(
+        store,
+        method,
+        params,
+        caller_webchat_control_grants,
+        browser_actuator,
+        browser_mutation_gate,
+        None,
+    )
+}
+
+fn browser_operation_call_with_controls(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+    browser_mutation_gate: Option<&std::sync::RwLock<()>>,
+    browser_mutation_admission: Option<&BrowserMutationAdmission>,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
         return json!({"ok": false, "code": "unknown_local_method", "method": method});
@@ -2072,7 +2773,7 @@ fn browser_operation_call_with_grants(
     // completes before the consent revision may change.
     let _mutation_gate = if operation.is_mutation() {
         match browser_mutation_gate {
-            Some(gate) => match gate.lock() {
+            Some(gate) => match gate.read() {
                 Ok(guard) => Some(guard),
                 Err(_) => {
                     return json!({
@@ -2087,7 +2788,7 @@ fn browser_operation_call_with_grants(
         None
     };
 
-    if operation.is_mutation() {
+    let mutation_scope = if operation.is_mutation() {
         let Ok(store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
@@ -2144,7 +2845,34 @@ fn browser_operation_call_with_grants(
             }
             Err(error) => return browser_store_error(error),
         }
-    }
+        match browser_operation_mutation_scope(&store_guard, operation, params) {
+            Ok(scope) => Some(scope),
+            Err(error) => return browser_store_error(error),
+        }
+    } else {
+        None
+    };
+
+    let _mutation_permit = match (browser_mutation_admission, mutation_scope.as_ref()) {
+        (Some(admission), Some(scope)) => match admission.reserve(scope) {
+            Ok(Some(permit)) => Some(permit),
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "code": "browser_account_backpressure",
+                    "retryable": true,
+                    "resource_key": format!(
+                        "{}:{}:{}",
+                        scope.endpoint_ref, scope.provider, scope.account_ref
+                    ),
+                    "limit": 1,
+                    "retry_after_ms": BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS,
+                });
+            }
+            Err(error) => return browser_store_error(error),
+        },
+        _ => None,
+    };
 
     match operation {
         BrowserOperation::SpaceInspect => browser_operation_inspect_resource(
@@ -2161,6 +2889,7 @@ fn browser_operation_call_with_grants(
             operation,
             caller_webchat_control_grants,
         ),
+        BrowserOperation::SessionCreate => browser_session_create(store, params, browser_actuator),
         BrowserOperation::SessionOpen => browser_session_open(store, params, browser_actuator),
         BrowserOperation::DispatchSubmit => {
             browser_dispatch_submit(store, params, browser_actuator)
@@ -2169,6 +2898,7 @@ fn browser_operation_call_with_grants(
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
             browser_dispatch_status(store, dispatch_id, browser_actuator)
         }
+        BrowserOperation::DispatchStop => browser_dispatch_stop(store, params, browser_actuator),
         _ => {
             let expected_generation = params
                 .get("expected_generation")
@@ -2241,8 +2971,13 @@ fn validate_browser_operation_params(
             "account_ref",
             "space_ref",
             "display_label",
+            "message",
+            "reasoning_effort",
+            "required_apps",
             "expected_generation",
             "idempotency_key",
+            "work_chain_id",
+            "lane_id",
         ],
         BrowserOperation::SessionOpen => &["session_ref", "expected_generation", "idempotency_key"],
         BrowserOperation::SessionInspect => &["session_ref"],
@@ -2318,8 +3053,13 @@ fn validate_browser_operation_params(
             browser_required_string(params, "account_ref", 96)?;
             let _ = browser_optional_string(params, "space_ref", 96)?;
             browser_required_string(params, "display_label", 256)?;
+            browser_required_string(params, "message", 262_144)?;
+            browser_required_reasoning_effort(params, true)?;
+            browser_required_apps(params, true)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
+            let _ = browser_optional_string(params, "work_chain_id", 128)?;
+            let _ = browser_optional_string(params, "lane_id", 160)?;
         }
         BrowserOperation::SessionOpen => {
             browser_required_string(params, "session_ref", 96)?;
@@ -2490,7 +3230,12 @@ fn browser_operation_actuation_decision(
     if operation == BrowserOperation::SessionOpen && target.provider != "chatgpt" {
         return Ok((false, Some("capability_not_allowed")));
     }
-    if decision != (true, None) || operation != BrowserOperation::DispatchSubmit {
+    if decision != (true, None)
+        || !matches!(
+            operation,
+            BrowserOperation::DispatchSubmit | BrowserOperation::SessionCreate
+        )
+    {
         return Ok(decision);
     }
 
@@ -2499,6 +3244,16 @@ fn browser_operation_actuation_decision(
     else {
         return Ok((false, Some("capability_unknown")));
     };
+    if operation == BrowserOperation::SessionCreate {
+        match browser_capability_snapshot_allows(
+            &provider_state.capabilities_json,
+            "composer.submit",
+        ) {
+            Some(true) => {}
+            Some(false) => return Ok((false, Some("capability_not_allowed"))),
+            None => return Ok((false, Some("capability_unknown"))),
+        }
+    }
     if params
         .get("reasoning_effort")
         .is_some_and(|value| !value.is_null())
@@ -2526,6 +3281,54 @@ fn browser_operation_actuation_decision(
         }
     }
     Ok((true, None))
+}
+
+fn browser_operation_mutation_scope(
+    store: &StateStore,
+    operation: BrowserOperation,
+    params: &Value,
+) -> Result<BrowserMutationScope, String> {
+    let target = match operation {
+        BrowserOperation::SpaceCreate | BrowserOperation::SessionCreate => {
+            browser_operation_resource(
+                store,
+                params.get("account_ref").and_then(Value::as_str).unwrap(),
+                "account",
+            )?
+        }
+        BrowserOperation::SpaceOpen => browser_operation_resource(
+            store,
+            params.get("space_ref").and_then(Value::as_str).unwrap(),
+            "space",
+        )?,
+        BrowserOperation::SessionOpen
+        | BrowserOperation::MessageAppend
+        | BrowserOperation::ComposerSetReasoning
+        | BrowserOperation::ComposerSetApps
+        | BrowserOperation::DispatchSubmit => browser_operation_resource(
+            store,
+            params.get("session_ref").and_then(Value::as_str).unwrap(),
+            "session",
+        )?,
+        BrowserOperation::DispatchStop => {
+            let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
+            let dispatch = store
+                .browser_dispatch(dispatch_id)?
+                .ok_or_else(|| "browser_dispatch_not_found".to_owned())?;
+            browser_operation_resource(store, &dispatch.target_session_ref, "session")?
+        }
+        BrowserOperation::SpaceInspect
+        | BrowserOperation::SessionInspect
+        | BrowserOperation::DispatchStatus => {
+            return Err("browser_operation_not_mutating".to_owned());
+        }
+    };
+    let account_ref = browser_resource_account_ref(store, &target)?;
+    Ok(BrowserMutationScope {
+        endpoint_ref: target.endpoint_ref,
+        provider: target.provider,
+        account_ref,
+    })
 }
 
 fn browser_operation_resource(
@@ -2653,6 +3456,46 @@ fn browser_capability_snapshot_allows(capabilities_json: &str, operation: &str) 
     )
 }
 
+fn browser_public_capabilities(capabilities_json: &str) -> Value {
+    let parsed = serde_json::from_str::<Value>(capabilities_json).unwrap_or_else(|_| json!({}));
+    let operations = parsed
+        .get("operations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    json!({
+        "schema_version": 1,
+        "operations": operations,
+        "input_contract": {
+            "message": {
+                "accepted_modalities": ["text"],
+                "max_bytes": 262_144,
+                "control_characters": "rejected"
+            },
+            "attachments": {
+                "supported": false,
+                "reason": "not_exposed_by_browser_dispatch_contract"
+            },
+            "required_apps": {
+                "max_items": 32,
+                "item_max_bytes": 64
+            },
+            "reasoning_effort": {
+                "values": ["economy", "balanced", "thorough"],
+                "requires_operation": "composer.set_reasoning"
+            }
+        },
+        "provider_dynamic_limits": {
+            "message_bytes": {"status": "unknown"},
+            "attachment_count": {"status": "unknown"},
+            "turn_timeout_ms": {"status": "unknown"},
+            "output_modalities": {"status": "unknown"},
+            "model_effort_combinations": {"status": "unknown"}
+        }
+    })
+}
+
 fn browser_required_generation(params: &Value) -> Result<i64, Value> {
     match params.get("expected_generation").and_then(Value::as_i64) {
         Some(value) if value >= 1 => Ok(value),
@@ -2763,9 +3606,49 @@ fn browser_operation_inspect_resource(
                 Ok(decision) => decision,
                 Err(error) => return browser_store_error(error),
             };
+            let account_ref = match browser_resource_account_ref(&store, &resource) {
+                Ok(account_ref) => account_ref,
+                Err(error) => return browser_store_error(error),
+            };
+            let provider_state =
+                match store.browser_provider_state(&resource.endpoint_ref, &resource.provider) {
+                    Ok(provider_state) => provider_state,
+                    Err(error) => return browser_store_error(error),
+                };
+            let route_endpoint_ref = resource.endpoint_ref.clone();
+            let route_provider = resource.provider.clone();
+            let resource_observation_generation = resource.observation_generation;
+            let route_status = match provider_state.as_ref() {
+                None => "capability_unknown",
+                Some(state) if state.observation_generation != resource.observation_generation => {
+                    "stale_capability_generation"
+                }
+                Some(state)
+                    if state.adapter_protocol_version != BROWSER_ADAPTER_PROTOCOL_VERSION =>
+                {
+                    "browser_adapter_protocol_unsupported"
+                }
+                Some(_) => "current",
+            };
+            let capabilities = provider_state
+                .as_ref()
+                .map(|state| browser_public_capabilities(&state.capabilities_json))
+                .unwrap_or_else(|| json!({"status": "unknown"}));
             json!({
                 "ok": true,
                 "resource": browser_resource_json(resource),
+                "route": {
+                    "endpoint_ref": route_endpoint_ref,
+                    "provider": route_provider,
+                    "account_ref": account_ref,
+                    "configuration_source": "browser_registry_observation",
+                    "resource_observation_generation": resource_observation_generation,
+                    "provider_observation_generation": provider_state.as_ref().map(|state| state.observation_generation),
+                    "adapter_protocol_version": provider_state.as_ref().map(|state| state.adapter_protocol_version),
+                    "provider_observed_at": provider_state.as_ref().map(|state| state.observed_at),
+                    "status": route_status,
+                },
+                "capabilities": capabilities,
                 "actuation_available": actuation_available,
                 "actuation_reason": actuation_reason,
             })
@@ -2785,6 +3668,7 @@ fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) ->
         "reasoning_effort": dispatch.reasoning_effort,
         "required_apps": dispatch.required_apps,
         "expected_generation": dispatch.expected_generation,
+        "parent_dispatch_id": dispatch.parent_dispatch_id,
         "delivery_state": dispatch.delivery_state.as_str(),
         "generation_owner": dispatch.generation_owner,
         "work_chain_id": dispatch.work_chain_id,
@@ -2865,7 +3749,7 @@ fn browser_registry_call_with_grants(
                                 "provider": state.provider,
                                 "adapter_protocol_version": state.adapter_protocol_version,
                                 "observation_generation": state.observation_generation,
-                                "capabilities": serde_json::from_str::<Value>(&state.capabilities_json).unwrap_or_else(|_| json!({})),
+                                "capabilities": browser_public_capabilities(&state.capabilities_json),
                                 "observed_at": state.observed_at,
                             })
                         }).collect::<Vec<_>>()
@@ -3104,8 +3988,19 @@ fn browser_required_string<'a>(
         return Err(json!({"ok": false, "code": format!("browser_{field}_required")}));
     };
     let value = value.trim();
-    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+    if value.is_empty() || value.chars().any(char::is_control) {
         return Err(json!({"ok": false, "code": format!("browser_{field}_invalid")}));
+    }
+    if value.len() > max_bytes {
+        return Err(json!({
+            "ok": false,
+            "code": format!("browser_{field}_invalid"),
+            "limit": {
+                "kind": "max_bytes",
+                "max_bytes": max_bytes,
+                "actual_bytes": value.len(),
+            }
+        }));
     }
     Ok(value)
 }
@@ -4247,6 +5142,23 @@ mod tests {
         assert_eq!(inspected["ok"], true);
         assert_eq!(inspected["provider_states"][0]["provider"], "chatgpt");
         assert_eq!(inspected["provider_states"][0]["observation_generation"], 7);
+        assert_eq!(
+            inspected["provider_states"][0]["capabilities"]["schema_version"],
+            1
+        );
+        assert_eq!(
+            inspected["provider_states"][0]["capabilities"]["operations"][0],
+            "identity.inspect"
+        );
+        assert_eq!(
+            inspected["provider_states"][0]["capabilities"]["input_contract"]["message"]["max_bytes"],
+            262_144
+        );
+        assert_eq!(
+            inspected["provider_states"][0]["capabilities"]["provider_dynamic_limits"]["turn_timeout_ms"]
+                ["status"],
+            "unknown"
+        );
 
         let resolved = browser_registry_call(
             &store,
@@ -4501,6 +5413,21 @@ mod tests {
             }),
         );
         assert_eq!(arbitrary_json["code"], "browser_operation_params_invalid");
+
+        let oversized = browser_operation_call(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "x".repeat(262_145),
+                "expected_generation": 7,
+                "idempotency_key": "dispatch-oversized-1"
+            }),
+        );
+        assert_eq!(oversized["code"], "browser_message_invalid");
+        assert_eq!(oversized["limit"]["kind"], "max_bytes");
+        assert_eq!(oversized["limit"]["max_bytes"], 262_144);
+        assert_eq!(oversized["limit"]["actual_bytes"], 262_145);
     }
 
     #[test]
@@ -4623,7 +5550,7 @@ mod tests {
                     provider: "chatgpt",
                     adapter_protocol_version: 1,
                     observation_generation: 7,
-                    capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                    capabilities_json: r#"{"operations":["composer.submit","generation.stop"]}"#,
                     observed_at: 11,
                 })
                 .unwrap();
@@ -4975,6 +5902,232 @@ mod tests {
             }),
         );
         assert_eq!(evidence_search["hits"].as_array().unwrap().len(), 1);
+
+        struct StopActuator {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl BrowserActuator for StopActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::DispatchStop.method());
+                assert!(dispatch_id.is_some_and(|value| value.starts_with("bd_")));
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: true,
+                    result: None,
+                })
+            }
+        }
+        let stop_actuator = StopActuator {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let stop_params = json!({
+            "dispatch_id": applied_dispatch_id,
+            "expected_generation": 7,
+            "idempotency_key": "stop-applied-dispatch-1"
+        });
+        let stopped = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &stop_params,
+            true,
+            Some(&stop_actuator),
+        );
+        assert_eq!(stopped["ok"], true);
+        assert_eq!(stopped["delivery_state"], "stopped");
+        assert_eq!(
+            stopped["dispatch"]["parent_dispatch_id"],
+            applied_dispatch_id
+        );
+        assert_eq!(stopped["target_dispatch"]["delivery_state"], "stopped");
+        assert_eq!(
+            stop_actuator
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let stopped_replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &stop_params,
+            true,
+            Some(&stop_actuator),
+        );
+        assert_eq!(stopped_replay["ok"], true);
+        assert_eq!(stopped_replay["replayed"], true);
+        assert_eq!(
+            stop_actuator
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "replaying a confirmed stop must not click Stop again"
+        );
+
+        let second_params = json!({
+            "session_ref": session_ref,
+            "message": "dispatch before delayed stop",
+            "expected_generation": 7,
+            "idempotency_key": "delivery-before-delayed-stop",
+            "work_chain_id": "wc_dddddddddddddddddddddddddddddddd",
+            "lane_id": "lane-browser"
+        });
+        let second = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &second_params,
+            true,
+            Some(&AppliedActuator),
+        );
+        assert_eq!(second["dispatch"]["delivery_state"], "applied");
+        let second_dispatch_id = second["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        struct DelayedStopActuator {
+            actuate_calls: std::sync::atomic::AtomicUsize,
+            reconcile_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl BrowserActuator for DelayedStopActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::DispatchStop.method());
+                assert!(dispatch_id.is_some_and(|value| value.starts_with("bd_")));
+                self.actuate_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: None,
+                })
+            }
+
+            fn reconcile_dispatch(
+                &self,
+                dispatch_id: &str,
+                expected_generation: i64,
+            ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+                assert!(dispatch_id.starts_with("bd_"));
+                self.reconcile_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: true,
+                    result: None,
+                }))
+            }
+        }
+        let delayed_stop_actuator = DelayedStopActuator {
+            actuate_calls: std::sync::atomic::AtomicUsize::new(0),
+            reconcile_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let delayed_stop_params = json!({
+            "dispatch_id": second_dispatch_id,
+            "expected_generation": 7,
+            "idempotency_key": "stop-delayed-dispatch-1"
+        });
+        let uncertain_stop = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &delayed_stop_params,
+            true,
+            Some(&delayed_stop_actuator),
+        );
+        assert_eq!(uncertain_stop["ok"], false);
+        assert_eq!(uncertain_stop["delivery_state"], "uncertain");
+        let stop_dispatch_id = uncertain_stop["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let uncertain_replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.stop",
+            &delayed_stop_params,
+            true,
+            Some(&delayed_stop_actuator),
+        );
+        assert_eq!(uncertain_replay["replayed"], true);
+        assert_eq!(uncertain_replay["delivery_state"], "uncertain");
+        assert_eq!(
+            delayed_stop_actuator
+                .actuate_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an uncertain stop replay must not send a second Stop command"
+        );
+
+        let reconciled_stop = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.status",
+            &json!({"dispatch_id": stop_dispatch_id}),
+            &[],
+            Some(&delayed_stop_actuator),
+            None,
+        );
+        assert_eq!(reconciled_stop["reconciled"], true);
+        assert_eq!(reconciled_stop["dispatch"]["delivery_state"], "stopped");
+        assert_eq!(
+            reconciled_stop["target_dispatch"]["delivery_state"],
+            "stopped"
+        );
+        assert_eq!(
+            delayed_stop_actuator
+                .reconcile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[test]
@@ -5167,7 +6320,7 @@ mod tests {
     }
 
     #[test]
-    fn alpha4_browser_mutation_support_matrix_is_frozen() {
+    fn beta2_browser_mutation_support_matrix_is_frozen() {
         let cases = [
             (
                 "herdr_mcp.browser_space.create",
@@ -5186,17 +6339,6 @@ mod tests {
                     "space_ref": "br_space",
                     "expected_generation": 7,
                     "idempotency_key": "unsupported-space-open"
-                }),
-            ),
-            (
-                "herdr_mcp.browser_session.create",
-                json!({
-                    "endpoint_ref": "be_alpha4",
-                    "provider": "chatgpt",
-                    "account_ref": "br_account",
-                    "display_label": "Conversation",
-                    "expected_generation": 7,
-                    "idempotency_key": "unsupported-session-create"
                 }),
             ),
             (
@@ -5224,14 +6366,6 @@ mod tests {
                     "required_apps": ["herdr"],
                     "expected_generation": 7,
                     "idempotency_key": "unsupported-apps"
-                }),
-            ),
-            (
-                "herdr_mcp.browser_dispatch.stop",
-                json!({
-                    "dispatch_id": "bd_alpha4",
-                    "expected_generation": 7,
-                    "idempotency_key": "unsupported-stop"
                 }),
             ),
             (
@@ -5281,20 +6415,26 @@ mod tests {
                 "idempotency_key": "supported-session-open"
             })
         ));
-        assert!(
-            !browser_operation_alpha4_supported(
-                BrowserOperation::SessionCreate,
-                &json!({
-                    "endpoint_ref": "be_alpha4",
-                    "provider": "chatgpt",
-                    "account_ref": "br_account",
-                    "display_label": "Conversation",
-                    "expected_generation": 7,
-                    "idempotency_key": "still-unsupported-session-create"
-                })
-            ),
-            "browser_session.create must remain unsupported"
-        );
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::DispatchStop,
+            &json!({
+                "dispatch_id": "bd_alpha4",
+                "expected_generation": 7,
+                "idempotency_key": "supported-stop"
+            })
+        ));
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::SessionCreate,
+            &json!({
+                "endpoint_ref": "be_alpha4",
+                "provider": "chatgpt",
+                "account_ref": "br_account",
+                "display_label": "Conversation",
+                "message": "first assignment",
+                "expected_generation": 7,
+                "idempotency_key": "supported-session-create"
+            })
+        ));
     }
 
     #[test]
@@ -5687,7 +6827,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_session_create_remains_unsupported_regression() {
+    fn browser_session_create_requires_advertised_capability_regression() {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
             BrowserProviderObservationInput, BrowserResourceObservationInput,
@@ -5748,13 +6888,254 @@ mod tests {
                 "account_ref": account_ref,
                 "display_label": "Conversation",
                 "expected_generation": 7,
-                "idempotency_key": "create-still-unsupported"
+                "message": "first assignment",
+                "idempotency_key": "create-without-capability"
             }),
             true,
             None,
         );
-        assert_eq!(result["code"], "unsupported");
-        assert_eq!(result["operation"], "herdr_mcp.browser_session.create");
+        assert_eq!(result["code"], "capability_not_allowed");
+        assert_eq!(result["actuation_available"], false);
+    }
+
+    #[test]
+    fn browser_session_create_materializes_once_and_reconciles_uncertain_delivery() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct SessionCreateActuator {
+            store: Arc<Mutex<StateStore>>,
+            calls: AtomicUsize,
+            reconcile_calls: AtomicUsize,
+            delayed: bool,
+        }
+
+        impl SessionCreateActuator {
+            fn applied_evidence(expected_generation: i64) -> BrowserPostconditionEvidence {
+                BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: true,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: None,
+                }
+            }
+
+            fn materialize(&self, params: &Value, expected_generation: i64) {
+                let reservation_ref = params["reservation_ref"].as_str().unwrap();
+                let account_ref = params["account_ref"].as_str().unwrap();
+                let native_identity = format!("created-{reservation_ref}");
+                let canonical_url = format!("https://chatgpt.com/c/{reservation_ref}");
+                let mut guard = self.store.lock().unwrap();
+                let reservation = guard
+                    .browser_session_reservation(reservation_ref)
+                    .unwrap()
+                    .unwrap();
+                let session = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &reservation.endpoint_ref,
+                        provider: &reservation.provider,
+                        kind: "session",
+                        parent_ref: Some(account_ref),
+                        native_identity: &native_identity,
+                        display_label: Some(&reservation.display_label),
+                        observation_generation: expected_generation,
+                        observed_at: 20,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &session.resource_ref,
+                        &canonical_url,
+                        expected_generation,
+                        20,
+                    )
+                    .unwrap();
+                guard
+                    .materialize_browser_session_reservation(
+                        reservation_ref,
+                        &session.resource_ref,
+                        20,
+                    )
+                    .unwrap();
+            }
+        }
+
+        impl BrowserActuator for SessionCreateActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::SessionCreate.method());
+                assert_eq!(dispatch_id, params["reservation_ref"].as_str());
+                assert_eq!(params["launch_url"], "https://chatgpt.com");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.materialize(params, expected_generation);
+                let mut evidence = Self::applied_evidence(expected_generation);
+                if self.delayed {
+                    evidence.generation_status_observed = false;
+                }
+                Ok(evidence)
+            }
+
+            fn reconcile_dispatch(
+                &self,
+                dispatch_id: &str,
+                expected_generation: i64,
+            ) -> Result<Option<BrowserPostconditionEvidence>, String> {
+                assert!(dispatch_id.starts_with("bsr_"));
+                self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Self::applied_evidence(expected_generation)))
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-create-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create","session.open","composer.submit"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "session-create-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &account.resource_ref,
+                    "https://chatgpt.com",
+                    7,
+                    12,
+                )
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        };
+
+        let immediate = SessionCreateActuator {
+            store: store.clone(),
+            calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            delayed: false,
+        };
+        let immediate_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker A",
+            "message": "do bounded task A",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-immediate-1"
+        });
+        let created = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &immediate_params,
+            true,
+            Some(&immediate),
+        );
+        assert_eq!(created["ok"], true);
+        assert!(created["session_ref"].as_str().unwrap().starts_with("br_"));
+        assert_eq!(created["dispatch"]["delivery_state"], "applied");
+        assert_eq!(immediate.calls.load(Ordering::SeqCst), 1);
+        let replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &immediate_params,
+            true,
+            Some(&immediate),
+        );
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(immediate.calls.load(Ordering::SeqCst), 1);
+
+        let delayed = SessionCreateActuator {
+            store: store.clone(),
+            calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            delayed: true,
+        };
+        let delayed_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker B",
+            "message": "do bounded task B",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-delayed-1"
+        });
+        let uncertain = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &delayed_params,
+            true,
+            Some(&delayed),
+        );
+        assert_eq!(uncertain["ok"], false);
+        assert_eq!(uncertain["delivery_state"], "uncertain");
+        assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+        let reconciled = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &delayed_params,
+            true,
+            Some(&delayed),
+        );
+        assert_eq!(reconciled["ok"], true);
+        assert_eq!(reconciled["replayed"], true);
+        assert_eq!(reconciled["reconciled"], true);
+        assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delayed.reconcile_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -5764,7 +7145,7 @@ mod tests {
             BrowserProviderObservationInput, BrowserResourceObservationInput,
             BrowserResourceRecord,
         };
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Mutex, RwLock};
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let (endpoint_ref, account_ref, session_ref) = {
@@ -5905,9 +7286,29 @@ mod tests {
         assert_eq!(inspect["ok"], true);
         assert_eq!(inspect["actuation_available"], true);
         assert!(inspect["actuation_reason"].is_null());
+        assert_eq!(inspect["route"]["endpoint_ref"], endpoint_ref);
+        assert_eq!(inspect["route"]["provider"], "chatgpt");
+        assert_eq!(inspect["route"]["account_ref"], account_ref);
+        assert_eq!(inspect["route"]["resource_observation_generation"], 7);
+        assert_eq!(inspect["route"]["provider_observation_generation"], 7);
+        assert_eq!(inspect["route"]["adapter_protocol_version"], 1);
+        assert_eq!(inspect["route"]["status"], "current");
+        assert_eq!(
+            inspect["route"]["configuration_source"],
+            "browser_registry_observation"
+        );
+        assert_eq!(inspect["capabilities"]["schema_version"], 1);
+        assert_eq!(
+            inspect["capabilities"]["input_contract"]["message"]["max_bytes"],
+            262_144
+        );
+        assert_eq!(
+            inspect["capabilities"]["provider_dynamic_limits"]["turn_timeout_ms"]["status"],
+            "unknown"
+        );
 
         struct GateProbeActuator<'a> {
-            gate: &'a Mutex<()>,
+            gate: &'a RwLock<()>,
         }
         impl BrowserActuator for GateProbeActuator<'_> {
             fn actuate(
@@ -5918,7 +7319,7 @@ mod tests {
                 _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
                 assert!(
-                    self.gate.try_lock().is_err(),
+                    self.gate.try_write().is_err(),
                     "the consent/mutation gate must remain held through browser actuation"
                 );
                 Ok(BrowserPostconditionEvidence::resource_unavailable(
@@ -5938,7 +7339,48 @@ mod tests {
                 panic!("explicit unsupported mutations must not reach browser actuation")
             }
         }
-        let mutation_gate = Mutex::new(());
+        let admission = BrowserMutationAdmission::default();
+        let same_account_scope = BrowserMutationScope {
+            endpoint_ref: endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: account_ref.clone(),
+        };
+        let same_account_permit = admission
+            .reserve(&same_account_scope)
+            .unwrap()
+            .expect("first account mutation reserves its slot");
+        let backpressured = browser_operation_call_with_controls(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            &exact_grants,
+            Some(&PanicActuator),
+            None,
+            Some(&admission),
+        );
+        assert_eq!(backpressured["code"], "browser_account_backpressure");
+        assert_eq!(backpressured["retryable"], true);
+        assert_eq!(backpressured["limit"], 1);
+        assert_eq!(
+            backpressured["retry_after_ms"],
+            BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS
+        );
+        assert_eq!(
+            backpressured["resource_key"],
+            format!("{endpoint_ref}:chatgpt:{account_ref}")
+        );
+        let other_account_permit = admission
+            .reserve(&BrowserMutationScope {
+                endpoint_ref: endpoint_ref.clone(),
+                provider: "chatgpt".to_owned(),
+                account_ref: format!("br_{}", "f".repeat(64)),
+            })
+            .unwrap()
+            .expect("an unrelated account keeps independent admission capacity");
+        drop(other_account_permit);
+        drop(same_account_permit);
+
+        let mutation_gate = RwLock::new(());
         let gated_attempt = browser_operation_call_with_grants(
             &store,
             "herdr_mcp.browser_dispatch.submit",
@@ -6044,6 +7486,26 @@ mod tests {
                 observed_at: 16,
             })
             .unwrap();
+        let stale_inspect = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_session.inspect",
+            &json!({"session_ref": session_ref}),
+            &exact_grants,
+            None,
+            None,
+        );
+        assert_eq!(stale_inspect["ok"], true);
+        assert_eq!(stale_inspect["actuation_available"], false);
+        assert_eq!(
+            stale_inspect["actuation_reason"],
+            "stale_capability_generation"
+        );
+        assert_eq!(
+            stale_inspect["route"]["status"],
+            "stale_capability_generation"
+        );
+        assert_eq!(stale_inspect["route"]["resource_observation_generation"], 7);
+        assert_eq!(stale_inspect["route"]["provider_observation_generation"], 8);
         let stale = browser_operation_call_with_grant(
             &store,
             "herdr_mcp.browser_dispatch.submit",
@@ -6418,5 +7880,155 @@ mod tests {
         assert_eq!(allowed["ok"], true);
         assert_eq!(allowed["generation"], "pa:test");
         assert_eq!(allowed["text"], "visible page text");
+    }
+    #[test]
+    fn browser_session_open_uses_local_locator_and_replays_idempotently() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct SessionOpenActuator {
+            calls: AtomicUsize,
+            session_ref: String,
+        }
+
+        impl BrowserActuator for SessionOpenActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::SessionOpen.method());
+                assert!(dispatch_id.is_none());
+                assert_eq!(params["session_ref"], self.session_ref);
+                assert_eq!(params["provider"], "chatgpt");
+                assert_eq!(
+                    params["canonical_url"],
+                    "https://chatgpt.com/c/session-open-1"
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: None,
+                })
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let session_ref = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "session-open-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "session-open-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-open-1",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    "https://chatgpt.com/c/session-open-1",
+                    7,
+                    13,
+                )
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            session.resource_ref
+        };
+        let actuator = SessionOpenActuator {
+            calls: AtomicUsize::new(0),
+            session_ref: session_ref.clone(),
+        };
+        let params = json!({
+            "session_ref": session_ref,
+            "expected_generation": 7,
+            "idempotency_key": "session-open-idempotency-1"
+        });
+        let first = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["delivery_state"], "applied");
+        assert_eq!(first["idempotent_replay"], false);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        let replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.open",
+            &params,
+            true,
+            Some(&actuator),
+        );
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
     }
 }

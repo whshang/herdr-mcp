@@ -233,7 +233,7 @@ test("A to B to A registration cannot resurrect an older A response", async () =
   assert.equal(harness.state().generation, 12);
 });
 
-test("ChatGPT session.open is the only supported existing-view open (create stays unsupported)", () => {
+test("ChatGPT session.open is the only supported existing-view open", () => {
   assert.match(backgroundSource, /capabilities:\s*\{\s*operations:\s*provider === "chatgpt"/);
   assert.match(backgroundSource, /"session\.open"/);
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
@@ -251,14 +251,14 @@ test("background session.open recovers unique target via recoverBrowserSessionTa
   assert.doesNotMatch(segment, /insertMainWorld|performWake|tabs\.reload|executeScript/);
   // Must fail closed on missing/duplicate/stale/provider mismatch.
   assert.match(segment, /observedGeneration/);
-  assert.match(segment, /provider !== "chatgpt"/);
+  assert.match(segment, /providerOpen !== "chatgpt"/);
 });
 
 test("content script session.open verifies identity, generation, route, canonical readiness and never submits", () => {
   const start = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_session.open")');
   assert.ok(start >= 0, "wake must handle session.open");
-  const dispatchStart = wakeSource.indexOf('if (command?.operation !== "herdr_mcp.browser_dispatch.submit")', start);
-  const segment = wakeSource.slice(start, dispatchStart >= 0 ? dispatchStart : start + 3000);
+  const stopStart = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_dispatch.stop")', start);
+  const segment = wakeSource.slice(start, stopStart >= 0 ? stopStart : start + 3000);
   assert.match(segment, /registeredBrowserSessionRef/);
   assert.match(segment, /registeredBrowserGeneration/);
   assert.match(segment, /registeredConvKey/);
@@ -272,10 +272,47 @@ test("content script session.open verifies identity, generation, route, canonica
   assert.match(segment, /command_accepted\s*=\s*true/);
 });
 
-test("browser_session.create remains unsupported and never reaches browser actuation", () => {
-  // Background must not have a dedicated create branch, and Rust matrix keeps it unsupported.
-  assert.equal(backgroundSource.includes('herdr_mcp.browser_session.create') && backgroundSource.includes('if (operation === "herdr_mcp.browser_session.create")'), false);
-  assert.match(wakeSource, /herdr_mcp\.browser_dispatch\.submit/);
-  // Ensure the capability snapshot for non-chatgpt never advertises session.open.
-  assert.match(backgroundSource, /provider === "chatgpt"\s*\?/);
+test("ChatGPT session.open can restore a disposable view from a local canonical locator", () => {
+  const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
+  assert.ok(start >= 0, "session.open branch must exist in handleBrowserActuation");
+  const end = backgroundSource.indexOf("\n  const sessionRef = String(params.session_ref", start);
+  const segment = backgroundSource.slice(start, end >= 0 ? end : start + 9000);
+  assert.match(segment, /recoverBrowserSessionTarget/);
+  assert.match(segment, /canonical_url/);
+  assert.match(segment, /chrome\.tabs\.create\(\{ url: canonicalUrl, active: true \}\)/);
+  assert.match(segment, /chrome\.tabs\.update\(targetOpen\.tabId, \{ active: true, autoDiscardable: false \}\)/);
+  assert.doesNotMatch(segment, /performWake|insertMainWorld|dispatchEnterSubmit|findSendButton/);
+
+  const contentStart = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_session.open")');
+  const contentEnd = wakeSource.indexOf('if (command?.operation === "herdr_mcp.browser_dispatch.stop")', contentStart);
+  const contentSegment = wakeSource.slice(contentStart, contentEnd);
+  assert.match(contentSegment, /registeredBrowserSessionRef/);
+  assert.match(contentSegment, /registeredBrowserGeneration/);
+  assert.match(contentSegment, /providerCanonicalConversationObserved/);
+  assert.match(contentSegment, /canonical_url_observed\s*=\s*true/);
+  assert.doesNotMatch(contentSegment, /performWake|findSendButton|dispatchEnterSubmit/);
+});
+
+test("ChatGPT session.create carries one durable reservation across the new-conversation route", () => {
+  const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
+  const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);
+  assert.ok(start >= 0 && end > start, "session.create branch must precede session.open");
+  const segment = backgroundSource.slice(start, end);
+  assert.match(segment, /browserTabScopes\.get\(createdTab\.id\)/);
+  assert.match(segment, /scope\.accountRef === accountRefCreate/);
+  assert.match(segment, /scope\.spaceRef === spaceRefCreate/);
+  assert.match(segment, /chrome\.tabs\.create\(\{ url: launchUrl, active: true \}\)/);
+  assert.match(segment, /reservationRef/);
+
+  const createStart = wakeSource.indexOf('const creatingSession = command?.operation === "herdr_mcp.browser_session.create"');
+  const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);
+  const createSegment = wakeSource.slice(createStart, createEnd);
+  assert.match(createSegment, /sessionStorage\.setItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef\)/);
+  assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
+  assert.match(createSegment, /registeredBrowserSessionRef/);
+
+  const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
+  const registrationSegment = wakeSource.slice(registrationStart, registrationStart + 3500);
+  assert.match(registrationSegment, /browserSessionReservationRef/);
+  assert.match(registrationSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
 });
