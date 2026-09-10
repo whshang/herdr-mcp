@@ -787,7 +787,32 @@ fn connect_existing_worker(
     _pairing_address: &str,
     _name: Option<&str>,
 ) -> Result<ExitCode, String> {
-    Err("worker connect is currently supported on macOS and Linux".to_owned())
+    Err("worker connect is unsupported on this platform".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn connect_existing_worker(
+    paths: &RuntimePaths,
+    pairing_address: &str,
+    name: Option<&str>,
+) -> Result<ExitCode, String> {
+    let (edge_origin, pairing_id) = parse_pairing_address(pairing_address)?;
+    let code = read_pairing_code_tty()?;
+    connect_macos_inner(
+        paths,
+        &edge_origin,
+        &pairing_id,
+        &code,
+        name,
+        crate::credential_store::store,
+        Config::load_for_instance,
+        write_config_atomic,
+        revoke_self,
+        crate::credential_store::delete,
+        activate_connected_runtime,
+        |_paths| crate::windows_service_manager::reconcile_link(),
+        consume_pairing,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -952,6 +977,29 @@ pub(crate) fn adopt_bootstrap_enrollment(
     )
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn adopt_bootstrap_enrollment(
+    paths: &RuntimePaths,
+    edge_origin: &str,
+    enrolled: EnrolledCredential,
+) -> Result<ExitCode, String> {
+    connect_macos_inner(
+        paths,
+        edge_origin,
+        "bootstrap-enrollment",
+        "000000",
+        None,
+        crate::credential_store::store,
+        Config::load_for_instance,
+        write_config_atomic,
+        revoke_self,
+        crate::credential_store::delete,
+        activate_connected_runtime,
+        |_paths| crate::windows_service_manager::reconcile_link(),
+        move |_, _, _, _| Ok(enrolled.clone()),
+    )
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn adopt_bootstrap_enrollment(
     paths: &RuntimePaths,
@@ -981,7 +1029,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
     _edge_origin: &str,
     _enrolled: EnrolledCredential,
 ) -> Result<ExitCode, String> {
-    Err("first-Worker enrollment activation is currently supported on macOS and Linux".to_owned())
+    Err("first-Worker enrollment activation is unsupported on this platform".to_owned())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -1763,6 +1811,24 @@ fn activate_connected_runtime(_paths: &RuntimePaths) -> Result<(), String> {
         );
     }
     crate::linux_service_manager::ensure_link_installed()?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn activate_connected_runtime(_paths: &RuntimePaths) -> Result<(), String> {
+    let code = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false })?;
+    if code != ExitCode::SUCCESS {
+        return Err(format!(
+            "Windows service install returned a non-success exit code: {code:?}"
+        ));
+    }
+    let service = crate::windows_service_manager::doctor_status()?;
+    if service.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(
+            "herdr-mcp Windows service is not healthy after worker connect activation".to_owned(),
+        );
+    }
+    crate::windows_service_manager::reconcile_link()?;
     Ok(())
 }
 

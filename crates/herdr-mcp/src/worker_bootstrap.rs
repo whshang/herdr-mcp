@@ -568,10 +568,7 @@ impl<'a> Cloudflare<'a> {
 
 pub fn run(paths: &RuntimePaths) -> Result<ExitCode, String> {
     if !bootstrap_platform_supported(std::env::consts::OS) {
-        return Err(
-            "worker bootstrap currently supports macOS and Linux first-device installation"
-                .to_owned(),
-        );
+        return Err("worker bootstrap is unsupported on this platform".to_owned());
     }
     if paths.instance.is_named() {
         return Err("worker bootstrap is available only on the default Herdr instance".to_owned());
@@ -580,7 +577,7 @@ pub fn run(paths: &RuntimePaths) -> Result<ExitCode, String> {
 }
 
 fn bootstrap_platform_supported(os: &str) -> bool {
-    matches!(os, "macos" | "linux")
+    matches!(os, "macos" | "linux" | "windows")
 }
 
 fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
@@ -2310,13 +2307,22 @@ fn validate_journal(
 }
 
 fn current_runtime_generation() -> Option<String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    fs::read_link(home.join(".config/herdr-mcp/runtime/current"))
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-        })
+    let paths = RuntimePaths::discover().ok()?;
+    let current = paths.config_dir.join("runtime").join("current");
+
+    #[cfg(target_os = "windows")]
+    {
+        return fs::read_to_string(current.join("generation"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| value.starts_with("rust-"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fs::read_link(current).ok().and_then(|path| {
+        path.file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+    })
 }
 
 fn form_body(values: &[(&str, &str)]) -> String {
@@ -2422,17 +2428,21 @@ fn open_browser(_url: &str) {
             .stderr(std::process::Stdio::null())
             .spawn();
     }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(_url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
 }
 
 fn stdin_is_tty() -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    use std::io::IsTerminal;
+    io::stdin().is_terminal()
 }
 
 fn read_hidden_line(prompt: &str) -> Result<String, String> {
@@ -2467,7 +2477,31 @@ fn read_hidden_line(prompt: &str) -> Result<String, String> {
         read.map_err(|error| error.to_string())?;
         Ok(line.trim_end_matches(['\r', '\n']).to_owned())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+        };
+
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut original = 0_u32;
+        if unsafe { GetConsoleMode(handle, &mut original) } == 0 {
+            return Err("cannot read Windows console mode for hidden credential input".to_owned());
+        }
+        if unsafe { SetConsoleMode(handle, original & !ENABLE_ECHO_INPUT) } == 0 {
+            return Err("cannot disable Windows console echo for credential input".to_owned());
+        }
+        let mut line = String::new();
+        let read = io::stdin().read_line(&mut line);
+        let restored = unsafe { SetConsoleMode(handle, original) };
+        eprintln!();
+        if restored == 0 {
+            return Err("could not restore Windows console echo after credential input".to_owned());
+        }
+        read.map_err(|error| error.to_string())?;
+        Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err("hidden API-token input is unavailable on this platform; set CLOUDFLARE_API_TOKEN in the current process".to_owned())
     }
@@ -2478,10 +2512,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_worker_bootstrap_supports_macos_and_linux() {
+    fn first_worker_bootstrap_supports_desktop_platforms() {
         assert!(bootstrap_platform_supported("macos"));
         assert!(bootstrap_platform_supported("linux"));
-        assert!(!bootstrap_platform_supported("windows"));
+        assert!(bootstrap_platform_supported("windows"));
+        assert!(!bootstrap_platform_supported("freebsd"));
     }
 
     #[test]
