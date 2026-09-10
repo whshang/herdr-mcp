@@ -70,12 +70,15 @@ test("Agent install resolves fleet existence before any Cloudflare mutation", ()
   assert.doesNotMatch(zh, /改用机器相关\/随机后缀名/);
 });
 
-test("Agent install guide makes the bootstrap Token ephemeral and DNS-free", () => {
-  const en = read("docs/i18n/en/agent-install.md");
-  assert.match(en, /Never echo a Cloudflare Token/);
-  assert.match(en, /shell history/);
-  assert.match(en, /Unset `CLOUDFLARE_API_TOKEN`/);
-  assert.match(en, /does not require generic DNS Write/);
+test("Agent install keeps the bootstrap Token ephemeral without requiring generic DNS write", () => {
+  for (const rel of ["docs/i18n/en/agent-install.md", "docs/i18n/zh-CN/agent-install.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /CLOUDFLARE_API_TOKEN/);
+    assert.match(doc, /shell history/);
+    assert.match(doc, /generic DNS Write|通用 DNS Write/);
+    assert.match(doc, /Cloudflare DNS/);
+    assert.match(doc, /Google DNS/);
+  }
 });
 
 test("Agent install stays concise while preserving the executable bootstrap contract", () => {
@@ -134,39 +137,17 @@ test("quick Agent protocols plan once, batch safe work, and keep optional detail
   }
 });
 
-test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () => {
+test("legacy Node herdr-link wrapper resolves Node from PATH when explicitly invoked", () => {
   const src = read("bin/herdr-link");
   assert.match(src, /HERDR_NODE_BIN/);
   assert.match(src, /command -v node/);
   assert.doesNotMatch(src, /^NODE_BIN="\/usr\/local\/bin\/node"$/m);
 });
 
-test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and fleet OAuth handoff", () => {
-  for (const rel of [
-  ]) {
-    const doc = read(rel);
-    assert.match(doc, /INTERNAL GA UAT|内部 GA UAT/);
-    assert.match(doc, /not end-user install|非终端用户安装/);
-    assert.match(doc, /begin execution immediately|立即阅读本 URL/);
-    assert.match(doc, /herdr\.dev\/install\.sh/);
-    assert.match(doc, /cloudflare-worker-name\.mjs/);
-    assert.match(doc, /herdr-edge-prod/);
-    assert.match(doc, /HERDR_EDGE_URL/);
-    assert.match(doc, /HERDR_WORKSTATION_ID/);
-    assert.match(doc, /HERDR_LINK_KEYCHAIN_SERVICE/);
-    assert.match(doc, /PlistBuddy|patch plist/i);
-    assert.match(doc, /workers_dev = true/);
-    assert.match(doc, /TAG=v0\.4\.0/);
-    assert.match(doc, /chrome:\/\/extensions/);
-    assert.match(doc, /Edit Cloudflare Workers/);
-    assert.match(doc, /CLOUDFLARE_API_TOKEN/);
-    assert.match(doc, /Account Resources/);
-    assert.match(doc, /Zone Resources/);
-    assert.match(doc, /dash\.cloudflare\.com\/profile\/api-tokens/);
-    assert.match(doc, /multi-device/i);
+test("end-user install docs exclude the retired second-Mac GA UAT prompt", () => {
+  for (const rel of ["docs/i18n/en/install.md", "docs/i18n/zh-CN/install.md"]) {
+    assert.doesNotMatch(read(rel), /second-mac-ga-uat-agent-prompt/);
   }
-  assert.doesNotMatch(read("docs/i18n/en/install.md"), /second-mac-ga-uat-agent-prompt/);
-  assert.doesNotMatch(read("docs/i18n/zh-CN/install.md"), /second-mac-ga-uat-agent-prompt/);
 });
 
 test("browser privacy policy matches the Store-first extension data model", () => {

@@ -95,7 +95,7 @@ test("release model keeps publication and ownership boundaries explicit", () => 
   assert.match(model, /DEV/);
 });
 
-test("v0.4.3 source-development docs expose DEV/PROD dogfood without the old npm rebuild path", () => {
+test("source-development docs expose DEV/PROD dogfood without the retired npm rebuild path", () => {
   for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
     const doc = read(rel);
     assert.doesNotMatch(doc, /herdr-mcp dev sync/, `${rel} keeps contributor DEV activation out of the top-level user path`);

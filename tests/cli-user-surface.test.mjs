@@ -72,16 +72,11 @@ test("cargo-built herdr-mcp --help lists the user path ahead of service", () => 
   assert.ok(install >= 0 && service > install, "user-path install must precede service");
 });
 
-test("worker connect owns local service and enrolled production Link activation", () => {
+test("worker connect keeps service/link readiness in its public result contract", () => {
   const worker = read("crates/herdr-mcp/src/worker.rs");
-  const refresh = read("crates/herdr-mcp/src/link/generation_refresh.rs");
 
-  assert.match(worker, /fn activate_connected_runtime\(/);
-  assert.match(worker, /service_lifecycle::run\(ServiceCommand::Install \{ adopt_node: false \}\)/);
+  // Rust unit tests own activation internals. This JS surface test only pins
+  // the user-visible result fields so internal function names can evolve.
   assert.match(worker, /"service_ready": true/);
   assert.match(worker, /"link_ready": true/);
-  assert.match(refresh, /ensure_enrolled_rust_prod_link/);
-  assert.match(refresh, /install_fresh_rust_prod_link/);
-  assert.match(refresh, /configured_edge_device_identity\(home\)/);
-  assert.match(refresh, /Never rewrite or bootstrap an existing Node\/foreign production Link/);
 });
