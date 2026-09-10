@@ -33,7 +33,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -460,6 +460,27 @@ ALTER TABLE browser_session_reservations ADD COLUMN request_digest TEXT;
 ALTER TABLE browser_session_reservations ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'not_applied';
 "#;
 
+/// Migration 12: durable browser dispatch result settlement linkage.
+///
+/// The assistant worker result keeps living in Work Memory; only the exact
+/// settled-assistant identity and the durable Work Memory turn/evidence
+/// linkage are added to the existing dispatch row so `browser_dispatch.status`
+/// can project settlement without a second result database. The reservation
+/// keeps one nullable accepted-user-message ref so a crash between provider
+/// acceptance and synthesized dispatch creation cannot lose the exact submit
+/// identity that result settlement must match.
+const MIGRATION_V12: &str = r#"
+ALTER TABLE browser_dispatches ADD COLUMN accepted_user_message_ref TEXT;
+ALTER TABLE browser_dispatches ADD COLUMN result_assistant_message_ref TEXT;
+ALTER TABLE browser_dispatches ADD COLUMN result_turn_message_id TEXT;
+ALTER TABLE browser_dispatches ADD COLUMN result_evidence_id TEXT;
+ALTER TABLE browser_dispatches ADD COLUMN result_settled_at INTEGER;
+ALTER TABLE browser_session_reservations ADD COLUMN accepted_user_message_ref TEXT;
+CREATE INDEX IF NOT EXISTS idx_browser_dispatches_result_lookup
+    ON browser_dispatches(provider, target_session_ref, accepted_user_message_ref)
+    WHERE accepted_user_message_ref IS NOT NULL;
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -474,6 +495,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V9,
     MIGRATION_V10,
     MIGRATION_V11,
+    MIGRATION_V12,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -840,6 +862,10 @@ pub struct BrowserSessionReservationRecord {
     pub idempotency_key_digest: String,
     pub request_digest: Option<String>,
     pub delivery_state: String,
+    /// Exact provider user-message identity proven accepted for the first
+    /// assignment. Persisted so the crash window between provider acceptance
+    /// and synthesized dispatch creation can still be settled.
+    pub accepted_user_message_ref: Option<String>,
     pub state: String,
     pub session_ref: Option<String>,
     pub created_at: i64,
@@ -944,6 +970,11 @@ pub struct BrowserDispatchRecord {
     pub parent_dispatch_id: Option<String>,
     pub delivery_state: BrowserDeliveryState,
     pub generation_owner: Option<i64>,
+    pub accepted_user_message_ref: Option<String>,
+    pub result_assistant_message_ref: Option<String>,
+    pub result_turn_message_id: Option<String>,
+    pub result_evidence_id: Option<String>,
+    pub result_settled_at: Option<i64>,
     pub work_chain_id: Option<String>,
     pub lane_id: Option<String>,
     pub created_at: i64,
@@ -954,6 +985,29 @@ pub struct BrowserDispatchRecord {
 pub enum BrowserDispatchReservation {
     Reserved(BrowserDispatchRecord),
     Existing(BrowserDispatchRecord),
+}
+
+/// Exact identity of a finalized worker assistant turn that should settle one
+/// already-applied `browser_dispatch.submit`.
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserDispatchResultInput<'a> {
+    pub provider: &'a str,
+    pub session_ref: &'a str,
+    pub expected_generation: i64,
+    pub accepted_user_message_ref: &'a str,
+    pub assistant_message_ref: &'a str,
+    pub assistant_text: &'a str,
+    pub observed_at: i64,
+}
+
+/// Durable settlement outcome returned to the trusted Extension IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserDispatchResultRecord {
+    pub dispatch: BrowserDispatchRecord,
+    pub turn_message_id: String,
+    pub evidence_id: String,
+    pub evidence_sha256: String,
+    pub replayed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1954,48 +2008,12 @@ impl StateStore {
         content: &str,
         created_at: i64,
     ) -> Result<WorkMemoryEvidenceAppendRecord, String> {
-        if !valid_work_chain_id(work_chain_id) {
-            return Err("work_memory_work_chain_id_invalid".to_owned());
-        }
-        let mut continuity_ids = self
-            .conn
-            .prepare(
-                "SELECT continuity_id FROM continuity_chains
-                 WHERE work_chain_id = ?1 AND status = 'active'
-                 ORDER BY continuity_id LIMIT 2",
-            )
-            .map_err(|error| format!("cannot resolve browser dispatch work chain: {error}"))?
-            .query_map([work_chain_id], |row| row.get::<_, String>(0))
-            .map_err(|error| format!("cannot query browser dispatch work chain: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot read browser dispatch work chain: {error}"))?;
-        let continuity_id = match continuity_ids.len() {
-            0 => return Err("work_memory_not_found".to_owned()),
-            1 => continuity_ids.remove(0),
-            _ => return Err("work_memory_ambiguous".to_owned()),
-        };
-
-        let mut bindings = self
-            .conn
-            .prepare(
-                "SELECT account_ref, space_ref FROM continuity_provider_bindings
-                 WHERE continuity_id = ?1 AND provider = ?2 AND session_ref = ?3
-                 ORDER BY account_ref, space_ref LIMIT 2",
-            )
-            .map_err(|error| format!("cannot resolve browser dispatch provider binding: {error}"))?
-            .query_map(params![continuity_id, provider, session_ref], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| format!("cannot query browser dispatch provider binding: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot read browser dispatch provider binding: {error}"))?;
-        let (account_ref, space_ref) = match bindings.len() {
-            0 => return Err("work_memory_provider_binding_missing".to_owned()),
-            1 => bindings.remove(0),
-            _ => return Err("work_memory_provider_binding_ambiguous".to_owned()),
-        };
-        let account_ref = (!account_ref.is_empty()).then_some(account_ref);
-        let space_ref = (!space_ref.is_empty()).then_some(space_ref);
+        let (continuity_id, account_ref, space_ref) = resolve_browser_dispatch_work_memory_scope(
+            &self.conn,
+            work_chain_id,
+            provider,
+            session_ref,
+        )?;
         self.append_work_memory_evidence(WorkMemoryEvidenceInput {
             continuity_id: &continuity_id,
             kind: "browser_dispatch",
@@ -2006,6 +2024,155 @@ impl StateStore {
             session_ref: Some(session_ref),
             portable_source: None,
             created_at,
+        })
+    }
+
+    /// Settle one already-applied `browser_dispatch.submit` with the exact
+    /// finalized worker assistant turn.
+    ///
+    /// Matching is exact on provider, target session, accepted user-message ref,
+    /// and expected/generation owner. No text similarity is ever consulted.
+    ///
+    /// The assistant text is persisted through Work Memory
+    /// ([`Self::append_work_memory_turn`]) under the dispatch's Work Chain,
+    /// together with one deterministic `browser_result` evidence record. The
+    /// existing dispatch row then stores the durable linkage so
+    /// `browser_dispatch.status` can project settlement without a second result
+    /// database. Replays are idempotent; a different assistant-message ref for
+    /// an already-settled dispatch fails closed.
+    pub fn settle_browser_dispatch_result(
+        &mut self,
+        input: BrowserDispatchResultInput<'_>,
+    ) -> Result<BrowserDispatchResultRecord, String> {
+        validate_browser_token(input.provider, 32, "provider")?;
+        validate_browser_resource_ref(input.session_ref)?;
+        validate_browser_ref_text(
+            input.accepted_user_message_ref,
+            512,
+            "accepted_user_message_ref",
+        )?;
+        validate_browser_ref_text(input.assistant_message_ref, 512, "assistant_message_ref")?;
+        if input.expected_generation < 1 {
+            return Err("browser_expected_generation_invalid".to_owned());
+        }
+        if input.assistant_text.is_empty() || input.assistant_text.len() > 256 * 1024 {
+            return Err("browser_dispatch_result_text_invalid".to_owned());
+        }
+        if input.observed_at < 0 {
+            return Err("browser_updated_at_invalid".to_owned());
+        }
+
+        let dispatch = match read_browser_dispatch_by_accepted_message(
+            &self.conn,
+            input.provider,
+            input.session_ref,
+            input.accepted_user_message_ref,
+        )? {
+            Some(dispatch) => decode_browser_dispatch(dispatch)?,
+            None => return Err("browser_dispatch_result_unmatched".to_owned()),
+        };
+        if dispatch.operation != "browser_dispatch.submit"
+            || dispatch.delivery_state != BrowserDeliveryState::Applied
+            || dispatch.expected_generation != input.expected_generation
+            || dispatch.generation_owner != Some(input.expected_generation)
+        {
+            return Err("browser_dispatch_result_unmatched".to_owned());
+        }
+        if let Some(existing) = dispatch.result_assistant_message_ref.as_deref() {
+            if existing == input.assistant_message_ref {
+                return Ok(BrowserDispatchResultRecord {
+                    turn_message_id: dispatch.result_turn_message_id.clone().unwrap_or_default(),
+                    evidence_id: dispatch.result_evidence_id.clone().unwrap_or_default(),
+                    evidence_sha256: dispatch.result_evidence_id.clone().unwrap_or_default(),
+                    dispatch,
+                    replayed: true,
+                });
+            }
+            return Err("browser_dispatch_result_conflict".to_owned());
+        }
+
+        let work_chain_id = dispatch
+            .work_chain_id
+            .clone()
+            .ok_or_else(|| "browser_dispatch_result_work_chain_missing".to_owned())?;
+        let (continuity_id, account_ref, space_ref) = resolve_browser_dispatch_work_memory_scope(
+            &self.conn,
+            &work_chain_id,
+            input.provider,
+            input.session_ref,
+        )?;
+
+        let turn = self.append_work_memory_turn(WorkMemoryTurnInput {
+            continuity_id: &continuity_id,
+            provider: input.provider,
+            account_ref: account_ref.as_deref(),
+            space_ref: space_ref.as_deref(),
+            session_ref: input.session_ref,
+            provider_message_ref: input.assistant_message_ref,
+            role: "assistant",
+            text: input.assistant_text,
+            fingerprint: None,
+            observed_at: input.observed_at,
+        })?;
+
+        let content = serde_json::json!({
+            "schema": "herdr.browser_result_evidence/v1",
+            "dispatch_id": dispatch.dispatch_id,
+            "provider": dispatch.provider,
+            "session_ref": dispatch.target_session_ref,
+            "expected_generation": dispatch.expected_generation,
+            "generation_owner": dispatch.generation_owner,
+            "accepted_user_message_ref": input.accepted_user_message_ref,
+            "assistant_message_ref": input.assistant_message_ref,
+            "turn_message_id": turn.message_id,
+            "work_chain_id": work_chain_id,
+            "lane_id": dispatch.lane_id,
+        })
+        .to_string();
+        let evidence = self.append_work_memory_evidence(WorkMemoryEvidenceInput {
+            continuity_id: &continuity_id,
+            kind: "browser_result",
+            content: &content,
+            provider: Some(input.provider),
+            account_ref: account_ref.as_deref(),
+            space_ref: space_ref.as_deref(),
+            session_ref: Some(input.session_ref),
+            portable_source: None,
+            created_at: input.observed_at,
+        })?;
+
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE browser_dispatches
+                 SET result_assistant_message_ref = ?2, result_turn_message_id = ?3,
+                     result_evidence_id = ?4, result_settled_at = ?5,
+                     updated_at = MAX(updated_at, ?5)
+                 WHERE dispatch_id = ?1 AND result_assistant_message_ref IS NULL",
+                params![
+                    dispatch.dispatch_id,
+                    input.assistant_message_ref,
+                    turn.message_id,
+                    evidence.evidence_id,
+                    input.observed_at
+                ],
+            )
+            .map_err(|error| format!("cannot settle browser dispatch result: {error}"))?;
+        let settled = match self.browser_dispatch(&dispatch.dispatch_id)? {
+            Some(record) => record,
+            None => return Err("browser_dispatch_not_found".to_owned()),
+        };
+        if changed != 1
+            && settled.result_assistant_message_ref.as_deref() != Some(input.assistant_message_ref)
+        {
+            return Err("browser_dispatch_result_conflict".to_owned());
+        }
+        Ok(BrowserDispatchResultRecord {
+            dispatch: settled,
+            turn_message_id: turn.message_id,
+            evidence_id: evidence.evidence_id,
+            evidence_sha256: evidence.sha256,
+            replayed: changed != 1,
         })
     }
 
@@ -3177,7 +3344,8 @@ impl StateStore {
             .query_row(
                 "SELECT reservation_ref, endpoint_ref, provider, account_ref, space_ref,
                         display_label, expected_generation, idempotency_key_digest,
-                        request_digest, delivery_state, state, session_ref, created_at, updated_at, expires_at
+                        request_digest, delivery_state, state, session_ref, created_at, updated_at,
+                        expires_at, accepted_user_message_ref
                  FROM browser_session_reservations WHERE reservation_ref = ?1",
                 params![reservation_ref],
                 decode_browser_session_reservation,
@@ -3186,11 +3354,18 @@ impl StateStore {
             .map_err(|error| format!("cannot inspect browser session reservation: {error}"))
     }
 
+    /// Update one session reservation's delivery state and, when the first
+    /// assignment is proven applied, durably record the exact accepted provider
+    /// user-message ref. The accepted ref is written in the same transaction as
+    /// `applied` so the crash window between provider acceptance and synthesized
+    /// dispatch creation preserves the exact submit identity. A different
+    /// accepted ref for an already-recorded reservation fails closed.
     pub fn update_browser_session_reservation_delivery(
         &mut self,
         reservation_ref: &str,
         expected_generation: i64,
         delivery_state: BrowserDeliveryState,
+        accepted_user_message_ref: Option<&str>,
         updated_at: i64,
     ) -> Result<BrowserSessionReservationRecord, String> {
         validate_browser_session_reservation_ref(reservation_ref)?;
@@ -3199,6 +3374,12 @@ impl StateStore {
         }
         if updated_at < 0 {
             return Err("browser_updated_at_invalid".to_owned());
+        }
+        if let Some(accepted) = accepted_user_message_ref {
+            validate_browser_ref_text(accepted, 512, "accepted_user_message_ref")?;
+            if delivery_state != BrowserDeliveryState::Applied {
+                return Err("browser_session_accepted_message_not_applied".to_owned());
+            }
         }
         let tx = self
             .conn
@@ -3218,11 +3399,28 @@ impl StateStore {
         if matches!(current.state.as_str(), "cancelled" | "expired") {
             return Err("browser_session_reservation_not_pending".to_owned());
         }
+        if let Some(accepted) = accepted_user_message_ref
+            && current
+                .accepted_user_message_ref
+                .as_deref()
+                .is_some_and(|existing| existing != accepted)
+        {
+            return Err("browser_session_accepted_message_conflict".to_owned());
+        }
+        let effective_accepted = accepted_user_message_ref
+            .map(str::to_owned)
+            .or_else(|| current.accepted_user_message_ref.clone());
         tx.execute(
             "UPDATE browser_session_reservations
-             SET delivery_state = ?2, updated_at = MAX(updated_at, ?3)
+             SET delivery_state = ?2, accepted_user_message_ref = ?3,
+                 updated_at = MAX(updated_at, ?4)
              WHERE reservation_ref = ?1",
-            params![reservation_ref, delivery_state.as_str(), updated_at],
+            params![
+                reservation_ref,
+                delivery_state.as_str(),
+                effective_accepted,
+                updated_at
+            ],
         )
         .map_err(|error| format!("cannot update browser session delivery state: {error}"))?;
         let record = read_browser_session_reservation_by_ref(&tx, reservation_ref)?
@@ -3608,6 +3806,75 @@ impl StateStore {
         Ok(record)
     }
 
+    /// Durably record the exact accepted provider user-message ref for one
+    /// already-applied `browser_dispatch.submit`. Generation-fenced and
+    /// idempotent: the same ref replays cleanly, a different ref for an
+    /// already-recorded dispatch fails closed.
+    pub fn record_browser_dispatch_accepted_message(
+        &mut self,
+        dispatch_id: &str,
+        expected_generation: i64,
+        accepted_user_message_ref: &str,
+        updated_at: i64,
+    ) -> Result<BrowserDispatchRecord, String> {
+        validate_browser_dispatch_id(dispatch_id)?;
+        validate_browser_ref_text(accepted_user_message_ref, 512, "accepted_user_message_ref")?;
+        if expected_generation < 1 {
+            return Err("browser_expected_generation_invalid".to_owned());
+        }
+        if updated_at < 0 {
+            return Err("browser_updated_at_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser dispatch message record: {error}"))?;
+        let current = read_browser_dispatch_by_ref(&tx, dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())?;
+        if current.expected_generation != expected_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        if current.delivery_state != BrowserDeliveryState::Applied.as_str()
+            || current.generation_owner != Some(expected_generation)
+            || current.operation != "browser_dispatch.submit"
+        {
+            return Err("browser_dispatch_not_applied".to_owned());
+        }
+        if let Some(existing) = current.accepted_user_message_ref.as_deref() {
+            if existing == accepted_user_message_ref {
+                let record = decode_browser_dispatch(current)?;
+                tx.commit().map_err(|error| {
+                    format!("cannot commit existing browser dispatch message record: {error}")
+                })?;
+                return Ok(record);
+            }
+            return Err("browser_dispatch_accepted_message_conflict".to_owned());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE browser_dispatches
+                 SET accepted_user_message_ref = ?2, updated_at = MAX(updated_at, ?3)
+                 WHERE dispatch_id = ?1 AND expected_generation = ?4
+                   AND accepted_user_message_ref IS NULL",
+                params![
+                    dispatch_id,
+                    accepted_user_message_ref,
+                    updated_at,
+                    expected_generation
+                ],
+            )
+            .map_err(|error| format!("cannot record browser dispatch accepted message: {error}"))?;
+        if changed != 1 {
+            return Err("browser_dispatch_message_raced".to_owned());
+        }
+        let record = read_browser_dispatch_by_ref(&tx, dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())
+            .and_then(decode_browser_dispatch)?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser dispatch message record: {error}"))?;
+        Ok(record)
+    }
+
     pub fn update_browser_dispatch(
         &mut self,
         input: BrowserDispatchUpdateInput<'_>,
@@ -3814,6 +4081,7 @@ fn decode_browser_session_reservation(
         idempotency_key_digest: row.get(7)?,
         request_digest: row.get(8)?,
         delivery_state: row.get(9)?,
+        accepted_user_message_ref: row.get(15)?,
         state: row.get(10)?,
         session_ref: row.get(11)?,
         created_at: row.get(12)?,
@@ -3825,7 +4093,7 @@ fn decode_browser_session_reservation(
 const BROWSER_SESSION_RESERVATION_SELECT: &str = "SELECT reservation_ref, endpoint_ref, provider,
             account_ref, space_ref, display_label, expected_generation,
             idempotency_key_digest, request_digest, delivery_state, state, session_ref,
-            created_at, updated_at, expires_at
+            created_at, updated_at, expires_at, accepted_user_message_ref
      FROM browser_session_reservations";
 
 fn read_browser_session_reservation_by_ref(
@@ -3875,6 +4143,11 @@ struct StoredBrowserDispatch {
     parent_dispatch_id: Option<String>,
     delivery_state: String,
     generation_owner: Option<i64>,
+    accepted_user_message_ref: Option<String>,
+    result_assistant_message_ref: Option<String>,
+    result_turn_message_id: Option<String>,
+    result_evidence_id: Option<String>,
+    result_settled_at: Option<i64>,
     work_chain_id: Option<String>,
     lane_id: Option<String>,
     created_at: i64,
@@ -3885,7 +4158,9 @@ const BROWSER_DISPATCH_SELECT: &str = "SELECT dispatch_id, endpoint_ref, provide
             target_session_ref, request_digest, message_digest,
             reasoning_effort, required_apps_json, expected_generation,
             idempotency_key_digest, parent_dispatch_id, delivery_state,
-            generation_owner, work_chain_id, lane_id, created_at, updated_at
+            generation_owner, work_chain_id, lane_id, created_at, updated_at,
+            accepted_user_message_ref, result_assistant_message_ref,
+            result_turn_message_id, result_evidence_id, result_settled_at
      FROM browser_dispatches";
 
 fn decode_stored_browser_dispatch(
@@ -3910,6 +4185,11 @@ fn decode_stored_browser_dispatch(
         lane_id: row.get(15)?,
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
+        accepted_user_message_ref: row.get(18)?,
+        result_assistant_message_ref: row.get(19)?,
+        result_turn_message_id: row.get(20)?,
+        result_evidence_id: row.get(21)?,
+        result_settled_at: row.get(22)?,
     })
 }
 
@@ -3946,6 +4226,90 @@ fn read_browser_dispatch_by_scope(
     .map_err(|error| format!("cannot read browser dispatch reservation: {error}"))
 }
 
+fn read_browser_dispatch_by_accepted_message(
+    conn: &Connection,
+    provider: &str,
+    session_ref: &str,
+    accepted_user_message_ref: &str,
+) -> Result<Option<StoredBrowserDispatch>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "{BROWSER_DISPATCH_SELECT}
+             WHERE provider = ?1 AND target_session_ref = ?2
+               AND accepted_user_message_ref = ?3
+             ORDER BY dispatch_id LIMIT 2"
+        ))
+        .map_err(|error| format!("cannot prepare browser dispatch result lookup: {error}"))?;
+    let rows = stmt
+        .query_map(
+            params![provider, session_ref, accepted_user_message_ref],
+            decode_stored_browser_dispatch,
+        )
+        .map_err(|error| format!("cannot query browser dispatch result lookup: {error}"))?;
+    let mut matches = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot decode browser dispatch result lookup: {error}"))?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches.remove(0))),
+        _ => Err("browser_dispatch_result_ambiguous".to_owned()),
+    }
+}
+
+/// Resolve the single active Continuity chain and provider binding that own a
+/// browser dispatch's Work Chain + provider session scope. Ambiguous or missing
+/// scope fails closed so result settlement never guesses an owner.
+fn resolve_browser_dispatch_work_memory_scope(
+    conn: &Connection,
+    work_chain_id: &str,
+    provider: &str,
+    session_ref: &str,
+) -> Result<(String, Option<String>, Option<String>), String> {
+    if !valid_work_chain_id(work_chain_id) {
+        return Err("work_memory_work_chain_id_invalid".to_owned());
+    }
+    let mut continuity_ids = conn
+        .prepare(
+            "SELECT continuity_id FROM continuity_chains
+             WHERE work_chain_id = ?1 AND status = 'active'
+             ORDER BY continuity_id LIMIT 2",
+        )
+        .map_err(|error| format!("cannot resolve browser dispatch work chain: {error}"))?
+        .query_map([work_chain_id], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("cannot query browser dispatch work chain: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read browser dispatch work chain: {error}"))?;
+    let continuity_id = match continuity_ids.len() {
+        0 => return Err("work_memory_not_found".to_owned()),
+        1 => continuity_ids.remove(0),
+        _ => return Err("work_memory_ambiguous".to_owned()),
+    };
+
+    let mut bindings = conn
+        .prepare(
+            "SELECT account_ref, space_ref FROM continuity_provider_bindings
+             WHERE continuity_id = ?1 AND provider = ?2 AND session_ref = ?3
+             ORDER BY account_ref, space_ref LIMIT 2",
+        )
+        .map_err(|error| format!("cannot resolve browser dispatch provider binding: {error}"))?
+        .query_map(params![continuity_id, provider, session_ref], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("cannot query browser dispatch provider binding: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read browser dispatch provider binding: {error}"))?;
+    let (account_ref, space_ref) = match bindings.len() {
+        0 => return Err("work_memory_provider_binding_missing".to_owned()),
+        1 => bindings.remove(0),
+        _ => return Err("work_memory_provider_binding_ambiguous".to_owned()),
+    };
+    Ok((
+        continuity_id,
+        (!account_ref.is_empty()).then_some(account_ref),
+        (!space_ref.is_empty()).then_some(space_ref),
+    ))
+}
+
 fn decode_browser_dispatch(stored: StoredBrowserDispatch) -> Result<BrowserDispatchRecord, String> {
     let delivery_state = BrowserDeliveryState::parse(&stored.delivery_state)?;
     let required_apps = parse_browser_required_apps(&stored.required_apps_json)?;
@@ -3964,6 +4328,11 @@ fn decode_browser_dispatch(stored: StoredBrowserDispatch) -> Result<BrowserDispa
         parent_dispatch_id: stored.parent_dispatch_id,
         delivery_state,
         generation_owner: stored.generation_owner,
+        accepted_user_message_ref: stored.accepted_user_message_ref,
+        result_assistant_message_ref: stored.result_assistant_message_ref,
+        result_turn_message_id: stored.result_turn_message_id,
+        result_evidence_id: stored.result_evidence_id,
+        result_settled_at: stored.result_settled_at,
         work_chain_id: stored.work_chain_id,
         lane_id: stored.lane_id,
         created_at: stored.created_at,
@@ -6707,17 +7076,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_eight_binary_refuses_v11_and_requires_compatible_rollback_state() {
+    fn schema_eight_binary_refuses_v12_and_requires_compatible_rollback_state() {
         let path = temp_db_path();
         {
             let store = StateStore::open(&path).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 11);
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         }
         let mut schema_eight_connection = open_connection(Some(&path)).unwrap();
         let error = migrate_to(&mut schema_eight_connection, 8, &MIGRATIONS[..8]).unwrap_err();
         assert!(error.contains("newer than this binary supports (8)"));
         assert!(error.contains("schema-8 database backup"));
-        assert!(error.contains("schema-11-capable binary"));
+        assert!(error.contains(&format!("schema-{SCHEMA_VERSION}-capable binary")));
         drop(schema_eight_connection);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
@@ -7454,7 +7823,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_upgrades_through_v11_without_losing_continuity() {
+    fn schema_v5_upgrades_through_latest_without_losing_continuity() {
         let path = temp_db_path();
         {
             let conn = Connection::open(&path).unwrap();
@@ -7485,7 +7854,7 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
             store
                 .scalar_i64(
@@ -7665,7 +8034,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v8_upgrades_through_v11_without_losing_browser_registry() {
+    fn schema_v8_upgrades_through_latest_without_losing_browser_registry() {
         let path = temp_db_path();
         let endpoint_ref;
         let session_ref;
@@ -7722,7 +8091,7 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(store.browser_endpoint(&endpoint_ref).unwrap().is_some());
         assert!(store.browser_resource(&session_ref).unwrap().is_some());
         let tables = store.table_names().unwrap();
@@ -7740,10 +8109,106 @@ mod tests {
         assert_eq!(
             store
                 .scalar_i64(
-                    "SELECT COUNT(*) FROM pragma_table_info('browser_session_reservations') WHERE name IN ('request_digest', 'delivery_state')",
+                    "SELECT COUNT(*) FROM pragma_table_info('browser_dispatches') WHERE name IN ('accepted_user_message_ref', 'result_assistant_message_ref', 'result_turn_message_id', 'result_evidence_id', 'result_settled_at')",
                 )
                 .unwrap(),
-            Some(2)
+            Some(5)
+        );
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM pragma_table_info('browser_session_reservations') WHERE name IN ('request_digest', 'delivery_state', 'accepted_user_message_ref')",
+                )
+                .unwrap(),
+            Some(3)
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn schema_v11_upgrades_to_v12_with_result_settlement_columns() {
+        let path = temp_db_path();
+        let dispatch_id;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(11) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '11')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            dispatch_id = browser_opaque_ref(
+                "bd_",
+                &[
+                    "browser-dispatch-v1",
+                    "bep_v11",
+                    "chatgpt",
+                    "browser_dispatch.submit",
+                    "v11-key",
+                ],
+            );
+            // A pre-v12 dispatch row is migrated in place and keeps NULL result
+            // columns until a real settlement writes them.
+            conn.execute(
+                "INSERT INTO browser_endpoints(
+                    endpoint_ref, device_id, browser_family, extension_version,
+                    first_observed_at, last_observed_at
+                 ) VALUES ('bep_v11', 'device-v11', 'chrome', '0.1.91', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_provider_state(
+                    endpoint_ref, provider, adapter_protocol_version,
+                    observation_generation, capabilities_json, observed_at
+                 ) VALUES ('bep_v11', 'chatgpt', 1, 7, '{\"operations\":[]}', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_resources(
+                    resource_ref, endpoint_ref, provider, kind, parent_ref,
+                    native_identity_sha256, observation_generation,
+                    first_observed_at, last_observed_at
+                 ) VALUES ('br_v11', 'bep_v11', 'chatgpt', 'session', '', 'sha-v11', 7, 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_dispatches(
+                    dispatch_id, endpoint_ref, provider, operation, target_session_ref,
+                    request_digest, message_digest, required_apps_json, expected_generation,
+                    idempotency_key_digest, delivery_state, created_at, updated_at
+                 ) VALUES (?1, 'bep_v11', 'chatgpt', 'browser_dispatch.submit', 'br_v11',
+                    'req-v11', 'msg-v11', '[]', 7, 'v11-key', 'uncertain', 1, 1)",
+                [&dispatch_id],
+            )
+            .unwrap();
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let migrated = store.browser_dispatch(&dispatch_id).unwrap().unwrap();
+        assert_eq!(migrated.delivery_state, BrowserDeliveryState::Uncertain);
+        assert!(migrated.accepted_user_message_ref.is_none());
+        assert!(migrated.result_assistant_message_ref.is_none());
+        assert!(migrated.result_turn_message_id.is_none());
+        assert!(migrated.result_evidence_id.is_none());
+        assert!(migrated.result_settled_at.is_none());
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM pragma_table_info('browser_session_reservations') WHERE name = 'accepted_user_message_ref'",
+                )
+                .unwrap(),
+            Some(1)
         );
         drop(store);
         std::fs::remove_file(&path).ok();
@@ -8114,6 +8579,457 @@ mod tests {
                 .unwrap_err(),
             "stale_capability_generation"
         );
+    }
+
+    fn applied_submit_fixture(
+        store: &mut StateStore,
+        work_chain_id: &str,
+        message: &str,
+        idempotency_key: &str,
+    ) -> (String, String) {
+        let (endpoint_ref, session_ref, _) =
+            browser_dispatch_fixture(store, 7, &format!("settle-{idempotency_key}"));
+        store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:settle",
+                project_ref: "project:settle",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id,
+                provider: "chatgpt",
+                account_ref: None,
+                space_ref: None,
+                session_ref: &session_ref,
+                bound_at: 1,
+            })
+            .unwrap();
+        let message_digest = sha256_text(message);
+        let request_digest = sha256_text(&format!("request-{idempotency_key}"));
+        let key_digest = sha256_text(idempotency_key);
+        let required_apps: [&str; 0] = [];
+        let BrowserDispatchReservation::Reserved(dispatch) = store
+            .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                operation: "browser_dispatch.submit",
+                target_session_ref: &session_ref,
+                request_digest: &request_digest,
+                message_digest: &message_digest,
+                reasoning_effort: None,
+                required_apps: &required_apps,
+                expected_generation: 7,
+                idempotency_key_digest: &key_digest,
+                parent_dispatch_id: None,
+                work_chain_id: Some(work_chain_id),
+                lane_id: Some("lane-settle"),
+                created_at: 10,
+            })
+            .unwrap()
+        else {
+            panic!("expected a reserved dispatch");
+        };
+        store
+            .update_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &dispatch.dispatch_id,
+                expected_generation: 7,
+                delivery_state: BrowserDeliveryState::Applied,
+                generation_owner: Some(7),
+                updated_at: 11,
+            })
+            .unwrap();
+        (endpoint_ref, dispatch.dispatch_id)
+    }
+
+    fn work_memory_result_counts(store: &StateStore) -> (i64, i64) {
+        let turns = store
+            .scalar_i64(
+                "SELECT COUNT(*) FROM continuity_turns WHERE continuity_id = 'wm:settle' AND role = 'assistant'",
+            )
+            .unwrap()
+            .unwrap_or(0);
+        let evidence = store
+            .scalar_i64(
+                "SELECT COUNT(*) FROM continuity_evidence WHERE continuity_id = 'wm:settle' AND kind = 'browser_result'",
+            )
+            .unwrap()
+            .unwrap_or(0);
+        (turns, evidence)
+    }
+
+    #[test]
+    fn browser_dispatch_result_settlement_is_exact_idempotent_and_conflict_aware() {
+        const WORK_CHAIN: &str = "wc_cccccccccccccccccccccccccccccccc";
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (_endpoint_ref, dispatch_id) = applied_submit_fixture(
+            &mut store,
+            WORK_CHAIN,
+            "distinct worker assignment text",
+            "settle-key-1",
+        );
+        store
+            .record_browser_dispatch_accepted_message(&dispatch_id, 7, "provider-user-1", 12)
+            .unwrap();
+
+        let exact = store
+            .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                provider: "chatgpt",
+                session_ref: &store
+                    .browser_dispatch(&dispatch_id)
+                    .unwrap()
+                    .unwrap()
+                    .target_session_ref,
+                expected_generation: 7,
+                accepted_user_message_ref: "provider-user-1",
+                assistant_message_ref: "provider-assistant-1",
+                assistant_text: "final worker answer",
+                observed_at: 13,
+            })
+            .unwrap();
+        assert!(!exact.replayed);
+        assert_eq!(
+            exact.dispatch.result_assistant_message_ref.as_deref(),
+            Some("provider-assistant-1")
+        );
+        assert_eq!(exact.dispatch.result_settled_at, Some(13));
+        assert!(exact.evidence_id.starts_with("ev_"));
+        assert!(!exact.turn_message_id.is_empty());
+        assert_eq!(work_memory_result_counts(&store), (1, 1));
+
+        let replay = store
+            .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                provider: "chatgpt",
+                session_ref: &store
+                    .browser_dispatch(&dispatch_id)
+                    .unwrap()
+                    .unwrap()
+                    .target_session_ref,
+                expected_generation: 7,
+                accepted_user_message_ref: "provider-user-1",
+                assistant_message_ref: "provider-assistant-1",
+                assistant_text: "final worker answer",
+                observed_at: 14,
+            })
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.turn_message_id, exact.turn_message_id);
+        assert_eq!(replay.evidence_id, exact.evidence_id);
+        assert_eq!(
+            work_memory_result_counts(&store),
+            (1, 1),
+            "replay must not append a second turn or evidence record"
+        );
+
+        let session_ref = store
+            .browser_dispatch(&dispatch_id)
+            .unwrap()
+            .unwrap()
+            .target_session_ref;
+        assert_eq!(
+            store
+                .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                    provider: "chatgpt",
+                    session_ref: &session_ref,
+                    expected_generation: 7,
+                    accepted_user_message_ref: "provider-user-1",
+                    assistant_message_ref: "provider-assistant-2",
+                    assistant_text: "a different conflicting answer",
+                    observed_at: 15,
+                })
+                .unwrap_err(),
+            "browser_dispatch_result_conflict",
+            "a different assistant message for an already-settled dispatch must fail closed"
+        );
+        assert_eq!(work_memory_result_counts(&store), (1, 1));
+
+        assert_eq!(
+            store
+                .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                    provider: "chatgpt",
+                    session_ref: &session_ref,
+                    expected_generation: 7,
+                    accepted_user_message_ref: "provider-user-wrong",
+                    assistant_message_ref: "provider-assistant-3",
+                    assistant_text: "unknown turn must not guess",
+                    observed_at: 16,
+                })
+                .unwrap_err(),
+            "browser_dispatch_result_unmatched"
+        );
+        assert_eq!(
+            store
+                .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                    provider: "chatgpt",
+                    session_ref: &format!("br_{}", "f".repeat(64)),
+                    expected_generation: 7,
+                    accepted_user_message_ref: "provider-user-1",
+                    assistant_message_ref: "provider-assistant-4",
+                    assistant_text: "wrong session must not settle",
+                    observed_at: 17,
+                })
+                .unwrap_err(),
+            "browser_dispatch_result_unmatched"
+        );
+        assert_eq!(
+            store
+                .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                    provider: "chatgpt",
+                    session_ref: &session_ref,
+                    expected_generation: 8,
+                    accepted_user_message_ref: "provider-user-1",
+                    assistant_message_ref: "provider-assistant-5",
+                    assistant_text: "wrong generation must not settle",
+                    observed_at: 18,
+                })
+                .unwrap_err(),
+            "browser_dispatch_result_unmatched"
+        );
+        let projection = store.browser_dispatch(&dispatch_id).unwrap().unwrap();
+        assert!(projection.result_assistant_message_ref.is_some());
+        assert_eq!(
+            projection.accepted_user_message_ref.as_deref(),
+            Some("provider-user-1")
+        );
+    }
+
+    #[test]
+    fn duplicate_same_text_dispatches_disambiguate_results_by_provider_user_message() {
+        const WORK_CHAIN: &str = "wc_dddddddddddddddddddddddddddddddd";
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, session_ref, _) =
+            browser_dispatch_fixture(&mut store, 7, "duplicate-text");
+        store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:settle",
+                project_ref: "project:settle",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: WORK_CHAIN,
+                provider: "chatgpt",
+                account_ref: None,
+                space_ref: None,
+                session_ref: &session_ref,
+                bound_at: 1,
+            })
+            .unwrap();
+        let message = "byte-identical worker instruction";
+        let message_digest = sha256_text(message);
+        let mut dispatch_ids = Vec::new();
+        for (key, request) in [("dup-key-a", "req-a"), ("dup-key-b", "req-b")] {
+            let request_digest = sha256_text(request);
+            let key_digest = sha256_text(key);
+            let required_apps: [&str; 0] = [];
+            let BrowserDispatchReservation::Reserved(dispatch) = store
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session_ref,
+                    request_digest: &request_digest,
+                    message_digest: &message_digest,
+                    reasoning_effort: None,
+                    required_apps: &required_apps,
+                    expected_generation: 7,
+                    idempotency_key_digest: &key_digest,
+                    parent_dispatch_id: None,
+                    work_chain_id: Some(WORK_CHAIN),
+                    lane_id: Some("lane-dup"),
+                    created_at: 10,
+                })
+                .unwrap()
+            else {
+                panic!("expected distinct dispatches for distinct idempotency keys");
+            };
+            store
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &dispatch.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(7),
+                    updated_at: 11,
+                })
+                .unwrap();
+            dispatch_ids.push(dispatch.dispatch_id);
+        }
+        assert_ne!(dispatch_ids[0], dispatch_ids[1]);
+        store
+            .record_browser_dispatch_accepted_message(&dispatch_ids[0], 7, "user-a", 12)
+            .unwrap();
+        store
+            .record_browser_dispatch_accepted_message(&dispatch_ids[1], 7, "user-b", 12)
+            .unwrap();
+
+        let a = store
+            .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                provider: "chatgpt",
+                session_ref: &session_ref,
+                expected_generation: 7,
+                accepted_user_message_ref: "user-a",
+                assistant_message_ref: "assistant-a",
+                assistant_text: "answer a",
+                observed_at: 13,
+            })
+            .unwrap();
+        assert_eq!(a.dispatch.dispatch_id, dispatch_ids[0]);
+        assert!(
+            store
+                .browser_dispatch(&dispatch_ids[1])
+                .unwrap()
+                .unwrap()
+                .result_assistant_message_ref
+                .is_none(),
+            "a result for user-a must not settle the byte-identical user-b dispatch"
+        );
+        let b = store
+            .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                provider: "chatgpt",
+                session_ref: &session_ref,
+                expected_generation: 7,
+                accepted_user_message_ref: "user-b",
+                assistant_message_ref: "assistant-b",
+                assistant_text: "answer b",
+                observed_at: 14,
+            })
+            .unwrap();
+        assert_eq!(b.dispatch.dispatch_id, dispatch_ids[1]);
+        assert_eq!(work_memory_result_counts(&store), (2, 2));
+    }
+
+    #[test]
+    fn browser_session_reservation_accepted_message_survives_delivery_replay() {
+        let path = temp_db_path();
+        let (endpoint_ref, session_ref, reservation_ref);
+        let accepted = "provider-first-assignment-user";
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            let (fixture_endpoint, fixture_session, _) =
+                browser_dispatch_fixture(&mut store, 7, "reservation-crash");
+            endpoint_ref = fixture_endpoint;
+            session_ref = fixture_session;
+            let account_ref = store
+                .browser_resource(&session_ref)
+                .unwrap()
+                .unwrap()
+                .parent_ref;
+            store
+                .upsert_browser_resource_locator(
+                    &session_ref,
+                    "https://chatgpt.com/c/reservation-crash",
+                    7,
+                    2,
+                )
+                .unwrap();
+            let BrowserSessionReservation::Reserved(reservation) = store
+                .reserve_browser_session(BrowserSessionReservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    account_ref: account_ref.as_deref().unwrap(),
+                    space_ref: None,
+                    display_label: "reservation-crash",
+                    expected_generation: 7,
+                    idempotency_key_digest: &sha256_text("reservation-key"),
+                    request_digest: &sha256_text("reservation-request"),
+                    created_at: 10,
+                    expires_at: 10_000,
+                })
+                .unwrap()
+            else {
+                panic!("expected a reserved browser session");
+            };
+            reservation_ref = reservation.reservation_ref;
+            store
+                .update_browser_session_reservation_delivery(
+                    &reservation_ref,
+                    7,
+                    BrowserDeliveryState::Uncertain,
+                    None,
+                    11,
+                )
+                .unwrap();
+            store
+                .materialize_browser_session_reservation(&reservation_ref, &session_ref, 12)
+                .unwrap();
+            let applied = store
+                .update_browser_session_reservation_delivery(
+                    &reservation_ref,
+                    7,
+                    BrowserDeliveryState::Applied,
+                    Some(accepted),
+                    13,
+                )
+                .unwrap();
+            assert_eq!(applied.accepted_user_message_ref.as_deref(), Some(accepted));
+            // A conflicting accepted ref for the same reservation fails closed.
+            assert_eq!(
+                store
+                    .update_browser_session_reservation_delivery(
+                        &reservation_ref,
+                        7,
+                        BrowserDeliveryState::Applied,
+                        Some("different-user"),
+                        14,
+                    )
+                    .unwrap_err(),
+                "browser_session_accepted_message_conflict"
+            );
+        }
+        // Reopen: the accepted ref survives the crash window and is carried into
+        // the synthesized dispatch by the caller (browser_session_create_success).
+        {
+            let mut reopened = StateStore::open(&path).unwrap();
+            let reservation = reopened
+                .browser_session_reservation(&reservation_ref)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reservation.delivery_state, "applied");
+            assert_eq!(
+                reservation.accepted_user_message_ref.as_deref(),
+                Some(accepted)
+            );
+            let request_digest = sha256_text("synthesized-request");
+            let message_digest = sha256_text("synthesized message");
+            let key_digest = sha256_text("reservation-key");
+            let required_apps: [&str; 0] = [];
+            let BrowserDispatchReservation::Reserved(dispatch) = reopened
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session_ref,
+                    request_digest: &request_digest,
+                    message_digest: &message_digest,
+                    reasoning_effort: None,
+                    required_apps: &required_apps,
+                    expected_generation: 7,
+                    idempotency_key_digest: &key_digest,
+                    parent_dispatch_id: None,
+                    work_chain_id: None,
+                    lane_id: None,
+                    created_at: 20,
+                })
+                .unwrap()
+            else {
+                panic!("expected synthesized dispatch");
+            };
+            reopened
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &dispatch.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(7),
+                    updated_at: 21,
+                })
+                .unwrap();
+            let carried = reopened
+                .record_browser_dispatch_accepted_message(
+                    &dispatch.dispatch_id,
+                    7,
+                    reservation.accepted_user_message_ref.as_deref().unwrap(),
+                    22,
+                )
+                .unwrap();
+            assert_eq!(carried.accepted_user_message_ref.as_deref(), Some(accepted));
+        }
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 
     #[test]

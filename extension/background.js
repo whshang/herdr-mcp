@@ -1667,6 +1667,23 @@ async function postBrowserRegistry(payload) {
   return parsed;
 }
 
+// Trusted local Extension IPC: report one finalized worker assistant turn so the
+// runtime can settle the exact already-applied dispatch. Sends only exact
+// provider/session/generation/user-message/assistant-message identity plus the
+// assistant text; the runtime matches and fails closed on unknown identity.
+// Requires no physical tab focus.
+async function postBrowserDispatchResult({ provider, session_ref, expected_generation, accepted_user_message_ref, assistant_message_ref, assistant_text }) {
+  return postBrowserRegistry({
+    operation: "dispatch.result",
+    provider,
+    session_ref,
+    expected_generation,
+    accepted_user_message_ref,
+    assistant_message_ref,
+    assistant_text,
+  });
+}
+
 async function observeBrowserConversation({
   provider,
   tabId,
@@ -6078,6 +6095,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         nowRaw: msg?.assistantUpdatedAt || msg?.userCreatedAt || Date.now(),
       });
       sendResponse({ ...result, backfilled: true });
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_browser_result") {
+    void (async () => {
+      const provider = String(msg?.provider || "").trim();
+      const sessionRef = String(msg?.session_ref || "").trim();
+      const generation = Number(msg?.generation || 0);
+      const acceptedUserMessageRef = String(msg?.accepted_user_message_ref || "").trim();
+      const assistantMessageRef = String(msg?.assistant_message_ref || "").trim();
+      const assistantText = String(msg?.assistant_text || "").trim();
+      if (!provider
+          || !sessionRef
+          || !Number.isSafeInteger(generation)
+          || generation < 1
+          || !acceptedUserMessageRef
+          || !assistantMessageRef
+          || !assistantText) {
+        sendResponse({ ok: false, skipped: true, error: "browser_result_fields_incomplete" });
+        return;
+      }
+      try {
+        const result = await postBrowserDispatchResult({
+          provider,
+          session_ref: sessionRef,
+          expected_generation: generation,
+          accepted_user_message_ref: acceptedUserMessageRef,
+          assistant_message_ref: assistantMessageRef,
+          assistant_text: assistantText,
+        });
+        sendResponse({
+          ok: true,
+          settled: result?.result_settled === true,
+          replayed: result?.replayed === true,
+        });
+      } catch (error) {
+        sendResponse({ ok: false, error: error?.message || "browser_result_post_failed" });
+      }
     })();
     return true;
   }

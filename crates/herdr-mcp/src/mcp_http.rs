@@ -13,8 +13,9 @@ use crate::runtime_meta;
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
-    BrowserEndpointConsentInput, BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
-    BrowserResourceObservationInput, ContinuityTurnInput, StateStore,
+    BrowserDispatchResultInput, BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+    BrowserProviderObservationInput, BrowserResourceObservationInput, ContinuityTurnInput,
+    StateStore,
 };
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -38,7 +39,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_BROWSER_RESULT_TEXT_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
 const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
@@ -640,6 +642,7 @@ async fn post_extension_browser_registry(State(state): State<AppState>, body: By
         "endpoint.consent" => extension_browser_endpoint_consent(&state, &payload, observed_at),
         "provider.observe" => extension_browser_provider_observe(&state, &payload, observed_at),
         "resource.observe" => extension_browser_resource_observe(&state, &payload, observed_at),
+        "dispatch.result" => extension_browser_dispatch_result(&state, &payload, observed_at),
         _ => Err("browser_registry_operation_unknown".to_owned()),
     };
     match result {
@@ -1029,6 +1032,61 @@ fn extension_browser_resource_observe(
             "state": reservation.state,
             "session_ref": reservation.session_ref,
         })),
+    }))
+}
+
+/// Trusted Extension IPC: settle one exact applied browser dispatch with the
+/// finalized worker assistant turn. This is not a public MCP tool and adds no
+/// Edge contract surface. Matching is exact (provider + session + accepted
+/// user-message ref + generation owner); missing/unknown identity skips.
+fn extension_browser_dispatch_result(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(
+        payload,
+        &[
+            "operation",
+            "provider",
+            "session_ref",
+            "expected_generation",
+            "accepted_user_message_ref",
+            "assistant_message_ref",
+            "assistant_text",
+            "observed_at",
+        ],
+    )?;
+    let provider = browser_registry_string(payload, "provider", 32)?;
+    let session_ref = browser_registry_string(payload, "session_ref", 96)?;
+    let expected_generation = browser_registry_positive_i64(payload, "expected_generation")?;
+    let accepted_user_message_ref =
+        browser_registry_string(payload, "accepted_user_message_ref", 512)?;
+    let assistant_message_ref = browser_registry_string(payload, "assistant_message_ref", 512)?;
+    let assistant_text =
+        browser_registry_string(payload, "assistant_text", MAX_BROWSER_RESULT_TEXT_BYTES)?;
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let record = store.settle_browser_dispatch_result(BrowserDispatchResultInput {
+        provider,
+        session_ref,
+        expected_generation,
+        accepted_user_message_ref,
+        assistant_message_ref,
+        assistant_text,
+        observed_at,
+    })?;
+    Ok(json!({
+        "ok": true,
+        "dispatch_id": record.dispatch.dispatch_id,
+        "provider": record.dispatch.provider,
+        "session_ref": record.dispatch.target_session_ref,
+        "result_settled": record.dispatch.result_assistant_message_ref.is_some(),
+        "result_turn_message_id": record.turn_message_id,
+        "result_evidence_id": record.evidence_id,
+        "replayed": record.replayed,
     }))
 }
 
@@ -3303,6 +3361,188 @@ mod tests {
         assert!(endpoint_a.webchat_control_allowed);
         assert_eq!(endpoint_a.consent_revision, 1);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn browser_dispatch_result_route_settles_exact_dispatch_and_replays() {
+        use crate::state_store::{
+            BrowserDeliveryState, BrowserDispatchReservation, BrowserDispatchReserveInput,
+            BrowserDispatchUpdateInput, BrowserEndpointConsentInput,
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput, WorkMemoryBindingInput,
+        };
+        const WORK_CHAIN: &str = "wc_ffffffffffffffffffffffffffffffff";
+        let root = test_root("browser-dispatch-result-route");
+        let mut extension_state = test_state(&root);
+        extension_state.trusted_extension_ipc = true;
+        let store = extension_state.state_store.clone();
+        let session_ref = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "dispatch-result-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["composer.submit","generation.status"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "dispatch-result-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "dispatch-result-session",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            guard
+                .bind_work_memory(WorkMemoryBindingInput {
+                    continuity_id: "wm:dispatch-result",
+                    project_ref: "project:dispatch-result",
+                    repo_id: "github.com/whshang/herdr-mcp",
+                    work_chain_id: WORK_CHAIN,
+                    provider: "chatgpt",
+                    account_ref: None,
+                    space_ref: None,
+                    session_ref: &session.resource_ref,
+                    bound_at: 15,
+                })
+                .unwrap();
+            let digest = |value: &str| format!("{:x}", Sha256::digest(value.as_bytes()));
+            let required_apps: [&str; 0] = [];
+            let BrowserDispatchReservation::Reserved(dispatch) = guard
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session.resource_ref,
+                    request_digest: &digest("result-route-request"),
+                    message_digest: &digest("result-route-message"),
+                    reasoning_effort: None,
+                    required_apps: &required_apps,
+                    expected_generation: 7,
+                    idempotency_key_digest: &digest("result-route-key"),
+                    parent_dispatch_id: None,
+                    work_chain_id: Some(WORK_CHAIN),
+                    lane_id: Some("lane-result"),
+                    created_at: 16,
+                })
+                .unwrap()
+            else {
+                panic!("expected a reserved dispatch");
+            };
+            guard
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &dispatch.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(7),
+                    updated_at: 17,
+                })
+                .unwrap();
+            guard
+                .record_browser_dispatch_accepted_message(
+                    &dispatch.dispatch_id,
+                    7,
+                    "provider-user-route",
+                    18,
+                )
+                .unwrap();
+            session.resource_ref
+        };
+
+        let app = candidate_router(extension_state);
+        let request = |payload: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/browser/registry")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+        let payload = json!({
+            "operation": "dispatch.result",
+            "provider": "chatgpt",
+            "session_ref": session_ref,
+            "expected_generation": 7,
+            "accepted_user_message_ref": "provider-user-route",
+            "assistant_message_ref": "provider-assistant-route",
+            "assistant_text": "final worker answer text",
+            "observed_at": 30
+        });
+        let response = app.clone().oneshot(request(payload.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["result_settled"], true);
+        assert_eq!(result["replayed"], false);
+        assert!(
+            result["result_evidence_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("ev_")
+        );
+
+        let response = app.clone().oneshot(request(payload.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let replay: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["result_evidence_id"], result["result_evidence_id"]);
+
+        let unknown = json!({
+            "operation": "dispatch.result",
+            "provider": "chatgpt",
+            "session_ref": session_ref,
+            "expected_generation": 7,
+            "accepted_user_message_ref": "provider-user-unknown",
+            "assistant_message_ref": "provider-assistant-unknown",
+            "assistant_text": "unknown turn must not guess",
+            "observed_at": 31
+        });
+        let response = app.oneshot(request(unknown)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let unknown_result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unknown_result["code"], "browser_dispatch_result_unmatched");
         let _ = std::fs::remove_dir_all(root);
     }
 
