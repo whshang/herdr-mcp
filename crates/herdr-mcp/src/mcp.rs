@@ -2331,7 +2331,7 @@ fn validate_browser_operation_params(
         }
         BrowserOperation::MessageAppend => {
             browser_required_string(params, "session_ref", 96)?;
-            browser_required_string(params, "message", 262_144)?;
+            browser_required_message(params, 262_144)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
         }
@@ -2349,7 +2349,7 @@ fn validate_browser_operation_params(
         }
         BrowserOperation::DispatchSubmit => {
             browser_required_string(params, "session_ref", 96)?;
-            browser_required_string(params, "message", 262_144)?;
+            browser_required_message(params, 262_144)?;
             browser_required_reasoning_effort(params, true)?;
             browser_required_apps(params, true)?;
             browser_required_generation(params)?;
@@ -3106,6 +3106,21 @@ fn browser_required_string<'a>(
     let value = value.trim();
     if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
         return Err(json!({"ok": false, "code": format!("browser_{field}_invalid")}));
+    }
+    Ok(value)
+}
+
+fn browser_required_message(params: &Value, max_bytes: usize) -> Result<&str, Value> {
+    let Some(value) = params.get("message").and_then(Value::as_str) else {
+        return Err(json!({"ok": false, "code": "browser_message_required"}));
+    };
+    if value.trim().is_empty()
+        || value.len() > max_bytes
+        || value
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return Err(json!({"ok": false, "code": "browser_message_invalid"}));
     }
     Ok(value)
 }
@@ -4381,7 +4396,7 @@ mod tests {
                 "herdr_mcp.browser_message.append",
                 json!({
                     "session_ref": session_ref,
-                    "message": "hello",
+                    "message": "hello\n\nsecond paragraph\twith tab",
                     "expected_generation": 7,
                     "idempotency_key": "message-append-1"
                 }),
@@ -4408,7 +4423,7 @@ mod tests {
                 "herdr_mcp.browser_dispatch.submit",
                 json!({
                     "session_ref": session_ref,
-                    "message": "ship it",
+                    "message": "ship it\r\nwith another line",
                     "reasoning_effort": "thorough",
                     "required_apps": ["herdr"],
                     "expected_generation": 7,
@@ -4501,6 +4516,18 @@ mod tests {
             }),
         );
         assert_eq!(arbitrary_json["code"], "browser_operation_params_invalid");
+
+        let control_character = browser_operation_call(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "unsafe\u{0}message",
+                "expected_generation": 7,
+                "idempotency_key": "dispatch-control-character-1"
+            }),
+        );
+        assert_eq!(control_character["code"], "browser_message_invalid");
     }
 
     #[test]
