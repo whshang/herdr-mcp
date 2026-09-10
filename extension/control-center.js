@@ -12,6 +12,7 @@ import {
 } from "./control-center-model.js";
 import { boundedTail } from "./browser-state.js";
 import { detectOrLoadLocale, getLocale, t } from "./i18n.js";
+import { getCurrentExtensionIdentity } from "./local-auth.js";
 
 const TARGET_KEY = "herdrControlPinnedTarget";
 const EXPANDED_WORKSPACES_KEY = "herdrControlExpandedWorkspaces";
@@ -152,11 +153,16 @@ function deviceLastSeenLabel(value) {
 
 function fleetFailureText(response) {
   const code = String(response?.code || "");
+  const current = getCurrentExtensionIdentity();
+  const extension = {
+    id: current.current_extension_id || response?.current_extension_id || "unknown",
+    channel: String(current.current_channel || "unknown").toUpperCase(),
+  };
   if (code === "device_inventory_admin_required") return t("cc_devices_owner_required");
   if (code === "native_origin_not_active") {
-    return t("cc_devices_native_owner_inactive", { id: response?.current_extension_id || "unknown" });
+    return t("cc_devices_native_owner_inactive", extension);
   }
-  if (code === "native_host_not_installed") return t("cc_devices_native_host_missing");
+  if (code === "native_host_not_installed") return t("cc_devices_native_host_missing", extension);
   if (response?.http_status === 404 || code === "not_found" || code === "device_inventory_platform_unsupported") {
     return t("cc_devices_runtime_unavailable");
   }

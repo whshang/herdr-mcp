@@ -1,6 +1,35 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
+import {
+  captureWebArtifactNative,
+  extensionChannelForId,
+  getCurrentExtensionIdentity,
+  getNativeExtensionOwnerStatus,
+  localHerdrFetch,
+  openLocalHerdrStream,
+  HERDR_NATIVE_HOST,
+  HERDR_STANDALONE_EXTENSION_ID,
+  HERDR_STORE_EXTENSION_ID,
+} from "../extension/local-auth.js";
+
+test("extension identity classifies Store, Standalone, and path-derived Dev builds", () => {
+  const oldChrome = globalThis.chrome;
+  try {
+    assert.equal(extensionChannelForId(HERDR_STORE_EXTENSION_ID), "store");
+    assert.equal(extensionChannelForId(HERDR_STANDALONE_EXTENSION_ID), "standalone");
+    assert.equal(extensionChannelForId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "dev");
+    assert.equal(extensionChannelForId(""), "unknown");
+
+    globalThis.chrome = { runtime: { id: HERDR_STANDALONE_EXTENSION_ID } };
+    assert.deepEqual(getCurrentExtensionIdentity(), {
+      current_extension_id: HERDR_STANDALONE_EXTENSION_ID,
+      current_extension_origin: `chrome-extension://${HERDR_STANDALONE_EXTENSION_ID}/`,
+      current_channel: "standalone",
+    });
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
 
 test("extension proxies localhost requests through Native Messaging without forwarding bearer auth", async () => {
   const oldChrome = globalThis.chrome;

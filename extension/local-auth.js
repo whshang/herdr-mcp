@@ -5,6 +5,26 @@
 // with the server's historical /extension/session endpoint.
 
 export const HERDR_NATIVE_HOST = "dev.herdr.mcp";
+export const HERDR_STORE_EXTENSION_ID = "kpcengcaammanfnbclapecdgahdmhanp";
+export const HERDR_STANDALONE_EXTENSION_ID = "jbcjhnnmhaekdnbgfllpfipennppfedh";
+
+export function extensionChannelForId(extensionId) {
+  const id = String(extensionId || "").trim();
+  if (!id) return "unknown";
+  if (id === HERDR_STORE_EXTENSION_ID) return "store";
+  if (id === HERDR_STANDALONE_EXTENSION_ID) return "standalone";
+  return "dev";
+}
+
+export function getCurrentExtensionIdentity() {
+  const extensionId = String(globalThis.chrome?.runtime?.id || "").trim();
+  if (!extensionId) return {};
+  return {
+    current_extension_id: extensionId,
+    current_extension_origin: `chrome-extension://${extensionId}/`,
+    current_channel: extensionChannelForId(extensionId),
+  };
+}
 
 function isNativeAdmissionDenied(message) {
   const text = String(message || "").toLowerCase();
@@ -34,7 +54,12 @@ function nativeMessage(message) {
             return;
           }
           if (isNativeAdmissionDenied(err)) {
-            resolve({ ok: true, active: false, reason: "native-origin-not-active" });
+            resolve({
+              ok: true,
+              active: false,
+              reason: "native-origin-not-active",
+              ...getCurrentExtensionIdentity(),
+            });
             return;
           }
           resolve({ ok: false, error: err });
@@ -85,7 +110,19 @@ function nativeRequestPayload(input, init = {}) {
 }
 
 export async function getNativeExtensionOwnerStatus() {
-  return nativeMessage({ type: "identity" });
+  const current = getCurrentExtensionIdentity();
+  const status = await nativeMessage({ type: "identity" });
+  if (status?.ok !== true) return status;
+  if (status.active === true) {
+    return {
+      ...status,
+      ...current,
+      active_extension_id: current.current_extension_id || null,
+      active_extension_origin: status.extension_origin || current.current_extension_origin || null,
+      active_channel: current.current_channel || null,
+    };
+  }
+  return { ...status, ...current };
 }
 
 // Dedicated ChatGPT Web generated-image capture over Native Messaging.

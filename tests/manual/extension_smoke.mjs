@@ -100,6 +100,12 @@ ok(ownerGateIndex >= 0
     && wakeSource.includes("A later page refresh can retry after MV3 recovers")
     && wakeSource.includes('[h2w] extension standby; skipping page control'),
   "inactive sibling extension exits before claiming shared page UI ownership");
+ok(backgroundSource.includes("extension standby: skipping stale-tab sweep")
+    && backgroundSource.includes("extension standby: skipping browser endpoint registration")
+    && backgroundSource.indexOf("async function sweepStaleTabs") < backgroundSource.indexOf("chrome.tabs.query({ url: activeH2WTabUrls() })")
+    && localAuthSource.includes("getCurrentExtensionIdentity")
+    && localAuthSource.includes("current_channel: extensionChannelForId(extensionId)"),
+  "inactive sibling extension also avoids background tab sweeping and endpoint registration while preserving its own identity");
 ok(!manifest.host_permissions?.includes("<all_urls>")
     && manifest.host_permissions?.includes("http://127.0.0.1:8772/*")
     && manifest.host_permissions?.includes("https://chatgpt.com/*")

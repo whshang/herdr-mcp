@@ -848,6 +848,10 @@ async function conversationInfoForTab(tabId) {
 
 // ---- Content-script version synchronization ----
 async function sweepStaleTabs(force = false) {
+  if (!(await extensionOwnerAllowsControl())) {
+    callLog("extension standby: skipping stale-tab sweep");
+    return;
+  }
   try {
     const tabs = await chrome.tabs.query({ url: activeH2WTabUrls() });
     for (const t of tabs) {
@@ -1800,6 +1804,11 @@ async function setLocalBrowserWebchatControlConsent(allowed) {
 
 async function registerLocalBrowserEndpoint() {
   await configReady;
+  if (!(await extensionOwnerAllowsControl())) {
+    browserEndpoint = null;
+    callLog("extension standby: skipping browser endpoint registration");
+    return null;
+  }
   try {
     const profileSeed = await getOrCreateBrowserProfileSeed();
     const response = await localHerdrFetch(browserRegistryUrl(), {
