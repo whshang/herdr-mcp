@@ -1539,7 +1539,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn webchat_grant_trace_uses_trusted_unix_ipc_without_bearer_fallback() {
+    async fn webchat_caller_trace_uses_trusted_unix_ipc_without_bearer_fallback() {
         let response = json!({"jsonrpc": "2.0", "id": "local-1", "result": {"ok": true}});
         let (socket, request_rx) = spawn_unix_server(response.to_string(), "rust-test").await;
         let mut config = LocalMcpConfig::new("token-test", "sha256:test");
@@ -1562,6 +1562,14 @@ mod tests {
                     "endpoint_ref": "be_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                 }]),
             ),
+            (
+                "webchat_authorization".to_owned(),
+                json!({
+                    "principal_ref": "connector:conn_auditconnector123",
+                    "connector_id": "conn_auditconnector123",
+                    "grant_generation": 7
+                }),
+            ),
         ]));
         let outcome = transport.dispatch_request(grant_request).await;
         assert_eq!(
@@ -1574,10 +1582,18 @@ mod tests {
         let lowered = raw_request.to_ascii_lowercase();
         assert!(lowered.starts_with("post /mcp http/1.1"));
         assert!(lowered.contains("x-herdr-edge-webchat-control-grants:"));
+        assert!(lowered.contains("x-herdr-edge-webchat-authorization:"));
         assert!(lowered.contains("x-herdr-edge-page-assist-grants:"));
         assert!(lowered.contains("x-herdr-edge-expected-runtime-generation: rust-test"));
-        assert!(!lowered.contains("authorization:"));
+        assert!(
+            !lowered
+                .lines()
+                .any(|line| line.starts_with("authorization:")),
+            "trusted Unix IPC must not carry the workstation bearer header",
+        );
         assert!(raw_request.contains("\"provider\":\"chatgpt\""));
+        assert!(raw_request.contains("conn_auditconnector123"));
+        assert!(raw_request.contains("\"grant_generation\":7"));
         assert!(
             raw_request
                 .contains("be_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
