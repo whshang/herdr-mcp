@@ -50,6 +50,7 @@ struct WindowsPaths {
     runtime_log: PathBuf,
     link_log: PathBuf,
     link_enabled: PathBuf,
+    startup_shortcut: PathBuf,
     port: u16,
     herdr_socket: PathBuf,
     run_value_name: String,
@@ -67,6 +68,16 @@ impl WindowsPaths {
             .name()
             .map(|name| format!(" - {name}"))
             .unwrap_or_default();
+        let app_data = env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| "APPDATA is required for Windows user autostart".to_owned())?;
+        let startup_shortcut = app_data
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup")
+            .join(format!("Herdr MCP Runtime{suffix}.lnk"));
         Ok(Self {
             config_dir: runtime.config_dir.clone(),
             generations_dir: runtime_root.join("generations"),
@@ -77,6 +88,7 @@ impl WindowsPaths {
             runtime_log: runtime_root.join("windows-runtime-startup.log"),
             link_log: runtime_root.join("windows-link-startup.log"),
             link_enabled: runtime_root.join("windows-link-enabled"),
+            startup_shortcut,
             current_dir,
             port: runtime.instance.default_port(),
             herdr_socket: runtime
@@ -175,13 +187,17 @@ pub fn doctor_status() -> Result<Value, String> {
     let link_enabled = link_enabled(&paths)?;
     let link_loaded = managed_process_active(&paths.link_process, LINK_KIND)?;
     let generation = current_generation(&paths);
+    let link_healthy = !link_enabled || link_loaded;
     Ok(json!({
-        "ok": autostart_registered && loaded && healthy,
+        "ok": autostart_registered && loaded && healthy && link_healthy,
         "implementation": IMPLEMENTATION,
         "loaded": loaded,
         "healthy": healthy,
         "label": paths.run_value_name,
         "autostart_registered": autostart_registered,
+        "autostart_method": "startup-folder-shortcut",
+        "autostart_path": paths.startup_shortcut,
+        "legacy_run_registered": legacy_run_registered(&paths)?,
         "generation": generation,
         "current_target": generation,
         "runtime_current": paths.current_binary,
@@ -246,11 +262,13 @@ pub fn uninstall_link() -> Result<(), String> {
 
 pub fn print_link_status() -> Result<ExitCode, String> {
     let paths = WindowsPaths::discover()?;
+    let enabled = link_enabled(&paths)?;
+    let loaded = managed_process_active(&paths.link_process, LINK_KIND)?;
     print_json(&json!({
-        "ok": true,
+        "ok": !enabled || loaded,
         "implementation": IMPLEMENTATION,
-        "loaded": managed_process_active(&paths.link_process, LINK_KIND)?,
-        "enabled": link_enabled(&paths)?,
+        "loaded": loaded,
+        "enabled": enabled,
         "label": paths.link_label,
         "generation": current_generation(&paths),
     }))?;
@@ -317,13 +335,14 @@ fn install() -> Result<(), String> {
 
     ensure_runtime_token()?;
     let previous_generation = current_generation(&paths);
-    let previous_autostart = read_run_value(&paths.run_value_name)?;
-    let expected_autostart = autostart_command(&paths)?;
-    if let Some(existing) = previous_autostart.as_deref()
-        && existing != expected_autostart
+    let previous_startup_shortcut = startup_shortcut_owned(&paths)?;
+    let previous_run_value = read_run_value(&paths.run_value_name)?;
+    let expected_run_value = autostart_command(&paths)?;
+    if let Some(existing) = previous_run_value.as_deref()
+        && existing != expected_run_value
     {
         return Err(format!(
-            "HKCU Run value '{}' already exists with an unexpected command; refusing to overwrite it",
+            "legacy HKCU Run value '{}' exists with an unexpected command; refusing to overwrite it",
             paths.run_value_name
         ));
     }
@@ -334,7 +353,10 @@ fn install() -> Result<(), String> {
     activate_generation(&paths, &generation_binary, &generation_id, &sha)?;
 
     let activation = (|| -> Result<(), String> {
-        set_run_value(&paths.run_value_name, &expected_autostart)?;
+        ensure_startup_shortcut(&paths)?;
+        if previous_run_value.is_some() {
+            delete_run_value(&paths.run_value_name)?;
+        }
         start_runtime(&paths)?;
         reconcile_link()?;
         Ok(())
@@ -343,7 +365,8 @@ fn install() -> Result<(), String> {
         stop_managed_process(&paths.link_process, LINK_KIND).ok();
         stop_managed_process(&paths.runtime_process, RUNTIME_KIND).ok();
         restore_generation(&paths, previous_generation.as_deref())?;
-        restore_run_value(&paths.run_value_name, previous_autostart.as_deref())?;
+        restore_startup_shortcut(&paths, previous_startup_shortcut)?;
+        restore_run_value(&paths.run_value_name, previous_run_value.as_deref())?;
         set_link_enabled(&paths, previous_link_enabled)?;
         if previous_generation.is_some() {
             start_runtime(&paths)?;
@@ -363,7 +386,9 @@ fn install() -> Result<(), String> {
         "implementation": IMPLEMENTATION,
         "generation": generation_id,
         "runtime_current": paths.current_binary,
-        "autostart": paths.run_value_name,
+        "autostart": paths.startup_shortcut,
+        "autostart_method": "startup-folder-shortcut",
+        "legacy_run_removed": previous_run_value.is_some(),
         "link_reconciled": managed_process_active(&paths.link_process, LINK_KIND)?,
         "runtime_token_printed": false,
     }))
@@ -388,18 +413,26 @@ fn uninstall() -> Result<(), String> {
 
 fn status_value() -> Result<Value, String> {
     let paths = WindowsPaths::discover()?;
+    let autostart_registered = autostart_registered(&paths)?;
+    let loaded = managed_process_active(&paths.runtime_process, RUNTIME_KIND)?;
+    let healthy = health_once(paths.port);
+    let link_enabled = link_enabled(&paths)?;
+    let link_loaded = managed_process_active(&paths.link_process, LINK_KIND)?;
     Ok(json!({
-        "ok": true,
+        "ok": autostart_registered && loaded && healthy && (!link_enabled || link_loaded),
         "implementation": IMPLEMENTATION,
         "label": paths.run_value_name,
-        "autostart_registered": autostart_registered(&paths)?,
-        "loaded": managed_process_active(&paths.runtime_process, RUNTIME_KIND)?,
-        "healthy": health_once(paths.port),
+        "autostart_registered": autostart_registered,
+        "autostart_method": "startup-folder-shortcut",
+        "autostart_path": paths.startup_shortcut,
+        "legacy_run_registered": legacy_run_registered(&paths)?,
+        "loaded": loaded,
+        "healthy": healthy,
         "generation": current_generation(&paths),
         "current_target": current_generation(&paths),
         "runtime_current": paths.current_binary,
-        "link_enabled": link_enabled(&paths)?,
-        "link_loaded": managed_process_active(&paths.link_process, LINK_KIND)?,
+        "link_enabled": link_enabled,
+        "link_loaded": link_loaded,
         "link_label": paths.link_label,
     }))
 }
@@ -681,19 +714,27 @@ fn remove_process_record(path: &Path) -> Result<(), String> {
     }
 }
 
-fn autostart_command(paths: &WindowsPaths) -> Result<String, String> {
-    let binary = paths
-        .current_binary
-        .to_str()
-        .ok_or_else(|| "Windows runtime path is not valid UTF-8".to_owned())?;
-    let mut args = vec![quote_windows_arg(binary)];
+fn autostart_arguments(paths: &WindowsPaths) -> String {
+    let mut args = Vec::new();
     if let Some(instance) = paths.instance_name.as_deref() {
         args.push("--instance".to_owned());
         args.push(quote_windows_arg(instance));
     }
     args.push("service".to_owned());
     args.push("start".to_owned());
-    Ok(args.join(" "))
+    args.join(" ")
+}
+
+fn autostart_command(paths: &WindowsPaths) -> Result<String, String> {
+    let binary = paths
+        .current_binary
+        .to_str()
+        .ok_or_else(|| "Windows runtime path is not valid UTF-8".to_owned())?;
+    Ok(format!(
+        "{} {}",
+        quote_windows_arg(binary),
+        autostart_arguments(paths)
+    ))
 }
 
 fn quote_windows_arg(value: &str) -> String {
@@ -722,30 +763,140 @@ fn quote_windows_arg(value: &str) -> String {
     out
 }
 
+fn expected_startup_shortcut(paths: &WindowsPaths) -> lnks::Shortcut {
+    lnks::ShortcutBuilder::new(paths.current_binary.clone())
+        .arguments(autostart_arguments(paths))
+        .working_dir(paths.current_dir.clone())
+        .description(format!("Start {}", paths.run_value_name))
+        .window_state(lnks::WindowState::Minimized)
+        .build()
+}
+
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+}
+
+fn startup_shortcut_matches(paths: &WindowsPaths, shortcut: &lnks::Shortcut) -> bool {
+    shortcut
+        .target_path
+        .as_deref()
+        .is_some_and(|target| same_windows_path(target, &paths.current_binary))
+        && shortcut.arguments.as_deref() == Some(autostart_arguments(paths).as_str())
+        && shortcut
+            .working_dir
+            .as_deref()
+            .is_some_and(|directory| same_windows_path(directory, &paths.current_dir))
+}
+
+fn startup_shortcut_owned(paths: &WindowsPaths) -> Result<bool, String> {
+    if !paths.startup_shortcut.exists() {
+        return Ok(false);
+    }
+    let shortcut = lnks::Shortcut::load(&paths.startup_shortcut).map_err(|error| {
+        format!(
+            "cannot inspect Windows Startup shortcut {}: {error}",
+            paths.startup_shortcut.display()
+        )
+    })?;
+    if !startup_shortcut_matches(paths, &shortcut) {
+        return Err(format!(
+            "Windows Startup shortcut {} is not owned by this installation",
+            paths.startup_shortcut.display()
+        ));
+    }
+    Ok(true)
+}
+
+fn ensure_startup_shortcut(paths: &WindowsPaths) -> Result<(), String> {
+    if startup_shortcut_owned(paths)? {
+        return Ok(());
+    }
+    let parent = paths
+        .startup_shortcut
+        .parent()
+        .ok_or_else(|| "Windows Startup shortcut has no parent directory".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create Windows Startup directory: {error}"))?;
+    let temp = paths
+        .startup_shortcut
+        .with_extension(format!("tmp-{}.lnk", std::process::id()));
+    let _ = fs::remove_file(&temp);
+    let expected = expected_startup_shortcut(paths);
+    expected
+        .save(&temp)
+        .map_err(|error| format!("cannot stage Windows Startup shortcut: {error}"))?;
+    let observed = lnks::Shortcut::load(&temp)
+        .map_err(|error| format!("cannot verify staged Windows Startup shortcut: {error}"))?;
+    if !startup_shortcut_matches(paths, &observed) {
+        let _ = fs::remove_file(&temp);
+        return Err("Windows Startup shortcut failed read-after-write verification".to_owned());
+    }
+    fs::rename(&temp, &paths.startup_shortcut).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("cannot activate Windows Startup shortcut: {error}")
+    })?;
+    if !startup_shortcut_owned(paths)? {
+        return Err("Windows Startup shortcut disappeared after activation".to_owned());
+    }
+    Ok(())
+}
+
+fn remove_startup_shortcut_if_owned(paths: &WindowsPaths) -> Result<(), String> {
+    if !startup_shortcut_owned(paths)? {
+        return Ok(());
+    }
+    fs::remove_file(&paths.startup_shortcut).map_err(|error| {
+        format!(
+            "cannot remove Windows Startup shortcut {}: {error}",
+            paths.startup_shortcut.display()
+        )
+    })
+}
+
+fn restore_startup_shortcut(paths: &WindowsPaths, previously_present: bool) -> Result<(), String> {
+    if previously_present {
+        ensure_startup_shortcut(paths)
+    } else {
+        remove_startup_shortcut_if_owned(paths)
+    }
+}
+
 fn require_autostart(paths: &WindowsPaths) -> Result<(), String> {
     if autostart_registered(paths)? {
         Ok(())
     } else {
-        Err("Windows user autostart is not installed; run `herdr-mcp install`".to_owned())
+        Err("Windows user Startup shortcut is not installed; run `herdr-mcp install`".to_owned())
     }
 }
 
 fn autostart_registered(paths: &WindowsPaths) -> Result<bool, String> {
+    startup_shortcut_owned(paths)
+}
+
+fn legacy_run_registered(paths: &WindowsPaths) -> Result<bool, String> {
     Ok(read_run_value(&paths.run_value_name)?.as_deref()
         == Some(autostart_command(paths)?.as_str()))
 }
 
 fn remove_autostart_if_owned(paths: &WindowsPaths) -> Result<(), String> {
-    let Some(existing) = read_run_value(&paths.run_value_name)? else {
-        return Ok(());
-    };
-    if existing != autostart_command(paths)? {
+    let legacy_run = read_run_value(&paths.run_value_name)?;
+    if let Some(existing) = legacy_run.as_deref()
+        && existing != autostart_command(paths)?
+    {
         return Err(format!(
-            "HKCU Run value '{}' is not owned by this installation; refusing to delete it",
+            "legacy HKCU Run value '{}' is not owned by this installation; refusing to delete it",
             paths.run_value_name
         ));
     }
-    delete_run_value(&paths.run_value_name)
+    remove_startup_shortcut_if_owned(paths)?;
+    if legacy_run.is_some() {
+        delete_run_value(&paths.run_value_name)?;
+    }
+    Ok(())
 }
 
 fn restore_run_value(name: &str, value: Option<&str>) -> Result<(), String> {

@@ -1527,11 +1527,11 @@ User path:\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
   herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
   herdr-mcp worker bootstrap  (macOS/Linux first device; guided Cloudflare Worker + enrollment bootstrap)\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]  (macOS/Linux enrolled device; creates pairing or exact-device credential recovery)\n  herdr-mcp worker credential-repair prepare|apply|finalize  (advanced headless repair; device secret never leaves the target machine)\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]  (macOS/Linux/Windows enrolled device; creates pairing or exact-device credential recovery)\n  herdr-mcp worker credential-repair prepare|apply|finalize  (advanced headless repair; device secret never leaves the target machine)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS/Linux; uses the platform credential store and reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
   herdr-mcp connector list  (enrolled-device credential; non-secret connector inventory)\n\
-  herdr-mcp connector approve <approval-request-id>  (macOS/Linux enrolled device; reads the 6-digit code interactively, never argv)\n\
+  herdr-mcp connector approve <approval-request-id>  (macOS/Linux/Windows enrolled device; reads the 6-digit code interactively, never argv)\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
   herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
   herdr-mcp connector planner-control list | <approve|revoke> <request-id> --confirm  (enrolled owner device)\n\
@@ -2728,7 +2728,7 @@ mod tests {
         assert!(worker.contains("worker credential-repair finalize --confirm"));
         assert!(worker.contains("device secret never crosses machines"));
         assert!(
-            text.contains("connector approve <approval-request-id>  (macOS/Linux enrolled device")
+            text.contains("connector approve <approval-request-id>  (macOS/Linux/Windows enrolled device")
         );
         assert!(!text.contains("worker connect <pairing-address> [--name NAME]  (macOS only"));
         assert!(text.contains("User path:"));

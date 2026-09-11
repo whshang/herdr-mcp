@@ -177,6 +177,14 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let code_identity = macos_privacy::probe_code_identity();
     let authenticated_local_mcp = probe_authenticated_local_mcp(config.runtime_port);
     let standalone_browser = crate::standalone_extension::doctor_report();
+    let windows_service_healthy = if cfg!(target_os = "windows") {
+        service_manager::doctor_status()
+            .ok()
+            .and_then(|status| status.get("ok").and_then(Value::as_bool))
+            == Some(true)
+    } else {
+        true
+    };
     println!("Herdr MCP doctor");
     println!(
         "runtime provenance: channel={} version={} source={}{}",
@@ -213,7 +221,8 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         authenticated_local_mcp.detail
     );
     println!("LAYER authenticated-remote-mcp not_probed reason=no-connector-oauth-credential");
-    let service_health = runtime_healthy
+    let service_health = windows_service_healthy
+        && runtime_healthy
         && report.herdr_transport_reachable
         && schema_healthy
         && native_call_healthy

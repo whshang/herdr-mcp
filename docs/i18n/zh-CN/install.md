@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 已支持 macOS 与 Linux。1.0 Windows x86_64 candidate 正在加入同一条核心接入路径，使用 Herdr named pipe、Windows Credential Manager、HKCU 登录自启动和独立用户进程；在 Windows 原生 UAT gate 通过前仍按 candidate 支持。Browser Native Messaging、self-update、产品级 reinstall/uninstall 不属于本轮 Windows 核心 UAT。
+当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 已支持 macOS 与 Linux。1.0 Windows x86_64 candidate 正在加入同一条核心接入路径，使用 Herdr named pipe、Windows Credential Manager、当前用户 Startup 文件夹快捷方式登录自启动和独立用户进程；在 Windows 原生 UAT gate 通过前仍按 candidate 支持。Browser Native Messaging、self-update、产品级 reinstall/uninstall 不属于本轮 Windows 核心 UAT。
 
 旧版本安装按[Runtime 自升级](runtime-self-upgrade.md)原地升级。已有 Worker、设备关系和健康的 ChatGPT Connector 不需要为了升级当前 runtime 重新创建。
 
