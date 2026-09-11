@@ -1102,6 +1102,15 @@ test("fleet-admin verifier rebind canonicalizes a legacy workstation identity", 
   ), env);
   assert.equal(repairedCredential.status, 200);
 
+  const repairedOwner = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control",
+    {},
+    legacy.device_id,
+    replacementSecret,
+  ), env);
+  assert.equal(repairedOwner.status, 400);
+  assert.equal((await repairedOwner.json()).code, "invalid_webchat_control_grant");
+
   const staleLegacy = await worker.fetch(postAsWorkstation(
     "/devices/pairings",
     { ttl_seconds: 60 },

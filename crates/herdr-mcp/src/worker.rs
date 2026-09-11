@@ -2232,7 +2232,11 @@ fn resolve_owner_link_fields(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "production Herdr Link has no credential service".to_owned())?;
-    if credential_service != LEGACY_LINK_KEYCHAIN_SERVICE {
+    let device_credential_service = config.edge_link_keychain_service();
+    let uses_matching_device_credential = config.edge_device_id.as_deref()
+        == Some(workstation_id.as_str())
+        && device_credential_service.as_deref() == Some(credential_service);
+    if credential_service != LEGACY_LINK_KEYCHAIN_SERVICE && !uses_matching_device_credential {
         return Err(
             "production Herdr Link does not use the stable owner credential service".to_owned(),
         );
@@ -2677,24 +2681,36 @@ mod tests {
     }
 
     #[test]
-    fn owner_control_rejects_non_owner_credential_service() {
-        let config = Config::default();
-        let mut env = std::collections::BTreeMap::new();
-        env.insert(
-            "HERDR_WORKSTATION_ID".to_owned(),
-            "prod-real-runtime".to_owned(),
-        );
+    fn owner_control_accepts_only_matching_device_credential_after_repair() {
+        let device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let credential_service = format!("herdr-edge-link-{device_id}");
+        let mut config = Config::default();
+        config.set_edge_device_id(device_id).unwrap();
+        config
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+        let mut env = std::collections::BTreeMap::from([
+            ("HERDR_WORKSTATION_ID".to_owned(), device_id.to_owned()),
+            (
+                "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+                credential_service.clone(),
+            ),
+            (
+                "HERDR_EDGE_URL".to_owned(),
+                "wss://edge.example/ws".to_owned(),
+            ),
+        ]);
+
+        let resolved = resolve_owner_link_fields(&config, &env).unwrap();
+        assert_eq!(resolved.0, device_id);
+        assert_eq!(resolved.1, credential_service);
+        assert_eq!(resolved.2, "https://edge.example");
+
         env.insert(
             "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
-            "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
         );
-        env.insert(
-            "HERDR_EDGE_URL".to_owned(),
-            "wss://edge.example/ws".to_owned(),
-        );
-
-        let error = resolve_owner_link_fields(&config, &env).unwrap_err();
-        assert!(error.contains("stable owner credential service"));
+        assert!(resolve_owner_link_fields(&config, &env).is_err());
     }
 
     #[test]
