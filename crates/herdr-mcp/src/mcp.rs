@@ -2257,6 +2257,31 @@ fn browser_created_session_dispatch(
     Ok((dispatch, writeback))
 }
 
+fn promote_materialized_browser_session_delivery(
+    store: &mut StateStore,
+    reservation: &BrowserSessionReservationRecord,
+    expected_generation: i64,
+) -> Result<Option<BrowserSessionReservationRecord>, String> {
+    if reservation.state != "materialized"
+        || BrowserDeliveryState::parse(&reservation.delivery_state)?
+            != BrowserDeliveryState::Uncertain
+    {
+        return Ok(None);
+    }
+    let Some(accepted_user_message_ref) = reservation.accepted_user_message_ref.as_deref() else {
+        return Ok(None);
+    };
+    store
+        .update_browser_session_reservation_delivery(
+            &reservation.reservation_ref,
+            expected_generation,
+            BrowserDeliveryState::Applied,
+            Some(accepted_user_message_ref),
+            browser_epoch_ms(),
+        )
+        .map(Some)
+}
+
 fn browser_session_create_success(
     store: &mut StateStore,
     reservation_ref: &str,
@@ -2419,6 +2444,29 @@ fn browser_session_create(
         );
     }
     if current_delivery == BrowserDeliveryState::Uncertain {
+        {
+            let Ok(mut guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            match promote_materialized_browser_session_delivery(
+                &mut guard,
+                &reservation,
+                expected_generation,
+            ) {
+                Ok(Some(promoted)) => {
+                    return browser_session_create_success(
+                        &mut guard,
+                        &promoted.reservation_ref,
+                        params,
+                        true,
+                        true,
+                        caller_authorization,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => return browser_store_error(error),
+            }
+        }
         let Some(actuator) = actuator else {
             return json!({
                 "ok": false,
@@ -2480,6 +2528,26 @@ fn browser_session_create(
                 true,
                 caller_authorization,
             );
+        }
+        if delivery_state == BrowserDeliveryState::Uncertain {
+            match promote_materialized_browser_session_delivery(
+                &mut guard,
+                &settled,
+                expected_generation,
+            ) {
+                Ok(Some(promoted)) => {
+                    return browser_session_create_success(
+                        &mut guard,
+                        &promoted.reservation_ref,
+                        params,
+                        true,
+                        true,
+                        caller_authorization,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => return browser_store_error(error),
+            }
         }
         return json!({
             "ok": false,
@@ -2571,6 +2639,26 @@ fn browser_session_create(
             false,
             caller_authorization,
         );
+    }
+    if delivery_state == BrowserDeliveryState::Uncertain {
+        match promote_materialized_browser_session_delivery(
+            &mut guard,
+            &updated,
+            expected_generation,
+        ) {
+            Ok(Some(promoted)) => {
+                return browser_session_create_success(
+                    &mut guard,
+                    &promoted.reservation_ref,
+                    params,
+                    replayed,
+                    true,
+                    caller_authorization,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => return browser_store_error(error),
+        }
     }
     json!({
         "ok": false,
@@ -2852,9 +2940,7 @@ fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Valu
             && params
                 .get("reasoning_effort")
                 .is_none_or(|value| value.is_null())
-            && browser_required_apps(params, true)
-                .map(|apps| apps.is_empty())
-                .unwrap_or(false);
+            && browser_required_apps(params, true).is_ok();
     }
     if operation != BrowserOperation::DispatchSubmit {
         return !operation.is_mutation();
@@ -6912,6 +6998,19 @@ mod tests {
                 "idempotency_key": "supported-session-create"
             })
         ));
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::SessionCreate,
+            &json!({
+                "endpoint_ref": "be_alpha4",
+                "provider": "chatgpt",
+                "account_ref": "br_account",
+                "display_label": "Conversation",
+                "message": "first assignment with app",
+                "required_apps": ["herdr"],
+                "expected_generation": 7,
+                "idempotency_key": "supported-session-create-app"
+            })
+        ));
     }
 
     #[test]
@@ -7389,6 +7488,7 @@ mod tests {
             calls: AtomicUsize,
             reconcile_calls: AtomicUsize,
             delayed: bool,
+            materialized_but_partial: bool,
         }
 
         impl SessionCreateActuator {
@@ -7469,6 +7569,12 @@ mod tests {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.materialize(params, expected_generation);
                 let mut evidence = Self::applied_evidence(expected_generation);
+                if self.materialized_but_partial {
+                    evidence.stable_resource_ref_observed = false;
+                    evidence.lifecycle_observed = false;
+                    evidence.canonical_url_observed = false;
+                    evidence.generation_status_observed = false;
+                }
                 if self.delayed {
                     evidence.generation_status_observed = false;
                     evidence.result = None;
@@ -7547,6 +7653,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
             delayed: false,
+            materialized_but_partial: false,
         };
         let immediate_params = json!({
             "endpoint_ref": endpoint_ref,
@@ -7579,11 +7686,50 @@ mod tests {
         assert_eq!(replay["replayed"], true);
         assert_eq!(immediate.calls.load(Ordering::SeqCst), 1);
 
+        let materialized_but_partial = SessionCreateActuator {
+            store: store.clone(),
+            calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            delayed: false,
+            materialized_but_partial: true,
+        };
+        let materialized_but_partial_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker accepted-before-registration-readback",
+            "message": "do bounded task with accepted provider identity",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-materialized-partial-1"
+        });
+        let promoted = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &materialized_but_partial_params,
+            true,
+            Some(&materialized_but_partial),
+        );
+        assert_eq!(promoted["ok"], true);
+        assert_eq!(promoted["delivery_state"], "applied");
+        assert_eq!(promoted["reconciled"], true);
+        assert_eq!(
+            promoted["dispatch"]["accepted_user_message_ref"],
+            "provider-created-session-user"
+        );
+        assert_eq!(materialized_but_partial.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            materialized_but_partial
+                .reconcile_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+
         let delayed = SessionCreateActuator {
             store: store.clone(),
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
             delayed: true,
+            materialized_but_partial: false,
         };
         let delayed_params = json!({
             "endpoint_ref": endpoint_ref,

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
+const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
 const recoveryStart = backgroundSource.indexOf("async function recoverBrowserSessionTarget(");
 const recoveryEnd = backgroundSource.indexOf("\nasync function handleBrowserActuation", recoveryStart);
@@ -345,9 +346,27 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   );
   assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
   assert.match(createSegment, /registeredBrowserSessionRef/);
+  assert.doesNotMatch(createSegment, /reasoning != null \|\| requiredApps\.length > 0/);
+  assert.match(createSegment, /ensureRequiredComposerApps\(requiredApps\)/);
+  assert.match(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
+  assert.match(createSegment, /requiredApps,/);
 
   const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
   const registrationSegment = wakeSource.slice(registrationStart, registrationStart + 3500);
   assert.match(registrationSegment, /browserSessionReservationRef/);
   assert.match(registrationSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
+});
+
+test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {
+  assert.match(backgroundSource, /"composer\.select_tool"/);
+  assert.match(chatGptAdapterSource, /#composer-plus-btn/);
+  assert.match(chatGptAdapterSource, /data-testid="composer-plus-btn"/);
+  assert.match(chatGptAdapterSource, /data-inline-selection-pill/);
+  assert.match(chatGptAdapterSource, /data-symbol="ecosystemMention"/);
+  assert.match(chatGptAdapterSource, /data-keyword/);
+  assert.match(chatGptAdapterSource, /leaf\.closest\('\[tabindex="0"\]'\)/);
+  assert.match(wakeSource, /candidates\.length !== 1/);
+  assert.match(wakeSource, /required-app-ambiguous/);
+  assert.match(wakeSource, /required-app-not-found/);
+  assert.match(wakeSource, /composerHasOnlyAppPills\(data\.requiredApps\)/);
 });

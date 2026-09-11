@@ -3382,12 +3382,13 @@ impl StateStore {
             .map_err(|error| format!("cannot inspect browser session reservation: {error}"))
     }
 
-    /// Update one session reservation's delivery state and, when the first
-    /// assignment is proven applied, durably record the exact accepted provider
-    /// user-message ref. The accepted ref is written in the same transaction as
-    /// `applied` so the crash window between provider acceptance and synthesized
-    /// dispatch creation preserves the exact submit identity. A different
-    /// accepted ref for an already-recorded reservation fails closed.
+    /// Update one session reservation's delivery state and durably record the
+    /// exact accepted provider user-message ref as soon as provider acceptance is
+    /// proven. An exact accepted ref may coexist with `uncertain` while Browser
+    /// Registry materialization catches up; it does not make the reservation
+    /// applied by itself. Once the same reservation is strictly materialized, the
+    /// caller may atomically promote it to `applied` without re-actuating. A
+    /// different accepted ref for an already-recorded reservation fails closed.
     pub fn update_browser_session_reservation_delivery(
         &mut self,
         reservation_ref: &str,
@@ -3405,7 +3406,10 @@ impl StateStore {
         }
         if let Some(accepted) = accepted_user_message_ref {
             validate_browser_ref_text(accepted, 512, "accepted_user_message_ref")?;
-            if delivery_state != BrowserDeliveryState::Applied {
+            if !matches!(
+                delivery_state,
+                BrowserDeliveryState::Applied | BrowserDeliveryState::Uncertain
+            ) {
                 return Err("browser_session_accepted_message_not_applied".to_owned());
             }
         }
@@ -9228,15 +9232,20 @@ mod tests {
                 panic!("expected a reserved browser session");
             };
             reservation_ref = reservation.reservation_ref;
-            store
+            let accepted_uncertain = store
                 .update_browser_session_reservation_delivery(
                     &reservation_ref,
                     7,
                     BrowserDeliveryState::Uncertain,
-                    None,
+                    Some(accepted),
                     11,
                 )
                 .unwrap();
+            assert_eq!(accepted_uncertain.delivery_state, "uncertain");
+            assert_eq!(
+                accepted_uncertain.accepted_user_message_ref.as_deref(),
+                Some(accepted)
+            );
             store
                 .materialize_browser_session_reservation(&reservation_ref, &session_ref, 12)
                 .unwrap();
@@ -9245,7 +9254,7 @@ mod tests {
                     &reservation_ref,
                     7,
                     BrowserDeliveryState::Applied,
-                    Some(accepted),
+                    None,
                     13,
                 )
                 .unwrap();

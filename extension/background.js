@@ -1823,7 +1823,7 @@ async function observeBrowserConversation({
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
     capabilities: { operations: provider === "chatgpt"
-      ? ["composer.submit", "generation.status", "generation.stop", "session.inspect", "session.open", "session.create"]
+      ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.inspect", "session.open", "session.create"]
       : ["composer.submit", "generation.status", "generation.stop", "session.inspect"] },
     observed_at: Date.now(),
   });
