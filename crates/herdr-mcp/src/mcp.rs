@@ -5886,7 +5886,9 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: None,
+                    result: Some(json!({
+                        "accepted_user_message_ref": "provider-user-delayed"
+                    })),
                 }))
             }
         }
@@ -5970,7 +5972,7 @@ mod tests {
                         expected_generation,
                         delivery_state: BrowserDeliveryState::Applied,
                         generation_owner: Some(expected_generation),
-                        accepted_user_message_ref: None,
+                        accepted_user_message_ref: Some("provider-user-race"),
                         updated_at: browser_epoch_ms(),
                     })
                     .unwrap();
@@ -6025,7 +6027,9 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: None,
+                    result: Some(json!({
+                        "accepted_user_message_ref": "provider-user-applied"
+                    })),
                 })
             }
         }
@@ -6594,7 +6598,9 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: None,
+                    result: Some(json!({
+                        "accepted_user_message_ref": "provider-user-restart"
+                    })),
                 })
             }
         }
