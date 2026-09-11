@@ -1,12 +1,19 @@
 use crate::exec_sessions::ExecRegistry;
 use crate::fs_security;
+use crate::herdr::HerdrClient;
 use crate::mutation;
 use crate::projects;
+use crate::utility_exec;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 
-pub fn start(snapshot: &Value, registry: &ExecRegistry, args: &Value) -> Value {
+pub fn start(
+    client: &HerdrClient,
+    snapshot: &Value,
+    registry: &ExecRegistry,
+    args: &Value,
+) -> Value {
     let root = match required_str(args, "root") {
         Ok(value) => value,
         Err(error) => return error,
@@ -52,22 +59,44 @@ pub fn start(snapshot: &Value, registry: &ExecRegistry, args: &Value) -> Value {
     let workspace_id = projects::workspaces_for_root(&topology, &managed.root)
         .into_iter()
         .next();
-    match registry.start_in_workspace(&managed.real, command, workspace_id.as_deref()) {
-        Ok(mut result) => {
-            if let Some(object) = result.as_object_mut() {
-                object.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
-                object.insert(
-                    "hint".to_owned(),
-                    json!("poll herdr_exec_read with session_id until phase=completed; herdr_exec_kill when done"),
-                );
-                if !working.is_empty() {
-                    object.insert("warnings".to_owned(), json!({"working": working}));
-                }
+    let mut result = if protected_root {
+        let Some(workspace_id) = workspace_id.as_deref() else {
+            return json!({
+                "ok": false,
+                "reason": "workspace_required_for_protected_exec",
+                "root": managed.root.to_string_lossy(),
+                "delivery_state": "not_delivered",
+            });
+        };
+        utility_exec::start_reusable_pane_session(
+            client,
+            snapshot,
+            registry,
+            workspace_id,
+            &managed.real,
+            command,
+        )
+    } else {
+        match registry.start_native(&managed.real, command) {
+            Ok(value) => value,
+            Err(message) => {
+                return json!({"ok": false, "reason": "exec_start_failed", "message": message});
             }
-            result
         }
-        Err(message) => json!({"ok": false, "reason": "exec_start_failed", "message": message}),
+    };
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        if let Some(object) = result.as_object_mut() {
+            object.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
+            object.insert(
+                "hint".to_owned(),
+                json!("poll herdr_exec_read with session_id until phase=completed; herdr_exec_kill when done"),
+            );
+            if !working.is_empty() {
+                object.insert("warnings".to_owned(), json!({"working": working}));
+            }
+        }
     }
+    result
 }
 
 pub fn read(registry: &ExecRegistry, args: &Value) -> Value {

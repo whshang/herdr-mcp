@@ -176,6 +176,96 @@ pub fn run_durable(
     )
 }
 
+pub(crate) fn start_reusable_pane_session(
+    client: &HerdrClient,
+    snapshot: &Value,
+    registry: &ExecRegistry,
+    workspace_id: &str,
+    effective_root: &Path,
+    command: &str,
+) -> Value {
+    #[cfg(windows)]
+    {
+        let _ = (
+            client,
+            snapshot,
+            registry,
+            workspace_id,
+            effective_root,
+            command,
+        );
+        return json!({
+            "ok": false,
+            "code": "unsupported_platform",
+            "message": "reusable utility-pane execution requires the Windows Herdr named-pipe transport, which is still pending",
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        let (pane_id, created) =
+            match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
+                Ok(value) => value,
+                Err(PrepareError::ControlPlane(message)) => {
+                    return json!({
+                        "ok": false,
+                        "code": "utility_pane_unavailable",
+                        "message": message,
+                        "workspace": workspace_id,
+                        "command": command,
+                        "delivery_state": "not_delivered",
+                        "safe_retry_mode": "retry_after_control_plane_recovery",
+                        "hint": "failed to prepare canonical utility pane before command delivery",
+                    });
+                }
+                Err(PrepareError::Other { code, message }) => {
+                    return json!({
+                        "ok": false,
+                        "code": code,
+                        "message": message,
+                        "workspace": workspace_id,
+                        "command": command,
+                        "delivery_state": "not_delivered",
+                        "hint": "failed to prepare canonical utility pane before command delivery",
+                    });
+                }
+            };
+
+        if let Ok(info) = client.call_with_timeout(
+            "pane.process_info",
+            json!({"pane_id": pane_id}),
+            PRE_SEND_TIMEOUT,
+        ) {
+            let readiness = utility_pane_readiness(&info);
+            if !readiness.ready {
+                return utility_pane_contention_result(workspace_id, &pane_id, command, &readiness);
+            }
+        }
+
+        let mut result = match registry.start_in_existing_pane(effective_root, command, &pane_id) {
+            Ok(value) => value,
+            Err(message) => {
+                return json!({
+                    "ok": false,
+                    "code": "exec_start_failed",
+                    "message": message,
+                    "backend": "utility_pane",
+                    "workspace": workspace_id,
+                    "pane_id": pane_id,
+                    "command": command,
+                    "delivery_state": "unknown",
+                    "hint": "utility command start did not complete cleanly; inspect pane/process state before retrying",
+                });
+            }
+        };
+        if let Some(object) = result.as_object_mut() {
+            object.insert("workspace".to_owned(), json!(workspace_id));
+            object.insert("created_utility_pane".to_owned(), json!(created));
+        }
+        result
+    }
+}
+
 #[cfg(unix)]
 fn run_unix_durable(
     client: &HerdrClient,
@@ -1052,6 +1142,94 @@ mod tests {
             select_project_root(Some("/tmp/c"), &roots).unwrap_err(),
             PathBuf::from("/tmp/c")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reusable_pane_session_reuses_canonical_pane_and_cancel_preserves_it() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = env::temp_dir().join(format!(
+            "herdr-utility-reuse-{}-{}",
+            std::process::id(),
+            now_ms(),
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_methods = Arc::clone(&methods);
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Value = serde_json::from_str(
+                    &BufReader::new(stream.try_clone().unwrap())
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                server_methods.lock().unwrap().push(method.clone());
+                let result = match method.as_str() {
+                    "pane.process_info" => json!({
+                        "process_info": {
+                            "shell_pid": 42,
+                            "foreground_process_group_id": 42,
+                            "foreground_processes": [{"pid": 42, "name": "zsh"}],
+                        }
+                    }),
+                    "pane.send_text" => json!({"ok": true}),
+                    "pane.send_keys" => {
+                        assert_eq!(request["params"]["keys"], json!(["C-c"]));
+                        json!({"ok": true})
+                    }
+                    other => panic!("unexpected Herdr method: {other}"),
+                };
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"id": request["id"].clone(), "result": result}),
+                )
+                .unwrap();
+            }
+        });
+
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+        let snapshot = json!({
+            "panes": [{
+                "workspace_id": "w1",
+                "pane_id": "w1:p2",
+                "label": UTILITY_LABEL,
+            }]
+        });
+        let result = start_reusable_pane_session(
+            &client,
+            &snapshot,
+            &registry,
+            "w1",
+            Path::new("/tmp"),
+            "sleep 30",
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["backend"], "utility_pane");
+        assert_eq!(result["pane_id"], "w1:p2");
+        assert_eq!(result["created_utility_pane"], false);
+
+        let session_id = result["session_id"].as_str().unwrap();
+        let killed = registry.kill(session_id);
+        assert_eq!(killed["ok"], true);
+        server.join().unwrap();
+        assert_eq!(
+            *methods.lock().unwrap(),
+            vec!["pane.process_info", "pane.send_text", "pane.send_keys"],
+        );
+        drop(registry);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

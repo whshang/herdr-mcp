@@ -486,26 +486,14 @@ impl ExecRegistry {
 
     #[cfg(test)]
     pub fn start(&self, cwd: &Path, command: &str) -> Result<Value, String> {
-        self.start_in_workspace(cwd, command, None)
+        self.start_native(cwd, command)
     }
 
-    pub fn start_in_workspace(
-        &self,
-        cwd: &Path,
-        command: &str,
-        workspace_id: Option<&str>,
-    ) -> Result<Value, String> {
+    pub(crate) fn start_native(&self, cwd: &Path, command: &str) -> Result<Value, String> {
         self.prune();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
         }
-        if should_use_pane_backend(cwd, workspace_id, self.inner.client.as_ref()) {
-            return self.start_pane(cwd, command, workspace_id.expect("checked above"));
-        }
-        self.start_native(cwd, command)
-    }
-
-    fn start_native(&self, cwd: &Path, command: &str) -> Result<Value, String> {
         let id = new_session_id();
         let mut process = shell_command(command, &id);
         process
@@ -576,111 +564,6 @@ impl ExecRegistry {
             "started_at": iso_from_ms(session.started_at_ms),
             "pid": pid,
             "backend": "native",
-            "phase": "started",
-            "progress": {
-                "bytes_read": 0,
-                "bytes_total": 0,
-                "elapsed_ms": 0,
-            },
-        }))
-    }
-
-    fn start_pane(&self, cwd: &Path, command: &str, workspace_id: &str) -> Result<Value, String> {
-        let client = self
-            .inner
-            .client
-            .clone()
-            .ok_or_else(|| "Herdr pane backend is unavailable".to_owned())?;
-        let id = new_session_id();
-        let pane = client
-            .call_with_timeout(
-                "pane.split",
-                json!({
-                    "workspace_id": workspace_id,
-                    "direction": "right",
-                    "cwd": cwd.to_string_lossy(),
-                    "focus": false,
-                }),
-                PANE_RPC_TIMEOUT,
-            )
-            .map_err(|error| format!("cannot create Herdr exec pane: {error}"))?;
-        let pane_id =
-            extract_pane_id(&pane).ok_or_else(|| "pane.split returned no pane id".to_owned())?;
-        let _ = client.call_with_timeout(
-            "pane.rename",
-            json!({
-                "pane_id": pane_id,
-                "label": format!("herdr-mcp:exec:{}", short_session_id(&id)),
-            }),
-            PANE_RPC_TIMEOUT,
-        );
-        let script_path = pane_script_path(&id);
-        let spool = pane_spool_paths(&id);
-        write_pane_script(&script_path, cwd, command, &spool)?;
-        let launch_line = format!(
-            "{} {}",
-            shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
-            shell_quote(script_path.to_string_lossy().as_ref()),
-        );
-        if let Err(error) = client.call_with_timeout(
-            "pane.send_text",
-            json!({"pane_id": pane_id, "text": format!("{launch_line}\n")}),
-            PANE_RPC_TIMEOUT,
-        ) {
-            cleanup_pane_files(&script_path, &spool);
-            let _ = client.call_with_timeout(
-                "pane.close",
-                json!({"pane_id": pane_id}),
-                PANE_RPC_TIMEOUT,
-            );
-            return Err(format!("cannot start Herdr pane command: {error}"));
-        }
-        let started_at_ms = now_ms();
-        let session = Arc::new(Session {
-            id: id.clone(),
-            cwd: cwd.to_path_buf(),
-            command: command.to_owned(),
-            started_at_ms,
-            pid: None,
-            backend: SessionBackend::Pane {
-                client,
-                pane_id: pane_id.clone(),
-                script_path,
-                spool,
-                stdout_offset: Mutex::new(0),
-                stderr_offset: Mutex::new(0),
-                close_on_complete: true,
-            },
-            buffers: Mutex::new(Buffers::default()),
-            status: Mutex::new(SessionStatus::default()),
-        });
-        if let Err(error) = self
-            .inner
-            .state_store
-            .lock()
-            .map_err(|_| "exec state store lock poisoned".to_owned())
-            .and_then(|store| store.record_pane_exec_running(&id, started_at_ms))
-        {
-            terminate_session(&session, true, None);
-            return Err(format!(
-                "cannot durably register pane exec session; pane closed before return: {error}"
-            ));
-        }
-        self.inner
-            .sessions
-            .lock()
-            .map_err(|_| "exec registry lock poisoned".to_owned())?
-            .insert(id.clone(), Arc::clone(&session));
-        spawn_monitor(Arc::clone(&session), Arc::downgrade(&self.inner));
-        Ok(json!({
-            "ok": true,
-            "session_id": id,
-            "cwd": cwd.to_string_lossy(),
-            "command": command,
-            "started_at": iso_from_ms(started_at_ms),
-            "pid": Value::Null,
-            "backend": "herdr_pane",
-            "pane_id": pane_id,
             "phase": "started",
             "progress": {
                 "bytes_read": 0,
@@ -1242,57 +1125,9 @@ fn spawn_monitor(session: Arc<Session>, registry: Weak<RegistryInner>) {
     });
 }
 
-fn should_use_pane_backend(
-    cwd: &Path,
-    workspace_id: Option<&str>,
-    client: Option<&HerdrClient>,
-) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        if workspace_id.is_none() || client.is_none() {
-            return false;
-        }
-        let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
-            return false;
-        };
-        is_protected_root_for_home(cwd, &home)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (cwd, workspace_id, client);
-        false
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn is_protected_root_for_home(cwd: &Path, home: &Path) -> bool {
-    ["Documents", "Desktop", "Downloads"]
-        .into_iter()
-        .map(|name| home.join(name))
-        .any(|protected| cwd.starts_with(protected))
-}
-
-fn extract_pane_id(value: &Value) -> Option<String> {
-    let pane = value.get("pane").unwrap_or(value);
-    pane.get("pane_id")
-        .and_then(Value::as_str)
-        .or_else(|| pane.get("id").and_then(Value::as_str))
-        .map(str::to_owned)
-}
-
 fn marker_safe_id(id: &str) -> String {
     id.chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect()
-}
-
-fn short_session_id(id: &str) -> String {
-    id.chars()
-        .rev()
-        .take(10)
-        .collect::<String>()
-        .chars()
-        .rev()
         .collect()
 }
 
@@ -1640,20 +1475,27 @@ fn terminate_session(session: &Arc<Session>, force: bool, registry: Option<&Regi
             pane_id,
             script_path,
             spool,
+            close_on_complete,
             ..
         } => {
-            let _ = client.call_with_timeout(
-                "pane.close",
-                json!({"pane_id": pane_id}),
-                PANE_RPC_TIMEOUT,
-            );
+            let method = if *close_on_complete {
+                "pane.close"
+            } else {
+                "pane.send_keys"
+            };
+            let params = if *close_on_complete {
+                json!({"pane_id": pane_id})
+            } else {
+                json!({"pane_id": pane_id, "keys": ["C-c"]})
+            };
+            let _ = client.call_with_timeout(method, params, PANE_RPC_TIMEOUT);
             cleanup_pane_files(script_path, spool);
-            complete_session(
-                session,
-                registry,
-                None,
-                Some(if force { "SIGKILL" } else { "SIGTERM" }),
-            );
+            let signal = if *close_on_complete {
+                if force { "SIGKILL" } else { "SIGTERM" }
+            } else {
+                "SIGINT"
+            };
+            complete_session(session, registry, None, Some(signal));
         }
     }
 }
@@ -2478,31 +2320,6 @@ mod tests {
         );
         drop(registry);
         fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn protected_root_detection_is_scoped_to_user_privacy_folders() {
-        let home = Path::new("/Users/example");
-        assert!(is_protected_root_for_home(
-            Path::new("/Users/example/Documents/repo"),
-            home
-        ));
-        assert!(is_protected_root_for_home(
-            Path::new("/Users/example/Desktop/repo"),
-            home
-        ));
-        assert!(is_protected_root_for_home(
-            Path::new("/Users/example/Downloads/repo"),
-            home
-        ));
-        assert!(!is_protected_root_for_home(
-            Path::new("/Users/example/src/repo"),
-            home
-        ));
-        assert!(!is_protected_root_for_home(
-            Path::new("/Users/other/Documents/repo"),
-            home
-        ));
     }
 
     #[cfg(unix)]
