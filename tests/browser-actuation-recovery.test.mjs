@@ -293,6 +293,20 @@ test("ChatGPT session.open can restore a disposable view from a local canonical 
   assert.doesNotMatch(contentSegment, /performWake|findSendButton|dispatchEnterSubmit/);
 });
 
+test("browser dispatch evicts a stale cached target before exact recovery", () => {
+  const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
+  const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);
+  assert.ok(start >= 0 && end > start, "dispatch target routing block must remain extractable");
+  const segment = backgroundSource.slice(start, end);
+  assert.match(segment, /cachedTargetCurrent/);
+  assert.match(segment, /cachedLive\?\.convKey === target\.convKey/);
+  assert.match(segment, /browserSessionTargets\.delete\(sessionRef\);\s*target = null;/);
+  const staleEviction = segment.indexOf("browserSessionTargets.delete(sessionRef)");
+  const recovery = segment.indexOf("recoverBrowserSessionTarget(sessionRef, expectedGeneration)", staleEviction);
+  assert.ok(staleEviction >= 0 && recovery > staleEviction, "stale cached target must be evicted before one exact recovery");
+  assert.match(segment, /live\?\.convKey !== target\.convKey/);
+});
+
 test("ChatGPT session.create carries one durable reservation across the new-conversation route", () => {
   const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
   const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);
