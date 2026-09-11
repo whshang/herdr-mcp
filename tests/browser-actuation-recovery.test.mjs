@@ -307,6 +307,20 @@ test("browser dispatch evicts a stale cached target before exact recovery", () =
   assert.match(segment, /live\?\.convKey !== target\.convKey/);
 });
 
+test("shared native push stream self-heals when heartbeat bytes stall", () => {
+  assert.match(backgroundSource, /const PUSH_STREAM_STALL_MS = 22000/);
+  const start = backgroundSource.indexOf("async function runPushStream(ctrl)");
+  const end = backgroundSource.indexOf("\nasync function postBrowserActuationEvidence", start);
+  assert.ok(start >= 0 && end > start, "push stream loop must remain extractable");
+  const segment = backgroundSource.slice(start, end);
+  assert.match(segment, /const armStallWatchdog = \(\) =>/);
+  assert.match(segment, /stallTimer = setTimeout\(\(\) => \{[\s\S]*?stream\?\.close\(\)/);
+  assert.match(segment, /onChunk: \(bytes\) => \{\s*armStallWatchdog\(\);/);
+  assert.match(segment, /noteLocalRuntimeReachability\(true\);\s*armStallWatchdog\(\);/);
+  assert.match(segment, /await stream\.done;\s*disarmStallWatchdog\(\);/);
+  assert.match(segment, /finally \{[\s\S]*?if \(stallTimer\) clearTimeout\(stallTimer\)/);
+});
+
 test("ChatGPT session.create carries one durable reservation across the new-conversation route", () => {
   const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
   const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);
