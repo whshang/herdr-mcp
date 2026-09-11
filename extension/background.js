@@ -114,6 +114,12 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
   },
 ];
 const PUSH_CONNECT_MS = 5000;
+// The Rust push endpoint emits an SSE heartbeat every 15s. A Native Messaging
+// stream that stays open but delivers no bytes across this wider window is
+// stale (for example after a local runtime restart). Close only that one shared
+// stream so the existing reconnect loop can rebuild it; never open a second
+// competing observation stream.
+const PUSH_STREAM_STALL_MS = 22000;
 const STATE_FETCH_MS = 4000;
 const TAB_RECOVERY_COOLDOWN_MS = 30000;
 const PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS = 180000;
@@ -2395,10 +2401,24 @@ async function runPushStream(ctrl) {
   while (runtimeAlive() && !ctrl.signal.aborted) {
     let stream = null;
     let connectTimer = null;
+    let stallTimer = null;
     let relayAbort = null;
     try {
       const decoder = new TextDecoder();
       let buf = "";
+      const disarmStallWatchdog = () => {
+        if (!stallTimer) return;
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      };
+      const armStallWatchdog = () => {
+        disarmStallWatchdog();
+        stallTimer = setTimeout(() => {
+          stallTimer = null;
+          callLog(`push stream silent for ${PUSH_STREAM_STALL_MS}ms; forcing reconnect`);
+          try { stream?.close(); } catch (_) {}
+        }, PUSH_STREAM_STALL_MS);
+      };
       const drainBlocks = () => {
         let idx;
         while ((idx = buf.indexOf("\n\n")) >= 0) {
@@ -2414,6 +2434,7 @@ async function runPushStream(ctrl) {
         path: "/push/events",
         timeoutMs: PUSH_CONNECT_MS,
         onChunk: (bytes) => {
+          armStallWatchdog();
           buf += decoder.decode(bytes, { stream: true });
           drainBlocks();
         },
@@ -2438,8 +2459,10 @@ async function runPushStream(ctrl) {
       }
       backoff = 2000;
       noteLocalRuntimeReachability(true);
+      armStallWatchdog();
       callLog(`push connected (shared native stream via ${opened.transport})`);
       await stream.done;
+      disarmStallWatchdog();
       buf += decoder.decode();
       drainBlocks();
       noteLocalRuntimeReachability(false);
@@ -2450,6 +2473,7 @@ async function runPushStream(ctrl) {
       callLog(`push disconnected (${e.message}); retrying in ${backoff}ms`);
     } finally {
       if (connectTimer) clearTimeout(connectTimer);
+      if (stallTimer) clearTimeout(stallTimer);
       if (relayAbort) ctrl.signal.removeEventListener("abort", relayAbort);
       try { stream?.close(); } catch (_) {}
     }
