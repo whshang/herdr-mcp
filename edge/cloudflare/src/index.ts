@@ -1184,17 +1184,23 @@ async function authenticateFleetDevice(request: Request, env: Env): Promise<stri
 
 // WebChat Control is a separate 1.0 security boundary: unlike ordinary
 // v0.4.6 fleet administration, widening a WebChat grant remains restricted to
-// the configured owner workstation. Keep this check distinct from
+// the configured owner device. Keep this check distinct from
 // authenticateFleetDevice/authenticateFleetAdmin.
 async function authenticateOwnerDevice(request: Request, env: Env): Promise<string | null> {
   const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
-  if (!env.DEFAULT_WORKSTATION_ID || workstationId !== env.DEFAULT_WORKSTATION_ID) return null;
+  const ownerWorkstationId = env.DEFAULT_WORKSTATION_ID?.trim() ?? "";
+  if (!ownerWorkstationId || !workstationId) return null;
   const extracted = extractLinkCredential(request);
   if (!extracted.ok) return null;
 
   const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
   const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
-  if (deviceAuth.ok) return workstationId;
+  if (deviceAuth.ok) {
+    if (workstationId === ownerWorkstationId) return workstationId;
+    const ownerAliasAuth = await authenticateDeviceCredential(registry, ownerWorkstationId, extracted.credential);
+    return ownerAliasAuth.ok && ownerAliasAuth.device_id === deviceAuth.device_id ? workstationId : null;
+  }
+  if (workstationId !== ownerWorkstationId) return null;
   if (deviceAuth.code !== "device_not_found" && deviceAuth.code !== "device_credential_missing") {
     return null;
   }
