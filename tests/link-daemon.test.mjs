@@ -1,3 +1,7 @@
+/**
+ * Legacy Node Link compatibility coverage. Rust owns the production Link runtime;
+ * retain this suite only while the Node compatibility entrypoint remains supported.
+ */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {

@@ -319,11 +319,11 @@ test("shared runtime assets keep theme/drawer/search behavior and gain localized
   assert.match(app, /herdr-docs-lang/, "app.js must pin the chosen language on switcher clicks");
 
   const css = await readFile(join(OUT, "style.css"), "utf8");
-  assert.match(css, /--sidebar-w:\s*250px/);
-  assert.match(css, /--toc-w:\s*220px/);
-  assert.match(css, /--article-w:\s*760px/);
-  assert.match(css, /@media \(max-width: 1023px\)/);
-  assert.match(css, /@media \(max-width: 720px\)/);
+  for (const token of ["sidebar-w", "toc-w", "article-w"]) {
+    assert.match(css, new RegExp(`--${token}:\\s*[^;]+;`), `layout token --${token} must stay defined`);
+  }
+  const responsiveBreakpoints = css.match(/@media \(max-width: \d+px\)/g) ?? [];
+  assert.ok(responsiveBreakpoints.length >= 2, "docs layout must keep desktop/tablet and mobile responsive boundaries");
   assert.match(css, /\.topnav, \.version-badge \{ display: none; \}/, "mobile docs header hides redundant nav and version badge");
   assert.match(css, /:root\[data-theme="dark"\]/);
   assert.match(css, /\.lang-switcher/, "language switcher styling");

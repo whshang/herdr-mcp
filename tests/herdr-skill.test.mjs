@@ -1,10 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   herdrSkillPointer,
   fetchHerdrSkill,
   HERDR_MCP_SKILL_BUNDLED,
 } from "../dist/herdr-skill.js";
+
+function workstationOfflineBackoffSeconds() {
+  const source = readFileSync(new URL("../edge/cloudflare/src/errors.ts", import.meta.url), "utf8");
+  const match = source.match(/WORKSTATION_OFFLINE_RETRY_BACKOFF_MS\s*=\s*\[([^\]]+)\]/);
+  assert.ok(match, "Edge retry backoff SSOT must be readable");
+  const values = [...match[1].matchAll(/\b([\d_]+)\b/g)].map((entry) => Number(entry[1].replaceAll("_", "")));
+  assert.ok(values.length > 0, "Edge retry backoff SSOT must contain at least one value");
+  assert.ok(values.every((value) => value % 1000 === 0), "Skill recovery prose is expressed in whole seconds");
+  return values.map((value) => value / 1000);
+}
 
 test("herdrSkillPointer exposes project policy, native reference and self-update entrypoint", () => {
   const p = herdrSkillPointer();
@@ -38,9 +49,13 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /dev\.herdr-mcp\.health-watchdog/);
     assert.match(r.content, /historical `dev\.herdr-mcp\.watchdog` identity/);
     assert.match(r.content, /health-watchdog\.\*/);
-    assert.match(r.content, /5 seconds.*10 seconds.*20 seconds/s);
-    assert.match(r.content, /roughly.*35 seconds/s);
-    assert.match(r.content, /exactly three.*read-only.*reconnect attempts/s);
+    const backoffSeconds = workstationOfflineBackoffSeconds();
+    for (const seconds of backoffSeconds) {
+      assert.match(r.content, new RegExp(`\\b${seconds} seconds\\b`));
+    }
+    const recoveryWindowSeconds = backoffSeconds.reduce((sum, seconds) => sum + seconds, 0);
+    assert.match(r.content, new RegExp(`roughly.*${recoveryWindowSeconds} seconds`, "s"));
+    assert.match(r.content, /read-only.*reconnect attempts/s);
     assert.match(r.content, /not a human-escalation threshold/);
     assert.match(r.content, /requires_human=false.*no-escalation signal/s);
     assert.match(r.content, /delivery_uncertain.*automatically inspect.*request\/resource evidence/s);

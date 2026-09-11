@@ -1,5 +1,9 @@
 /**
- * Batch 5: pure lifecycle/policy parity for the herdr-link client.
+ * Batch 5: compatibility lifecycle/policy parity for the legacy Node herdr-link client.
+ *
+ * This suite protects the still-supported Node compatibility path; Rust owns the
+ * production Link runtime. Remove this suite only when the Node Link compatibility
+ * entrypoint and its release support are removed together.
  *
  * Validates the shared fixture `fixtures/link-lifecycle-policy-batch5.json`
  * against the Node implementation (src/link/client.ts). Pure exported helpers

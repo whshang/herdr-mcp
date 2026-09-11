@@ -37,7 +37,7 @@ jobs:
       - name: Frozen Edge/contract gate
         run: npm run test:edge
       - name: Root regression gate
-        run: npm test
+        run: npm run test:built
       - name: Stop Herdr runtime
         if: always()
         run: scripts/ci-herdr-runtime.sh stop
