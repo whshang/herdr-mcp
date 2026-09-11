@@ -18,7 +18,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "7";
+  const VERSION = "8";
   const API_NAME = "__HERDR_CHATGPT_PERF__";
 
   const VIEWER_SELECTOR = "#code-block-viewer.cm-editor";
