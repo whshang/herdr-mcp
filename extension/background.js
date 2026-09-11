@@ -48,7 +48,7 @@ import {
 } from "./queued-insert-core.js";
 
 const H2W_SCRIPT_VERSION = "0.1.91";
-const CHATGPT_PERF_SCRIPT_VERSION = "8";
+const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];

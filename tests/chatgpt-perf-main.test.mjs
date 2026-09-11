@@ -372,21 +372,21 @@ function nearEntry(target, height = 442) {
   return { target, isIntersecting: true, boundingClientRect: { height } };
 }
 
-test("v8 keeps React mutation hot path free of synchronous layout reads", () => {
+test("v9 keeps React mutation hot path free of synchronous layout reads", () => {
   const { context, originalAppendChild } = makeContext();
-  assert.equal(context.__HERDR_CHATGPT_PERF__.version, "8");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.version, "9");
   assert.equal(context.Node.prototype.appendChild, originalAppendChild);
   assert.equal(source.includes("getBoundingClientRect"), false);
   assert.equal(source.includes('querySelectorAll?.("*")'), false);
 });
 
-test("v8 does not install the rejected streaming style throttle", () => {
+test("v9 does not install the rejected streaming style throttle", () => {
   assert.equal(source.includes("data-herdr-streaming-throttle"), false);
   assert.equal(source.includes("transition-duration: 0.001ms"), false);
   assert.equal(source.includes("streaming_throttle_activations"), false);
 });
 
-test("v8 preserves the proven code-viewer intrinsic estimate", () => {
+test("v9 preserves the proven code-viewer intrinsic estimate", () => {
   const { context, document, FakeElement } = makeContext();
   const text = Array.from({ length: 231 }, (_, i) => `line-${i}`).join("\n");
   const { viewer } = codeViewer(FakeElement, document, text);
@@ -538,7 +538,7 @@ test("manual/idle scan can discover a deeply nested writing root without layout 
 });
 
 
-test("v8 discovers only the minimal heavy tool cluster", () => {
+test("v9 discovers only the minimal heavy tool cluster", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8, outerTools: 4 });
   document.body.appendChild(outer);
@@ -553,7 +553,7 @@ test("v8 discovers only the minimal heavy tool cluster", () => {
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_observed, 1);
 });
 
-test("v8 does not merge separate small tool groups into a conversation-wide cluster", () => {
+test("v9 does not merge separate small tool groups into a conversation-wide cluster", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const outer = new FakeElement("div", "qMYqUG_convSearchResultHighlightRoot");
   outer.ownerDocument = document;
@@ -578,7 +578,7 @@ test("v8 does not merge separate small tool groups into a conversation-wide clus
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_observed, 0);
 });
 
-test("v8 forces discovery when continuous mutations never become quiet", () => {
+test("v9 forces discovery when continuous mutations never become quiet", () => {
   const {
     context,
     document,
@@ -603,7 +603,7 @@ test("v8 forces discovery when continuous mutations never become quiet", () => {
   assert.ok(context.__HERDR_CHATGPT_PERF__.stats.forced_scans >= 1);
 });
 
-test("v8 discovers a heavy tool cluster directly from its mutation batch", () => {
+test("v9 discovers a heavy tool cluster directly from its mutation batch", () => {
   const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -617,7 +617,7 @@ test("v8 discovers a heavy tool cluster directly from its mutation batch", () =>
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_discovery_batches, 1);
 });
 
-test("v8 hides a far heavy tool cluster with observer-provided exact height", () => {
+test("v9 hides a far heavy tool cluster with observer-provided exact height", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -632,7 +632,7 @@ test("v8 hides a far heavy tool cluster with observer-provided exact height", ()
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.max_tool_cluster_height_px, 2761.5);
 });
 
-test("v8 reveals a hidden tool cluster when it reaches the viewport", () => {
+test("v9 reveals a hidden tool cluster when it reaches the viewport", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -646,7 +646,7 @@ test("v8 reveals a hidden tool cluster when it reaches the viewport", () => {
   assert.ok(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_revealed >= 1);
 });
 
-test("v8 reveals and unobserves a mutating hidden tool cluster without layout reads", () => {
+test("v9 reveals and unobserves a mutating hidden tool cluster without layout reads", () => {
   const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
   const { outer, cluster, toolNodes } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -662,7 +662,7 @@ test("v8 reveals and unobserves a mutating hidden tool cluster without layout re
   assert.equal(toolObserver.observed.has(cluster), false);
 });
 
-test("v8 suspends tool hiding for find-in-page", () => {
+test("v9 suspends tool hiding for find-in-page", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -774,6 +774,53 @@ test("streaming ChatGPT tool runs fold on the second card and grow incrementally
   assert.equal(summary.textContent, "− Tool calls × 4");
   assert.equal(fourthWrap.getAttribute("data-herdr-tool-run-hidden"), null);
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_runs_folded, 1);
+});
+
+test("tool-only ChatGPT turns fold independently and grow while streaming", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const stop = new FakeElement("button");
+  stop.ownerDocument = document;
+  stop.setAttribute("data-testid", "stop-button");
+  document._querySelectorHook = (selector) => selector.includes("stop-button") ? stop : null;
+
+  const section = new FakeElement("section");
+  section.ownerDocument = document;
+  section.setAttribute("data-testid", "conversation-turn-4");
+  const stack = new FakeElement("div", "flex", "max-w-full", "flex-col", "gap-4", "grow");
+  stack.ownerDocument = document;
+  section.appendChild(stack);
+
+  const addTool = () => {
+    const lane = new FakeElement("div", "contents");
+    lane.ownerDocument = document;
+    const wrapper = new FakeElement("div", "contents");
+    wrapper.ownerDocument = document;
+    const tool = new FakeElement("span", "group/tool-message");
+    tool.ownerDocument = document;
+    wrapper.appendChild(tool);
+    lane.appendChild(wrapper);
+    stack.appendChild(lane);
+    return lane;
+  };
+
+  const first = addTool();
+  const second = addTool();
+  const third = addTool();
+  document.body.appendChild(section);
+  context.__HERDR_CHATGPT_PERF__.scan();
+
+  const summary = stack.children.find((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1");
+  assert.ok(summary);
+  assert.equal(summary.textContent, "+ Tool calls × 3");
+  assert.equal(first.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(second.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(third.getAttribute("data-herdr-tool-run-hidden"), "1");
+
+  const fourth = addTool();
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [fourth], removedNodes: [] }]);
+  assert.equal(summary.textContent, "+ Tool calls × 4");
+  assert.equal(fourth.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(stack.children.filter((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1").length, 1);
 });
 
 test("wrapped code viewers remain uncontained", () => {

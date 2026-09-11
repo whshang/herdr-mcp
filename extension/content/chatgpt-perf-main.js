@@ -18,7 +18,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "8";
+  const VERSION = "9";
   const API_NAME = "__HERDR_CHATGPT_PERF__";
 
   const VIEWER_SELECTOR = "#code-block-viewer.cm-editor";
@@ -635,15 +635,38 @@
     }
   }
 
+  function lowestCommonAncestor(nodes, boundary) {
+    if (!nodes.length) return null;
+    let candidate = nodes[0] instanceof Element ? nodes[0] : null;
+    while (candidate && candidate !== boundary?.parentElement) {
+      if (nodes.every((node) => candidate.contains(node))) return candidate;
+      candidate = candidate.parentElement;
+    }
+    return boundary instanceof Element ? boundary : null;
+  }
+
+  function toolRunStacks() {
+    const stacks = new Set();
+    for (const message of document.querySelectorAll?.('[data-message-author-role="assistant"]') || []) {
+      if (message.parentElement instanceof Element) stacks.add(message.parentElement);
+    }
+    for (const section of document.querySelectorAll?.("section") || []) {
+      const turnId = String(section.getAttribute?.("data-testid") || "");
+      if (!turnId.startsWith("conversation-turn-")) continue;
+      if (section.querySelector?.('[data-message-author-role="assistant"]')) continue;
+      const tools = Array.from(section.querySelectorAll?.(TOOL_MESSAGE_SELECTOR) || []);
+      if (tools.length < TOOL_RUN_MIN_MESSAGES) continue;
+      const stack = lowestCommonAncestor(tools, section);
+      if (stack instanceof Element) stacks.add(stack);
+    }
+    return stacks;
+  }
+
   function foldToolRuns() {
     if (!enabled) return 0;
     let folded = 0;
-    const seenStacks = new Set();
-
-    for (const message of document.querySelectorAll?.('[data-message-author-role="assistant"]') || []) {
-      const stack = message.parentElement;
-      if (!(stack instanceof Element) || seenStacks.has(stack)) continue;
-      seenStacks.add(stack);
+    for (const stack of toolRunStacks()) {
+      if (!(stack instanceof Element)) continue;
       if (stack.querySelector?.('[data-testid="tool-approval-card"]')) continue;
 
       let run = [];
