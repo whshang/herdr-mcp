@@ -42,9 +42,12 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_BROWSER_RESULT_TEXT_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
-const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(35);
 const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
-const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(2);
+// The extension polls for browser actuation on the shared SSE heartbeat. Keep
+// the liveness window above that 15s cadence so an idle healthy stream is not
+// classified offline between polls.
+const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(20);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
 const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
@@ -3617,6 +3620,15 @@ mod tests {
         let unknown_result: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(unknown_result["code"], "browser_dispatch_result_unmatched");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_actuation_liveness_covers_one_idle_sse_heartbeat() {
+        let state = BrowserActuationState {
+            last_extension_poll: Some(Instant::now() - SSE_HEARTBEAT),
+            ..BrowserActuationState::default()
+        };
+        assert!(BrowserActuationBroker::extension_live(&state));
     }
 
     #[tokio::test]
