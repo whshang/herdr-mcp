@@ -1380,20 +1380,23 @@ impl StateStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("cannot begin continuity append: {error}"))?;
-        let (owner_count, only_owner, incoming_is_owner) = tx
+        let workspace_id = workspace_id.unwrap_or("");
+        let (owner_count, only_owner, incoming_workspace_owner, workspace_owner_count) = tx
             .query_row(
                 "SELECT COUNT(DISTINCT b.continuity_id),
                         MIN(b.continuity_id),
-                        MAX(CASE WHEN b.continuity_id = ?2 THEN 1 ELSE 0 END)
+                        MAX(CASE WHEN b.continuity_id = ?2 AND b.workspace_id = ?3 THEN 1 ELSE 0 END),
+                        COUNT(DISTINCT CASE WHEN b.workspace_id = ?3 THEN b.continuity_id END)
                  FROM continuity_bindings b
                  JOIN continuity_chains c ON c.continuity_id = b.continuity_id
                  WHERE b.conversation_id = ?1 AND c.status = 'active'",
-                params![conversation_id, continuity_id],
+                params![conversation_id, continuity_id, workspace_id],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
@@ -1401,7 +1404,11 @@ impl StateStore {
         let canonical_continuity_id = match (owner_count, only_owner) {
             (0, _) => continuity_id.to_owned(),
             (1, Some(owner)) => owner,
-            (count, _) if count > 1 && incoming_is_owner != 0 => continuity_id.to_owned(),
+            (count, _)
+                if count > 1 && incoming_workspace_owner != 0 && workspace_owner_count == 1 =>
+            {
+                continuity_id.to_owned()
+            }
             _ => return Err("continuity_binding_ambiguous".to_owned()),
         };
         if owner_count > 1 {
@@ -1433,7 +1440,7 @@ impl StateStore {
             params![
                 canonical_continuity_id,
                 conversation_id,
-                workspace_id.unwrap_or(""),
+                workspace_id,
                 observed_at
             ],
         )
