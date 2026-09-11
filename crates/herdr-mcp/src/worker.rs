@@ -418,7 +418,7 @@ fn prepare_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, St
         "credential_verifier_sha256": verifier,
         "staged": true,
         "secret_printed": false,
-        "next": "on a macOS legacy-owner Link, finalize can rebind locally; otherwise run apply from another enrolled fleet-admin device before finalize",
+        "next": "run worker credential-repair apply from another enrolled fleet-admin device before finalize, or use worker pair --recover-device for exact-device recovery",
     }))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -491,33 +491,6 @@ fn apply_device_credential_repair(
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn legacy_owner_service_is_active(plist_env: &std::collections::BTreeMap<String, String>) -> bool {
-    plist_env
-        .get("HERDR_LINK_KEYCHAIN_SERVICE")
-        .map(|service| service.trim() == LEGACY_LINK_KEYCHAIN_SERVICE)
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-fn maybe_rebind_staged_credential_with_legacy_owner(
-    paths: &RuntimePaths,
-    config: &Config,
-    device_id: &str,
-    secret: &str,
-) -> Result<bool, String> {
-    let Some(plist_env) = production_link_environment_if_present()? else {
-        return Ok(false);
-    };
-    if !legacy_owner_service_is_active(&plist_env) {
-        return Ok(false);
-    }
-    let owner = resolve_owner_link_identity(paths, config)?;
-    let verifier = device_secret_verifier(secret);
-    let _ = rebind_device_credential_verifier(&owner, device_id, &verifier)?;
-    Ok(true)
-}
-
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn finalize_device_credential_repair(_paths: &RuntimePaths) -> Result<ExitCode, String> {
     Err("credential repair is supported on macOS and Linux enrolled devices".to_owned())
@@ -544,12 +517,6 @@ fn finalize_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, S
         .map_err(|error| format!("cannot load staged credential repair secret: {error}"))?;
     validate_device_secret(&secret)?;
 
-    #[cfg(target_os = "macos")]
-    let verifier_rebound_locally =
-        maybe_rebind_staged_credential_with_legacy_owner(paths, &config, &device_id, &secret)?;
-    #[cfg(target_os = "linux")]
-    let verifier_rebound_locally = false;
-
     crate::credential_store::store(&target_service, &account, &secret).map_err(|error| {
         format!("cannot commit repaired credential to the device service: {error}")
     })?;
@@ -568,7 +535,6 @@ fn finalize_device_credential_repair(paths: &RuntimePaths) -> Result<ExitCode, S
         "device_id": device_id,
         "credential_service": target_service,
         "staging_deleted": true,
-        "verifier_rebound_locally": verifier_rebound_locally,
         "secret_printed": false,
     }))?;
     Ok(ExitCode::SUCCESS)
@@ -831,7 +797,7 @@ fn connect_existing_worker(
         write_config_atomic,
         revoke_self,
         crate::credential_store::delete,
-        activate_connected_runtime,
+        activate_connected_runtime_after_pairing,
         |_paths| crate::linux_service_manager::reconcile_link(),
         consume_pairing,
     )
@@ -856,7 +822,7 @@ fn connect_existing_worker(
         write_config_atomic,
         revoke_self,
         crate::credential_store::delete,
-        activate_connected_runtime,
+        activate_connected_runtime_after_pairing,
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
     )
@@ -879,7 +845,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
         write_config_atomic,
         revoke_self,
         crate::credential_store::delete,
-        activate_connected_runtime,
+        activate_connected_runtime_after_pairing,
         |_paths| crate::linux_service_manager::reconcile_link(),
         move |_, _, _, _| Ok(enrolled.clone()),
     )
@@ -902,7 +868,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
         write_config_atomic,
         revoke_self,
         crate::credential_store::delete,
-        activate_connected_runtime,
+        activate_connected_runtime_after_pairing,
         crate::link::reconcile_after_service_generation_change,
         move |_, _, _, _| Ok(enrolled.clone()),
     )
@@ -1624,6 +1590,33 @@ fn rename_current_device(paths: &RuntimePaths, name: &str) -> Result<ExitCode, S
 }
 
 #[cfg(target_os = "linux")]
+fn activate_connected_runtime_after_pairing(
+    paths: &RuntimePaths,
+    _recovered_existing: bool,
+    _device_id: &str,
+    _keychain_service: &str,
+) -> Result<(), String> {
+    activate_connected_runtime(paths)
+}
+
+#[cfg(target_os = "macos")]
+fn activate_connected_runtime_after_pairing(
+    paths: &RuntimePaths,
+    recovered_existing: bool,
+    device_id: &str,
+    keychain_service: &str,
+) -> Result<(), String> {
+    // Ordinary generation refresh deliberately preserves the current Link
+    // credential owner. Exact-device recovery is an explicit enrollment
+    // transition, so only this path may switch an existing owner Link to the
+    // freshly recovered device credential before normal activation checks.
+    if recovered_existing {
+        crate::link::switch_prod_link_credential_service(paths, device_id, keychain_service)?;
+    }
+    activate_connected_runtime(paths)
+}
+
+#[cfg(target_os = "linux")]
 fn activate_connected_runtime(_paths: &RuntimePaths) -> Result<(), String> {
     let code = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false })?;
     if code != ExitCode::SUCCESS {
@@ -1821,7 +1814,7 @@ where
     H: Fn(&RuntimePaths, &Config) -> Result<(), String>,
     I: Fn(&str, &str, &str) -> Result<bool, String>,
     J: Fn(&str, &str) -> Result<(), String>,
-    K: Fn(&RuntimePaths) -> Result<(), String>,
+    K: Fn(&RuntimePaths, bool, &str, &str) -> Result<(), String>,
     L: Fn(&RuntimePaths) -> Result<(), String>,
     M: Fn(&str, &str, &str, Option<&str>) -> Result<EnrolledCredential, String>,
 {
@@ -1970,7 +1963,7 @@ where
         ));
     }
 
-    if let Err(error) = activate(paths) {
+    if let Err(error) = activate(paths, recovered_existing, &device_id, &keychain_service) {
         if recovered_existing {
             return Err(format!(
                 "existing device {device_id} credential recovery was persisted, but the local runtime could not be activated: {error}; the device was not revoked and the recovered credential/config were preserved for repair"
@@ -2654,22 +2647,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_owner_finalize_detection_is_exact() {
-        let mut env = std::collections::BTreeMap::new();
-        assert!(!legacy_owner_service_is_active(&env));
-        env.insert(
-            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
-            format!("herdr-edge-link-{}", "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-        );
-        assert!(!legacy_owner_service_is_active(&env));
-        env.insert(
-            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
-            format!("  {LEGACY_LINK_KEYCHAIN_SERVICE}  "),
-        );
-        assert!(legacy_owner_service_is_active(&env));
-    }
-
-    #[test]
     fn owner_control_uses_production_owner_identity_not_enrolled_device_identity() {
         let mut config = Config::default();
         config
@@ -3230,7 +3207,11 @@ mod tests {
             *delete_calls_hook.borrow_mut() += 1;
             Ok(())
         };
-        let activate = move |_paths: &RuntimePaths| -> Result<(), String> {
+        let activate = move |_paths: &RuntimePaths,
+                             _recovered_existing: bool,
+                             _device_id: &str,
+                             _keychain_service: &str|
+              -> Result<(), String> {
             *activation_calls_hook.borrow_mut() += 1;
             Err("simulated activation failure".to_owned())
         };
@@ -3348,7 +3329,7 @@ mod tests {
             delete_calls_hook.set(delete_calls_hook.get() + 1);
             Ok(())
         };
-        let activate = |_: &RuntimePaths| Ok(());
+        let activate = |_: &RuntimePaths, _: bool, _: &str, _: &str| Ok(());
         let reconcile = |_: &RuntimePaths| Ok(());
         let consume = |_: &str, _: &str, _: &str, _: Option<&str>| {
             Ok(EnrolledCredential {
@@ -3435,7 +3416,14 @@ mod tests {
             delete_hook.set(delete_hook.get() + 1);
             Ok(())
         };
-        let activate = |_: &RuntimePaths| -> Result<(), String> {
+        let activate = |_: &RuntimePaths,
+                        recovered_existing: bool,
+                        device_id: &str,
+                        keychain_service: &str|
+         -> Result<(), String> {
+            assert!(recovered_existing);
+            assert_eq!(device_id, DEVICE_ID);
+            assert_eq!(keychain_service, format!("herdr-edge-link-{DEVICE_ID}"));
             Err("simulated activation failure".to_owned())
         };
         let reconcile = move |_: &RuntimePaths| -> Result<(), String> {
@@ -3525,7 +3513,8 @@ mod tests {
         };
         let revoke = |_: &str, _: &str, _: &str| -> Result<bool, String> { Ok(true) };
         let delete = |_: &str, _: &str| -> Result<(), String> { Ok(()) };
-        let activate = |_paths: &RuntimePaths| -> Result<(), String> { Ok(()) };
+        let activate =
+            |_: &RuntimePaths, _: bool, _: &str, _: &str| -> Result<(), String> { Ok(()) };
         let reconcile = |_paths: &RuntimePaths| -> Result<(), String> { Ok(()) };
         let consume = move |origin: &str, id: &str, code: &str, name: Option<&str>| {
             assert_eq!(origin, "https://edge.example");
