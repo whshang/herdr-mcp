@@ -336,6 +336,13 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);
   const createSegment = wakeSource.slice(createStart, createEnd);
   assert.match(createSegment, /sessionStorage\.setItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef\)/);
+  assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 8000/);
+  assert.match(createSegment, /while \(!ADAPTER\.getInputEl\(\) && Date\.now\(\) < composerReadyDeadline\)/);
+  assert.match(createSegment, /await wait\(200\)/);
+  assert.ok(
+    createSegment.indexOf("const composerReadyDeadline") < createSegment.indexOf("if (isTurnInProgress() || ADAPTER.inputHasContent())"),
+    "fresh-session composer readiness must settle before the normal busy guard",
+  );
   assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
   assert.match(createSegment, /registeredBrowserSessionRef/);
 
