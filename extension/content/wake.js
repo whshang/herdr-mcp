@@ -1448,6 +1448,24 @@ const H2W_CONTENT_VERSION = "0.1.91";
       }
       return { ...evidence, rejected: true };
     }
+    if (creatingSession) {
+      // Browser Registry scope registration can beat ChatGPT's Project-home
+      // composer mount. Existing-session dispatches must still fail closed on
+      // the current page state, but a freshly created tab gets one bounded
+      // readiness window before we decide that insertion is unavailable.
+      const composerReadyDeadline = Date.now() + 8000;
+      while (!ADAPTER.getInputEl() && Date.now() < composerReadyDeadline) {
+        if (!runtimeAlive()) {
+          try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+          return { ...evidence, resource_available: false };
+        }
+        await wait(200);
+      }
+      if (!ADAPTER.getInputEl()) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+        return { ...evidence, rejected: true };
+      }
+    }
     if (isTurnInProgress() || ADAPTER.inputHasContent()) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
