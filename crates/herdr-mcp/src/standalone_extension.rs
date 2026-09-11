@@ -214,6 +214,7 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn diagnose_chrome_load(
     expected_path: &Path,
     extension_id: &str,
