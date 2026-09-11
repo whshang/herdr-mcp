@@ -790,6 +790,84 @@ test("execution lanes durably bind opaque WebChat sessions and fence device reas
   assert.equal(persisted.lane.webchat_binding, null);
 });
 
+test("active WebChat session reservation is exclusive while endpoint and account remain shareable", async () => {
+  const { storage, registry } = makeRegistry();
+  await putDevice(storage, device(DEVICE_A));
+  const created = await createChain(registry, "webchat-session-reservation-chain");
+  const lease = await acquire(registry, created.chain, "webchat-session-reservation-lease");
+  const binding = {
+    endpoint_ref: `bep_${"a".repeat(64)}`,
+    provider: "chatgpt",
+    account_ref: `br_${"b".repeat(64)}`,
+    space_ref: null,
+    session_ref: `br_${"c".repeat(64)}`,
+    observation_generation: 7,
+  };
+  const laneParams = (revision, key, branchRef, webchatBinding) => ({
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: revision,
+    expected_lease_generation: 1,
+    idempotency_key: key,
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: branchRef,
+    webchat_binding: webchatBinding,
+  });
+
+  const laneA = await call(registry, "herdr_mcp.execution_lane.create",
+    laneParams(lease.chain.revision, "webchat-reserve-a", "feat/webchat-reserve-a", binding));
+  assert.equal(laneA.ok, true);
+
+  // Simulate upgrading a Durable Object whose active lane predates the
+  // reservation index, then rebuild the DO around the same durable storage.
+  for (const key of [...storage.map.keys()]) {
+    if (key.startsWith("fleet:webchat-session-reservation:v1:")) storage.map.delete(key);
+  }
+  const { registry: restartedRegistry } = makeRegistry(storage);
+  const duplicate = await call(restartedRegistry, "herdr_mcp.execution_lane.create",
+    laneParams(laneA.chain.revision, "webchat-reserve-duplicate", "feat/webchat-reserve-duplicate", binding));
+  assert.equal(duplicate.code, "webchat_session_lane_conflict");
+  assert.equal(duplicate.conflicting_lane_id, laneA.lane.lane_id);
+
+  const siblingBinding = { ...binding, session_ref: `br_${"d".repeat(64)}` };
+  const laneB = await call(registry, "herdr_mcp.execution_lane.create",
+    laneParams(laneA.chain.revision, "webchat-reserve-b", "feat/webchat-reserve-b", siblingBinding));
+  assert.equal(laneB.ok, true);
+  assert.equal(laneB.lane.webchat_binding.account_ref, laneA.lane.webchat_binding.account_ref,
+    "one endpoint/account may host multiple independent worker sessions");
+
+  const unbound = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: laneB.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: 1,
+    lane_id: laneA.lane.lane_id,
+    idempotency_key: "webchat-release-a",
+    webchat_binding: null,
+  });
+  assert.equal(unbound.ok, true);
+
+  const laneC = await call(registry, "herdr_mcp.execution_lane.create",
+    laneParams(unbound.chain.revision, "webchat-reserve-c", "feat/webchat-reserve-c", binding));
+  assert.equal(laneC.ok, true, "explicit unbind releases the exact session reservation");
+
+  const cancelled = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: laneC.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: 1,
+    lane_id: laneB.lane.lane_id,
+    idempotency_key: "webchat-release-b-terminal",
+    status: "cancelled",
+  });
+  assert.equal(cancelled.ok, true);
+
+  const laneD = await call(registry, "herdr_mcp.execution_lane.create",
+    laneParams(cancelled.chain.revision, "webchat-reserve-d", "feat/webchat-reserve-d", siblingBinding));
+  assert.equal(laneD.ok, true, "terminal lane releases its session reservation without erasing binding history");
+});
+
 test("execution lane identity and scopes use portable canonical syntax", async () => {
   const { storage, registry } = makeRegistry();
   await putDevice(storage, device(DEVICE_A));
