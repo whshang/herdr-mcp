@@ -1160,6 +1160,21 @@ async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
 }
 
+async function adoptContinuityOwner(convKey, previousId, canonicalId) {
+  if (!convKey || !previousId || !canonicalId || previousId === canonicalId) return false;
+  const bindings = await loadBindings();
+  let changed = false;
+  for (const binding of bindingsForConv(bindings, convKey)) {
+    if (binding?.continuity_id !== previousId || !binding?.storeKey || !bindings[binding.storeKey]) continue;
+    bindings[binding.storeKey] = { ...bindings[binding.storeKey], continuity_id: canonicalId };
+    changed = true;
+  }
+  if (!changed) return false;
+  await saveBindings(bindings);
+  broadcastControlMessage({ type: "herdr_control_binding_changed" });
+  return true;
+}
+
 async function reconcileBindingsWithLiveWorkspaces(bindings, workspaces, source = "snapshot") {
   const result = reconcileWorkspaceCatalogBindings(bindings, workspaces);
   if (!result.changed) return bindings;
@@ -2013,12 +2028,19 @@ async function journalPostTurnToRust(payload) {
     const parsed = await response.json().catch(() => null);
     if (response.ok && parsed?.ok === true) {
       noteLocalRuntimeReachability(true);
-      if (payload?.continuity_id) {
+      const continuityId = String(parsed?.continuity_id || payload?.continuity_id || "").trim();
+      if (continuityId) {
         await loadRustAcked();
-        rustAcked[payload.continuity_id] = true;
+        rustAcked[continuityId] = true;
         await persistRustAcked();
       }
-      return { ok: true, durable: true, inserted: parsed.inserted === true };
+      return {
+        ok: true,
+        durable: true,
+        inserted: parsed.inserted === true,
+        continuity_id: continuityId || null,
+        canonicalized: parsed?.canonicalized === true,
+      };
     }
     noteLocalRuntimeReachability(false);
     return { ok: false, durable: false, error: parsed?.error || `http-${response.status}` };
@@ -2078,6 +2100,10 @@ async function journalAppendContinuityTurn(payload) {
     observed_at: payload?.observedAt || payload?.endedAt || Date.now(),
   });
   if (ack.ok && ack.durable) {
+    const canonicalId = String(ack?.continuity_id || "").trim();
+    if (canonicalId && canonicalId !== continuityId) {
+      await adoptContinuityOwner(convKey, continuityId, canonicalId).catch(() => false);
+    }
     // Rust is the source of truth; drop the pending retry once acknowledged.
     try {
       const cache = await loadContinuityCache();

@@ -1302,8 +1302,8 @@ async fn post_extension_continuity_turn(State(state): State<AppState>, body: Byt
     let project_id = payload.get("project_id").and_then(Value::as_str);
     let title = payload.get("title").and_then(Value::as_str);
     let fingerprint = payload.get("fingerprint").and_then(Value::as_str);
-    let inserted = match state.state_store.lock() {
-        Ok(mut store) => store.append_continuity_turn(ContinuityTurnInput {
+    let appended = match state.state_store.lock() {
+        Ok(mut store) => match store.append_continuity_turn(ContinuityTurnInput {
             continuity_id,
             conversation_id,
             workspace_id,
@@ -1314,16 +1314,34 @@ async fn post_extension_continuity_turn(State(state): State<AppState>, body: Byt
             text,
             fingerprint,
             observed_at,
-        }),
+        }) {
+            Ok(inserted) => store
+                .continuity_for_conversation(conversation_id)
+                .and_then(|owner| {
+                    owner
+                        .map(|owner| (inserted, owner))
+                        .ok_or_else(|| "continuity_owner_missing_after_append".to_owned())
+                }),
+            Err(error) => Err(error),
+        },
         Err(_) => Err("continuity_store_lock_poisoned".to_owned()),
     };
-    match inserted {
-        Ok(inserted) => json_response(
+    match appended {
+        Ok((inserted, owner)) => json_response(
             StatusCode::OK,
-            &json!({"ok": true, "continuity_id": continuity_id, "inserted": inserted}),
+            &json!({
+                "ok": true,
+                "continuity_id": owner,
+                "inserted": inserted,
+                "canonicalized": owner != continuity_id,
+            }),
         ),
         Err(error) => json_response(
-            StatusCode::BAD_REQUEST,
+            if error == "continuity_binding_ambiguous" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
             &json!({"ok": false, "error": error}),
         ),
     }
@@ -3107,6 +3125,35 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let result: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(result["inserted"], false);
+        assert_eq!(result["continuity_id"], "hc:test");
+        assert_eq!(result["canonicalized"], false);
+
+        let stale_writer = Request::builder()
+            .method(Method::POST)
+            .uri("/extension/continuity/turn")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "continuity_id": "hc:stale",
+                    "conversation_id": "conv-1",
+                    "workspace_id": "w20",
+                    "project_id": "project-1",
+                    "title": "stale local owner",
+                    "message_id": "msg-2",
+                    "role": "assistant",
+                    "text": "continue on the canonical chain",
+                    "observed_at": 1235
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(stale_writer).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["inserted"], true);
+        assert_eq!(result["continuity_id"], "hc:test");
+        assert_eq!(result["canonicalized"], true);
 
         let resolve = Request::builder()
             .method(Method::POST)
@@ -3140,8 +3187,17 @@ mod tests {
             .continuity_resume("hc:test", 32)
             .unwrap()
             .unwrap();
-        assert_eq!(resume.turns.len(), 1);
+        assert_eq!(resume.turns.len(), 2);
         assert_eq!(resume.turns[0].text, "continue");
+        assert_eq!(resume.turns[1].text, "continue on the canonical chain");
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_resume("hc:stale", 32)
+                .unwrap()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

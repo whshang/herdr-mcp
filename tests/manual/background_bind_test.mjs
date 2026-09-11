@@ -97,6 +97,7 @@ let failQueuedInsertStorage = false;
 const queuedInsertDeliveries = [];
 const controlActionRequests = [];
 let mockContinuityPersistenceEnabled = false;
+let mockContinuityCanonicalId = null;
 const mockContinuityChains = new Set();
 const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
@@ -430,11 +431,12 @@ globalThis.chrome = {
           });
           return;
         }
-        if (body.continuity_id) mockContinuityChains.add(body.continuity_id);
+        const continuityId = mockContinuityCanonicalId || body.continuity_id;
+        if (continuityId) mockContinuityChains.add(continuityId);
         callback({
           ok: true, transport: "ipc", status: 200,
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ ok: true, continuity_id: body.continuity_id, inserted: true }),
+          body: JSON.stringify({ ok: true, continuity_id: continuityId, inserted: true, canonicalized: continuityId !== body.continuity_id }),
         });
         return;
       }
@@ -2291,7 +2293,10 @@ console.log("\n[project handoff]");
   ok(storage.herdrConversationTransfers[transferId]?.handoff_text == null, "committed transfer clears the temporary handoff packet");
 
   const priorContinuityPersistence = mockContinuityPersistenceEnabled;
+  const priorContinuityCanonicalId = mockContinuityCanonicalId;
+  const canonicalContinuityId = "hc:test-canonical-owner";
   mockContinuityPersistenceEnabled = true;
+  mockContinuityCanonicalId = canonicalContinuityId;
   const manualContinueBefore = continuityTurnRequests.length;
   let resolveManualContinue;
   const manualContinueP = new Promise((r) => { resolveManualContinue = r; });
@@ -2311,6 +2316,16 @@ console.log("\n[project handoff]");
       && continuityTurnRequests.at(-1)?.role === "user"
       && continuityTurnRequests.at(-1)?.text === "continue without continuity id",
     "manual continue inherits the Project continuity chain instead of creating or requiring another id");
+  ok(manualContinue?.continuity_id === canonicalContinuityId
+      && storage.herdrWakeBindings[targetKey]?.continuity_id === canonicalContinuityId,
+    "Rust canonical continuity owner replaces the stale local binding after turn persistence",
+    JSON.stringify(manualContinue));
+  for (const binding of Object.values(storage.herdrWakeBindings || {})) {
+    if (binding?.continuity_id === canonicalContinuityId) binding.continuity_id = continuityId;
+  }
+  mockContinuityChains.delete(canonicalContinuityId);
+  mockContinuityChains.add(continuityId);
+  mockContinuityCanonicalId = priorContinuityCanonicalId;
   mockContinuityPersistenceEnabled = priorContinuityPersistence;
 
   // Repeat with Project Auto on. Manual handoff must remain available and the
