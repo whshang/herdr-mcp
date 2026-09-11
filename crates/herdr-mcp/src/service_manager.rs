@@ -2,7 +2,7 @@
 //!
 //! macOS uses launchd; Linux uses `systemd --user` when available and an
 //! ownership-checked detached user-process fallback in init-less environments.
-//! Windows uses HKCU login autostart plus ownership-checked detached user processes.
+//! Windows uses a current-user Startup-folder shortcut plus ownership-checked detached user processes.
 //! On macOS, the default production launchd label stays `dev.herdr-mcp.server`
 //! so callers and the browser extension keep a single primary service identity.
 //! Named instances (`HERDR_MCP_INSTANCE` / `--instance`) suffix labels and ports
