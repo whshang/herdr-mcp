@@ -416,10 +416,15 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "account_ref": {"type": "string", "maxLength": 96},
                     "space_ref": {"type": ["string", "null"], "maxLength": 96},
                     "display_label": {"type": "string", "maxLength": 256},
+                    "message": {"type": "string", "maxLength": 262144},
+                    "reasoning_effort": {"type": ["string", "null"], "enum": ["economy", "balanced", "thorough", null]},
+                    "required_apps": {"type": ["array", "null"], "maxItems": 32, "items": {"type": "string", "maxLength": 64}},
                     "expected_generation": {"type": "integer", "minimum": 1},
                     "idempotency_key": {"type": "string", "maxLength": 256},
+                    "work_chain_id": {"type": ["string", "null"], "maxLength": 128},
+                    "lane_id": {"type": ["string", "null"], "maxLength": 160},
                 },
-                "required": ["endpoint_ref", "provider", "account_ref", "display_label", "expected_generation", "idempotency_key"],
+                "required": ["endpoint_ref", "provider", "account_ref", "display_label", "message", "expected_generation", "idempotency_key"],
                 "empty": false,
             },
         }),
@@ -2437,6 +2442,38 @@ mod tests {
         assert_eq!(methods[5]["method"], BROWSER_SPACE_CREATE_METHOD);
         assert_eq!(methods[7]["method"], BROWSER_SPACE_INSPECT_METHOD);
         assert_eq!(methods[8]["method"], BROWSER_SESSION_CREATE_METHOD);
+        assert_eq!(
+            methods[8]["params"]["required"],
+            json!([
+                "endpoint_ref",
+                "provider",
+                "account_ref",
+                "display_label",
+                "message",
+                "expected_generation",
+                "idempotency_key"
+            ])
+        );
+        assert_eq!(
+            methods[8]["params"]["properties"]["message"]["maxLength"],
+            262144
+        );
+        assert_eq!(
+            methods[8]["params"]["properties"]["reasoning_effort"]["enum"],
+            json!(["economy", "balanced", "thorough", null])
+        );
+        assert_eq!(
+            methods[8]["params"]["properties"]["required_apps"]["maxItems"],
+            32
+        );
+        assert_eq!(
+            methods[8]["params"]["properties"]["work_chain_id"]["maxLength"],
+            128
+        );
+        assert_eq!(
+            methods[8]["params"]["properties"]["lane_id"]["maxLength"],
+            160
+        );
         assert_eq!(methods[10]["method"], BROWSER_SESSION_INSPECT_METHOD);
         assert_eq!(methods[11]["method"], BROWSER_MESSAGE_APPEND_METHOD);
         assert_eq!(methods[12]["method"], BROWSER_COMPOSER_SET_REASONING_METHOD);
