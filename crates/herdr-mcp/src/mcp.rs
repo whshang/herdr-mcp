@@ -3814,10 +3814,15 @@ fn browser_operation_inspect_resource(
 fn browser_dispatch_result_is_durable(
     dispatch: &crate::state_store::BrowserDispatchRecord,
 ) -> bool {
-    dispatch.result_assistant_message_ref.is_some()
-        && dispatch.result_turn_message_id.is_some()
-        && dispatch.result_evidence_id.is_some()
-        && dispatch.result_settled_at.is_some()
+    if dispatch.result_assistant_message_ref.is_none() || dispatch.result_settled_at.is_none() {
+        return false;
+    }
+    match dispatch.work_chain_id {
+        Some(_) => {
+            dispatch.result_turn_message_id.is_some() && dispatch.result_evidence_id.is_some()
+        }
+        None => dispatch.result_turn_message_id.is_none() && dispatch.result_evidence_id.is_none(),
+    }
 }
 
 /// Conservative beta.2 assignment projection derived from existing authorities.
