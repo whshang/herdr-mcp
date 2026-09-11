@@ -31,7 +31,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; never select a chain by recency or text similarity alone. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; pass a supplied ChatGPT conversation URL to continuity.search as conversation_url; never select a chain by recency or text similarity alone. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -420,6 +420,37 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     Ok(tool_result(output, false))
 }
 
+fn chatgpt_conversation_url_ref(raw: &str) -> Option<(String, Option<String>)> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    if parsed.scheme() != "https"
+        || !matches!(
+            parsed.host_str()?.to_ascii_lowercase().as_str(),
+            "chatgpt.com" | "www.chatgpt.com"
+        )
+    {
+        return None;
+    }
+    let segments = parsed
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["c", conversation_id] => Some(((*conversation_id).to_owned(), None)),
+        ["g", project_segment, "c", conversation_id] if project_segment.starts_with("g-p-") => {
+            let resource_id = project_segment.strip_prefix("g-p-")?.split('-').next()?;
+            let project_id = if resource_id.len() == 32
+                && resource_id.chars().all(|ch| ch.is_ascii_hexdigit())
+            {
+                format!("g-p-{resource_id}")
+            } else {
+                (*project_segment).to_owned()
+            };
+            Some(((*conversation_id).to_owned(), Some(project_id)))
+        }
+        _ => None,
+    }
+}
+
 fn continuity_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
@@ -494,6 +525,7 @@ fn continuity_call(
                 "project_id",
                 "workspace_id",
                 "conversation_id",
+                "conversation_url",
                 "query",
                 "limit",
             ];
@@ -504,7 +536,7 @@ fn continuity_call(
                     "message": format!("unknown continuity.search param: {key}"),
                 });
             }
-            let project_id = match continuity_search_string(params, "project_id", 256) {
+            let explicit_project_id = match continuity_search_string(params, "project_id", 256) {
                 Ok(value) => value,
                 Err(error) => return error,
             };
@@ -512,10 +544,54 @@ fn continuity_call(
                 Ok(value) => value,
                 Err(error) => return error,
             };
-            let conversation_id = match continuity_search_string(params, "conversation_id", 512) {
+            let explicit_conversation_id =
+                match continuity_search_string(params, "conversation_id", 512) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+            let conversation_url = match continuity_search_string(params, "conversation_url", 2048)
+            {
                 Ok(value) => value,
                 Err(error) => return error,
             };
+            let (url_conversation_id, url_project_id) = match conversation_url {
+                Some(raw) => match chatgpt_conversation_url_ref(raw) {
+                    Some((conversation_id, project_id)) => (Some(conversation_id), project_id),
+                    None => {
+                        return json!({
+                            "ok": false,
+                            "code": "continuity_search_params_invalid",
+                            "message": "conversation_url must be a ChatGPT conversation URL",
+                        });
+                    }
+                },
+                None => (None, None),
+            };
+            if explicit_conversation_id
+                .is_some_and(|value| Some(value) != url_conversation_id.as_deref())
+                && url_conversation_id.is_some()
+            {
+                return json!({
+                    "ok": false,
+                    "code": "continuity_search_params_invalid",
+                    "message": "conversation_id conflicts with conversation_url",
+                });
+            }
+            if explicit_project_id.is_some_and(|value| Some(value) != url_project_id.as_deref())
+                && url_project_id.is_some()
+            {
+                return json!({
+                    "ok": false,
+                    "code": "continuity_search_params_invalid",
+                    "message": "project_id conflicts with conversation_url",
+                });
+            }
+            let project_id_owned = explicit_project_id.map(str::to_owned).or(url_project_id);
+            let conversation_id_owned = explicit_conversation_id
+                .map(str::to_owned)
+                .or(url_conversation_id);
+            let project_id = project_id_owned.as_deref();
+            let conversation_id = conversation_id_owned.as_deref();
             let query = match continuity_search_string(params, "query", 512) {
                 Ok(value) => value,
                 Err(error) => return error,
@@ -4991,7 +5067,7 @@ mod tests {
                     "hc:alpha",
                     "conv-a",
                     "w19",
-                    "project-a",
+                    "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "Alpha release",
                     "msg-a",
                     "continue v0.4.2 release work",
@@ -5045,6 +5121,17 @@ mod tests {
         assert_eq!(exact["candidates"][0]["continuity_id"], "hc:alpha");
         assert_eq!(exact["candidates"][0]["match_reasons"][0], "workspace_id");
 
+        let url_exact = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({
+                "conversation_url": "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project/c/conv-a?foo=bar#tail"
+            }),
+        );
+        assert_eq!(url_exact["resolution"], "unique_exact");
+        assert_eq!(url_exact["auto_resume_safe"], true);
+        assert_eq!(url_exact["candidates"][0]["continuity_id"], "hc:alpha");
+
         let text_only = continuity_call(&store, "continuity.search", &json!({"query": "v0.4.2"}));
         assert_eq!(text_only["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(text_only["resolution"], "confirmation_required");
@@ -5057,7 +5144,7 @@ mod tests {
                     continuity_id: "hc:gamma",
                     conversation_id: "conv-c",
                     workspace_id: Some("w19"),
-                    project_id: Some("project-a"),
+                    project_id: Some("g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                     title: Some("Gamma release"),
                     message_id: "msg-c",
                     role: "user",

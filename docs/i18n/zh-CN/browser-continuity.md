@@ -107,6 +107,8 @@ ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。
 
 用户**手动**在同一个已绑定 ChatGPT Project 里新开会话时，不需要记住或输入 `continuity_id`。新会话第一条已确认发送的用户消息（例如“继续”）会沿用 Project binding 写入同一条 continuity chain；Web planner 看到“继续 / 接着 / 恢复上次”等意图后，应先通过 `continuity.resolve` / `continuity.search` 搜索，而不是先要求用户提供内部 ID。只有 `conversation_id`、`project_id`、`workspace_id` 这类稳定身份把候选收敛为唯一链时才允许自动 `continuity.resume`。单纯文本匹配即使只剩一个候选也仍需要用户确认；“继续”本身只是触发搜索，不是选择证据。多个候选会返回有界的标题、workspace、更新时间和最近对话摘要供确认，系统禁止用“最近一次”或“最像”直接猜。
 
+手动接力也可以直接从旧 ChatGPT 对话链接开始。用户在新的 Web AI 会话里粘贴旧链接并让 Herdr 继续即可；`continuity.search` 直接接受 `conversation_url`，由 Rust 解析 ChatGPT Project 与 conversation 身份，得到唯一精确链时 planner 立即调用 `continuity.resume` 恢复已持久化的上下文。这个恢复动作不依赖浏览器插件，也不需要先打开 Project 首页等待 composer。浏览器插件继续负责自动记录 turn 和自动 rollover。此前从未写入本地 journal 的私有 ChatGPT 会话无法仅凭 URL 经 MCP 拉取正文，因为 MCP 连接本身不携带用户的 ChatGPT 私有会话正文。
+
 Rust journal 不可用或实时确认失败时，扩展继续使用既有 `HERDR_HANDOFF_V1` 与 bounded transcript 路径。
 
 ### 未来目标：Continuity 2.0
