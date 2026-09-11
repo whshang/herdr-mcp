@@ -155,15 +155,9 @@ pub(crate) fn doctor_line() -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn connector_ready() -> Result<bool, String> {
-    #[cfg(target_os = "macos")]
-    {
-        platform::connector_ready()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(true)
-    }
+    platform::connector_ready()
 }
 
 pub(crate) fn remove_for_service() -> Result<(), String> {
