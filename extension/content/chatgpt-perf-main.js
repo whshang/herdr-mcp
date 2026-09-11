@@ -636,7 +636,7 @@
   }
 
   function foldToolRuns() {
-    if (!enabled || composerGenerating()) return 0;
+    if (!enabled) return 0;
     let folded = 0;
     const seenStacks = new Set();
 
@@ -645,30 +645,46 @@
       if (!(stack instanceof Element) || seenStacks.has(stack)) continue;
       seenStacks.add(stack);
       if (stack.querySelector?.('[data-testid="tool-approval-card"]')) continue;
-      if (Array.from(stack.children || []).some(
-        (child) => child instanceof Element && child.getAttribute(TOOL_RUN_SUMMARY_ATTR) === "1",
-      )) continue;
 
       let run = [];
+      let activeSummary = null;
       const flush = () => {
         if (run.length < TOOL_RUN_MIN_MESSAGES) {
           run = [];
+          activeSummary = null;
           return;
         }
-        const summary = document.createElement("button");
-        summary.setAttribute("type", "button");
-        summary.setAttribute(TOOL_RUN_SUMMARY_ATTR, "1");
-        summary.setAttribute("aria-expanded", "false");
-        foldedToolRuns.set(summary, run.slice());
-        setToolRunExpanded(summary, false);
-        stack.insertBefore(summary, run[0]);
-        stats.tool_runs_folded += 1;
-        stats.tool_run_messages_hidden += run.length;
-        folded += 1;
+
+        if (activeSummary instanceof Element) {
+          const previous = foldedToolRuns.get(activeSummary) || [];
+          const expanded = activeSummary.getAttribute("aria-expanded") === "true";
+          const newlyTracked = run.filter((wrapper) => !previous.includes(wrapper)).length;
+          foldedToolRuns.set(activeSummary, run.slice());
+          setToolRunExpanded(activeSummary, expanded);
+          if (!expanded) stats.tool_run_messages_hidden += newlyTracked;
+        } else {
+          const summary = document.createElement("button");
+          summary.setAttribute("type", "button");
+          summary.setAttribute(TOOL_RUN_SUMMARY_ATTR, "1");
+          summary.setAttribute("aria-expanded", "false");
+          foldedToolRuns.set(summary, run.slice());
+          setToolRunExpanded(summary, false);
+          stack.insertBefore(summary, run[0]);
+          stats.tool_runs_folded += 1;
+          stats.tool_run_messages_hidden += run.length;
+          folded += 1;
+        }
         run = [];
+        activeSummary = null;
       };
 
       for (const child of Array.from(stack.children || [])) {
+        if (!(child instanceof Element)) continue;
+        if (child.getAttribute(TOOL_RUN_SUMMARY_ATTR) === "1") {
+          if (run.length) flush();
+          activeSummary = child;
+          continue;
+        }
         if (isDirectToolWrapper(child)) {
           run.push(child);
           continue;
@@ -845,6 +861,7 @@
     if (toolStructureChanged) {
       stats.tool_discovery_batches += 1;
       discoverToolClusters();
+      foldToolRuns();
     }
 
     scheduleSettledScan();

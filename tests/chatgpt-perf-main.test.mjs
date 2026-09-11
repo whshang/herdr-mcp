@@ -722,6 +722,60 @@ test("settled ChatGPT tool runs fold to one count and expand without moving repl
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_runs_expanded, 1);
 });
 
+test("streaming ChatGPT tool runs fold on the second card and grow incrementally", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const stack = new FakeElement("div");
+  stack.ownerDocument = document;
+  const reply = new FakeElement("div");
+  reply.ownerDocument = document;
+  reply.setAttribute("data-message-author-role", "assistant");
+  reply.textContent = "working";
+  const stop = new FakeElement("button");
+  document._querySelectorHook = (selector) => selector.includes("stop-button") ? stop : null;
+
+  const toolWrap = () => {
+    const wrap = new FakeElement("div", "contents");
+    wrap.ownerDocument = document;
+    const tool = new FakeElement("span", "group/tool-message");
+    tool.ownerDocument = document;
+    wrap.appendChild(tool);
+    return wrap;
+  };
+
+  const firstWrap = toolWrap();
+  stack.appendChild(firstWrap);
+  stack.appendChild(reply);
+  document.body.appendChild(stack);
+  context.__HERDR_CHATGPT_PERF__.scan();
+  assert.equal(stack.children.some((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1"), false);
+
+  const secondWrap = toolWrap();
+  stack.insertBefore(secondWrap, reply);
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [secondWrap], removedNodes: [] }]);
+
+  const summary = stack.children.find((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1");
+  assert.ok(summary);
+  assert.equal(summary.textContent, "+ Tool calls × 2");
+  assert.equal(firstWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(secondWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+
+  const thirdWrap = toolWrap();
+  stack.insertBefore(thirdWrap, reply);
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [thirdWrap], removedNodes: [] }]);
+  assert.equal(summary.textContent, "+ Tool calls × 3");
+  assert.equal(thirdWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(stack.children.filter((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1").length, 1);
+
+  document.emit("click", summary);
+  assert.equal(summary.getAttribute("aria-expanded"), "true");
+  const fourthWrap = toolWrap();
+  stack.insertBefore(fourthWrap, reply);
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [fourthWrap], removedNodes: [] }]);
+  assert.equal(summary.textContent, "− Tool calls × 4");
+  assert.equal(fourthWrap.getAttribute("data-herdr-tool-run-hidden"), null);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_runs_folded, 1);
+});
+
 test("wrapped code viewers remain uncontained", () => {
   const { context, document, FakeElement } = makeContext();
   const { viewer } = codeViewer(FakeElement, document, "a very long wrapped line", { wrapped: true });
