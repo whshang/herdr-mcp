@@ -44,6 +44,7 @@ pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 2;
 
 const LOCAL_MCP_RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
+const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
 const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const LOCAL_MCP_MIN_FRAME_BYTES: usize = 64;
@@ -400,6 +401,52 @@ impl LocalMcpTransport {
         serde_json::to_string(&normalized).map(Some).map_err(|_| ())
     }
 
+    fn webchat_authorization_header(
+        trace: Option<&Map<String, Value>>,
+    ) -> Result<Option<String>, ()> {
+        let Some(value) = trace.and_then(|trace| trace.get("webchat_authorization")) else {
+            return Ok(None);
+        };
+        let object = value.as_object().ok_or(())?;
+        if object.len() != 3
+            || !object.contains_key("principal_ref")
+            || !object.contains_key("connector_id")
+            || !object.contains_key("grant_generation")
+        {
+            return Err(());
+        }
+        let principal_ref = object
+            .get("principal_ref")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        let connector_id = object
+            .get("connector_id")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        let grant_generation = object
+            .get("grant_generation")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or(())?;
+        if !connector_id.starts_with("conn_")
+            || connector_id.len() < 13
+            || connector_id.len() > 133
+            || !connector_id[5..]
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            || principal_ref != format!("connector:{connector_id}")
+        {
+            return Err(());
+        }
+        serde_json::to_string(&json!({
+            "principal_ref": principal_ref,
+            "connector_id": connector_id,
+            "grant_generation": grant_generation,
+        }))
+        .map(Some)
+        .map_err(|_| ())
+    }
+
     fn failure(
         &self,
         code: &str,
@@ -472,6 +519,7 @@ impl LocalMcpTransport {
         rpc_id: String,
         webchat_grants_header: Option<&str>,
         page_assist_grants_header: Option<&str>,
+        authorization_header: Option<&str>,
     ) -> RuntimeToolResult {
         let Some(expected_generation) = self.runtime_generation.as_deref() else {
             return self.failure(
@@ -526,6 +574,9 @@ impl LocalMcpTransport {
         }
         if let Some(value) = page_assist_grants_header {
             request_builder = request_builder.header(EDGE_PAGE_ASSIST_GRANTS_HEADER, value);
+        }
+        if let Some(value) = authorization_header {
+            request_builder = request_builder.header(EDGE_WEBCHAT_AUTHORIZATION_HEADER, value);
         }
         let request = match request_builder
             .header(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER, expected_generation)
@@ -584,6 +635,7 @@ impl LocalMcpTransport {
         _rpc_id: String,
         _webchat_grants_header: Option<&str>,
         _page_assist_grants_header: Option<&str>,
+        _authorization_header: Option<&str>,
     ) -> RuntimeToolResult {
         self.failure(
             code::UNREACHABLE,
@@ -676,13 +728,18 @@ impl LocalMcpTransport {
         rpc_id: String,
         webchat_grants_header: Option<String>,
         page_assist_grants_header: Option<String>,
+        authorization_header: Option<String>,
     ) -> RuntimeToolResult {
-        if webchat_grants_header.is_some() || page_assist_grants_header.is_some() {
+        if webchat_grants_header.is_some()
+            || page_assist_grants_header.is_some()
+            || authorization_header.is_some()
+        {
             self.dispatch_trusted_ipc(
                 body,
                 rpc_id,
                 webchat_grants_header.as_deref(),
                 page_assist_grants_header.as_deref(),
+                authorization_header.as_deref(),
             )
             .await
         } else {
@@ -729,6 +786,18 @@ impl LocalMcpTransport {
                     );
                 }
             };
+        let authorization_header = match Self::webchat_authorization_header(request.trace.as_ref())
+        {
+            Ok(value) => value,
+            Err(()) => {
+                return self.failure(
+                    code::BAD_REQUEST,
+                    false,
+                    "invalid trusted caller authorization context",
+                    None,
+                );
+            }
+        };
         let body = match serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -792,7 +861,13 @@ impl LocalMcpTransport {
                     None,
                 )
             },
-            result = self.dispatch_routed(body, rpc_id, webchat_grants_header, page_assist_grants_header) => result,
+            result = self.dispatch_routed(
+                body,
+                rpc_id,
+                webchat_grants_header,
+                page_assist_grants_header,
+                authorization_header,
+            ) => result,
         };
 
         let mut in_flight = self.lock_in_flight();
@@ -1464,7 +1539,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn webchat_grant_trace_uses_trusted_unix_ipc_without_bearer_fallback() {
+    async fn webchat_caller_trace_uses_trusted_unix_ipc_without_bearer_fallback() {
         let response = json!({"jsonrpc": "2.0", "id": "local-1", "result": {"ok": true}});
         let (socket, request_rx) = spawn_unix_server(response.to_string(), "rust-test").await;
         let mut config = LocalMcpConfig::new("token-test", "sha256:test");
@@ -1487,6 +1562,14 @@ mod tests {
                     "endpoint_ref": "be_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                 }]),
             ),
+            (
+                "webchat_authorization".to_owned(),
+                json!({
+                    "principal_ref": "connector:conn_auditconnector123",
+                    "connector_id": "conn_auditconnector123",
+                    "grant_generation": 7
+                }),
+            ),
         ]));
         let outcome = transport.dispatch_request(grant_request).await;
         assert_eq!(
@@ -1499,10 +1582,18 @@ mod tests {
         let lowered = raw_request.to_ascii_lowercase();
         assert!(lowered.starts_with("post /mcp http/1.1"));
         assert!(lowered.contains("x-herdr-edge-webchat-control-grants:"));
+        assert!(lowered.contains("x-herdr-edge-webchat-authorization:"));
         assert!(lowered.contains("x-herdr-edge-page-assist-grants:"));
         assert!(lowered.contains("x-herdr-edge-expected-runtime-generation: rust-test"));
-        assert!(!lowered.contains("authorization:"));
+        assert!(
+            !lowered
+                .lines()
+                .any(|line| line.starts_with("authorization:")),
+            "trusted Unix IPC must not carry the workstation bearer header",
+        );
         assert!(raw_request.contains("\"provider\":\"chatgpt\""));
+        assert!(raw_request.contains("conn_auditconnector123"));
+        assert!(raw_request.contains("\"grant_generation\":7"));
         assert!(
             raw_request
                 .contains("be_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")

@@ -1091,6 +1091,8 @@ test("JSON-RPC request validation and method errors preserve ids", async () => {
 test("browser and Page Assist private methods require explicit enrolled device selector before forwarding", async () => {
   const d = deps({
     client: {
+      connectorId: "conn_auditconnector123",
+      grantGeneration: 7,
       webchatControlGrants: [
         {
           device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -1174,7 +1176,12 @@ test("browser and Page Assist private methods require explicit enrolled device s
       provider: "chatgpt",
       account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     }],
-  }, "only grants for the routed device cross the Edge -> Link handoff");
+    webchat_authorization: {
+      principal_ref: "connector:conn_auditconnector123",
+      connector_id: "conn_auditconnector123",
+      grant_generation: 7,
+    },
+  }, "routed browser private methods carry only the selected device grants plus exact Connector authorization provenance");
 
   const pageAssist = await handleMcp(
     req(4, "tools/call", {

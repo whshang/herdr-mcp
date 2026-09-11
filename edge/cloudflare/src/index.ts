@@ -829,6 +829,8 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
       client: {
         userAgent: request.headers.get("user-agent"),
         oauthClientId: devAuth.clientId ?? null,
+        connectorId: devAuth.connectorId ?? null,
+        grantGeneration: devAuth.grantGeneration ?? null,
         authSource: devAuth.source,
         webchatControlGrants,
         pageAssistGrants,
