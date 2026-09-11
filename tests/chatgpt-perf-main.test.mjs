@@ -80,6 +80,12 @@ function makeContext() {
       if (selector === '[data-herdr-tool-cluster-hidden="1"]') {
         return this.getAttribute("data-herdr-tool-cluster-hidden") === "1";
       }
+      if (selector === '[data-herdr-tool-run-summary="1"]') {
+        return this.getAttribute("data-herdr-tool-run-summary") === "1";
+      }
+      if (selector === '[data-herdr-tool-run-hidden="1"]') {
+        return this.getAttribute("data-herdr-tool-run-hidden") === "1";
+      }
       if (selector === "#code-block-viewer.cm-editor") {
         return this.id === "code-block-viewer" && this.classList.contains("cm-editor");
       }
@@ -821,6 +827,12 @@ test("tool-only ChatGPT turns fold independently and grow while streaming", () =
   assert.equal(summary.textContent, "+ Tool calls × 4");
   assert.equal(fourth.getAttribute("data-herdr-tool-run-hidden"), "1");
   assert.equal(stack.children.filter((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1").length, 1);
+
+  context.__HERDR_CHATGPT_PERF__.disable();
+  assert.equal(stack.children.some((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1"), false);
+  for (const wrapper of [first, second, third, fourth]) {
+    assert.equal(wrapper.getAttribute("data-herdr-tool-run-hidden"), null);
+  }
 });
 
 test("wrapped code viewers remain uncontained", () => {

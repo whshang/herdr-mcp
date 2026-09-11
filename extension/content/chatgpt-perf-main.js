@@ -738,20 +738,15 @@
   }
 
   function cleanupToolRuns() {
-    const seenStacks = new Set();
-    for (const message of document.querySelectorAll?.('[data-message-author-role="assistant"]') || []) {
-      const stack = message.parentElement;
-      if (!(stack instanceof Element) || seenStacks.has(stack)) continue;
-      seenStacks.add(stack);
-      for (const child of Array.from(stack.children || [])) {
-        if (!(child instanceof Element)) continue;
-        if (child.getAttribute(TOOL_RUN_SUMMARY_ATTR) === "1") {
-          foldedToolRuns.delete(child);
-          child.remove?.();
-          continue;
-        }
-        child.removeAttribute(TOOL_RUN_HIDDEN_ATTR);
-      }
+    for (const summary of document.querySelectorAll?.(`[${TOOL_RUN_SUMMARY_ATTR}="1"]`) || []) {
+      if (!(summary instanceof Element)) continue;
+      const wrappers = foldedToolRuns.get(summary) || [];
+      for (const wrapper of wrappers) wrapper?.removeAttribute?.(TOOL_RUN_HIDDEN_ATTR);
+      foldedToolRuns.delete(summary);
+      summary.remove?.();
+    }
+    for (const wrapper of document.querySelectorAll?.(`[${TOOL_RUN_HIDDEN_ATTR}="1"]`) || []) {
+      wrapper?.removeAttribute?.(TOOL_RUN_HIDDEN_ATTR);
     }
   }
 
