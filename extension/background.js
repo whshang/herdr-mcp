@@ -48,6 +48,9 @@ import {
 } from "./queued-insert-core.js";
 
 const H2W_SCRIPT_VERSION = "0.1.91";
+const CHATGPT_PERF_SCRIPT_VERSION = "9";
+const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
+const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -142,6 +145,7 @@ const AUTOMATION_MODE_PROJECT = "project_auto";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
 const tabVersions = new Map();
 const reloadedTabs = new Set();
+let chatGptPerfMigrationPending = false;
 const tabRecoveryAttemptAt = new Map();
 const pageHealthForceReloadAt = new Map();
 const FALLBACK_TEMPLATE =
@@ -853,6 +857,109 @@ async function conversationInfoForTab(tabId) {
   return fallback;
 }
 
+// ---- ChatGPT MAIN-world performance-script migration ----
+async function probeChatGptPerfTab(tabId) {
+  try {
+    const rows = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        const stopSelectors = [
+          '[data-testid="stop-button"]',
+          'button[aria-label="Stop streaming" i]',
+          'button[aria-label="Stop generating" i]',
+          'button[aria-label*="停止" i]',
+        ];
+        const streaming = stopSelectors.some((selector) => {
+          try { return Boolean(document.querySelector(selector)); } catch (_) { return false; }
+        });
+        const input = document.querySelector('#prompt-textarea');
+        let composerText = "";
+        if (input) {
+          if (typeof input.value === "string" && input.tagName !== "DIV") composerText = input.value;
+          else {
+            const clone = input.cloneNode(true);
+            for (const node of clone.querySelectorAll?.('[data-inline-selection-pill],[contenteditable="false"]') || []) node.remove();
+            composerText = clone.textContent || "";
+          }
+        }
+        composerText = String(composerText).replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+        const assistants = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+        const lastAssistant = assistants[assistants.length - 1] || null;
+        const toolRunning = Boolean(lastAssistant?.querySelector?.('[aria-busy="true"],[class*="animate-spin"],[class*="animate-pulse"],svg.animate-spin'));
+        return {
+          perfVersion: String(window.__HERDR_CHATGPT_PERF__?.version || ""),
+          streaming,
+          composerHasText: Boolean(composerText),
+          toolRunning,
+          permissionCardActive: Boolean(document.querySelector('[data-testid="tool-approval-card"]')),
+        };
+      },
+    });
+    return rows?.[0]?.result || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function chatGptPerfReloadSafe(probe) {
+  return Boolean(probe)
+    && !probe.streaming
+    && !probe.composerHasText
+    && !probe.toolRunning
+    && !probe.permissionCardActive;
+}
+
+function scheduleChatGptPerfMigrationSweep(delayMs = 6000) {
+  try { chrome.alarms.create(CHATGPT_PERF_MIGRATION_ALARM, { when: Date.now() + delayMs }); } catch (_) {}
+}
+
+async function sweepStaleChatGptPerfTabs() {
+  if (!chatGptPerfMigrationPending) return { pending: false, reloaded: 0, deferred: 0 };
+  let reloaded = 0;
+  let deferred = 0;
+  let stale = 0;
+  try {
+    const tabs = await chrome.tabs.query({ url: "*://chatgpt.com/*" });
+    for (const tab of tabs) {
+      if (!tab?.id) continue;
+      if (tab.status !== "complete") {
+        stale += 1;
+        deferred += 1;
+        continue;
+      }
+      const probe = await probeChatGptPerfTab(tab.id);
+      if (probe?.perfVersion === CHATGPT_PERF_SCRIPT_VERSION) continue;
+      stale += 1;
+      if (!chatGptPerfReloadSafe(probe) || reloadedTabs.has(tab.id)) {
+        deferred += 1;
+        continue;
+      }
+      reloadedTabs.add(tab.id);
+      await chrome.tabs.reload(tab.id);
+      reloaded += 1;
+    }
+  } catch (error) {
+    callLog("ChatGPT perf-script migration sweep failed:", error?.message || error);
+    stale += 1;
+    deferred += 1;
+  }
+
+  if (stale === 0) {
+    chatGptPerfMigrationPending = false;
+    await chrome.storage.local.set({ [CHATGPT_PERF_VERSION_STORAGE_KEY]: CHATGPT_PERF_SCRIPT_VERSION });
+  } else {
+    scheduleChatGptPerfMigrationSweep(60000);
+  }
+  return { pending: chatGptPerfMigrationPending, reloaded, deferred };
+}
+
+void chrome.storage.local.get(CHATGPT_PERF_VERSION_STORAGE_KEY).then((state) => {
+  if (String(state?.[CHATGPT_PERF_VERSION_STORAGE_KEY] || "") === CHATGPT_PERF_SCRIPT_VERSION) return;
+  chatGptPerfMigrationPending = true;
+  scheduleChatGptPerfMigrationSweep();
+}).catch((error) => callLog("ChatGPT perf-script migration state read failed:", error?.message || error));
+
 // ---- Content-script version synchronization ----
 async function sweepStaleTabs(force = false) {
   try {
@@ -860,6 +967,10 @@ async function sweepStaleTabs(force = false) {
     for (const t of tabs) {
       if (t.status !== "complete" || reloadedTabs.has(t.id)) continue;
       if (!force && tabVersions.get(t.id) === H2W_SCRIPT_VERSION) continue;
+      if (String(t.url || "").startsWith("https://chatgpt.com/")) {
+        const probe = await probeChatGptPerfTab(t.id);
+        if (!chatGptPerfReloadSafe(probe)) continue;
+      }
       reloadedTabs.add(t.id);
       callLog(`tab ${t.id} ${t.url} content script ${tabVersions.get(t.id) || "old/unreported"}; reloading`);
       chrome.tabs.reload(t.id);
@@ -6399,6 +6510,10 @@ try {
   chrome.alarms.onAlarm.addListener((a) => {
     if (a.name === "h2w-keepalive") {
       void ensureAlive();
+      return;
+    }
+    if (a.name === CHATGPT_PERF_MIGRATION_ALARM) {
+      void sweepStaleChatGptPerfTabs();
       return;
     }
     if (String(a.name || "").startsWith(HANDOFF_FALLBACK_ALARM_PREFIX)) {

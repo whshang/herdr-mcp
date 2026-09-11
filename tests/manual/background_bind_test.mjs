@@ -57,7 +57,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true, experimentalGrokEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", chatgptPerfScriptVersion: "8", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true, experimentalGrokEnabled: true };
 const listeners = {
   onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
   onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [],
@@ -598,6 +598,7 @@ globalThis.chrome = {
     async reload(tabId, options) {
       reloadCalls.push({ tabId, options });
       const tab = tabs.get(tabId);
+      if (tab?.perfProbe) tab.perfProbe = { ...tab.perfProbe, perfVersion: "9" };
       if (tab?.url?.startsWith("https://gemini.google.com/")
         && registeredContentScripts.has("herdr-experimental-gemini")) {
         tab.listener = targetListener(tab);
@@ -632,6 +633,9 @@ globalThis.chrome = {
       executeScriptCalls.push(args);
       const tabId = args?.target?.tabId;
       const tab = tabs.get(tabId);
+      if (args?.world === "MAIN" && typeof args?.func === "function" && tab?.perfProbe) {
+        return [{ result: { ...tab.perfProbe } }];
+      }
       if (tab) {
         tab.listener = (msg, _sender, sendResponse) => {
           if (msg?.type === "h2w_page_assist") {
@@ -709,6 +713,47 @@ function installContentScript(tabId, url, convKey, site = "chatgpt") {
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
 ok(!!onMsg, "background onMessage listener registered");
+
+console.log("\n[ChatGPT perf-script migration]");
+{
+  const idleTabId = 141;
+  const busyTabId = 142;
+  tabs.set(idleTabId, {
+    id: idleTabId,
+    url: "https://chatgpt.com/c/perf-idle",
+    status: "complete",
+    perfProbe: { perfVersion: "8", streaming: false, composerHasText: false, toolRunning: false, permissionCardActive: false },
+  });
+  tabs.set(busyTabId, {
+    id: busyTabId,
+    url: "https://chatgpt.com/c/perf-busy",
+    status: "complete",
+    perfProbe: { perfVersion: "8", streaming: true, composerHasText: false, toolRunning: false, permissionCardActive: false },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const reloadsBefore = reloadCalls.length;
+  for (const listener of listeners.onAlarm) listener({ name: "h2w-chatgpt-perf-migration" });
+  await waitForTest(() => reloadCalls.length > reloadsBefore);
+  ok(reloadCalls.slice(reloadsBefore).some((entry) => entry.tabId === idleTabId),
+    "stale idle ChatGPT perf script reloads on the dedicated migration sweep");
+  ok(!reloadCalls.slice(reloadsBefore).some((entry) => entry.tabId === busyTabId),
+    "stale streaming ChatGPT tab is not interrupted by perf-script migration");
+  ok(storage.chatgptPerfScriptVersion !== "9",
+    "perf migration stays pending while a stale busy ChatGPT tab remains");
+
+  tabs.get(busyTabId).perfProbe.streaming = false;
+  const secondReloadStart = reloadCalls.length;
+  for (const listener of listeners.onAlarm) listener({ name: "h2w-chatgpt-perf-migration" });
+  await waitForTest(() => reloadCalls.length > secondReloadStart);
+  ok(reloadCalls.slice(secondReloadStart).some((entry) => entry.tabId === busyTabId),
+    "deferred ChatGPT perf migration reloads after the tab becomes quiescent");
+  for (const listener of listeners.onAlarm) listener({ name: "h2w-chatgpt-perf-migration" });
+  await waitForTest(() => storage.chatgptPerfScriptVersion === "9");
+  ok(storage.chatgptPerfScriptVersion === "9",
+    "perf migration records completion only after every open ChatGPT tab reports the new script version");
+  tabs.delete(idleTabId);
+  tabs.delete(busyTabId);
+}
 
 console.log("\n[HUD cold-start locale readiness]");
 let coldHudSettled = false;

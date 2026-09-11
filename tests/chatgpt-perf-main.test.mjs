@@ -35,6 +35,15 @@ function makeContext() {
       this.children.push(child);
       return child;
     }
+    insertBefore(child, reference) {
+      const index = this.children.indexOf(reference);
+      if (index < 0) return this.appendChild(child);
+      child.parentNode = this;
+      child.ownerDocument ||= this.ownerDocument;
+      child._setConnected(this.isConnected);
+      this.children.splice(index, 0, child);
+      return child;
+    }
     _setConnected(value) {
       this.isConnected = value;
       for (const child of this.children) child._setConnected(value);
@@ -70,6 +79,12 @@ function makeContext() {
       }
       if (selector === '[data-herdr-tool-cluster-hidden="1"]') {
         return this.getAttribute("data-herdr-tool-cluster-hidden") === "1";
+      }
+      if (selector === '[data-herdr-tool-run-summary="1"]') {
+        return this.getAttribute("data-herdr-tool-run-summary") === "1";
+      }
+      if (selector === '[data-herdr-tool-run-hidden="1"]') {
+        return this.getAttribute("data-herdr-tool-run-hidden") === "1";
       }
       if (selector === "#code-block-viewer.cm-editor") {
         return this.id === "code-block-viewer" && this.classList.contains("cm-editor");
@@ -363,21 +378,21 @@ function nearEntry(target, height = 442) {
   return { target, isIntersecting: true, boundingClientRect: { height } };
 }
 
-test("v7 keeps React mutation hot path free of synchronous layout reads", () => {
+test("v9 keeps React mutation hot path free of synchronous layout reads", () => {
   const { context, originalAppendChild } = makeContext();
-  assert.equal(context.__HERDR_CHATGPT_PERF__.version, "7");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.version, "9");
   assert.equal(context.Node.prototype.appendChild, originalAppendChild);
   assert.equal(source.includes("getBoundingClientRect"), false);
   assert.equal(source.includes('querySelectorAll?.("*")'), false);
 });
 
-test("v7 does not install the rejected streaming style throttle", () => {
+test("v9 does not install the rejected streaming style throttle", () => {
   assert.equal(source.includes("data-herdr-streaming-throttle"), false);
   assert.equal(source.includes("transition-duration: 0.001ms"), false);
   assert.equal(source.includes("streaming_throttle_activations"), false);
 });
 
-test("v7 preserves the proven code-viewer intrinsic estimate", () => {
+test("v9 preserves the proven code-viewer intrinsic estimate", () => {
   const { context, document, FakeElement } = makeContext();
   const text = Array.from({ length: 231 }, (_, i) => `line-${i}`).join("\n");
   const { viewer } = codeViewer(FakeElement, document, text);
@@ -529,7 +544,7 @@ test("manual/idle scan can discover a deeply nested writing root without layout 
 });
 
 
-test("v7 discovers only the minimal heavy tool cluster", () => {
+test("v9 discovers only the minimal heavy tool cluster", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8, outerTools: 4 });
   document.body.appendChild(outer);
@@ -544,7 +559,7 @@ test("v7 discovers only the minimal heavy tool cluster", () => {
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_observed, 1);
 });
 
-test("v7 does not merge separate small tool groups into a conversation-wide cluster", () => {
+test("v9 does not merge separate small tool groups into a conversation-wide cluster", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const outer = new FakeElement("div", "qMYqUG_convSearchResultHighlightRoot");
   outer.ownerDocument = document;
@@ -569,7 +584,7 @@ test("v7 does not merge separate small tool groups into a conversation-wide clus
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_observed, 0);
 });
 
-test("v7 forces discovery when continuous mutations never become quiet", () => {
+test("v9 forces discovery when continuous mutations never become quiet", () => {
   const {
     context,
     document,
@@ -594,7 +609,7 @@ test("v7 forces discovery when continuous mutations never become quiet", () => {
   assert.ok(context.__HERDR_CHATGPT_PERF__.stats.forced_scans >= 1);
 });
 
-test("v7 discovers a heavy tool cluster directly from its mutation batch", () => {
+test("v9 discovers a heavy tool cluster directly from its mutation batch", () => {
   const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -608,7 +623,7 @@ test("v7 discovers a heavy tool cluster directly from its mutation batch", () =>
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_discovery_batches, 1);
 });
 
-test("v7 hides a far heavy tool cluster with observer-provided exact height", () => {
+test("v9 hides a far heavy tool cluster with observer-provided exact height", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -623,7 +638,7 @@ test("v7 hides a far heavy tool cluster with observer-provided exact height", ()
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.max_tool_cluster_height_px, 2761.5);
 });
 
-test("v7 reveals a hidden tool cluster when it reaches the viewport", () => {
+test("v9 reveals a hidden tool cluster when it reaches the viewport", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -637,7 +652,7 @@ test("v7 reveals a hidden tool cluster when it reaches the viewport", () => {
   assert.ok(context.__HERDR_CHATGPT_PERF__.stats.tool_clusters_revealed >= 1);
 });
 
-test("v7 reveals and unobserves a mutating hidden tool cluster without layout reads", () => {
+test("v9 reveals and unobserves a mutating hidden tool cluster without layout reads", () => {
   const { context, document, FakeElement, mutationObservers, intersectionObservers } = makeContext();
   const { outer, cluster, toolNodes } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -653,7 +668,7 @@ test("v7 reveals and unobserves a mutating hidden tool cluster without layout re
   assert.equal(toolObserver.observed.has(cluster), false);
 });
 
-test("v7 suspends tool hiding for find-in-page", () => {
+test("v9 suspends tool hiding for find-in-page", () => {
   const { context, document, FakeElement, intersectionObservers } = makeContext();
   const { outer, cluster } = toolClusterTree(FakeElement, document, { tools: 8 });
   document.body.appendChild(outer);
@@ -666,6 +681,158 @@ test("v7 suspends tool hiding for find-in-page", () => {
   toolObserver.trigger([farEntry(cluster, 2761.5)]);
 
   assert.equal(cluster.getAttribute("data-herdr-tool-cluster-hidden"), null);
+});
+
+test("settled ChatGPT tool runs fold to one count and expand without moving reply nodes", () => {
+  const { context, document, FakeElement } = makeContext();
+  const stack = new FakeElement("div");
+  stack.ownerDocument = document;
+  const firstWrap = new FakeElement("div", "contents");
+  firstWrap.ownerDocument = document;
+  const firstTool = new FakeElement("span", "group/tool-message");
+  firstTool.ownerDocument = document;
+  firstWrap.appendChild(firstTool);
+  const inert = new FakeElement("div", "contents");
+  inert.ownerDocument = document;
+  const secondWrap = new FakeElement("div", "contents");
+  secondWrap.ownerDocument = document;
+  const secondTool = new FakeElement("span", "group/tool-message");
+  secondTool.ownerDocument = document;
+  secondWrap.appendChild(secondTool);
+  const reply = new FakeElement("div");
+  reply.ownerDocument = document;
+  reply.setAttribute("data-message-author-role", "assistant");
+  reply.textContent = "final reply";
+  stack.appendChild(firstWrap);
+  stack.appendChild(inert);
+  stack.appendChild(secondWrap);
+  stack.appendChild(reply);
+  document.body.appendChild(stack);
+
+  context.__HERDR_CHATGPT_PERF__.scan();
+
+  const summary = stack.children.find((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1");
+  assert.ok(summary);
+  assert.equal(summary.textContent, "+ Tool calls × 2");
+  assert.equal(firstWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(secondWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.ok(stack.children.indexOf(summary) < stack.children.indexOf(firstWrap));
+  assert.ok(stack.children.indexOf(secondWrap) < stack.children.indexOf(reply));
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_runs_folded, 1);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_run_messages_hidden, 2);
+
+  document.emit("click", summary);
+  assert.equal(summary.getAttribute("aria-expanded"), "true");
+  assert.equal(firstWrap.getAttribute("data-herdr-tool-run-hidden"), null);
+  assert.equal(secondWrap.getAttribute("data-herdr-tool-run-hidden"), null);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_runs_expanded, 1);
+});
+
+test("streaming ChatGPT tool runs fold on the second card and grow incrementally", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const stack = new FakeElement("div");
+  stack.ownerDocument = document;
+  const reply = new FakeElement("div");
+  reply.ownerDocument = document;
+  reply.setAttribute("data-message-author-role", "assistant");
+  reply.textContent = "working";
+  const stop = new FakeElement("button");
+  document._querySelectorHook = (selector) => selector.includes("stop-button") ? stop : null;
+
+  const toolWrap = () => {
+    const wrap = new FakeElement("div", "contents");
+    wrap.ownerDocument = document;
+    const tool = new FakeElement("span", "group/tool-message");
+    tool.ownerDocument = document;
+    wrap.appendChild(tool);
+    return wrap;
+  };
+
+  const firstWrap = toolWrap();
+  stack.appendChild(firstWrap);
+  stack.appendChild(reply);
+  document.body.appendChild(stack);
+  context.__HERDR_CHATGPT_PERF__.scan();
+  assert.equal(stack.children.some((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1"), false);
+
+  const secondWrap = toolWrap();
+  stack.insertBefore(secondWrap, reply);
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [secondWrap], removedNodes: [] }]);
+
+  const summary = stack.children.find((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1");
+  assert.ok(summary);
+  assert.equal(summary.textContent, "+ Tool calls × 2");
+  assert.equal(firstWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(secondWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+
+  const thirdWrap = toolWrap();
+  stack.insertBefore(thirdWrap, reply);
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [thirdWrap], removedNodes: [] }]);
+  assert.equal(summary.textContent, "+ Tool calls × 3");
+  assert.equal(thirdWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(stack.children.filter((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1").length, 1);
+
+  document.emit("click", summary);
+  assert.equal(summary.getAttribute("aria-expanded"), "true");
+  const fourthWrap = toolWrap();
+  stack.insertBefore(fourthWrap, reply);
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [fourthWrap], removedNodes: [] }]);
+  assert.equal(summary.textContent, "− Tool calls × 4");
+  assert.equal(fourthWrap.getAttribute("data-herdr-tool-run-hidden"), null);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_runs_folded, 1);
+});
+
+test("tool-only ChatGPT turns fold independently and grow while streaming", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const stop = new FakeElement("button");
+  stop.ownerDocument = document;
+  stop.setAttribute("data-testid", "stop-button");
+  document._querySelectorHook = (selector) => selector.includes("stop-button") ? stop : null;
+
+  const section = new FakeElement("section");
+  section.ownerDocument = document;
+  section.setAttribute("data-testid", "conversation-turn-4");
+  const stack = new FakeElement("div", "flex", "max-w-full", "flex-col", "gap-4", "grow");
+  stack.ownerDocument = document;
+  section.appendChild(stack);
+
+  const addTool = () => {
+    const lane = new FakeElement("div", "contents");
+    lane.ownerDocument = document;
+    const wrapper = new FakeElement("div", "contents");
+    wrapper.ownerDocument = document;
+    const tool = new FakeElement("span", "group/tool-message");
+    tool.ownerDocument = document;
+    wrapper.appendChild(tool);
+    lane.appendChild(wrapper);
+    stack.appendChild(lane);
+    return lane;
+  };
+
+  const first = addTool();
+  const second = addTool();
+  const third = addTool();
+  document.body.appendChild(section);
+  context.__HERDR_CHATGPT_PERF__.scan();
+
+  const summary = stack.children.find((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1");
+  assert.ok(summary);
+  assert.equal(summary.textContent, "+ Tool calls × 3");
+  assert.equal(first.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(second.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(third.getAttribute("data-herdr-tool-run-hidden"), "1");
+
+  const fourth = addTool();
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [fourth], removedNodes: [] }]);
+  assert.equal(summary.textContent, "+ Tool calls × 4");
+  assert.equal(fourth.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(stack.children.filter((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1").length, 1);
+
+  context.__HERDR_CHATGPT_PERF__.disable();
+  assert.equal(stack.children.some((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1"), false);
+  for (const wrapper of [first, second, third, fourth]) {
+    assert.equal(wrapper.getAttribute("data-herdr-tool-run-hidden"), null);
+  }
 });
 
 test("wrapped code viewers remain uncontained", () => {
