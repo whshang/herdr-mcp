@@ -41,6 +41,8 @@ herdr-mcp native-host use standalone
 
 下载器先把 ref 解析为不可变 commit SHA，再只下载该 commit 下 Git 跟踪的 `extension/` 文件。除 `manifest.json` 为固定 STANDALONE ID 注入公开 `key` 外，其余文件必须与该 commit 的 `extension/` 字节一致；repo/worktree 中的 DEV `extension/manifest.json` 不会被修改。可用 `herdr-mcp extension standalone status` 查看已安装 commit、版本、ID 和路径。
 
+macOS 安装或更新 STANDALONE 后还应执行一次 `herdr-mcp doctor`。`standalone status` 说明受管目录里的文件状态；`doctor` 会额外只读取 Google Chrome profile preferences 中 **Herdr 这个固定 extension ID** 的精确条目，并把 Chrome 当前 Load unpacked 的实际路径与上面的受管路径比较。若出现 `WARN standalone-extension-load state=drift`，说明相同固定 ID 仍从另一目录加载，常见于旧的 Downloads/开发副本仍留在 Chrome。打开 `chrome://extensions`，找到 Herdr 扩展，按 `doctor` 给出的 `expected` 路径重新 Load unpacked/Reload。不要仅为修复路径漂移而切换 Native Host channel、删除扩展数据或复制凭据。该检查只诊断，不会重写 Chrome 配置，也不会刷新标签页。
+
 选择通道后验证：
 
 ```bash

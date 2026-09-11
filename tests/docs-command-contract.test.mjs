@@ -119,6 +119,28 @@ test("source-development docs expose DEV/PROD dogfood without the retired npm re
   }
 });
 
+test("standalone extension path drift diagnosis stays documented", () => {
+  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /standalone-extension-load state=drift/);
+    assert.match(doc, /~\/.config\/herdr-mcp\/extensions\/standalone\/current/);
+  }
+
+  for (const rel of ["docs/i18n/en/extension.md", "docs/i18n/zh-CN/extension.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /herdr-mcp doctor/);
+    assert.match(doc, /standalone-extension-load state=drift/);
+    assert.match(doc, /chrome:\/\/extensions/);
+  }
+
+  for (const rel of ["docs/i18n/en/troubleshooting.md", "docs/i18n/zh-CN/troubleshooting.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /DOCTOR_JSON\.standalone_extension/);
+    assert.match(doc, /expected_path/);
+    assert.match(doc, /drift_count/);
+  }
+});
+
 test("workstation_offline docs track live reconnect/recycle constants and delivery-state safety", () => {
   const edgeGraceMs = numericConstant("edge/cloudflare/src/limits.ts", "DEFAULT_LINK_RECONNECT_GRACE_MS");
   const localRecycleMs = numericConstant("crates/herdr-mcp/src/link/io_loop.rs", "LINK_DEFAULT_OFFLINE_RECYCLE_MS");

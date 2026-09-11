@@ -223,6 +223,16 @@ workstation → ChatGPT
 
 如果 ID 本身错了，再重新绑定。
 
+## 症状：`standalone status` 已是最新，但 Chrome 仍运行旧的/意外的 unpacked 构建
+
+这是加载路径 ownership 漂移。`herdr-mcp extension standalone status` 只能证明 Herdr 在磁盘上管理的是哪份副本，不能证明已经配置过的 Chrome profile 当前到底从哪个 unpacked 目录加载。macOS 上执行：
+
+```bash
+herdr-mcp doctor
+```
+
+如果出现 `WARN standalone-extension-load state=drift`，比较其中的 `expected` 与 `actual` 路径；`DOCTOR_JSON.standalone_extension` 也会提供同样的机器可读证据，包括 Chrome profile 和 `drift_count`。打开 `chrome://extensions`，找到 Herdr，按 `expected_path`（通常是 `~/.config/herdr-mcp/extensions/standalone/current`）重新 Load unpacked/Reload，然后再次运行 `doctor`。除非另有证据证明 Native Host identity 也有问题，否则不要顺手切换 Native Host ownership 或删除扩展数据。这个 doctor 探针是只读的，只检查 Chrome preferences 中 Herdr 固定 extension ID 的精确条目。
+
 ## 症状：浏览器控制中心打不开、没有 workspace，或一直显示本机运行时不可用
 
 先区分 **Side Panel UI 问题**、**Native Messaging 身份问题** 和 **runtime 问题**：

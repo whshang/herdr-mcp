@@ -64,7 +64,7 @@ herdr-mcp permissions verify
 
 ## Capability discovery: `scan`
 
-`doctor` answers **“is this installation healthy?”**. `scan` answers **“which local agent capabilities are actually evidenced on this workstation?”**.
+`doctor` answers **“is this installation healthy?”**. On macOS, when the managed STANDALONE extension is installed, it also emits `standalone-extension-load` evidence and a `DOCTOR_JSON.standalone_extension` object. `state=drift` means Google Chrome is loading the fixed standalone extension ID from a path other than `~/.config/herdr-mcp/extensions/standalone/current`; the object includes `expected_path`, the actual loaded path/profile, Chromium `location`, and `drift_count`. Because the browser extension is optional, this advisory does not turn otherwise healthy core MCP/service readiness into a failure. `scan` answers **“which local agent capabilities are actually evidenced on this workstation?”**.
 
 ```bash
 herdr-mcp scan
