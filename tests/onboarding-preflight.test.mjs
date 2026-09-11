@@ -58,7 +58,22 @@ test("macOS TCC/FDA readiness is verified before background setup, not after ins
     assert.match(doc, /herdr-mcp permissions status/);
     assert.match(doc, /needs_setup/);
     assert.match(doc, /Full Disk Access|完全磁盘访问/);
-    assert.match(doc, /before Cloudflare work|Cloudflare 工作之前/);
+    assert.match(doc, /before Cloudflare work|Cloudflare 工作(?:之前|前)/);
+  }
+});
+
+test("first Worker handoff stays complete for a non-developer Mac user", () => {
+  for (const rel of AGENT_INSTALL) {
+    const doc = read(rel);
+    assert.match(doc, /Workers Free/);
+    assert.match(doc, /Google sign-in|Google 登录/);
+    assert.match(doc, /Developer mode/);
+    assert.match(doc, /Plugins → Browse plugins|插件 → 浏览插件/);
+    assert.match(doc, /`herdr`/);
+    assert.match(doc, /workers\.dev\/mcp/);
+    assert.match(doc, /ChatGPT Project/);
+    assert.match(doc, /`\+` button|`\+` 加号/);
+    assert.match(doc, /first message|第一条消息/);
   }
 });
 
@@ -83,7 +98,7 @@ test("R2 is an optional artifact-relay capability, not a core install requiremen
   for (const rel of AGENT_INSTALL) {
     const doc = read(rel);
     assert.match(doc, /Core install does not require R2|核心安装不需要 R2/);
-    assert.match(doc, /no payment method|没绑卡/);
+    assert.match(doc, /no payment method|不需要绑卡|没绑卡/);
     // The legacy "R2 write is required" contract must be gone.
     assert.doesNotMatch(doc, /R2 write is required|R2 写权限用于在 Worker 部署前/);
   }

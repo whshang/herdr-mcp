@@ -1012,6 +1012,36 @@ fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, Stri
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn connector_service_ready(status: &Value) -> bool {
+    status.get("ok").and_then(Value::as_bool) == Some(true)
+        && status.get("loaded").and_then(Value::as_bool) == Some(true)
+        && status.get("healthy").and_then(Value::as_bool) == Some(true)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_connector_local_runtime_ready() -> Result<(), String> {
+    let service = crate::service_manager::doctor_status()?;
+    if !connector_service_ready(&service) {
+        return Err(
+            "local herdr-mcp service is not ready; run `herdr-mcp service start`, verify `herdr-mcp service status`, then retry this approval command"
+                .to_owned(),
+        );
+    }
+    if !crate::herdr_supervisor::connector_ready()? {
+        return Err(
+            "local Herdr server is not ready; run `herdr-mcp herdr-supervisor start`, verify `herdr-mcp herdr-supervisor status`, then retry this approval command"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_connector_local_runtime_ready() -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn approve_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
     Err(
@@ -1025,6 +1055,7 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
     if request_id.trim().is_empty() || request_id.len() > 256 {
         return Err("connector approval request id is invalid".to_owned());
     }
+    ensure_connector_local_runtime_ready()?;
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
@@ -3133,6 +3164,23 @@ mod tests {
 
         assert_eq!(result.unwrap(), ExitCode::SUCCESS);
         assert!(connect_new_called.get());
+    }
+
+    #[test]
+    fn connector_approval_requires_loaded_healthy_local_service() {
+        assert!(connector_service_ready(&json!({
+            "ok": true,
+            "loaded": true,
+            "healthy": true,
+        })));
+        for status in [
+            json!({"ok": false, "loaded": true, "healthy": true}),
+            json!({"ok": true, "loaded": false, "healthy": true}),
+            json!({"ok": true, "loaded": true, "healthy": false}),
+            json!({"ok": true}),
+        ] {
+            assert!(!connector_service_ready(&status));
+        }
     }
 
     #[test]

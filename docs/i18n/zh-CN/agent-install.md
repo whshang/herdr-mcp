@@ -43,13 +43,11 @@ herdr-mcp doctor
 
 如果 `~/.local/bin/herdr-mcp` 已存在但交互 shell 找不到它，记为 `installed_but_not_on_shell_path`，修复用户 PATH 后用新 shell 验证。不要重复安装，也不要创建第二个 PATH owner。只有实际需要修 PATH 时再打开[故障排查](troubleshooting.md)。
 
-macOS 在 Cloudflare 工作之前执行 `herdr-mcp permissions status` 和 `herdr-mcp permissions verify`。授权目标固定为 macOS 专用的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`；Linux 与 Windows 不走 TCC/FDA 流程。需要授权时，ChatGPT / 安装 Agent 必须把用户实际带到“系统设置 → 隐私与安全性 → 完全磁盘访问权限”，必要时明确指导点击 `+`、按 `Command+Shift+G` 并粘贴上述 broker 路径，然后重新执行 `permissions verify`。Touch ID / 密码确认属于必须保留的 macOS 人工边界，不能绕过；`sudo` 不能替代。
-
-只有 responsibility-isolated broker probe 成功才算授权完成，不能因为父级 Terminal 自己已有权限就出现假阳性。若看到 `broker_update_available: true`，普通 runtime 更新继续保留旧 broker；仅在明确的 broker compatibility migration 时执行 `herdr-mcp permissions setup --upgrade-broker`。host-capable broker 完成授权后，还必须验证 `~/Documents` 下真实 Herdr pane/worktree 的 `getcwd`/Git，不得只验证 `herdr_git`。Linux 使用 release 自带的受支持 user-service / process backend，不套用 macOS launchd 假设。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
+macOS 在 Cloudflare 工作前先执行 `herdr-mcp permissions status`。仅当它返回 `needs_setup` 时，集中引导用户在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中为稳定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker` 授权一次，再执行 `herdr-mcp permissions verify`。setup 前不要主动探测受保护路径，`sudo` 也不能替代。host-capable broker 统一承担 MCP 与 native Herdr pane/worktree 的 TCC 边界，后续复用这一次授权，避免每个进程各弹一次。普通 runtime 更新保留已授权 broker；只有明确的 compatibility migration 才执行 `permissions setup --upgrade-broker`。Linux/Windows 不走这套 TCC 流程。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
 
 ## 4. 第一台 Worker：Cloudflare + bootstrap
 
-需要 Token 时打开 <https://dash.cloudflare.com/profile/api-tokens>。推荐 Cloudflare 的 **Edit Cloudflare Workers** 模板并限定到本次使用的 Account。自定义 Token 的核心预检需要 **Account Settings → Read** 和 **Workers Scripts → Write/Edit**。Token 验证有效但 `workers/subdomain` 返回 403 时，指出缺少的权限，不要无根据扩大权限。**核心安装不需要 R2**，Workers Free、没绑卡也应可完成；只有用户明确启用 artifact relay 时才增加 Workers R2 Storage。
+Herdr 使用 Cloudflare Workers Free 即可，不需要绑卡。用户没有 Cloudflare 账号时，先明确告诉他可免费注册，推荐直接用 Google 登录，步骤最少。需要 Token 时打开 <https://dash.cloudflare.com/profile/api-tokens>。推荐 Cloudflare 的 **Edit Cloudflare Workers** 模板并限定到本次使用的 Account。自定义 Token 的核心预检需要 **Account Settings → Read** 和 **Workers Scripts → Write/Edit**。Token 验证有效但 `workers/subdomain` 返回 403 时，指出缺少的权限，不要无根据扩大权限。**核心安装不需要 R2**；只有用户明确启用 artifact relay 时才增加 Workers R2 Storage。
 
 Token 仅放入当前进程的 `CLOUDFLARE_API_TOKEN` 或交给 `worker bootstrap` 的隐藏输入。不要把 Token 写进命令行字面量、配置仓库或普通日志。
 
@@ -105,7 +103,7 @@ herdr-mcp link status
 - 本机存在 canonical `dev_<ULID>` device identity；
 - 一条真实认证 MCP 请求能够从公网 origin 往返到当前工作站。
 
-随后引导用户在 ChatGPT 中开启需要的 Developer Mode，使用最终 `.../mcp` 地址创建 `herdr` Connector 并完成 OAuth。ChatGPT 授权是最后一个必须由用户本人完成的边界。
+随后在 ChatGPT 的插件设置中开启 Developer mode，进入“**插件 → 浏览插件**”，添加自定义插件，名称建议 `herdr`，地址粘贴完整的 `https://…workers.dev/mcp`，必须包含 `/mcp`，再完成 OAuth。后续应在 ChatGPT Project 中工作；每个新会话的第一条消息都先用输入框的 `+` 加号引用 `herdr`，确保该会话启用插件。ChatGPT 授权是最后一个必须由用户本人完成的边界。
 
 Chrome 扩展 / Native Messaging 是可选增强，不是核心 Connector 安装前置。用户需要浏览器连续工作、接力或 Control Center 时再按[扩展文档](extension.md)安装；扩展分发和开发细节留在扩展文档中。
 

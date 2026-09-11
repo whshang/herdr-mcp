@@ -43,13 +43,11 @@ herdr-mcp doctor
 
 If `~/.local/bin/herdr-mcp` exists but the interactive shell cannot resolve it, classify this as `installed_but_not_on_shell_path`, repair the user's PATH, and verify a fresh shell. Do not reinstall or create a second PATH owner. Use [Troubleshooting](troubleshooting.md) only if the PATH repair is needed.
 
-On macOS, verify `herdr-mcp permissions status` and `herdr-mcp permissions verify` before Cloudflare work. The permission target is the stable macOS-only `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`; Linux and Windows do not use this TCC/FDA flow. If setup is required, ChatGPT / the installing Agent must walk the user through **System Settings → Privacy & Security → Full Disk Access**, including using `+` and `Command+Shift+G` to add that exact broker path when necessary, then rerun `permissions verify`. Touch ID/password confirmation is a human macOS boundary and must not be bypassed; `sudo` is not a substitute.
-
-Treat verification as complete only when the responsibility-isolated broker probe succeeds; an already-authorized parent Terminal must not create a false positive. If `broker_update_available: true`, preserve the old broker during ordinary runtime updates and use `herdr-mcp permissions setup --upgrade-broker` only for an explicit broker compatibility migration. After a host-capable broker is authorized, also verify a native Herdr pane/worktree under `~/Documents`, not only `herdr_git`, so `getcwd`/Git cannot silently bypass the broker responsibility boundary. Linux uses the supported release user-service/process backend and must not inherit macOS launchd assumptions. Normal installation does not require Node.js, Wrangler, npm, or Cargo.
+On macOS, run `herdr-mcp permissions status` before Cloudflare work. If it reports `needs_setup`, guide the user once through **System Settings → Privacy & Security → Full Disk Access** for `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`, then run `herdr-mcp permissions verify`. Do not probe protected paths before setup or use `sudo`. This stable broker serves MCP and native Herdr panes/worktrees, avoiding per-process TCC prompts. Ordinary updates preserve it; use `permissions setup --upgrade-broker` only for an explicit compatibility migration. Linux/Windows skip this TCC flow. Normal installation needs no Node.js, Wrangler, npm, or Cargo.
 
 ## 4. First Worker: Cloudflare + bootstrap
 
-When a Token is required, open <https://dash.cloudflare.com/profile/api-tokens>. Prefer Cloudflare's **Edit Cloudflare Workers** template scoped to the Account being used. For a custom token, the core preflight needs **Account Settings → Read** and **Workers Scripts → Write/Edit**. If the token verifies as valid but `workers/subdomain` returns 403, report the missing permission and do not inflate the token scope. **Core install does not require R2** and must work on Workers Free with no payment method; add Workers R2 Storage only when the user explicitly enables artifact relay.
+Cloudflare Workers Free is enough for Herdr and needs no payment method. If the user has no account, say registration is free and recommend Google sign-in. When a Token is required, open <https://dash.cloudflare.com/profile/api-tokens>. Prefer **Edit Cloudflare Workers** for the selected Account. A custom token needs **Account Settings → Read** and **Workers Scripts → Write/Edit**. If `workers/subdomain` returns 403, report the missing permission and do not inflate the token scope. **Core install does not require R2**; add Workers R2 Storage only for artifact relay.
 
 Keep the Token only in the current process as `CLOUDFLARE_API_TOKEN` or provide it through the hidden `worker bootstrap` input. Do not put the Token in a command-line literal, repository config, or ordinary log.
 
@@ -105,7 +103,7 @@ Combine read-only checks into one final verification wave instead of repeating t
 - the machine has a canonical `dev_<ULID>` device identity;
 - one real authenticated MCP request completes from the public origin to this workstation and back.
 
-Then guide the user to enable ChatGPT Developer Mode when required, create the `herdr` Connector with the final `.../mcp` URL, and complete OAuth. ChatGPT authorization is the last user-owned boundary.
+Then in ChatGPT enable Developer mode for Plugins, open **Plugins → Browse plugins**, and add `herdr` with the complete `https://…workers.dev/mcp` address, including `/mcp`; finish OAuth. Work inside a ChatGPT Project. In every new chat, use the `+` button in the first message to reference `herdr` so that chat enables the plugin.
 
 The Chrome extension / Native Messaging path is optional and is not a prerequisite for the core Connector. Install it from the [extension guide](extension.md) only when the user wants browser continuity, handoff, or the Control Center; keep extension distribution/development details in that guide.
 

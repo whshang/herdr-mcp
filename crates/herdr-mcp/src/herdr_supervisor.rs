@@ -155,6 +155,17 @@ pub(crate) fn doctor_line() -> String {
     }
 }
 
+pub(crate) fn connector_ready() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::connector_ready()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(true)
+    }
+}
+
 pub(crate) fn remove_for_service() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -449,6 +460,14 @@ mod platform {
             state.failure_streak,
             state.attempts_total
         )
+    }
+
+    pub(super) fn connector_ready() -> Result<bool, String> {
+        let paths = SupervisorPaths::discover()?;
+        if !paths.plist.exists() || !is_loaded()? {
+            return Ok(false);
+        }
+        Ok(probe_herdr(paths.socket()?).state == "healthy")
     }
 
     pub(super) fn run(command: HerdrSupervisorCommand) -> Result<ExitCode, String> {

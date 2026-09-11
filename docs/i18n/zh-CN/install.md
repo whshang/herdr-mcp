@@ -56,9 +56,11 @@ herdr-mcp status
 
 x86_64 Debian 使用静态 `x86_64-unknown-linux-musl` Release 产物。安装器优先使用 `systemd --user`，没有 user systemd manager 时使用托管用户进程 backend。macOS 使用用户级 LaunchAgent，完全磁盘访问只授予稳定的 macOS 专用 broker：`~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`；Linux 与 Windows 不使用这套 TCC/FDA 路径，`sudo` 也不能替代 macOS 隐私权限。
 
-macOS 需要授权时执行 `herdr-mcp permissions setup`，在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中开启上述 broker，再执行 `herdr-mcp permissions verify`。broker compatibility 升级必须显式执行 `permissions setup --upgrade-broker`，保留回滚证据，并在 code identity 变化时接受一次新的人工授权；普通 runtime generation 更新不得替换 broker。host-capable broker 授权后还必须验证 `~/Documents` 下真实 Herdr pane/worktree 的 `getcwd`/Git；只验证 `herdr_git` 不足以证明 native 路径已经统一到 broker responsibility。平台服务与常驻细节见 [CLI 参考](cli-reference.md)和[故障排查](troubleshooting.md)。本地 doctor 不健康时先解决 runtime / Herdr 问题，再部署公网 Edge。
+macOS 先执行 `herdr-mcp permissions status`。只有返回 `needs_setup` 时才执行 `herdr-mcp permissions setup`，在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中为稳定 broker 授权一次，再执行 `herdr-mcp permissions verify`。setup 前不要为了触发弹窗而主动访问 `~/Documents`。host-capable broker 统一承担 MCP 与 native Herdr pane/worktree 的 TCC 责任，正常首次安装只需要这一处 Full Disk Access 授权，避免每个进程分别弹窗。普通 runtime 更新保留这个 broker；只有明确的 compatibility migration 才执行 `permissions setup --upgrade-broker`。平台细节见 [CLI 参考](cli-reference.md)和[故障排查](troubleshooting.md)。本地 doctor 不健康时先解决 runtime / Herdr 问题，再部署公网 Edge。
 
 ## 第二步：部署稳定公网 Edge
+
+Herdr 使用 Cloudflare Workers Free 即可，不需要绑卡。没有 Cloudflare 账号时可在登录页免费注册，推荐直接用 Google 登录，步骤最少。
 
 如果 ChatGPT 需要从公网访问工作站，使用 Cloudflare Worker 提供稳定 OAuth/MCP 入口。保持 `workers.dev` 作为零域名 bootstrap/诊断 origin；但如果选定的 Cloudflare Account 已有合适的 active zone，应在 Connector/OAuth 授权前优先使用 `herdr-mcp.example.com` 这类专用 Custom Domain 作为长期稳定身份。没有合适 zone 或用户不采用自定义域名时，继续使用 `workers.dev`，不要阻塞安装。
 
@@ -141,12 +143,12 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 这一步需要用户本人操作。让 Coding Agent 暂停并指导：
 
-1. 打开 ChatGPT 设置中的 Apps / Connectors；
-2. 当前 UI 需要时开启 Developer mode；
-3. 添加自定义 MCP Connector，名称建议 `herdr`；
-4. URL 填部署后的 `${MCP_URL}`，必须以 `/mcp` 结尾；
-5. 完成浏览器 OAuth；
-6. 在新会话或 Project 中启用该 Connector。
+1. 在 ChatGPT 插件设置中开启 **Developer mode**；
+2. 进入“**插件 → 浏览插件**”，添加自定义插件，名称建议 `herdr`；
+3. 粘贴完整的 `${MCP_URL}`，必须包含最后的 `/mcp`；
+4. 完成浏览器 OAuth；首次授权页会按浏览器语言自动使用中文、英文或日文，并明确要求先在终端运行批准命令，再按 CLI 提示输入 6 位验证码；
+5. 创建或打开一个 **Project**，后续在项目里工作；
+6. 每个新会话的第一条消息都先用输入框的 `+` 加号引用 `herdr`，确保这个会话启用插件。
 
 然后先做只读验证：
 
