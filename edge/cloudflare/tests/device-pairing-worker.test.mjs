@@ -1066,6 +1066,51 @@ test("recovery pairing canonicalizes a legacy workstation identity without dupli
   assert.equal(finalInventory.devices.length, before.devices.length);
 });
 
+test("fleet-admin verifier rebind canonicalizes a legacy workstation identity", async () => {
+  const { env, registry } = makeEnv();
+  const legacyConnect = await worker.fetch(
+    wsRequest("prod-real-runtime", "legacy-secret", "legacy-rebind-air"),
+    env,
+  );
+  assert.equal(legacyConnect.status, 200);
+
+  const before = await (await registry.fetch(new Request("https://registry.internal/internal/devices"))).json();
+  const legacy = before.devices.find((device) => device.workstation_id === "prod-real-runtime");
+  assert.ok(legacy);
+  assert.notEqual(legacy.device_id, legacy.workstation_id);
+
+  const replacementSecret = "replacement-device-secret";
+  const verifier = createHash("sha256").update(replacementSecret).digest("hex");
+  const rebind = await worker.fetch(post(
+    "/devices/credential-rebind",
+    { device_id: legacy.device_id, credential_verifier_sha256: verifier },
+    "owner-secret",
+  ), env);
+  assert.equal(rebind.status, 200);
+
+  const after = await (await registry.fetch(new Request("https://registry.internal/internal/devices"))).json();
+  assert.equal(after.devices.length, before.devices.length);
+  const canonical = after.devices.find((device) => device.device_id === legacy.device_id);
+  assert.equal(canonical?.workstation_id, legacy.device_id);
+  assert.equal(after.devices.some((device) => device.workstation_id === "prod-real-runtime"), false);
+
+  const repairedCredential = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    legacy.device_id,
+    replacementSecret,
+  ), env);
+  assert.equal(repairedCredential.status, 200);
+
+  const staleLegacy = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), env);
+  assert.equal(staleLegacy.status, 401);
+});
+
 test("fleet-admin verifier rebind repairs one existing device without receiving its secret", async () => {
   const { env } = makeEnv();
   const original = await pair(env, "rebind-me");
