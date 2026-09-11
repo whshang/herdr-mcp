@@ -59,6 +59,289 @@ struct PreparedManifest {
     source_sha256: String,
 }
 
+#[derive(Debug)]
+struct ChromeExtensionLoad {
+    profile: String,
+    path: PathBuf,
+    location: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StandaloneBrowserDoctor {
+    state: &'static str,
+    installed: bool,
+    extension_id: String,
+    expected_path: Option<PathBuf>,
+    loads: Vec<ChromeExtensionLoad>,
+    unreadable_profiles: usize,
+    reason: Option<String>,
+}
+
+impl StandaloneBrowserDoctor {
+    pub(crate) fn as_json(&self) -> Value {
+        let loaded = self
+            .loads
+            .iter()
+            .map(|load| {
+                json!({
+                    "browser": "Google Chrome",
+                    "profile": load.profile,
+                    "path": load.path,
+                    "location": load.location,
+                    "matches_expected": self.expected_path.as_deref().is_some_and(|expected| {
+                        paths_equivalent(expected, &load.path)
+                    }),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "state": self.state,
+            "installed": self.installed,
+            "extension_id": self.extension_id,
+            "expected_path": self.expected_path,
+            "loaded": loaded,
+            "drift_count": self.drift_count(),
+            "unreadable_profiles": self.unreadable_profiles,
+            "reason": self.reason,
+        })
+    }
+
+    pub(crate) fn doctor_line(&self) -> String {
+        match self.state {
+            "drift" => {
+                let drift = self.loads.iter().find(|load| {
+                    self.expected_path
+                        .as_deref()
+                        .is_some_and(|expected| !paths_equivalent(expected, &load.path))
+                });
+                format!(
+                    "WARN standalone-extension-load state=drift extension_id={} expected={} actual={} browser=\"Google Chrome\" profile={} action=reload-from-managed-path-via-chrome://extensions",
+                    self.extension_id,
+                    quote_path(self.expected_path.as_deref()),
+                    drift
+                        .map(|load| quote_path(Some(&load.path)))
+                        .unwrap_or_else(|| "null".to_owned()),
+                    drift
+                        .map(|load| json_quote(&load.profile))
+                        .unwrap_or_else(|| "null".to_owned()),
+                )
+            }
+            "pass" => format!(
+                "INFO standalone-extension-load state=pass extension_id={} expected={} loaded_profiles={}",
+                self.extension_id,
+                quote_path(self.expected_path.as_deref()),
+                self.loads.len()
+            ),
+            "not_loaded" => format!(
+                "WARN standalone-extension-load state=not_loaded extension_id={} expected={} action=load-unpacked-via-chrome://extensions",
+                self.extension_id,
+                quote_path(self.expected_path.as_deref())
+            ),
+            "chrome_not_found" => format!(
+                "INFO standalone-extension-load state=chrome_not_found extension_id={} expected={}",
+                self.extension_id,
+                quote_path(self.expected_path.as_deref())
+            ),
+            "not_installed" => "INFO standalone-extension-load state=not_installed".to_owned(),
+            _ => format!(
+                "INFO standalone-extension-load state=not_probed reason={}",
+                json_quote(self.reason.as_deref().unwrap_or("unknown"))
+            ),
+        }
+    }
+
+    fn drift_count(&self) -> usize {
+        let Some(expected) = self.expected_path.as_deref() else {
+            return 0;
+        };
+        self.loads
+            .iter()
+            .filter(|load| !paths_equivalent(expected, &load.path))
+            .count()
+    }
+}
+
+pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
+    let identity = match crate::browser_extension_identity::official_standalone_identity() {
+        Ok(identity) => identity,
+        Err(error) => return doctor_not_probed(None, String::new(), error),
+    };
+    let current = match base_dir() {
+        Ok(base) => base.join("current"),
+        Err(error) => return doctor_not_probed(None, identity.extension_id, error),
+    };
+    let manifest = read_json(&current.join("manifest.json")).ok();
+    let key_ok = manifest
+        .as_ref()
+        .and_then(|value| value.get("key"))
+        .and_then(Value::as_str)
+        .is_some_and(|key| identity.manifest_key.as_deref() == Some(key));
+    if !(current.is_dir() && manifest.is_some() && key_ok) {
+        return StandaloneBrowserDoctor {
+            state: "not_installed",
+            installed: false,
+            extension_id: identity.extension_id,
+            expected_path: Some(current),
+            loads: Vec::new(),
+            unreadable_profiles: 0,
+            reason: None,
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = env::var_os("HOME") else {
+            return doctor_not_probed(
+                Some(current),
+                identity.extension_id,
+                "HOME is unavailable".to_owned(),
+            );
+        };
+        diagnose_chrome_load(
+            &current,
+            &identity.extension_id,
+            &PathBuf::from(home).join("Library/Application Support/Google/Chrome"),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        doctor_not_probed(
+            Some(current),
+            identity.extension_id,
+            "Chrome unpacked-path probe is currently implemented on macOS".to_owned(),
+        )
+    }
+}
+
+fn diagnose_chrome_load(
+    expected_path: &Path,
+    extension_id: &str,
+    chrome_root: &Path,
+) -> StandaloneBrowserDoctor {
+    if !chrome_root.is_dir() {
+        return StandaloneBrowserDoctor {
+            state: "chrome_not_found",
+            installed: true,
+            extension_id: extension_id.to_owned(),
+            expected_path: Some(expected_path.to_path_buf()),
+            loads: Vec::new(),
+            unreadable_profiles: 0,
+            reason: None,
+        };
+    }
+
+    let mut loads = Vec::new();
+    let mut unreadable_profiles = 0;
+    let entries = match fs::read_dir(chrome_root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return doctor_not_probed(
+                Some(expected_path.to_path_buf()),
+                extension_id.to_owned(),
+                format!("cannot read Chrome profile root: {error}"),
+            );
+        }
+    };
+    for entry in entries.flatten() {
+        let profile_dir = entry.path();
+        if !profile_dir.is_dir() {
+            continue;
+        }
+        let profile = entry.file_name().to_string_lossy().to_string();
+        for filename in ["Secure Preferences", "Preferences"] {
+            let path = profile_dir.join(filename);
+            if !path.is_file() {
+                continue;
+            }
+            let prefs = match read_json(&path) {
+                Ok(prefs) => prefs,
+                Err(_) => {
+                    unreadable_profiles += 1;
+                    continue;
+                }
+            };
+            // Read only the Herdr extension's exact settings entry. Doctor must not
+            // enumerate or expose unrelated browser extensions or profile data.
+            let setting = prefs
+                .get("extensions")
+                .and_then(|value| value.get("settings"))
+                .and_then(|value| value.get(extension_id));
+            let Some(load_path) = setting
+                .and_then(|value| value.get("path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            loads.push(ChromeExtensionLoad {
+                profile: profile.clone(),
+                path: PathBuf::from(load_path),
+                location: setting
+                    .and_then(|value| value.get("location"))
+                    .and_then(Value::as_i64),
+            });
+            break;
+        }
+    }
+
+    let state = if loads.is_empty() && unreadable_profiles > 0 {
+        "not_probed"
+    } else if loads.is_empty() {
+        "not_loaded"
+    } else if loads
+        .iter()
+        .any(|load| !paths_equivalent(expected_path, &load.path))
+    {
+        "drift"
+    } else {
+        "pass"
+    };
+    StandaloneBrowserDoctor {
+        state,
+        installed: true,
+        extension_id: extension_id.to_owned(),
+        expected_path: Some(expected_path.to_path_buf()),
+        loads,
+        unreadable_profiles,
+        reason: (state == "not_probed")
+            .then(|| "Chrome profile preferences could not be read".to_owned()),
+    }
+}
+
+fn doctor_not_probed(
+    expected_path: Option<PathBuf>,
+    extension_id: String,
+    reason: String,
+) -> StandaloneBrowserDoctor {
+    StandaloneBrowserDoctor {
+        state: "not_probed",
+        installed: expected_path.is_some(),
+        extension_id,
+        expected_path,
+        loads: Vec::new(),
+        unreadable_profiles: 0,
+        reason: Some(reason),
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn quote_path(path: Option<&Path>) -> String {
+    path.map(|path| json_quote(path.to_string_lossy().as_ref()))
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn json_quote(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"<unavailable>\"".to_owned())
+}
+
 pub fn run_install(options: StandaloneInstallOptions) -> Result<ExitCode, String> {
     let view = install(options)?;
     println!(
@@ -484,6 +767,55 @@ mod tests {
         let installed = inject_key(source, key).unwrap();
         let expected = b"{\n  \"manifest_version\": 3,\n  \"name\": \"Herdr\",\n  \"version\": \"0.1.99\",\n  \"key\": \"abc123\"\n}\n";
         assert_eq!(installed, expected);
+    }
+
+    fn write_chrome_profile(root: &Path, profile: &str, extension_id: &str, extension_path: &Path) {
+        let profile_dir = root.join(profile);
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("Secure Preferences"),
+            serde_json::to_vec(&json!({
+                "extensions": { "settings": {
+                    extension_id: { "location": 4, "path": extension_path }
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn browser_doctor_detects_loaded_path_drift() {
+        let root = env::temp_dir().join(format!("herdr-browser-drift-test-{}", now_ms()));
+        let chrome = root.join("Chrome");
+        let expected = root.join("managed/current");
+        let stale = root.join("Downloads/herdr-old/unpacked");
+        fs::create_dir_all(&expected).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+        write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &stale);
+
+        let report = diagnose_chrome_load(&expected, "abcdefghijklmnop", &chrome);
+        assert_eq!(report.state, "drift");
+        assert_eq!(report.drift_count(), 1);
+        assert_eq!(report.loads[0].path, stale);
+        assert!(report.doctor_line().contains("chrome://extensions"));
+        assert_eq!(report.as_json()["loaded"][0]["matches_expected"], false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_doctor_accepts_managed_path() {
+        let root = env::temp_dir().join(format!("herdr-browser-match-test-{}", now_ms()));
+        let chrome = root.join("Chrome");
+        let expected = root.join("managed/current");
+        fs::create_dir_all(&expected).unwrap();
+        write_chrome_profile(&chrome, "Profile 1", "abcdefghijklmnop", &expected);
+
+        let report = diagnose_chrome_load(&expected, "abcdefghijklmnop", &chrome);
+        assert_eq!(report.state, "pass");
+        assert_eq!(report.drift_count(), 0);
+        assert_eq!(report.as_json()["loaded"][0]["matches_expected"], true);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -176,6 +176,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let documents_permission = macos_privacy::probe_documents_permission(&paths.config_dir);
     let code_identity = macos_privacy::probe_code_identity();
     let authenticated_local_mcp = probe_authenticated_local_mcp(config.runtime_port);
+    let standalone_browser = crate::standalone_extension::doctor_report();
     println!("Herdr MCP doctor");
     println!(
         "runtime provenance: channel={} version={} source={}{}",
@@ -205,6 +206,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     println!("{}", code_identity.doctor_line());
     println!("{}", herdr_supervisor::doctor_line());
     println!("{}", crate::child_process::doctor_line());
+    println!("{}", standalone_browser.doctor_line());
     let remote = print_layer_ownership(paths, config, &report);
     println!(
         "LAYER authenticated-local-mcp {}",
@@ -239,6 +241,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
             "edge_reachable": remote.edge_state.as_str(),
             "oauth_metadata": remote.oauth_state.as_str(),
             "mcp_surface": remote.mcp_surface_state.as_str(),
+            "standalone_extension": standalone_browser.as_json(),
             "overall": readiness.as_str(),
         })
     );
