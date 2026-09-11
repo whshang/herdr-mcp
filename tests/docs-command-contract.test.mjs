@@ -23,6 +23,15 @@ const QUICK_START_POST_INSTALL = [
   ["docs/i18n/zh-CN/quick-start.md", /本页从“herdr-mcp 已安装并连接”开始/, /## 1\. 先做一次只读检查/],
 ];
 
+function numericConstant(rel, name) {
+  const line = read(rel).split("\n").find((candidate) => candidate.includes(name));
+  assert.ok(line, `missing numeric constant ${name} in ${rel}`);
+  const rhs = line.split("=").slice(1).join("=");
+  const match = rhs.match(/\b[\d_]+\b/);
+  assert.ok(match, `missing numeric value for ${name} in ${rel}`);
+  return Number(match[0].replaceAll("_", ""));
+}
+
 function sectionAfterHeading(doc, heading) {
   const start = doc.indexOf(heading);
   assert.ok(start >= 0, `missing heading: ${heading}`);
@@ -95,7 +104,7 @@ test("release model keeps publication and ownership boundaries explicit", () => 
   assert.match(model, /DEV/);
 });
 
-test("v0.4.3 source-development docs expose DEV/PROD dogfood without the old npm rebuild path", () => {
+test("source-development docs expose DEV/PROD dogfood without the retired npm rebuild path", () => {
   for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
     const doc = read(rel);
     assert.doesNotMatch(doc, /herdr-mcp dev sync/, `${rel} keeps contributor DEV activation out of the top-level user path`);
@@ -110,15 +119,20 @@ test("v0.4.3 source-development docs expose DEV/PROD dogfood without the old npm
   }
 });
 
-test("workstation_offline docs preserve layered self-healing and delivery-state safety", () => {
+test("workstation_offline docs track live reconnect/recycle constants and delivery-state safety", () => {
+  const edgeGraceMs = numericConstant("edge/cloudflare/src/limits.ts", "DEFAULT_LINK_RECONNECT_GRACE_MS");
+  const localRecycleMs = numericConstant("crates/herdr-mcp/src/link/io_loop.rs", "LINK_DEFAULT_OFFLINE_RECYCLE_MS");
+  assert.equal(edgeGraceMs % 1000, 0);
+  assert.equal(localRecycleMs % 1000, 0);
+
   const cases = [
-    ["docs/i18n/en/troubleshooting.md", /2 seconds/, /300 seconds/, /delivery_state=not_delivered/, /retry_after_ms=5000/, /browser extension does not make this decision/],
-    ["docs/i18n/zh-CN/troubleshooting.md", /2 秒/, /300 秒/, /not_delivered/, /retry_after_ms=5000/, /浏览器扩展不参与这个错误判定/],
+    ["docs/i18n/en/troubleshooting.md", `${edgeGraceMs / 1000} seconds`, `${localRecycleMs / 1000} seconds`, /delivery_state=not_delivered/, /retry_after_ms=5000/, /browser extension does not make this decision/],
+    ["docs/i18n/zh-CN/troubleshooting.md", `${edgeGraceMs / 1000} 秒`, `${localRecycleMs / 1000} 秒`, /not_delivered/, /retry_after_ms=5000/, /浏览器扩展不参与这个错误判定/],
   ];
   for (const [rel, edgeGrace, localRecycle, notDelivered, retryAfter, extensionBoundary] of cases) {
     const doc = read(rel);
-    assert.match(doc, edgeGrace, `${rel} must document bounded Edge reconnect grace`);
-    assert.match(doc, localRecycle, `${rel} must document prolonged local Link recycle`);
+    assert.ok(doc.includes(edgeGrace), `${rel} must document the live Edge reconnect grace`);
+    assert.ok(doc.includes(localRecycle), `${rel} must document the live local Link recycle budget`);
     assert.match(doc, notDelivered, `${rel} must document confirmed non-delivery`);
     assert.match(doc, retryAfter, `${rel} must document machine-readable retry timing`);
     assert.match(doc, extensionBoundary, `${rel} must keep browser extension outside the offline decision path`);

@@ -118,10 +118,10 @@ HERDR_LINK_PROXY > HTTPS_PROXY/https_proxy > HTTP_PROXY/http_proxy > ALL_PROXY/a
 
 这已经不是 ChatGPT tool schema 问题。如果 ChatGPT 收到了结构化 `workstation_offline`，说明 ChatGPT → MCP Edge 这段链路至少能够返回错误；真正不可用的是 Edge 找不到目标 workstation 的可用 Link WebSocket。浏览器扩展不参与这个错误判定。
 
-v0.4.3+ 的恢复是分层自愈，而不是“看到错误就全家桶重启”：
+当前恢复采用分层自愈，而不是“看到错误就全家桶重启”：
 
-1. 最近在线过的 workstation 刚掉线时，Edge 最多给 **2 秒** process-local reconnect grace。新的 Link 通过 validated `hello` 回来后，等待中的原请求立即继续；这段 grace 不写 Durable Object storage，也不创建 alarm。
-2. 2 秒后仍不可用时，Edge 返回机器可读恢复信息：`retryable=true`、`delivery_state=not_delivered`、`retry_after_ms=5000`，并明确给出用只读 `herdr_inspect` 做 5s / 10s / 20s 三次 probe 的策略。
+1. 最近在线过的 workstation 刚掉线时，Edge 最多给 **15 秒** process-local reconnect grace。新的 Link 通过 validated `hello` 回来后，等待中的原请求立即继续；这段 grace 不写 Durable Object storage，也不创建 alarm。
+2. 15 秒后仍不可用时，Edge 返回机器可读恢复信息：`retryable=true`、`delivery_state=not_delivered`、`retry_after_ms=5000`，并明确给出用只读 `herdr_inspect` 做 5s / 10s / 20s 三次 probe 的策略。
 3. 本机 Link 继续执行正常 reconnect/backoff；一旦重新进入 Online，prolonged-offline timer 立即清零。
 4. Link 连续 **300 秒** 都无法 Online 时，会带诊断证据退出，由 launchd `KeepAlive` 拉起全新的 `dev.herdr-mcp.link-prod`。
 5. server health watchdog 只负责真正不健康的本机 server。单独出现 `workstation_offline`，不应该去重启一个健康的 `dev.herdr-mcp.server`。
