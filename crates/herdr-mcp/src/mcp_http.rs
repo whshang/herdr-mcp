@@ -42,7 +42,7 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_BROWSER_RESULT_TEXT_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
-const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(35);
 const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
 // The extension polls for browser actuation on the shared SSE heartbeat. Keep
 // the liveness window above that 15s cadence so an idle healthy stream is not

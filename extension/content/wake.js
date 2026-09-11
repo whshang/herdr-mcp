@@ -1473,7 +1473,10 @@ const H2W_CONTENT_VERSION = "0.1.91";
     }
     evidence.command_accepted = true;
 
-    const deadline = Date.now() + 6000;
+    const exactChatGptDispatchIdentity = ADAPTER.name === "chatgpt"
+      && !creatingSession
+      && command?.operation === "herdr_mcp.browser_dispatch.submit";
+    const deadline = Date.now() + (exactChatGptDispatchIdentity ? 12000 : 6000);
     do {
       const afterServer = ADAPTER.name === "chatgpt"
         ? await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }))
@@ -1498,9 +1501,9 @@ const H2W_CONTENT_VERSION = "0.1.91";
       evidence.accepted_message_observed = serverAdvanced || domAdvanced;
       evidence.message_baseline_advanced = domAdvanced;
       evidence.canonical_url_observed = providerCanonicalConversationObserved();
-      const acceptedUserMessageRef = (afterServer?.ok ? afterServer.userMessageId : null)
-        || afterDom?.messageId
-        || null;
+      const acceptedUserMessageRef = exactChatGptDispatchIdentity
+        ? (serverAdvanced ? afterServer.userMessageId : null)
+        : ((afterServer?.ok ? afterServer.userMessageId : null) || afterDom?.messageId || null);
       if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef) {
         // The existing actuation evidence.result object carries the exact
         // provider user-message identity; no new top-level field is added.
@@ -1541,6 +1544,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
       );
       if (evidence.accepted_message_observed
           && evidence.generation_status_observed
+          && (!exactChatGptDispatchIdentity || Boolean(acceptedUserMessageRef))
           && (!creatingSession || (evidence.stable_resource_ref_observed && evidence.canonical_url_observed))) {
         evidence.generation_owner = expectedGeneration;
         return evidence;

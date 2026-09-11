@@ -1597,6 +1597,7 @@ fn browser_delivery_state_from_postcondition(
             (evidence.accepted_message_observed || evidence.message_baseline_advanced)
                 && evidence.generation_owner == Some(expected_generation)
                 && evidence.generation_status_observed
+                && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
         }
         BrowserOperation::DispatchStop => evidence.generation_stopped,
         BrowserOperation::SpaceInspect
@@ -5650,6 +5651,20 @@ mod tests {
         evidence.accepted_message_observed = true;
         evidence.generation_owner = Some(7);
         evidence.generation_status_observed = true;
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::DispatchSubmit,
+                &params,
+                7,
+                &evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Uncertain
+        );
+
+        evidence.result = Some(json!({
+            "accepted_user_message_ref": "provider-user-1"
+        }));
         assert_eq!(
             browser_delivery_state_from_postcondition(
                 BrowserOperation::DispatchSubmit,
