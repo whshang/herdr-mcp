@@ -12,10 +12,12 @@
 //! rotating `runtime/generations/rust-<sha256>/` runtime generations. Because
 //! the broker path and binary are never rewritten by service install / update
 //! apply, the broker keeps one stable identity across runtime upgrades. The
-//! broker is a one-shot JSON-over-stdin/stdout process that dispatches only
-//! a strict allowlist of bounded fs/git operations to the existing security
-//! gates. Arbitrary shell execution is intentionally outside this broker; on
-//! macOS protected roots, exec sessions use a dedicated Herdr pane instead.
+//! broker's MCP mode is a one-shot JSON-over-stdin/stdout process that
+//! dispatches only a strict allowlist of bounded fs/git operations to the
+//! existing security gates. Revision 2 also adds one private macOS-only Herdr
+//! host mode: it may launch only the canonical `herdr server` dependency and
+//! remain its parent so pane/Agent descendants inherit this stable TCC
+//! responsibility. It is not a generic shell or arbitrary-command broker.
 //!
 //! Routing is opt-in via `HERDR_MCP_TCC_BROKER=1`; the default MCP path stays
 //! direct in-process execution. This is a feasibility layer for a non-paid
@@ -42,7 +44,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Compatibility revision of the long-lived broker implementation. This is
 /// deliberately independent of the rotating `herdr-mcp` runtime bytes. Bump
 /// only when the installed broker itself must be replaced.
-pub const BROKER_COMPAT_REVISION: u32 = 1;
+pub const BROKER_COMPAT_REVISION: u32 = 2;
+/// First broker revision that can be a stable TCC parent for `herdr server`.
+#[cfg(any(target_os = "macos", test))]
+pub const HERDR_HOST_MIN_COMPAT_REVISION: u32 = 2;
 /// Stable signing identifier reserved for separately signed broker candidates.
 pub const BROKER_SIGNING_IDENTIFIER: &str = "cc.agentforme.herdr.tcc-broker";
 /// Brokers installed before revision metadata existed are the v0.4.2 revision.
@@ -69,6 +74,72 @@ pub fn broker_path(config_dir: &Path) -> PathBuf {
 
 pub fn broker_metadata_path(config_dir: &Path) -> PathBuf {
     config_dir.join("tcc-broker").join("metadata.json")
+}
+
+fn previous_broker_path(config_dir: &Path) -> PathBuf {
+    config_dir
+        .join("tcc-broker")
+        .join("herdr-mcp-broker.previous")
+}
+
+fn previous_broker_metadata_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("tcc-broker").join("metadata.previous.json")
+}
+
+/// Whether the installed stable broker contains the private Herdr-host
+/// capability. Revision 1 remains valid for the original fs/git broker path;
+/// callers must keep their pre-host fallback until an explicit broker upgrade
+/// has installed revision 2 or newer.
+#[cfg(any(target_os = "macos", test))]
+pub fn installed_supports_herdr_host(config_dir: &Path) -> bool {
+    status(&broker_path(config_dir)).is_some()
+        && installed_compat_revision(config_dir)
+            .is_some_and(|revision| revision >= HERDR_HOST_MIN_COMPAT_REVISION)
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_herdr_binary() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is required for the stable Herdr TCC host".to_owned())?;
+    [
+        home.join(".local/bin/herdr"),
+        PathBuf::from("/opt/homebrew/bin/herdr"),
+        PathBuf::from("/usr/local/bin/herdr"),
+    ]
+    .into_iter()
+    .find(|path| {
+        path.metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
+    .ok_or_else(|| {
+        "cannot locate a trusted standard Herdr binary for the stable TCC host".to_owned()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn same_canonical_file(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn herdr_host_can_wrap(config_dir: &Path, herdr_binary: &Path) -> bool {
+    if !installed_supports_herdr_host(config_dir) {
+        return false;
+    }
+    let Ok(trusted) = trusted_herdr_binary() else {
+        return false;
+    };
+    if !same_canonical_file(herdr_binary, &trusted) {
+        return false;
+    }
+    matches!(
+        run_disclaimed_documents_probe(&broker_path(config_dir), Duration::from_secs(2)),
+        Ok(Some(status)) if status.success()
+    )
 }
 
 fn broker_candidate_path() -> Result<PathBuf, String> {
@@ -544,6 +615,109 @@ pub fn install(config_dir: &Path, force: bool) -> Result<(), String> {
     write_broker_metadata(config_dir)
 }
 
+/// Explicitly replace an older broker revision when macOS must authorize a
+/// new code identity. Ordinary install/update paths must never call this: the
+/// caller has to opt into the broker upgrade and complete `permissions verify`
+/// afterwards. The prior broker bytes/metadata remain beside the new broker
+/// until verification succeeds so a failed migration still has rollback
+/// evidence instead of silently destroying the last authorized identity.
+pub fn migrate_for_explicit_reauthorization(config_dir: &Path) -> Result<bool, String> {
+    let upgrade = upgrade_status(config_dir);
+    if !upgrade.update_available {
+        return Ok(false);
+    }
+
+    let source = broker_candidate_path()?;
+    let source_bytes = std::fs::read(&source).map_err(|error| {
+        format!(
+            "cannot read TCC broker upgrade candidate {}: {error}",
+            source.display()
+        )
+    })?;
+    let target = broker_path(config_dir);
+    let metadata = broker_metadata_path(config_dir);
+    let previous = previous_broker_path(config_dir);
+    let previous_metadata = previous_broker_metadata_path(config_dir);
+    let parent = target
+        .parent()
+        .ok_or_else(|| "broker path has no parent directory".to_owned())?;
+    ensure_secure_dir(parent)?;
+
+    let target_meta = std::fs::symlink_metadata(&target).map_err(|error| {
+        format!(
+            "cannot inspect existing broker {}: {error}",
+            target.display()
+        )
+    })?;
+    if target_meta.file_type().is_symlink() || !target_meta.is_file() {
+        return Err(format!(
+            "existing TCC broker {} must be a regular file and not a symlink",
+            target.display()
+        ));
+    }
+    if previous.exists() || previous_metadata.exists() {
+        return Err(
+            "a previous TCC broker migration backup is still present; complete or recover that migration before starting another"
+                .to_owned(),
+        );
+    }
+
+    std::fs::rename(&target, &previous).map_err(|error| {
+        format!(
+            "cannot preserve previous TCC broker {}: {error}",
+            target.display()
+        )
+    })?;
+    let metadata_was_present = metadata.exists();
+    if metadata_was_present && let Err(error) = std::fs::rename(&metadata, &previous_metadata) {
+        let _ = std::fs::rename(&previous, &target);
+        return Err(format!(
+            "cannot preserve previous TCC broker metadata {}: {error}",
+            metadata.display()
+        ));
+    }
+
+    let install_result = atomic_write(&target, &source_bytes, 0o700)
+        .and_then(|()| write_broker_metadata(config_dir));
+    if let Err(error) = install_result {
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&metadata);
+        let broker_restored = std::fs::rename(&previous, &target).is_ok();
+        let metadata_restored =
+            !metadata_was_present || std::fs::rename(&previous_metadata, &metadata).is_ok();
+        return Err(format!(
+            "TCC broker migration failed: {error}; rollback broker_restored={broker_restored} metadata_restored={metadata_restored}"
+        ));
+    }
+    Ok(true)
+}
+
+/// Remove the rollback copy only after the newly installed broker has passed
+/// the responsibility-isolated permission probe.
+#[cfg(any(target_os = "macos", test))]
+pub fn finalize_explicit_reauthorization(config_dir: &Path) -> Result<(), String> {
+    for path in [
+        previous_broker_path(config_dir),
+        previous_broker_metadata_path(config_dir),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(format!(
+                    "TCC broker migration backup {} must be a regular file",
+                    path.display()
+                ));
+            }
+            Ok(_) => std::fs::remove_file(&path)
+                .map_err(|error| format!("cannot remove {}: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("cannot inspect {}: {error}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Remove the stable broker binary. Full uninstall may call this; ordinary
 /// runtime/generation rotation must not. Returns whether a file was removed.
 pub fn uninstall_broker(config_dir: &Path) -> Result<bool, String> {
@@ -930,19 +1104,334 @@ fn run_broker_child_standard(broker: &Path, request_bytes: &[u8]) -> Result<Valu
 }
 
 #[cfg(target_os = "macos")]
-fn run_broker_child_disclaimed(broker: &Path, request_bytes: &[u8]) -> Result<Value, String> {
-    use crate::child_process;
+fn posix_spawn_ok(code: libc::c_int, context: &str) -> Result<(), String> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context}: {}",
+            std::io::Error::from_raw_os_error(code)
+        ))
+    }
+}
+
+/// Spawn one hidden mode of the stable broker while explicitly disclaiming
+/// the rotating caller's macOS responsibility. The child becomes the TCC
+/// responsible identity. This is the shared primitive for the real broker
+/// path, permission verification, and the restricted Herdr host.
+#[cfg(target_os = "macos")]
+fn spawn_disclaimed_broker_mode(
+    broker: &Path,
+    mode: &str,
+    stdin_fd: libc::c_int,
+    stdout_fd: libc::c_int,
+    stderr_fd: libc::c_int,
+    broker_child_env: bool,
+) -> Result<libc::pid_t, String> {
     use std::ffi::CString;
-    use std::fs::File;
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::ExitStatus;
     use std::ptr;
-    use std::time::Instant;
 
     type ResponsibilitySpawnattrsSetdisclaim =
         unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
+
+    let broker_c = CString::new(broker.as_os_str().as_bytes())
+        .map_err(|_| format!("broker path contains NUL: {}", broker.display()))?;
+    let mode_c = CString::new(mode).map_err(|_| "broker mode contains NUL".to_owned())?;
+    let mut argv = vec![
+        broker_c.as_ptr().cast_mut(),
+        mode_c.as_ptr().cast_mut(),
+        ptr::null_mut(),
+    ];
+    let mut env_storage = std::env::vars_os()
+        .filter(|(key, _)| key != BROKER_CHILD_ENV)
+        .map(|(key, value)| {
+            let mut bytes = key.as_os_str().as_bytes().to_vec();
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_os_str().as_bytes());
+            CString::new(bytes).map_err(|_| "environment contains NUL".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if broker_child_env {
+        env_storage.push(
+            CString::new(format!("{BROKER_CHILD_ENV}=1")).expect("static broker env has no NUL"),
+        );
+    }
+    let mut envp = env_storage
+        .iter()
+        .map(|entry| entry.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    envp.push(ptr::null_mut());
+
+    let mut actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
+    posix_spawn_ok(
+        unsafe { libc::posix_spawn_file_actions_init(&mut actions) },
+        "cannot initialize broker spawn file actions",
+    )?;
+    let mut attrs: libc::posix_spawnattr_t = ptr::null_mut();
+    if let Err(error) = posix_spawn_ok(
+        unsafe { libc::posix_spawnattr_init(&mut attrs) },
+        "cannot initialize broker spawn attributes",
+    ) {
+        unsafe {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+        }
+        return Err(error);
+    }
+
+    let result = (|| {
+        let stdio = [
+            (stdin_fd, libc::STDIN_FILENO),
+            (stdout_fd, libc::STDOUT_FILENO),
+            (stderr_fd, libc::STDERR_FILENO),
+        ];
+        for (from, to) in stdio {
+            posix_spawn_ok(
+                unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions, from, to) },
+                "cannot configure broker stdio",
+            )?;
+        }
+        let mut close_fds = Vec::new();
+        for (from, to) in stdio {
+            if from != to && !close_fds.contains(&from) {
+                close_fds.push(from);
+            }
+        }
+        for fd in close_fds {
+            posix_spawn_ok(
+                unsafe { libc::posix_spawn_file_actions_addclose(&mut actions, fd) },
+                "cannot close broker inherited stdio fd",
+            )?;
+        }
+
+        let flags = (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_CLOEXEC_DEFAULT) as i16;
+        posix_spawn_ok(
+            unsafe { libc::posix_spawnattr_setflags(&mut attrs, flags) },
+            "cannot configure broker spawn flags",
+        )?;
+        posix_spawn_ok(
+            unsafe { libc::posix_spawnattr_setpgroup(&mut attrs, 0) },
+            "cannot configure broker process group",
+        )?;
+
+        let symbol_name = CString::new("responsibility_spawnattrs_setdisclaim")
+            .expect("static responsibility symbol has no NUL");
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol_name.as_ptr()) };
+        if symbol.is_null() {
+            return Err(
+                "macOS responsibility_spawnattrs_setdisclaim is unavailable; refusing to launch stable TCC broker with rotating caller responsibility"
+                    .to_owned(),
+            );
+        }
+        let disclaim: ResponsibilitySpawnattrsSetdisclaim = unsafe { std::mem::transmute(symbol) };
+        posix_spawn_ok(
+            unsafe { disclaim(&mut attrs, 1) },
+            "cannot disclaim rotating caller TCC responsibility for broker",
+        )?;
+
+        let mut pid = 0_i32;
+        posix_spawn_ok(
+            unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    broker_c.as_ptr(),
+                    &actions,
+                    &attrs,
+                    argv.as_mut_ptr(),
+                    envp.as_mut_ptr(),
+                )
+            },
+            "cannot spawn disclaimed TCC broker",
+        )?;
+        Ok(pid)
+    })();
+
+    unsafe {
+        libc::posix_spawnattr_destroy(&mut attrs);
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn try_wait_pid(pid: libc::pid_t) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut raw_status = 0_i32;
+    let waited = unsafe { libc::waitpid(pid, &mut raw_status, libc::WNOHANG) };
+    if waited == pid {
+        Ok(Some(std::process::ExitStatus::from_raw(raw_status)))
+    } else if waited == 0 {
+        Ok(None)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_pid_bounded(
+    pid: libc::pid_t,
+    timeout: Duration,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    let started = std::time::Instant::now();
+    loop {
+        match try_wait_pid(pid) {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => {}
+            Err(error) => return Err(format!("broker waitpid failed: {error}")),
+        }
+        if started.elapsed() >= timeout {
+            terminate_pid_group(pid);
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_pid_group(pid: libc::pid_t) {
+    let _ = unsafe { libc::kill(-pid, libc::SIGTERM) };
+    let grace = std::time::Instant::now();
+    while grace.elapsed() < Duration::from_millis(500) {
+        match try_wait_pid(pid) {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return,
+        }
+    }
+    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let mut raw_status = 0_i32;
+    let _ = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_disclaimed_documents_probe(
+    broker: &Path,
+    timeout: Duration,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    use std::os::fd::AsRawFd;
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .map_err(|error| format!("cannot open /dev/null for TCC probe: {error}"))?;
+    let fd = null.as_raw_fd();
+    let pid = spawn_disclaimed_broker_mode(broker, "__documents-probe", fd, fd, fd, false)?;
+    let _registration = crate::child_process::register_owned_pid("documents-probe", pid as u32);
+    wait_pid_bounded(pid, timeout)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MacosHerdrHostChild {
+    pid: libc::pid_t,
+    _registration: crate::child_process::OwnedChildRegistration,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosHerdrHostChild {
+    pub(crate) fn id(&self) -> u32 {
+        self.pid as u32
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        try_wait_pid(self.pid)
+    }
+
+    pub(crate) fn terminate_and_reap(&mut self) {
+        terminate_pid_group(self.pid);
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_herdr_host(
+    config_dir: &Path,
+    stdout: &std::fs::File,
+    stderr: &std::fs::File,
+) -> Result<MacosHerdrHostChild, String> {
+    use std::os::fd::AsRawFd;
+    if !installed_supports_herdr_host(config_dir) {
+        return Err("installed TCC broker does not support stable Herdr hosting".to_owned());
+    }
+    let broker = broker_path(config_dir);
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/null")
+        .map_err(|error| format!("cannot open /dev/null for Herdr host: {error}"))?;
+    let pid = spawn_disclaimed_broker_mode(
+        &broker,
+        "__tcc-herdr-host",
+        null.as_raw_fd(),
+        stdout.as_raw_fd(),
+        stderr.as_raw_fd(),
+        false,
+    )?;
+    let registration = crate::child_process::register_owned_pid("tcc-herdr-host", pid as u32);
+    Ok(MacosHerdrHostChild {
+        pid,
+        _registration: registration,
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_herdr_host() -> Result<ExitCode, String> {
+    use std::process::{Command, Stdio};
+
+    let paths = crate::paths::RuntimePaths::discover()?;
+    if paths.instance.is_named() {
+        return Err(
+            "stable TCC Herdr host is owned only by the default production instance".to_owned(),
+        );
+    }
+    let broker = broker_path(&paths.config_dir);
+    let current = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve TCC Herdr host executable: {error}"))?;
+    if !same_canonical_file(&current, &broker) {
+        return Err(format!(
+            "refusing TCC Herdr host outside installed stable broker {}",
+            broker.display()
+        ));
+    }
+    if !installed_supports_herdr_host(&paths.config_dir) {
+        return Err("installed TCC broker metadata does not authorize Herdr host mode".to_owned());
+    }
+    let herdr = trusted_herdr_binary()?;
+    let socket = paths
+        .herdr_socket
+        .as_deref()
+        .ok_or_else(|| "stable TCC Herdr host requires a local Unix socket".to_owned())?;
+    let mut command = Command::new(&herdr);
+    command
+        .arg("server")
+        .env("HERDR_SOCKET_PATH", socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // Deliberately do not create a new process group and do not disclaim the
+    // Herdr child: it must remain a normal descendant of the stable broker so
+    // macOS TCC responsibility stays attached to the broker identity.
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("stable TCC broker cannot start Herdr server: {error}"))?;
+    let _registration = crate::child_process::register_owned_child("tcc-herdr-server", &child);
+    let status = child
+        .wait()
+        .map_err(|error| format!("stable TCC broker cannot wait for Herdr server: {error}"))?;
+    Ok(if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn run_herdr_host() -> Result<ExitCode, String> {
+    Err("stable TCC Herdr host is only available on macOS".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn run_broker_child_disclaimed(broker: &Path, request_bytes: &[u8]) -> Result<Value, String> {
+    use crate::child_process;
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd};
 
     fn pipe_pair() -> Result<(File, File), String> {
         let mut fds = [-1_i32; 2];
@@ -969,161 +1458,17 @@ fn run_broker_child_disclaimed(broker: &Path, request_bytes: &[u8]) -> Result<Va
         Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
     }
 
-    fn posix_ok(code: libc::c_int, context: &str) -> Result<(), String> {
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "{context}: {}",
-                std::io::Error::from_raw_os_error(code)
-            ))
-        }
-    }
-
-    fn wait_pid_bounded(pid: libc::pid_t, timeout: Duration) -> Result<Option<ExitStatus>, String> {
-        let started = Instant::now();
-        loop {
-            let mut raw_status = 0_i32;
-            let waited = unsafe { libc::waitpid(pid, &mut raw_status, libc::WNOHANG) };
-            if waited == pid {
-                return Ok(Some(ExitStatus::from_raw(raw_status)));
-            }
-            if waited < 0 {
-                return Err(format!(
-                    "broker waitpid failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            if started.elapsed() >= timeout {
-                let _ = unsafe { libc::kill(-pid, libc::SIGTERM) };
-                let grace = Instant::now();
-                while grace.elapsed() < Duration::from_millis(500) {
-                    let mut raw_status = 0_i32;
-                    let waited = unsafe { libc::waitpid(pid, &mut raw_status, libc::WNOHANG) };
-                    if waited == pid {
-                        return Ok(None);
-                    }
-                    if waited < 0 {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
-                let mut raw_status = 0_i32;
-                let _ = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
-                return Ok(None);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
     let (stdin_read, mut stdin_write) = pipe_pair()?;
     let (mut stdout_read, stdout_write) = pipe_pair()?;
     let (mut stderr_read, stderr_write) = pipe_pair()?;
-    let broker_c = CString::new(broker.as_os_str().as_bytes())
-        .map_err(|_| format!("broker path contains NUL: {}", broker.display()))?;
-    let arg_mode = CString::new("__tcc-broker").expect("static broker arg has no NUL");
-    let mut argv = vec![
-        broker_c.as_ptr().cast_mut(),
-        arg_mode.as_ptr().cast_mut(),
-        ptr::null_mut(),
-    ];
-    let mut env_storage = std::env::vars_os()
-        .filter(|(key, _)| key != BROKER_CHILD_ENV)
-        .map(|(key, value)| {
-            let mut bytes = key.as_os_str().as_bytes().to_vec();
-            bytes.push(b'=');
-            bytes.extend_from_slice(value.as_os_str().as_bytes());
-            CString::new(bytes).map_err(|_| "environment contains NUL".to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    env_storage
-        .push(CString::new(format!("{BROKER_CHILD_ENV}=1")).expect("static broker env has no NUL"));
-    let mut envp = env_storage
-        .iter()
-        .map(|entry| entry.as_ptr().cast_mut())
-        .collect::<Vec<_>>();
-    envp.push(ptr::null_mut());
-
-    let mut actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
-    posix_ok(
-        unsafe { libc::posix_spawn_file_actions_init(&mut actions) },
-        "cannot initialize broker spawn file actions",
+    let pid = spawn_disclaimed_broker_mode(
+        broker,
+        "__tcc-broker",
+        stdin_read.as_raw_fd(),
+        stdout_write.as_raw_fd(),
+        stderr_write.as_raw_fd(),
+        true,
     )?;
-    let mut attrs: libc::posix_spawnattr_t = ptr::null_mut();
-    if let Err(error) = posix_ok(
-        unsafe { libc::posix_spawnattr_init(&mut attrs) },
-        "cannot initialize broker spawn attributes",
-    ) {
-        unsafe {
-            libc::posix_spawn_file_actions_destroy(&mut actions);
-        }
-        return Err(error);
-    }
-
-    let spawn_result = (|| {
-        for (from, to) in [
-            (stdin_read.as_raw_fd(), libc::STDIN_FILENO),
-            (stdout_write.as_raw_fd(), libc::STDOUT_FILENO),
-            (stderr_write.as_raw_fd(), libc::STDERR_FILENO),
-        ] {
-            posix_ok(
-                unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions, from, to) },
-                "cannot configure broker stdio",
-            )?;
-            if from != to {
-                posix_ok(
-                    unsafe { libc::posix_spawn_file_actions_addclose(&mut actions, from) },
-                    "cannot close broker inherited stdio fd",
-                )?;
-            }
-        }
-        let flags = (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_CLOEXEC_DEFAULT) as i16;
-        posix_ok(
-            unsafe { libc::posix_spawnattr_setflags(&mut attrs, flags) },
-            "cannot configure broker spawn flags",
-        )?;
-        posix_ok(
-            unsafe { libc::posix_spawnattr_setpgroup(&mut attrs, 0) },
-            "cannot configure broker process group",
-        )?;
-
-        let symbol_name = CString::new("responsibility_spawnattrs_setdisclaim")
-            .expect("static responsibility symbol has no NUL");
-        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol_name.as_ptr()) };
-        if symbol.is_null() {
-            return Err(
-                "macOS responsibility_spawnattrs_setdisclaim is unavailable; refusing to launch TCC broker with rotating runtime responsibility"
-                    .to_owned(),
-            );
-        }
-        let disclaim: ResponsibilitySpawnattrsSetdisclaim = unsafe { std::mem::transmute(symbol) };
-        posix_ok(
-            unsafe { disclaim(&mut attrs, 1) },
-            "cannot disclaim rotating runtime TCC responsibility for broker",
-        )?;
-
-        let mut pid = 0_i32;
-        posix_ok(
-            unsafe {
-                libc::posix_spawn(
-                    &mut pid,
-                    broker_c.as_ptr(),
-                    &actions,
-                    &attrs,
-                    argv.as_mut_ptr(),
-                    envp.as_mut_ptr(),
-                )
-            },
-            "cannot spawn disclaimed TCC broker",
-        )?;
-        Ok(pid)
-    })();
-    unsafe {
-        libc::posix_spawnattr_destroy(&mut attrs);
-        libc::posix_spawn_file_actions_destroy(&mut actions);
-    }
-    let pid = spawn_result?;
     let _registration = child_process::register_owned_pid("tcc-broker", pid as u32);
 
     drop(stdin_read);
@@ -1399,6 +1744,33 @@ mod tests {
         assert!(!text.contains("rust-"));
     }
 
+    #[test]
+    fn herdr_host_capability_requires_revision_two_or_newer() {
+        let dir = temp_dir("host-capability");
+        let config = dir.join("config");
+        let target = broker_path(&config);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"stable-broker").unwrap();
+        fs::write(
+            broker_metadata_path(&config),
+            format!(
+                "{{\"schema_version\":1,\"compat_revision\":1,\"preferred_signing_identifier\":\"{BROKER_SIGNING_IDENTIFIER}\"}}"
+            ),
+        )
+        .unwrap();
+        assert!(!installed_supports_herdr_host(&config));
+
+        fs::write(
+            broker_metadata_path(&config),
+            format!(
+                "{{\"schema_version\":1,\"compat_revision\":{HERDR_HOST_MIN_COMPAT_REVISION},\"preferred_signing_identifier\":\"{BROKER_SIGNING_IDENTIFIER}\"}}"
+            ),
+        )
+        .unwrap();
+        assert!(installed_supports_herdr_host(&config));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn disclaimed_broker_spawn_round_trips_json() {
@@ -1419,10 +1791,18 @@ mod tests {
         let dir = temp_dir("install");
         let config = dir.join("config");
         let target = broker_path(&config);
-        // A v0.4.2 pre-metadata broker is compatibility revision 1. Runtime
-        // rebuilds can have different bytes without implying a broker upgrade.
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"existing-broker-bytes").unwrap();
+        fs::write(
+            broker_metadata_path(&config),
+            format!(
+                "{{\"schema_version\":1,\"compat_revision\":{BROKER_COMPAT_REVISION},\"preferred_signing_identifier\":\"{BROKER_SIGNING_IDENTIFIER}\"}}"
+            ),
+        )
+        .unwrap();
+
+        // Runtime rebuilds can have different bytes without implying a broker
+        // upgrade when the installed compatibility revision is still current.
         let result = install(&config, false);
         assert!(result.is_ok());
         assert_eq!(fs::read(&target).unwrap(), b"existing-broker-bytes");
@@ -1430,13 +1810,69 @@ mod tests {
             installed_compat_revision(&config),
             Some(BROKER_COMPAT_REVISION)
         );
-        assert!(!broker_metadata_path(&config).is_file());
+        assert!(broker_metadata_path(&config).is_file());
 
         // Even an explicit setup pass cannot replace the identity when the
         // broker implementation revision did not change.
         let result = install(&config, true);
         assert!(result.is_ok());
         assert_eq!(fs::read(&target).unwrap(), b"existing-broker-bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_revision_one_requires_explicit_upgrade_after_host_revision_advance() {
+        let dir = temp_dir("legacy-revision");
+        let config = dir.join("config");
+        let target = broker_path(&config);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"legacy-v1-broker").unwrap();
+
+        assert_eq!(installed_compat_revision(&config), Some(1));
+        let error = install(&config, false).unwrap_err();
+        assert!(error.contains("revision 1 is installed"));
+        assert!(error.contains("permissions setup --upgrade-broker"));
+        assert_eq!(fs::read(&target).unwrap(), b"legacy-v1-broker");
+        assert!(!broker_metadata_path(&config).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_reauthorization_migration_preserves_old_broker_until_verify() {
+        let _guard = crate::test_env::lock();
+        let dir = temp_dir("explicit-reauthorization");
+        let config = dir.join("config");
+        let target = broker_path(&config);
+        let candidate = dir.join("candidate");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"revision-one-broker").unwrap();
+        fs::write(&candidate, b"revision-two-broker").unwrap();
+        let previous_candidate = std::env::var_os("HERDR_MCP_TCC_BROKER_CANDIDATE");
+        unsafe {
+            std::env::set_var("HERDR_MCP_TCC_BROKER_CANDIDATE", &candidate);
+        }
+
+        assert!(migrate_for_explicit_reauthorization(&config).unwrap());
+        assert_eq!(fs::read(&target).unwrap(), b"revision-two-broker");
+        assert_eq!(
+            fs::read(previous_broker_path(&config)).unwrap(),
+            b"revision-one-broker"
+        );
+        assert_eq!(
+            installed_compat_revision(&config),
+            Some(BROKER_COMPAT_REVISION)
+        );
+
+        finalize_explicit_reauthorization(&config).unwrap();
+        assert!(!previous_broker_path(&config).exists());
+        assert!(!previous_broker_metadata_path(&config).exists());
+
+        unsafe {
+            match previous_candidate {
+                Some(value) => std::env::set_var("HERDR_MCP_TCC_BROKER_CANDIDATE", value),
+                None => std::env::remove_var("HERDR_MCP_TCC_BROKER_CANDIDATE"),
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

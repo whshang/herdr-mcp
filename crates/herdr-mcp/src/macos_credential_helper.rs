@@ -426,7 +426,7 @@ pub fn prewarm_existing_default(_config_dir: &Path) -> Result<(), String> {
     })?;
     // Exactly one bounded load. Discard the returned secret immediately.
     let _ = load(&service, &account).map_err(|_| {
-        "stable credential helper authorization is required once before runtime mutation".to_owned()
+        "approve the stable Herdr credential helper in the one-time macOS Keychain prompt, then retry this command from an interactive Mac Terminal; this authorization is separate from Full Disk Access and is reused across runtime updates".to_owned()
     })?;
     Ok(())
 }

@@ -59,8 +59,8 @@ function makeOptions(overrides = {}) {
 
 // --- request builders -------------------------------------------------------
 
-function GET(path, opts) {
-  return handleOAuthPublic(new Request(`https://x.example${path}`), opts);
+function GET(path, opts, { headers = {} } = {}) {
+  return handleOAuthPublic(new Request(`https://x.example${path}`, { headers }), opts);
 }
 
 function POST(path, body, opts, { form = false, headers = {} } = {}) {
@@ -140,7 +140,7 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.match(html, /visible CLI prompt/);
   assert.match(html, /do not refresh it while approval is pending/);
   assert.doesNotMatch(html, /no-echo prompt/);
-  assert.match(html, /unknown command 'connector'/);
+  assert.match(html, /unknown command (?:'|&#39;)connector(?:'|&#39;)/);
   assert.match(html, /computer that is already enrolled in this Worker/);
   assert.match(html, /Approval grants ordinary MCP access; it does not grant fleet-administration authority\./);
   assert.doesNotMatch(html, /another Herdr WebChat/);
@@ -227,6 +227,39 @@ test("every handled response carries CORS headers", async () => {
   assert.equal(reg.headers.get("access-control-allow-origin"), "*");
   const token = await POST("/oauth/token", { grant_type: "x" }, opts);
   assert.equal(token.headers.get("access-control-allow-origin"), "*");
+});
+
+test("approval page auto-detects English, Chinese, and Japanese from the browser language", async () => {
+  for (const [acceptLanguage, htmlLang, step1, step2] of [
+    ["en-US,en;q=0.9", "en", "Open Terminal and run this command", "Enter the six-digit code when the CLI asks"],
+    ["zh-CN,zh;q=0.9,en;q=0.8", "zh-CN", "打开终端并运行这条命令", "CLI 提示后输入 6 位验证码"],
+    ["ja-JP,ja;q=0.9,en;q=0.8", "ja", "ターミナルを開いてこのコマンドを実行", "CLI に求められたら 6 桁のコードを入力"],
+  ]) {
+    const opts = makeOptions();
+    const client = await registerClient(opts, { client_name: "Herdr language test" });
+    const verifier = "L".repeat(43) + "zZ-._";
+    const challenge = await s256Challenge(verifier);
+    const qs = new URLSearchParams({
+      client_id: client.client_id,
+      redirect_uri: "https://app.example/cb",
+      response_type: "code",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: `lang-${htmlLang}`,
+    });
+    const resp = await GET(`/oauth/authorize?${qs}`, opts, {
+      headers: { "accept-language": acceptLanguage },
+    });
+    assert.equal(resp.status, 200);
+    const html = await resp.text();
+    assert.match(html, new RegExp(`<html lang="${htmlLang}">`));
+    assert.ok(html.includes(step1));
+    assert.ok(html.includes(step2));
+    assert.match(
+      html,
+      /local herdr-mcp service and Herdr server are ready|本机 herdr-mcp 服务和 Herdr server|ローカルの herdr-mcp サービスと Herdr server/,
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------

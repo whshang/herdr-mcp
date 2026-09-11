@@ -43,16 +43,16 @@ ChatGPT 能完成 initialize / discovery / `tools/list`。
 
 当前 ChatGPT Web 的开发者模式可以添加自定义 MCP 应用。界面和套餐权限可能变化，整体流程保持一致：
 
-1. 在 ChatGPT Workspace / Apps 设置中启用 Developer mode；
-2. 创建或添加自定义 MCP App / Connector；
-3. MCP URL 填写：
+1. 在 ChatGPT 插件设置中启用 Developer mode；
+2. 进入“**插件 → 浏览插件**”，添加自定义插件，名称建议 `herdr`；
+3. MCP URL 填完整地址，必须包含 `/mcp`：
 
    ```text
    https://<your-edge-origin>/mcp
    ```
 
-4. 完成浏览器 OAuth。首次授权时，Herdr 不会静默放行，而是显示一个短期批准请求；在任意已登记到这个 Worker 的电脑上运行 `herdr-mcp connector approve <approval-request-id>` 完成批准。已批准的 WebChat Connector 仍只有普通 MCP 权限，不能继续批准另一个 Connector；
-5. 保存后新建一个聊天进行验收。
+4. 完成浏览器 OAuth。首次授权页会根据浏览器语言自动使用中文、英文或日文。第一步复制 `herdr-mcp connector approve <approval-request-id>` 到终端；该命令先检查本机 `herdr-mcp` 服务和 Herdr server 是否就绪，第二步才要求输入页面上的 6 位验证码。已批准的 WebChat Connector 仍只有普通 MCP 权限，不能继续批准另一个 Connector；
+5. 创建或打开 ChatGPT **Project**。每个新会话的第一条消息先用输入框 `+` 加号引用 `herdr`，确保这个会话启用插件。
 
 **不要填写本机 `HERDR_MCP_TOKEN`。** ChatGPT 公网入口使用 OAuth；静态 bearer 只用于本机 curl / Cursor 和兼容路径。
 

@@ -784,22 +784,31 @@ fn connect_existing_worker(
     pairing_address: &str,
     name: Option<&str>,
 ) -> Result<ExitCode, String> {
-    let (edge_origin, pairing_id) = parse_pairing_address(pairing_address)?;
-    let code = read_pairing_code_tty()?;
-    connect_macos_inner(
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    connect_existing_worker_flow(
         paths,
-        &edge_origin,
-        &pairing_id,
-        &code,
+        pairing_address,
         name,
-        crate::credential_store::store,
-        Config::load_for_instance,
-        write_config_atomic,
-        revoke_self,
-        crate::credential_store::delete,
-        activate_connected_runtime_after_pairing,
-        |_paths| crate::linux_service_manager::reconcile_link(),
-        consume_pairing,
+        &config,
+        || extension_fleet_snapshot(paths),
+        read_pairing_code_tty,
+        |paths, edge_origin, pairing_id, code, name| {
+            connect_macos_inner(
+                paths,
+                edge_origin,
+                pairing_id,
+                code,
+                name,
+                crate::credential_store::store,
+                Config::load_for_instance,
+                write_config_atomic,
+                revoke_self,
+                crate::credential_store::delete,
+                activate_connected_runtime_after_pairing,
+                |_paths| crate::linux_service_manager::reconcile_link(),
+                consume_pairing,
+            )
+        },
     )
 }
 
@@ -809,23 +818,103 @@ fn connect_existing_worker(
     pairing_address: &str,
     name: Option<&str>,
 ) -> Result<ExitCode, String> {
-    let (edge_origin, pairing_id) = parse_pairing_address(pairing_address)?;
-    let code = read_pairing_code_tty()?;
-    connect_macos_inner(
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    connect_existing_worker_flow(
         paths,
-        &edge_origin,
-        &pairing_id,
-        &code,
+        pairing_address,
         name,
-        crate::credential_store::store,
-        Config::load_for_instance,
-        write_config_atomic,
-        revoke_self,
-        crate::credential_store::delete,
-        activate_connected_runtime_after_pairing,
-        crate::link::reconcile_after_service_generation_change,
-        consume_pairing,
+        &config,
+        || extension_fleet_snapshot(paths),
+        read_pairing_code_tty,
+        |paths, edge_origin, pairing_id, code, name| {
+            connect_macos_inner(
+                paths,
+                edge_origin,
+                pairing_id,
+                code,
+                name,
+                crate::credential_store::store,
+                Config::load_for_instance,
+                write_config_atomic,
+                revoke_self,
+                crate::credential_store::delete,
+                activate_connected_runtime_after_pairing,
+                crate::link::reconcile_after_service_generation_change,
+                consume_pairing,
+            )
+        },
     )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn existing_enrollment_for_worker(
+    config: &Config,
+    requested_origin: &str,
+) -> Result<Option<String>, String> {
+    let (Some(existing_origin), Some(device_id)) = (
+        config.edge_public_origin.as_deref(),
+        config.edge_device_id.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    if normalize_edge_origin(existing_origin)? != normalize_edge_origin(requested_origin)? {
+        return Ok(None);
+    }
+    Ok(Some(crate::config::normalize_device_id(device_id)?))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn inventory_has_active_device(snapshot: &Value, device_id: &str) -> bool {
+    snapshot.get("ok").and_then(Value::as_bool) == Some(true)
+        && snapshot
+            .get("devices")
+            .and_then(Value::as_array)
+            .is_some_and(|devices| {
+                devices.iter().any(|device| {
+                    device.get("device_id").and_then(Value::as_str) == Some(device_id)
+                        && device.get("authorization").and_then(Value::as_str) == Some("active")
+                })
+            })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn connect_existing_worker_flow<I, R, C>(
+    paths: &RuntimePaths,
+    pairing_address: &str,
+    name: Option<&str>,
+    config: &Config,
+    inventory: I,
+    read_code: R,
+    connect_new: C,
+) -> Result<ExitCode, String>
+where
+    I: FnOnce() -> Result<Value, String>,
+    R: FnOnce() -> Result<String, String>,
+    C: FnOnce(&RuntimePaths, &str, &str, &str, Option<&str>) -> Result<ExitCode, String>,
+{
+    let (edge_origin, pairing_id) = parse_pairing_address(pairing_address)?;
+    if let Some(device_id) = existing_enrollment_for_worker(config, &edge_origin)? {
+        let snapshot = inventory()?;
+        if !inventory_has_active_device(&snapshot, &device_id) {
+            return Err(format!(
+                "existing enrollment {device_id} is not active on Worker {edge_origin}; refusing to create a second device identity"
+            ));
+        }
+        print_json(&json!({
+            "ok": true,
+            "action": "worker_connect",
+            "device_id": device_id,
+            "workstation_id": device_id,
+            "edge_origin": edge_origin,
+            "pairing_consumed": false,
+            "reused_existing_enrollment": true,
+            "secret_printed": false,
+        }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let code = read_code()?;
+    connect_new(paths, &edge_origin, &pairing_id, &code, name)
 }
 
 #[cfg(target_os = "linux")]
@@ -923,6 +1012,36 @@ fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, Stri
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn connector_service_ready(status: &Value) -> bool {
+    status.get("ok").and_then(Value::as_bool) == Some(true)
+        && status.get("loaded").and_then(Value::as_bool) == Some(true)
+        && status.get("healthy").and_then(Value::as_bool) == Some(true)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_connector_local_runtime_ready() -> Result<(), String> {
+    let service = crate::service_manager::doctor_status()?;
+    if !connector_service_ready(&service) {
+        return Err(
+            "local herdr-mcp service is not ready; run `herdr-mcp service start`, verify `herdr-mcp service status`, then retry this approval command"
+                .to_owned(),
+        );
+    }
+    if !crate::herdr_supervisor::connector_ready()? {
+        return Err(
+            "local Herdr server is not ready; run `herdr-mcp herdr-supervisor start`, verify `herdr-mcp herdr-supervisor status`, then retry this approval command"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_connector_local_runtime_ready() -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn approve_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
     Err(
@@ -936,6 +1055,7 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
     if request_id.trim().is_empty() || request_id.len() > 256 {
         return Err("connector approval request id is invalid".to_owned());
     }
+    ensure_connector_local_runtime_ready()?;
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
@@ -2921,6 +3041,146 @@ mod tests {
         assert!(parse_pairing_address("https://edge.example/pair?x=1#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
         assert!(parse_pairing_address("https://edge.example/pair#pair with space").is_err());
         assert!(parse_pairing_address("not a url").is_err());
+    }
+
+    #[test]
+    fn same_worker_active_enrollment_reuses_identity_without_reading_code_or_consuming_pairing() {
+        use std::cell::Cell;
+
+        const DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut config = Config::default();
+        config.set_edge_device_id(DEVICE_ID).unwrap();
+        config
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+        let paths = RuntimePaths {
+            config_dir: env::temp_dir(),
+            config_file: env::temp_dir().join("herdr-worker-reuse.toml"),
+            dev_state_dir: env::temp_dir().join("herdr-worker-reuse-dev"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+        let read_code_called = Cell::new(false);
+        let connect_new_called = Cell::new(false);
+
+        let result = connect_existing_worker_flow(
+            &paths,
+            "https://edge.example/pair#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Some("ignored-name"),
+            &config,
+            || {
+                Ok(json!({
+                    "ok": true,
+                    "devices": [{"device_id": DEVICE_ID, "authorization": "active"}]
+                }))
+            },
+            || {
+                read_code_called.set(true);
+                Ok("123456".to_owned())
+            },
+            |_, _, _, _, _| {
+                connect_new_called.set(true);
+                Ok(ExitCode::SUCCESS)
+            },
+        );
+
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        assert!(!read_code_called.get());
+        assert!(!connect_new_called.get());
+    }
+
+    #[test]
+    fn same_worker_stale_enrollment_fails_closed_without_consuming_pairing() {
+        const DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut config = Config::default();
+        config.set_edge_device_id(DEVICE_ID).unwrap();
+        config
+            .set_edge_public_origin("https://edge.example/")
+            .unwrap();
+        let paths = RuntimePaths {
+            config_dir: env::temp_dir(),
+            config_file: env::temp_dir().join("herdr-worker-stale.toml"),
+            dev_state_dir: env::temp_dir().join("herdr-worker-stale-dev"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+
+        let error = connect_existing_worker_flow(
+            &paths,
+            "https://edge.example/pair#pair_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            None,
+            &config,
+            || {
+                Ok(json!({
+                    "ok": true,
+                    "devices": [{"device_id": DEVICE_ID, "authorization": "revoked"}]
+                }))
+            },
+            || panic!("same-Worker stale enrollment must not read a new pairing code"),
+            |_, _, _, _, _| panic!("same-Worker stale enrollment must not consume a pairing"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("refusing to create a second device identity"));
+        assert!(error.contains(DEVICE_ID));
+    }
+
+    #[test]
+    fn different_worker_keeps_explicit_pairing_path() {
+        const DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut config = Config::default();
+        config.set_edge_device_id(DEVICE_ID).unwrap();
+        config
+            .set_edge_public_origin("https://old-edge.example")
+            .unwrap();
+        let paths = RuntimePaths {
+            config_dir: env::temp_dir(),
+            config_file: env::temp_dir().join("herdr-worker-other-edge.toml"),
+            dev_state_dir: env::temp_dir().join("herdr-worker-other-edge-dev"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+        let connect_new_called = std::cell::Cell::new(false);
+
+        let result = connect_existing_worker_flow(
+            &paths,
+            "https://new-edge.example/pair#pair_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            Some("new-worker-device"),
+            &config,
+            || panic!("different Worker must not query the old Worker inventory"),
+            || Ok("654321".to_owned()),
+            |_, origin, pairing_id, code, name| {
+                assert_eq!(origin, "https://new-edge.example");
+                assert_eq!(
+                    pairing_id,
+                    "pair_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                );
+                assert_eq!(code, "654321");
+                assert_eq!(name, Some("new-worker-device"));
+                connect_new_called.set(true);
+                Ok(ExitCode::SUCCESS)
+            },
+        );
+
+        assert_eq!(result.unwrap(), ExitCode::SUCCESS);
+        assert!(connect_new_called.get());
+    }
+
+    #[test]
+    fn connector_approval_requires_loaded_healthy_local_service() {
+        assert!(connector_service_ready(&json!({
+            "ok": true,
+            "loaded": true,
+            "healthy": true,
+        })));
+        for status in [
+            json!({"ok": false, "loaded": true, "healthy": true}),
+            json!({"ok": true, "loaded": false, "healthy": true}),
+            json!({"ok": true, "loaded": true, "healthy": false}),
+            json!({"ok": true}),
+        ] {
+            assert!(!connector_service_ready(&status));
+        }
     }
 
     #[test]

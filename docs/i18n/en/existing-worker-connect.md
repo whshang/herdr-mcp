@@ -54,7 +54,9 @@ On the new computer, the Agent runs:
 herdr-mcp worker connect "<pairing-address>"
 ```
 
-The CLI then prompts for the 6-digit code as normal visible terminal input so you can verify what you typed. The code is intentionally not accepted as a normal command-line argument, so it stays out of shell history.
+If this computer is not already enrolled in the same Worker, the CLI then prompts for the 6-digit code as normal visible terminal input so you can verify what you typed. The code is intentionally not accepted as a normal command-line argument, so it stays out of shell history.
+
+`worker connect` is idempotent for an already-enrolled device on the **same Worker**. If local durable config identifies an existing `device_id` for that Worker and the Worker inventory confirms that device is still `active`, Herdr reuses that enrollment: it does not ask for the 6-digit code, does not consume the new pairing, and does not create or overwrite a device identity. If the local same-Worker enrollment exists but is no longer active remotely, the command fails closed instead of silently creating a second identity. A pairing for a different Worker still follows the explicit pairing path.
 
 By default, the joining computer registers the platform-reported computer/host name as the device display name. Use `--name "<device-name>"` only when the user explicitly wants a different initial name. A `worker pair --name ...` value supplied by the pairing creator is also an explicit override and takes precedence.
 

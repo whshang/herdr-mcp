@@ -789,7 +789,11 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
     println!("[6/7] Connection — `herdr-mcp link status` reports operational_ready=true.");
     println!("[7/7] Done — MCP URL: {edge_origin}/mcp");
     println!(
-        "Next: create the ChatGPT Connector for this MCP URL and approve it from this enrolled computer."
+        "Next in ChatGPT: enable Developer mode for Plugins, then open Plugins → Browse plugins and add a custom plugin named `herdr`."
+    );
+    println!("Paste this complete MCP address, including `/mcp`: {edge_origin}/mcp");
+    println!(
+        "After OAuth approval, create or open a ChatGPT Project. In the first message of each new chat, use the + button to reference `herdr` so the plugin is enabled for that conversation."
     );
     println!("Cloudflare credential management: https://dash.cloudflare.com/profile/api-tokens");
     println!("If a Cloudflare credential appeared in any conversation or terminal, revoke it now.");
@@ -938,6 +942,9 @@ fn acquire_device_flow() -> Result<(SecretBytes, Option<SecretBytes>), String> {
         .verification_uri_complete
         .unwrap_or_else(|| verification_uri.clone());
 
+    println!(
+        "Cloudflare Workers Free is sufficient for Herdr. If you do not have a Cloudflare account, create one on the page that opens; signing in with Google is the simplest option."
+    );
     println!("Open this Cloudflare page and approve Herdr: {verification_uri}");
     println!("Verification code: {user_code}");
     println!("Code expires in at most {expires} seconds.");

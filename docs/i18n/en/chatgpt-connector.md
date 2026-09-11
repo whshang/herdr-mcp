@@ -41,16 +41,16 @@ A green connector status only proves one layer. The reliable validation is a fre
 
 The exact ChatGPT UI evolves. The general flow is:
 
-1. Enable Developer mode where available.
-2. Add a custom MCP App / Connector.
-3. Enter:
+1. Enable Developer mode for Plugins.
+2. Open **Plugins → Browse plugins** and add a custom plugin named `herdr`.
+3. Enter the complete MCP URL, including `/mcp`:
 
 ```text
 https://<your-edge-origin>/mcp
 ```
 
-4. Complete OAuth in the browser. On first authorization, Herdr shows a short-lived approval request instead of silently granting access; approve it from any computer already enrolled in this Worker with `herdr-mcp connector approve <approval-request-id>`. An approved WebChat Connector remains ordinary MCP only and cannot approve another Connector.
-5. Create a new conversation for validation.
+4. Complete OAuth in the browser. On first authorization, Herdr selects Chinese, English, or Japanese from the browser language. Step 1 copies `herdr-mcp connector approve <approval-request-id>` for Terminal; that command checks the local `herdr-mcp` service and Herdr server before Step 2 asks for the six-digit approval code. An approved WebChat Connector remains ordinary MCP only and cannot approve another Connector.
+5. Create or open a ChatGPT **Project**. In the first message of every new chat, use the composer `+` button to reference `herdr` so that chat enables the plugin.
 
 Never paste `HERDR_MCP_TOKEN` into ChatGPT. Public ChatGPT access uses OAuth. Static bearer is for local clients such as curl or Cursor.
 

@@ -340,6 +340,108 @@ function chatgptMcpEndpointErrorPage(issuer: string): Response {
   });
 }
 
+type ApprovalLocale = "en" | "zh" | "ja";
+
+const APPROVAL_COPY = {
+  en: {
+    htmlLang: "en",
+    brand: "Herdr secure access",
+    eyebrow: "Connector authorization",
+    waiting: "Waiting for approval",
+    defaultTitle: "Approve Herdr Connector",
+    leadSuffix: " is requesting access to this Herdr Worker. Approve it from a computer that is already enrolled in this Worker.",
+    step1Title: "Open Terminal and run this command",
+    step1Help: "Run it on the enrolled Mac. The CLI checks that the local herdr-mcp service and Herdr server are ready before it asks for the code. Requires herdr-mcp v0.4.6 or newer. If the CLI says unknown command 'connector', update herdr-mcp first and retry.",
+    copy: "Copy",
+    copied: "Copied",
+    copyFailed: "Copy failed",
+    step2Title: "Enter the six-digit code when the CLI asks",
+    codeLabel: "Approval code",
+    codeHelp: "Enter this code only at the visible CLI prompt. It is intentionally not included in the command or shell history. Keep this page open and do not refresh it while approval is pending.",
+    pending: "Waiting for approval…",
+    approved: "Approved. Returning to ChatGPT…",
+    failed: "Approval failed or expired.",
+    unavailable: "Approval status could not be checked. Reload the original Connector flow and try again.",
+    continue: "Continue to ChatGPT",
+    continueHelp: "Use this if automatic return is blocked.",
+    details: "Request details",
+    connector: "Connector",
+    requestId: "Request ID",
+    expires: "Expires",
+    securityLabel: "Security check:",
+    security: " approve only requests you just initiated. Never enter this code into an untrusted site. Approval grants ordinary MCP access; it does not grant fleet-administration authority.",
+    footer: "Herdr keeps the workstation private: the enrolled device approves this request, then the authorization result returns only to the original OAuth callback.",
+  },
+  zh: {
+    htmlLang: "zh-CN",
+    brand: "Herdr 安全授权",
+    eyebrow: "Connector 授权",
+    waiting: "等待批准",
+    defaultTitle: "批准 Herdr Connector",
+    leadSuffix: " 正在请求访问这个 Herdr Worker。请在已经登记到该 Worker 的 Mac 上完成批准。",
+    step1Title: "打开终端并运行这条命令",
+    step1Help: "请在已登记的 Mac 上运行。CLI 会先检查本机 herdr-mcp 服务和 Herdr server 是否已就绪，再要求输入验证码。需要 herdr-mcp v0.4.6 或更高版本；如果提示 unknown command 'connector'，请先更新 herdr-mcp。",
+    copy: "复制",
+    copied: "已复制",
+    copyFailed: "复制失败",
+    step2Title: "CLI 提示后输入 6 位验证码",
+    codeLabel: "批准验证码",
+    codeHelp: "只在终端出现验证码提示后输入下面的数字。验证码不会放进命令或 shell history。批准完成前请保持本页打开，不要刷新。",
+    pending: "正在等待批准…",
+    approved: "已批准，正在返回 ChatGPT…",
+    failed: "批准失败或已过期。",
+    unavailable: "暂时无法检查批准状态。请重新打开原来的 Connector 授权流程后重试。",
+    continue: "继续返回 ChatGPT",
+    continueHelp: "自动返回被阻止时使用。",
+    details: "请求详情",
+    connector: "Connector",
+    requestId: "请求 ID",
+    expires: "过期时间",
+    securityLabel: "安全检查：",
+    security: "只批准你刚刚发起的请求。不要把验证码输入到不可信的网站。批准只授予普通 MCP 访问权限，不授予设备管理权限。",
+    footer: "Herdr 保持工作站私有：已登记设备在本地批准请求，授权结果只返回原始 OAuth callback。",
+  },
+  ja: {
+    htmlLang: "ja",
+    brand: "Herdr セキュアアクセス",
+    eyebrow: "Connector 認証",
+    waiting: "承認待ち",
+    defaultTitle: "Herdr Connector を承認",
+    leadSuffix: " がこの Herdr Worker へのアクセスを要求しています。この Worker に登録済みの Mac で承認してください。",
+    step1Title: "ターミナルを開いてこのコマンドを実行",
+    step1Help: "登録済みの Mac で実行してください。CLI はコード入力前にローカルの herdr-mcp サービスと Herdr server が利用可能か確認します。herdr-mcp v0.4.6 以降が必要です。unknown command 'connector' と表示された場合は herdr-mcp を更新してください。",
+    copy: "コピー",
+    copied: "コピー済み",
+    copyFailed: "コピー失敗",
+    step2Title: "CLI に求められたら 6 桁のコードを入力",
+    codeLabel: "承認コード",
+    codeHelp: "ターミナルにコード入力の案内が出た後で、下の数字を入力してください。コードはコマンドや shell history には含まれません。承認が終わるまでこのページを開いたままにし、再読み込みしないでください。",
+    pending: "承認を待っています…",
+    approved: "承認されました。ChatGPT に戻ります…",
+    failed: "承認に失敗したか、有効期限が切れました。",
+    unavailable: "承認状態を確認できません。元の Connector 認証フローを開き直して再試行してください。",
+    continue: "ChatGPT に戻る",
+    continueHelp: "自動で戻らない場合に使用します。",
+    details: "リクエスト詳細",
+    connector: "Connector",
+    requestId: "リクエスト ID",
+    expires: "有効期限",
+    securityLabel: "セキュリティ確認：",
+    security: "直前に自分で開始したリクエストだけを承認してください。このコードを信頼できないサイトへ入力しないでください。承認されるのは通常の MCP アクセスだけで、端末管理権限は付与されません。",
+    footer: "Herdr はワークステーションを非公開のまま保ちます。登録済み端末で承認し、認証結果だけを元の OAuth callback に返します。",
+  },
+} as const;
+
+function approvalLocale(acceptLanguage: string | null): ApprovalLocale {
+  for (const part of (acceptLanguage ?? "").split(",")) {
+    const tag = part.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+    if (tag === "zh" || tag.startsWith("zh-")) return "zh";
+    if (tag === "ja" || tag.startsWith("ja-")) return "ja";
+    if (tag === "en" || tag.startsWith("en-")) return "en";
+  }
+  return "en";
+}
+
 function approvalPage(input: {
   issuer: string;
   requestId: string;
@@ -347,135 +449,79 @@ function approvalPage(input: {
   resumeToken: string;
   expiresAtMs: number;
   clientName?: string;
+  locale: ApprovalLocale;
 }): Response {
   const poll = `${input.issuer}${AUTHORIZE_POLL_PATH}`;
   const expiresAt = new Date(input.expiresAtMs).toISOString();
-  const title = input.clientName ? `Approve ${input.clientName}` : "Approve Herdr Connector";
+  const copy = APPROVAL_COPY[input.locale];
   const clientLabel = input.clientName ?? "Web AI Connector";
+  const title = input.clientName
+    ? input.locale === "zh"
+      ? `批准 ${input.clientName}`
+      : input.locale === "ja"
+        ? `${input.clientName} を承認`
+        : `Approve ${input.clientName}`
+    : copy.defaultTitle;
   const approvalCommand = `herdr-mcp connector approve ${input.requestId}`;
+  const scriptCopy = {
+    copy: copy.copy,
+    copied: copy.copied,
+    copyFailed: copy.copyFailed,
+    approved: copy.approved,
+    failed: copy.failed,
+    unavailable: copy.unavailable,
+  };
   const html = `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="${copy.htmlLang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <style>
-:root{color-scheme:light dark;--bg:#f5f6f8;--card:#fff;--text:#16181d;--muted:#69707d;--line:#e5e7eb;--soft:#f7f8fa;--accent:#17191f;--accentText:#fff;--good:#147a42;--goodSoft:#e9f7ef;--warn:#8a5a00;--warnSoft:#fff6df;--shadow:0 24px 70px rgba(20,24,32,.12)}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;min-height:100dvh;padding:32px 20px;background:radial-gradient(circle at 50% -10%,#fff 0,#f5f6f8 52%,#eef0f3 100%);color:var(--text);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center}
-.shell{width:min(720px,100%)}
-.brand{display:flex;align-items:center;gap:10px;margin:0 0 14px 4px;color:#4d5562;font-size:13px;font-weight:650;letter-spacing:.08em;text-transform:uppercase}
-.brand-mark{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:#17191f;color:#fff;font-size:13px;font-weight:800;letter-spacing:0;box-shadow:0 5px 16px rgba(20,24,32,.16)}
-.card{background:var(--card);border:1px solid rgba(20,24,32,.08);border-radius:24px;box-shadow:var(--shadow);overflow:hidden}
-.main{padding:34px 36px 28px}
-.eyebrow{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
-.eyebrow-label{font-size:12px;font-weight:750;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
-.pill{display:inline-flex;align-items:center;gap:7px;padding:6px 10px;border-radius:999px;background:var(--warnSoft);color:var(--warn);font-size:12px;font-weight:700;white-space:nowrap}
-.pill-dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 12%,transparent)}
-h1{margin:0;font-size:clamp(27px,5vw,38px);line-height:1.12;letter-spacing:-.035em;font-weight:760}
-.lead{margin:12px 0 0;color:var(--muted);font-size:16px;max-width:600px}
-.connector{font-weight:700;color:var(--text)}
-.code-card{margin:28px 0 22px;padding:22px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(180deg,#fafbfc,#f5f6f8);text-align:center}
-.code-label{font-size:12px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
-.approval-code{font:760 clamp(34px,8vw,48px)/1 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;letter-spacing:.18em;font-variant-numeric:tabular-nums;padding-left:.18em;color:#111318}
-.code-help{margin:10px 0 0;color:var(--muted);font-size:13px}
-.step{display:grid;grid-template-columns:32px minmax(0,1fr);gap:14px;padding:18px 0 4px}
-.step-number{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:#17191f;color:#fff;font-size:13px;font-weight:800}
-.step-title{font-weight:720;margin:2px 0 9px}
-.command-row{display:flex;align-items:stretch;gap:8px;padding:7px 7px 7px 13px;border:1px solid var(--line);border-radius:13px;background:#111318;color:#f7f8fa;min-width:0}
-.command-row code{display:block;align-self:center;min-width:0;flex:1;overflow-x:auto;white-space:nowrap;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;scrollbar-width:thin}
-.copy{appearance:none;border:0;border-radius:9px;padding:8px 12px;background:#fff;color:#17191f;font:700 12px/1 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer;white-space:nowrap;transition:transform .12s ease,opacity .12s ease}
-.copy:hover{opacity:.9}.copy:active{transform:scale(.97)}.copy:focus-visible{outline:3px solid rgba(120,160,255,.55);outline-offset:2px}
-.helper{margin:9px 0 0;color:var(--muted);font-size:13px}
-.status{display:flex;align-items:center;gap:10px;margin-top:22px;padding:12px 14px;border-radius:13px;background:var(--warnSoft);color:var(--warn);font-size:13px;font-weight:650}
-.status-dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex:0 0 auto;animation:pulse 1.8s ease-in-out infinite}
-.status.success{background:var(--goodSoft);color:var(--good)}
-.status.error{background:#fff0ef;color:#a43228}
-.continue-row{margin-top:12px;display:flex;align-items:center;gap:10px}.continue-row[hidden]{display:none!important}.continue-link{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:11px;background:var(--accent);color:var(--accentText);font-weight:750;text-decoration:none}.continue-help{color:var(--muted);font-size:12px}
-details{margin-top:20px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted)}
-summary{cursor:pointer;font-size:13px;font-weight:700;color:#4d5562;user-select:none}
-.details-grid{display:grid;grid-template-columns:110px minmax(0,1fr);gap:7px 14px;margin-top:12px;font-size:12px}
-.details-grid dt{color:var(--muted)}.details-grid dd{margin:0;color:#444b56;min-width:0;overflow-wrap:anywhere}.details-grid code{font-size:12px}
-.security{display:flex;gap:9px;margin:18px 0 0;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
-.security strong{color:#4d5562}
-.footer{padding:15px 36px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.38}}
-@media(max-width:560px){body{padding:16px 12px}.main{padding:26px 20px 22px}.footer{padding:14px 20px}.eyebrow{align-items:flex-start;flex-direction:column-reverse;gap:10px}.command-row{align-items:stretch;flex-direction:column;padding:10px}.command-row code{padding:2px 3px}.copy{padding:10px 12px}.details-grid{grid-template-columns:1fr;gap:2px}.details-grid dd{margin-bottom:8px}}
-@media(prefers-color-scheme:dark){:root{--bg:#0d0f12;--card:#15181d;--text:#f4f5f7;--muted:#9aa2af;--line:#2a2f37;--soft:#111419;--accent:#f4f5f7;--accentText:#111318;--good:#70d79d;--goodSoft:#123524;--warn:#f0c46d;--warnSoft:#352812;--shadow:0 28px 80px rgba(0,0,0,.45)}body{background:radial-gradient(circle at 50% -10%,#22262d 0,#111419 48%,#0b0d10 100%)}.brand{color:#b2b8c2}.brand-mark{background:#f4f5f7;color:#111318}.card{border-color:#292e36}.eyebrow-label{color:#9aa2af}.connector{color:#fff}.code-card{background:linear-gradient(180deg,#1b1f25,#171a1f)}.approval-code{color:#fff}.step-number{background:#f4f5f7;color:#111318}.command-row{background:#0c0e11;border-color:#303640}.copy{background:#f4f5f7}.details-grid dd,summary,.security strong{color:#c8cdd5}.status.error{background:#3a1c1a;color:#ff9a8f}}
+:root{color-scheme:light dark;--bg:#fafafa;--card:#fff;--text:#171717;--muted:#666;--line:#e6e6e6;--soft:#f6f6f6;--accent:#006bff;--accentText:#fff;--good:#137333;--goodSoft:#edf7ef;--bad:#b42318;--badSoft:#fff0ee;--shadow:0 18px 60px rgba(0,0,0,.09)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:40px 16px}.shell{width:min(680px,100%);margin:0 auto}.brand{display:flex;align-items:center;gap:9px;margin:0 0 14px 4px;font-size:13px;font-weight:650;color:#4d4d4d}.brand-mark{display:grid;place-items:center;width:25px;height:25px;border-radius:7px;background:#171717;color:#fff;font-size:13px;font-weight:800}.card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--card);box-shadow:var(--shadow)}.main{padding:32px}.eyebrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}.eyebrow-label{font-size:12px;font-weight:700;letter-spacing:.03em;color:var(--muted);text-transform:uppercase}.pill{display:inline-flex;align-items:center;gap:7px;border-radius:999px;background:var(--soft);padding:6px 9px;font-size:12px;color:var(--muted)}.pill-dot,.status-dot{width:7px;height:7px;border-radius:50%;background:var(--accent)}h1{font-size:30px;line-height:1.16;letter-spacing:-.025em;margin:0 0 10px}.lead{margin:0 0 26px;color:var(--muted);font-size:15px;line-height:1.6}.connector{color:var(--text);font-weight:650}.steps{display:grid;gap:14px}.step{display:grid;grid-template-columns:30px minmax(0,1fr);gap:12px;border:1px solid var(--line);border-radius:13px;padding:16px;background:var(--soft)}.step-number{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:var(--text);color:var(--card);font-weight:800;font-size:13px}.step-title{font-weight:720;font-size:15px;margin:3px 0 10px}.helper{margin:9px 0 0;color:var(--muted);font-size:12px;line-height:1.55}.command-row{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:10px;background:var(--card);padding:8px}.command-row code{min-width:0;flex:1;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.copy{border:0;border-radius:8px;background:var(--text);color:var(--card);padding:8px 10px;font-weight:700;cursor:pointer}.code-card{display:flex;align-items:center;justify-content:space-between;gap:16px;border:1px solid var(--line);border-radius:10px;background:var(--card);padding:12px 14px}.code-label{color:var(--muted);font-size:12px}.approval-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:28px;letter-spacing:.15em;font-weight:760}.status{display:flex;align-items:center;gap:9px;margin-top:16px;border-radius:11px;background:var(--soft);padding:11px 13px;color:var(--muted);font-size:13px}.status.success{background:var(--goodSoft);color:var(--good)}.status.success .status-dot{background:var(--good)}.status.error{background:var(--badSoft);color:var(--bad)}.status.error .status-dot{background:var(--bad)}.continue-row{margin-top:12px;display:flex;align-items:center;gap:10px}.continue-row[hidden]{display:none!important}.continue-link{display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:10px;background:var(--accent);color:var(--accentText);font-weight:750;text-decoration:none}.continue-help{color:var(--muted);font-size:12px}details{margin-top:20px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted)}summary{cursor:pointer;font-size:13px;font-weight:700}.details-grid{display:grid;grid-template-columns:100px minmax(0,1fr);gap:7px 14px;margin-top:12px;font-size:12px}.details-grid dd{margin:0;min-width:0;overflow-wrap:anywhere}.security{margin:18px 0 0;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.55}.security strong{color:var(--text)}.footer{padding:14px 32px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px;line-height:1.5}
+@media(max-width:560px){body{padding:16px 10px}.main{padding:23px 18px}.footer{padding:13px 18px}.eyebrow{align-items:flex-start;flex-direction:column}.command-row,.code-card{align-items:stretch;flex-direction:column}.copy{width:100%}.approval-code{font-size:25px}.details-grid{grid-template-columns:1fr;gap:2px}.details-grid dd{margin-bottom:7px}}
+@media(prefers-color-scheme:dark){:root{--bg:#0d0f12;--card:#15181d;--text:#f4f5f7;--muted:#9aa2af;--line:#2a2f37;--soft:#111419;--accent:#4c9aff;--accentText:#07111f;--good:#70d79d;--goodSoft:#123524;--bad:#ff9a8f;--badSoft:#3a1c1a;--shadow:0 28px 80px rgba(0,0,0,.45)}.brand{color:#b2b8c2}.brand-mark{background:#f4f5f7;color:#111318}}
 </style></head>
 <body><main class="shell">
-<div class="brand"><span class="brand-mark" aria-hidden="true">H</span><span>Herdr secure access</span></div>
-<section class="card" aria-labelledby="approval-title">
-<div class="main">
-<div class="eyebrow"><span class="eyebrow-label">Connector authorization</span><span class="pill" id="status-pill"><span class="pill-dot" aria-hidden="true"></span>Waiting for approval</span></div>
+<div class="brand"><span class="brand-mark" aria-hidden="true">H</span><span>${escapeHtml(copy.brand)}</span></div>
+<section class="card" aria-labelledby="approval-title"><div class="main">
+<div class="eyebrow"><span class="eyebrow-label">${escapeHtml(copy.eyebrow)}</span><span class="pill" id="status-pill"><span class="pill-dot" aria-hidden="true"></span>${escapeHtml(copy.waiting)}</span></div>
 <h1 id="approval-title">${escapeHtml(title)}</h1>
-<p class="lead"><span class="connector">${escapeHtml(clientLabel)}</span> is requesting access to this Herdr Worker. Approve it from a computer that is already enrolled in this Worker.</p>
-
-<div class="code-card" aria-label="Six digit approval code">
-  <div class="code-label">Approval code</div>
-  <div class="approval-code">${escapeHtml(input.code)}</div>
-  <p class="code-help">You will enter this code only after the CLI asks for it.</p>
+<p class="lead"><span class="connector">${escapeHtml(clientLabel)}</span>${escapeHtml(copy.leadSuffix)}</p>
+<div class="steps">
+  <div class="step"><div class="step-number" aria-hidden="true">1</div><div>
+    <div class="step-title">${escapeHtml(copy.step1Title)}</div>
+    <div class="command-row"><code id="approval-command">${escapeHtml(approvalCommand)}</code><button class="copy" type="button" id="copy-command" aria-label="${escapeHtml(copy.copy)}">${escapeHtml(copy.copy)}</button></div>
+    <p class="helper">${escapeHtml(copy.step1Help)}</p>
+  </div></div>
+  <div class="step"><div class="step-number" aria-hidden="true">2</div><div>
+    <div class="step-title">${escapeHtml(copy.step2Title)}</div>
+    <div class="code-card"><div class="code-label">${escapeHtml(copy.codeLabel)}</div><div class="approval-code">${escapeHtml(input.code)}</div></div>
+    <p class="helper">${escapeHtml(copy.codeHelp)}</p>
+  </div></div>
 </div>
-
-<div class="step">
-  <div class="step-number" aria-hidden="true">1</div>
-  <div>
-    <div class="step-title">Run this command on an enrolled computer</div>
-    <div class="command-row">
-      <code id="approval-command">${escapeHtml(approvalCommand)}</code>
-      <button class="copy" type="button" id="copy-command" aria-label="Copy approval command">Copy</button>
-    </div>
-    <p class="helper">Requires herdr-mcp v0.4.6 or newer. Then enter the six-digit code above at the visible CLI prompt. The code is intentionally not included in the command or shell history. Keep this page open and do not refresh it while approval is pending. If the CLI says <code>unknown command 'connector'</code>, update herdr-mcp first and retry while keeping this page open.</p>
-  </div>
-</div>
-
-<div class="status" id="status-wrap" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="status">Waiting for approval…</span></div>
-<div class="continue-row" id="continue-row" hidden><a class="continue-link" id="continue-link" href="#">Continue to ChatGPT</a><span class="continue-help">Use this if automatic return is blocked.</span></div>
-
-<details>
-  <summary>Request details</summary>
-  <dl class="details-grid">
-    <dt>Connector</dt><dd>${escapeHtml(clientLabel)}</dd>
-    <dt>Request ID</dt><dd><code>${escapeHtml(input.requestId)}</code></dd>
-    <dt>Expires</dt><dd>${escapeHtml(expiresAt)}</dd>
-  </dl>
-</details>
-
-<p class="security"><span aria-hidden="true">◈</span><span><strong>Security check:</strong> approve only requests you just initiated. Never enter this code into an untrusted site. Approval grants ordinary MCP access; it does not grant fleet-administration authority.</span></p>
-</div>
-<div class="footer">Herdr keeps the workstation private: the enrolled device approves this request, then the authorization result returns only to the original OAuth callback.</div>
-</section></main>
+<div class="status" id="status-wrap" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="status">${escapeHtml(copy.pending)}</span></div>
+<div class="continue-row" id="continue-row" hidden><a class="continue-link" id="continue-link" href="#">${escapeHtml(copy.continue)}</a><span class="continue-help">${escapeHtml(copy.continueHelp)}</span></div>
+<details><summary>${escapeHtml(copy.details)}</summary><dl class="details-grid"><dt>${escapeHtml(copy.connector)}</dt><dd>${escapeHtml(clientLabel)}</dd><dt>${escapeHtml(copy.requestId)}</dt><dd><code>${escapeHtml(input.requestId)}</code></dd><dt>${escapeHtml(copy.expires)}</dt><dd>${escapeHtml(expiresAt)}</dd></dl></details>
+<p class="security"><strong>${escapeHtml(copy.securityLabel)}</strong>${escapeHtml(copy.security)}</p>
+</div><div class="footer">${escapeHtml(copy.footer)}</div></section></main>
 <script>
 const endpoint=${JSON.stringify(poll)};
 const requestId=${JSON.stringify(input.requestId)};
 const resumeToken=${JSON.stringify(input.resumeToken)};
 const approvalCommand=${JSON.stringify(approvalCommand)};
-const copyButton=document.getElementById('copy-command');
+const ui=${JSON.stringify(scriptCopy)};
 const statusWrap=document.getElementById('status-wrap');
 const statusText=document.getElementById('status');
-const statusPill=document.getElementById('status-pill');
+const copyButton=document.getElementById('copy-command');
 const continueRow=document.getElementById('continue-row');
 const continueLink=document.getElementById('continue-link');
-let approvedRedirect=null;
-function setStatus(message,state){
-  statusText.textContent=message;
-  statusWrap.className='status'+(state?' '+state:'');
-  if(state==='success')statusPill.textContent='Approved';
-  else if(state==='error')statusPill.textContent='Approval stopped';
-}
+let approvedRedirect='';
+function setStatus(message,state){statusText.textContent=message;statusWrap.className='status'+(state?' '+state:'')}
 async function copyApprovalCommand(){
   let copied=false;
-  try{
-    if(window.isSecureContext&&navigator.clipboard&&navigator.clipboard.writeText){
-      await navigator.clipboard.writeText(approvalCommand);copied=true;
-    }
-  }catch{}
-  if(!copied){
-    try{
-      const area=document.createElement('textarea');
-      area.value=approvalCommand;area.setAttribute('readonly','');area.style.position='fixed';area.style.opacity='0';area.style.pointerEvents='none';
-      document.body.appendChild(area);area.select();copied=document.execCommand('copy');area.remove();
-    }catch{}
-  }
-  copyButton.textContent=copied?'Copied':'Copy failed';
-  setTimeout(()=>{copyButton.textContent='Copy'},1600);
+  try{if(window.isSecureContext&&navigator.clipboard&&navigator.clipboard.writeText){await navigator.clipboard.writeText(approvalCommand);copied=true}}catch{}
+  if(!copied){try{const area=document.createElement('textarea');area.value=approvalCommand;area.setAttribute('readonly','');area.style.position='fixed';area.style.opacity='0';area.style.pointerEvents='none';document.body.appendChild(area);area.select();copied=document.execCommand('copy');area.remove()}catch{}}
+  copyButton.textContent=copied?ui.copied:ui.copyFailed;
+  setTimeout(()=>{copyButton.textContent=ui.copy},1600);
 }
 copyButton.addEventListener('click',copyApprovalCommand);
 continueLink.addEventListener('click',(event)=>{if(!approvedRedirect)event.preventDefault()});
@@ -483,21 +529,11 @@ async function poll(){
   poll.failures=poll.failures||0;
   try{
     const u=new URL(endpoint);u.searchParams.set('request_id',requestId);u.searchParams.set('resume_token',resumeToken);
-    const r=await fetch(u.toString(),{cache:'no-store'});const p=await r.json();
-    poll.failures=0;
-    if(p.status==='approved'&&p.redirect){
-      approvedRedirect=p.redirect;continueLink.href=approvedRedirect;continueRow.hidden=false;
-      setStatus('Approved. Returning to ChatGPT…','success');
-      try{window.location.assign(approvedRedirect)}catch{}
-      return;
-    }
-    if(p.status==='pending'){setTimeout(poll,1500);return;}
-    setStatus(p.message||'Approval failed or expired.','error');
-  }catch{
-    poll.failures++;
-    if(poll.failures>=5){setStatus('Approval status could not be checked. Reload the original Connector flow and try again.','error');return;}
-    setTimeout(poll,2500)
-  }
+    const r=await fetch(u.toString(),{cache:'no-store'});const p=await r.json();poll.failures=0;
+    if(p.status==='approved'&&p.redirect){approvedRedirect=p.redirect;continueLink.href=approvedRedirect;continueRow.hidden=false;setStatus(ui.approved,'success');try{window.location.assign(approvedRedirect)}catch{};return}
+    if(p.status==='pending'){setTimeout(poll,1500);return}
+    setStatus(p.message||ui.failed,'error');
+  }catch{poll.failures++;if(poll.failures>=5){setStatus(ui.unavailable,'error');return}setTimeout(poll,2500)}
 }poll();
 </script></body></html>`;
   return new Response(html, {
@@ -943,7 +979,7 @@ async function issueAuthorizationRedirect(
  * Authorization endpoint. Registered/DCR clients do not self-authorize: an
  * unknown grant becomes a short-lived pending fleet-approval request.
  */
-async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
+async function handleAuthorize(url: URL, ctx: HandlerCtx, acceptLanguage: string | null): Promise<Response> {
   if (url.search.length > ctx.maxQueryBytes) {
     return ctx.json({ error: "invalid_request", error_description: "authorization request too large" }, 400);
   }
@@ -1094,6 +1130,7 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
     resumeToken,
     expiresAtMs,
     clientName: client.client_name,
+    locale: approvalLocale(acceptLanguage),
   });
 }
 
@@ -1444,7 +1481,7 @@ export async function handleOAuthPublic(
       return hctx.json(mcpServerCardMetadata(identity, serverName, serverVersion));
     }
     if (path === AUTHORIZE_PATH) {
-      return handleAuthorize(url, hctx);
+      return handleAuthorize(url, hctx, request.headers.get("accept-language"));
     }
     if (path === AUTHORIZE_POLL_PATH) {
       return handleAuthorizePoll(url, hctx);

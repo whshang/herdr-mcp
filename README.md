@@ -41,13 +41,13 @@ For step-by-step manual setup, use the [manual install guide](docs/i18n/en/insta
 
 ### ChatGPT configuration
 
-Enable Developer Mode when required, then add the `herdr` app/Connector in **Settings → Apps** and complete OAuth.
+Enable Developer Mode for Plugins, open **Plugins → Browse plugins**, then add `herdr` with the complete Worker URL ending in `/mcp` and complete OAuth. Work in a ChatGPT Project; in the first message of each new chat, use the composer `+` button to reference `herdr` so that conversation enables the plugin.
 
 [ChatGPT setup](docs/i18n/en/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
 
 ### Cloudflare configuration
 
-Cloudflare provides the stable public MCP/OAuth entry while every development computer connects outward, so you do not need to expose an inbound port on each machine.
+Cloudflare provides the stable public MCP/OAuth entry while every development computer connects outward, so you do not need to expose an inbound port on each machine. Workers Free is sufficient and needs no payment method; if you do not have an account, registration is free and Google sign-in is the shortest setup path.
 
 [Cloudflare setup](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 

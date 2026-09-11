@@ -55,9 +55,13 @@ herdr-mcp status
 
 `install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and points the user PATH entry at `runtime/current/herdr-mcp`. Normal users do not install the local runtime with a git clone, `npm`, or `cargo`.
 
-On x86_64 Debian, use the static `x86_64-unknown-linux-musl` release asset. The installer prefers `systemd --user`; when no user systemd manager exists it uses the managed user-process backend. On macOS, the service is a user LaunchAgent and Full Disk Access is granted to the stable TCC broker. `sudo` does not replace that permission. Platform-specific service and persistence details live in [CLI reference](cli-reference.md) and [Troubleshooting](troubleshooting.md). Do not add public Edge while the local doctor is unhealthy.
+On x86_64 Debian, use the static `x86_64-unknown-linux-musl` release asset. The installer prefers `systemd --user`; when no user systemd manager exists it uses the managed user-process backend. On macOS, the service is a user LaunchAgent and Full Disk Access is granted only to the stable macOS-only broker at `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`; Linux and Windows do not use that TCC/FDA path. `sudo` does not replace macOS privacy permission.
+
+On macOS, start with `herdr-mcp permissions status`. If it reports `needs_setup`, run `herdr-mcp permissions setup`, enable the exact stable broker in **System Settings → Privacy & Security → Full Disk Access**, then run `herdr-mcp permissions verify`. Do not probe `~/Documents` before setup just to trigger macOS prompts. The host-capable broker is the single TCC responsibility boundary for MCP and native Herdr panes/worktrees, so a normal first install should need one Full Disk Access approval instead of separate approvals per process. Ordinary runtime updates preserve this broker; use `permissions setup --upgrade-broker` only for an explicit compatibility migration. macOS may separately ask once for Keychain access by the stable `herdr-mcp-credential-helper`; approve that one-time prompt and keep the helper stable across updates. Platform details live in [CLI reference](cli-reference.md) and [Troubleshooting](troubleshooting.md). Do not add public Edge while the local doctor is unhealthy.
 
 ## Step 2: deploy the public Edge
+
+Cloudflare Workers Free is sufficient for Herdr and does not require a payment method. If you do not have a Cloudflare account, create the free account on the sign-in page; Google sign-in is the recommended shortest path.
 
 When ChatGPT needs to reach the workstation over the Internet, use a Cloudflare Worker as the stable OAuth/MCP entry point. Keep `workers.dev` enabled as the zero-domain bootstrap/diagnostic origin, but when the selected Cloudflare Account already has a suitable active zone, prefer a dedicated Custom Domain such as `herdr-mcp.example.com` for the long-lived OAuth/MCP identity before Connector authorization. If no suitable zone exists or the user declines, continue on `workers.dev` without blocking installation.
 
@@ -139,12 +143,12 @@ An unauthenticated `/mcp` response of `401` can be correct. The useful checks ar
 
 This is a human step. The coding agent should pause and guide the user:
 
-1. open ChatGPT settings → Apps / Connectors;
-2. enable Developer mode when the current UI requires it;
-3. add a custom MCP Connector named `herdr`;
-4. enter the deployed `${MCP_URL}` ending in `/mcp`;
-5. complete OAuth in the browser;
-6. enable the Connector in a new conversation or Project.
+1. open ChatGPT settings and enable **Developer mode** for Plugins;
+2. open **Plugins → Browse plugins** and add a custom plugin named `herdr`;
+3. paste the complete deployed `${MCP_URL}`, including the final `/mcp`;
+4. complete OAuth in the browser; the approval page selects Chinese, English, or Japanese from the browser language and asks you to run the Terminal approval command before entering the six-digit code;
+5. create or open a **Project** and work there;
+6. in the first message of every new chat, use the composer `+` button to reference `herdr`, so the plugin is enabled for that conversation.
 
 Then do a read-only test:
 

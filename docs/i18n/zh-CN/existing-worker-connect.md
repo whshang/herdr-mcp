@@ -54,7 +54,9 @@ herdr-mcp worker pair
 herdr-mcp worker connect "<pairing-address>"
 ```
 
-随后 CLI 会要求输入 6 位验证码，输入的数字会正常显示，便于核对。验证码不会作为普通命令行参数传入，因此不会进入 shell history。
+如果这台电脑尚未注册到同一个 Worker，CLI 随后会要求输入 6 位验证码，输入的数字会正常显示，便于核对。验证码不会作为普通命令行参数传入，因此不会进入 shell history。
+
+同一台已经注册的设备再次连接**同一个 Worker**时，`worker connect` 必须是幂等的：如果本机持久配置已经记录了该 Worker 对应的 `device_id`，并且 Worker 设备清单确认这个设备仍为 `active`，Herdr 直接复用已有 enrollment，不再要求输入 6 位验证码、不消费新的 pairing，也不会创建或覆盖设备身份。如果本机仍记录同一 Worker 的 enrollment，但远端已经不是 active，则命令 fail closed，不能静默创建第二个 `device_id`。只有明确连接到另一个 Worker 时才继续走新的 pairing 流程。
 
 默认情况下，新加入电脑会自动使用平台报告的电脑名/hostname 作为 device display name。只有用户明确希望使用其他名字时，才传 `--name "<device-name>"`。如果创建配对时显式使用了 `worker pair --name ...`，它同样属于用户覆盖，并优先于新电脑自动读取的名称。
 

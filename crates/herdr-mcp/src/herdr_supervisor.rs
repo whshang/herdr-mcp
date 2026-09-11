@@ -155,6 +155,11 @@ pub(crate) fn doctor_line() -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn connector_ready() -> Result<bool, String> {
+    platform::connector_ready()
+}
+
 pub(crate) fn remove_for_service() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -251,6 +256,7 @@ mod platform {
     use super::*;
     use crate::child_process;
     use crate::herdr::HerdrClient;
+    use crate::tcc_broker;
     use plist::{Dictionary, Value as PlistValue};
     use std::env;
     use std::fs::{self, File, OpenOptions};
@@ -389,9 +395,37 @@ mod platform {
         Ok(InstallDisposition::WritePlist)
     }
 
+    enum ManagedHerdrChild {
+        Direct(Child),
+        TccBroker(tcc_broker::MacosHerdrHostChild),
+    }
+
+    impl ManagedHerdrChild {
+        fn id(&self) -> u32 {
+            match self {
+                Self::Direct(child) => child.id(),
+                Self::TccBroker(child) => child.id(),
+            }
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            match self {
+                Self::Direct(child) => child.try_wait(),
+                Self::TccBroker(child) => child.try_wait(),
+            }
+        }
+
+        fn terminate_and_reap(&mut self) {
+            match self {
+                Self::Direct(child) => child_process::terminate_and_reap(child),
+                Self::TccBroker(child) => child.terminate_and_reap(),
+            }
+        }
+    }
+
     struct ReconcileResult {
         value: Value,
-        child: Option<Child>,
+        child: Option<ManagedHerdrChild>,
     }
 
     impl ReconcileResult {
@@ -420,6 +454,14 @@ mod platform {
             state.failure_streak,
             state.attempts_total
         )
+    }
+
+    pub(super) fn connector_ready() -> Result<bool, String> {
+        let paths = SupervisorPaths::discover()?;
+        if !paths.plist.exists() || !is_loaded()? {
+            return Ok(false);
+        }
+        Ok(probe_herdr(paths.socket()?).state == "healthy")
     }
 
     pub(super) fn run(command: HerdrSupervisorCommand) -> Result<ExitCode, String> {
@@ -691,7 +733,7 @@ mod platform {
 
     fn run_daemon() -> Result<(), String> {
         let paths = SupervisorPaths::discover()?;
-        let mut owned_child: Option<Child> = None;
+        let mut owned_child: Option<ManagedHerdrChild> = None;
         loop {
             if let Some(child) = owned_child.as_mut()
                 && let Some(status) = child
@@ -748,7 +790,7 @@ mod platform {
                     );
                 if recycle_owned {
                     let pid = child.id();
-                    child_process::terminate_and_reap(child);
+                    child.terminate_and_reap();
                     owned_child = None;
                     state.owned_pid = None;
                     state.next_attempt_at_ms =
@@ -867,19 +909,37 @@ mod platform {
         let err_log = log
             .try_clone()
             .map_err(|error| format!("cannot clone supervisor Herdr log: {error}"))?;
-        let mut command = Command::new(herdr_bin);
-        command
-            .arg("server")
-            .env("HERDR_SOCKET_PATH", paths.socket()?)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log));
-        child_process::configure_process_group(&mut command);
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("cannot start Herdr server: {error}"))?;
+        let use_tcc_broker = tcc_broker::herdr_host_can_wrap(&paths.runtime.config_dir, herdr_bin);
+        let mut child = if use_tcc_broker {
+            ManagedHerdrChild::TccBroker(tcc_broker::spawn_herdr_host(
+                &paths.runtime.config_dir,
+                &log,
+                &err_log,
+            )?)
+        } else {
+            let mut command = Command::new(herdr_bin);
+            command
+                .arg("server")
+                .env("HERDR_SOCKET_PATH", paths.socket()?)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(err_log));
+            child_process::configure_process_group(&mut command);
+            ManagedHerdrChild::Direct(
+                command
+                    .spawn()
+                    .map_err(|error| format!("cannot start Herdr server: {error}"))?,
+            )
+        };
         state.owned_pid = Some(child.id());
-        state.transition("starting", Some("supervisor_started_herdr".to_owned()));
+        state.transition(
+            "starting",
+            Some(if use_tcc_broker {
+                "supervisor_started_herdr_via_stable_tcc_broker".to_owned()
+            } else {
+                "supervisor_started_herdr_direct".to_owned()
+            }),
+        );
         save_state(paths, state)?;
 
         let started = Instant::now();

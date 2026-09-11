@@ -44,6 +44,7 @@ pub enum Command {
     Link(LinkCommand),
     TccBroker(TccBrokerCommand),
     TccBrokerRun,
+    TccHerdrHost,
     CredentialHelperRun,
     Permissions(crate::macos_permissions::PermissionsCommand),
 }
@@ -315,6 +316,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "doctor" => no_extra(args, Command::Doctor),
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
         "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
+        "__tcc-herdr-host" => no_extra(args, Command::TccHerdrHost),
         "__credential-helper" => no_extra(args, Command::CredentialHelperRun),
         "tcc-broker" => parse_tcc_broker(&args[1..]),
         "permissions" => parse_permissions(&args[1..]),
@@ -2016,6 +2018,11 @@ mod tests {
             parse(args(&["__tcc-broker"])).unwrap().command,
             Command::TccBrokerRun
         );
+        assert_eq!(
+            parse(args(&["__tcc-herdr-host"])).unwrap().command,
+            Command::TccHerdrHost
+        );
+        assert!(parse(args(&["__tcc-herdr-host", "sh"])).is_err());
         assert!(parse(args(&["tcc-broker", "bogus"])).is_err());
         assert_eq!(
             parse(args(&["service", "install", "--adopt-node"]))
