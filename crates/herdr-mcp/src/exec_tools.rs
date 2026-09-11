@@ -84,17 +84,21 @@ pub fn start(
             }
         }
     };
-    if result.get("ok").and_then(Value::as_bool) == Some(true) {
-        if let Some(object) = result.as_object_mut() {
-            object.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
-            object.insert(
-                "hint".to_owned(),
-                json!("poll herdr_exec_read with session_id until phase=completed; herdr_exec_kill when done"),
-            );
-            if !working.is_empty() {
-                object.insert("warnings".to_owned(), json!({"working": working}));
-            }
-        }
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return result;
+    }
+    let Some(object) = result.as_object_mut() else {
+        return result;
+    };
+    object.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
+    object.insert(
+        "hint".to_owned(),
+        json!(
+            "poll herdr_exec_read with session_id until phase=completed; herdr_exec_kill when done"
+        ),
+    );
+    if !working.is_empty() {
+        object.insert("warnings".to_owned(), json!({"working": working}));
     }
     result
 }
