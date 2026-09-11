@@ -1568,8 +1568,14 @@ fn browser_delivery_state_from_postcondition(
                 && evidence.lifecycle_observed
                 && evidence.canonical_url_observed
                 && (evidence.accepted_message_observed || evidence.message_baseline_advanced)
-                && evidence.generation_owner == Some(expected_generation)
-                && evidence.generation_status_observed
+                // The exact provider user-message identity is terminal proof that
+                // the first assignment crossed the browser/provider boundary.
+                // Assistant generation can begin after the bounded create
+                // observation window, so generation-status timing must not turn an
+                // already accepted message into delivery-uncertain. Session
+                // materialization + locator generation above still fence the new
+                // resource to the requested browser generation.
+                && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
         }
         BrowserOperation::SpaceOpen | BrowserOperation::SessionOpen => {
             evidence.stable_resource_ref_observed
@@ -5693,6 +5699,40 @@ mod tests {
             "stale_capability_generation"
         );
 
+        let mut create_evidence = BrowserPostconditionEvidence::resource_unavailable(7);
+        create_evidence.resource_available = true;
+        create_evidence.command_accepted = true;
+        create_evidence.stable_resource_ref_observed = true;
+        create_evidence.lifecycle_observed = true;
+        create_evidence.canonical_url_observed = true;
+        create_evidence.accepted_message_observed = true;
+        create_evidence.result = Some(json!({
+            "accepted_user_message_ref": "provider-create-user-1"
+        }));
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::SessionCreate,
+                &params,
+                7,
+                &create_evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Applied,
+            "exact provider acceptance must not depend on assistant-start timing"
+        );
+        create_evidence.result = None;
+        assert_eq!(
+            browser_delivery_state_from_postcondition(
+                BrowserOperation::SessionCreate,
+                &params,
+                7,
+                &create_evidence,
+            )
+            .unwrap(),
+            BrowserDeliveryState::Uncertain,
+            "session materialization without exact provider acceptance stays uncertain"
+        );
+
         let mut stop_evidence = BrowserPostconditionEvidence::resource_unavailable(7);
         stop_evidence.resource_available = true;
         stop_evidence.command_accepted = true;
@@ -7369,7 +7409,9 @@ mod tests {
                     generation_owner: Some(expected_generation),
                     generation_status_observed: true,
                     generation_stopped: false,
-                    result: None,
+                    result: Some(json!({
+                        "accepted_user_message_ref": "provider-created-session-user"
+                    })),
                 }
             }
 
@@ -7429,6 +7471,7 @@ mod tests {
                 let mut evidence = Self::applied_evidence(expected_generation);
                 if self.delayed {
                     evidence.generation_status_observed = false;
+                    evidence.result = None;
                 }
                 Ok(evidence)
             }
