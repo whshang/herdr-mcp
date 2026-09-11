@@ -812,7 +812,7 @@ fn connect_existing_worker(
         write_config_atomic,
         revoke_self,
         crate::credential_store::delete,
-        activate_connected_runtime,
+        activate_connected_runtime_after_pairing,
         |_paths| crate::windows_service_manager::reconcile_link(),
         consume_pairing,
     )
@@ -997,7 +997,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
         write_config_atomic,
         revoke_self,
         crate::credential_store::delete,
-        activate_connected_runtime,
+        activate_connected_runtime_after_pairing,
         |_paths| crate::windows_service_manager::reconcile_link(),
         move |_, _, _, _| Ok(enrolled.clone()),
     )
@@ -1815,6 +1815,20 @@ fn activate_connected_runtime(_paths: &RuntimePaths) -> Result<(), String> {
     }
     crate::linux_service_manager::ensure_link_installed()?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn activate_connected_runtime_after_pairing(
+    paths: &RuntimePaths,
+    _recovered_existing: bool,
+    _device_id: &str,
+    _keychain_service: &str,
+) -> Result<(), String> {
+    // Windows Link resolves the device-specific Credential Manager service from
+    // the freshly persisted config each time it starts. Unlike the macOS plist,
+    // there is no embedded credential-service field to rewrite during exact-
+    // device recovery, so normal activation is the complete recovery action.
+    activate_connected_runtime(paths)
 }
 
 #[cfg(target_os = "windows")]
