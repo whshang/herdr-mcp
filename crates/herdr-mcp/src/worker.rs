@@ -17,7 +17,7 @@ use serde_json::Value;
 use serde_json::json;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use sha2::{Digest, Sha256};
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use std::env;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 use std::fs::{self, OpenOptions};
@@ -1324,7 +1324,7 @@ fn connector_planner_control(
     Err("planner control requires a supported enrolled-owner credential backend".to_owned())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn connector_planner_control(
     paths: &RuntimePaths,
     action: &str,
@@ -1356,7 +1356,7 @@ fn connector_planner_control(
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn set_connector_webchat_control(
     _paths: &RuntimePaths,
     _connector_id: &str,
