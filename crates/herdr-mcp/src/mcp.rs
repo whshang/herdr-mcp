@@ -380,9 +380,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_fs_write" => route_fs_git("fs_write", &context.cache.snapshot(), &arguments),
         "herdr_fs_patch" => route_fs_git("fs_patch", &context.cache.snapshot(), &arguments),
         "herdr_git" => route_fs_git("git", &context.cache.snapshot(), &arguments),
-        "herdr_exec_start" => {
-            exec_tools::start(&context.cache.snapshot(), context.exec, &arguments)
-        }
+        "herdr_exec_start" => exec_tools::start(
+            context.client,
+            &context.cache.snapshot(),
+            context.exec,
+            &arguments,
+        ),
         "herdr_exec_read" => exec_tools::read(context.exec, &arguments),
         "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
         "herdr_exec" => utility_exec::run_durable(
