@@ -452,7 +452,100 @@ fn start_runtime(paths: &WindowsPaths) -> Result<(), String> {
         }
         return Err(error);
     }
+
+    // Herdr is an independent user-owned runtime. Keep herdr-mcp itself
+    // available even if Herdr is temporarily absent, but recover the ordinary
+    // Windows login path automatically when an installed Herdr server is not
+    // running. EventCache remains responsible for reconnecting after startup.
+    if let Err(error) = ensure_herdr_dependency_running(paths) {
+        record_herdr_dependency_warning(paths, &error);
+    }
     Ok(())
+}
+
+fn ensure_herdr_dependency_running(paths: &WindowsPaths) -> Result<bool, String> {
+    if herdr_dependency_reachable(paths) {
+        return Ok(false);
+    }
+
+    let binary = find_herdr_executable().ok_or_else(|| {
+        "Herdr is not running and herdr.exe is not discoverable; install Herdr or make its executable available to the current user"
+            .to_owned()
+    })?;
+    let mut child = Command::new(&binary)
+        .arg("server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .env("HERDR_SOCKET_PATH", &paths.herdr_socket)
+        .env_remove("CLOUDFLARE_API_TOKEN")
+        .env_remove("HERDR_EDGE_TOKEN")
+        .env_remove("HERDR_LINK_TOKEN")
+        .env_remove("HERDR_MCP_CLIENT_SECRET")
+        .env_remove("HERDR_MCP_TOKEN")
+        .env_remove("LINK_SHARED_SECRET")
+        .env_remove("STATIC_MCP_BEARER_SECRET")
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "cannot start installed Herdr server {}: {error}",
+                binary.display()
+            )
+        })?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if herdr_dependency_reachable(paths) {
+            return Ok(true);
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("cannot inspect started Herdr server: {error}"))?
+        {
+            return Err(format!(
+                "started Herdr server exited before its API became reachable: {status}"
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "started Herdr server did not make {} reachable within 15 seconds",
+                paths.herdr_socket.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn herdr_dependency_reachable(paths: &WindowsPaths) -> bool {
+    crate::herdr::HerdrClient::new(&paths.herdr_socket)
+        .call_with_timeout("ping", json!({}), Duration::from_millis(250))
+        .is_ok()
+}
+
+fn find_herdr_executable() -> Option<PathBuf> {
+    let installed = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("Programs")
+                .join("Herdr")
+                .join("bin")
+                .join("herdr.exe")
+        })
+        .filter(|path| path.is_file());
+    installed.or_else(|| crate::workstation::find_executable("herdr"))
+}
+
+fn record_herdr_dependency_warning(paths: &WindowsPaths, error: &str) {
+    let message = format!("warning: Herdr dependency startup did not complete: {error}");
+    eprintln!("{message}");
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.runtime_log)
+    {
+        let _ = writeln!(log, "{message}");
+    }
 }
 
 fn start_link(paths: &WindowsPaths) -> Result<(), String> {

@@ -102,7 +102,7 @@ fn which(name: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     let extensions = executable_extensions();
     for directory in env::split_paths(&path) {

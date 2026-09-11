@@ -39,7 +39,7 @@ Then run `herdr --version` again. Herdr's own install behavior is authoritative 
 
 ## Supported platform boundary
 
-Use the GitHub `Latest` stable Release at <https://github.com/whshang/herdr-mcp/releases>. First-device `worker bootstrap` and existing-fleet `worker connect` are supported on macOS and Linux. The 1.0 Windows x86_64 candidate adds the same core enrollment path using Herdr named pipes, Windows Credential Manager, current-user Startup-folder shortcut autostart, and detached user processes; Windows remains candidate support until the native UAT gate passes. Browser Native Messaging, self-update, and product-level reinstall/uninstall are outside this Windows core UAT.
+Use the GitHub `Latest` stable Release at <https://github.com/whshang/herdr-mcp/releases>. First-device `worker bootstrap` and existing-fleet `worker connect` are supported on macOS and Linux. The 1.0 Windows x86_64 candidate adds the same core enrollment path using Herdr named pipes, Windows Credential Manager, current-user Startup-folder shortcut autostart, and detached user processes; Windows remains candidate support until the native UAT gate passes. When that managed Windows runtime starts, it probes the configured Herdr API and best-effort starts an already-installed `herdr server` if needed; it does not install or remove Herdr itself. Browser Native Messaging, self-update, and product-level reinstall/uninstall are outside this Windows core UAT.
 
 For an older installation, follow [Runtime self-upgrade](runtime-self-upgrade.md). Upgrade the runtime in place; do not recreate a healthy Worker, device relationship, or ChatGPT Connector just to move to the current release.
 
