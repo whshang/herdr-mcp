@@ -47,6 +47,9 @@
   const TOOL_CLUSTER_MAX_HEIGHT_PX = 500000;
   const TOOL_CLUSTER_ANCESTOR_DEPTH = 12;
   const TOOL_FIND_SUSPEND_MS = 30000;
+  const TOOL_RUN_SUMMARY_ATTR = "data-herdr-tool-run-summary";
+  const TOOL_RUN_HIDDEN_ATTR = "data-herdr-tool-run-hidden";
+  const TOOL_RUN_MIN_MESSAGES = 2;
 
   const QUIET_MS = 300;
   const MAX_DISCOVERY_LATENCY_MS = 1000;
@@ -84,6 +87,9 @@
     tool_clusters_revealed: 0,
     tool_clusters_skipped: 0,
     tool_discovery_batches: 0,
+    tool_runs_folded: 0,
+    tool_run_messages_hidden: 0,
+    tool_runs_expanded: 0,
     last_batch_records: 0,
     last_scan_ms: 0,
     last_intrinsic_height_px: 0,
@@ -115,6 +121,7 @@
   const blockHeights = new WeakMap();
   const observedToolClusters = new Set();
   const toolClusterHeights = new WeakMap();
+  const foldedToolRuns = new WeakMap();
 
   function publish(value) {
     try {
@@ -586,6 +593,129 @@
     return minimal.length;
   }
 
+  function toolRunLabel(count, expanded) {
+    const lang = String(document.documentElement?.lang || "").toLowerCase();
+    const label = lang.startsWith("zh")
+      ? "工具调用"
+      : (lang.startsWith("ja") ? "ツール呼び出し" : "Tool calls");
+    return `${expanded ? "−" : "+"} ${label} × ${count}`;
+  }
+
+  function isDirectToolWrapper(child) {
+    if (!(child instanceof Element) || child.getAttribute(TOOL_RUN_SUMMARY_ATTR) === "1") return false;
+    try {
+      return child.matches?.(TOOL_MESSAGE_SELECTOR)
+        || Boolean(child.querySelector?.(TOOL_MESSAGE_SELECTOR));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isToolRunBarrier(child) {
+    if (!(child instanceof Element) || child.getAttribute(TOOL_RUN_SUMMARY_ATTR) === "1") return false;
+    if (isDirectToolWrapper(child)) return false;
+    if (child.getAttribute("data-message-author-role")) return true;
+    const text = String(child.textContent || child.innerText || "").trim();
+    if (text) return true;
+    try {
+      return Boolean(child.querySelector?.("button,a,input,textarea,select,[role=\"button\"]"));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function setToolRunExpanded(summary, expanded) {
+    const wrappers = foldedToolRuns.get(summary) || [];
+    summary.setAttribute("aria-expanded", expanded ? "true" : "false");
+    summary.textContent = toolRunLabel(wrappers.length, expanded);
+    for (const wrapper of wrappers) {
+      if (!(wrapper instanceof Element) || !wrapper.isConnected) continue;
+      if (expanded) wrapper.removeAttribute(TOOL_RUN_HIDDEN_ATTR);
+      else wrapper.setAttribute(TOOL_RUN_HIDDEN_ATTR, "1");
+    }
+  }
+
+  function foldToolRuns() {
+    if (!enabled || composerGenerating()) return 0;
+    let folded = 0;
+    const seenStacks = new Set();
+
+    for (const message of document.querySelectorAll?.('[data-message-author-role="assistant"]') || []) {
+      const stack = message.parentElement;
+      if (!(stack instanceof Element) || seenStacks.has(stack)) continue;
+      seenStacks.add(stack);
+      if (stack.querySelector?.('[data-testid="tool-approval-card"]')) continue;
+      if (Array.from(stack.children || []).some(
+        (child) => child instanceof Element && child.getAttribute(TOOL_RUN_SUMMARY_ATTR) === "1",
+      )) continue;
+
+      let run = [];
+      const flush = () => {
+        if (run.length < TOOL_RUN_MIN_MESSAGES) {
+          run = [];
+          return;
+        }
+        const summary = document.createElement("button");
+        summary.setAttribute("type", "button");
+        summary.setAttribute(TOOL_RUN_SUMMARY_ATTR, "1");
+        summary.setAttribute("aria-expanded", "false");
+        foldedToolRuns.set(summary, run.slice());
+        setToolRunExpanded(summary, false);
+        stack.insertBefore(summary, run[0]);
+        stats.tool_runs_folded += 1;
+        stats.tool_run_messages_hidden += run.length;
+        folded += 1;
+        run = [];
+      };
+
+      for (const child of Array.from(stack.children || [])) {
+        if (isDirectToolWrapper(child)) {
+          run.push(child);
+          continue;
+        }
+        if (isToolRunBarrier(child)) flush();
+      }
+      flush();
+    }
+    return folded;
+  }
+
+  function toolRunSummaryFor(node) {
+    let element = elementForNode(node);
+    while (element) {
+      if (element.getAttribute?.(TOOL_RUN_SUMMARY_ATTR) === "1") return element;
+      element = element.parentElement;
+    }
+    return null;
+  }
+
+  function handleToolRunClick(event) {
+    if (!enabled) return;
+    const summary = toolRunSummaryFor(event?.target);
+    if (!summary) return;
+    const expanded = summary.getAttribute("aria-expanded") !== "true";
+    setToolRunExpanded(summary, expanded);
+    if (expanded) stats.tool_runs_expanded += 1;
+  }
+
+  function cleanupToolRuns() {
+    const seenStacks = new Set();
+    for (const message of document.querySelectorAll?.('[data-message-author-role="assistant"]') || []) {
+      const stack = message.parentElement;
+      if (!(stack instanceof Element) || seenStacks.has(stack)) continue;
+      seenStacks.add(stack);
+      for (const child of Array.from(stack.children || [])) {
+        if (!(child instanceof Element)) continue;
+        if (child.getAttribute(TOOL_RUN_SUMMARY_ATTR) === "1") {
+          foldedToolRuns.delete(child);
+          child.remove?.();
+          continue;
+        }
+        child.removeAttribute(TOOL_RUN_HIDDEN_ATTR);
+      }
+    }
+  }
+
   function rearmToolClusters() {
     if (!enabled || !toolClusterObserver) return;
     for (const cluster of observedToolClusters) {
@@ -631,6 +761,23 @@
           content-visibility: hidden;
           contain-intrinsic-size: var(${TOOL_CLUSTER_INTRINSIC_VAR}, 600px);
         }
+      }
+      [${TOOL_RUN_HIDDEN_ATTR}="1"] {
+        display: none !important;
+      }
+      [${TOOL_RUN_SUMMARY_ATTR}="1"] {
+        width: fit-content;
+        border: 0;
+        background: transparent;
+        padding: 2px 0;
+        color: inherit;
+        font: inherit;
+        font-size: 0.8125rem;
+        opacity: 0.68;
+        cursor: pointer;
+      }
+      [${TOOL_RUN_SUMMARY_ATTR}="1"]:hover {
+        opacity: 1;
       }
     `;
     parent.appendChild(style);
@@ -723,6 +870,7 @@
     }
 
     discovered += discoverToolClusters();
+    discovered += foldToolRuns();
 
     for (const block of Array.from(observedBlocks)) {
       if (!block?.isConnected || !isEditableRoot(block.parentElement)) {
@@ -856,6 +1004,7 @@
     document.addEventListener("selectionchange", handleSelectionChange, true);
     document.addEventListener("keydown", handleKeyDown, true);
     document.addEventListener("beforematch", handleBeforeMatch, true);
+    document.addEventListener("click", handleToolRunClick, true);
     listenersInstalled = true;
   }
 
@@ -866,10 +1015,12 @@
     document.removeEventListener("selectionchange", handleSelectionChange, true);
     document.removeEventListener("keydown", handleKeyDown, true);
     document.removeEventListener("beforematch", handleBeforeMatch, true);
+    document.removeEventListener("click", handleToolRunClick, true);
     listenersInstalled = false;
   }
 
   function cleanupContainment() {
+    cleanupToolRuns();
     for (const viewer of document.querySelectorAll?.(`${VIEWER_SELECTOR}[${VIEWER_ATTR}="1"]`) || []) {
       clearViewer(viewer);
     }

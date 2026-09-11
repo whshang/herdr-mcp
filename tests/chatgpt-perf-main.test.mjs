@@ -35,6 +35,15 @@ function makeContext() {
       this.children.push(child);
       return child;
     }
+    insertBefore(child, reference) {
+      const index = this.children.indexOf(reference);
+      if (index < 0) return this.appendChild(child);
+      child.parentNode = this;
+      child.ownerDocument ||= this.ownerDocument;
+      child._setConnected(this.isConnected);
+      this.children.splice(index, 0, child);
+      return child;
+    }
     _setConnected(value) {
       this.isConnected = value;
       for (const child of this.children) child._setConnected(value);
@@ -666,6 +675,51 @@ test("v7 suspends tool hiding for find-in-page", () => {
   toolObserver.trigger([farEntry(cluster, 2761.5)]);
 
   assert.equal(cluster.getAttribute("data-herdr-tool-cluster-hidden"), null);
+});
+
+test("settled ChatGPT tool runs fold to one count and expand without moving reply nodes", () => {
+  const { context, document, FakeElement } = makeContext();
+  const stack = new FakeElement("div");
+  stack.ownerDocument = document;
+  const firstWrap = new FakeElement("div", "contents");
+  firstWrap.ownerDocument = document;
+  const firstTool = new FakeElement("span", "group/tool-message");
+  firstTool.ownerDocument = document;
+  firstWrap.appendChild(firstTool);
+  const inert = new FakeElement("div", "contents");
+  inert.ownerDocument = document;
+  const secondWrap = new FakeElement("div", "contents");
+  secondWrap.ownerDocument = document;
+  const secondTool = new FakeElement("span", "group/tool-message");
+  secondTool.ownerDocument = document;
+  secondWrap.appendChild(secondTool);
+  const reply = new FakeElement("div");
+  reply.ownerDocument = document;
+  reply.setAttribute("data-message-author-role", "assistant");
+  reply.textContent = "final reply";
+  stack.appendChild(firstWrap);
+  stack.appendChild(inert);
+  stack.appendChild(secondWrap);
+  stack.appendChild(reply);
+  document.body.appendChild(stack);
+
+  context.__HERDR_CHATGPT_PERF__.scan();
+
+  const summary = stack.children.find((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1");
+  assert.ok(summary);
+  assert.equal(summary.textContent, "+ Tool calls × 2");
+  assert.equal(firstWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.equal(secondWrap.getAttribute("data-herdr-tool-run-hidden"), "1");
+  assert.ok(stack.children.indexOf(summary) < stack.children.indexOf(firstWrap));
+  assert.ok(stack.children.indexOf(secondWrap) < stack.children.indexOf(reply));
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_runs_folded, 1);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_run_messages_hidden, 2);
+
+  document.emit("click", summary);
+  assert.equal(summary.getAttribute("aria-expanded"), "true");
+  assert.equal(firstWrap.getAttribute("data-herdr-tool-run-hidden"), null);
+  assert.equal(secondWrap.getAttribute("data-herdr-tool-run-hidden"), null);
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.tool_runs_expanded, 1);
 });
 
 test("wrapped code viewers remain uncontained", () => {
