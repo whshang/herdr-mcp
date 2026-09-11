@@ -782,12 +782,98 @@ test("execution lanes durably bind opaque WebChat sessions and fence device reas
   assert.equal(reassigned.ok, true);
   assert.equal(reassigned.lane.device_id, DEVICE_B);
   assert.equal(reassigned.lane.webchat_binding, null);
+  assert.equal(reassigned.lane.webchat_binding_history.length, 1);
+  assert.equal(reassigned.lane.webchat_binding_history[0].from_device_id, DEVICE_A);
+  assert.equal(reassigned.lane.webchat_binding_history[0].to_device_id, DEVICE_B);
+  assert.equal(reassigned.lane.webchat_binding_history[0].from_webchat_binding.session_ref, binding.session_ref);
+  assert.equal(reassigned.lane.webchat_binding_history[0].to_webchat_binding, null);
 
   const persisted = await call(registry, "herdr_mcp.execution_lane.inspect", {
     lane_id: lane.lane.lane_id,
   }, PRINCIPAL_A, 5004);
   assert.equal(persisted.ok, true);
   assert.equal(persisted.lane.webchat_binding, null);
+});
+
+test("first WebChat assignment is routine and later route removal requires explicit reassignment", async () => {
+  const { storage, registry } = makeRegistry();
+  await putDevice(storage, device(DEVICE_A));
+  const created = await createChain(registry, "webchat-first-assignment-chain");
+  const lease = await acquire(registry, created.chain, "webchat-first-assignment-lease");
+  const lane = await call(registry, "herdr_mcp.execution_lane.create", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lease.chain.revision,
+    expected_lease_generation: 1,
+    idempotency_key: "webchat-first-assignment-lane",
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: "feat/webchat-first-assignment",
+  });
+  assert.equal(lane.ok, true);
+  assert.equal(lane.lane.webchat_binding, null);
+  assert.deepEqual(lane.lane.webchat_binding_history, []);
+
+  const binding = {
+    endpoint_ref: `bep_${"1".repeat(64)}`,
+    provider: "chatgpt",
+    account_ref: `br_${"2".repeat(64)}`,
+    space_ref: null,
+    session_ref: `br_${"3".repeat(64)}`,
+    observation_generation: 5,
+  };
+  const assigned = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lane.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: 1,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-first-assignment-bind",
+    webchat_binding: binding,
+  });
+  assert.equal(assigned.ok, true);
+  assert.equal(assigned.lane.webchat_binding.session_ref, binding.session_ref);
+  assert.deepEqual(assigned.lane.webchat_binding_history, []);
+
+  const refreshed = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: assigned.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: assigned.lane.lane_generation,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-first-assignment-refresh",
+    webchat_binding: { ...binding, observation_generation: 6 },
+  });
+  assert.equal(refreshed.ok, true);
+  assert.equal(refreshed.lane.webchat_binding.observation_generation, 6);
+  assert.deepEqual(refreshed.lane.webchat_binding_history, []);
+
+  const implicitUnbind = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: refreshed.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: refreshed.lane.lane_generation,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-first-assignment-unbind-implicit",
+    webchat_binding: null,
+  });
+  assert.equal(implicitUnbind.code, "execution_lane_reassign_required");
+
+  const explicitUnbind = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: refreshed.chain.revision,
+    expected_lease_generation: 1,
+    expected_lane_generation: refreshed.lane.lane_generation,
+    lane_id: lane.lane.lane_id,
+    idempotency_key: "webchat-first-assignment-unbind-explicit",
+    reassign: true,
+    webchat_binding: null,
+  });
+  assert.equal(explicitUnbind.ok, true);
+  assert.equal(explicitUnbind.lane.webchat_binding, null);
+  assert.equal(explicitUnbind.lane.webchat_binding_history.length, 1);
+  assert.equal(explicitUnbind.lane.webchat_binding_history[0].from_webchat_binding.session_ref, binding.session_ref);
+  assert.equal(explicitUnbind.lane.webchat_binding_history[0].to_webchat_binding, null);
 });
 
 test("active WebChat session reservation is exclusive while endpoint and account remain shareable", async () => {
@@ -844,6 +930,7 @@ test("active WebChat session reservation is exclusive while endpoint and account
     expected_lane_generation: 1,
     lane_id: laneA.lane.lane_id,
     idempotency_key: "webchat-release-a",
+    reassign: true,
     webchat_binding: null,
   });
   assert.equal(unbound.ok, true);
@@ -1188,6 +1275,25 @@ test("fleet authority preserves execution provenance across reconstruction and W
   });
   assert.equal(laneAfterRestart.lane.webchat_binding.provider, "chatgpt");
 
+  const reboundBinding = {
+    endpoint_ref: "bep_" + "d".repeat(64),
+    provider: "gemini",
+    account_ref: "br_" + "e".repeat(64),
+    space_ref: null,
+    session_ref: "br_" + "f".repeat(64),
+    observation_generation: 11,
+  };
+  const implicitRebound = await call(second, "herdr_mcp.execution_lane.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: createdLane.chain.revision,
+    expected_lease_generation: 1,
+    lane_id: createdLane.lane.lane_id,
+    expected_lane_generation: createdLane.lane.lane_generation,
+    idempotency_key: "persist-lane-gemini-route-implicit",
+    webchat_binding: reboundBinding,
+  }, PRINCIPAL_A, 2002);
+  assert.equal(implicitRebound.code, "execution_lane_reassign_required");
+
   const rebound = await call(second, "herdr_mcp.execution_lane.update", {
     work_chain_id: created.chain.work_chain_id,
     expected_chain_revision: createdLane.chain.revision,
@@ -1195,14 +1301,8 @@ test("fleet authority preserves execution provenance across reconstruction and W
     lane_id: createdLane.lane.lane_id,
     expected_lane_generation: createdLane.lane.lane_generation,
     idempotency_key: "persist-lane-gemini-route",
-    webchat_binding: {
-      endpoint_ref: "bep_" + "d".repeat(64),
-      provider: "gemini",
-      account_ref: "br_" + "e".repeat(64),
-      space_ref: null,
-      session_ref: "br_" + "f".repeat(64),
-      observation_generation: 11,
-    },
+    reassign: true,
+    webchat_binding: reboundBinding,
   }, PRINCIPAL_A, 2002);
   assert.equal(rebound.ok, true);
   assert.equal(rebound.lane.webchat_binding.provider, "gemini");
@@ -1212,11 +1312,20 @@ test("fleet authority preserves execution provenance across reconstruction and W
   assert.equal(rebound.lane.work_chain_id, laneAfterRestart.lane.work_chain_id);
   assert.equal(rebound.lane.device_id, laneAfterRestart.lane.device_id);
   assert.equal(rebound.lane.owner_principal, laneAfterRestart.lane.owner_principal);
+  assert.equal(rebound.lane.webchat_binding_history.length, 1);
+  assert.equal(rebound.lane.webchat_binding_history[0].lane_generation, rebound.lane.lane_generation);
+  assert.equal(rebound.lane.webchat_binding_history[0].from_device_id, DEVICE_A);
+  assert.equal(rebound.lane.webchat_binding_history[0].to_device_id, DEVICE_A);
+  assert.equal(rebound.lane.webchat_binding_history[0].from_webchat_binding.provider, "chatgpt");
+  assert.equal(rebound.lane.webchat_binding_history[0].to_webchat_binding.provider, "gemini");
 
   const third = makeRegistry(storage).registry;
   const persistedRoute = await call(third, "herdr_mcp.execution_lane.inspect", { lane_id: createdLane.lane.lane_id }, PRINCIPAL_B, 2003);
   assert.equal(persistedRoute.ok, true);
   assert.equal(persistedRoute.lane.webchat_binding.provider, "gemini");
+  assert.equal(persistedRoute.lane.webchat_binding_history.length, 1);
+  assert.equal(persistedRoute.lane.webchat_binding_history[0].from_webchat_binding.provider, "chatgpt");
+  assert.equal(persistedRoute.lane.webchat_binding_history[0].to_webchat_binding.provider, "gemini");
   assert.equal(persistedRoute.lane.repo_id, "github.com/whshang/herdr-mcp");
   assert.equal(persistedRoute.lane.branch_ref, "feat/persist-lane");
   assert.equal(persistedRoute.lane.work_chain_id, created.chain.work_chain_id);
