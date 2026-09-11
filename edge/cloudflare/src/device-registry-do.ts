@@ -327,20 +327,36 @@ export class DeviceRegistryDO {
         if (!existing) return { ok: false as const, code: "device_not_found" as const };
         if (existing.authorization === "revoked") return { ok: false as const, code: "device_revoked" as const };
         if (existing.authorization !== "active") return { ok: false as const, code: "device_suspended" as const };
+        const canonicalWorkstationId = existing.device_id;
+        const canonicalIndexKey = WORKSTATION_PREFIX + canonicalWorkstationId;
+        const canonicalIndexedDeviceId = await tx.get<string>(canonicalIndexKey);
+        if (canonicalIndexedDeviceId && canonicalIndexedDeviceId !== existing.device_id) {
+          return { ok: false as const, code: "registry_corrupt" as const };
+        }
         const credentialId = newCredentialId();
         const deviceSecret = newDeviceSecret();
         const credential: DeviceCredentialRecord = {
           credential_id: credentialId,
           device_id: existing.device_id,
-          workstation_id: existing.workstation_id,
+          workstation_id: canonicalWorkstationId,
           verifier_sha256: await sha256Hex(deviceSecret),
           created_at_ms: now,
         };
-        const updated: DeviceRecord = { ...existing, credential_id: credentialId, updated_at_ms: now };
+        const updated: DeviceRecord = {
+          ...existing,
+          workstation_id: canonicalWorkstationId,
+          credential_id: credentialId,
+          updated_at_ms: now,
+        };
         await tx.delete(storageKey);
         if (existing.credential_id) await tx.delete(CREDENTIAL_PREFIX + existing.credential_id);
         await tx.put(DEVICE_PREFIX + existing.device_id, updated);
         await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
+        await tx.put(canonicalIndexKey, existing.device_id);
+        // Keep any legacy workstation index as a compatibility tombstone. It
+        // resolves to this canonical device, whose device credential now makes
+        // the old shared-secret path fail closed instead of auto-registering a
+        // duplicate legacy device during a stale Link reconnect.
         return { ok: true as const, device_id: existing.device_id, credential_id: credentialId, device_secret: deviceSecret, recovered_existing: true as const };
       }
 

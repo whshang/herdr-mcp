@@ -1008,6 +1008,64 @@ test("recovery pairing rotates one active device credential without changing dev
   assert.equal((await replay.json()).code, "pairing_rejected");
 });
 
+test("recovery pairing canonicalizes a legacy workstation identity without duplicating the device", async () => {
+  const { env, registry } = makeEnv();
+  const legacyConnect = await worker.fetch(
+    wsRequest("prod-real-runtime", "legacy-secret", "legacy-recovery-air"),
+    env,
+  );
+  assert.equal(legacyConnect.status, 200);
+
+  const before = await (await registry.fetch(new Request("https://registry.internal/internal/devices"))).json();
+  const legacy = before.devices.find((device) => device.workstation_id === "prod-real-runtime");
+  assert.ok(legacy);
+  assert.notEqual(legacy.device_id, legacy.workstation_id);
+
+  const create = await worker.fetch(post(
+    "/devices/pairings",
+    { ttl_seconds: 60, recover_device_id: legacy.device_id },
+    "owner-secret",
+  ), env);
+  assert.equal(create.status, 200);
+  const session = await create.json();
+
+  const consume = await worker.fetch(post(
+    "/devices/pairings/consume",
+    { pairing_id: session.pairing_id, code: session.code },
+  ), env);
+  assert.equal(consume.status, 200);
+  const recovered = await consume.json();
+  assert.equal(recovered.device_id, legacy.device_id);
+  assert.equal(recovered.workstation_id, legacy.device_id);
+  assert.equal(recovered.recovered_existing, true);
+
+  const after = await (await registry.fetch(new Request("https://registry.internal/internal/devices"))).json();
+  assert.equal(after.devices.length, before.devices.length);
+  const canonical = after.devices.find((device) => device.device_id === legacy.device_id);
+  assert.equal(canonical?.workstation_id, legacy.device_id);
+  assert.equal(canonical?.name, "legacy-recovery-air");
+  assert.equal(after.devices.some((device) => device.workstation_id === "prod-real-runtime"), false);
+
+  const newCredential = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    recovered.workstation_id,
+    recovered.device_secret,
+  ), env);
+  assert.equal(newCredential.status, 200);
+
+  const staleLegacy = await worker.fetch(postAsWorkstation(
+    "/devices/pairings",
+    { ttl_seconds: 60 },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), env);
+  assert.equal(staleLegacy.status, 401);
+
+  const finalInventory = await (await registry.fetch(new Request("https://registry.internal/internal/devices"))).json();
+  assert.equal(finalInventory.devices.length, before.devices.length);
+});
+
 test("fleet-admin verifier rebind repairs one existing device without receiving its secret", async () => {
   const { env } = makeEnv();
   const original = await pair(env, "rebind-me");
