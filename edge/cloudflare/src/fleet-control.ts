@@ -12,6 +12,7 @@ const MAX_PRINCIPAL = 4096;
 const MAX_STRING = 4096;
 const MAX_SCOPE_ITEMS = 64;
 const MAX_TAKEOVER_REASON = 512;
+const MAX_WEBCHAT_REASSIGN_HISTORY = 32;
 const DEFAULT_LEASE_TTL_MS = 5 * 60_000;
 const MIN_LEASE_TTL_MS = 30_000;
 const MAX_LEASE_TTL_MS = 30 * 60_000;
@@ -227,6 +228,7 @@ export interface ExecutionLaneRecord {
   validation_summary: string | null;
   validation_refs: string[];
   webchat_binding: WebChatLaneBinding | null;
+  webchat_binding_history: WebChatLaneBindingHistoryEntry[];
   created_at_ms: number;
   updated_at_ms: number;
 }
@@ -240,6 +242,16 @@ export interface WebChatLaneBinding {
   session_ref: string;
   observation_generation: number;
   bound_at_ms: number;
+}
+
+export interface WebChatLaneBindingHistoryEntry {
+  schema_version: 1;
+  lane_generation: number;
+  from_device_id: string;
+  to_device_id: string;
+  from_webchat_binding: WebChatLaneBinding | null;
+  to_webchat_binding: WebChatLaneBinding | null;
+  changed_at_ms: number;
 }
 
 interface IdempotencyRecord {
@@ -500,8 +512,10 @@ function normalizeLane(value: unknown): ExecutionLaneRecord | null {
   if (!(value.validation_summary === null || boundedString(value.validation_summary, 4096))) return null;
   const webchatBinding = normalizeStoredWebChatBinding(value.webchat_binding);
   if (value.webchat_binding !== undefined && value.webchat_binding !== null && !webchatBinding) return null;
+  const webchatBindingHistory = normalizeStoredWebChatBindingHistory(value.webchat_binding_history, value.lane_generation);
+  if (!webchatBindingHistory) return null;
   if (!integer(value.created_at_ms, 0) || !integer(value.updated_at_ms, 0)) return null;
-  return { ...value, file_scope: fileScope, runtime_scope: runtimeScope, validation_refs: validationRefs, webchat_binding: webchatBinding } as unknown as ExecutionLaneRecord;
+  return { ...value, file_scope: fileScope, runtime_scope: runtimeScope, validation_refs: validationRefs, webchat_binding: webchatBinding, webchat_binding_history: webchatBindingHistory } as unknown as ExecutionLaneRecord;
 }
 
 function normalizeStoredWebChatBinding(value: unknown): WebChatLaneBinding | null {
@@ -511,6 +525,35 @@ function normalizeStoredWebChatBinding(value: unknown): WebChatLaneBinding | nul
   if (!(value.space_ref === null || browserOpaqueRef(value.space_ref, "br_"))) return null;
   if (!browserOpaqueRef(value.session_ref, "br_") || !integer(value.observation_generation, 1) || !integer(value.bound_at_ms, 0)) return null;
   return value as unknown as WebChatLaneBinding;
+}
+
+function normalizeStoredWebChatBindingHistory(value: unknown, laneGeneration: number): WebChatLaneBindingHistoryEntry[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_WEBCHAT_REASSIGN_HISTORY) return null;
+  const out: WebChatLaneBindingHistoryEntry[] = [];
+  let previousGeneration = 0;
+  for (const raw of value) {
+    if (!isRecord(raw) || raw.schema_version !== 1) return null;
+    if (!integer(raw.lane_generation, 1) || raw.lane_generation <= previousGeneration || raw.lane_generation > laneGeneration) return null;
+    if (!boundedString(raw.from_device_id, 128) || !boundedString(raw.to_device_id, 128) || !integer(raw.changed_at_ms, 0)) return null;
+    const fromBinding = normalizeStoredWebChatBinding(raw.from_webchat_binding);
+    const toBinding = normalizeStoredWebChatBinding(raw.to_webchat_binding);
+    if (raw.from_webchat_binding !== null && !fromBinding) return null;
+    if (raw.to_webchat_binding !== null && !toBinding) return null;
+    if (fromBinding === null && toBinding === null) return null;
+    if (fromBinding && toBinding && raw.from_device_id === raw.to_device_id && sameWebChatSessionIdentity(fromBinding, toBinding)) return null;
+    out.push({
+      schema_version: 1,
+      lane_generation: raw.lane_generation,
+      from_device_id: raw.from_device_id,
+      to_device_id: raw.to_device_id,
+      from_webchat_binding: fromBinding,
+      to_webchat_binding: toBinding,
+      changed_at_ms: raw.changed_at_ms,
+    });
+    previousGeneration = raw.lane_generation;
+  }
+  return out;
 }
 
 function normalizeWebChatBindingInput(value: unknown, nowMs: number): WebChatLaneBinding | null | undefined {
@@ -956,7 +999,7 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
           const conflict = await claimWebChatSessionReservation(tx, laneId, id, webchatBinding, nowMs);
           if (conflict) return conflict;
         }
-        const lane: ExecutionLaneRecord = { schema_version: 1, lane_id: laneId, work_chain_id: id, lane_generation: 1, device_id: params.device_id, repo_id: repoId, base_commit: params.base_commit.toLowerCase(), branch_ref: branchRef, file_scope: fileScope, runtime_scope: runtimeScope, owner_principal: principal, agent_ref: boundedString(params.agent_ref, 1024) ? params.agent_ref : null, status, validation_summary: boundedString(params.validation_summary, 4096) ? params.validation_summary : null, validation_refs: [], webchat_binding: webchatBinding ?? null, created_at_ms: nowMs, updated_at_ms: nowMs };
+        const lane: ExecutionLaneRecord = { schema_version: 1, lane_id: laneId, work_chain_id: id, lane_generation: 1, device_id: params.device_id, repo_id: repoId, base_commit: params.base_commit.toLowerCase(), branch_ref: branchRef, file_scope: fileScope, runtime_scope: runtimeScope, owner_principal: principal, agent_ref: boundedString(params.agent_ref, 1024) ? params.agent_ref : null, status, validation_summary: boundedString(params.validation_summary, 4096) ? params.validation_summary : null, validation_refs: [], webchat_binding: webchatBinding ?? null, webchat_binding_history: [], created_at_ms: nowMs, updated_at_ms: nowMs };
         await tx.put(LANE_PREFIX + laneId, lane);
         await tx.put(reservationKey, { schema_version: 1, lane_id: laneId, work_chain_id: id, repo_id: repoId, branch_ref: branchRef, created_at_ms: nowMs } satisfies LaneReservationRecord);
         const next: WorkChainRecord = { ...chain, revision: chain.revision + 1, updated_at_ms: nowMs };
@@ -978,8 +1021,15 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
         if (!targetDeviceId) return error("invalid_params", { field: "device_id" });
         const requestedWebChatBinding = normalizeWebChatBindingInput(params.webchat_binding, nowMs);
         if (params.webchat_binding !== undefined && requestedWebChatBinding === undefined) return error("invalid_params", { field: "webchat_binding" });
-        const ownershipChanges = lane.owner_principal !== principal || targetDeviceId !== lane.device_id;
-        if (ownershipChanges && !reassign) return error(lane.owner_principal !== principal ? "execution_lane_owner_mismatch" : "execution_lane_reassign_required");
+        const nextWebChatBinding = params.webchat_binding === undefined ? lane.webchat_binding : requestedWebChatBinding ?? null;
+        const webChatBindingChanges = params.webchat_binding !== undefined
+          && (lane.webchat_binding === null
+            ? nextWebChatBinding !== null
+            : nextWebChatBinding === null || !sameWebChatSessionIdentity(lane.webchat_binding, nextWebChatBinding));
+        const hadPriorWebChatAssignment = lane.webchat_binding !== null || lane.webchat_binding_history.length > 0;
+        const webChatReassignment = webChatBindingChanges && hadPriorWebChatAssignment;
+        if (lane.owner_principal !== principal && !reassign) return error("execution_lane_owner_mismatch");
+        if ((targetDeviceId !== lane.device_id || webChatReassignment) && !reassign) return error("execution_lane_reassign_required");
         if (reassign && terminalLane(lane.status)) return error("execution_lane_terminal");
         if (targetDeviceId !== lane.device_id
           && (lane.webchat_binding !== null || params.webchat_binding !== undefined)
@@ -993,14 +1043,26 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
         }
         const validationSummary = params.validation_summary === undefined ? lane.validation_summary : params.validation_summary === null ? null : boundedString(params.validation_summary, 4096) ? params.validation_summary : undefined;
         if (validationSummary === undefined) return error("invalid_params");
-        const nextWebChatBinding = params.webchat_binding === undefined ? lane.webchat_binding : requestedWebChatBinding ?? null;
+        let webchatBindingHistory = lane.webchat_binding_history;
+        if (webChatReassignment) {
+          if (webchatBindingHistory.length >= MAX_WEBCHAT_REASSIGN_HISTORY) return error("execution_lane_webchat_history_full");
+          webchatBindingHistory = [...webchatBindingHistory, {
+            schema_version: 1,
+            lane_generation: lane.lane_generation + 1,
+            from_device_id: lane.device_id,
+            to_device_id: targetDeviceId,
+            from_webchat_binding: lane.webchat_binding,
+            to_webchat_binding: nextWebChatBinding,
+            changed_at_ms: nowMs,
+          }];
+        }
         if (!terminalLane(nextStatus) && nextWebChatBinding) {
           const conflict = await claimWebChatSessionReservation(tx, lane.lane_id, id, nextWebChatBinding, nowMs);
           if (conflict) return conflict;
         }
         const releasePriorWebChat = lane.webchat_binding !== null
           && (terminalLane(nextStatus) || nextWebChatBinding === null || !sameWebChatSessionIdentity(lane.webchat_binding, nextWebChatBinding));
-        const nextLane: ExecutionLaneRecord = { ...lane, lane_generation: lane.lane_generation + 1, device_id: targetDeviceId, owner_principal: reassign ? principal : lane.owner_principal, status: nextStatus, validation_summary: validationSummary, webchat_binding: nextWebChatBinding, updated_at_ms: nowMs };
+        const nextLane: ExecutionLaneRecord = { ...lane, lane_generation: lane.lane_generation + 1, device_id: targetDeviceId, owner_principal: reassign ? principal : lane.owner_principal, status: nextStatus, validation_summary: validationSummary, webchat_binding: nextWebChatBinding, webchat_binding_history: webchatBindingHistory, updated_at_ms: nowMs };
         await tx.put(LANE_PREFIX + lane.lane_id, nextLane);
         if (releasePriorWebChat && lane.webchat_binding) {
           await releaseWebChatSessionReservation(tx, lane.lane_id, lane.webchat_binding);
