@@ -65,9 +65,28 @@ jobs:
             $expected = "b4508c445de1c1a68c760a01735da2aba2fa214b2aafd4b07f732e49b2a64b11"
             if ($actual -ne $expected) { throw "Herdr 0.9.0 Windows archive SHA-256 mismatch" }
             Expand-Archive -Path $archive -DestinationPath $root -Force
-            $herdr = Get-ChildItem -Path $root -Filter herdr.exe -File -Recurse | Select-Object -First 1
-            if (-not $herdr) { throw "herdr.exe missing from Herdr 0.9.0 Windows archive" }
-            $env:PATH = "$($herdr.Directory.FullName);$env:PATH"
+            $archiveHerdr = Get-ChildItem -Path $root -Filter herdr.exe -File -Recurse | Select-Object -First 1
+            if (-not $archiveHerdr) { throw "herdr.exe missing from Herdr 0.9.0 Windows archive" }
+            $officialHerdrDir = Join-Path $env:LOCALAPPDATA "Programs\Herdr\bin"
+            New-Item -ItemType Directory -Force -Path $officialHerdrDir | Out-Null
+            Copy-Item -Path (Join-Path $archiveHerdr.Directory.FullName "*") -Destination $officialHerdrDir -Recurse -Force
+            $herdr = Get-Item (Join-Path $officialHerdrDir "herdr.exe")
+            if (-not $herdr) { throw "cannot stage the official per-user Herdr install layout" }
+
+            function Test-HerdrDoctorPasses([string] $text) {
+              foreach ($label in @(
+                "Herdr local transport",
+                "Herdr API schema",
+                "validated Herdr RPC",
+                "Herdr snapshot state",
+                "Herdr inspect projection",
+                "Herdr event cache"
+              )) {
+                $pattern = "(?m)^PASS $([regex]::Escape($label))\s*$"
+                if ($text -notmatch $pattern) { return $false }
+              }
+              return $true
+            }
 
             $before = (& $herdr.FullName status server --json | ConvertFrom-Json)
             if ($before.running -eq $true) {
@@ -99,16 +118,16 @@ jobs:
 
             $serverAfterInstall = (& $herdr.FullName status server --json | ConvertFrom-Json)
             if ($serverAfterInstall.running -ne $true) { throw "herdr-mcp install did not auto-start the installed Herdr server" }
-            $cacheReady = $false
+            $doctorReady = $false
             $doctorText = ""
             for ($attempt = 0; $attempt -lt 12; $attempt++) {
               Start-Sleep -Milliseconds 250
               $doctorText = (& $candidate doctor 2>&1 | Out-String)
-              if ($doctorText -match '(?m)^PASS Herdr event cache\s*$') { $cacheReady = $true; break }
+              if (Test-HerdrDoctorPasses $doctorText) { $doctorReady = $true; break }
             }
-            if (-not $cacheReady) {
+            if (-not $doctorReady) {
               Write-Host $doctorText
-              throw "Windows runtime did not recover its Herdr event cache after automatic dependency startup"
+              throw "Windows runtime did not recover the full Herdr doctor surface after automatic dependency startup"
             }
 
             & $candidate service stop *> $null
@@ -134,16 +153,16 @@ jobs:
             }
             if (-not $loginRecovered) { throw "Windows Startup shortcut did not restore herdr-mcp plus the Herdr dependency after simulated login" }
 
-            $cacheReady = $false
+            $doctorReady = $false
             $doctorText = ""
             for ($attempt = 0; $attempt -lt 12; $attempt++) {
               Start-Sleep -Milliseconds 250
               $doctorText = (& $candidate doctor 2>&1 | Out-String)
-              if ($doctorText -match '(?m)^PASS Herdr event cache\s*$') { $cacheReady = $true; break }
+              if (Test-HerdrDoctorPasses $doctorText) { $doctorReady = $true; break }
             }
-            if (-not $cacheReady) {
+            if (-not $doctorReady) {
               Write-Host $doctorText
-              throw "Windows event cache did not recover after simulated-login Herdr startup"
+              throw "Windows full Herdr doctor surface did not recover after simulated-login startup"
             }
           }
           finally {

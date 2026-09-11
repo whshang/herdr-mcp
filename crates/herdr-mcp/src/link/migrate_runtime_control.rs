@@ -234,6 +234,40 @@ fn reconcile_current_generation_with_paths(
         control_path,
         status_path,
     )?;
+    apply_reconcile_plan(plan)
+}
+
+/// Reconcile runtime-control against an already-resolved managed runtime.
+///
+/// Windows owns `runtime/current` as a directory containing `herdr-mcp.exe`
+/// plus a generation marker rather than the Unix symlink layout. Passing the
+/// resolved binary and generation keeps the exact same control-document
+/// revision/staleness rules without inventing a second Windows-only planner.
+pub(crate) fn reconcile_current_generation_for_runtime_at(
+    config_dir: &Path,
+    current_binary: &Path,
+    generation_id: &str,
+    control_path: &Path,
+    status_path: &Path,
+) -> Result<bool, String> {
+    if !current_binary.is_file() {
+        return Err(format!(
+            "managed runtime binary is missing: {}",
+            current_binary.display()
+        ));
+    }
+    let plan = plan_migrate_with_identity(
+        config_dir,
+        MigrateMode::Apply,
+        Some(control_path),
+        Some(status_path),
+        current_binary,
+        generation_id,
+    )?;
+    apply_reconcile_plan(plan)
+}
+
+fn apply_reconcile_plan(plan: Value) -> Result<bool, String> {
     if plan.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(format!("runtime-control reconcile plan failed: {plan}"));
     }
@@ -265,13 +299,32 @@ fn plan_migrate_with_paths(
     status_path_override: Option<&Path>,
 ) -> Result<Value, String> {
     // Touch managed runtime so we refuse planning against a missing/broken install.
-    let _binary = resolve_managed_runtime_binary(home)?;
+    let binary = resolve_managed_runtime_binary(home)?;
     let generation_id = active_rust_generation_id(home)?;
-    if !generation_looks_rust_compatible(&generation_id) {
+    plan_migrate_with_identity(
+        config_dir,
+        mode,
+        control_path_override,
+        status_path_override,
+        &binary,
+        &generation_id,
+    )
+}
+
+fn plan_migrate_with_identity(
+    config_dir: &Path,
+    mode: MigrateMode,
+    control_path_override: Option<&Path>,
+    status_path_override: Option<&Path>,
+    current_binary: &Path,
+    generation_id: &str,
+) -> Result<Value, String> {
+    if !generation_looks_rust_compatible(generation_id) {
         return Err(format!(
             "active runtime generation is not Rust-compatible: {generation_id}"
         ));
     }
+    let generation_id = generation_id.to_owned();
 
     let control_path = control_path_override
         .map(Path::to_path_buf)
@@ -337,7 +390,7 @@ fn plan_migrate_with_paths(
         .as_ref()
         .ok()
         .cloned()
-        .or_else(|| read_binary_version_hint(home));
+        .or_else(|| read_binary_version_hint_at(current_binary));
 
     let mut planned = Map::new();
     let next_revision = current
@@ -391,7 +444,7 @@ fn plan_migrate_with_paths(
         "control_path": control_path.display().to_string(),
         "status_path": status_path.as_ref().map(|path| path.display().to_string()),
         "staging_path": staging_path.display().to_string(),
-        "runtime_current_binary": managed_runtime_binary(home).display().to_string(),
+        "runtime_current_binary": current_binary.display().to_string(),
         "active_rust_generation": generation_id,
         "current": {
             "desired_active": desired,
@@ -534,8 +587,11 @@ fn health_url_from_endpoint(endpoint: &str) -> String {
 }
 
 pub(crate) fn read_binary_version_hint(home: &Path) -> Option<String> {
-    let binary = managed_runtime_binary(home);
-    let output = std::process::Command::new(&binary)
+    read_binary_version_hint_at(&managed_runtime_binary(home))
+}
+
+fn read_binary_version_hint_at(binary: &Path) -> Option<String> {
+    let output = std::process::Command::new(binary)
         .arg("--version")
         .output()
         .ok()?;
@@ -824,6 +880,58 @@ mod tests {
         .unwrap();
         assert!(!reconcile_current_generation(&home, &config_dir).unwrap());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn explicit_runtime_identity_reconciles_stale_control_before_link_restart() {
+        let root = test_home();
+        let config_dir = root.join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let current_binary = root.join("runtime-current-herdr-mcp.exe");
+        fs::write(&current_binary, b"not-an-executable").unwrap();
+        let control_path = config_dir.join("runtime-control.json");
+        let status_path = config_dir.join("runtime-status.json");
+        fs::write(
+            &control_path,
+            r#"{"schema_version":1,"revision":7,"desired_active":"rust-old000000000001","generations":[{"generation":"rust-old000000000001","endpoint":"http://127.0.0.1:9/mcp"}]}"#,
+        )
+        .unwrap();
+
+        assert!(
+            reconcile_current_generation_for_runtime_at(
+                &config_dir,
+                &current_binary,
+                "rust-new000000000002",
+                &control_path,
+                &status_path,
+            )
+            .unwrap()
+        );
+        let reconciled: Value =
+            serde_json::from_str(&fs::read_to_string(&control_path).unwrap()).unwrap();
+        assert_eq!(reconciled["desired_active"], "rust-new000000000002");
+        assert_eq!(reconciled["revision"], 8);
+        assert_eq!(
+            reconciled["generations"][0]["generation"],
+            "rust-new000000000002"
+        );
+
+        // With no status proving that revision 8 was consumed yet, do not churn
+        // the control revision just because Link has not published status.
+        assert!(
+            !reconcile_current_generation_for_runtime_at(
+                &config_dir,
+                &current_binary,
+                "rust-new000000000002",
+                &control_path,
+                &status_path,
+            )
+            .unwrap()
+        );
+        let unchanged: Value =
+            serde_json::from_str(&fs::read_to_string(&control_path).unwrap()).unwrap();
+        assert_eq!(unchanged["revision"], 8);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -102,6 +102,40 @@ fn which(name: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+pub(crate) fn find_herdr_executable() -> Option<PathBuf> {
+    // The official Windows installer does not guarantee that a detached child
+    // launched from Startup inherits the interactive shell's PATH. Prefer the
+    // stable per-user install location, then preserve the Unix user-local and
+    // Homebrew fallbacks before normal PATH discovery.
+    #[cfg(target_os = "windows")]
+    if let Some(candidate) = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("Programs")
+                .join("Herdr")
+                .join("bin")
+                .join("herdr.exe")
+        })
+        .filter(|path| path.is_file())
+    {
+        return Some(candidate);
+    }
+
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let candidates = [
+        home.map(|home| home.join(".local/bin/herdr")),
+        Some(PathBuf::from("/opt/homebrew/bin/herdr")),
+        Some(PathBuf::from("/usr/local/bin/herdr")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|path| is_executable(path))
+        .or_else(|| find_executable("herdr"))
+}
+
 pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     let extensions = executable_extensions();

@@ -297,6 +297,13 @@ pub fn reconcile_link() -> Result<(), String> {
     })?;
     runtime_token()?;
 
+    // A Windows service install can atomically move runtime/current while the
+    // durable runtime-control document still names the previous generation.
+    // Reconcile that document before starting/restarting Link; otherwise Link
+    // faithfully re-advertises the stale desired generation to Edge and every
+    // reserved request is fenced before dispatch.
+    reconcile_runtime_control(&paths, &runtime)?;
+
     let was_enabled = link_enabled(&paths)?;
     set_link_enabled(&paths, true)?;
     if let Err(error) = start_link(&paths) {
@@ -306,6 +313,19 @@ pub fn reconcile_link() -> Result<(), String> {
         return Err(error);
     }
     Ok(())
+}
+
+fn reconcile_runtime_control(paths: &WindowsPaths, runtime: &RuntimePaths) -> Result<(), String> {
+    let generation = current_generation(paths)
+        .ok_or_else(|| "Windows runtime/current generation marker is missing".to_owned())?;
+    crate::link::migrate_runtime_control::reconcile_current_generation_for_runtime_at(
+        &runtime.config_dir,
+        &paths.current_binary,
+        &generation,
+        &runtime.config_dir.join("runtime-control.json"),
+        &runtime.config_dir.join("runtime-status.json"),
+    )
+    .map(|_| ())
 }
 
 fn install() -> Result<(), String> {
@@ -468,7 +488,7 @@ fn ensure_herdr_dependency_running(paths: &WindowsPaths) -> Result<bool, String>
         return Ok(false);
     }
 
-    let binary = find_herdr_executable().ok_or_else(|| {
+    let binary = crate::workstation::find_herdr_executable().ok_or_else(|| {
         "Herdr is not running and herdr.exe is not discoverable; install Herdr or make its executable available to the current user"
             .to_owned()
     })?;
@@ -521,19 +541,6 @@ fn herdr_dependency_reachable(paths: &WindowsPaths) -> bool {
     crate::herdr::HerdrClient::new(&paths.herdr_socket)
         .call_with_timeout("ping", json!({}), Duration::from_millis(250))
         .is_ok()
-}
-
-fn find_herdr_executable() -> Option<PathBuf> {
-    let installed = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|root| {
-            root.join("Programs")
-                .join("Herdr")
-                .join("bin")
-                .join("herdr.exe")
-        })
-        .filter(|path| path.is_file());
-    installed.or_else(|| crate::workstation::find_executable("herdr"))
 }
 
 fn record_herdr_dependency_warning(paths: &WindowsPaths, error: &str) {
@@ -606,7 +613,8 @@ fn start_managed_process(
         .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
         .env_remove("CLOUDFLARE_API_TOKEN")
         .env_remove("CLOUDFLARE_ACCOUNT_ID")
-        .env_remove("HERDR_MCP_TOKEN");
+        .env_remove("HERDR_MCP_TOKEN")
+        .env("HERDR_RUNTIME_GENERATION", &generation);
     if let Some(instance) = paths.instance_name.as_deref() {
         command.env("HERDR_MCP_INSTANCE", instance);
     }
