@@ -2766,7 +2766,21 @@ async function handleBrowserActuation(command) {
     return;
   }
   const sessionRef = String(params.session_ref || "");
-  let target = browserSessionTargets.get(sessionRef);
+  let target = browserSessionTargets.get(sessionRef) || null;
+  if (target) {
+    let cachedTab = null;
+    try { cachedTab = await chrome.tabs.get(target.tabId); } catch (_) {}
+    const cachedProvider = target.provider || "chatgpt";
+    const cachedLive = browserConversationInfo(cachedProvider, cachedTab?.url || "");
+    const cachedTargetCurrent = target.observationGeneration === expectedGeneration
+      && Boolean(cachedTab)
+      && cachedLive?.conversation_id === target.conversationId
+      && cachedLive?.convKey === target.convKey;
+    if (!cachedTargetCurrent) {
+      browserSessionTargets.delete(sessionRef);
+      target = null;
+    }
+  }
   if (!target) {
     const recovered = await recoverBrowserSessionTarget(sessionRef, expectedGeneration);
     target = recovered.target;
@@ -2779,6 +2793,7 @@ async function handleBrowserActuation(command) {
     }
   }
   if (target.observationGeneration !== expectedGeneration) {
+    browserSessionTargets.delete(sessionRef);
     await postBrowserActuationEvidence(
       actuationId,
       unavailableBrowserActuationEvidence(expectedGeneration, target.observationGeneration),
@@ -2789,7 +2804,7 @@ async function handleBrowserActuation(command) {
   try { tab = await chrome.tabs.get(target.tabId); } catch (_) {}
   const targetProvider = target.provider || "chatgpt";
   const live = browserConversationInfo(targetProvider, tab?.url || "");
-  if (!tab || live?.conversation_id !== target.conversationId) {
+  if (!tab || live?.conversation_id !== target.conversationId || live?.convKey !== target.convKey) {
     browserSessionTargets.delete(sessionRef);
     await postBrowserActuationEvidence(
       actuationId,
