@@ -65,7 +65,7 @@ herdr-mcp permissions verify
 
 ## Agent 能力发现：`scan`
 
-`doctor` 回答的是**“这套安装现在健康吗？”**；`scan` 回答的是**“这台机器上的 Agent 到底有哪些已经被证据确认的能力？”**。
+`doctor` 回答的是**“这套安装现在健康吗？”**。macOS 已安装受管 STANDALONE 扩展时，它还会输出 `standalone-extension-load` 证据和 `DOCTOR_JSON.standalone_extension` 对象；`state=drift` 表示 Google Chrome 正在从 `~/.config/herdr-mcp/extensions/standalone/current` 之外的路径加载同一个固定 standalone extension ID，对象会给出 `expected_path`、实际加载路径/profile、Chromium `location` 和 `drift_count`。浏览器扩展属于可选能力，因此这条 advisory 不会把原本健康的核心 MCP/service readiness 判成失败。`scan` 回答的是**“这台机器上的 Agent 到底有哪些已经被证据确认的能力？”**。
 
 ```bash
 herdr-mcp scan

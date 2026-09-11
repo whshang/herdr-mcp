@@ -126,6 +126,8 @@ Herdr-MCP 可以直接完成确定性的操作。长时间实现、大型重构�
 
 核心 ChatGPT → MCP → 开发机连接不依赖浏览器扩展。需要长对话连续工作、排队下一轮消息、Browser Control Center 或支持的 ChatGPT artifact 捕获时再安装。
 
+如果在 macOS 使用 STANDALONE 通道，`herdr-mcp doctor` 还会检查 Google Chrome 是否真的从受管 `~/.config/herdr-mcp/extensions/standalone/current` 路径加载固定 Herdr standalone ID。出现 `standalone-extension-load state=drift` 表示 Chrome 仍在使用另一份 Load unpacked 目录；按 `doctor` 输出的 `expected` 路径重新加载 Herdr 扩展即可。
+
 [Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [扩展说明](docs/i18n/zh-CN/extension.md) · [浏览器连续工作](docs/i18n/zh-CN/browser-continuity.md)
 
 ## 常见问题

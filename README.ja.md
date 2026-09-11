@@ -126,6 +126,8 @@ Herdr は Worker control plane で pairing を作成するため、その操作�
 
 ChatGPT → MCP → 開発マシンの基本接続には必須ではありません。会話の継続、queued next-turn、Browser Control Center、対応する ChatGPT artifact capture が必要な場合に追加します。
 
+macOS で STANDALONE channel を使う場合、`herdr-mcp doctor` は Google Chrome が固定 Herdr standalone ID を managed path `~/.config/herdr-mcp/extensions/standalone/current` から実際に読み込んでいるかも確認します。`standalone-extension-load state=drift` が出た場合、Chrome は別の Load-unpacked directory を使っているため、`doctor` が示す `expected` path から Herdr extension を再読み込みしてください。
+
 [Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [Extension guide](docs/i18n/en/extension.md) · [Browser continuity](docs/i18n/en/browser-continuity.md)
 
 ## よくある質問

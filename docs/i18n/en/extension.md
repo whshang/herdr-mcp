@@ -41,6 +41,8 @@ A release runtime defaults to its immutable compile-time source commit; only a d
 
 The installer resolves the requested ref to an immutable commit SHA and downloads only Git-tracked files below that commit's `extension/` tree. Every file remains byte-identical to the repository source except `manifest.json`, where Herdr injects the public `key` required for the fixed STANDALONE extension ID. The repo/worktree DEV manifest is never modified. `herdr-mcp extension standalone status` reports the installed commit, version, ID, and path.
 
+On macOS, also run `herdr-mcp doctor` after installing or updating STANDALONE. `standalone status` describes the managed files on disk; `doctor` additionally reads only the Herdr extension's exact entry in Google Chrome profile preferences and compares Chrome's active Load-unpacked path with the managed path above. If it reports `WARN standalone-extension-load state=drift`, the same fixed extension ID is being loaded from another directory, commonly an older Downloads or development copy. Open `chrome://extensions`, find the Herdr extension, and load/reload it from the `expected` path reported by `doctor`. Do not switch Native Host channels, delete extension data, or copy credentials merely to repair this path mismatch. The check is diagnostic only: it never rewrites Chrome configuration or reloads tabs.
+
 After choosing a channel, verify:
 
 ```bash
