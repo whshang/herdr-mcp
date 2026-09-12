@@ -26,6 +26,8 @@ Treat phrases such as “continue”, “resume”, “keep going”, “接着�
 
 Use the existing `herdr_call` local methods in this order:
 
+Performance rule: when stable `conversation_id` and optional `project_id` are already available from the user's input, call `continuity.resume` once with those identifiers. Do not spend a separate `continuity.resolve` round trip before that resume; use `continuity.search` only when stable identity remains ambiguous.
+
 1. If the user supplies a full ChatGPT conversation URL, pass it unchanged to `continuity.resume` as `conversation_url`. Rust parses the Project/conversation identity and resumes the unique durable chain in the same call; use `continuity.search` only if the result is ambiguous. The browser extension is not required for this manual URL-based recovery. If the URL was never captured into the local journal, the private ChatGPT body cannot be fetched through MCP from the URL alone; continue from independently persisted Herdr/Git state only when that evidence is sufficient.
 2. If the conversation contains an explicit `continuity_id` or `[HERDR_CONTINUITY_REF ...]`, call `continuity.resume` for exactly that ID.
 3. If a concrete current/known conversation ID is available, prefer `continuity.resolve` for that exact conversation.
