@@ -16,17 +16,21 @@ const CONV = "https://chatgpt.com/g/project/c/1";
 test("journal exposes the shared storage key and a compact continuity seed", () => {
   assert.equal(typeof CONTINUITY_JOURNAL_STORAGE_KEY, "string");
   assert.ok(CONTINUITY_JOURNAL_STORAGE_KEY.length > 0);
-  const seed = buildContinuitySeed({ transferId: "ht:1", continuityId: CID });
+  const seed = buildContinuitySeed({ transferId: "ht:1", continuityId: CID, sourceUrl: CONV });
   assert.ok(seed.includes(CONTINUITY_SEED_PREFIX));
-  assert.ok(seed.includes(`continuity_id=${CID}`));
+  assert.ok(seed.includes(`continuity_id=`));
+  assert.ok(seed.includes(CONV));
+  assert.ok(seed.includes(`source_url: `));
   assert.ok(continuitySeedContainsReference(seed, "ht:1"));
   assert.equal(continuitySeedContainsReference(seed, "ht:other"), false);
 });
 
 test("continuity seed instructs continuity.resume then live revalidation", () => {
-  const seed = buildContinuitySeed({ transferId: "ht:1", continuityId: CID });
+  const seed = buildContinuitySeed({ transferId: "ht:1", continuityId: CID, sourceUrl: CONV });
   assert.ok(seed.includes('method 为 continuity.resume'));
   assert.ok(seed.includes("continuity.resume"));
+  assert.ok(seed.includes("conversation_url"));
+  assert.ok(!seed.includes("<<<HERDR_HANDOFF_V1"));
   assert.ok(seed.includes("重新检查相关 Herdr/runtime/Git 实时状态"));
 });
 

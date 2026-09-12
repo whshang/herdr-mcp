@@ -411,6 +411,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "access": "mutation",
             "params": {
                 "properties": {
+                    "source_url": {"type": ["string", "null"], "maxLength": 2048},
                     "endpoint_ref": {"type": "string", "maxLength": 96},
                     "provider": {"type": "string", "maxLength": 32},
                     "account_ref": {"type": "string", "maxLength": 96},
@@ -424,7 +425,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "work_chain_id": {"type": ["string", "null"], "maxLength": 128},
                     "lane_id": {"type": ["string", "null"], "maxLength": 160},
                 },
-                "required": ["endpoint_ref", "provider", "account_ref", "display_label", "message", "expected_generation", "idempotency_key"],
+                "required": ["message", "idempotency_key"],
                 "empty": false,
             },
         }),
@@ -2444,19 +2445,15 @@ mod tests {
         assert_eq!(methods[8]["method"], BROWSER_SESSION_CREATE_METHOD);
         assert_eq!(
             methods[8]["params"]["required"],
-            json!([
-                "endpoint_ref",
-                "provider",
-                "account_ref",
-                "display_label",
-                "message",
-                "expected_generation",
-                "idempotency_key"
-            ])
+            json!(["message", "idempotency_key"])
         );
         assert_eq!(
             methods[8]["params"]["properties"]["message"]["maxLength"],
             262144
+        );
+        assert_eq!(
+            methods[8]["params"]["properties"]["source_url"]["maxLength"],
+            2048
         );
         assert_eq!(
             methods[8]["params"]["properties"]["reasoning_effort"]["enum"],

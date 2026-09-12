@@ -31,7 +31,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; never select a chain by recency or text similarity alone. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, prefer browser_session.create with source_url, message, and idempotency_key; do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -420,6 +420,37 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     Ok(tool_result(output, false))
 }
 
+fn chatgpt_conversation_url_ref(raw: &str) -> Option<(String, Option<String>)> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    if parsed.scheme() != "https"
+        || !matches!(
+            parsed.host_str()?.to_ascii_lowercase().as_str(),
+            "chatgpt.com" | "www.chatgpt.com"
+        )
+    {
+        return None;
+    }
+    let segments = parsed
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["c", conversation_id] => Some(((*conversation_id).to_owned(), None)),
+        ["g", project_segment, "c", conversation_id] if project_segment.starts_with("g-p-") => {
+            let resource_id = project_segment.strip_prefix("g-p-")?.split('-').next()?;
+            let project_id = if resource_id.len() == 32
+                && resource_id.chars().all(|ch| ch.is_ascii_hexdigit())
+            {
+                format!("g-p-{resource_id}")
+            } else {
+                (*project_segment).to_owned()
+            };
+            Some(((*conversation_id).to_owned(), Some(project_id)))
+        }
+        _ => None,
+    }
+}
+
 fn continuity_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
@@ -430,15 +461,75 @@ fn continuity_call(
     };
     match method {
         "continuity.resume" => {
-            let Some(continuity_id) = params
-                .get("continuity_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                return json!({"ok": false, "code": "continuity_id_required"});
+            let Some(object) = params.as_object() else {
+                return json!({"ok": false, "code": "continuity_resume_params_invalid"});
             };
-            match store.continuity_resume(continuity_id, 32) {
+            const ALLOWED: &[&str] = &["continuity_id", "conversation_url"];
+            if let Some(key) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
+                return json!({
+                    "ok": false,
+                    "code": "continuity_resume_params_invalid",
+                    "message": format!("unknown continuity.resume param: {key}"),
+                });
+            }
+            let explicit_id = match continuity_search_string(params, "continuity_id", 160) {
+                Ok(value) => value,
+                Err(_) => return json!({"ok": false, "code": "continuity_resume_params_invalid"}),
+            };
+            let conversation_url = match continuity_search_string(params, "conversation_url", 2048)
+            {
+                Ok(value) => value,
+                Err(_) => return json!({"ok": false, "code": "continuity_resume_params_invalid"}),
+            };
+            if explicit_id.is_some() && conversation_url.is_some() {
+                return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "pass continuity_id or conversation_url, not both"});
+            }
+            let continuity_id = if let Some(value) = explicit_id {
+                value.to_owned()
+            } else if let Some(raw_url) = conversation_url {
+                let Some((conversation_id, project_id)) = chatgpt_conversation_url_ref(raw_url)
+                else {
+                    return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "conversation_url must be a ChatGPT conversation URL"});
+                };
+                match store.continuity_for_conversation(&conversation_id) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        let Some(project_id) = project_id else {
+                            return json!({"ok": false, "code": "continuity_not_found", "conversation_url": raw_url});
+                        };
+                        let records = match store.continuity_search(ContinuitySearchInput {
+                            project_id: Some(&project_id),
+                            workspace_id: None,
+                            conversation_id: None,
+                            query: None,
+                            limit: 2,
+                        }) {
+                            Ok(records) => records,
+                            Err(error) => {
+                                return json!({"ok": false, "code": "continuity_read_failed", "message": error});
+                            }
+                        };
+                        match records.as_slice() {
+                            [record] => record.continuity_id.clone(),
+                            [] => {
+                                return json!({"ok": false, "code": "continuity_not_found", "conversation_url": raw_url});
+                            }
+                            _ => {
+                                return json!({"ok": false, "code": "continuity_ambiguous", "conversation_url": raw_url});
+                            }
+                        }
+                    }
+                    Err(error) if error == "continuity_binding_ambiguous" => {
+                        return json!({"ok": false, "code": "continuity_ambiguous", "conversation_url": raw_url});
+                    }
+                    Err(error) => {
+                        return json!({"ok": false, "code": "continuity_read_failed", "message": error});
+                    }
+                }
+            } else {
+                return json!({"ok": false, "code": "continuity_id_or_url_required"});
+            };
+            match store.continuity_resume(&continuity_id, 32) {
                 Ok(Some(record)) => {
                     let turns = record
                         .turns
@@ -494,6 +585,7 @@ fn continuity_call(
                 "project_id",
                 "workspace_id",
                 "conversation_id",
+                "conversation_url",
                 "query",
                 "limit",
             ];
@@ -504,7 +596,7 @@ fn continuity_call(
                     "message": format!("unknown continuity.search param: {key}"),
                 });
             }
-            let project_id = match continuity_search_string(params, "project_id", 256) {
+            let explicit_project_id = match continuity_search_string(params, "project_id", 256) {
                 Ok(value) => value,
                 Err(error) => return error,
             };
@@ -512,10 +604,54 @@ fn continuity_call(
                 Ok(value) => value,
                 Err(error) => return error,
             };
-            let conversation_id = match continuity_search_string(params, "conversation_id", 512) {
+            let explicit_conversation_id =
+                match continuity_search_string(params, "conversation_id", 512) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+            let conversation_url = match continuity_search_string(params, "conversation_url", 2048)
+            {
                 Ok(value) => value,
                 Err(error) => return error,
             };
+            let (url_conversation_id, url_project_id) = match conversation_url {
+                Some(raw) => match chatgpt_conversation_url_ref(raw) {
+                    Some((conversation_id, project_id)) => (Some(conversation_id), project_id),
+                    None => {
+                        return json!({
+                            "ok": false,
+                            "code": "continuity_search_params_invalid",
+                            "message": "conversation_url must be a ChatGPT conversation URL",
+                        });
+                    }
+                },
+                None => (None, None),
+            };
+            if explicit_conversation_id
+                .is_some_and(|value| Some(value) != url_conversation_id.as_deref())
+                && url_conversation_id.is_some()
+            {
+                return json!({
+                    "ok": false,
+                    "code": "continuity_search_params_invalid",
+                    "message": "conversation_id conflicts with conversation_url",
+                });
+            }
+            if explicit_project_id.is_some_and(|value| Some(value) != url_project_id.as_deref())
+                && url_project_id.is_some()
+            {
+                return json!({
+                    "ok": false,
+                    "code": "continuity_search_params_invalid",
+                    "message": "project_id conflicts with conversation_url",
+                });
+            }
+            let project_id_owned = explicit_project_id.map(str::to_owned).or(url_project_id);
+            let conversation_id_owned = explicit_conversation_id
+                .map(str::to_owned)
+                .or(url_conversation_id);
+            let project_id = project_id_owned.as_deref();
+            let conversation_id = conversation_id_owned.as_deref();
             let query = match continuity_search_string(params, "query", 512) {
                 Ok(value) => value,
                 Err(error) => return error,
@@ -2331,6 +2467,121 @@ fn browser_session_create_success(
     })
 }
 
+fn browser_session_create_params_from_source(
+    store: &StateStore,
+    params: &Value,
+) -> Result<Option<Value>, Value> {
+    let Some(source_url) = params.get("source_url") else {
+        return Ok(None);
+    };
+    let Some(source_url) = source_url
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+    };
+    if source_url.len() > 2048 || source_url.chars().any(char::is_control) {
+        return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+    }
+    let Some(object) = params.as_object() else {
+        return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+    };
+    const ALLOWED: &[&str] = &[
+        "source_url",
+        "message",
+        "idempotency_key",
+        "work_chain_id",
+        "lane_id",
+    ];
+    if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+    }
+    let message = browser_required_string(params, "message", 262_144)?;
+    let message = if message.contains(source_url) {
+        message.to_owned()
+    } else {
+        let source_reference = format!(" source_url: {source_url}");
+        let actual_bytes = message.len().saturating_add(source_reference.len());
+        if actual_bytes > 262_144 {
+            return Err(json!({
+                "ok": false,
+                "code": "browser_message_invalid",
+                "limit": {
+                    "kind": "max_bytes",
+                    "max_bytes": 262_144,
+                    "actual_bytes": actual_bytes,
+                }
+            }));
+        }
+        format!("{message}{source_reference}")
+    };
+    let idempotency_key = browser_required_idempotency_key(params)?;
+    let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
+    let lane_id = browser_optional_string(params, "lane_id", 160)?;
+    let session_ref = match store.browser_session_ref_for_canonical_url(source_url) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_session_not_found"})),
+        Err(error) => return Err(browser_store_error(error)),
+    };
+    let session = match store.browser_resource(&session_ref) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_session_not_found"})),
+        Err(error) => return Err(browser_store_error(error)),
+    };
+    let Some(parent_ref) = session.parent_ref.as_deref() else {
+        return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+    };
+    let parent = match store.browser_resource(parent_ref) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_scope_missing"})),
+        Err(error) => return Err(browser_store_error(error)),
+    };
+    let (space_ref, account) = if parent.kind == "space" {
+        let Some(account_ref) = parent.parent_ref.as_deref() else {
+            return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+        };
+        let account = match store.browser_resource(account_ref) {
+            Ok(Some(value)) => value,
+            Ok(None) => return Err(json!({"ok": false, "code": "browser_source_scope_missing"})),
+            Err(error) => return Err(browser_store_error(error)),
+        };
+        (Some(parent.resource_ref.as_str()), account)
+    } else if parent.kind == "account" {
+        (None, parent.clone())
+    } else {
+        return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+    };
+    if session.provider != "chatgpt"
+        || parent.provider != session.provider
+        || account.kind != "account"
+        || account.provider != session.provider
+        || parent.endpoint_ref != session.endpoint_ref
+        || account.endpoint_ref != session.endpoint_ref
+        || parent.observation_generation != session.observation_generation
+        || account.observation_generation != session.observation_generation
+    {
+        return Err(json!({"ok": false, "code": "browser_source_scope_mismatch"}));
+    }
+    let display_label = parent
+        .display_label
+        .as_deref()
+        .or(session.display_label.as_deref())
+        .unwrap_or("ChatGPT continuation");
+    Ok(Some(json!({
+        "endpoint_ref": session.endpoint_ref,
+        "provider": "chatgpt",
+        "account_ref": account.resource_ref,
+        "space_ref": space_ref,
+        "display_label": display_label,
+        "message": message,
+        "expected_generation": session.observation_generation,
+        "idempotency_key": idempotency_key,
+        "work_chain_id": work_chain_id,
+        "lane_id": lane_id,
+    })))
+}
+
 fn browser_session_create(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -2995,6 +3246,22 @@ fn browser_operation_call_with_controls(
     if let Some(error) = browser_reject_forbidden_input(object) {
         return error;
     }
+    let normalized_params;
+    let params = if operation == BrowserOperation::SessionCreate
+        && object.contains_key("source_url")
+    {
+        let Ok(store_guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        normalized_params = match browser_session_create_params_from_source(&store_guard, params) {
+            Ok(Some(value)) => value,
+            Ok(None) => unreachable!(),
+            Err(error) => return error,
+        };
+        &normalized_params
+    } else {
+        params
+    };
     if let Err(error) = validate_browser_operation_params(operation, params) {
         return error;
     }
@@ -4991,7 +5258,7 @@ mod tests {
                     "hc:alpha",
                     "conv-a",
                     "w19",
-                    "project-a",
+                    "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "Alpha release",
                     "msg-a",
                     "continue v0.4.2 release work",
@@ -5045,6 +5312,33 @@ mod tests {
         assert_eq!(exact["candidates"][0]["continuity_id"], "hc:alpha");
         assert_eq!(exact["candidates"][0]["match_reasons"][0], "workspace_id");
 
+        let url_exact = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({
+                "conversation_url": "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project/c/conv-a?foo=bar#tail"
+            }),
+        );
+        assert_eq!(url_exact["resolution"], "unique_exact");
+        assert_eq!(url_exact["auto_resume_safe"], true);
+        assert_eq!(url_exact["candidates"][0]["continuity_id"], "hc:alpha");
+
+        let resumed_url = continuity_call(
+            &store,
+            "continuity.resume",
+            &json!({"conversation_url": "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project/c/conv-a"}),
+        );
+        assert_eq!(resumed_url["ok"], true);
+        assert_eq!(resumed_url["continuity_id"], "hc:alpha");
+
+        let resumed_project = continuity_call(
+            &store,
+            "continuity.resume",
+            &json!({"conversation_url": "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project/c/unseen-conv"}),
+        );
+        assert_eq!(resumed_project["ok"], true);
+        assert_eq!(resumed_project["continuity_id"], "hc:alpha");
+
         let text_only = continuity_call(&store, "continuity.search", &json!({"query": "v0.4.2"}));
         assert_eq!(text_only["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(text_only["resolution"], "confirmation_required");
@@ -5057,7 +5351,7 @@ mod tests {
                     continuity_id: "hc:gamma",
                     conversation_id: "conv-c",
                     workspace_id: Some("w19"),
-                    project_id: Some("project-a"),
+                    project_id: Some("g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                     title: Some("Gamma release"),
                     message_id: "msg-c",
                     role: "user",
@@ -5918,6 +6212,43 @@ mod tests {
                     observation_generation: 7,
                     observed_at: 13,
                 })
+                .unwrap();
+            let space = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "space",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-create-space",
+                    display_label: Some("Project A"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &space.resource_ref,
+                    "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project",
+                    7,
+                    12,
+                )
+                .unwrap();
+            let source = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    native_identity: "session-create-source",
+                    display_label: Some("Source"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let source_url =
+                "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+            guard
+                .upsert_browser_resource_locator(&source.resource_ref, source_url, 7, 12)
                 .unwrap();
             guard
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
@@ -7530,7 +7861,7 @@ mod tests {
                         endpoint_ref: &reservation.endpoint_ref,
                         provider: &reservation.provider,
                         kind: "session",
-                        parent_ref: Some(account_ref),
+                        parent_ref: reservation.space_ref.as_deref().or(Some(account_ref)),
                         native_identity: &native_identity,
                         display_label: Some(&reservation.display_label),
                         observation_generation: expected_generation,
@@ -7565,7 +7896,22 @@ mod tests {
             ) -> Result<BrowserPostconditionEvidence, String> {
                 assert_eq!(operation, BrowserOperation::SessionCreate.method());
                 assert_eq!(dispatch_id, params["reservation_ref"].as_str());
-                assert_eq!(params["launch_url"], "https://chatgpt.com");
+                assert!(
+                    params["launch_url"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("https://chatgpt.com")
+                );
+                if params["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("continue from source URL")
+                {
+                    assert_eq!(
+                        params["message"],
+                        "continue from source URL source_url: https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv"
+                    );
+                }
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.materialize(params, expected_generation);
                 let mut evidence = Self::applied_evidence(expected_generation);
@@ -7594,7 +7940,7 @@ mod tests {
         }
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let (endpoint_ref, account_ref) = {
+        let (endpoint_ref, account_ref, source_url) = {
             let mut guard = store.lock().unwrap();
             let endpoint = guard
                 .register_browser_endpoint(BrowserEndpointRegistrationInput {
@@ -7635,6 +7981,43 @@ mod tests {
                     12,
                 )
                 .unwrap();
+            let space = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "space",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-create-project",
+                    display_label: Some("Project A"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &space.resource_ref,
+                    "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project",
+                    7,
+                    12,
+                )
+                .unwrap();
+            let source = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    native_identity: "session-create-source",
+                    display_label: Some("Source"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let source_url =
+                "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+            guard
+                .upsert_browser_resource_locator(&source.resource_ref, source_url, 7, 12)
+                .unwrap();
             guard
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                     endpoint_ref: &endpoint.endpoint_ref,
@@ -7645,7 +8028,11 @@ mod tests {
                     observed_at: 13,
                 })
                 .unwrap();
-            (endpoint.endpoint_ref, account.resource_ref)
+            (
+                endpoint.endpoint_ref,
+                account.resource_ref,
+                source_url.to_owned(),
+            )
         };
 
         let immediate = SessionCreateActuator {
@@ -7723,6 +8110,36 @@ mod tests {
                 .load(Ordering::SeqCst),
             0
         );
+
+        let shortcut_params = json!({
+            "source_url": source_url,
+            "message": "continue from source URL",
+            "idempotency_key": "session-create-source-url-1"
+        });
+        let shortcut = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &shortcut_params,
+            true,
+            Some(&immediate),
+        );
+        assert_eq!(shortcut["ok"], true);
+        let shortcut_ref = shortcut["session_ref"].as_str().unwrap();
+        let shortcut_resource = store
+            .lock()
+            .unwrap()
+            .browser_resource(shortcut_ref)
+            .unwrap()
+            .unwrap();
+        let shortcut_parent = store
+            .lock()
+            .unwrap()
+            .browser_resource(shortcut_resource.parent_ref.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(shortcut_parent.kind, "space");
+        assert_eq!(shortcut_parent.display_label.as_deref(), Some("Project A"));
+        assert_eq!(immediate.calls.load(Ordering::SeqCst), 2);
 
         let delayed = SessionCreateActuator {
             store: store.clone(),
