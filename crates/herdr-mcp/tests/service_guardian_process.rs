@@ -85,6 +85,31 @@ fn wait_child(child: &mut Child, budget: Duration) -> std::process::ExitStatus {
     }
 }
 
+fn binary_under_test() -> PathBuf {
+    let mut root = std::env::current_dir().expect("test working directory");
+    loop {
+        let manifest = root.join("Cargo.toml");
+        if manifest.is_file()
+            && fs::read_to_string(&manifest).is_ok_and(|text| text.contains("[workspace]"))
+        {
+            break;
+        }
+        assert!(root.pop(), "cannot locate workspace root from test cwd");
+    }
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let binary = root.join("target").join(profile).join("herdr-mcp");
+    assert!(
+        binary.is_file(),
+        "missing binary under test: {}",
+        binary.display()
+    );
+    binary
+}
+
 #[test]
 fn guardian_real_exec_inherits_pipe_and_lock_until_committed_hup() {
     let root = test_root();
@@ -138,8 +163,8 @@ fn guardian_real_exec_inherits_pipe_and_lock_until_committed_hup() {
     assert!(![read_fd, write_fd, lock_fd].contains(&GUARDIAN_PARENT_FD));
     assert!(![read_fd, write_fd, lock_fd].contains(&GUARDIAN_LOCK_FD));
 
-    let binary = env!("CARGO_BIN_EXE_herdr-mcp");
-    let mut command = Command::new(binary);
+    let binary = binary_under_test();
+    let mut command = Command::new(&binary);
     command
         .args([
             "service",
