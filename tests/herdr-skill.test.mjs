@@ -67,6 +67,12 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /Live herdr-mcp runtime context/);
     assert.match(r.content, /Latency-aware tool scheduling/);
     assert.match(r.content, /dependency-aware \*\*wave\*\*/);
+    assert.match(r.content, /host-side safety rejection.*pre-delivery/s);
+    assert.match(r.content, /none of Herdr's normal execution identity\/evidence fields.*op_id.*session_id.*device_id/s);
+    assert.match(r.content, /do not repeat the identical rejected payload/);
+    assert.match(r.content, /one bounded single-purpose read\/probe per call/);
+    assert.match(r.content, /not permission to bypass, disable, or evade host safety checks/);
+    assert.match(r.content, /never escalate to a more powerful tool solely to force a rejected request through/);
     assert.match(r.content, /herdr_git status.*diff.*log.*herdr_exec.*herdr_fs_grep.*compacted/s);
     assert.match(r.content, /counts.*compacted.*summarized `output`/s);
     assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start` \/ `herdr_exec_read`/);
