@@ -775,7 +775,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
     },
     BuiltinSkillSpec {
         id: "agent-dispatch",
-        description: "Select and submit safe compatible coding-agent work from live capability facts.",
+        description: "Select and submit safe compatible local-agent work from live capability facts, including bounded fallback after a host-side pre-delivery rejection.",
         content: AGENT_DISPATCH,
         triggers: &[
             "delegate",
@@ -783,6 +783,9 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
             "review",
             "parallel implementation",
             "audit",
+            "pre-delivery",
+            "host rejection",
+            "safety rejection",
         ],
         requires_capabilities: &["live agent state"],
         related_skills: &["workstation-control", "development-orchestration"],
@@ -2068,6 +2071,37 @@ mod tests {
         assert!(content.contains("continuity.search"));
         assert!(content.contains("confirmation_required"));
         assert!(content.contains("never choose by recency or textual similarity"));
+    }
+
+    #[test]
+    fn agent_dispatch_is_discoverable_for_host_pre_delivery_fallback() {
+        let service = ProgressiveSkillService::new();
+        let descriptor = service
+            .catalog()
+            .into_iter()
+            .find(|item| item.id == "agent-dispatch")
+            .expect("agent-dispatch must be in the builtin catalog");
+        assert!(descriptor.description.contains("pre-delivery rejection"));
+        for expected in ["pre-delivery", "host rejection", "safety rejection"] {
+            assert!(
+                descriptor
+                    .triggers
+                    .iter()
+                    .any(|trigger| trigger == expected)
+            );
+        }
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["agent-dispatch"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["ok"], true);
+        let content = loaded["skills"][0]["content"].as_str().unwrap();
+        assert!(content.contains("Host-side pre-delivery rejection"));
+        assert!(content.contains("existing compatible local Agent"));
+        assert!(content.contains("fallback chain stops"));
     }
 
     #[test]
