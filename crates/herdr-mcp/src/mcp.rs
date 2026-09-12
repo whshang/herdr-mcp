@@ -31,7 +31,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, prefer browser_session.create with source_url, message, and idempotency_key; do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, prefer browser_session.create with source_url, message, and idempotency_key; do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -466,7 +466,12 @@ fn continuity_call(
             let Some(object) = params.as_object() else {
                 return json!({"ok": false, "code": "continuity_resume_params_invalid"});
             };
-            const ALLOWED: &[&str] = &["continuity_id", "conversation_url"];
+            const ALLOWED: &[&str] = &[
+                "continuity_id",
+                "conversation_url",
+                "conversation_id",
+                "project_id",
+            ];
             if let Some(key) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
                 return json!({
                     "ok": false,
@@ -483,9 +488,52 @@ fn continuity_call(
                 Ok(value) => value,
                 Err(_) => return json!({"ok": false, "code": "continuity_resume_params_invalid"}),
             };
-            if explicit_id.is_some() && conversation_url.is_some() {
-                return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "pass continuity_id or conversation_url, not both"});
+            let conversation_id = match continuity_search_string(params, "conversation_id", 512) {
+                Ok(value) => value,
+                Err(_) => return json!({"ok": false, "code": "continuity_resume_params_invalid"}),
+            };
+            let project_id = match continuity_search_string(params, "project_id", 512) {
+                Ok(value) => value,
+                Err(_) => return json!({"ok": false, "code": "continuity_resume_params_invalid"}),
+            };
+            let selector_count = usize::from(explicit_id.is_some())
+                + usize::from(conversation_url.is_some())
+                + usize::from(conversation_id.is_some());
+            if selector_count == 0 && project_id.is_none() {
+                return json!({"ok": false, "code": "continuity_id_or_url_required"});
             }
+            if selector_count != 1 || (project_id.is_some() && conversation_id.is_none()) {
+                return json!({
+                    "ok": false,
+                    "code": "continuity_resume_params_invalid",
+                    "message": "pass exactly one of continuity_id, conversation_url, or conversation_id; project_id is only valid with conversation_id"
+                });
+            }
+            let resolve_identity = |conversation_id: &str,
+                                    project_id: Option<&str>|
+             -> Result<Option<String>, String> {
+                match store.continuity_for_conversation(conversation_id) {
+                    Ok(Some(value)) => Ok(Some(value)),
+                    Ok(None) => {
+                        let Some(project_id) = project_id else {
+                            return Ok(None);
+                        };
+                        let records = store.continuity_search(ContinuitySearchInput {
+                            project_id: Some(project_id),
+                            workspace_id: None,
+                            conversation_id: None,
+                            query: None,
+                            limit: 2,
+                        })?;
+                        match records.as_slice() {
+                            [record] => Ok(Some(record.continuity_id.clone())),
+                            [] => Ok(None),
+                            _ => Err("continuity_binding_ambiguous".to_owned()),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            };
             let continuity_id = if let Some(value) = explicit_id {
                 value.to_owned()
             } else if let Some(raw_url) = conversation_url {
@@ -493,33 +541,10 @@ fn continuity_call(
                 else {
                     return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "conversation_url must be a ChatGPT conversation URL"});
                 };
-                match store.continuity_for_conversation(&conversation_id) {
+                match resolve_identity(&conversation_id, project_id.as_deref()) {
                     Ok(Some(value)) => value,
                     Ok(None) => {
-                        let Some(project_id) = project_id else {
-                            return json!({"ok": false, "code": "continuity_not_found", "conversation_url": raw_url});
-                        };
-                        let records = match store.continuity_search(ContinuitySearchInput {
-                            project_id: Some(&project_id),
-                            workspace_id: None,
-                            conversation_id: None,
-                            query: None,
-                            limit: 2,
-                        }) {
-                            Ok(records) => records,
-                            Err(error) => {
-                                return json!({"ok": false, "code": "continuity_read_failed", "message": error});
-                            }
-                        };
-                        match records.as_slice() {
-                            [record] => record.continuity_id.clone(),
-                            [] => {
-                                return json!({"ok": false, "code": "continuity_not_found", "conversation_url": raw_url});
-                            }
-                            _ => {
-                                return json!({"ok": false, "code": "continuity_ambiguous", "conversation_url": raw_url});
-                            }
-                        }
+                        return json!({"ok": false, "code": "continuity_not_found", "conversation_url": raw_url});
                     }
                     Err(error) if error == "continuity_binding_ambiguous" => {
                         return json!({"ok": false, "code": "continuity_ambiguous", "conversation_url": raw_url});
@@ -528,8 +553,21 @@ fn continuity_call(
                         return json!({"ok": false, "code": "continuity_read_failed", "message": error});
                     }
                 }
+            } else if let Some(conversation_id) = conversation_id {
+                match resolve_identity(conversation_id, project_id) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => {
+                        return json!({"ok": false, "code": "continuity_not_found", "conversation_id": conversation_id});
+                    }
+                    Err(error) if error == "continuity_binding_ambiguous" => {
+                        return json!({"ok": false, "code": "continuity_ambiguous", "conversation_id": conversation_id});
+                    }
+                    Err(error) => {
+                        return json!({"ok": false, "code": "continuity_read_failed", "message": error});
+                    }
+                }
             } else {
-                return json!({"ok": false, "code": "continuity_id_or_url_required"});
+                unreachable!("selector_count guarantees one continuity selector")
             };
             match store.continuity_resume(&continuity_id, 32) {
                 Ok(Some(record)) => {
@@ -5359,6 +5397,40 @@ mod tests {
         assert_eq!(resumed_url["ok"], true);
         assert_eq!(resumed_url["continuity_id"], "hc:alpha");
 
+        let resumed_identity = continuity_call(
+            &store,
+            "continuity.resume",
+            &json!({
+                "conversation_id": "conv-a",
+                "project_id": "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        );
+        assert_eq!(resumed_identity["ok"], true);
+        assert_eq!(resumed_identity["continuity_id"], "hc:alpha");
+
+        let resumed_identity_project = continuity_call(
+            &store,
+            "continuity.resume",
+            &json!({
+                "conversation_id": "unseen-conv",
+                "project_id": "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        );
+        assert_eq!(resumed_identity_project["ok"], true);
+        assert_eq!(resumed_identity_project["continuity_id"], "hc:alpha");
+
+        let mixed_resume = continuity_call(
+            &store,
+            "continuity.resume",
+            &json!({"continuity_id": "hc:alpha", "conversation_id": "conv-a"}),
+        );
+        assert_eq!(mixed_resume["ok"], false);
+        assert_eq!(mixed_resume["code"], "continuity_resume_params_invalid");
+
+        let empty_resume = continuity_call(&store, "continuity.resume", &json!({}));
+        assert_eq!(empty_resume["ok"], false);
+        assert_eq!(empty_resume["code"], "continuity_id_or_url_required");
+
         let resumed_project = continuity_call(
             &store,
             "continuity.resume",
@@ -5394,6 +5466,17 @@ mod tests {
         assert_eq!(ambiguous["resolution"], "confirmation_required");
         assert_eq!(ambiguous["auto_resume_safe"], false);
         assert_eq!(ambiguous["candidates"].as_array().unwrap().len(), 2);
+
+        let ambiguous_identity_resume = continuity_call(
+            &store,
+            "continuity.resume",
+            &json!({
+                "conversation_id": "missing-conv",
+                "project_id": "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        );
+        assert_eq!(ambiguous_identity_resume["ok"], false);
+        assert_eq!(ambiguous_identity_resume["code"], "continuity_ambiguous");
 
         let identity_plus_text = continuity_call(
             &store,
