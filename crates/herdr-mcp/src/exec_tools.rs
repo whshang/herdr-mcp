@@ -7,6 +7,8 @@ use crate::utility_exec;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub fn start(
     client: &HerdrClient,
@@ -123,6 +125,73 @@ pub fn read(registry: &ExecRegistry, args: &Value) -> Value {
     registry.read(id, stream, offset, limit)
 }
 
+const EXEC_WAIT_DEFAULT_TIMEOUT_MS: usize = 10_000;
+const EXEC_WAIT_MAX_TIMEOUT_MS: usize = 20_000;
+const EXEC_WAIT_POLL_MS: u64 = 200;
+
+pub fn wait(registry: &ExecRegistry, args: &Value) -> Value {
+    let id = match required_str(args, "session_id") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let stream = match optional_str(args, "stream") {
+        Ok(value) => value.unwrap_or("both"),
+        Err(error) => return error,
+    };
+    let offset = match optional_usize(args, "offset", 0, 9_007_199_254_740_991usize) {
+        Ok(value) => value.unwrap_or(0),
+        Err(error) => return error,
+    };
+    let limit = match optional_usize(args, "limit", 1, 262_144) {
+        Ok(value) => value.unwrap_or(65_536),
+        Err(error) => return error,
+    };
+    let timeout_ms = match optional_usize(args, "timeout_ms", 1, EXEC_WAIT_MAX_TIMEOUT_MS) {
+        Ok(value) => value.unwrap_or(EXEC_WAIT_DEFAULT_TIMEOUT_MS),
+        Err(error) => return error,
+    };
+    let started = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms as u64);
+
+    loop {
+        let mut view = registry.read(id, stream, offset, limit);
+        if wait_view_ready(&view, offset) {
+            annotate_wait(&mut view, started.elapsed(), false);
+            return view;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            annotate_wait(&mut view, elapsed, true);
+            return view;
+        }
+        thread::sleep(Duration::from_millis(EXEC_WAIT_POLL_MS).min(timeout - elapsed));
+    }
+}
+
+fn wait_view_ready(view: &Value, offset: usize) -> bool {
+    if view.get("ok").and_then(Value::as_bool) == Some(false) {
+        return true;
+    }
+    if view.get("running").and_then(Value::as_bool) == Some(false)
+        || view.get("phase").and_then(Value::as_str) == Some("completed")
+    {
+        return true;
+    }
+    view.get("next_offset")
+        .and_then(Value::as_u64)
+        .is_some_and(|next| next > offset as u64)
+}
+
+fn annotate_wait(view: &mut Value, elapsed: Duration, timed_out: bool) {
+    if let Some(object) = view.as_object_mut() {
+        object.insert(
+            "waited_ms".to_owned(),
+            json!(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+        );
+        object.insert("wait_timed_out".to_owned(), json!(timed_out));
+    }
+}
+
 pub fn kill(registry: &ExecRegistry, args: &Value) -> Value {
     let id = match required_str(args, "session_id") {
         Ok(value) => value,
@@ -171,4 +240,30 @@ fn optional_usize(args: &Value, key: &str, min: usize, max: usize) -> Result<Opt
 
 fn invalid(message: &str) -> Value {
     json!({"ok": false, "code": "invalid_params", "message": message})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_view_ready;
+    use serde_json::json;
+
+    #[test]
+    fn exec_wait_stops_only_for_output_completion_or_error() {
+        assert!(!wait_view_ready(
+            &json!({"ok": true, "running": true, "phase": "running", "next_offset": 10}),
+            10,
+        ));
+        assert!(wait_view_ready(
+            &json!({"ok": true, "running": true, "phase": "running", "next_offset": 11}),
+            10,
+        ));
+        assert!(wait_view_ready(
+            &json!({"ok": true, "running": false, "phase": "completed", "next_offset": 10}),
+            10,
+        ));
+        assert!(wait_view_ready(
+            &json!({"ok": false, "code": "missing_session"}),
+            10
+        ));
+    }
 }

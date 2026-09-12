@@ -18,6 +18,7 @@ pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
 pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
 pub const GITHUB_STATUS_METHOD: &str = "herdr_mcp.github.status";
 pub const CLEANUP_PREVIEW_METHOD: &str = "herdr_mcp.cleanup.preview";
+pub const EXEC_WAIT_METHOD: &str = "herdr_mcp.exec.wait";
 pub const TEXT_READ_METHOD: &str = "herdr_mcp.text.read";
 pub const TEXT_WRITE_METHOD: &str = "herdr_mcp.text.write";
 pub const WORK_MEMORY_BIND_METHOD: &str = "work_memory.bind";
@@ -125,6 +126,21 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "target_ref": {"type": "string"},
                 },
                 "required": ["project_root"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": EXEC_WAIT_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "stream": {"type": "string", "enum": ["stdout", "stderr", "both"]},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 9007199254740991_i64},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 262144},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 20000},
+                },
+                "required": ["session_id"],
                 "empty": false,
             },
         }),
@@ -2394,6 +2410,15 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0]["method"], GITHUB_STATUS_METHOD);
         assert_eq!(methods[0]["params"]["required"][0], "project_root");
+
+        let methods = local_method_schemas("exec.wait");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["method"], EXEC_WAIT_METHOD);
+        assert_eq!(methods[0]["source"], "herdr_mcp_local");
+        assert_eq!(
+            methods[0]["params"]["properties"]["timeout_ms"]["maximum"],
+            20_000
+        );
 
         let methods = local_method_schemas("cleanup");
         assert_eq!(methods.len(), 1);

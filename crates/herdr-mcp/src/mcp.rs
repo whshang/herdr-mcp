@@ -325,6 +325,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &params,
                     context.caller_webchat_control_grants,
                 )
+            } else if method == crate::progressive_skills::EXEC_WAIT_METHOD {
+                exec_tools::wait(context.exec, &params)
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else {

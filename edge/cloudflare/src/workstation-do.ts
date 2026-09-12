@@ -46,6 +46,7 @@ import {
 } from "./errors.js";
 import {
   classifyOp,
+  classifyRequestOp,
   makeLimits,
   MAX_LINK_REQUEST_TIMEOUT_MS,
   MIN_REQUEST_TIMEOUT_MS,
@@ -638,7 +639,7 @@ export class WorkstationDO {
       );
     }
 
-    const opClass = classifyOp(req.op);
+    const opClass = classifyRequestOp(req.op, req.args);
 
     // Known reads are safe to retry after ambiguity. Keep their request
     // lifecycle process-local so read-heavy traffic consumes zero Durable
@@ -996,7 +997,7 @@ export class WorkstationDO {
    */
   private async persistSettlement(requestId: string, completion: Completion): Promise<boolean> {
     const candidate = this.registry.get(requestId);
-    if (candidate && classifyOp(candidate.op) === "read") {
+    if (candidate && candidate.opClass === "read") {
       this.logger.warn("pending.read_rejected_from_durable_settlement", { requestId, op: candidate.op });
       this.registry.removeActive(requestId);
       const resolve = this.resolvers.get(requestId);
@@ -1063,7 +1064,7 @@ export class WorkstationDO {
    */
   private async persistEvictedSettlement(entry: PendingRequest, completion: Completion): Promise<boolean> {
     const requestId = entry.requestId;
-    if (classifyOp(entry.op) === "read") {
+    if (entry.opClass === "read") {
       this.logger.warn("pending.read_rejected_from_durable_eviction", { requestId, op: entry.op });
       const resolve = this.resolvers.get(requestId);
       if (resolve) {
