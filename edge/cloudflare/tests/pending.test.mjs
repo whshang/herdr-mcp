@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeLimits, classifyOp } from "../dist/limits.js";
+import { makeLimits, classifyOp, classifyRequestOp } from "../dist/limits.js";
 import {
   decodeStoredPendingRequest,
   PendingRequestRegistry,
@@ -244,4 +244,7 @@ test("limits: classifyOp only marks known-read ops retryable", () => {
   assert.equal(classifyOp("herdr_prompt"), "mutating");
   assert.equal(classifyOp("some_mystery_tool"), "mutating");
   assert.equal(classifyOp("herdr_skill"), "read");
+  assert.equal(classifyRequestOp("herdr_call", { method: "herdr_mcp.exec.wait" }), "read");
+  assert.equal(classifyRequestOp("herdr_call", { method: "herdr_mcp.exec.wait.extra" }), "mutating");
+  assert.equal(classifyRequestOp("herdr_call", { method: "workspace.list" }), "mutating");
 });

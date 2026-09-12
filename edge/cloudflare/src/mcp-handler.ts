@@ -5,7 +5,7 @@ import { RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 import { MCP_SERVER_VERSION } from "./version.js";
 import { relayErrorRequiresHuman, type RelayErrorResult } from "./errors.js";
 import {
-  classifyOp,
+  classifyRequestOp,
   MAX_REQUEST_TIMEOUT_MS,
   REQUEST_SETTLEMENT_GRACE_MS,
   type EdgeLimits,
@@ -1059,7 +1059,7 @@ export async function handleMcp(
 
     const now = deps.now?.() ?? Date.now();
     const requestId = newRequestId();
-    const opClass = classifyOp(name);
+    const opClass = classifyRequestOp(name, runtimeArgs);
     const idempotencyKey =
       typeof runtimeArgs.idempotency_key === "string" && runtimeArgs.idempotency_key.length > 0
         ? runtimeArgs.idempotency_key

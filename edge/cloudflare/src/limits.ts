@@ -206,3 +206,11 @@ export function classifyOp(op: string): OpClass {
   // Exec/prompt/git can mutate; unknown tool names are treated as mutating.
   return "mutating";
 }
+
+export function classifyRequestOp(op: string, args: unknown): OpClass {
+  if (op === "herdr_call" && args !== null && typeof args === "object" && !Array.isArray(args)) {
+    const method = (args as Record<string, unknown>).method;
+    if (method === "herdr_mcp.exec.wait") return "read";
+  }
+  return classifyOp(op);
+}

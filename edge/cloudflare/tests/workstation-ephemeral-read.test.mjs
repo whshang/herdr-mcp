@@ -103,6 +103,33 @@ test("known reads settle successfully with zero Durable Storage mutations", asyn
   }
 });
 
+test("private exec.wait herdr_call is recomputed read-only and spends zero Durable Storage mutations", async () => {
+  const { subject, events } = makeSubject();
+  await init(subject, events);
+  const requestId = "exec-wait-read";
+  const pending = subject.forwardInternal({
+    kind: "request",
+    requestId,
+    op: "herdr_call",
+    args: { method: "herdr_mcp.exec.wait", params: JSON.stringify({ session_id: "es-1", offset: 10 }) },
+    opClass: "mutating",
+    deadlineMs: Date.now() + 30_000,
+  });
+  const sent = events.find((event) => event[0] === "send" && event[1].kind === "tool_request");
+  assert.ok(sent, "exec.wait should reach the Link");
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: requestId,
+    result: { ok: true, running: true, next_offset: 10, wait_timed_out: true },
+    served_at_ms: Date.now(),
+  });
+  const response = await pending;
+  assert.equal(response.status, 200);
+  assert.deepEqual(events.filter((event) => event[0] !== "send"), []);
+});
+
 test("Edge settlement grace does not widen the legacy Link wire timeout", async () => {
   const { subject, events } = makeSubject();
   await init(subject, events);
