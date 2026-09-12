@@ -31,7 +31,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent with a supplied ChatGPT conversation URL, call continuity.resume directly with conversation_url; use continuity.search only for bounded ambiguity discovery and never select by recency or text similarity alone. For ChatGPT self-handoff, prefer browser_session.create with source_url, message, and idempotency_key; do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, prefer browser_session.create with source_url, message, and idempotency_key; do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -5654,7 +5654,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let (endpoint_ref, account_ref, source_url) = {
+        let (endpoint_ref, account_ref) = {
             let mut guard = store.lock().unwrap();
             let endpoint = guard
                 .register_browser_endpoint(BrowserEndpointRegistrationInput {
@@ -6194,12 +6194,41 @@ mod tests {
                 .unwrap();
             let space = guard
                 .observe_browser_resource(BrowserResourceObservationInput {
-                    endpoint_ref: &endpoint.endpoint_ref, provider: "chatgpt", kind: "space",
-                    parent_ref: Some(&account.resource_ref), native_identity: "session-create-space",
-                    display_label: Some("Project A"), observation_generation: 7, observed_at: 12,
-                }).unwrap();
-            guard.upsert_browser_resource_locator(&space.resource_ref, "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project", 7, 12).unwrap();
-            // __SOURCE_SESSION_SETUP__
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "space",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-create-space",
+                    display_label: Some("Project A"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &space.resource_ref,
+                    "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project",
+                    7,
+                    12,
+                )
+                .unwrap();
+            let source = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    native_identity: "session-create-source",
+                    display_label: Some("Source"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let source_url =
+                "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+            guard
+                .upsert_browser_resource_locator(&source.resource_ref, source_url, 7, 12)
+                .unwrap();
             guard
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                     endpoint_ref: &endpoint.endpoint_ref,
@@ -7880,7 +7909,7 @@ mod tests {
         }
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let (endpoint_ref, account_ref) = {
+        let (endpoint_ref, account_ref, source_url) = {
             let mut guard = store.lock().unwrap();
             let endpoint = guard
                 .register_browser_endpoint(BrowserEndpointRegistrationInput {
@@ -7921,6 +7950,43 @@ mod tests {
                     12,
                 )
                 .unwrap();
+            let space = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "space",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "session-create-project",
+                    display_label: Some("Project A"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &space.resource_ref,
+                    "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/project",
+                    7,
+                    12,
+                )
+                .unwrap();
+            let source = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    native_identity: "session-create-source",
+                    display_label: Some("Source"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let source_url =
+                "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+            guard
+                .upsert_browser_resource_locator(&source.resource_ref, source_url, 7, 12)
+                .unwrap();
             guard
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                     endpoint_ref: &endpoint.endpoint_ref,
@@ -7931,7 +7997,11 @@ mod tests {
                     observed_at: 13,
                 })
                 .unwrap();
-            (endpoint.endpoint_ref, account.resource_ref)
+            (
+                endpoint.endpoint_ref,
+                account.resource_ref,
+                source_url.to_owned(),
+            )
         };
 
         let immediate = SessionCreateActuator {
@@ -8009,6 +8079,36 @@ mod tests {
                 .load(Ordering::SeqCst),
             0
         );
+
+        let shortcut_params = json!({
+            "source_url": source_url,
+            "message": "continue from source URL",
+            "idempotency_key": "session-create-source-url-1"
+        });
+        let shortcut = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &shortcut_params,
+            true,
+            Some(&immediate),
+        );
+        assert_eq!(shortcut["ok"], true);
+        let shortcut_ref = shortcut["session_ref"].as_str().unwrap();
+        let shortcut_resource = store
+            .lock()
+            .unwrap()
+            .browser_resource(shortcut_ref)
+            .unwrap()
+            .unwrap();
+        let shortcut_parent = store
+            .lock()
+            .unwrap()
+            .browser_resource(shortcut_resource.parent_ref.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(shortcut_parent.kind, "space");
+        assert_eq!(shortcut_parent.display_label.as_deref(), Some("Project A"));
+        assert_eq!(immediate.calls.load(Ordering::SeqCst), 2);
 
         let delayed = SessionCreateActuator {
             store: store.clone(),
