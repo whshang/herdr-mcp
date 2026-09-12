@@ -110,6 +110,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "project_root": {"type": "string"},
+                    "repository": {"type": "string"},
                     "pr_number": {"type": "integer", "minimum": 1},
                     "previous_fingerprint": {"type": "string"},
                 },
@@ -2410,6 +2411,10 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0]["method"], GITHUB_STATUS_METHOD);
         assert_eq!(methods[0]["params"]["required"][0], "project_root");
+        assert_eq!(
+            methods[0]["params"]["properties"]["repository"]["type"],
+            "string"
+        );
 
         let methods = local_method_schemas("exec.wait");
         assert_eq!(methods.len(), 1);

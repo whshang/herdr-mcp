@@ -18,9 +18,14 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
     let Some(object) = params.as_object() else {
         return invalid_params("params must be an object");
     };
-    let allowed = ["project_root", "pr_number", "previous_fingerprint"]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let allowed = [
+        "project_root",
+        "repository",
+        "pr_number",
+        "previous_fingerprint",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     let unknown = object
         .keys()
         .filter(|key| !allowed.contains(key.as_str()))
@@ -60,6 +65,15 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
             _ => return invalid_params("previous_fingerprint must be a non-empty string"),
         },
     };
+    let explicit_repository = match object.get("repository") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_str().and_then(parse_repository_name) {
+            Some(repository) => Some(repository),
+            None => {
+                return invalid_params("repository must be an owner/repo GitHub repository name");
+            }
+        },
+    };
 
     let Some(gh) = find_gh() else {
         return json!({
@@ -68,12 +82,28 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
             "message": "GitHub CLI (gh) is not available on the runtime PATH or standard install locations",
         });
     };
-    let repository = match github_repository(&root) {
-        Ok(repository) => repository,
-        Err(error) => return error,
+    let repository = match explicit_repository {
+        Some(repository) => repository,
+        None => match github_repository(&root) {
+            Ok(repository) => repository,
+            Err(error) => return error,
+        },
+    };
+    // `--repo owner/repo` makes GitHub CLI independent from a Git working tree.
+    // When the repository is explicit, run from a safe temp directory so a
+    // rotating macOS runtime never re-enters a TCC-protected project merely to
+    // inspect GitHub state. The managed project_root gate above still scopes
+    // who may invoke this private status helper.
+    let gh_root = if object
+        .get("repository")
+        .is_some_and(|value| !value.is_null())
+    {
+        env::temp_dir()
+    } else {
+        root.clone()
     };
     let repo_api_path = format!("repos/{repository}");
-    let repository_json = match run_gh_json(&gh, &root, &["api", &repo_api_path]) {
+    let repository_json = match run_gh_json(&gh, &gh_root, &["api", &repo_api_path]) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -82,7 +112,7 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
         let number = number.to_string();
         match run_gh_json(
             &gh,
-            &root,
+            &gh_root,
             &[
                 "pr",
                 "view",
@@ -105,7 +135,7 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
         let fields = "name,state,bucket,link,workflow";
         let all = match run_gh_checks_json(
             &gh,
-            &root,
+            &gh_root,
             &[
                 "pr",
                 "checks",
@@ -121,7 +151,7 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
         };
         let required = match run_gh_checks_json(
             &gh,
-            &root,
+            &gh_root,
             &[
                 "pr",
                 "checks",
@@ -200,6 +230,27 @@ pub(crate) fn github_repository(root: &Path) -> Result<String, Value> {
             "message": "origin must be a github.com repository remote",
         })
     })
+}
+
+fn parse_repository_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 200 || value.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let mut parts = value.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if parts.next().is_some() || owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    if !owner.chars().all(allowed) || !repo.chars().all(allowed) {
+        return None;
+    }
+    if matches!(owner, "." | "..") || matches!(repo, "." | "..") {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 fn parse_github_repository(remote: &str) -> Option<String> {
@@ -488,6 +539,28 @@ mod tests {
                 .success()
         );
         root
+    }
+
+    #[test]
+    fn parses_explicit_repository_names() {
+        for value in [
+            "whshang/herdr-mcp",
+            " whshang/herdr-mcp ",
+            "owner.with-dots/repo_name-1",
+        ] {
+            assert_eq!(parse_repository_name(value).as_deref(), Some(value.trim()));
+        }
+        for value in [
+            "",
+            "owner",
+            "owner/repo/extra",
+            "https://github.com/owner/repo",
+            "owner/repo with space",
+            "../repo",
+            "owner/..",
+        ] {
+            assert_eq!(parse_repository_name(value), None, "{value}");
+        }
     }
 
     #[test]
