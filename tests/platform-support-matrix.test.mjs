@@ -94,6 +94,8 @@ test("matrix publishes explicit production, candidate, and unsupported platform 
   assert.match(en, /\| Windows x86_64 \| \*\*Candidate — not production\*\*/);
   assert.match(en, /\| WSL \| \*\*Unsupported\*\*/);
   assert.match(en, /pull\/364/);
+  assert.match(en, /issues\/394/);
+  assert.match(en, /Source merge and hosted CI are qualification evidence, not a production guarantee/);
   assert.match(en, /UNC\/path behavior must be covered/i);
 
   assert.match(zh, /\| macOS \| \*\*生产支持\*\*/);
@@ -101,6 +103,8 @@ test("matrix publishes explicit production, candidate, and unsupported platform 
   assert.match(zh, /\| Windows x86_64 \| \*\*候选——非生产支持\*\*/);
   assert.match(zh, /\| WSL \| \*\*不支持\*\*/);
   assert.match(zh, /pull\/364/);
+  assert.match(zh, /issues\/394/);
+  assert.match(zh, /源码合并和 hosted CI 只是候选验证证据，不构成正式支持保证/);
   assert.match(zh, /UNC\/网络路径能力/);
 
   assert.ok(DOC_ORDER.includes("platform-support-matrix"), "support matrix must be published in site navigation");
