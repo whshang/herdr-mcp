@@ -59,6 +59,8 @@ The runtime, Link and Edge surfaces must agree on the active contract epoch and 
 
 An Edge deployment is an operator action independent of Runtime Release publication. A runtime update does not imply an Edge deploy, and an Edge deploy does not switch the local runtime generation.
 
+The public [platform and compatibility support matrix](i18n/en/platform-support-matrix.md) is the release-claim boundary for tested MCP versions, N/N-1/N+1 behavior, and macOS/Linux/Windows/WSL security status. A release must not broaden a platform or compatibility claim unless that matrix and its contract test are updated with the qualifying evidence.
+
 ## Ownership boundaries
 
 | Identity | Location | Do not confuse with |

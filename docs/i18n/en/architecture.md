@@ -318,4 +318,5 @@ Related reading:
 - [Best practices](best-practices.md)
 - [ChatGPT Connector](chatgpt-connector.md)
 - [Browser continuity](browser-continuity.md)
+- [Platform and compatibility support matrix](platform-support-matrix.md)
 - [Troubleshooting](troubleshooting.md)
