@@ -158,10 +158,15 @@ ok(wakeSource.includes("syncDocumentTitle")
     && wakeSource.includes('.join("-")')
     && wakeSource.includes("chatGptDomConversationTitle")
     && wakeSource.includes("chatGptDomProjectTitle")
-    && wakeSource.includes("titleStatusIcon")
+    && wakeSource.includes("syncDocumentFavicon")
+    && wakeSource.includes("statusFaviconHref")
+    && wakeSource.includes('data-herdr-status-favicon')
     && backgroundSource.includes("active_workspace_label: labels[0] || null")
     && backgroundSource.includes("liveSession = state?.ok"),
-  "page title is composed dynamically as emoji-workspace-conversation");
+  "page title keeps project-conversation text while status moves to the favicon");
+ok(wakeSource.includes('const next = [project, conversation]')
+    && !wakeSource.includes('const next = [status, project, conversation]'),
+  "page title no longer injects the status emoji");
 ok(wakeSource.includes('if (isComposerGenerating() || health === "reply_waiting") return "⏳"')
     && wakeSource.includes('if (state === "offline" || state === "failed" || health === "failed" || handoff === "failed") return "🔴"')
     && wakeSource.includes('if (workspaceWorking) return "⚙️"')
@@ -170,13 +175,14 @@ ok(wakeSource.includes('if (isComposerGenerating() || health === "reply_waiting"
     && wakeSource.includes('return "🧠"')
     && wakeSource.includes('["reply_suspect", "rollover_recommended"].includes(health)')
     && wakeSource.includes('handoff === "seed_uncertain") return "⚠️"')
+    && wakeSource.includes('ADAPTER.name === "chatgpt" && !chatGptConversationId()) return "🆕"')
     && wakeSource.includes('if (state === "done") return "👀"')
     && wakeSource.includes('if (state === "idle") return "💤"')
     && wakeSource.includes('return "⚪"'),
-  "title status icon covers generating/working/transition/context/risk/attention/offline/review/idle/unknown");
-const titleStatusSource = wakeSource.slice(
-  wakeSource.indexOf("function titleStatusIcon"),
-  wakeSource.indexOf("function syncDocumentTitle"),
+  "favicon status covers generating/working/transition/context/risk/attention/offline/review/idle/unknown");
+const faviconStatusSource = wakeSource.slice(
+  wakeSource.indexOf("function tabStatusEmoji"),
+  wakeSource.indexOf("function statusFaviconHref"),
 );
 const titlePriorityPositions = [
   'isComposerGenerating() || health === "reply_waiting"',
@@ -189,10 +195,23 @@ const titlePriorityPositions = [
   'state === "done"',
   'state === "idle"',
   'return "⚪"',
-].map((marker) => titleStatusSource.indexOf(marker));
+].map((marker) => faviconStatusSource.indexOf(marker));
 ok(titlePriorityPositions.every((position) => position >= 0)
     && titlePriorityPositions.every((position, index) => index === 0 || position > titlePriorityPositions[index - 1]),
-  "title status priority keeps page activity and hard failures ahead of stale workspace/terminal states");
+  "favicon status priority keeps page activity and hard failures ahead of stale workspace/terminal states");
+ok(wakeSource.includes("chatGptProjectCatalog")
+    && wakeSource.includes("/backend-api/gizmos/snorlax/sidebar")
+    && wakeSource.includes("browserProjectId")
+    && backgroundSource.includes("enrichConversationInfoWithBrowserScope")
+    && backgroundSource.includes("project_roots"),
+  "ChatGPT project catalog restores project identity for plain conversation URLs and keeps local roots on bindings");
+ok(controlCenterSource.includes("[HERDR_PROJECT_CONTEXT_START]")
+    && controlCenterSource.includes("projectInstructionContext")
+    && controlCenterSource.includes('type: "h2w_sync_project_instructions"')
+    && wakeSource.includes("mergeHerdrProjectContext")
+    && wakeSource.includes("project-instructions-not-verified")
+    && backgroundSource.includes("project-sync-user-gesture-required"),
+  "project instruction sync is explicit, preserves a managed block, and requires verified ChatGPT readback");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),

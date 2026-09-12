@@ -36,6 +36,7 @@ pub const BROWSER_SPACE_OPEN_METHOD: &str = "herdr_mcp.browser_space.open";
 pub const BROWSER_SPACE_INSPECT_METHOD: &str = "herdr_mcp.browser_space.inspect";
 pub const BROWSER_SESSION_CREATE_METHOD: &str = "herdr_mcp.browser_session.create";
 pub const BROWSER_SESSION_OPEN_METHOD: &str = "herdr_mcp.browser_session.open";
+pub const BROWSER_SESSION_ARCHIVE_METHOD: &str = "herdr_mcp.browser_session.archive";
 pub const BROWSER_SESSION_INSPECT_METHOD: &str = "herdr_mcp.browser_session.inspect";
 pub const BROWSER_MESSAGE_APPEND_METHOD: &str = "herdr_mcp.browser_message.append";
 pub const BROWSER_COMPOSER_SET_REASONING_METHOD: &str = "herdr_mcp.browser_composer.set_reasoning";
@@ -431,6 +432,21 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
         }),
         json!({
             "method": BROWSER_SESSION_OPEN_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "session_ref": {"type": "string", "maxLength": 96},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["session_ref", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_SESSION_ARCHIVE_METHOD,
             "source": "herdr_mcp_local",
             "schema_version": 1,
             "access": "mutation",
@@ -2434,7 +2450,7 @@ mod tests {
         assert_eq!(methods[5]["params"]["oneOf"].as_array().unwrap().len(), 2);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
-        assert_eq!(methods.len(), 17);
+        assert_eq!(methods.len(), 18);
         assert_eq!(methods[0]["method"], BROWSER_ENDPOINT_LIST_METHOD);
         assert_eq!(methods[1]["method"], BROWSER_ENDPOINT_INSPECT_METHOD);
         assert_eq!(methods[2]["method"], BROWSER_RESOURCE_LIST_METHOD);
@@ -2471,13 +2487,15 @@ mod tests {
             methods[8]["params"]["properties"]["lane_id"]["maxLength"],
             160
         );
-        assert_eq!(methods[10]["method"], BROWSER_SESSION_INSPECT_METHOD);
-        assert_eq!(methods[11]["method"], BROWSER_MESSAGE_APPEND_METHOD);
-        assert_eq!(methods[12]["method"], BROWSER_COMPOSER_SET_REASONING_METHOD);
-        assert_eq!(methods[13]["method"], BROWSER_COMPOSER_SET_APPS_METHOD);
-        assert_eq!(methods[14]["method"], BROWSER_DISPATCH_SUBMIT_METHOD);
-        assert_eq!(methods[15]["method"], BROWSER_DISPATCH_STATUS_METHOD);
-        assert_eq!(methods[16]["method"], BROWSER_DISPATCH_STOP_METHOD);
+        assert_eq!(methods[9]["method"], BROWSER_SESSION_OPEN_METHOD);
+        assert_eq!(methods[10]["method"], BROWSER_SESSION_ARCHIVE_METHOD);
+        assert_eq!(methods[11]["method"], BROWSER_SESSION_INSPECT_METHOD);
+        assert_eq!(methods[12]["method"], BROWSER_MESSAGE_APPEND_METHOD);
+        assert_eq!(methods[13]["method"], BROWSER_COMPOSER_SET_REASONING_METHOD);
+        assert_eq!(methods[14]["method"], BROWSER_COMPOSER_SET_APPS_METHOD);
+        assert_eq!(methods[15]["method"], BROWSER_DISPATCH_SUBMIT_METHOD);
+        assert_eq!(methods[16]["method"], BROWSER_DISPATCH_STATUS_METHOD);
+        assert_eq!(methods[17]["method"], BROWSER_DISPATCH_STOP_METHOD);
         assert_eq!(
             methods
                 .iter()

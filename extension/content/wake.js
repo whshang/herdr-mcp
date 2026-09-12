@@ -1391,6 +1391,78 @@ const H2W_CONTENT_VERSION = "0.1.91";
     return Boolean(chatGptConversationId());
   }
 
+  function visibleChatGptArchiveMenuItem() {
+    const labels = /^(归档|Archive|アーカイブ)$/i;
+    return [...document.querySelectorAll('[role="menuitem"]')].find((item) => (
+      ADAPTER.elementVisible(item)
+      && labels.test(normText(item.innerText || item.textContent || ""))
+    )) || null;
+  }
+
+  async function openChatGptArchiveMenu() {
+    const moreLabels = /^(更多|More|その他)$/i;
+    const buttons = [...document.querySelectorAll('button[aria-label]')];
+    const headerMore = buttons.find((button) => (
+      ADAPTER.elementVisible(button)
+      && moreLabels.test(normText(button.getAttribute("aria-label") || ""))
+    ));
+    if (headerMore) {
+      headerMore.click();
+      const deadline = Date.now() + 1500;
+      do {
+        const item = visibleChatGptArchiveMenuItem();
+        if (item) return item;
+        await wait(50);
+      } while (Date.now() < deadline);
+    }
+
+    const anchor = chatGptCurrentConversationAnchor();
+    const row = anchor?.closest?.("li") || anchor?.parentElement || null;
+    const options = [...(row?.querySelectorAll?.('button[aria-label]') || [])].find((button) => {
+      const label = normText(button.getAttribute("aria-label") || "");
+      return ADAPTER.elementVisible(button)
+        && /(?:对话选项|conversation options|chat options|チャット.*オプション)/i.test(label);
+    });
+    if (!options) return null;
+    options.click();
+    const deadline = Date.now() + 1500;
+    do {
+      const item = visibleChatGptArchiveMenuItem();
+      if (item) return item;
+      await wait(50);
+    } while (Date.now() < deadline);
+    return null;
+  }
+
+  async function performChatGptSessionArchive(command, evidence) {
+    if (ADAPTER.name !== "chatgpt") return { ...evidence, resource_available: false };
+    const params = command?.params && typeof command.params === "object" ? command.params : {};
+    const sessionRef = typeof params.session_ref === "string" ? params.session_ref : "";
+    const conversationId = chatGptConversationId();
+    if (!sessionRef || sessionRef !== registeredBrowserSessionRef || !conversationId) {
+      return { ...evidence, resource_available: false };
+    }
+    if (evidence.observed_generation !== registeredBrowserGeneration) {
+      return { ...evidence, resource_available: false };
+    }
+    if (isTurnInProgress()) return { ...evidence, rejected: true };
+    const archive = await openChatGptArchiveMenu();
+    if (!archive) return { ...evidence, rejected: true };
+    archive.click();
+    evidence.command_accepted = true;
+    evidence.stable_resource_ref_observed = true;
+    const deadline = Date.now() + 6000;
+    do {
+      const archived = await fetchChatGptConversation({ conversationId, timeoutMs: 2500 }).catch(() => ({ ok: false }));
+      if (archived?.ok && archived.body?.is_archived === true) {
+        evidence.lifecycle_observed = true;
+        return evidence;
+      }
+      await wait(200);
+    } while (Date.now() < deadline);
+    return evidence;
+  }
+
   async function performBrowserActuationCommand(command) {
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
@@ -1447,6 +1519,9 @@ const H2W_CONTENT_VERSION = "0.1.91";
       evidence.canonical_url_observed = true;
       evidence.observed_generation = expectedGeneration;
       return evidence;
+    }
+    if (command?.operation === "herdr_mcp.browser_session.archive") {
+      return performChatGptSessionArchive(command, evidence);
     }
     if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)) {
       return { ...evidence, resource_available: false };
@@ -1679,6 +1754,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
   let registeredBrowserSessionRef = null;
   let registeredBrowserGeneration = null;
   let browserRegistrationAttempt = 0;
+  let chatGptProjectCatalogCache = { accountNativeIdentity: null, fetchedAt: 0, projects: [] };
   const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
   // Exact accepted provider user-message identity reported by the last proven
   // browser_dispatch.submit. Used as the settlement fallback only when a live
@@ -1688,6 +1764,12 @@ const H2W_CONTENT_VERSION = "0.1.91";
   // ---- Message listener ----
   try {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (msg?.type === "h2w_sync_project_instructions") {
+        void performChatGptProjectInstructionsSync(msg)
+          .then((result) => sendResponse(result))
+          .catch(() => sendResponse({ ok: false, error: "project-instructions-sync-failed" }));
+        return true;
+      }
       if (msg?.type === "h2w_browser_actuation") {
         void performBrowserActuationCommand(msg.command || {})
           .then((evidence) => sendResponse({ ok: true, evidence }))
@@ -1703,10 +1785,13 @@ const H2W_CONTENT_VERSION = "0.1.91";
       if (msg?.type === "h2w_get_convkey") {
         const convKey = ADAPTER.getConversationKey();
         const identityMatchesRoute = Boolean(convKey && registeredConvKey === convKey);
+        const project = currentChatGptProjectFromCatalog(chatGptProjectCatalogCache.projects);
         sendResponse({
           convKey,
           url: location.href,
           site: ADAPTER.name,
+          browserProjectId: project?.id || null,
+          browserProjectName: project?.name || null,
           browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
           browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
         });
@@ -2046,6 +2131,64 @@ const H2W_CONTENT_VERSION = "0.1.91";
     return null;
   }
 
+  async function chatGptProjectCatalog(accountNativeIdentity) {
+    if (ADAPTER.name !== "chatgpt" || !accountNativeIdentity) return [];
+    const now = Date.now();
+    if (chatGptProjectCatalogCache.accountNativeIdentity === accountNativeIdentity
+        && now - chatGptProjectCatalogCache.fetchedAt < 5 * 60 * 1000) {
+      return chatGptProjectCatalogCache.projects;
+    }
+    const accessToken = await readChatGptAccessToken();
+    if (!accessToken) return [];
+    const projects = [];
+    const seen = new Set();
+    let cursor = null;
+    for (let page = 0; page < 5; page += 1) {
+      const query = new URLSearchParams({
+        owned_only: "true",
+        conversations_per_gizmo: "5",
+        limit: "20",
+      });
+      if (cursor != null && String(cursor)) query.set("cursor", String(cursor));
+      let response;
+      try {
+        response = await fetch(`/backend-api/gizmos/snorlax/sidebar?${query}`, {
+          credentials: "include",
+          cache: "no-store",
+          redirect: "error",
+          headers: { accept: "application/json", authorization: `Bearer ${accessToken}` },
+        });
+      } catch (_) {
+        break;
+      }
+      if (!response.ok) break;
+      let body;
+      try { body = await response.json(); } catch (_) { break; }
+      for (const item of Array.isArray(body?.items) ? body.items : []) {
+        const project = item?.gizmo?.gizmo;
+        const id = typeof project?.id === "string" ? project.id.trim() : "";
+        const name = typeof project?.display?.name === "string" ? project.display.name.trim() : "";
+        if (!/^g-p-[A-Za-z0-9_-]+$/.test(id) || !name || seen.has(id) || project?.is_archived === true) continue;
+        seen.add(id);
+        projects.push({ id, name });
+      }
+      cursor = body?.cursor ?? null;
+      if (cursor == null || String(cursor) === "") break;
+    }
+    chatGptProjectCatalogCache = { accountNativeIdentity, fetchedAt: now, projects };
+    return projects;
+  }
+
+  function currentChatGptProjectFromCatalog(projects) {
+    const anchor = chatGptCurrentConversationAnchor();
+    const aria = normText(anchor?.getAttribute?.("aria-label") || "");
+    if (!aria) return null;
+    const matches = (projects || []).filter((project) => project?.name && aria.includes(project.name));
+    if (!matches.length) return null;
+    matches.sort((a, b) => b.name.length - a.name.length);
+    return matches[0];
+  }
+
   async function registerCurrentConversation(reason = "startup") {
     if (!runtimeAlive()) return null;
     const registrationAttempt = ++browserRegistrationAttempt;
@@ -2058,6 +2201,8 @@ const H2W_CONTENT_VERSION = "0.1.91";
       registeredBrowserGeneration = null;
     }
     const accountNativeIdentity = await browserAccountNativeIdentity();
+    const browserProjects = await chatGptProjectCatalog(accountNativeIdentity);
+    const browserCurrentProject = currentChatGptProjectFromCatalog(browserProjects);
     if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
       if (registeredConvKey === convKey) {
         if (ADAPTER.getConversationKey() !== convKey) {
@@ -2078,6 +2223,9 @@ const H2W_CONTENT_VERSION = "0.1.91";
       url: location.href,
       site: ADAPTER.name,
       accountNativeIdentity,
+      browserProjects,
+      browserCurrentProjectId: browserCurrentProject?.id || null,
+      browserCurrentProjectName: browserCurrentProject?.name || null,
       browserSessionReservationRef,
     });
     if (response !== null) {
@@ -2477,6 +2625,172 @@ const H2W_CONTENT_VERSION = "0.1.91";
       }
     } catch (_) {
       return null;
+    }
+  }
+
+  const HERDR_PROJECT_CONTEXT_START = "[HERDR_PROJECT_CONTEXT_START]";
+  const HERDR_PROJECT_CONTEXT_END = "[HERDR_PROJECT_CONTEXT_END]";
+
+  function mergeHerdrProjectContext(existing, managedBlock) {
+    const current = String(existing || "");
+    const block = String(managedBlock || "").trim();
+    if (!block.startsWith(HERDR_PROJECT_CONTEXT_START) || !block.endsWith(HERDR_PROJECT_CONTEXT_END)) {
+      return { ok: false, error: "project-context-block-invalid" };
+    }
+    const start = current.indexOf(HERDR_PROJECT_CONTEXT_START);
+    const end = start >= 0 ? current.indexOf(HERDR_PROJECT_CONTEXT_END, start) : -1;
+    if ((start >= 0) !== (end >= 0)) return { ok: false, error: "project-context-block-malformed" };
+    if (start >= 0) {
+      const next = `${current.slice(0, start)}${block}${current.slice(end + HERDR_PROJECT_CONTEXT_END.length)}`;
+      return { ok: true, value: next, changed: next !== current };
+    }
+    const prefix = current.trimEnd();
+    const next = prefix ? `${prefix}\n\n${block}` : block;
+    return { ok: true, value: next, changed: next !== current };
+  }
+
+  function projectInstructionsFromPayload(body) {
+    const candidates = [
+      body?.gizmo?.gizmo?.instructions,
+      body?.gizmo?.instructions,
+      body?.instructions,
+    ];
+    return candidates.find((value) => typeof value === "string") ?? null;
+  }
+
+  async function fetchChatGptProjectInstructions(projectId, timeoutMs = 4000) {
+    if (ADAPTER.name !== "chatgpt" || !/^g-p-[A-Za-z0-9_-]+$/.test(String(projectId || ""))) {
+      return { ok: false, error: "project-id-invalid" };
+    }
+    const accessToken = await readChatGptAccessToken();
+    if (!accessToken) return { ok: false, error: "session-missing" };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`/backend-api/gizmos/${encodeURIComponent(projectId)}`, {
+        credentials: "include",
+        cache: "no-store",
+        redirect: "error",
+        headers: { accept: "application/json", authorization: `Bearer ${String(accessToken)}` },
+        signal: controller.signal,
+      });
+      if (!response.ok) return { ok: false, error: `project-http-${response.status}` };
+      const body = await response.json();
+      return { ok: true, instructions: projectInstructionsFromPayload(body) };
+    } catch (error) {
+      return { ok: false, error: error?.name === "AbortError" ? "project-read-timeout" : "project-read-failed" };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function visibleChatGptProjectOptionsButton(projectName) {
+    const name = normText(projectName);
+    if (!name) return null;
+    return [...document.querySelectorAll('button[aria-label]')].find((button) => {
+      const label = normText(button.getAttribute("aria-label") || "");
+      return ADAPTER.elementVisible(button)
+        && label.includes(name)
+        && /(?:项目选项|project options|プロジェクト.*オプション)/i.test(label);
+    }) || null;
+  }
+
+  async function openChatGptProjectInstructions(projectName) {
+    let options = visibleChatGptProjectOptionsButton(projectName);
+    if (!options) {
+      const sidebarButton = [...document.querySelectorAll('button[aria-label]')].find((button) => (
+        ADAPTER.elementVisible(button)
+        && /^(?:打开侧边栏|Open sidebar|サイドバーを開く)$/i.test(normText(button.getAttribute("aria-label") || ""))
+      ));
+      if (sidebarButton) {
+        sidebarButton.click();
+        const deadline = Date.now() + 1500;
+        do {
+          options = visibleChatGptProjectOptionsButton(projectName);
+          if (options) break;
+          await wait(50);
+        } while (Date.now() < deadline);
+      }
+    }
+    if (!options) return null;
+    options.click();
+    let settings = null;
+    const menuDeadline = Date.now() + 1500;
+    do {
+      settings = [...document.querySelectorAll('[role="menuitem"]')].find((item) => (
+        ADAPTER.elementVisible(item)
+        && /^(?:项目设置|Project settings|プロジェクト設定)$/i.test(normText(item.innerText || item.textContent || ""))
+      )) || null;
+      if (settings) break;
+      await wait(50);
+    } while (Date.now() < menuDeadline);
+    if (!settings) return null;
+    settings.click();
+    const fieldDeadline = Date.now() + 2000;
+    do {
+      const field = [...document.querySelectorAll("textarea")].find((textarea) => {
+        const label = normText(textarea.getAttribute("aria-label") || "");
+        return ADAPTER.elementVisible(textarea) && /^(?:指令|Instructions|指示)$/i.test(label);
+      });
+      if (field) return field;
+      await wait(50);
+    } while (Date.now() < fieldDeadline);
+    return null;
+  }
+
+  function closeChatGptProjectSettings() {
+    const close = [...document.querySelectorAll('button[aria-label]')].find((button) => (
+      ADAPTER.elementVisible(button)
+      && /^(?:关闭|Close|閉じる)$/i.test(normText(button.getAttribute("aria-label") || ""))
+    ));
+    if (close) close.click();
+  }
+
+  async function performChatGptProjectInstructionsSync(msg) {
+    if (ADAPTER.name !== "chatgpt") return { ok: false, error: "project-sync-chatgpt-only" };
+    const projectId = String(msg?.project_id || "").trim();
+    const managedBlock = String(msg?.managed_block || "").trim();
+    if (!/^g-p-[A-Za-z0-9_-]+$/.test(projectId) || managedBlock.length < 1 || managedBlock.length > 12000) {
+      return { ok: false, error: "project-sync-params-invalid" };
+    }
+    const catalogProject = chatGptProjectCatalogCache.projects.find((project) => project?.id === projectId) || null;
+    const currentProject = currentChatGptProjectFromCatalog(chatGptProjectCatalogCache.projects);
+    if (!currentProject || currentProject.id !== projectId) return { ok: false, error: "project-sync-target-mismatch" };
+    const projectName = normText(catalogProject?.name || msg?.project_name || "");
+    if (!projectName) return { ok: false, error: "project-sync-project-name-missing" };
+
+    const existingServer = await fetchChatGptProjectInstructions(projectId);
+    if (existingServer.ok && typeof existingServer.instructions === "string") {
+      const mergedServer = mergeHerdrProjectContext(existingServer.instructions, managedBlock);
+      if (mergedServer.ok && !mergedServer.changed) return { ok: true, changed: false, verified: true };
+    }
+
+    const textarea = await openChatGptProjectInstructions(projectName);
+    if (!textarea) return { ok: false, error: "project-settings-unavailable" };
+    try {
+      const merged = mergeHerdrProjectContext(textarea.value, managedBlock);
+      if (!merged.ok) return merged;
+      if (merged.changed) {
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+        if (typeof setter !== "function") return { ok: false, error: "project-instructions-setter-unavailable" };
+        textarea.focus();
+        setter.call(textarea, merged.value);
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+        textarea.blur();
+      }
+      const deadline = Date.now() + 8000;
+      do {
+        const observed = await fetchChatGptProjectInstructions(projectId, 2500);
+        if (observed.ok && typeof observed.instructions === "string") {
+          const verified = mergeHerdrProjectContext(observed.instructions, managedBlock);
+          if (verified.ok && !verified.changed) return { ok: true, changed: merged.changed, verified: true };
+        }
+        await wait(300);
+      } while (Date.now() < deadline);
+      return { ok: false, error: "project-instructions-not-verified" };
+    } finally {
+      closeChatGptProjectSettings();
     }
   }
 
@@ -3706,6 +4020,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
   let renderedHerdrTitle = "";
   let titleSnapshot = null;
   let titleObserver = null;
+  const HERDR_STATUS_FAVICON_ATTR = "data-herdr-status-favicon";
 
   function cleanConversationTitle(value) {
     return normText(value)
@@ -3719,7 +4034,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
     nativeConversationTitle = cleanConversationTitle(current) || current;
   }
 
-  function titleStatusIcon(hud, state) {
+  function tabStatusEmoji(hud, state) {
     const health = String(conversationHealth?.state || "");
     const continuity = String(hud?.continuity?.state || "");
     const handoff = String(hud?.handoff?.status || "");
@@ -3727,7 +4042,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
     const workspaceWorking = state === "working"
       || bindings.some((binding) => binding?.status === "working" || Number(binding?.working_count) > 0);
 
-    // The tab title answers a human question: "what needs my attention here?"
+    // The favicon answers a human question: "what needs my attention here?"
     // It deliberately does not expose the internal state-machine labels.
     if (isComposerGenerating() || health === "reply_waiting") return "⏳";
     if (state === "offline" || state === "failed" || health === "failed" || handoff === "failed") return "🔴";
@@ -3739,14 +4054,35 @@ const H2W_CONTENT_VERSION = "0.1.91";
     if (continuity === "context_warning") return "🧠";
     if (state === "blocked" || ["reply_suspect", "rollover_recommended"].includes(health)
       || continuity === "rollover_recommended" || handoff === "seed_uncertain") return "⚠️";
+    if (ADAPTER.name === "chatgpt" && !chatGptConversationId()) return "🆕";
     if (state === "done") return "👀";
     if (state === "idle") return "💤";
     return "⚪";
   }
 
+  function statusFaviconHref(status) {
+    const emoji = normText(status) || "⚪";
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><text x="16" y="24" text-anchor="middle" font-size="24">${emoji}</text></svg>`;
+    return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+  }
+
+  function syncDocumentFavicon(hud, state) {
+    const head = document.head || document.documentElement;
+    if (!head) return;
+    let icon = head.querySelector(`link[${HERDR_STATUS_FAVICON_ATTR}="true"]`);
+    if (!icon) {
+      icon = document.createElement("link");
+      icon.setAttribute("rel", "icon");
+      icon.setAttribute("type", "image/svg+xml");
+      icon.setAttribute(HERDR_STATUS_FAVICON_ATTR, "true");
+      head.appendChild(icon);
+    }
+    const href = statusFaviconHref(tabStatusEmoji(hud, state));
+    if (icon.getAttribute("href") !== href) icon.setAttribute("href", href);
+  }
+
   function syncDocumentTitle(hud, state) {
     captureNativeConversationTitle();
-    const status = titleStatusIcon(hud, state);
     const project = chatGptDomProjectTitle()
       || hud?.active_workspace_label
       || hud?.workspace_label
@@ -3754,8 +4090,9 @@ const H2W_CONTENT_VERSION = "0.1.91";
       || hudLabels?.states?.unbound
       || "unbound";
     const conversation = chatGptDomConversationTitle() || nativeConversationTitle || ADAPTER.name || "conversation";
-    const next = [status, project, conversation].map((value) => normText(value)).filter(Boolean).join("-");
+    const next = [project, conversation].map((value) => normText(value)).filter(Boolean).join("-");
     titleSnapshot = { hud, state };
+    syncDocumentFavicon(hud, state);
     if (!next || document.title === next) {
       renderedHerdrTitle = next;
       return;

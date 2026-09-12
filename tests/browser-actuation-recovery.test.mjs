@@ -68,6 +68,8 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     const location = { get href() { return currentUrl; } };
     const runtimeAlive = () => true;
     const browserAccountNativeIdentity = async () => "opaque-account";
+    const chatGptProjectCatalog = async () => [];
+    const currentChatGptProjectFromCatalog = () => null;
     const sendBg = async (payload) => new Promise((resolve) => pending.push({ payload, resolve }));
     const ensureConversationHealth = async () => {};
     const chatGptConversationId = () => null;
@@ -271,6 +273,22 @@ test("content script session.open verifies identity, generation, route, canonica
   assert.match(segment, /lifecycle_observed\s*=\s*true/);
   assert.match(segment, /canonical_url_observed\s*=\s*true/);
   assert.match(segment, /command_accepted\s*=\s*true/);
+});
+
+test("ChatGPT session.archive targets the exact registered session and verifies provider archive state", () => {
+  assert.match(backgroundSource, /"session\.archive"/);
+  const start = wakeSource.indexOf("async function performChatGptSessionArchive");
+  const end = wakeSource.indexOf("async function performBrowserActuationCommand", start);
+  assert.ok(start >= 0 && end > start, "session.archive helper must exist before browser actuation");
+  const segment = wakeSource.slice(start, end);
+  assert.match(segment, /sessionRef !== registeredBrowserSessionRef/);
+  assert.match(segment, /registeredBrowserGeneration/);
+  assert.match(segment, /isTurnInProgress\(\)/);
+  assert.match(segment, /openChatGptArchiveMenu/);
+  assert.match(segment, /is_archived === true/);
+  assert.match(segment, /stable_resource_ref_observed = true/);
+  assert.match(segment, /lifecycle_observed = true/);
+  assert.doesNotMatch(segment, /performWake|dispatchEnterSubmit|findSendButton|delete/);
 });
 
 test("ChatGPT session.open can restore a disposable view from a local canonical locator", () => {

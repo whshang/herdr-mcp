@@ -115,6 +115,13 @@ export function reconcileWorkspaceCatalogBindings(bindings, workspaces, now = Da
       next.local_project_key = localProjectKey;
       changed = true;
     }
+    const liveRoots = Array.isArray(liveRow?.roots)
+      ? liveRow.roots.filter((root) => typeof root === "string" && root.trim()).map((root) => root.trim()).slice(0, 16)
+      : [];
+    if (liveRoots.length && JSON.stringify(next.project_roots || []) !== JSON.stringify(liveRoots)) {
+      next.project_roots = liveRoots;
+      changed = true;
+    }
     // Preserve trusted device identity for browser conversation/project binding.
     // New bindings may carry device_id; existing single-device bindings remain valid
     // without it (backward compatible). Device switching must not change device_id.

@@ -31,6 +31,8 @@ let devicePanelCollapsed = false;
 let bindingMutationWorkspaceId = null;
 let actionInFlight = false;
 let browserConsentInFlight = false;
+let projectInstructionsSyncInFlight = false;
+let projectInstructionsSyncStatus = null;
 
 const $ = (id) => document.getElementById(id);
 const runtimeDot = $("runtimeDot");
@@ -48,6 +50,7 @@ const pageContextCard = $("pageContextCard");
 const pageContextTitle = $("pageContextTitle");
 const pageContextMeta = $("pageContextMeta");
 const pageContextHelp = $("pageContextHelp");
+const syncProjectInstructionsButton = $("syncProjectInstructionsButton");
 const webchatControlConsent = $("webchatControlConsent");
 const webchatControlCheckbox = $("webchatControlCheckbox");
 const targetCard = $("targetCard");
@@ -331,6 +334,47 @@ function pageContextBindingIds() {
   return new Set(pageContextBindings().map((binding) => String(binding?.workspace_id || "")).filter(Boolean));
 }
 
+function projectInstructionContext(state) {
+  const info = pageContextInfo();
+  if (info?.site !== "chatgpt") return null;
+  const bindings = pageContextBindings().filter((binding) => binding?.project_id && binding?.workspace_id);
+  if (!bindings.length) return null;
+  const projectId = String(info.project_id || bindings[0].project_id || "").trim();
+  if (!projectId) return null;
+  const projectName = String(info.project_name || bindings.find((binding) => binding.project_name)?.project_name || projectId).trim();
+  const workspaces = new Map((state.workspaces || []).map((workspace) => [String(workspace.workspace_id), workspace]));
+  const devices = new Map((fleetContext.response?.devices || []).map((device) => [String(device.device_id || ""), device]));
+  const rows = [];
+  const seen = new Set();
+  for (const binding of bindings.slice(0, 20)) {
+    const workspaceId = String(binding.workspace_id || "").trim();
+    if (!workspaceId || seen.has(workspaceId)) continue;
+    seen.add(workspaceId);
+    const workspace = workspaces.get(workspaceId) || null;
+    const deviceId = String(binding.device_id || workspace?.device_id || "").trim();
+    const device = devices.get(deviceId) || null;
+    const deviceName = String(device?.name || deviceId || "unknown").trim();
+    const workspaceLabel = String(binding.workspace_label || workspace?.label || workspaceId).trim();
+    const roots = (Array.isArray(workspace?.roots) && workspace.roots.length ? workspace.roots : binding.project_roots || [])
+      .filter((root) => typeof root === "string" && root.trim())
+      .map((root) => root.trim())
+      .slice(0, 6);
+    if (!roots.length && binding.local_project_key) roots.push(String(binding.local_project_key));
+    rows.push(`- device: ${deviceName}${deviceId && deviceName !== deviceId ? ` [${deviceId}]` : ""}; workspace: ${workspaceLabel} [${workspaceId}]; local folders: ${roots.length ? roots.join(", ") : "unknown"}`);
+  }
+  if (!rows.length) return null;
+  const managedBlock = [
+    "[HERDR_PROJECT_CONTEXT_START]",
+    "Herdr managed project mapping. Re-sync this block from the Herdr extension when mappings change.",
+    `ChatGPT project: ${projectName}${projectName !== projectId ? ` [${projectId}]` : ""}`,
+    "Work locations:",
+    ...rows,
+    "For work in this ChatGPT Project, use these mapped locations before asking the user to identify a device or folder. Refresh live Herdr state before execution; when live state conflicts with this block, live state is current.",
+    "[HERDR_PROJECT_CONTEXT_END]",
+  ].join("\n");
+  return { projectId, projectName, managedBlock };
+}
+
 function renderPageContext(state) {
   const info = pageContextInfo();
   const bindings = pageContextBindings();
@@ -357,6 +401,15 @@ function renderPageContext(state) {
   pageContextMeta.title = identity.join(" · ");
   pageContextHelp.hidden = !pageContext.error;
   pageContextHelp.textContent = pageContext.error || "";
+  const projectContext = projectInstructionContext(state);
+  syncProjectInstructionsButton.hidden = !projectContext;
+  syncProjectInstructionsButton.disabled = projectInstructionsSyncInFlight || !projectContext;
+  syncProjectInstructionsButton.textContent = projectInstructionsSyncInFlight
+    ? t("cc_project_instructions_syncing")
+    : projectInstructionsSyncStatus === "done"
+      ? t("cc_project_instructions_synced")
+      : t("cc_project_instructions_sync");
+  syncProjectInstructionsButton.title = projectContext ? t("cc_project_instructions_sync_help") : "";
   const endpoint = pageContext.response?.browserEndpoint || null;
   const hasBrowserEndpoint = Boolean(endpoint?.endpoint_ref);
   const webchatControlAllowed = endpoint?.consent?.webchat_control === true;
@@ -773,6 +826,7 @@ async function mutateWorkspaceBinding(workspaceId) {
       workspace_id: workspaceId,
       workspace_label: workspace.label || workspaceId,
       local_project_key: workspace.local_project_key || null,
+      roots: Array.isArray(workspace.roots) ? workspace.roots : [],
       device_id: workspace.device_id || null,
     });
   const actionError = !response?.ok && response?.error !== "already-bound"
@@ -951,6 +1005,33 @@ webchatControlCheckbox.addEventListener("change", async () => {
     };
   }
   browserConsentInFlight = false;
+  renderAll();
+});
+syncProjectInstructionsButton.addEventListener("click", async () => {
+  if (projectInstructionsSyncInFlight) return;
+  const context = projectInstructionContext(store.get());
+  if (!context || !pageContext.tabId) return;
+  projectInstructionsSyncInFlight = true;
+  projectInstructionsSyncStatus = null;
+  pageContext = { ...pageContext, error: null };
+  renderPageContext(store.get());
+  const response = await bg({
+    type: "h2w_sync_project_instructions",
+    tabId: pageContext.tabId,
+    project_id: context.projectId,
+    project_name: context.projectName,
+    managed_block: context.managedBlock,
+  });
+  if (response?.ok) {
+    projectInstructionsSyncStatus = "done";
+    pageContext = { ...pageContext, error: null };
+  } else {
+    pageContext = {
+      ...pageContext,
+      error: t("cc_project_instructions_sync_failed", { error: response?.error || "unknown" }),
+    };
+  }
+  projectInstructionsSyncInFlight = false;
   renderAll();
 });
 $("settingsButton").addEventListener("click", () => chrome.runtime.openOptionsPage());
