@@ -4486,7 +4486,7 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
     }
   }
   const seed = durableAvailable
-    ? buildContinuitySeed({ transferId, continuityId: transfer.continuity_id })
+    ? buildContinuitySeed({ transferId, continuityId: transfer.continuity_id, sourceUrl: transfer.source_url })
     : buildHandoffSeed({
         transferId,
         packet: transfer.handoff_text,
@@ -4986,6 +4986,7 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     status: durableAvailable ? "summary_ready" : "summary_requested",
     source_conv_key: convInfo.convKey,
     source_tab_id: tabId,
+    source_url: liveInfo?.url || null,
     project_id: convInfo.project_id,
     project_key: convInfo.project_key,
     project_launch_url: convInfo.project_launch_url,

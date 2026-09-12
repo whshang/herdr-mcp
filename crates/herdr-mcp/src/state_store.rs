@@ -3286,6 +3286,43 @@ impl StateStore {
             .map_err(|error| format!("cannot inspect browser resource locator: {error}"))
     }
 
+    pub fn browser_session_ref_for_canonical_url(
+        &self,
+        canonical_url: &str,
+    ) -> Result<Option<String>, String> {
+        if canonical_url.is_empty()
+            || canonical_url.len() > 2048
+            || canonical_url != canonical_url.trim()
+            || canonical_url.chars().any(char::is_control)
+            || !canonical_url.starts_with("https://")
+        {
+            return Err("browser_canonical_url_invalid".to_owned());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.resource_ref
+                 FROM browser_resource_locators l
+                 JOIN browser_resources r ON r.resource_ref = l.resource_ref
+                 WHERE l.canonical_url = ?1
+                   AND r.kind = 'session'
+                   AND r.provider = 'chatgpt'
+                 ORDER BY l.observed_at DESC, r.resource_ref
+                 LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
+        let mut refs = stmt
+            .query_map([canonical_url], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
+        match refs.len() {
+            0 => Ok(None),
+            1 => Ok(refs.pop()),
+            _ => Err("browser_canonical_url_ambiguous".to_owned()),
+        }
+    }
+
     pub fn reserve_browser_session(
         &mut self,
         input: BrowserSessionReservationInput<'_>,
