@@ -1160,6 +1160,21 @@ async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
 }
 
+async function adoptContinuityOwner(convKey, previousId, canonicalId) {
+  if (!convKey || !previousId || !canonicalId || previousId === canonicalId) return false;
+  const bindings = await loadBindings();
+  let changed = false;
+  for (const binding of bindingsForConv(bindings, convKey)) {
+    if (binding?.continuity_id !== previousId || !binding?.storeKey || !bindings[binding.storeKey]) continue;
+    bindings[binding.storeKey] = { ...bindings[binding.storeKey], continuity_id: canonicalId };
+    changed = true;
+  }
+  if (!changed) return false;
+  await saveBindings(bindings);
+  broadcastControlMessage({ type: "herdr_control_binding_changed" });
+  return true;
+}
+
 async function reconcileBindingsWithLiveWorkspaces(bindings, workspaces, source = "snapshot") {
   const result = reconcileWorkspaceCatalogBindings(bindings, workspaces);
   if (!result.changed) return bindings;
@@ -2013,12 +2028,19 @@ async function journalPostTurnToRust(payload) {
     const parsed = await response.json().catch(() => null);
     if (response.ok && parsed?.ok === true) {
       noteLocalRuntimeReachability(true);
-      if (payload?.continuity_id) {
+      const continuityId = String(parsed?.continuity_id || payload?.continuity_id || "").trim();
+      if (continuityId) {
         await loadRustAcked();
-        rustAcked[payload.continuity_id] = true;
+        rustAcked[continuityId] = true;
         await persistRustAcked();
       }
-      return { ok: true, durable: true, inserted: parsed.inserted === true };
+      return {
+        ok: true,
+        durable: true,
+        inserted: parsed.inserted === true,
+        continuity_id: continuityId || null,
+        canonicalized: parsed?.canonicalized === true,
+      };
     }
     noteLocalRuntimeReachability(false);
     return { ok: false, durable: false, error: parsed?.error || `http-${response.status}` };
@@ -2078,6 +2100,10 @@ async function journalAppendContinuityTurn(payload) {
     observed_at: payload?.observedAt || payload?.endedAt || Date.now(),
   });
   if (ack.ok && ack.durable) {
+    const canonicalId = String(ack?.continuity_id || "").trim();
+    if (canonicalId && canonicalId !== continuityId) {
+      await adoptContinuityOwner(convKey, continuityId, canonicalId).catch(() => false);
+    }
     // Rust is the source of truth; drop the pending retry once acknowledged.
     try {
       const cache = await loadContinuityCache();
@@ -2118,8 +2144,7 @@ async function journalAppendFinalizedTurn(payload) {
  * when state.db currently holds the chain (HTTP 200 + parsed `{ok:true}`). The
  * persisted `rust_acked` flag is only a hint/cache and never upgrades a failed
  * or missing live resolve. Any resolve failure (404, 5xx, transport) returns
- * durable:false so the classic HERDR_HANDOFF_V1 packet fallback runs. Unknown
- * or ambiguous chains fail closed.
+ * durable:false. New ChatGPT handoffs fail closed on that result; only already-existing legacy transfers and provider-specific legacy contracts may continue through HERDR_HANDOFF_V1 recovery. Unknown or ambiguous chains fail closed.
  */
 async function durableChainWindow(continuityIdRaw) {
   const continuityId = String(continuityIdRaw || "").trim();
@@ -4442,10 +4467,9 @@ async function waitForHandoffTargetComposer(transfer, targetTabId, timeoutMs = H
 async function seedHandoffIntoTarget(transferId, targetTabId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
-  // Prefer the durable continuity journal: when the source chain has real local
-  // state, the target only needs the continuity_id reference, not a large
-  // model-written HERDR_HANDOFF_V1 packet. The packet remains the fallback for
-  // chains without durable state (jittery storage, unknown continuity, etc.).
+  // Prefer the durable continuity journal. New ChatGPT handoffs reach this path with
+  // durable state only; handoff_text is retained solely so already-existing legacy
+  // transfers and provider-specific legacy contracts can finish recovery.
   const durable = transfer?.continuity_id
     ? await durableChainWindow(transfer.continuity_id)
     : null;
@@ -4460,7 +4484,7 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
     }
   }
   const seed = durableAvailable
-    ? buildContinuitySeed({ transferId, continuityId: transfer.continuity_id })
+    ? buildContinuitySeed({ transferId, continuityId: transfer.continuity_id, sourceUrl: transfer.source_url })
     : buildHandoffSeed({
         transferId,
         packet: transfer.handoff_text,
@@ -4942,6 +4966,9 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   }
   if (!continuityId) continuityId = newContinuityId(now);
   const durableAvailable = Boolean(durable?.durable && durable?.turn_count > 0);
+  if (convInfo.site === "chatgpt" && !durableAvailable) {
+    return { ok: false, error: "continuity_unavailable", source_preserved: true, source_url: liveInfo?.url || null };
+  }
   let sourceAssistantFp = null;
   let sourceSnapshot = null;
   if (!durableAvailable) {
@@ -4960,6 +4987,7 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     status: durableAvailable ? "summary_ready" : "summary_requested",
     source_conv_key: convInfo.convKey,
     source_tab_id: tabId,
+    source_url: liveInfo?.url || null,
     project_id: convInfo.project_id,
     project_key: convInfo.project_key,
     project_launch_url: convInfo.project_launch_url,

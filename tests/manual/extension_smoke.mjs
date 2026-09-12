@@ -894,11 +894,11 @@ ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")'
   "permission-card automation is folded into effective Project automation");
 ok(wakeDocEn.includes("The HUD exposes Continue / Check Herdr / LLM decide plus Manual handoff")
     && wakeDocZh.includes("HUD 提供 `继续 / 查 Herdr / LLM 判断`")
-    && wakeDocEn.includes("configured OpenAI-compatible LLM may create")
-    && wakeDocEn.includes("leaves the current conversation unchanged")
-    && wakeDocZh.includes("已配置的 OpenAI-compatible LLM")
-    && wakeDocZh.includes("当前会话和页面地址保持不变"),
-  "Wake docs place manual handoff in the HUD and document the configured LLM fallback");
+    && wakeDocEn.includes("calls `continuity.resume` directly")
+    && wakeDocEn.includes("it no longer invokes a fallback LLM")
+    && wakeDocZh.includes("直接调用 `continuity.resume`")
+    && wakeDocZh.includes("不再调用 fallback LLM"),
+  "Wake docs unify manual URL and HUD handoff on durable continuity without ChatGPT summary fallback");
 const actionClickStart = backgroundSource.indexOf("chrome.action.onClicked.addListener");
 const actionClickEnd = actionClickStart >= 0 ? backgroundSource.indexOf("void rebuildStreams();", actionClickStart) : -1;
 const actionClickBlock = actionClickStart >= 0 && actionClickEnd > actionClickStart

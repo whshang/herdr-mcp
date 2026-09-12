@@ -1380,6 +1380,48 @@ impl StateStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("cannot begin continuity append: {error}"))?;
+        let workspace_id = workspace_id.unwrap_or("");
+        let (owner_count, only_owner, incoming_workspace_owner, workspace_owner_count) = tx
+            .query_row(
+                "SELECT COUNT(DISTINCT b.continuity_id),
+                        MIN(b.continuity_id),
+                        MAX(CASE WHEN b.continuity_id = ?2 AND b.workspace_id = ?3 THEN 1 ELSE 0 END),
+                        COUNT(DISTINCT CASE WHEN b.workspace_id = ?3 THEN b.continuity_id END)
+                 FROM continuity_bindings b
+                 JOIN continuity_chains c ON c.continuity_id = b.continuity_id
+                 WHERE b.conversation_id = ?1 AND c.status = 'active'",
+                params![conversation_id, continuity_id, workspace_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("cannot resolve continuity owner before append: {error}"))?;
+        let canonical_continuity_id = match (owner_count, only_owner) {
+            (0, _) => continuity_id.to_owned(),
+            (1, Some(owner)) => owner,
+            (count, _)
+                if count > 1 && incoming_workspace_owner != 0 && workspace_owner_count == 1 =>
+            {
+                continuity_id.to_owned()
+            }
+            _ => return Err("continuity_binding_ambiguous".to_owned()),
+        };
+        if owner_count > 1 {
+            tx.execute(
+                "DELETE FROM continuity_bindings
+                 WHERE conversation_id = ?1 AND continuity_id <> ?2
+                   AND continuity_id IN (
+                       SELECT continuity_id FROM continuity_chains WHERE status = 'active'
+                   )",
+                params![conversation_id, canonical_continuity_id],
+            )
+            .map_err(|error| format!("cannot repair continuity owner bindings: {error}"))?;
+        }
         tx.execute(
             "INSERT INTO continuity_chains (
                 continuity_id, title, project_id, status, created_at, updated_at
@@ -1388,7 +1430,7 @@ impl StateStore {
                 title = COALESCE(excluded.title, continuity_chains.title),
                 project_id = COALESCE(excluded.project_id, continuity_chains.project_id),
                 updated_at = MAX(continuity_chains.updated_at, excluded.updated_at)",
-            params![continuity_id, title, project_id, observed_at],
+            params![canonical_continuity_id, title, project_id, observed_at],
         )
         .map_err(|error| format!("cannot upsert continuity chain: {error}"))?;
         tx.execute(
@@ -1396,9 +1438,9 @@ impl StateStore {
                 continuity_id, conversation_id, workspace_id, bound_at
              ) VALUES (?1, ?2, ?3, ?4)",
             params![
-                continuity_id,
+                canonical_continuity_id,
                 conversation_id,
-                workspace_id.unwrap_or(""),
+                workspace_id,
                 observed_at
             ],
         )
@@ -1410,7 +1452,7 @@ impl StateStore {
                     fingerprint, observed_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    continuity_id,
+                    canonical_continuity_id,
                     conversation_id,
                     message_id,
                     role,
@@ -1424,7 +1466,7 @@ impl StateStore {
             tx.execute(
                 "INSERT INTO continuity_memory_fts(continuity_id, source_kind, source_id, text)
                  VALUES (?1, 'turn', ?2, ?3)",
-                params![continuity_id, message_id, text],
+                params![canonical_continuity_id, message_id, text],
             )
             .map_err(|error| format!("cannot index continuity turn: {error}"))?;
         }
@@ -3242,6 +3284,43 @@ impl StateStore {
             )
             .optional()
             .map_err(|error| format!("cannot inspect browser resource locator: {error}"))
+    }
+
+    pub fn browser_session_ref_for_canonical_url(
+        &self,
+        canonical_url: &str,
+    ) -> Result<Option<String>, String> {
+        if canonical_url.is_empty()
+            || canonical_url.len() > 2048
+            || canonical_url != canonical_url.trim()
+            || canonical_url.chars().any(char::is_control)
+            || !canonical_url.starts_with("https://")
+        {
+            return Err("browser_canonical_url_invalid".to_owned());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.resource_ref
+                 FROM browser_resource_locators l
+                 JOIN browser_resources r ON r.resource_ref = l.resource_ref
+                 WHERE l.canonical_url = ?1
+                   AND r.kind = 'session'
+                   AND r.provider = 'chatgpt'
+                 ORDER BY l.observed_at DESC, r.resource_ref
+                 LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
+        let mut refs = stmt
+            .query_map([canonical_url], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
+        match refs.len() {
+            0 => Ok(None),
+            1 => Ok(refs.pop()),
+            _ => Err("browser_canonical_url_ambiguous".to_owned()),
+        }
     }
 
     pub fn reserve_browser_session(
@@ -7257,7 +7336,7 @@ mod tests {
     }
 
     #[test]
-    fn continuity_turns_are_idempotent_resumable_and_ambiguity_fails_closed() {
+    fn continuity_turns_keep_single_active_conversation_owner_and_repair_legacy_duplicates() {
         let mut store = StateStore::open(":memory:").unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(
@@ -7334,10 +7413,65 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
+            store.continuity_for_conversation("conv-a").unwrap(),
+            Some("hc:alpha".to_owned())
+        );
+        let resume = store.continuity_resume("hc:alpha", 32).unwrap().unwrap();
+        assert_eq!(resume.turns.len(), 3);
+        assert_eq!(resume.turns[2].message_id, "msg-user-2");
+        assert!(store.continuity_resume("hc:beta", 32).unwrap().is_none());
+        assert_eq!(store.continuity_candidates(10).unwrap().len(), 1);
+
+        store
+            .append_continuity_turn(ContinuityTurnInput {
+                continuity_id: "hc:beta",
+                conversation_id: "conv-b",
+                workspace_id: Some("w20"),
+                project_id: Some("project-a"),
+                title: Some("Continuity beta"),
+                message_id: "msg-beta-1",
+                role: "user",
+                text: "independent chain",
+                fingerprint: None,
+                observed_at: 104,
+            })
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO continuity_bindings (
+                    continuity_id, conversation_id, workspace_id, bound_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params!["hc:beta", "conv-a", "w20", 105],
+            )
+            .unwrap();
+        assert_eq!(
             store.continuity_for_conversation("conv-a").unwrap_err(),
             "continuity_binding_ambiguous"
         );
-        assert_eq!(store.continuity_candidates(10).unwrap().len(), 2);
+
+        store
+            .append_continuity_turn(ContinuityTurnInput {
+                continuity_id: "hc:alpha",
+                conversation_id: "conv-a",
+                workspace_id: Some("w19"),
+                project_id: Some("project-a"),
+                title: None,
+                message_id: "msg-assistant-2",
+                role: "assistant",
+                text: "repair legacy duplicate owner",
+                fingerprint: None,
+                observed_at: 106,
+            })
+            .unwrap();
+        assert_eq!(
+            store.continuity_for_conversation("conv-a").unwrap(),
+            Some("hc:alpha".to_owned())
+        );
+        assert_eq!(
+            store.continuity_for_conversation("conv-b").unwrap(),
+            Some("hc:beta".to_owned())
+        );
     }
 
     #[test]

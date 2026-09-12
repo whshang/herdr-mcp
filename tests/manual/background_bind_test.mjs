@@ -97,6 +97,7 @@ let failQueuedInsertStorage = false;
 const queuedInsertDeliveries = [];
 const controlActionRequests = [];
 let mockContinuityPersistenceEnabled = false;
+let mockContinuityCanonicalId = null;
 const mockContinuityChains = new Set();
 const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
@@ -430,11 +431,12 @@ globalThis.chrome = {
           });
           return;
         }
-        if (body.continuity_id) mockContinuityChains.add(body.continuity_id);
+        const continuityId = mockContinuityCanonicalId || body.continuity_id;
+        if (continuityId) mockContinuityChains.add(continuityId);
         callback({
           ok: true, transport: "ipc", status: 200,
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ ok: true, continuity_id: body.continuity_id, inserted: true }),
+          body: JSON.stringify({ ok: true, continuity_id: continuityId, inserted: true, canonicalized: continuityId !== body.continuity_id }),
         });
         return;
       }
@@ -2196,8 +2198,9 @@ console.log("\n[project handoff]");
   const noFallbackStart = await noFallbackStartP;
   ok(noFallbackStart?.ok === false
       && noFallbackStart?.source_preserved === true
-      && noFallbackStart?.error === "handoff_fallback_llm_not_configured",
-    "manual Project handoff fails closed when neither durable continuity nor fallback LLM is available",
+      && noFallbackStart?.error === "continuity_unavailable"
+      && String(noFallbackStart?.source_url || "").includes("source123"),
+    "manual Project handoff fails closed when durable continuity is unavailable",
     JSON.stringify(noFallbackStart));
   ok(handoffPrompt === failedPromptBefore && tabUpdateCount === failedUpdateBefore,
     "failed manual Project handoff leaves the source conversation and route unchanged");
@@ -2225,18 +2228,20 @@ console.log("\n[project handoff]");
     },
   }, {}, (r) => resolveFallbackConfig(r));
   await fallbackConfigP;
+  mockContinuityPersistenceEnabled = true;
+  mockContinuityChains.add(continuityId);
 
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveStart(r));
   const started = await startP;
-  ok(started?.ok === true && started.pending === true && started?.source_preserved === true,
-    "manual Project rollover uses the read-only fallback without touching the source conversation", JSON.stringify(started));
+  ok(started?.ok === true && started.pending === true && started?.continuity_reference === true,
+    "manual Project rollover uses the durable continuity reference without touching the source conversation", JSON.stringify(started));
   const transferId = started?.handoff?.id;
   ok(!!transferId && handoffPrompt === failedPromptBefore,
     "manual ChatGPT Project handoff never submits HERDR_HANDOFF_V1 into the source conversation");
-  ok(llmHandoffRequests.length === fallbackRequestsBefore + 1,
-    "missing durable continuity uses exactly one configured fallback LLM request");
+  ok(llmHandoffRequests.length === fallbackRequestsBefore,
+    "durable continuity bypasses the configured fallback LLM");
 
   await waitForTest(() => storage.herdrConversationTransfers?.[transferId]?.status === "seed_uncertain");
   const uncertain = storage.herdrConversationTransfers[transferId];
@@ -2255,8 +2260,10 @@ console.log("\n[project handoff]");
   ok(targetProbeCount >= 4, "current-tab handoff waits for the delayed Project composer (>=4 probes) before seeding");
   ok(targetSeedCount === 1, "delayed-composer Project handoff seeds the target exactly once");
   ok(seedTemplateCaptures.length === 1
-      && seedTemplateCaptures[0].includes(`[HERDR_CONTINUITY_TRANSFER id=${transferId}]`),
-    "ChatGPT target seed template carries the exact continuity transfer marker",
+      && seedTemplateCaptures[0].includes(`[HERDR_CONTINUITY_REF id=${transferId} continuity_id=${continuityId}]`)
+      && seedTemplateCaptures[0].includes(PROJECT_SOURCE_URL)
+      && !seedTemplateCaptures[0].includes("<<<HERDR_HANDOFF_V1"),
+    "ChatGPT target seed carries continuity id and old conversation URL without a legacy packet",
     JSON.stringify(seedTemplateCaptures).slice(0, 200));
   ok(!!storage.herdrWakeBindings[sourceKey]
       && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
@@ -2291,7 +2298,10 @@ console.log("\n[project handoff]");
   ok(storage.herdrConversationTransfers[transferId]?.handoff_text == null, "committed transfer clears the temporary handoff packet");
 
   const priorContinuityPersistence = mockContinuityPersistenceEnabled;
+  const priorContinuityCanonicalId = mockContinuityCanonicalId;
+  const canonicalContinuityId = "hc:test-canonical-owner";
   mockContinuityPersistenceEnabled = true;
+  mockContinuityCanonicalId = canonicalContinuityId;
   const manualContinueBefore = continuityTurnRequests.length;
   let resolveManualContinue;
   const manualContinueP = new Promise((r) => { resolveManualContinue = r; });
@@ -2311,6 +2321,16 @@ console.log("\n[project handoff]");
       && continuityTurnRequests.at(-1)?.role === "user"
       && continuityTurnRequests.at(-1)?.text === "continue without continuity id",
     "manual continue inherits the Project continuity chain instead of creating or requiring another id");
+  ok(manualContinue?.continuity_id === canonicalContinuityId
+      && storage.herdrWakeBindings[targetKey]?.continuity_id === canonicalContinuityId,
+    "Rust canonical continuity owner replaces the stale local binding after turn persistence",
+    JSON.stringify(manualContinue));
+  for (const binding of Object.values(storage.herdrWakeBindings || {})) {
+    if (binding?.continuity_id === canonicalContinuityId) binding.continuity_id = continuityId;
+  }
+  mockContinuityChains.delete(canonicalContinuityId);
+  mockContinuityChains.add(continuityId);
+  mockContinuityCanonicalId = priorContinuityCanonicalId;
   mockContinuityPersistenceEnabled = priorContinuityPersistence;
 
   // Repeat with Project Auto on. Manual handoff must remain available and the
@@ -2593,6 +2613,8 @@ console.log("\n[project handoff insert false-negative]");
   await bindP;
   const sourceKey = `${PROJECT_KEY}::wH`;
   const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+  mockContinuityPersistenceEnabled = true;
+  mockContinuityChains.add(continuityId);
 
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
@@ -2650,6 +2672,8 @@ console.log("\n[project handoff legacy failed-seed recovery]");
     tabUrl: PROJECT_SOURCE_URL,
   };
   const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+  mockContinuityPersistenceEnabled = true;
+  mockContinuityChains.add(continuityId);
 
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
@@ -2675,6 +2699,9 @@ console.log("\n[project handoff legacy failed-seed recovery]");
   await waitForTest(() => storage.herdrConversationTransfers?.[transferId]?.status === "seed_uncertain");
 
   const transfer = storage.herdrConversationTransfers[transferId];
+  transfer.handoff_text = assistantText;
+  transfer.summary_source = "legacy_packet";
+  transfer.seed_kind = "legacy_packet";
   transfer.status = "failed";
   transfer.error = "insert-failed";
   const targetTabId = transfer.target_tab_id;
@@ -2727,6 +2754,8 @@ console.log("\n[project handoff immediate-ready]");
   await bindP;
   const sourceKey = `${PROJECT_KEY}::wH`;
   const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+  mockContinuityPersistenceEnabled = true;
+  mockContinuityChains.add(continuityId);
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId, trigger: "manual" }, { tab: { id: tabId } }, (r) => resolveStart(r));
@@ -2735,23 +2764,15 @@ console.log("\n[project handoff immediate-ready]");
   const transferId = Object.values(storage.herdrConversationTransfers || {})
     .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
     .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
-  const assistantText = [
-    `<<<HERDR_HANDOFF_V1 id=${transferId}>>>`,
-    "# Project handoff",
-    "Immediate-ready fixture.",
-    "<<<END_HERDR_HANDOFF_V1>>>",
-  ].join("\n");
-  let resolveEnded;
-  const endedP = new Promise((r) => { resolveEnded = r; });
-  onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: tabId } }, (r) => resolveEnded(r));
-  await endedP;
   await waitForTest(() => storage.herdrConversationTransfers?.[transferId]?.status === "committed");
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed",
     "immediate-ready Project handoff commits", JSON.stringify(storage.herdrConversationTransfers[transferId]));
   ok(targetSeedCount === 1 && seedTemplateCaptures.length === 1,
     "immediate-ready Project handoff commits with exactly one seed");
-  ok(seedTemplateCaptures[0]?.includes(`[HERDR_CONTINUITY_TRANSFER id=${transferId}]`),
-    "immediate-ready seed carries the exact continuity marker");
+  ok(seedTemplateCaptures[0]?.includes(`[HERDR_CONTINUITY_REF id=${transferId} continuity_id=${continuityId}]`)
+      && seedTemplateCaptures[0]?.includes(PROJECT_SOURCE_URL)
+      && !seedTemplateCaptures[0]?.includes("<<<HERDR_HANDOFF_V1"),
+    "immediate-ready seed carries continuity id and old URL only");
   ok(storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_TARGET
       && storage.herdrWakeBindings[sourceKey]?.continuity_id === continuityId,
     "immediate-ready commit switches the conversation target and preserves continuity");
@@ -3055,18 +3076,18 @@ console.log("\n[project hard-limit handoff LLM fallback]");
   onMsg({ type: "h2w_handoff_start", tabId: fallbackTabId, trigger: "manual" },
     { tab: { id: fallbackTabId, url: PROJECT_SOURCE_URL } }, (r) => resolveStart(r));
   const started = await startP;
-  ok(started?.ok === true && started?.fallback === true && started?.handoff?.summary_source === "llm_fallback",
-    "hard conversation limit switches directly to the configured LLM summary path", JSON.stringify(started));
-  ok(primaryPromptCount === 0, "hard-limit detection does not send an impossible web-model summary prompt");
-  ok(llmHandoffRequests.length === 1
-      && String(llmHandoffRequests[0]?.messages?.[0]?.content || "").includes("<<<SOURCE_TRANSCRIPT>>>")
-      && String(llmHandoffRequests[0]?.messages?.[0]?.content || "").includes("Implement the HUD handoff change"),
-    "fallback LLM receives one bounded source transcript under the existing handoff contract");
-
-  await waitForTest(() => storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_TARGET, 5000);
-  ok(storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_TARGET
+  ok(started?.ok === false
+      && started?.source_preserved === true
+      && started?.error === "continuity_unavailable"
+      && String(started?.source_url || "").includes("source123"),
+    "hard conversation limit keeps the old URL and fails closed without durable continuity", JSON.stringify(started));
+  ok(primaryPromptCount === 0,
+    "hard-limit detection does not send an impossible web-model summary prompt");
+  ok(llmHandoffRequests.length === 0,
+    "hard-limit ChatGPT handoff does not invoke the configured fallback LLM");
+  ok(storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE
       && storage.herdrWakeBindings[sourceKey]?.continuity_id === continuityId,
-    "LLM fallback rejoins the normal Project cutover and preserves continuity", JSON.stringify(storage.herdrWakeBindings[sourceKey]));
+    "failed hard-limit handoff preserves the source binding", JSON.stringify(storage.herdrWakeBindings[sourceKey]));
 
   llmHandoffResponder = null;
   let resolveClearConfig;
