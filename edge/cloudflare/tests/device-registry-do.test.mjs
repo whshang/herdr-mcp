@@ -40,8 +40,18 @@ const TEST_PEPPER = "test-pepper-link-shared-secret-high-entropy-32b!!";
 function makeRegistry(envOverrides = {}) {
   const storage = new FakeStorage();
   const state = { storage };
-  const env = { LINK_SHARED_SECRET: TEST_PEPPER, ...envOverrides };
-  return { storage, registry: new DeviceRegistryDO(state, env), env };
+  const fenceCalls = [];
+  const defaultWorkstationDO = {
+    idFromName: (name) => name,
+    get: (name) => ({
+      fetch: async (request) => {
+        fenceCalls.push({ name, url: request.url, body: request.method === "POST" ? await request.clone().json() : null });
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    }),
+  };
+  const env = { LINK_SHARED_SECRET: TEST_PEPPER, WORKSTATION_DO: defaultWorkstationDO, ...envOverrides };
+  return { storage, registry: new DeviceRegistryDO(state, env), env, fenceCalls };
 }
 
 test("device registry writes durable identity records and reads them without observation writes", async () => {
@@ -289,4 +299,203 @@ test("pepper never appears in DO storage, logs, or pairing output", async () => 
   assert.equal(snapshot.includes(TEST_PEPPER), false, "pepper must never be stored in DO");
   assert.equal(snapshot.includes(session.pairing_id), false);
   assert.equal(JSON.stringify(session).includes(TEST_PEPPER), false, "pepper must never be returned to clients");
+});
+
+
+test("execution-state PUT projects restrictive state before registry write and widening state after it", async () => {
+  const { storage, registry, env } = makeRegistry();
+  const initial = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A)),
+  }));
+  assert.equal(initial.status, 200);
+
+  const observations = [];
+  env.WORKSTATION_DO = {
+    idFromName: (name) => name,
+    get: () => ({
+      fetch: async (request) => {
+        const body = await request.clone().json();
+        observations.push({ projected: body.scheduling, stored: storage.map.get(`device:${DEVICE_A}`).scheduling });
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    }),
+  };
+
+  const paused = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A, { scheduling: "paused", updated_at_ms: 20 })),
+  }));
+  assert.equal(paused.status, 200);
+  assert.deepEqual(observations[0], { projected: "paused", stored: "enabled" }, "restrictive projection must happen before registry write");
+  assert.equal(storage.map.get(`device:${DEVICE_A}`).scheduling, "paused");
+
+  const resumed = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A, { scheduling: "enabled", updated_at_ms: 30 })),
+  }));
+  assert.equal(resumed.status, 200);
+  assert.deepEqual(observations[1], { projected: "enabled", stored: "enabled" }, "widening registry write must happen before projection");
+});
+
+test("restrictive projection failure leaves the registry routable state unchanged", async () => {
+  const { storage, registry, env } = makeRegistry();
+  assert.equal((await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A)),
+  }))).status, 200);
+  env.WORKSTATION_DO = {
+    idFromName: (name) => name,
+    get: () => ({ fetch: async () => new Response(JSON.stringify({ ok: false }), { status: 503 }) }),
+  };
+  const response = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A, { scheduling: "paused", updated_at_ms: 40 })),
+  }));
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).code, "execution_fence_unavailable");
+  assert.equal(storage.map.get(`device:${DEVICE_A}`).scheduling, "enabled");
+});
+
+
+test("widening projection failure converges on an identical retry", async () => {
+  const { storage, registry, env } = makeRegistry();
+  assert.equal((await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A, { scheduling: "paused" })),
+  }))).status, 200);
+
+  let attempts = 0;
+  env.WORKSTATION_DO = {
+    idFromName: (name) => name,
+    get: () => ({
+      fetch: async () => {
+        attempts += 1;
+        return new Response(JSON.stringify({ ok: attempts > 1 }), { status: attempts > 1 ? 200 : 503 });
+      },
+    }),
+  };
+
+  const body = JSON.stringify(record(DEVICE_A, { scheduling: "enabled", updated_at_ms: 50 }));
+  const first = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body,
+  }));
+  assert.equal(first.status, 503);
+  assert.equal(storage.map.get(`device:${DEVICE_A}`).scheduling, "enabled", "registry widening commits before projection");
+
+  const second = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body,
+  }));
+  assert.equal(second.status, 200);
+  assert.equal(attempts, 2, "identical retry must refresh the routable execution fence");
+});
+
+
+test("generic device PUT cannot rewrite an enrolled workstation mapping", async () => {
+  const { storage, registry } = makeRegistry();
+  assert.equal((await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A)),
+  }))).status, 200);
+
+  const response = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A, { workstation_id: DEVICE_B })),
+  }));
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, "workstation_id_immutable");
+  assert.equal(storage.map.get(`device:${DEVICE_A}`).workstation_id, DEVICE_A);
+});
+
+test("device PUT uses a server-owned monotonic execution-fence revision", async () => {
+  const { storage, registry } = makeRegistry();
+  assert.equal((await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A)),
+  }))).status, 200);
+  const before = storage.map.get(`device:${DEVICE_A}`).updated_at_ms;
+  const forgedFuture = 8_000_000_000_000;
+  const response = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A, { name: "renamed", updated_at_ms: forgedFuture })),
+  }));
+  assert.equal(response.status, 200);
+  const stored = storage.map.get(`device:${DEVICE_A}`);
+  assert.ok(stored.updated_at_ms > before, "server revision must advance");
+  assert.ok(stored.updated_at_ms < forgedFuture, "caller-supplied future timestamp must not control fence ordering");
+});
+
+test("revoke fences WorkstationDO before registry revocation and tears down only after registry commit", async () => {
+  const { storage, registry, env } = makeRegistry();
+  assert.equal((await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A)),
+  }))).status, 200);
+
+  const observations = [];
+  env.WORKSTATION_DO = {
+    idFromName: (name) => name,
+    get: (name) => ({
+      fetch: async (request) => {
+        const path = new URL(request.url).pathname;
+        const storedAuthorization = storage.map.get(`device:${DEVICE_A}`).authorization;
+        if (path === "/internal/execution-fence") {
+          const body = await request.clone().json();
+          observations.push({ path, projected: body.authorization, storedAuthorization, name });
+          return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        if (path === "/internal/revoke") {
+          observations.push({ path, storedAuthorization, name });
+          return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        throw new Error(`unexpected path ${path}`);
+      },
+    }),
+  };
+
+  const response = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}/revoke`, { method: "POST" }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(observations, [
+    { path: "/internal/execution-fence", projected: "revoked", storedAuthorization: "active", name: DEVICE_A },
+    { path: "/internal/revoke", storedAuthorization: "revoked", name: DEVICE_A },
+  ]);
+  assert.equal(storage.map.get(`device:${DEVICE_A}`).authorization, "revoked");
+});
+
+test("revoke projection failure leaves registry active and never reaches teardown", async () => {
+  const { storage, registry, env } = makeRegistry();
+  assert.equal((await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_A)),
+  }))).status, 200);
+
+  const paths = [];
+  env.WORKSTATION_DO = {
+    idFromName: (name) => name,
+    get: () => ({
+      fetch: async (request) => {
+        const path = new URL(request.url).pathname;
+        paths.push(path);
+        return new Response(JSON.stringify({ ok: false }), { status: 503, headers: { "content-type": "application/json" } });
+      },
+    }),
+  };
+
+  const response = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}/revoke`, { method: "POST" }));
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).code, "execution_fence_unavailable");
+  assert.deepEqual(paths, ["/internal/execution-fence"]);
+  assert.equal(storage.map.get(`device:${DEVICE_A}`).authorization, "active");
 });

@@ -270,3 +270,129 @@ test("alarm budget: active request deadlines stay exact ahead of coalesced clean
   assert.equal(storage.alarm, liveDeadline, "pending request timeout must remain exact");
   assert.deepEqual(storage.mutations, [["setAlarm", liveDeadline]]);
 });
+
+
+const ROUTE_DEVICE = "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ";
+
+function routeFence(overrides = {}) {
+  return {
+    device_id: ROUTE_DEVICE,
+    workstation_id: "prod-real-runtime",
+    authorization: "active",
+    scheduling: "enabled",
+    revision: 10,
+    ...overrides,
+  };
+}
+
+test("execution fence bootstrap persists once and admits an active canonical route", async () => {
+  const storage = new FakeStorage();
+  const sent = [];
+  const activeSocket = {
+    deserializeAttachment: () => ({ active: true, registered: true }),
+    send: (frame) => sent.push(JSON.parse(frame)),
+  };
+  const subject = new WorkstationDO(fakeState(storage, [activeSocket]), {});
+  await subject.fetch(new Request("https://do/internal/status"));
+  storage.mutations.length = 0;
+
+  const requestId = "route-fence-active";
+  const pending = subject.forwardInternal({
+    kind: "request",
+    requestId,
+    op: "herdr_inspect",
+    routeDeviceId: ROUTE_DEVICE,
+    executionFence: routeFence(),
+    deadlineMs: Date.now() + 30_000,
+  });
+  await waitForToolRequests(sent, 1);
+  assert.equal(sent.at(-1)?.kind, "tool_request");
+  assert.deepEqual(storage.mutations, [["put", "device_execution_fence"]]);
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: requestId,
+    result: { ok: true },
+    served_at_ms: Date.now(),
+  });
+  assert.equal((await pending).status, 200);
+
+  storage.mutations.length = 0;
+  const requestId2 = "route-fence-warm";
+  const warm = subject.forwardInternal({
+    kind: "request",
+    requestId: requestId2,
+    op: "herdr_inspect",
+    routeDeviceId: ROUTE_DEVICE,
+    deadlineMs: Date.now() + 30_000,
+  });
+  await waitForToolRequests(sent, 2);
+  assert.deepEqual(storage.mutations, [], "warm fast path must not write the fence again");
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: requestId2,
+    result: { ok: true },
+    served_at_ms: Date.now(),
+  });
+  assert.equal((await warm).status, 200);
+});
+
+test("paused and suspended execution fences fail closed before any Link delivery", async () => {
+  for (const [state, expectedCode] of [
+    [{ scheduling: "paused", revision: 20 }, "device_paused"],
+    [{ authorization: "suspended", revision: 30 }, "device_suspended"],
+  ]) {
+    const storage = new FakeStorage();
+    const sent = [];
+    const activeSocket = {
+      deserializeAttachment: () => ({ active: true, registered: true }),
+      send: (frame) => sent.push(JSON.parse(frame)),
+    };
+    const subject = new WorkstationDO(fakeState(storage, [activeSocket]), {});
+    await subject.fetch(new Request("https://do/internal/status"));
+    const fenceResp = await subject.fetch(new Request("https://do/internal/execution-fence", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(routeFence(state)),
+    }));
+    assert.equal(fenceResp.status, 200);
+    const response = await subject.forwardInternal({
+      kind: "request",
+      requestId: `blocked-${expectedCode}`,
+      op: "herdr_inspect",
+      routeDeviceId: ROUTE_DEVICE,
+      deadlineMs: Date.now() + 30_000,
+    });
+    assert.equal((await response.json()).error.code, expectedCode);
+    assert.equal(sent.some((frame) => frame.kind === "tool_request"), false);
+  }
+});
+
+test("a stale active bootstrap cannot reopen a newer paused fence", async () => {
+  const storage = new FakeStorage();
+  const sent = [];
+  const activeSocket = {
+    deserializeAttachment: () => ({ active: true, registered: true }),
+    send: (frame) => sent.push(JSON.parse(frame)),
+  };
+  const subject = new WorkstationDO(fakeState(storage, [activeSocket]), {});
+  await subject.fetch(new Request("https://do/internal/status"));
+  await subject.fetch(new Request("https://do/internal/execution-fence", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(routeFence({ scheduling: "paused", revision: 50 })),
+  }));
+  const response = await subject.forwardInternal({
+    kind: "request",
+    requestId: "stale-bootstrap",
+    op: "herdr_inspect",
+    routeDeviceId: ROUTE_DEVICE,
+    executionFence: routeFence({ revision: 40 }),
+    deadlineMs: Date.now() + 30_000,
+  });
+  assert.equal((await response.json()).error.code, "device_paused");
+  assert.equal(sent.some((frame) => frame.kind === "tool_request"), false);
+});

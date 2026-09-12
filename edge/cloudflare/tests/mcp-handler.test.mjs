@@ -71,7 +71,7 @@ test("device-bound automation defaults to its device and rejects other selectors
     arguments: { method: "pane.read", params: JSON.stringify({ pane_id: "w1:p1", source: "recent" }) },
   }), "legacy", d.value);
   assert.equal(implicit.body.result.isError, undefined);
-  assert.deepEqual(resolved, [DEVICE_A], "omitted device must resolve only to the automation-bound device");
+  assert.deepEqual(resolved, [], "warm canonical automation route must not spend a registry lookup");
   assert.equal(d.calls.length, 1);
 
   const explicitOther = await handleMcp(req(902, "tools/call", {
@@ -81,7 +81,7 @@ test("device-bound automation defaults to its device and rejects other selectors
   assert.equal(explicitOther.body.result.isError, true);
   assert.equal(explicitOther.body.result.structuredContent.code, "automation_device_scope_violation");
   assert.equal(explicitOther.body.result.structuredContent.delivery_state, "not_delivered");
-  assert.deepEqual(resolved, [DEVICE_A], "cross-device selector must fail before route resolution");
+  assert.deepEqual(resolved, [], "cross-device selector must fail before route resolution");
   assert.equal(d.calls.length, 1, "cross-device selector must not forward");
 
   const otherRef = encodeDeviceRef(DEVICE_B, undefined, "w2:p1");
@@ -92,7 +92,7 @@ test("device-bound automation defaults to its device and rejects other selectors
   assert.equal(refOther.body.result.isError, true);
   assert.equal(refOther.body.result.structuredContent.code, "automation_device_scope_violation");
   assert.equal(refOther.body.result.structuredContent.delivery_state, "not_delivered");
-  assert.deepEqual(resolved, [DEVICE_A], "cross-device ref must fail before route resolution");
+  assert.deepEqual(resolved, [], "cross-device ref must fail before route resolution");
   assert.equal(d.calls.length, 1, "cross-device ref must not forward");
 
   const fleet = await handleMcp(req(904, "tools/call", {
@@ -296,8 +296,8 @@ test("all 18 workstation contract tools honor the same explicit device route", a
     }), "legacy-default", d.value);
     assert.equal(response.body.result.isError, undefined, `${tool.name} explicit device route must succeed`);
   }
-  assert.deepEqual(resolved, Array(EPOCH2_CONTRACT.tools.length).fill(DEVICE_A));
-  assert.deepEqual(d.targets, Array(EPOCH2_CONTRACT.tools.length).fill("ws-explicit"));
+  assert.deepEqual(resolved, [], "canonical tool routes should not consult DeviceRegistryDO once the fence is warm");
+  assert.deepEqual(d.targets, Array(EPOCH2_CONTRACT.tools.length).fill(DEVICE_A));
   assert.equal(d.calls.every((call) => !Object.hasOwn(call.args, "device")), true);
 });
 
@@ -928,8 +928,8 @@ test("explicit device routing selects one workstation and strips Edge-only devic
     d.value,
   );
   assert.equal(r.body.result.isError, undefined);
-  assert.equal(routeCalls, 1);
-  assert.deepEqual(d.targets, ["prod-real-runtime"]);
+  assert.equal(routeCalls, 0);
+  assert.deepEqual(d.targets, [DEVICE_A]);
   assert.equal(Object.hasOwn(d.calls[0].args, "device"), false);
   assert.equal(d.calls[0].contractEpoch, EPOCH2_CONTRACT.contract_epoch);
   assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
@@ -1166,7 +1166,7 @@ test("browser and Page Assist private methods require explicit enrolled device s
   );
   assert.equal(explicit.body.result.isError, undefined);
   assert.equal(d.calls.length, 1, "request forwarded to workstation");
-  assert.equal(d.targets[0], "w-target");
+  assert.equal(d.targets[0], "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
   assert.equal(d.calls[0].op, "herdr_call");
   assert.equal(d.calls[0].args.method, "herdr_mcp.browser_endpoint.list");
   assert.equal(d.calls[0].args.device, undefined, "device selector stripped by unwrapDeviceRefs");
@@ -1207,4 +1207,159 @@ test("browser and Page Assist private methods require explicit enrolled device s
       endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     }],
   }, "Page Assist receives only endpoint grants for the routed device and no WebChat grant tuple");
+});
+
+
+test("canonical device_id tools/call uses the registry-free route when the workstation fence is already warm", async () => {
+  let registryReads = 0;
+  const d = deps({
+    resolveDevice: async () => {
+      registryReads += 1;
+      throw new Error("registry should not be consulted on the warm canonical path");
+    },
+  });
+  const r = await handleMcp(req(201, "tools/call", {
+    name: "herdr_inspect",
+    arguments: { device: DEVICE_A },
+  }), "legacy", d.value);
+  assert.equal(r.body.result.structuredContent.served, true);
+  assert.equal(registryReads, 0);
+  assert.deepEqual(d.targets, [DEVICE_A]);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].routeDeviceId, DEVICE_A);
+  assert.equal(d.calls[0].executionFence, undefined);
+});
+
+test("canonical route falls back exactly once to DeviceRegistryDO when the execution fence is cold", async () => {
+  let registryReads = 0;
+  let forwardAttempts = 0;
+  const d = deps({
+    resolveDevice: async (selector) => {
+      registryReads += 1;
+      assert.equal(selector, DEVICE_A);
+      return {
+        ok: true,
+        device_id: DEVICE_A,
+        workstation_id: DEVICE_A,
+        device_name: "macbook-main",
+        routing_reason: "explicit_device",
+        execution_fence: {
+          device_id: DEVICE_A,
+          workstation_id: DEVICE_A,
+          authorization: "active",
+          scheduling: "enabled",
+          revision: 42,
+        },
+      };
+    },
+    forward: async () => {
+      forwardAttempts += 1;
+      if (forwardAttempts === 1) {
+        return new Response(JSON.stringify({
+          status: "error",
+          error: { ok: false, code: "device_route_unverified", retryable: false, delivery_state: "not_delivered" },
+        }), { status: 428, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { warmed: true } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const r = await handleMcp(req(202, "tools/call", {
+    name: "herdr_inspect",
+    arguments: { device: DEVICE_A },
+  }), "legacy", d.value);
+  assert.equal(r.body.result.structuredContent.warmed, true);
+  assert.equal(registryReads, 1);
+  assert.equal(d.calls.length, 2);
+  assert.equal(d.calls[0].routeDeviceId, DEVICE_A);
+  assert.equal(d.calls[0].executionFence, undefined);
+  assert.deepEqual(d.calls[1].executionFence, {
+    device_id: DEVICE_A,
+    workstation_id: DEVICE_A,
+    authorization: "active",
+    scheduling: "enabled",
+    revision: 42,
+  });
+  assert.notEqual(d.calls[0].requestId, d.calls[1].requestId, "cold-fence fallback must use a fresh request id");
+});
+
+
+test("canonical fast route falls back to a legacy noncanonical workstation mapping when its fence is absent", async () => {
+  let registryReads = 0;
+  const forwardedTargets = [];
+  const d = deps({
+    resolveDevice: async (selector) => {
+      registryReads += 1;
+      assert.equal(selector, DEVICE_A);
+      return {
+        ok: true,
+        device_id: DEVICE_A,
+        workstation_id: "legacy-ws-a",
+        device_name: "legacy-a",
+        routing_reason: "explicit_device",
+        execution_fence: {
+          device_id: DEVICE_A,
+          workstation_id: "legacy-ws-a",
+          authorization: "active",
+          scheduling: "enabled",
+          revision: 77,
+        },
+      };
+    },
+    forward: async (stub, body) => {
+      forwardedTargets.push(stub.workstationId);
+      if (forwardedTargets.length === 1) {
+        return new Response(JSON.stringify({
+          status: "error",
+          error: { ok: false, code: "device_route_unverified", retryable: false, delivery_state: "not_delivered" },
+        }), { status: 428, headers: { "content-type": "application/json" } });
+      }
+      const parsed = JSON.parse(body);
+      assert.equal(parsed.executionFence.workstation_id, "legacy-ws-a");
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { legacy: true } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const r = await handleMcp(req(204, "tools/call", {
+    name: "herdr_inspect",
+    arguments: { device: DEVICE_A },
+  }), "legacy-default", d.value);
+  assert.equal(r.body.result.structuredContent.legacy, true);
+  assert.equal(registryReads, 1);
+  assert.deepEqual(forwardedTargets, [DEVICE_A, "legacy-ws-a"]);
+});
+
+test("display-name routing remains registry-owned", async () => {
+  let registryReads = 0;
+  const d = deps({
+    resolveDevice: async (selector) => {
+      registryReads += 1;
+      assert.equal(selector, "macbook-main");
+      return {
+        ok: true,
+        device_id: DEVICE_A,
+        workstation_id: DEVICE_A,
+        device_name: "macbook-main",
+        routing_reason: "explicit_device",
+        execution_fence: {
+          device_id: DEVICE_A,
+          workstation_id: DEVICE_A,
+          authorization: "active",
+          scheduling: "enabled",
+          revision: 43,
+        },
+      };
+    },
+  });
+  const r = await handleMcp(req(203, "tools/call", {
+    name: "herdr_inspect",
+    arguments: { device: "macbook-main" },
+  }), "legacy", d.value);
+  assert.equal(r.body.result.structuredContent.served, true);
+  assert.equal(registryReads, 1);
+  assert.equal(d.calls[0].executionFence.revision, 43);
 });
