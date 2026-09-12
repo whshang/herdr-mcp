@@ -9,10 +9,63 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const SOURCE: &str = "local_gh_api";
-const GIT_TIMEOUT: Duration = Duration::from_secs(1);
+// Local Git metadata is normally sub-millisecond, but a one-second budget can
+// false-timeout under release-link/LTO scheduler pressure and force the planner
+// into a second status request. Keep it bounded without making CPU contention a
+// remote-call amplifier.
+const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 const GH_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_COMMAND_BYTES: usize = 256 * 1024;
 const MAX_STDERR_BYTES: usize = 2048;
+const MAX_CHECK_PAGES: usize = 32;
+
+const PR_STATUS_META_QUERY: &str = r#"
+query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    autoMergeAllowed
+    defaultBranchRef{name}
+    pullRequest(number:$number){
+      id number state isDraft mergeable mergeStateStatus
+      headRefOid baseRefOid headRefName baseRefName
+      autoMergeRequest{mergeMethod}
+      url
+    }
+  }
+}
+"#;
+
+const PR_STATUS_CHECKS_QUERY: &str = r#"
+query($id:ID!,$endCursor:String){
+  node(id:$id){
+    ...on PullRequest{
+      commits(last:1){
+        nodes{
+          commit{
+            statusCheckRollup{
+              contexts(first:100,after:$endCursor){
+                nodes{
+                  __typename
+                  ...on StatusContext{
+                    context state targetUrl createdAt description
+                    isRequired(pullRequestId:$id)
+                  }
+                  ...on CheckRun{
+                    name
+                    checkSuite{workflowRun{event workflow{name}}}
+                    status conclusion startedAt completedAt detailsUrl
+                    isRequired(pullRequestId:$id)
+                  }
+                }
+                pageInfo{hasNextPage endCursor}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
 
 pub fn status(params: &Value, snapshot: &Value) -> Value {
     let Some(object) = params.as_object() else {
@@ -102,73 +155,29 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
     } else {
         root.clone()
     };
-    let repo_api_path = format!("repos/{repository}");
-    let repository_json = match run_gh_json(&gh, &gh_root, &["api", &repo_api_path]) {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
-
-    let pr_json = if let Some(number) = pr_number {
-        let number = number.to_string();
-        match run_gh_json(
-            &gh,
-            &gh_root,
-            &[
-                "pr",
-                "view",
-                &number,
-                "--repo",
-                &repository,
-                "--json",
-                "number,state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefOid,headRefName,baseRefName,autoMergeRequest,url",
-            ],
-        ) {
-            Ok(value) => Some(value),
-            Err(error) => return error,
-        }
-    } else {
-        None
-    };
-
-    let (all_checks, required_checks) = if let Some(number) = pr_number {
-        let number = number.to_string();
-        let fields = "name,state,bucket,link,workflow";
-        let all = match run_gh_checks_json(
-            &gh,
-            &gh_root,
-            &[
-                "pr",
-                "checks",
-                &number,
-                "--repo",
-                &repository,
-                "--json",
-                fields,
-            ],
-        ) {
+    let (repository_json, pr_json, all_checks, required_checks) = if let Some(number) = pr_number {
+        let (repository_json, pr_json, pr_id) =
+            match fetch_pr_metadata(&gh, &gh_root, &repository, number) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+        let (all_checks, required_checks) = match fetch_pr_checks(&gh, &gh_root, &pr_id, &pr_json) {
             Ok(value) => value,
             Err(error) => return error,
         };
-        let required = match run_gh_checks_json(
-            &gh,
-            &gh_root,
-            &[
-                "pr",
-                "checks",
-                &number,
-                "--repo",
-                &repository,
-                "--required",
-                "--json",
-                fields,
-            ],
-        ) {
+        (
+            repository_json,
+            Some(pr_json),
+            Some(all_checks),
+            Some(required_checks),
+        )
+    } else {
+        let repo_api_path = format!("repos/{repository}");
+        let repository_json = match run_gh_json(&gh, &gh_root, &["api", &repo_api_path]) {
             Ok(value) => value,
             Err(error) => return error,
         };
-        (Some(all), Some(required))
-    } else {
-        (None, None)
+        (repository_json, None, None, None)
     };
 
     render_status(
@@ -275,6 +284,284 @@ fn parse_github_repository(remote: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+fn fetch_pr_metadata(
+    gh: &Path,
+    root: &Path,
+    repository: &str,
+    number: u64,
+) -> Result<(Value, Value, String), Value> {
+    let Some((owner, name)) = repository.split_once('/') else {
+        return Err(command_error(
+            "unsupported_git_remote",
+            "GitHub repository identity must be owner/name".to_owned(),
+        ));
+    };
+    let query = format!("query={PR_STATUS_META_QUERY}");
+    let owner = format!("owner={owner}");
+    let name = format!("name={name}");
+    let number = format!("number={number}");
+    let response = run_gh_json(
+        gh,
+        root,
+        &[
+            "api", "graphql", "-f", &query, "-F", &owner, "-F", &name, "-F", &number,
+        ],
+    )?;
+    reject_graphql_errors(&response)?;
+    parse_pr_metadata_response(&response)
+}
+
+fn parse_pr_metadata_response(response: &Value) -> Result<(Value, Value, String), Value> {
+    let Some(repository_json) = response.pointer("/data/repository") else {
+        return Err(graphql_shape_error("repository metadata is missing"));
+    };
+    let Some(pr_json) = repository_json
+        .get("pullRequest")
+        .filter(|value| !value.is_null())
+    else {
+        return Err(command_error(
+            "gh_command_failed",
+            "pull request was not found in the GitHub repository".to_owned(),
+        ));
+    };
+    let Some(pr_id) = pr_json.get("id").and_then(Value::as_str) else {
+        return Err(graphql_shape_error("pull request node id is missing"));
+    };
+    let repository_summary = json!({
+        "allow_auto_merge": repository_json.get("autoMergeAllowed").cloned().unwrap_or(Value::Null),
+        "default_branch": repository_json.pointer("/defaultBranchRef/name").cloned().unwrap_or(Value::Null),
+    });
+    Ok((repository_summary, pr_json.clone(), pr_id.to_owned()))
+}
+
+fn fetch_pr_checks(
+    gh: &Path,
+    root: &Path,
+    pr_id: &str,
+    pr_json: &Value,
+) -> Result<(Value, Value), Value> {
+    let mut contexts = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut completed = false;
+    for _ in 0..MAX_CHECK_PAGES {
+        let response = fetch_pr_check_page(gh, root, pr_id, cursor.as_deref())?;
+        reject_graphql_errors(&response)?;
+        let Some(page) =
+            response.pointer("/data/node/commits/nodes/0/commit/statusCheckRollup/contexts")
+        else {
+            return Err(graphql_shape_error(
+                "pull request check contexts are missing",
+            ));
+        };
+        let Some(nodes) = page.get("nodes").and_then(Value::as_array) else {
+            return Err(graphql_shape_error("pull request check nodes are invalid"));
+        };
+        contexts.extend(nodes.iter().cloned());
+        let has_next = page
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| graphql_shape_error("check pagination flag is missing"))?;
+        if !has_next {
+            completed = true;
+            break;
+        }
+        let Some(next) = page
+            .pointer("/pageInfo/endCursor")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return Err(graphql_shape_error("check pagination cursor is missing"));
+        };
+        cursor = Some(next.to_owned());
+    }
+    if !completed {
+        return Err(command_error(
+            "gh_command_failed",
+            format!("pull request check pagination exceeded {MAX_CHECK_PAGES} pages"),
+        ));
+    }
+    let head = pr_json
+        .get("headRefName")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    normalize_check_contexts(contexts, head)
+}
+
+fn fetch_pr_check_page(
+    gh: &Path,
+    root: &Path,
+    pr_id: &str,
+    cursor: Option<&str>,
+) -> Result<Value, Value> {
+    let query = format!("query={PR_STATUS_CHECKS_QUERY}");
+    let id = format!("id={pr_id}");
+    if let Some(cursor) = cursor {
+        let cursor = format!("endCursor={cursor}");
+        run_gh_json(
+            gh,
+            root,
+            &["api", "graphql", "-f", &query, "-F", &id, "-F", &cursor],
+        )
+    } else {
+        run_gh_json(gh, root, &["api", "graphql", "-f", &query, "-F", &id])
+    }
+}
+
+fn normalize_check_contexts(mut contexts: Vec<Value>, head: &str) -> Result<(Value, Value), Value> {
+    contexts.sort_by(|left, right| check_started_at(right).cmp(check_started_at(left)));
+    let mut seen = BTreeSet::new();
+    let mut all = Vec::new();
+    let mut required = Vec::new();
+    for context in contexts {
+        let key = check_identity(&context)?;
+        if !seen.insert(key) {
+            continue;
+        }
+        let is_required = context
+            .get("isRequired")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| graphql_shape_error("check required-state is missing"))?;
+        let row = normalize_check_context(&context)?;
+        if is_required {
+            required.push(row.clone());
+        }
+        all.push(row);
+    }
+    if all.is_empty() {
+        return Err(command_error(
+            "gh_command_failed",
+            format!("no checks reported on the '{head}' branch"),
+        ));
+    }
+    if required.is_empty() {
+        return Err(command_error(
+            "gh_command_failed",
+            format!("no required checks reported on the '{head}' branch"),
+        ));
+    }
+    Ok((Value::Array(all), Value::Array(required)))
+}
+
+fn check_started_at(context: &Value) -> &str {
+    context
+        .get("startedAt")
+        .or_else(|| context.get("createdAt"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn check_identity(context: &Value) -> Result<String, Value> {
+    match context
+        .get("__typename")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "StatusContext" => context
+            .get("context")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("status:{value}"))
+            .ok_or_else(|| graphql_shape_error("status context name is missing")),
+        "CheckRun" => {
+            let name = context
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| graphql_shape_error("check run name is missing"))?;
+            let workflow = context
+                .pointer("/checkSuite/workflowRun/workflow/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let event = context
+                .pointer("/checkSuite/workflowRun/event")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Ok(format!("check:{name}/{workflow}/{event}"))
+        }
+        _ => Err(graphql_shape_error("unknown status check context type")),
+    }
+}
+
+fn normalize_check_context(context: &Value) -> Result<Value, Value> {
+    match context
+        .get("__typename")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "StatusContext" => {
+            let name = context
+                .get("context")
+                .and_then(Value::as_str)
+                .ok_or_else(|| graphql_shape_error("status context name is missing"))?;
+            let state = context
+                .get("state")
+                .and_then(Value::as_str)
+                .ok_or_else(|| graphql_shape_error("status context state is missing"))?;
+            Ok(json!({
+                "name": name,
+                "state": state,
+                "bucket": check_bucket(state),
+                "link": context.get("targetUrl").cloned().unwrap_or(Value::Null),
+                "workflow": "",
+            }))
+        }
+        "CheckRun" => {
+            let name = context
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| graphql_shape_error("check run name is missing"))?;
+            let status = context
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or_else(|| graphql_shape_error("check run status is missing"))?;
+            let state = if status == "COMPLETED" {
+                context
+                    .get("conclusion")
+                    .and_then(Value::as_str)
+                    .unwrap_or(status)
+            } else {
+                status
+            };
+            Ok(json!({
+                "name": name,
+                "state": state,
+                "bucket": check_bucket(state),
+                "link": context.get("detailsUrl").cloned().unwrap_or(Value::Null),
+                "workflow": context.pointer("/checkSuite/workflowRun/workflow/name").cloned().unwrap_or(Value::String(String::new())),
+            }))
+        }
+        _ => Err(graphql_shape_error("unknown status check context type")),
+    }
+}
+
+fn check_bucket(state: &str) -> &'static str {
+    match state {
+        "SUCCESS" => "pass",
+        "SKIPPED" | "NEUTRAL" => "skipping",
+        "ERROR" | "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" => "fail",
+        "CANCELLED" => "cancel",
+        _ => "pending",
+    }
+}
+
+fn reject_graphql_errors(response: &Value) -> Result<(), Value> {
+    if response
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(command_error(
+            "gh_command_failed",
+            "GitHub GraphQL returned errors".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn graphql_shape_error(message: &str) -> Value {
+    command_error("github_status_shape_invalid", message.to_owned())
+}
+
 pub(crate) fn find_gh() -> Option<PathBuf> {
     if let Some(path) = env::var_os("PATH") {
         for directory in env::split_paths(&path) {
@@ -297,10 +584,6 @@ pub(crate) fn find_gh() -> Option<PathBuf> {
 
 pub(crate) fn run_gh_json(gh: &Path, root: &Path, args: &[&str]) -> Result<Value, Value> {
     run_gh_json_inner(gh, root, args, &[])
-}
-
-fn run_gh_checks_json(gh: &Path, root: &Path, args: &[&str]) -> Result<Value, Value> {
-    run_gh_json_inner(gh, root, args, &[8])
 }
 
 fn run_gh_json_inner(
@@ -564,6 +847,12 @@ mod tests {
     }
 
     #[test]
+    fn git_remote_probe_budget_absorbs_scheduler_jitter_without_unbounded_wait() {
+        assert_eq!(GIT_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(GIT_TIMEOUT, GH_TIMEOUT);
+    }
+
+    #[test]
     fn parses_common_github_remotes() {
         for remote in [
             "git@github.com:whshang/herdr-mcp.git",
@@ -576,6 +865,134 @@ mod tests {
             );
         }
         assert_eq!(parse_github_repository("https://gitlab.com/x/y.git"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_page_pr_status_uses_exactly_two_gh_commands() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_repo();
+        let gh = root.join("fake-gh");
+        let script = r#"#!/bin/sh
++LOG="$(dirname "$0")/gh-calls.log"
++printf 'call\n' >> "$LOG"
++COUNT=$(wc -l < "$LOG" | tr -d ' ')
++if [ "$COUNT" = "1" ]; then
++  printf '%s\n' '{"data":{"repository":{"autoMergeAllowed":true,"defaultBranchRef":{"name":"main"},"pullRequest":{"id":"PR_1","number":401,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED","headRefOid":"abc","baseRefOid":"def","headRefName":"feature","baseRefName":"main","autoMergeRequest":null,"url":"https://github.com/o/r/pull/401"}}}}'
++elif [ "$COUNT" = "2" ]; then
++  printf '%s\n' '{"data":{"node":{"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"rust","checkSuite":{"workflowRun":{"event":"pull_request","workflow":{"name":"CI"}}},"status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-09-12T07:02:00Z","completedAt":"2026-09-12T07:03:00Z","detailsUrl":"rust","isRequired":true},{"__typename":"StatusContext","context":"deploy/relay","state":"SUCCESS","targetUrl":"relay","createdAt":"2026-09-12T07:01:00Z","description":"ok","isRequired":false}],"pageInfo":{"hasNextPage":false,"endCursor":"2"}}}}}]}}}}'
++else
++  exit 99
++fi
++"#;
+        fs::write(&gh, script.replace("\n+", "\n")).unwrap();
+        let mut permissions = fs::metadata(&gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&gh, permissions).unwrap();
+
+        let (repo, pr, pr_id) = fetch_pr_metadata(&gh, &root, "o/r", 401).unwrap();
+        let (all, required) = fetch_pr_checks(&gh, &root, &pr_id, &pr).unwrap();
+        let calls = fs::read_to_string(root.join("gh-calls.log")).unwrap();
+        assert_eq!(calls.lines().count(), 2);
+        assert_eq!(repo["default_branch"], "main");
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        assert_eq!(required.as_array().unwrap().len(), 1);
+        assert_eq!(required[0]["name"], "rust");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn graphql_metadata_preserves_repository_and_pr_shape() {
+        let response = json!({
+            "data": {
+                "repository": {
+                    "autoMergeAllowed": true,
+                    "defaultBranchRef": {"name": "main"},
+                    "pullRequest": {
+                        "id": "PR_1",
+                        "number": 401,
+                        "state": "OPEN",
+                        "isDraft": false,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "BLOCKED",
+                        "headRefOid": "abc",
+                        "baseRefOid": "def",
+                        "headRefName": "feature",
+                        "baseRefName": "main",
+                        "autoMergeRequest": null,
+                        "url": "https://github.com/o/r/pull/401"
+                    }
+                }
+            }
+        });
+        let (repo, pr, pr_id) = parse_pr_metadata_response(&response).unwrap();
+        assert_eq!(repo["allow_auto_merge"], true);
+        assert_eq!(repo["default_branch"], "main");
+        assert_eq!(pr["number"], 401);
+        assert_eq!(pr["headRefName"], "feature");
+        assert_eq!(pr_id, "PR_1");
+    }
+
+    #[test]
+    fn graphql_checks_preserve_event_identity_required_state_and_latest_duplicate() {
+        let contexts = vec![
+            json!({
+                "__typename": "CheckRun",
+                "name": "rust",
+                "checkSuite": {"workflowRun": {"event": "pull_request", "workflow": {"name": "CI"}}},
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-09-12T07:00:00Z",
+                "detailsUrl": "old",
+                "isRequired": true
+            }),
+            json!({
+                "__typename": "CheckRun",
+                "name": "rust",
+                "checkSuite": {"workflowRun": {"event": "pull_request", "workflow": {"name": "CI"}}},
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-09-12T07:02:00Z",
+                "detailsUrl": "new",
+                "isRequired": true
+            }),
+            json!({
+                "__typename": "CheckRun",
+                "name": "rust",
+                "checkSuite": {"workflowRun": {"event": "push", "workflow": {"name": "CI"}}},
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-09-12T07:01:00Z",
+                "detailsUrl": "push",
+                "isRequired": false
+            }),
+            json!({
+                "__typename": "StatusContext",
+                "context": "deploy/relay",
+                "state": "SUCCESS",
+                "targetUrl": "relay",
+                "createdAt": "2026-09-12T07:01:00Z",
+                "isRequired": false
+            }),
+        ];
+        let (all, required) = normalize_check_contexts(contexts, "feature").unwrap();
+        let all = all.as_array().unwrap();
+        let required = required.as_array().unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0]["name"], "rust");
+        assert_eq!(required[0]["state"], "SUCCESS");
+        assert_eq!(required[0]["link"], "new");
+        assert_eq!(all.iter().filter(|row| row["name"] == "rust").count(), 2);
+        assert!(
+            all.iter()
+                .any(|row| row["link"] == "push" && row["bucket"] == "fail")
+        );
+        assert!(
+            all.iter()
+                .any(|row| row["name"] == "deploy/relay" && row["bucket"] == "pass")
+        );
     }
 
     #[test]
