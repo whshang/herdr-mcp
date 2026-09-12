@@ -1730,21 +1730,100 @@ impl StateStore {
                  FROM continuity_bindings b
                  JOIN continuity_chains c ON c.continuity_id = b.continuity_id
                  WHERE b.conversation_id = ?1 AND c.status = 'active'
-                 ORDER BY c.updated_at DESC LIMIT 2",
+                 ORDER BY c.updated_at DESC LIMIT 9",
             )
             .map_err(|error| format!("cannot prepare continuity binding lookup: {error}"))?;
         let rows = stmt
             .query_map([conversation_id], |row| row.get::<_, String>(0))
             .map_err(|error| format!("cannot query continuity binding: {error}"))?;
-        let mut ids = Vec::new();
+        let mut owner_ids = Vec::new();
         for row in rows {
-            ids.push(row.map_err(|error| format!("cannot decode continuity binding: {error}"))?);
+            owner_ids
+                .push(row.map_err(|error| format!("cannot decode continuity binding: {error}"))?);
         }
-        match ids.as_slice() {
-            [] => Ok(None),
-            [only] => Ok(Some(only.clone())),
-            _ => Err("continuity_binding_ambiguous".to_owned()),
+        match owner_ids.as_slice() {
+            [] => return Ok(None),
+            [only] => return Ok(Some(only.clone())),
+            _ => {}
         }
+        if owner_ids.len() >= 9 {
+            return Err("continuity_binding_ambiguous".to_owned());
+        }
+        drop(stmt);
+
+        let mut legacy_stmt = self
+            .conn
+            .prepare(
+                "SELECT c.continuity_id, c.project_id, b.first_bound_at,
+                        MIN(t.observed_at), MAX(t.observed_at), COUNT(t.message_id)
+                 FROM continuity_chains c
+                 JOIN (
+                     SELECT continuity_id, MIN(bound_at) AS first_bound_at
+                     FROM continuity_bindings
+                     WHERE conversation_id = ?1
+                     GROUP BY continuity_id
+                 ) b ON b.continuity_id = c.continuity_id
+                 LEFT JOIN continuity_turns t
+                   ON t.continuity_id = c.continuity_id
+                  AND t.conversation_id = ?1
+                 WHERE c.status = 'active'
+                 GROUP BY c.continuity_id, c.project_id, b.first_bound_at
+                 ORDER BY c.continuity_id",
+            )
+            .map_err(|error| format!("cannot prepare legacy continuity lookup: {error}"))?;
+        let legacy_rows = legacy_stmt
+            .query_map([conversation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| format!("cannot query legacy continuity segments: {error}"))?;
+        let mut owners = Vec::with_capacity(owner_ids.len());
+        for row in legacy_rows {
+            owners.push(
+                row.map_err(|error| format!("cannot decode legacy continuity segment: {error}"))?,
+            );
+        }
+        if owners.len() != owner_ids.len() {
+            return Err("continuity_binding_ambiguous".to_owned());
+        }
+
+        // Older extension builds could start a fresh chain for the same ChatGPT
+        // conversation after a workspace transition. Resolve that legacy shape
+        // only when persisted evidence proves strict succession; otherwise keep
+        // the fail-closed ambiguity contract.
+        let Some(expected_project) = owners[0].1.clone() else {
+            return Err("continuity_binding_ambiguous".to_owned());
+        };
+        let mut segments = Vec::with_capacity(owners.len());
+        for (continuity_id, project_id, first_bound_at, first_turn, last_turn, turn_count) in owners
+        {
+            if project_id.as_deref() != Some(expected_project.as_str()) || turn_count <= 0 {
+                return Err("continuity_binding_ambiguous".to_owned());
+            }
+            let (Some(first_turn), Some(last_turn)) = (first_turn, last_turn) else {
+                return Err("continuity_binding_ambiguous".to_owned());
+            };
+            if first_bound_at > first_turn || first_turn > last_turn {
+                return Err("continuity_binding_ambiguous".to_owned());
+            }
+            segments.push((continuity_id, first_turn, last_turn));
+        }
+        segments.sort_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then(left.2.cmp(&right.2))
+                .then(left.0.cmp(&right.0))
+        });
+        if segments.windows(2).any(|window| window[0].2 >= window[1].1) {
+            return Err("continuity_binding_ambiguous".to_owned());
+        }
+        Ok(segments.last().map(|segment| segment.0.clone()))
     }
 
     pub fn bind_work_memory(&mut self, input: WorkMemoryBindingInput<'_>) -> Result<(), String> {
@@ -7471,6 +7550,71 @@ mod tests {
         assert_eq!(
             store.continuity_for_conversation("conv-b").unwrap(),
             Some("hc:beta".to_owned())
+        );
+    }
+
+    #[test]
+    fn continuity_lookup_recovers_only_strict_legacy_conversation_segments() {
+        let store = StateStore::open(":memory:").unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO continuity_chains
+                    (continuity_id, project_id, status, created_at, updated_at)
+                 VALUES
+                    ('hc:alpha', 'project-a', 'active', 90, 110),
+                    ('hc:beta', 'project-a', 'active', 190, 210),
+                    ('hc:gamma', 'project-a', 'active', 290, 310);
+                 INSERT INTO continuity_bindings
+                    (continuity_id, conversation_id, workspace_id, bound_at)
+                 VALUES
+                    ('hc:alpha', 'conv-a', 'w1', 100),
+                    ('hc:beta', 'conv-a', 'w2', 200),
+                    ('hc:gamma', 'conv-a', 'w3', 300);
+                 INSERT INTO continuity_turns
+                    (continuity_id, conversation_id, message_id, role, text, observed_at)
+                 VALUES
+                    ('hc:alpha', 'conv-a', 'alpha-1', 'user', 'alpha first', 100),
+                    ('hc:alpha', 'conv-a', 'alpha-2', 'assistant', 'alpha last', 110),
+                    ('hc:beta', 'conv-a', 'beta-1', 'user', 'beta first', 200),
+                    ('hc:beta', 'conv-a', 'beta-2', 'assistant', 'beta last', 210),
+                    ('hc:gamma', 'conv-a', 'gamma-1', 'user', 'gamma first', 300),
+                    ('hc:gamma', 'conv-a', 'gamma-2', 'assistant', 'gamma last', 310);",
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.continuity_for_conversation("conv-a").unwrap(),
+            Some("hc:gamma".to_owned())
+        );
+        let binding_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT continuity_id)
+                 FROM continuity_bindings WHERE conversation_id = 'conv-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding_count, 3, "read-side recovery must preserve history");
+
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO continuity_chains
+                    (continuity_id, project_id, status, created_at, updated_at)
+                 VALUES ('hc:delta', 'project-a', 'active', 195, 205);
+                 INSERT INTO continuity_bindings
+                    (continuity_id, conversation_id, workspace_id, bound_at)
+                 VALUES ('hc:delta', 'conv-a', 'w4', 205);
+                 INSERT INTO continuity_turns
+                    (continuity_id, conversation_id, message_id, role, text, observed_at)
+                 VALUES ('hc:delta', 'conv-a', 'delta-1', 'user', 'overlap', 205);",
+            )
+            .unwrap();
+        assert_eq!(
+            store.continuity_for_conversation("conv-a").unwrap_err(),
+            "continuity_binding_ambiguous"
         );
     }
 
