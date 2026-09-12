@@ -70,31 +70,63 @@ export function classifyMcpAttributionOperation(payload: unknown): string {
  * Cloudflare recycles the isolate before the next request rolls the bucket.
  * Durable Object metrics remain the billing/request-count source of truth; this
  * aggregate exists only to explain which bounded MCP operations drove a peak.
+ *
+ * AMPLIFICATION BOUNDARY: `recordWorkstationForward` counts ONLY the Edge
+ * `forward` callback hops issued for one OpenAI-visible MCP request (normally 1;
+ * more when a bounded generation/transient retry runs). It is deliberately NOT a
+ * total Cloudflare DO/subrequest count — device-registry, OAuth-store, planner,
+ * fleet and device-resolution DO fetches are not represented. Exact total DO
+ * fan-out would require invasive cross-helper plumbing and new instrumentation
+ * seams, so this metric stays intentionally narrow and clearly named instead.
+ * It is computed in-process from data the router already has and adds no
+ * requests.
  */
 export class McpMinuteAttribution {
   private minuteStartMs: number | null = null;
   private total = 0;
   private readonly counts = new Map<string, number>();
+  private workstationForwardCount = 0;
+  private readonly workstationForwards = new Map<string, number>();
 
   constructor(private readonly logger: EdgeLogger) {}
 
-  record(payload: unknown, nowMs = Date.now()): void {
+  /** Record one OpenAI-visible MCP operation and return its classification token. */
+  record(payload: unknown, nowMs = Date.now()): string {
+    this.rollMinute(nowMs);
+    const operation = classifyMcpAttributionOperation(payload);
+    const bucket = this.counts.has(operation) || this.counts.size < MAX_OPERATION_BUCKETS ? operation : "other";
+    this.counts.set(bucket, (this.counts.get(bucket) ?? 0) + 1);
+    this.total += 1;
+    return operation;
+  }
+
+  /**
+   * Attribute downstream workstation `forward` hops to the OpenAI-visible
+   * operation that caused them. `operation` should be the token returned by
+   * `record` for the same request. This is not a total DO-fetch counter; see the
+   * class comment for the exact boundary.
+   */
+  recordWorkstationForward(operation: string, count = 1, nowMs = Date.now()): void {
+    if (count <= 0) return;
+    this.rollMinute(nowMs);
+    this.workstationForwardCount += count;
+    this.workstationForwards.set(operation, (this.workstationForwards.get(operation) ?? 0) + count);
+  }
+
+  private rollMinute(nowMs: number): void {
     const minuteStartMs = Math.floor(nowMs / MINUTE_MS) * MINUTE_MS;
     if (this.minuteStartMs !== null && minuteStartMs !== this.minuteStartMs) this.flush();
     if (this.minuteStartMs !== minuteStartMs) {
       this.minuteStartMs = minuteStartMs;
       this.total = 0;
       this.counts.clear();
+      this.workstationForwardCount = 0;
+      this.workstationForwards.clear();
     }
-
-    const operation = classifyMcpAttributionOperation(payload);
-    const bucket = this.counts.has(operation) || this.counts.size < MAX_OPERATION_BUCKETS ? operation : "other";
-    this.counts.set(bucket, (this.counts.get(bucket) ?? 0) + 1);
-    this.total += 1;
   }
 
   flush(): void {
-    if (this.minuteStartMs === null || this.total === 0) return;
+    if (this.minuteStartMs === null || (this.total === 0 && this.workstationForwardCount === 0)) return;
     const operations = [...this.counts.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .map(([operation, count]) => `${operation}=${count}`)
@@ -103,6 +135,15 @@ export class McpMinuteAttribution {
       minute_start_ms: this.minuteStartMs,
       total: this.total,
       operations,
+      ...(this.workstationForwardCount > 0
+        ? {
+            workstation_forward_count: this.workstationForwardCount,
+            workstation_forwards: [...this.workstationForwards.entries()]
+              .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+              .map(([operation, count]) => `${operation}=${count}`)
+              .join(","),
+          }
+        : {}),
     });
   }
 }
