@@ -34,6 +34,56 @@ class ChatGPTAdapter extends BaseAdapter {
     return document.querySelector('#prompt-textarea[contenteditable="true"]');
   }
 
+  getSelectedComposerApps() {
+    const input = this.getInputEl();
+    if (!input) return [];
+    const selected = new Set();
+    for (const pill of input.querySelectorAll('[data-inline-selection-pill][data-symbol="ecosystemMention"][data-keyword]')) {
+      const keyword = String(pill.getAttribute('data-keyword') || '').trim().toLowerCase();
+      if (keyword) selected.add(keyword);
+    }
+    return [...selected];
+  }
+
+  composerHasOnlyAppPills(requiredApps = []) {
+    const input = this.getInputEl();
+    if (!input) return false;
+    const requested = [...new Set(requiredApps.map((app) => String(app || '').trim().toLowerCase()).filter(Boolean))];
+    const selected = this.getSelectedComposerApps();
+    if (!requested.length || requested.some((app) => !selected.includes(app))) return false;
+    const clone = input.cloneNode(true);
+    for (const node of clone.querySelectorAll('[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]')) {
+      node.remove();
+    }
+    return String(clone.textContent || '').replace(/\uFEFF/g, '').trim() === '';
+  }
+
+  openComposerAppsMenu() {
+    const input = this.getInputEl();
+    const scope = input?.closest?.('form') || document;
+    const button = scope.querySelector('#composer-plus-btn, button[data-testid="composer-plus-btn"]');
+    if (!button || button.disabled === true || button.getAttribute('aria-disabled') === 'true') return false;
+    button.click();
+    return true;
+  }
+
+  getComposerAppCandidates(keyword) {
+    const wanted = String(keyword || '').trim().toLowerCase();
+    const input = this.getInputEl();
+    if (!wanted || !input) return [];
+    const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    const seen = new Set();
+    const matches = [];
+    for (const leaf of document.querySelectorAll('span')) {
+      if (!visible(leaf) || String(leaf.textContent || '').trim().toLowerCase() !== wanted) continue;
+      const candidate = leaf.closest('[tabindex="0"]');
+      if (!candidate || !visible(candidate) || input.contains(candidate) || seen.has(candidate)) continue;
+      seen.add(candidate);
+      matches.push(candidate);
+    }
+    return matches;
+  }
+
   getWatchMainWorldSelector() {
     return '#prompt-textarea[contenteditable="true"]';
   }

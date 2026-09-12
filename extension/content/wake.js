@@ -792,6 +792,46 @@ const H2W_CONTENT_VERSION = "0.1.91";
     return !isComposerGenerating();
   }
 
+  async function ensureRequiredComposerApps(requiredApps) {
+    const requested = [...new Set((Array.isArray(requiredApps) ? requiredApps : [])
+      .map((app) => String(app || '').trim().toLowerCase())
+      .filter(Boolean))];
+    if (!requested.length) return { ok: true, apps: [] };
+    if (ADAPTER.name !== 'chatgpt'
+        || typeof ADAPTER.getSelectedComposerApps !== 'function'
+        || typeof ADAPTER.openComposerAppsMenu !== 'function'
+        || typeof ADAPTER.getComposerAppCandidates !== 'function') {
+      return { ok: false, error: 'required-apps-unsupported' };
+    }
+    for (const app of requested) {
+      if (ADAPTER.getSelectedComposerApps().includes(app)) continue;
+      let candidates = ADAPTER.getComposerAppCandidates(app);
+      if (!candidates.length) {
+        if (!ADAPTER.openComposerAppsMenu()) return { ok: false, error: 'required-apps-menu-unavailable' };
+        const deadline = Date.now() + 3000;
+        do {
+          await wait(100);
+          candidates = ADAPTER.getComposerAppCandidates(app);
+          if (candidates.length) break;
+        } while (Date.now() < deadline);
+      }
+      if (candidates.length !== 1) {
+        return { ok: false, error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found' };
+      }
+      candidates[0].click();
+      const selectedDeadline = Date.now() + 2500;
+      while (Date.now() < selectedDeadline) {
+        if (ADAPTER.getSelectedComposerApps().includes(app)) break;
+        await wait(100);
+      }
+      if (!ADAPTER.getSelectedComposerApps().includes(app)) {
+        return { ok: false, error: 'required-app-selection-not-observed' };
+      }
+    }
+    const selected = ADAPTER.getSelectedComposerApps();
+    return { ok: requested.every((app) => selected.includes(app)), apps: selected };
+  }
+
   function captureSubmitAckBaseline(sendButton = null) {
     return {
       composer: composerNorm(),
@@ -997,7 +1037,11 @@ const H2W_CONTENT_VERSION = "0.1.91";
     }
     let resumeOnly = false;
     let clearBeforeInsert = false;
-    if (ADAPTER.inputHasContent() && !data.llmNudge) {
+    const requiredAppsOnly = Array.isArray(data.requiredApps)
+      && data.requiredApps.length > 0
+      && typeof ADAPTER.composerHasOnlyAppPills === 'function'
+      && ADAPTER.composerHasOnlyAppPills(data.requiredApps);
+    if (ADAPTER.inputHasContent() && !data.llmNudge && !requiredAppsOnly) {
       if (composerHasSameWake(text)) {
         resumeOnly = true;
       } else if (isExtensionStaleComposer(composerNorm())) {
@@ -1442,7 +1486,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
     const message = typeof params.message === "string" ? params.message.trim() : "";
     const reasoning = params.reasoning_effort;
     const requiredApps = Array.isArray(params.required_apps) ? params.required_apps : [];
-    if (!message || reasoning != null || requiredApps.length > 0) {
+    if (!message || reasoning != null) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
@@ -1473,6 +1517,17 @@ const H2W_CONTENT_VERSION = "0.1.91";
       return { ...evidence, rejected: true };
     }
 
+    if (requiredApps.length > 0) {
+      const appSelection = await ensureRequiredComposerApps(requiredApps);
+      if (!appSelection.ok) {
+        if (creatingSession) {
+          try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+        }
+        return { ...evidence, rejected: true, result: { error: appSelection.error } };
+      }
+      evidence.required_apps_readback = appSelection.apps;
+    }
+
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }))
       : { ok: false };
@@ -1482,6 +1537,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
       template: message,
       autoAllow: false,
       browserActuation: true,
+      requiredApps,
     });
     if (!result?.ok) {
       if (creatingSession) {
