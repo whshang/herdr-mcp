@@ -128,7 +128,7 @@ test("new-shaped PEM JWT cannot bypass Edge principal and device verification", 
   const kp = await keyPair();
   const pem = await publicPem(kp.publicKey);
   const now = Math.floor(Date.now() / 1000);
-  const deviceId = "dev_01M1TEST000000000000000000";
+  const deviceId = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
   const token = await jwt(kp.privateKey, {
     iss: ISSUER,
     aud: `${ISSUER}/mcp`,
@@ -158,6 +158,41 @@ test("new-shaped PEM JWT cannot bypass Edge principal and device verification", 
     clientId: "svc_ci",
     principalType: "automation",
     deviceId,
+  });
+});
+
+test("Edge token verification carries the realtime control grant snapshot", async () => {
+  const token = "edge-token-with-control-snapshot";
+  const webchatControlGrants = [{
+    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    endpoint_ref: "browser-endpoint-1",
+    provider: "chatgpt",
+    account_ref: "account-1",
+  }];
+  const pageAssistGrants = [{
+    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    endpoint_ref: "browser-endpoint-1",
+  }];
+  const result = await authenticateMcpRequest(request(token), {}, {
+    verifyEdgeToken: async () => ({
+      ok: true,
+      clientId: "https://chatgpt.com/client",
+      connectorId: "conn_snapshot123",
+      grantGeneration: 2,
+      principalType: "connector",
+      webchatControlGrants,
+      pageAssistGrants,
+    }),
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    source: "oauth_edge",
+    clientId: "https://chatgpt.com/client",
+    connectorId: "conn_snapshot123",
+    grantGeneration: 2,
+    principalType: "connector",
+    webchatControlGrants,
+    pageAssistGrants,
   });
 });
 

@@ -13,12 +13,43 @@ export interface OAuthMcpAuthEnv {
   OAUTH_JWT_PUBLIC_PEM?: string;
 }
 
+export interface AuthWebChatControlGrant {
+  device_id: string;
+  endpoint_ref: string;
+  provider: string;
+  account_ref: string;
+}
+
+export interface AuthPageAssistGrant {
+  device_id: string;
+  endpoint_ref: string;
+}
+
 export type McpAuthResult =
-  | { ok: true; source: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge"; clientId?: string; connectorId?: string; grantGeneration?: number; principalType?: string; deviceId?: string }
+  | {
+      ok: true;
+      source: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge";
+      clientId?: string;
+      connectorId?: string;
+      grantGeneration?: number;
+      principalType?: string;
+      deviceId?: string;
+      webchatControlGrants?: readonly AuthWebChatControlGrant[];
+      pageAssistGrants?: readonly AuthPageAssistGrant[];
+    }
   | { ok: false; code: "mcp_auth_failed" };
 
 export interface OAuthMcpAuthDeps {
-  verifyEdgeToken?: (token: string) => Promise<{ ok: boolean; clientId?: string; connectorId?: string; grantGeneration?: number; principalType?: string; deviceId?: string }>;
+  verifyEdgeToken?: (token: string) => Promise<{
+    ok: boolean;
+    clientId?: string;
+    connectorId?: string;
+    grantGeneration?: number;
+    principalType?: string;
+    deviceId?: string;
+    webchatControlGrants?: readonly AuthWebChatControlGrant[];
+    pageAssistGrants?: readonly AuthPageAssistGrant[];
+  }>;
   verifyLegacyClient?: (clientId: string) => Promise<boolean>;
 }
 
@@ -154,6 +185,8 @@ export async function authenticateMcpRequest(
             : {}),
           ...(edge.principalType ? { principalType: edge.principalType } : {}),
           ...(edge.deviceId ? { deviceId: edge.deviceId } : {}),
+          ...(edge.webchatControlGrants ? { webchatControlGrants: edge.webchatControlGrants } : {}),
+          ...(edge.pageAssistGrants ? { pageAssistGrants: edge.pageAssistGrants } : {}),
         };
       }
     } catch {
