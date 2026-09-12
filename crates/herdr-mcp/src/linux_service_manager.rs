@@ -23,6 +23,55 @@ const SERVICE_PROCESS_FILE: &str = "service-process.json";
 const LINK_PROCESS_FILE: &str = "link-process.json";
 const SYSTEMD_BACKEND: &str = "rust-systemd-user";
 const PROCESS_BACKEND: &str = "rust-process-user";
+const WSL_UNSUPPORTED_IMPLEMENTATION: &str = "unsupported-wsl";
+
+fn detect_wsl_environment(
+    distro_name: Option<&str>,
+    interop: Option<&str>,
+    kernel_release: Option<&str>,
+) -> bool {
+    distro_name.is_some_and(|value| !value.trim().is_empty())
+        || interop.is_some_and(|value| !value.trim().is_empty())
+        || kernel_release.is_some_and(|value| value.to_ascii_lowercase().contains("microsoft"))
+}
+
+fn wsl_environment_detected() -> bool {
+    let distro_name = env::var("WSL_DISTRO_NAME").ok();
+    let interop = env::var("WSL_INTEROP").ok();
+    let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+    detect_wsl_environment(
+        distro_name.as_deref(),
+        interop.as_deref(),
+        kernel_release.as_deref(),
+    )
+}
+
+fn unsupported_wsl_error(operation: &str) -> String {
+    format!(
+        "unsupported_platform_wsl: {operation} is not supported in WSL; use a qualified native Linux or macOS workstation"
+    )
+}
+
+fn ensure_supported_linux_workstation_for(operation: &str, is_wsl: bool) -> Result<(), String> {
+    if is_wsl {
+        return Err(unsupported_wsl_error(operation));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_supported_linux_workstation(operation: &str) -> Result<(), String> {
+    ensure_supported_linux_workstation_for(operation, wsl_environment_detected())
+}
+
+fn unsupported_wsl_status_value() -> Value {
+    json!({
+        "ok": false,
+        "supported": false,
+        "implementation": WSL_UNSUPPORTED_IMPLEMENTATION,
+        "platform": "wsl",
+        "detail": "WSL is not a qualified Herdr-MCP production workstation target; use native Linux or macOS",
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxBackend {
@@ -97,10 +146,12 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
             if adopt_node {
                 return Err("service install --adopt-node is only supported on macOS".to_owned());
             }
+            ensure_supported_linux_workstation("service install")?;
             install()?;
         }
         ServiceCommand::Status => print_json(&status_value()?)?,
         ServiceCommand::Start => {
+            ensure_supported_linux_workstation("service start")?;
             let paths = LinuxPaths::discover()?;
             match backend_for_control(&paths)? {
                 LinuxBackend::SystemdUser => systemctl(&["start", SERVICE_UNIT])?,
@@ -120,6 +171,7 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
             print_json(&status_value()?)?;
         }
         ServiceCommand::Restart => {
+            ensure_supported_linux_workstation("service restart")?;
             let paths = LinuxPaths::discover()?;
             match backend_for_control(&paths)? {
                 LinuxBackend::SystemdUser => systemctl(&["restart", SERVICE_UNIT])?,
@@ -143,6 +195,9 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
 }
 
 pub fn doctor_status() -> Result<Value, String> {
+    if wsl_environment_detected() {
+        return Ok(unsupported_wsl_status_value());
+    }
     let paths = LinuxPaths::discover()?;
     let backend = backend_for_control(&paths)?;
     let loaded = match backend {
@@ -180,6 +235,7 @@ pub fn ensure_link_installed() -> Result<(), String> {
 }
 
 fn ensure_link_installed_with_restart(restart_existing: bool) -> Result<(), String> {
+    ensure_supported_linux_workstation("Link activation")?;
     let paths = LinuxPaths::discover()?;
     if !paths.current_binary.exists() {
         return Err(
@@ -249,6 +305,7 @@ fn require_link_enrollment(config: &Config) -> Result<(), String> {
 }
 
 pub fn reconcile_link() -> Result<(), String> {
+    ensure_supported_linux_workstation("Link reconcile")?;
     let paths = LinuxPaths::discover()?;
     let runtime_paths = RuntimePaths::discover()?;
     let config = Config::load(&runtime_paths.config_file)?;
@@ -278,10 +335,12 @@ fn reconcile_runtime_control(
 }
 
 pub fn runtime_token_for_link() -> Result<String, String> {
+    ensure_supported_linux_workstation("Link runtime credential access")?;
     read_runtime_token(&LinuxPaths::discover()?.runtime_env)
 }
 
 fn install() -> Result<(), String> {
+    ensure_supported_linux_workstation("service install")?;
     let paths = LinuxPaths::discover()?;
     let backend = backend_for_install(&paths)?;
     let runtime_paths = RuntimePaths::discover()?;
@@ -501,6 +560,9 @@ fn uninstall() -> Result<(), String> {
 }
 
 fn status_value() -> Result<Value, String> {
+    if wsl_environment_detected() {
+        return Ok(unsupported_wsl_status_value());
+    }
     let paths = LinuxPaths::discover()?;
     let backend = backend_for_control(&paths)?;
     let loaded = match backend {
@@ -1277,6 +1339,53 @@ fn print_json(value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_detection_uses_explicit_environment_or_kernel_identity() {
+        assert!(detect_wsl_environment(
+            Some("Ubuntu"),
+            None,
+            Some("6.8.0-generic")
+        ));
+        assert!(detect_wsl_environment(
+            None,
+            Some("/run/WSL/1_interop"),
+            Some("6.8.0-generic")
+        ));
+        assert!(detect_wsl_environment(
+            None,
+            None,
+            Some("5.15.153.1-microsoft-standard-WSL2")
+        ));
+        assert!(!detect_wsl_environment(
+            None,
+            None,
+            Some("6.8.0-79-generic")
+        ));
+        assert!(!detect_wsl_environment(
+            Some("   "),
+            Some(""),
+            Some("6.8.0-79-generic")
+        ));
+    }
+
+    #[test]
+    fn unsupported_wsl_status_is_explicit_and_fail_closed() {
+        let status = unsupported_wsl_status_value();
+        assert_eq!(status.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            status.get("supported").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            status.get("implementation").and_then(Value::as_str),
+            Some(WSL_UNSUPPORTED_IMPLEMENTATION)
+        );
+        assert!(unsupported_wsl_error("service install").contains("unsupported_platform_wsl"));
+        let error = ensure_supported_linux_workstation_for("service install", true).unwrap_err();
+        assert!(error.contains("unsupported_platform_wsl"));
+        assert!(ensure_supported_linux_workstation_for("service install", false).is_ok());
+    }
 
     #[test]
     fn systemd_units_never_inline_runtime_or_device_secrets() {

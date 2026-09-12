@@ -292,10 +292,22 @@ fn render_automation_inventory(mut payload: Value, now_ms: u64) -> Value {
     payload
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn worker_command_requires_supported_workstation(command: &WorkerCommand) -> bool {
+    !matches!(
+        command,
+        WorkerCommand::List | WorkerCommand::ConnectorList { .. } | WorkerCommand::AutomationList
+    )
+}
+
 pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     if paths.instance.is_named() {
         return Err("Worker pairing is available only on the default Herdr instance".to_owned());
+    }
+    #[cfg(target_os = "linux")]
+    if worker_command_requires_supported_workstation(&command) {
+        crate::linux_service_manager::ensure_supported_linux_workstation("Worker mutation")?;
     }
     match command {
         WorkerCommand::List => list_devices(&paths),
@@ -2669,6 +2681,43 @@ fn print_json(value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_linux_subenvironments_allow_only_worker_inventory_reads() {
+        assert!(!worker_command_requires_supported_workstation(
+            &WorkerCommand::List
+        ));
+        assert!(!worker_command_requires_supported_workstation(
+            &WorkerCommand::ConnectorList { include_all: false }
+        ));
+        assert!(!worker_command_requires_supported_workstation(
+            &WorkerCommand::AutomationList
+        ));
+        assert!(worker_command_requires_supported_workstation(
+            &WorkerCommand::Connect {
+                pairing_address: "https://edge.example/pair#pair_test".to_owned(),
+                name: None,
+            }
+        ));
+        assert!(worker_command_requires_supported_workstation(
+            &WorkerCommand::Pair {
+                ttl_seconds: 600,
+                name: None,
+                recover_device_id: None,
+            }
+        ));
+        assert!(worker_command_requires_supported_workstation(
+            &WorkerCommand::ConnectorApprove {
+                request_id: "request_test".to_owned(),
+            }
+        ));
+        assert!(worker_command_requires_supported_workstation(
+            &WorkerCommand::AutomationCreate {
+                name: "ci".to_owned(),
+                device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            }
+        ));
+    }
 
     #[test]
     fn device_secret_verifier_is_lowercase_sha256_without_exposing_secret() {
