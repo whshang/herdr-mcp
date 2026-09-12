@@ -54,7 +54,7 @@ export function continuityMessageId({ messageId, convKey, role, text, startedAt 
  * model-written HERDR_HANDOFF_V1 when Rust has acknowledged durable state. The
  * target model MUST call `herdr_call(method="continuity.resume", ...)` to fetch
  * the authoritative journal, then re-check live Herdr/runtime/Git state before
- * any mutation. Durable handoffs carry the source URL for direct recovery; HERDR_HANDOFF_V1 / source-transcript remains the fallback when durable state is unavailable.
+ * any mutation. New ChatGPT handoffs carry the source URL and use only this durable reference path. HERDR_HANDOFF_V1 remains read-only compatibility for already-existing legacy transfers and provider-specific legacy contracts.
  */
 export function buildContinuitySeed({ transferId, continuityId, sourceUrl } = {}) {
   const tid = String(transferId || "").trim();
@@ -62,12 +62,12 @@ export function buildContinuitySeed({ transferId, continuityId, sourceUrl } = {}
   const url = String(sourceUrl || "").trim();
   if (!tid || !cid) throw new Error("transferId and continuityId are required");
   return [
-    "继续同一个项目。以下内容由 Herdr 浏览器扩展从上一段对话接力（durable continuity journal）。",
+    "继续这个 Herdr 工作链。旧会话 URL 已附在下方，供人工查阅。",
     "continuity_id 是稳定的工作状态链标识，不是实时状态未变化的证明。",
     `旧会话：${url}`,
-    "接手后第一步：调用 herdr_call，method 为 continuity.resume，params 为 {\"continuity_id\":\"<此连续链>\"}，读取 Rust 持久化的权威 journal（目标、已完成、决定、约束、anchors）。",
+    "接手后第一步：调用 herdr_call，method 为 continuity.resume。已有 continuity_id 时直接按 ID 恢复；如果只有旧会话 URL，则把该 URL 作为 conversation_url 传给 continuity.resume。",
     "continuity.resume 之后：重新检查相关 Herdr/runtime/Git 实时状态，再决定是否开始任何 mutation。",
-    "不要因为 journal 或 handoff 提到过某件事，就重复执行已经完成的工作。",
+    "不要重复已经完成的工作，不要为接力生成摘要，也不要为了定位会话枚举浏览器 endpoint、account、Project、generation 或 device。",
     "",
     `${CONTINUITY_SEED_PREFIX} id=${tid} continuity_id=${cid}]`,
     `continuity_id: ${cid}`,

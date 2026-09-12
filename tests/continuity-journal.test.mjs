@@ -29,6 +29,8 @@ test("continuity seed instructs continuity.resume then live revalidation", () =>
   const seed = buildContinuitySeed({ transferId: "ht:1", continuityId: CID, sourceUrl: CONV });
   assert.ok(seed.includes('method 为 continuity.resume'));
   assert.ok(seed.includes("continuity.resume"));
+  assert.ok(seed.includes("conversation_url"));
+  assert.ok(!seed.includes("<<<HERDR_HANDOFF_V1"));
   assert.ok(seed.includes("重新检查相关 Herdr/runtime/Git 实时状态"));
 });
 

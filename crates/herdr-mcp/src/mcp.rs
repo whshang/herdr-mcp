@@ -2481,6 +2481,9 @@ fn browser_session_create_params_from_source(
     else {
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     };
+    if source_url.len() > 2048 || source_url.chars().any(char::is_control) {
+        return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+    }
     let Some(object) = params.as_object() else {
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     };
@@ -2495,6 +2498,24 @@ fn browser_session_create_params_from_source(
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     }
     let message = browser_required_string(params, "message", 262_144)?;
+    let message = if message.contains(source_url) {
+        message.to_owned()
+    } else {
+        let source_reference = format!(" source_url: {source_url}");
+        let actual_bytes = message.len().saturating_add(source_reference.len());
+        if actual_bytes > 262_144 {
+            return Err(json!({
+                "ok": false,
+                "code": "browser_message_invalid",
+                "limit": {
+                    "kind": "max_bytes",
+                    "max_bytes": 262_144,
+                    "actual_bytes": actual_bytes,
+                }
+            }));
+        }
+        format!("{message}{source_reference}")
+    };
     let idempotency_key = browser_required_idempotency_key(params)?;
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
@@ -7881,6 +7902,16 @@ mod tests {
                         .unwrap()
                         .starts_with("https://chatgpt.com")
                 );
+                if params["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("continue from source URL")
+                {
+                    assert_eq!(
+                        params["message"],
+                        "continue from source URL source_url: https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv"
+                    );
+                }
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.materialize(params, expected_generation);
                 let mut evidence = Self::applied_evidence(expected_generation);

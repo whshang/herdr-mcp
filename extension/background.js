@@ -2144,8 +2144,7 @@ async function journalAppendFinalizedTurn(payload) {
  * when state.db currently holds the chain (HTTP 200 + parsed `{ok:true}`). The
  * persisted `rust_acked` flag is only a hint/cache and never upgrades a failed
  * or missing live resolve. Any resolve failure (404, 5xx, transport) returns
- * durable:false so the classic HERDR_HANDOFF_V1 packet fallback runs. Unknown
- * or ambiguous chains fail closed.
+ * durable:false. New ChatGPT handoffs fail closed on that result; only already-existing legacy transfers and provider-specific legacy contracts may continue through HERDR_HANDOFF_V1 recovery. Unknown or ambiguous chains fail closed.
  */
 async function durableChainWindow(continuityIdRaw) {
   const continuityId = String(continuityIdRaw || "").trim();
@@ -4468,10 +4467,9 @@ async function waitForHandoffTargetComposer(transfer, targetTabId, timeoutMs = H
 async function seedHandoffIntoTarget(transferId, targetTabId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
-  // Prefer the durable continuity journal: when the source chain has real local
-  // state, the target only needs the continuity_id reference, not a large
-  // model-written HERDR_HANDOFF_V1 packet. The packet remains the fallback for
-  // chains without durable state (jittery storage, unknown continuity, etc.).
+  // Prefer the durable continuity journal. New ChatGPT handoffs reach this path with
+  // durable state only; handoff_text is retained solely so already-existing legacy
+  // transfers and provider-specific legacy contracts can finish recovery.
   const durable = transfer?.continuity_id
     ? await durableChainWindow(transfer.continuity_id)
     : null;
@@ -4968,6 +4966,9 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   }
   if (!continuityId) continuityId = newContinuityId(now);
   const durableAvailable = Boolean(durable?.durable && durable?.turn_count > 0);
+  if (convInfo.site === "chatgpt" && !durableAvailable) {
+    return { ok: false, error: "continuity_unavailable", source_preserved: true, source_url: liveInfo?.url || null };
+  }
   let sourceAssistantFp = null;
   let sourceSnapshot = null;
   if (!durableAvailable) {
