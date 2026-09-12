@@ -132,6 +132,7 @@ test("future epoch 4 annotates only read-only tools and leaves prior hashes unch
     "herdr_fs_image",
     "herdr_git",
     "herdr_exec_read",
+    "herdr_devices",
   ];
   const mutationCapable = [
     "herdr_call",
@@ -158,6 +159,27 @@ test("future epoch 4 annotates only read-only tools and leaves prior hashes unch
     assert.ok(tool, `${name} must exist in epoch 4`);
     assert.equal(tool.annotations?.readOnlyHint, true, `${name} must be truthfully read-only`);
   }
+  const closedWorldReadOnly = [
+    "herdr_methods",
+    "herdr_inspect",
+    "herdr_since",
+    "herdr_fs_read",
+    "herdr_fs_list",
+    "herdr_fs_grep",
+    "herdr_fs_image",
+    "herdr_git",
+    "herdr_exec_read",
+    "herdr_devices",
+  ];
+  for (const name of closedWorldReadOnly) {
+    const tool = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === name);
+    assert.ok(tool, `${name} must exist in epoch 4`);
+    assert.equal(tool.annotations?.readOnlyHint, true, `${name} must be truthfully read-only`);
+    assert.equal(tool.annotations?.openWorldHint, false, `${name} must be truthfully closed-world`);
+  }
+  const skill = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === "herdr_skill");
+  assert.equal(skill.annotations?.readOnlyHint, true);
+  assert.notEqual(skill.annotations?.openWorldHint, false, "herdr_skill may refresh configured upstream policy");
   for (const name of mutationCapable) {
     const tool = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === name);
     assert.ok(tool, `${name} must exist in epoch 4`);
