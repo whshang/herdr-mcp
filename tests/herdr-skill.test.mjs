@@ -69,7 +69,10 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /dependency-aware \*\*wave\*\*/);
     assert.match(r.content, /host-side safety rejection.*pre-delivery/s);
     assert.match(r.content, /none of Herdr's normal execution identity\/evidence fields.*op_id.*session_id.*device_id/s);
-    assert.match(r.content, /do not repeat the identical rejected payload/);
+    assert.match(r.content, /One identical retry is allowed.*pre-delivery evidence/s);
+    assert.match(r.content, /For a mutation, retry only when the host rejection itself proves pre-delivery/s);
+    assert.match(r.content, /after a second host rejection, stop instead of changing transport.*tool power/s);
+    assert.match(r.content, /Do not build a tool\/command blacklist from a single rejection/);
     assert.match(r.content, /one bounded single-purpose read\/probe per call/);
     assert.match(r.content, /not permission to bypass, disable, or evade host safety checks/);
     assert.match(r.content, /never escalate to a more powerful tool solely to force a rejected request through/);
