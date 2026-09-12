@@ -37,6 +37,7 @@ import {
 import { readBodyBounded } from "./payload.js";
 import { makeLimits } from "./limits.js";
 import { createLogger } from "./logger.js";
+import { McpMinuteAttribution } from "./mcp-attribution.js";
 import { WorkstationDO } from "./workstation-do.js";
 import { OAuthStoreDO } from "./oauth-store-do.js";
 import { DeviceRegistryDO } from "./device-registry-do.js";
@@ -66,6 +67,7 @@ import { sha256Hex } from "./device-crypto.js";
 export { DeviceRegistryDO, OAuthStoreDO, WorkstationDO };
 
 const logger = createLogger("edge-worker");
+const mcpMinuteAttribution = new McpMinuteAttribution(logger);
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -815,6 +817,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         parsed.code === "payload_too_large" ? 413 : 400,
       ));
     }
+    mcpMinuteAttribution.record(parsed.value);
     const workstationId = resolveWorkstation(request, env);
     const webchatControlGrants = devAuth.webchatControlGrants ?? [];
     const pageAssistGrants = devAuth.pageAssistGrants ?? [];
