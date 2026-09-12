@@ -811,13 +811,33 @@ function browserConversationInfoFromSupportedUrl(rawUrl) {
   return null;
 }
 
+function enrichConversationInfoWithBrowserScope(tabId, info) {
+  if (!tabId || !info || info.site !== "chatgpt" || info.project_id) return info;
+  const scope = browserTabScopes.get(tabId);
+  const projectId = typeof scope?.projectId === "string" && scope.projectId.trim()
+    ? scope.projectId.trim()
+    : String(info.browserProjectId || "").trim();
+  if (!/^g-p-[A-Za-z0-9_-]+$/.test(projectId)) return info;
+  const projectName = typeof scope?.projectName === "string" && scope.projectName.trim()
+    ? scope.projectName.trim()
+    : String(info.browserProjectName || "").trim();
+  return {
+    ...info,
+    project_id: projectId,
+    project_name: projectName || null,
+    project_key: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
+    project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`,
+  };
+}
+
 async function conversationInfoForTab(tabId) {
   if (!tabId) return null;
   try {
     const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
     if (live?.convKey) {
       const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
-      return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
+      const info = parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
+      return enrichConversationInfoWithBrowserScope(tabId, info);
     }
   } catch (_) {}
 
@@ -843,7 +863,8 @@ async function conversationInfoForTab(tabId) {
           const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
           if (live?.convKey) {
             const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
-            return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
+            const info = parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
+            return enrichConversationInfoWithBrowserScope(tabId, info);
           }
         } catch (error) {
           if (!missingReceiverError(error)) throw error;
@@ -854,7 +875,7 @@ async function conversationInfoForTab(tabId) {
       callLog(`content-script recovery failed for tab ${tabId}:`, e.message);
     }
   }
-  return fallback;
+  return enrichConversationInfoWithBrowserScope(tabId, fallback);
 }
 
 // ---- ChatGPT MAIN-world performance-script migration ----
@@ -1822,6 +1843,7 @@ async function observeBrowserConversation({
   convKey,
   pageInfo,
   accountNativeIdentity,
+  projects = [],
   reservationRef = null,
 }) {
   if (!tabId || !pageInfo || !accountNativeIdentity) return null;
@@ -1838,7 +1860,7 @@ async function observeBrowserConversation({
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
     capabilities: { operations: provider === "chatgpt"
-      ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.inspect", "session.open", "session.create"]
+      ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create"]
       : ["composer.submit", "generation.status", "generation.stop", "session.inspect"] },
     observed_at: Date.now(),
   });
@@ -1859,21 +1881,47 @@ async function observeBrowserConversation({
   });
   let parentRef = account.resource?.resource_ref || null;
   let spaceRef = null;
+  const observedSpaces = new Map();
+  if (provider === "chatgpt" && parentRef) {
+    for (const project of Array.isArray(projects) ? projects.slice(0, 100) : []) {
+      const projectId = typeof project?.id === "string" ? project.id.trim() : "";
+      const projectName = typeof project?.name === "string" ? project.name.trim() : "";
+      if (!/^g-p-[A-Za-z0-9_-]+$/.test(projectId) || !projectName || observedSpaces.has(projectId)) continue;
+      const observed = await postBrowserRegistry({
+        operation: "resource.observe",
+        profile_seed: profileSeed,
+        endpoint_ref: endpoint.endpoint_ref,
+        provider,
+        kind: "space",
+        parent_ref: parentRef,
+        native_identity: projectId,
+        display_label: projectName,
+        canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`,
+        observation_generation: observationGeneration,
+        observed_at: Date.now(),
+      });
+      const ref = observed.resource?.resource_ref || null;
+      if (ref) observedSpaces.set(projectId, ref);
+    }
+  }
   if (pageInfo.project_id && parentRef) {
-    const space = await postBrowserRegistry({
-      operation: "resource.observe",
-      profile_seed: profileSeed,
-      endpoint_ref: endpoint.endpoint_ref,
-      provider,
-      kind: "space",
-      parent_ref: parentRef,
-      native_identity: pageInfo.project_id,
-      display_label: null,
-      canonical_url: pageInfo.project_launch_url || pageInfo.project_key || null,
-      observation_generation: observationGeneration,
-      observed_at: Date.now(),
-    });
-    spaceRef = space.resource?.resource_ref || null;
+    spaceRef = observedSpaces.get(pageInfo.project_id) || null;
+    if (!spaceRef) {
+      const space = await postBrowserRegistry({
+        operation: "resource.observe",
+        profile_seed: profileSeed,
+        endpoint_ref: endpoint.endpoint_ref,
+        provider,
+        kind: "space",
+        parent_ref: parentRef,
+        native_identity: pageInfo.project_id,
+        display_label: pageInfo.project_name || null,
+        canonical_url: pageInfo.project_launch_url || pageInfo.project_key || null,
+        observation_generation: observationGeneration,
+        observed_at: Date.now(),
+      });
+      spaceRef = space.resource?.resource_ref || null;
+    }
     parentRef = spaceRef || parentRef;
   }
   if (!parentRef) return null;
@@ -1881,6 +1929,8 @@ async function observeBrowserConversation({
     provider,
     accountRef: account.resource?.resource_ref || null,
     spaceRef,
+    projectId: pageInfo.project_id || null,
+    projectName: pageInfo.project_name || null,
     observationGeneration,
     lastSeenAt: Date.now(),
   });
@@ -5424,7 +5474,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       const bindings = await loadBindings();
-      const pageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
+      const parsedPageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
+      const catalogProjectId = /^g-p-[A-Za-z0-9_-]+$/.test(String(msg.browserCurrentProjectId || ""))
+        ? String(msg.browserCurrentProjectId)
+        : null;
+      const catalogProjectName = String(msg.browserCurrentProjectName || "").trim() || null;
+      const pageInfo = parsedPageInfo?.site === "chatgpt" && !parsedPageInfo.project_id && catalogProjectId
+        ? {
+            ...parsedPageInfo,
+            project_id: catalogProjectId,
+            project_name: catalogProjectName,
+            project_key: `https://chatgpt.com/g/${encodeURIComponent(catalogProjectId)}`,
+            project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(catalogProjectId)}/project`,
+          }
+        : parsedPageInfo;
       const browserPageInfo = pageInfo?.site === "chatgpt"
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
@@ -5437,6 +5500,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             convKey: String(msg.convKey || ""),
             pageInfo: browserPageInfo,
             accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
+            projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
             reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
           });
         } catch (error) {
@@ -5476,6 +5540,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         for (const entry of matched) {
           const b = bindings[entry.storeKey];
           if (!b) continue;
+          if (browserObservation?.accountRef) b.browser_account_ref = browserObservation.accountRef;
+          if (browserObservation?.spaceRef) b.browser_space_ref = browserObservation.spaceRef;
+          if (Number.isSafeInteger(browserObservation?.observationGeneration)
+              && browserObservation.observationGeneration > 0) {
+            b.browser_generation = browserObservation.observationGeneration;
+          }
           if (!isProjectScopedBinding(b)) {
             b.tabId = sender.tab?.id;
             b.tabUrl = msg.url || sender.tab?.url;
@@ -5973,6 +6043,47 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg?.type === "h2w_sync_project_instructions") {
+    const controlCenterUrl = chrome.runtime.getURL("control-center.html");
+    if (sender?.url !== controlCenterUrl) {
+      sendResponse({ ok: false, error: "project-sync-user-gesture-required" });
+      return;
+    }
+    void (async () => {
+      const tabId = Number(msg.tabId || 0);
+      const projectId = String(msg.project_id || "").trim();
+      const projectName = String(msg.project_name || "").trim();
+      const managedBlock = String(msg.managed_block || "").trim();
+      if (!Number.isSafeInteger(tabId)
+          || tabId < 1
+          || !/^g-p-[A-Za-z0-9_-]+$/.test(projectId)
+          || projectName.length > 256
+          || managedBlock.length < 1
+          || managedBlock.length > 12000
+          || !managedBlock.startsWith("[HERDR_PROJECT_CONTEXT_START]")
+          || !managedBlock.endsWith("[HERDR_PROJECT_CONTEXT_END]")) {
+        sendResponse({ ok: false, error: "project-sync-params-invalid" });
+        return;
+      }
+      const convInfo = await conversationInfoForTab(tabId);
+      if (convInfo?.site !== "chatgpt" || convInfo?.project_id !== projectId) {
+        sendResponse({ ok: false, error: "project-sync-target-mismatch" });
+        return;
+      }
+      try {
+        const result = await chrome.tabs.sendMessage(tabId, {
+          type: "h2w_sync_project_instructions",
+          project_id: projectId,
+          project_name: projectName,
+          managed_block: managedBlock,
+        });
+        sendResponse(result && typeof result === "object" ? result : { ok: false, error: "project-sync-invalid-result" });
+      } catch (error) {
+        sendResponse({ ok: false, error: error?.message || "project-sync-unavailable" });
+      }
+    })();
+    return true;
+  }
   if (msg?.type === "h2w_agents") {
     void (async () => {
       // Workspace discovery must prefer a fresh state read. The push hello cache
@@ -6005,6 +6116,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const pendingRoot = pageInfo?.site === "chatgpt" && pageInfo?.is_new_chat_root === true;
       const hasConversationTarget = Boolean(pageInfo?.conversation_id);
       const deliveryTabId = projectScoped && !hasConversationTarget ? null : tabId;
+      const browserScope = tabId ? browserTabScopes.get(tabId) : null;
       // Device-aware binding: preserve immutable device identity where known.
       // The local workspace catalog may advertise device_id; otherwise use
       // explicit msg.device_id (from control center) or leave absent for
@@ -6026,8 +6138,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         site: pageInfo?.site || "unknown",
         binding_scope: projectScoped ? "project" : (pendingRoot ? "pending" : "conversation"),
         project_id: pageInfo?.project_id || null,
+        project_name: pageInfo?.project_name || null,
         project_key: pageInfo?.project_key || null,
         local_project_key: msg.local_project_key || null,
+        project_roots: Array.isArray(msg.roots)
+          ? msg.roots.filter((root) => typeof root === "string" && root.trim()).map((root) => root.trim()).slice(0, 16)
+          : [],
+        browser_account_ref: browserScope?.accountRef || null,
+        browser_space_ref: browserScope?.spaceRef || null,
+        browser_generation: Number.isSafeInteger(browserScope?.observationGeneration)
+          ? browserScope.observationGeneration
+          : null,
         device_id: bindingDeviceId,
         active_conv_key: projectScoped && hasConversationTarget ? pageInfo.convKey : null,
         tabId: deliveryTabId,

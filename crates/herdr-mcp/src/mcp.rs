@@ -1559,6 +1559,7 @@ enum BrowserOperation {
     SpaceInspect,
     SessionCreate,
     SessionOpen,
+    SessionArchive,
     SessionInspect,
     MessageAppend,
     ComposerSetReasoning,
@@ -1576,6 +1577,7 @@ impl BrowserOperation {
             "herdr_mcp.browser_space.inspect" => Some(Self::SpaceInspect),
             "herdr_mcp.browser_session.create" => Some(Self::SessionCreate),
             "herdr_mcp.browser_session.open" => Some(Self::SessionOpen),
+            "herdr_mcp.browser_session.archive" => Some(Self::SessionArchive),
             "herdr_mcp.browser_session.inspect" => Some(Self::SessionInspect),
             "herdr_mcp.browser_message.append" => Some(Self::MessageAppend),
             "herdr_mcp.browser_composer.set_reasoning" => Some(Self::ComposerSetReasoning),
@@ -1594,6 +1596,7 @@ impl BrowserOperation {
             Self::SpaceInspect => "herdr_mcp.browser_space.inspect",
             Self::SessionCreate => "herdr_mcp.browser_session.create",
             Self::SessionOpen => "herdr_mcp.browser_session.open",
+            Self::SessionArchive => "herdr_mcp.browser_session.archive",
             Self::SessionInspect => "herdr_mcp.browser_session.inspect",
             Self::MessageAppend => "herdr_mcp.browser_message.append",
             Self::ComposerSetReasoning => "herdr_mcp.browser_composer.set_reasoning",
@@ -1618,6 +1621,7 @@ impl BrowserOperation {
             Self::SpaceInspect => "space.inspect",
             Self::SessionCreate => "session.create",
             Self::SessionOpen => "session.open",
+            Self::SessionArchive => "session.archive",
             Self::SessionInspect => "session.inspect",
             Self::MessageAppend => "message.append",
             Self::ComposerSetReasoning => "composer.set_reasoning",
@@ -1717,6 +1721,9 @@ fn browser_delivery_state_from_postcondition(
             evidence.stable_resource_ref_observed
                 && evidence.lifecycle_observed
                 && evidence.canonical_url_observed
+        }
+        BrowserOperation::SessionArchive => {
+            evidence.stable_resource_ref_observed && evidence.lifecycle_observed
         }
         BrowserOperation::MessageAppend => {
             evidence.accepted_message_observed || evidence.message_baseline_advanced
@@ -3182,7 +3189,9 @@ fn browser_operation_call_with_grant(
 fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Value) -> bool {
     if matches!(
         operation,
-        BrowserOperation::SessionOpen | BrowserOperation::DispatchStop
+        BrowserOperation::SessionOpen
+            | BrowserOperation::SessionArchive
+            | BrowserOperation::DispatchStop
     ) {
         return true;
     }
@@ -3291,7 +3300,10 @@ fn browser_operation_call_with_controls(
         let Ok(store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
-        if operation == BrowserOperation::SessionOpen {
+        if matches!(
+            operation,
+            BrowserOperation::SessionOpen | BrowserOperation::SessionArchive
+        ) {
             let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
             if let Ok(Some(resource)) = store_guard.browser_resource(session_ref)
                 && resource.provider != "chatgpt"
@@ -3492,6 +3504,9 @@ fn validate_browser_operation_params(
             "lane_id",
         ],
         BrowserOperation::SessionOpen => &["session_ref", "expected_generation", "idempotency_key"],
+        BrowserOperation::SessionArchive => {
+            &["session_ref", "expected_generation", "idempotency_key"]
+        }
         BrowserOperation::SessionInspect => &["session_ref"],
         BrowserOperation::MessageAppend => &[
             "session_ref",
@@ -3574,6 +3589,11 @@ fn validate_browser_operation_params(
             let _ = browser_optional_string(params, "lane_id", 160)?;
         }
         BrowserOperation::SessionOpen => {
+            browser_required_string(params, "session_ref", 96)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::SessionArchive => {
             browser_required_string(params, "session_ref", 96)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
@@ -3703,6 +3723,7 @@ fn browser_operation_actuation_decision(
             "space",
         )?,
         BrowserOperation::SessionOpen
+        | BrowserOperation::SessionArchive
         | BrowserOperation::MessageAppend
         | BrowserOperation::ComposerSetReasoning
         | BrowserOperation::ComposerSetApps
@@ -3739,7 +3760,11 @@ fn browser_operation_actuation_decision(
         caller_webchat_control_grants,
         params.get("expected_generation").and_then(Value::as_i64),
     )?;
-    if operation == BrowserOperation::SessionOpen && target.provider != "chatgpt" {
+    if matches!(
+        operation,
+        BrowserOperation::SessionOpen | BrowserOperation::SessionArchive
+    ) && target.provider != "chatgpt"
+    {
         return Ok((false, Some("capability_not_allowed")));
     }
     if decision != (true, None)
@@ -3814,6 +3839,7 @@ fn browser_operation_mutation_scope(
             "space",
         )?,
         BrowserOperation::SessionOpen
+        | BrowserOperation::SessionArchive
         | BrowserOperation::MessageAppend
         | BrowserOperation::ComposerSetReasoning
         | BrowserOperation::ComposerSetApps
@@ -7307,6 +7333,14 @@ mod tests {
                 "session_ref": "br_session",
                 "expected_generation": 7,
                 "idempotency_key": "supported-session-open"
+            })
+        ));
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::SessionArchive,
+            &json!({
+                "session_ref": "br_session",
+                "expected_generation": 7,
+                "idempotency_key": "supported-session-archive"
             })
         ));
         assert!(browser_operation_alpha4_supported(
