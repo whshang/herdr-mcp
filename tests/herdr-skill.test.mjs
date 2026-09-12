@@ -74,6 +74,10 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /after a second host rejection, stop instead of changing transport.*tool power/s);
     assert.match(r.content, /Do not build a tool\/command blacklist from a single rejection/);
     assert.match(r.content, /one bounded single-purpose read\/probe per call/);
+    assert.match(r.content, /existing local Agent.*execution fallback/s);
+    assert.match(r.content, /Use `herdr_prompt` with one high-level task contract/s);
+    assert.match(r.content, /Agent fallback is an alternate execution subject.*not a privilege or safety bypass/s);
+    assert.match(r.content, /If `herdr_prompt` is itself rejected.*stop the fallback chain/s);
     assert.match(r.content, /not permission to bypass, disable, or evade host safety checks/);
     assert.match(r.content, /never escalate to a more powerful tool solely to force a rejected request through/);
     assert.match(r.content, /herdr_git status.*diff.*log.*herdr_exec.*herdr_fs_grep.*compacted/s);
@@ -116,6 +120,19 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     if (prev === undefined) delete process.env.HERDR_SKILL_NETWORK;
     else process.env.HERDR_SKILL_NETWORK = prev;
   }
+});
+
+test("agent-dispatch skill keeps host pre-delivery fallback bounded", () => {
+  const content = readFileSync(
+    new URL("../assets/herdr/skills/agent-dispatch/SKILL.md", import.meta.url),
+    "utf8",
+  );
+  assert.match(content, /host-side pre-delivery rejection/);
+  assert.match(content, /existing compatible local Agent.*alternate execution subject/s);
+  assert.match(content, /high-level task contract/);
+  assert.match(content, /authorization\/confirmation.*irreversible-action boundary/s);
+  assert.match(content, /If `herdr_prompt` is itself rejected before Herdr delivery.*fallback chain stops/s);
+  assert.match(content, /never bypass, disable, or evade host safety checks/);
 });
 
 test("fetchHerdrSkill appends release-matched native Herdr reference with remote-scope warning", async () => {
