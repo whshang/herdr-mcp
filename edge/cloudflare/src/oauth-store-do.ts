@@ -1998,6 +1998,34 @@ export class OAuthStoreDO {
     return json({ ok: true, kid: key.kid, public_jwk: key.public_jwk, created_at: key.created_at });
   }
 
+  private async verifiedControlGrantSnapshot(
+    clientId: string,
+    connectorId: string | undefined,
+    grantGeneration: number | undefined,
+  ): Promise<{
+    webchat_control: Array<{ device_id: string; endpoint_ref: string; provider: string; account_ref: string }>;
+    page_assist: Array<{ device_id: string; endpoint_ref: string }>;
+  }> {
+    if (!connectorId || !grantGeneration) return { webchat_control: [], page_assist: [] };
+    const grant = normalizeConnectorGrant(
+      await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId),
+    );
+    if (!grant || grant.status !== "active") return { webchat_control: [], page_assist: [] };
+    return {
+      webchat_control: (grant.webchat_control ?? [])
+        .filter((item) => item.connector_id === connectorId && item.grant_generation === grantGeneration)
+        .map((item) => ({
+          device_id: item.device_id,
+          endpoint_ref: item.endpoint_ref,
+          provider: item.provider,
+          account_ref: item.account_ref,
+        })),
+      page_assist: (grant.page_assist ?? [])
+        .filter((item) => item.connector_id === connectorId && item.grant_generation === grantGeneration)
+        .map((item) => ({ device_id: item.device_id, endpoint_ref: item.endpoint_ref })),
+    };
+  }
+
   private async verifyAccess(request: Request): Promise<Response> {
     const body = await this.body(request);
     const token = body?.token;
@@ -2027,6 +2055,9 @@ export class OAuthStoreDO {
           } else if (!(await this.connectorAllowsAccess(verdict.clientId, verdict.connectorId, verdict.grantGeneration, nowSec * 1000))) {
             return json({ ok: false, code: "invalid_token" }, 401);
           }
+          const controls = verdict.principalType === "automation"
+            ? { webchat_control: [], page_assist: [] }
+            : await this.verifiedControlGrantSnapshot(verdict.clientId, verdict.connectorId, verdict.grantGeneration);
           return json({
             ok: true,
             client_id: verdict.clientId,
@@ -2034,6 +2065,7 @@ export class OAuthStoreDO {
             grant_generation: verdict.grantGeneration ?? null,
             principal_type: verdict.principalType ?? null,
             device_id: verdict.deviceId ?? null,
+            ...controls,
             source: "edge_jwt",
           });
         }
@@ -2053,11 +2085,13 @@ export class OAuthStoreDO {
     if (!(await this.connectorAllowsAccess(legacy.client_id, legacy.connector_id, legacy.grant_generation, nowSec * 1000))) {
       return json({ ok: false, code: "invalid_token" }, 401);
     }
+    const controls = await this.verifiedControlGrantSnapshot(legacy.client_id, legacy.connector_id, legacy.grant_generation);
     return json({
       ok: true,
       client_id: legacy.client_id,
       connector_id: legacy.connector_id ?? null,
       grant_generation: legacy.grant_generation ?? null,
+      ...controls,
       source: "opaque",
     });
   }

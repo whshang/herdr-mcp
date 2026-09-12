@@ -53,7 +53,11 @@ import {
   resolveDeviceRoute,
 } from "./device-directory.js";
 import { normalizeDeviceId } from "./device-model.js";
-import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
+import {
+  authenticateMcpRequest,
+  type AuthPageAssistGrant,
+  type AuthWebChatControlGrant,
+} from "./oauth-mcp-auth.js";
 import { createOAuthIdentity, hashOAuthApprovalCode } from "./oauth-edge.js";
 import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
 import { randomBase64UrlToken } from "./oauth-token-crypto.js";
@@ -812,18 +816,8 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
       ));
     }
     const workstationId = resolveWorkstation(request, env);
-    const webchatControlGrants = await oauthClientWebChatControlGrants(
-      env,
-      devAuth.clientId,
-      devAuth.connectorId,
-      devAuth.grantGeneration,
-    );
-    const pageAssistGrants = await oauthClientPageAssistGrants(
-      env,
-      devAuth.clientId,
-      devAuth.connectorId,
-      devAuth.grantGeneration,
-    );
+    const webchatControlGrants = devAuth.webchatControlGrants ?? [];
+    const pageAssistGrants = devAuth.pageAssistGrants ?? [];
     const dev = await handleMcp(parsed.value, workstationId, {
       limits,
       client: {
@@ -1082,6 +1076,8 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{
   grantGeneration?: number;
   principalType?: string;
   deviceId?: string;
+  webchatControlGrants?: readonly AuthWebChatControlGrant[];
+  pageAssistGrants?: readonly AuthPageAssistGrant[];
 }> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   const response = await stub.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
@@ -1101,12 +1097,39 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{
   const principalType = typeof payload.principal_type === "string" ? payload.principal_type : undefined;
   const deviceId = typeof payload.device_id === "string" ? payload.device_id : undefined;
   if (!clientId || ((connectorId === undefined) !== (grantGeneration === undefined))) return { ok: false };
+
+  const webchatControlGrants = Array.isArray(payload.webchat_control)
+    ? payload.webchat_control.flatMap((value): AuthWebChatControlGrant[] => {
+        if (!isRecord(value)) return [];
+        return typeof value.device_id === "string"
+          && typeof value.endpoint_ref === "string"
+          && typeof value.provider === "string"
+          && typeof value.account_ref === "string"
+          ? [{
+              device_id: value.device_id,
+              endpoint_ref: value.endpoint_ref,
+              provider: value.provider,
+              account_ref: value.account_ref,
+            }]
+          : [];
+      })
+    : [];
+  const pageAssistGrants = Array.isArray(payload.page_assist)
+    ? payload.page_assist.flatMap((value): AuthPageAssistGrant[] => {
+        if (!isRecord(value)) return [];
+        return typeof value.device_id === "string" && typeof value.endpoint_ref === "string"
+          ? [{ device_id: value.device_id, endpoint_ref: value.endpoint_ref }]
+          : [];
+      })
+    : [];
   return {
     ok: true,
     clientId,
     ...(connectorId ? { connectorId, grantGeneration } : {}),
     ...(principalType ? { principalType } : {}),
     ...(deviceId ? { deviceId } : {}),
+    ...(webchatControlGrants.length > 0 ? { webchatControlGrants } : {}),
+    ...(pageAssistGrants.length > 0 ? { pageAssistGrants } : {}),
   };
 }
 
@@ -1304,43 +1327,6 @@ async function revokeAutomationClient(
     return { ok: false, code: "automation_revoke_failed" };
   }
   return { ok: true };
-}
-
-async function oauthClientWebChatControlGrants(
-  env: Env,
-  clientId: string | undefined,
-  connectorId: string | undefined,
-  grantGeneration: number | undefined,
-) {
-  if (!clientId || !connectorId || !grantGeneration) return [];
-  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
-  const store = createOAuthPublicStore(stub);
-  const grant = await store.getGrant(clientId);
-  if (grant?.status !== "active") return [];
-  return (grant.webchat_control ?? [])
-    .filter((item) => item.connector_id === connectorId && item.grant_generation === grantGeneration)
-    .map((item) => ({
-      device_id: item.device_id,
-      endpoint_ref: item.endpoint_ref,
-      provider: item.provider,
-      account_ref: item.account_ref,
-    }));
-}
-
-async function oauthClientPageAssistGrants(
-  env: Env,
-  clientId: string | undefined,
-  connectorId: string | undefined,
-  grantGeneration: number | undefined,
-) {
-  if (!clientId || !connectorId || !grantGeneration) return [];
-  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
-  const store = createOAuthPublicStore(stub);
-  const grant = await store.getGrant(clientId);
-  if (grant?.status !== "active") return [];
-  return (grant.page_assist ?? [])
-    .filter((item) => item.connector_id === connectorId && item.grant_generation === grantGeneration)
-    .map((item) => ({ device_id: item.device_id, endpoint_ref: item.endpoint_ref }));
 }
 
 async function plannerControlStore(env: Env, input: Record<string, unknown>): Promise<Record<string, unknown>> {

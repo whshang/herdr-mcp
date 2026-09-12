@@ -655,6 +655,83 @@ test("authenticated Connector activity persists last_used_at at most once per 24
   assert.equal(h.storage.map.get(`connector:${connectorId}`).last_used_at_ms, nextDaySec * 1000);
 });
 
+test("access verify returns current connector control grants without extra grant round trips", async () => {
+  const h = harness();
+  const connectorId = "conn_snapshot123";
+  const clientId = "https://chatgpt.com/oauth/snapshot.json";
+  const nowSec = 6_000_000;
+  await h.storage.put(`connector:${connectorId}`, {
+    connector_id: connectorId,
+    client_id: clientId,
+    status: "active",
+    principal_type: "connector",
+    capabilities: ["mcp_access"],
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect",
+    auth_source: "chatgpt_cimd",
+    grant_generation: 2,
+    approved_at_ms: nowSec * 1000 - 1_000,
+    approved_by: "device:owner",
+  });
+  await h.storage.put(`grant:${clientId}`, {
+    client_id: clientId,
+    status: "active",
+    principal_type: "connector",
+    connector_id: connectorId,
+    grant_generation: 2,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    approved_at_ms: nowSec * 1000 - 1_000,
+    approved_by: "device:owner",
+    webchat_control: [{
+      connector_id: connectorId,
+      grant_generation: 2,
+      device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      endpoint_ref: "browser-endpoint-1",
+      provider: "chatgpt",
+      account_ref: "account-1",
+    }],
+    page_assist: [{
+      connector_id: connectorId,
+      grant_generation: 2,
+      device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      endpoint_ref: "browser-endpoint-1",
+    }],
+  });
+  const accessToken = "opaque-snapshot-access";
+  const accessHash = await hashOpaqueToken(accessToken);
+  await h.storage.put(`access:${accessHash}`, {
+    client_id: clientId,
+    connector_id: connectorId,
+    grant_generation: 2,
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    expires_at: nowSec + 3600,
+  });
+
+  const verified = await h.post("/internal/oauth/access/verify", { token: accessToken, now_sec: nowSec });
+  assert.equal(verified.status, 200);
+  const verifiedBody = await body(verified);
+  assert.deepEqual(verifiedBody.webchat_control, [{
+    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    endpoint_ref: "browser-endpoint-1",
+    provider: "chatgpt",
+    account_ref: "account-1",
+  }]);
+  assert.deepEqual(verifiedBody.page_assist, [{
+    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    endpoint_ref: "browser-endpoint-1",
+  }]);
+
+  await h.post("/internal/oauth/grant/revoke", {
+    client_id: clientId,
+    revoked_by: "device:owner",
+    now_ms: nowSec * 1000 + 1,
+  });
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: accessToken, now_sec: nowSec + 1 })).status, 401);
+});
+
 test("connector grant revoke fences current and legacy JWT/refresh credentials with a durable tombstone", async () => {
   const h = harness();
   const legacyIssued = await body(await h.post("/internal/oauth/token/issue", {

@@ -220,3 +220,53 @@ test("generation supersede proven not delivered releases mutation idempotency fo
   await second;
   assert.equal(storage.map.get(`idem:${idempotencyKey}`).requestId, "generation-new");
 });
+
+
+test("alarm budget: completed mutation moves off spent deadline and coalesces cleanup", async () => {
+  const storage = new FakeStorage();
+  const subject = new WorkstationDO(fakeState(storage), {});
+  await subject.fetch(new Request("https://do/internal/status"));
+
+  const now = Date.now();
+  const deadline = now + 30_000;
+  const entry = pending("alarm-budget-completed", deadline, "sent", "mutating");
+  const { state: _state, createdAtMs: _createdAtMs, sentAtMs: _sentAtMs, ...entryInput } = entry;
+  subject.registry.add(entryInput);
+  subject.registry.markSent(entry.requestId, now);
+  subject.registry.settle(entry.requestId, { status: "ok", result: { ok: true }, servedAtMs: now });
+
+  // Model the deadline alarm that was armed when the request was dispatched.
+  storage.alarm = deadline;
+  storage.mutations.length = 0;
+  await subject.armAlarm();
+
+  assert.notEqual(storage.alarm, deadline, "settled work must not leave its old deadline alarm armed");
+  assert.equal(storage.alarm % 60_000, 0, "completed cleanup should coalesce to minute buckets");
+  assert.ok(storage.alarm >= now + 600_000, "cleanup must never run before the 10 minute completion TTL");
+  assert.ok(storage.alarm < now + 660_000, "coalescing may extend completion retention by less than one minute");
+  assert.deepEqual(storage.mutations, [["setAlarm", storage.alarm]]);
+});
+
+test("alarm budget: active request deadlines stay exact ahead of coalesced cleanup", async () => {
+  const storage = new FakeStorage();
+  const subject = new WorkstationDO(fakeState(storage), {});
+  await subject.fetch(new Request("https://do/internal/status"));
+
+  const now = Date.now();
+  const completed = pending("alarm-budget-history", now + 5_000, "sent", "mutating");
+  const { state: _completedState, createdAtMs: _completedCreatedAtMs, sentAtMs: _completedSentAtMs, ...completedInput } = completed;
+  subject.registry.add(completedInput);
+  subject.registry.markSent(completed.requestId, now);
+  subject.registry.settle(completed.requestId, { status: "ok", result: { ok: true }, servedAtMs: now });
+
+  const liveDeadline = now + 20_000;
+  const live = pending("alarm-budget-live", liveDeadline, "sent", "mutating");
+  const { state: _liveState, createdAtMs: _liveCreatedAtMs, sentAtMs: _liveSentAtMs, ...liveInput } = live;
+  subject.registry.add(liveInput);
+  subject.registry.markSent(live.requestId, now);
+  storage.mutations.length = 0;
+  await subject.armAlarm();
+
+  assert.equal(storage.alarm, liveDeadline, "pending request timeout must remain exact");
+  assert.deepEqual(storage.mutations, [["setAlarm", liveDeadline]]);
+});

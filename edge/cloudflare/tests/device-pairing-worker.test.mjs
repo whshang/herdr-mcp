@@ -767,9 +767,11 @@ test("browser authority is fenced to one exact Connector instance even when clie
       }), { status: 200, headers: { "content-type": "application/json" } });
     },
   };
+  const oauthPaths = [];
   const oauthStub = {
     async fetch(request) {
       const url = new URL(request.url);
+      oauthPaths.push(url.pathname);
       const body = await request.json();
       if (url.pathname === "/internal/oauth/access/verify") {
         if (body.token === "connector-a-token") {
@@ -779,6 +781,7 @@ test("browser authority is fenced to one exact Connector instance even when clie
             connector_id: connectorA,
             grant_generation: 1,
             principal_type: "connector",
+            page_assist: [{ device_id: target.device_id, endpoint_ref: endpointA }],
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         if (body.token === "connector-b-token") {
@@ -788,6 +791,7 @@ test("browser authority is fenced to one exact Connector instance even when clie
             connector_id: connectorB,
             grant_generation: 1,
             principal_type: "connector",
+            page_assist: [{ device_id: target.device_id, endpoint_ref: endpointB }],
           }), { status: 200, headers: { "content-type": "application/json" } });
         }
         if (body.token === "legacy-shared-client-token") {
@@ -858,6 +862,11 @@ test("browser authority is fenced to one exact Connector instance even when clie
   assert.equal((await call("legacy-shared-client-token", 73)).status, 200);
   assert.equal(forwarded[2].trace?.page_assist_grants, undefined,
     "client-only legacy identity cannot inherit browser authority from any Connector instance");
+  assert.deepEqual(oauthPaths, [
+    "/internal/oauth/access/verify",
+    "/internal/oauth/access/verify",
+    "/internal/oauth/access/verify",
+  ], "each MCP call must consume exactly one OAuthStoreDO request; no post-verify grant/get round trips");
 });
 
 test("pairing creation requires fleet-admin auth and returns one-time material with worker origin metadata", async () => {

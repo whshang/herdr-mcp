@@ -104,6 +104,13 @@ const KEY_SESSION = "session";
 const KEY_REVOKED = "revoked";
 /** Policy close code for a revoked device link. */
 const REVOKED_CLOSE_CODE = 4401;
+/**
+ * Completed rows are replay/dedup evidence, not latency-sensitive work. Group
+ * their cleanup alarms into one-minute buckets so high request volume does not
+ * turn housekeeping into one billable Durable Object alarm invocation per
+ * completed request. Pending request deadlines remain exact.
+ */
+const COMPLETED_CLEANUP_ALARM_GRANULARITY_MS = 60_000;
 
 /**
  * Durable settlement row (completed:<id>). The completed row is the
@@ -1565,19 +1572,27 @@ export class WorkstationDO {
     await this.armAlarm();
   }
 
-  /** Keep the next deadline/expiry armed (alarms coalesce; earliest fires). */
+  /** Keep the next exact deadline / coalesced completion cleanup armed. */
   private async armAlarm(): Promise<void> {
     const pendingAt = this.registry.nextDeadlineMs();
-    const expiredAt = this.registry.completedExpiryAtMs();
+    const completedExpiryAt = this.registry.completedExpiryAtMs();
+    const cleanupAt = completedExpiryAt === undefined
+      ? undefined
+      : Math.ceil(completedExpiryAt / COMPLETED_CLEANUP_ALARM_GRANULARITY_MS)
+        * COMPLETED_CLEANUP_ALARM_GRANULARITY_MS;
     let next: number | undefined;
-    if (pendingAt !== undefined && expiredAt !== undefined) next = Math.min(pendingAt, expiredAt);
-    else next = pendingAt ?? expiredAt;
+    if (pendingAt !== undefined && cleanupAt !== undefined) next = Math.min(pendingAt, cleanupAt);
+    else next = pendingAt ?? cleanupAt;
+
+    // Storage alarm operations are input-gated. Reconcile to the actual next
+    // work item in both directions: after a request settles, leaving its old
+    // (earlier) deadline armed would create a billable no-op alarm invocation.
     const current = await this.state.storage.getAlarm();
     if (next === undefined) {
       if (current !== null) await this.state.storage.deleteAlarm();
       return;
     }
-    if (current === null || next < current) {
+    if (current !== next) {
       await this.state.storage.setAlarm(next);
     }
   }
