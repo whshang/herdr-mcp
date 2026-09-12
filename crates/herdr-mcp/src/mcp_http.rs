@@ -479,22 +479,9 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
     let prompt = PromptRegistry::with_store(state_store.clone());
     let skill = SkillService::new();
     crate::schema::prewarm_async();
-    if !cache.wait_ready(Duration::from_secs(3)) {
-        return Err(format!(
-            "candidate event cache did not bootstrap: {}",
-            cache
-                .last_error()
-                .unwrap_or_else(|| "unknown error".to_owned())
-        ));
-    }
-    if !cache.wait_stream_connected(Duration::from_secs(2)) {
-        return Err(format!(
-            "candidate event cache did not connect events.subscribe: {}",
-            cache
-                .last_error()
-                .unwrap_or_else(|| "unknown error".to_owned())
-        ));
-    }
+    // Herdr is a recoverable local dependency. EventCache owns reconnect/backoff,
+    // so a temporarily absent Herdr server must not prevent the managed runtime
+    // from starting or make installation transactional rollback permanent.
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

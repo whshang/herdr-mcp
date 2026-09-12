@@ -32,6 +32,178 @@ jobs:
       - name: Rust release gate
         run: scripts/release-gate.sh rust
 
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: "0"
+      HERDR_MCP_BUILD_CHANNEL: dev
+      HERDR_MCP_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build Windows UAT candidate
+        shell: pwsh
+        run: cargo +1.97.1 build --locked --release -p herdr-mcp --target x86_64-pc-windows-msvc
+      - name: Windows user-process lifecycle and Herdr recovery smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $candidate = (Resolve-Path "target/x86_64-pc-windows-msvc/release/herdr-mcp.exe").Path
+          $archive = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64.zip"
+          $root = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          $herdr = $null
+          try {
+            Invoke-WebRequest -Uri "https://github.com/herdrdev/herdr/releases/download/v0.9.0/herdr-windows-x86_64.zip" -OutFile $archive
+            $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            $expected = "b4508c445de1c1a68c760a01735da2aba2fa214b2aafd4b07f732e49b2a64b11"
+            if ($actual -ne $expected) { throw "Herdr 0.9.0 Windows archive SHA-256 mismatch" }
+            Expand-Archive -Path $archive -DestinationPath $root -Force
+            $archiveHerdr = Get-ChildItem -Path $root -Filter herdr.exe -File -Recurse | Select-Object -First 1
+            if (-not $archiveHerdr) { throw "herdr.exe missing from Herdr 0.9.0 Windows archive" }
+            $officialHerdrDir = Join-Path $env:LOCALAPPDATA "Programs\Herdr\bin"
+            New-Item -ItemType Directory -Force -Path $officialHerdrDir | Out-Null
+            Copy-Item -Path (Join-Path $archiveHerdr.Directory.FullName "*") -Destination $officialHerdrDir -Recurse -Force
+            $herdr = Get-Item (Join-Path $officialHerdrDir "herdr.exe")
+            if (-not $herdr) { throw "cannot stage the official per-user Herdr install layout" }
+
+            function Test-HerdrDoctorPasses([string] $text) {
+              foreach ($label in @(
+                "Herdr local transport",
+                "Herdr API schema",
+                "validated Herdr RPC",
+                "Herdr snapshot state",
+                "Herdr inspect projection",
+                "Herdr event cache"
+              )) {
+                $pattern = "(?m)^PASS $([regex]::Escape($label))\s*$"
+                if ($text -notmatch $pattern) { return $false }
+              }
+              return $true
+            }
+
+            $before = (& $herdr.FullName status server --json | ConvertFrom-Json)
+            if ($before.running -eq $true) {
+              & $herdr.FullName server stop *> $null
+              if ($LASTEXITCODE -ne 0) { throw "cannot stop pre-existing Herdr server before Windows smoke" }
+            }
+
+            & $candidate install
+            if ($LASTEXITCODE -ne 0) { throw "Windows install smoke failed" }
+            $status = (& $candidate service status | ConvertFrom-Json)
+            if ($status.implementation -ne "rust-windows-process-user") { throw "unexpected Windows service implementation" }
+            if (-not $status.ok) { throw "Windows service status reported unhealthy after install" }
+            if (-not $status.autostart_registered) { throw "Windows Startup-folder autostart was not registered" }
+            if ($status.autostart_method -ne "startup-folder-shortcut") { throw "unexpected Windows autostart method" }
+            if (-not $status.loaded) { throw "Windows runtime process is not active" }
+            if (-not $status.healthy) { throw "Windows runtime process is not healthy" }
+            $startup = [Environment]::GetFolderPath([Environment+SpecialFolder]::Startup)
+            $shortcutPath = Join-Path $startup "Herdr MCP Runtime.lnk"
+            if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) { throw "Windows Startup shortcut is missing" }
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut($shortcutPath)
+            $expectedTarget = (Resolve-Path "$env:USERPROFILE\.config\herdr-mcp\runtime\current\herdr-mcp.exe").Path
+            if ($shortcut.TargetPath -ne $expectedTarget) { throw "Windows Startup shortcut target is incorrect" }
+            if ($shortcut.Arguments -ne "service start") { throw "Windows Startup shortcut arguments are incorrect" }
+            & reg.exe query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "Herdr MCP Runtime" *> $null
+            if ($LASTEXITCODE -eq 0) { throw "legacy HKCU Run registration was unexpectedly retained" }
+            & schtasks.exe /Query /TN "Herdr MCP Runtime" *> $null
+            if ($LASTEXITCODE -eq 0) { throw "legacy scheduled task was unexpectedly created" }
+
+            $serverAfterInstall = (& $herdr.FullName status server --json | ConvertFrom-Json)
+            if ($serverAfterInstall.running -ne $true) { throw "herdr-mcp install did not auto-start the installed Herdr server" }
+            $doctorReady = $false
+            $doctorText = ""
+            for ($attempt = 0; $attempt -lt 12; $attempt++) {
+              Start-Sleep -Milliseconds 250
+              $doctorText = (& $candidate doctor 2>&1 | Out-String)
+              if (Test-HerdrDoctorPasses $doctorText) { $doctorReady = $true; break }
+            }
+            if (-not $doctorReady) {
+              Write-Host $doctorText
+              throw "Windows runtime did not recover the full Herdr doctor surface after automatic dependency startup"
+            }
+
+            & $candidate service stop *> $null
+            $stopped = (& $candidate service status | ConvertFrom-Json)
+            if ($stopped.loaded -or $stopped.healthy -or $stopped.ok) { throw "Windows service stop did not produce an offline status" }
+            & $herdr.FullName server stop *> $null
+            if ($LASTEXITCODE -ne 0) { throw "cannot stop Herdr before simulated login" }
+            $serverStopped = (& $herdr.FullName status server --json | ConvertFrom-Json)
+            if ($serverStopped.running -eq $true) { throw "Herdr remained running before simulated login" }
+
+            Start-Process -FilePath $shortcutPath
+            $loginRecovered = $false
+            $herdrRecovered = $false
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              Start-Sleep -Milliseconds 250
+              $afterLogin = (& $candidate service status | ConvertFrom-Json)
+              $serverAfterLogin = (& $herdr.FullName status server --json | ConvertFrom-Json)
+              if ($serverAfterLogin.running -eq $true) { $herdrRecovered = $true }
+              if ($afterLogin.autostart_registered -and $afterLogin.loaded -and $afterLogin.healthy -and $afterLogin.ok -and $herdrRecovered) {
+                $loginRecovered = $true
+                break
+              }
+            }
+            if (-not $loginRecovered) { throw "Windows Startup shortcut did not restore herdr-mcp plus the Herdr dependency after simulated login" }
+
+            $doctorReady = $false
+            $doctorText = ""
+            for ($attempt = 0; $attempt -lt 12; $attempt++) {
+              Start-Sleep -Milliseconds 250
+              $doctorText = (& $candidate doctor 2>&1 | Out-String)
+              if (Test-HerdrDoctorPasses $doctorText) { $doctorReady = $true; break }
+            }
+            if (-not $doctorReady) {
+              Write-Host $doctorText
+              throw "Windows full Herdr doctor surface did not recover after simulated-login startup"
+            }
+          }
+          finally {
+            & $candidate service uninstall *> $null
+            if ($herdr) {
+              $serverStatus = (& $herdr.FullName status server --json | ConvertFrom-Json)
+              if ($serverStatus.running -eq $true) { & $herdr.FullName server stop *> $null }
+            }
+          }
+      - name: Stage Windows UAT bundle
+        shell: pwsh
+        run: |
+          $line = Select-String -Path crates/herdr-mcp/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $line) { throw "cannot resolve herdr-mcp version" }
+          $version = $line.Matches[0].Groups[1].Value
+          $edgeOut = Join-Path $env:RUNNER_TEMP "herdr-edge"
+          New-Item -ItemType Directory -Force -Path $edgeOut, "windows-uat" | Out-Null
+          npx --yes wrangler@4.129.0 deploy --dry-run --outdir $edgeOut --config edge/cloudflare/wrangler.user.example.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item "target/x86_64-pc-windows-msvc/release/herdr-mcp.exe" "windows-uat/herdr-mcp.exe"
+          Copy-Item (Join-Path $edgeOut "index.js") "windows-uat/herdr-edge-$version.mjs"
+          $versionOutput = (& "windows-uat/herdr-mcp.exe" version | Out-String)
+          $schemaMatch = [regex]::Match($versionOutput, '(?m)^state schema (\d+)\s*$')
+          $contractMatch = [regex]::Match($versionOutput, '(?m)^contract epoch (\d+) / (\d+) tools\s*$')
+          if (-not $schemaMatch.Success) { throw "cannot resolve runtime state schema from candidate" }
+          if (-not $contractMatch.Success) { throw "cannot resolve runtime contract identity from candidate" }
+          @(
+            "commit=$env:GITHUB_SHA"
+            "version=$version"
+            "channel=dev"
+            "state_schema=$($schemaMatch.Groups[1].Value)"
+            "contract_epoch=$($contractMatch.Groups[1].Value)"
+            "tool_count=$($contractMatch.Groups[2].Value)"
+          ) | Set-Content -Encoding ascii "windows-uat/BUILD.txt"
+          Write-Host $versionOutput
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-uat
+          path: windows-uat/*
+          if-no-files-found: error
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20

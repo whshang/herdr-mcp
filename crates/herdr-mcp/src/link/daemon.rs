@@ -458,6 +458,13 @@ fn resolve_daemon_base_generation(config: &LinkDaemonConfig) -> Result<String, S
 /// when the link is missing, unreadable, or does not point at a `rust-*`
 /// generation, so a placeholder or foreign target is never adopted.
 fn managed_generation_from_link(link: &Path) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    if link.is_dir() {
+        return std::fs::read_to_string(link.join("generation"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| value.starts_with("rust-"));
+    }
     let target = std::fs::read_link(link).ok()?;
     let name = target.file_name()?.to_str()?.trim();
     name.starts_with("rust-").then(|| name.to_owned())

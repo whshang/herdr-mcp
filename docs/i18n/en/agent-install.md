@@ -31,7 +31,7 @@ Check `herdr` first. If it is missing, install the official stable build:
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-On Windows use the official `install.ps1`. Then verify `herdr --version` and `herdr api schema`.
+On Windows use `install.ps1`; verify `herdr --version` and `herdr api schema`. Windows UAT uses matching PR CI `windows-uat`; do not use 0.4.8 or source builds.
 
 Download the **Latest stable** platform binary from <https://github.com/whshang/herdr-mcp/releases>, place it on the user `PATH` (normally `~/.local/bin/herdr-mcp`), then run:
 
@@ -43,7 +43,7 @@ herdr-mcp doctor
 
 If `~/.local/bin/herdr-mcp` exists but the interactive shell cannot resolve it, classify this as `installed_but_not_on_shell_path`, repair the user's PATH, and verify a fresh shell. Do not reinstall or create a second PATH owner. Use [Troubleshooting](troubleshooting.md) only if the PATH repair is needed.
 
-On macOS, run `herdr-mcp permissions status` before Cloudflare work. If it reports `needs_setup`, guide the user once through **System Settings → Privacy & Security → Full Disk Access** for `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`, then run `herdr-mcp permissions verify`. Do not probe protected paths before setup or use `sudo`. This stable broker serves MCP and native Herdr panes/worktrees, avoiding per-process TCC prompts. Ordinary updates preserve it; use `permissions setup --upgrade-broker` only for an explicit compatibility migration. Linux/Windows skip this TCC flow. Normal installation needs no Node.js, Wrangler, npm, or Cargo.
+On macOS, run `herdr-mcp permissions status` before Cloudflare work. If it reports `needs_setup`, grant Full Disk Access once to the stable Herdr-MCP broker, then run `herdr-mcp permissions verify`; do not probe protected paths first or use `sudo`. The broker carries MCP/native Herdr TCC; use `permissions setup --upgrade-broker` only for migration. Linux uses the user-service/process backend. Windows uses a Startup-folder shortcut, user processes and Credential Manager without elevation; it can start installed `herdr server` if needed. Normal install needs no Node.js, Wrangler, npm or Cargo.
 
 ## 4. First Worker: Cloudflare + bootstrap
 

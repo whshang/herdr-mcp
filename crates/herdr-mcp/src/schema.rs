@@ -1,7 +1,7 @@
 use serde_json::{Map, Value};
 use std::env;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -433,28 +433,15 @@ fn run_schema_command() -> Result<Vec<u8>, String> {
 }
 
 fn discover_herdr_binary() -> PathBuf {
-    let explicit = env::var_os("HERDR_BIN").map(PathBuf::from);
-    let home = env::var_os("HOME").map(PathBuf::from);
-    discover_herdr_binary_from(explicit, home, |path| path.is_file())
+    discover_herdr_binary_from(
+        env::var_os("HERDR_BIN").map(PathBuf::from),
+        crate::workstation::find_herdr_executable(),
+    )
 }
 
-fn discover_herdr_binary_from(
-    explicit: Option<PathBuf>,
-    home: Option<PathBuf>,
-    is_file: impl Fn(&Path) -> bool,
-) -> PathBuf {
-    if let Some(explicit) = explicit {
-        return explicit;
-    }
-    let candidates = [
-        home.map(|home| home.join(".local/bin/herdr")),
-        Some(PathBuf::from("/opt/homebrew/bin/herdr")),
-        Some(PathBuf::from("/usr/local/bin/herdr")),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|path| is_file(path))
+fn discover_herdr_binary_from(explicit: Option<PathBuf>, discovered: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or(discovered)
         .unwrap_or_else(|| PathBuf::from("herdr"))
 }
 
@@ -655,24 +642,21 @@ mod tests {
         let explicit = PathBuf::from("/custom/herdr");
         let resolved = discover_herdr_binary_from(
             Some(explicit.clone()),
-            Some(PathBuf::from("/home/test")),
-            |_| false,
+            Some(PathBuf::from("/discovered/herdr")),
         );
         assert_eq!(resolved, explicit);
     }
 
     #[test]
-    fn schema_binary_discovery_finds_user_local_install_without_path() {
-        let home = PathBuf::from("/home/test");
-        let expected = home.join(".local/bin/herdr");
-        let resolved = discover_herdr_binary_from(None, Some(home), |path| path == expected);
+    fn schema_binary_discovery_uses_shared_discovery_after_explicit_override() {
+        let expected = PathBuf::from("/discovered/herdr");
+        let resolved = discover_herdr_binary_from(None, Some(expected.clone()));
         assert_eq!(resolved, expected);
     }
 
     #[test]
-    fn schema_binary_discovery_falls_back_to_path_lookup() {
-        let resolved =
-            discover_herdr_binary_from(None, Some(PathBuf::from("/home/test")), |_| false);
+    fn schema_binary_discovery_falls_back_to_command_name() {
+        let resolved = discover_herdr_binary_from(None, None);
         assert_eq!(resolved, PathBuf::from("herdr"));
     }
 }

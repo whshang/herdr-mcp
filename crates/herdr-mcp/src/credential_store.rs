@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 use sha2::{Digest, Sha256};
 
 pub fn load(service: &str, account: &str) -> Result<String, String> {
@@ -11,10 +11,14 @@ pub fn load(service: &str, account: &str) -> Result<String, String> {
     {
         linux::load(service, account)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::load(service, account)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (service, account);
-        Err("secure device credential storage is currently supported on macOS and Linux".to_owned())
+        Err("secure device credential storage is unsupported on this platform".to_owned())
     }
 }
 
@@ -29,10 +33,14 @@ pub fn store(service: &str, account: &str, secret: &str) -> Result<(), String> {
     {
         linux::store(service, account, secret)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::store(service, account, secret)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (service, account, secret);
-        Err("secure device credential storage is currently supported on macOS and Linux".to_owned())
+        Err("secure device credential storage is unsupported on this platform".to_owned())
     }
 }
 
@@ -46,10 +54,14 @@ pub fn delete(service: &str, account: &str) -> Result<(), String> {
     {
         linux::delete(service, account)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::delete(service, account)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (service, account);
-        Err("secure device credential storage is currently supported on macOS and Linux".to_owned())
+        Err("secure device credential storage is unsupported on this platform".to_owned())
     }
 }
 
@@ -69,13 +81,109 @@ fn validate_secret(secret: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn key_id(service: &str, account: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(service.as_bytes());
     hash.update([0]);
     hash.update(account.as_bytes());
     format!("{:x}", hash.finalize())
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::{key_id, validate_secret};
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
+        CredReadW, CredWriteW,
+    };
+
+    struct CredentialGuard(*mut CREDENTIALW);
+
+    impl Drop for CredentialGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CredFree(self.0.cast()) };
+            }
+        }
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn target_name(service: &str, account: &str) -> Vec<u16> {
+        wide(&format!("Herdr-MCP/{}", key_id(service, account)))
+    }
+
+    pub(super) fn load(service: &str, account: &str) -> Result<String, String> {
+        let target = target_name(service, account);
+        let mut raw = null_mut();
+        let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut raw) };
+        if ok == 0 {
+            return Err(format!(
+                "cannot load Windows device credential: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if raw.is_null() {
+            return Err(
+                "Windows Credential Manager returned an empty credential handle".to_owned(),
+            );
+        }
+        let guard = CredentialGuard(raw);
+        let credential = unsafe { &*guard.0 };
+        let size = credential.CredentialBlobSize as usize;
+        if size == 0 || size > 4096 || credential.CredentialBlob.is_null() {
+            return Err("Windows device credential has an invalid size".to_owned());
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(credential.CredentialBlob, size) };
+        let secret = String::from_utf8(bytes.to_vec())
+            .map_err(|_| "Windows device credential is not valid UTF-8".to_owned())?;
+        validate_secret(&secret)?;
+        Ok(secret)
+    }
+
+    pub(super) fn store(service: &str, account: &str, secret: &str) -> Result<(), String> {
+        validate_secret(secret)?;
+        let mut target = target_name(service, account);
+        let mut username = wide(account);
+        let mut blob = secret.as_bytes().to_vec();
+        let blob_size = u32::try_from(blob.len())
+            .map_err(|_| "Windows device credential is too large".to_owned())?;
+        let credential = CREDENTIALW {
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target.as_mut_ptr(),
+            CredentialBlobSize: blob_size,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            UserName: username.as_mut_ptr(),
+            ..CREDENTIALW::default()
+        };
+        let ok = unsafe { CredWriteW(&credential, 0) };
+        if ok == 0 {
+            return Err(format!(
+                "cannot store Windows device credential: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete(service: &str, account: &str) -> Result<(), String> {
+        let target = target_name(service, account);
+        let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
+        if ok != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+            return Ok(());
+        }
+        Err(format!("cannot delete Windows device credential: {error}"))
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -35,7 +35,21 @@ impl RuntimePaths {
         );
 
         #[cfg(windows)]
-        let herdr_socket = env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from);
+        let herdr_socket = Some(
+            env::var_os("HERDR_SOCKET_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let config_home = env::var_os("XDG_CONFIG_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| env::var_os("APPDATA").map(PathBuf::from))
+                        .or_else(|| {
+                            env::var_os("USERPROFILE")
+                                .map(|path| PathBuf::from(path).join("AppData").join("Roaming"))
+                        })
+                        .unwrap_or_else(|| home.join(".config"));
+                    config_home.join("herdr").join("herdr.sock")
+                }),
+        );
 
         Ok(Self {
             instance,
