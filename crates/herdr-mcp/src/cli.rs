@@ -711,8 +711,7 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             let [request_id] = &args[1..] else {
                 return Err("connector approve requires exactly one approval request id; the 6-digit code is entered interactively".to_owned());
             };
-            if request_id.starts_with('-') || request_id.trim().is_empty() || request_id.len() > 256
-            {
+            if !valid_connector_approval_request_id(request_id) {
                 return Err("connector approve requires a valid approval request id".to_owned());
             }
             Ok(Command::Worker(WorkerCommand::ConnectorApprove {
@@ -723,8 +722,7 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             let [request_id] = &args[1..] else {
                 return Err("connector cancel requires exactly one approval request id".to_owned());
             };
-            if request_id.starts_with('-') || request_id.trim().is_empty() || request_id.len() > 256
-            {
+            if !valid_connector_approval_request_id(request_id) {
                 return Err("connector cancel requires a valid approval request id".to_owned());
             }
             Ok(Command::Worker(WorkerCommand::ConnectorCancel {
@@ -973,6 +971,14 @@ fn parse_automation_create(args: &[String]) -> Result<Command, String> {
         name,
         device,
     }))
+}
+
+fn valid_connector_approval_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= 256
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn validate_connector_id(connector_id: &str) -> Result<(), String> {
@@ -2414,6 +2420,25 @@ mod tests {
                 request_id: "req_abc".to_owned(),
             })
         );
+        let leading_dash_request_id = "--4OKVqQqj6DQtUeZnHCeFI7k5GIZSb3gLyVZu_GmVs";
+        assert_eq!(
+            parse(args(&["connector", "approve", leading_dash_request_id]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorApprove {
+                request_id: leading_dash_request_id.to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&["connector", "cancel", leading_dash_request_id]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorCancel {
+                request_id: leading_dash_request_id.to_owned(),
+            })
+        );
+        assert!(parse(args(&["connector", "approve", "bad/request"])).is_err());
+        assert!(parse(args(&["connector", "cancel", "bad request"])).is_err());
         assert_eq!(
             parse(args(&["connector", "list"])).unwrap().command,
             Command::Worker(WorkerCommand::ConnectorList { include_all: false })
