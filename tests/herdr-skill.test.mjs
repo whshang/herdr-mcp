@@ -87,7 +87,8 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /never escalate to a more powerful tool solely to force a rejected request through/);
     assert.match(r.content, /herdr_git status.*diff.*log.*herdr_exec.*herdr_fs_grep.*compacted/s);
     assert.match(r.content, /counts.*compacted.*summarized `output`/s);
-    assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start` \/ `herdr_exec_read`/);
+    assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start`, not the visible utility pane or a blocking `herdr_exec`/);
+    assert.match(r.content, /herdr_mcp\.exec\.wait/);
     assert.match(r.content, /GitHub Actions artifact downloads.*`herdr_exec_start`/s);
     assert.match(r.content, /destination-file growth.*never start a duplicate transfer/s);
     assert.match(r.content, /herdr_exec_read\(offset=next_offset\)/);
