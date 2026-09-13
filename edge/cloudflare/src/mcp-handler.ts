@@ -15,6 +15,7 @@ import { newRequestId } from "./pending.js";
 import type { DeviceRouteResult } from "./device-directory.js";
 import { extractDeviceIdFromArgs } from "./device-refs.js";
 import { normalizeDeviceId } from "./device-model.js";
+import { sha256Hex } from "./device-crypto.js";
 import type { InternalForwardRequest } from "./workstation-do.js";
 import { discoverFleetControlMethods, invalidFleetControlParam, isFleetControlMethod, type FleetControlMethod } from "./fleet-control.js";
 import {
@@ -33,6 +34,15 @@ export const MCP_SUPPORTED_PROTOCOLS = [
   "2024-11-05",
   "2024-10-07",
 ] as const;
+
+function stableDedupeValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableDedupeValue);
+  if (value === null || typeof value !== "object") return value;
+  const source = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(source).sort()) out[key] = stableDedupeValue(source[key]);
+  return out;
+}
 
 export type JsonRpcId = string | number | null;
 
@@ -1155,6 +1165,19 @@ export async function handleMcp(
           grant_generation: Number(deps.client.grantGeneration),
         }
       : null;
+    const readDedupeKey = opClass === "read"
+      ? `read_${await sha256Hex(JSON.stringify(stableDedupeValue({
+          op: name,
+          args: runtimeArgs,
+          route_device_id: route.device_id ?? null,
+          connector_id: deps.client?.connectorId ?? null,
+          grant_generation: deps.client?.grantGeneration ?? null,
+          auth_source: deps.client?.authSource ?? null,
+          automation_device_id: deps.client?.automationDeviceId ?? null,
+          webchat_control_grants: webchatControlGrants,
+          page_assist_grants: pageAssistGrants,
+        })))}`
+      : undefined;
     const requestedToolTimeoutMs =
       typeof runtimeArgs.timeout_ms === "number" && Number.isFinite(runtimeArgs.timeout_ms)
         ? Math.max(1, runtimeArgs.timeout_ms)
@@ -1175,6 +1198,7 @@ export async function handleMcp(
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
       contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
       idempotencyKey,
+      readDedupeKey,
       ...(route.device_id ? { routeDeviceId: route.device_id } : {}),
       ...(route.execution_fence ? { executionFence: route.execution_fence } : {}),
       ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0 || webchatAuthorization

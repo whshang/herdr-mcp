@@ -1363,3 +1363,32 @@ test("display-name routing remains registry-owned", async () => {
   assert.equal(registryReads, 1);
   assert.equal(d.calls[0].executionFence.revision, 43);
 });
+
+
+test("read tools receive stable short-window dedupe keys while mutations do not", async () => {
+  const d = deps();
+  for (const id of ["dedupe-read-a", "dedupe-read-b"]) {
+    const response = await handleMcp(req(id, "tools/call", {
+      name: "herdr_git",
+      arguments: { root: "/repo", action: "status" },
+    }), "legacy-default", d.value);
+    assert.equal(response.body.result.isError, undefined);
+  }
+  assert.equal(d.calls.length, 2);
+  assert.match(d.calls[0].readDedupeKey, /^read_[0-9a-f]{64}$/);
+  assert.equal(d.calls[1].readDedupeKey, d.calls[0].readDedupeKey);
+
+  const different = await handleMcp(req("dedupe-read-different", "tools/call", {
+    name: "herdr_git",
+    arguments: { root: "/repo", action: "log", max_count: 1 },
+  }), "legacy-default", d.value);
+  assert.equal(different.body.result.isError, undefined);
+  assert.notEqual(d.calls[2].readDedupeKey, d.calls[0].readDedupeKey);
+
+  const mutation = await handleMcp(req("dedupe-mutation", "tools/call", {
+    name: "herdr_fs_write",
+    arguments: { path: "/repo/file.txt", content: "x" },
+  }), "legacy-default", d.value);
+  assert.equal(mutation.body.result.isError, undefined);
+  assert.equal(d.calls[3].readDedupeKey, undefined);
+});

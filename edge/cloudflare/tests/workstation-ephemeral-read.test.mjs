@@ -344,3 +344,197 @@ test("online link drop settles ephemeral reads even when session persist hits wr
   );
   assert.equal(storage.map.get("session") !== undefined, true, "failed put must not clear the prior online session row");
 });
+
+
+test("identical read dedupe keys coalesce in-flight and recent host duplicates", async () => {
+  const { subject, events } = makeSubject();
+  await init(subject, events);
+  const deadlineMs = Date.now() + 30_000;
+  const first = subject.forwardInternal({
+    kind: "request",
+    requestId: "dedupe-read-1",
+    op: "herdr_git",
+    args: { root: "/repo", action: "status" },
+    readDedupeKey: "read_same_fixture",
+    deadlineMs,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = subject.forwardInternal({
+    kind: "request",
+    requestId: "dedupe-read-2",
+    op: "herdr_git",
+    args: { root: "/repo", action: "status" },
+    readDedupeKey: "read_same_fixture",
+    deadlineMs,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    events.filter((event) => event[0] === "send" && event[1].kind === "tool_request").length,
+    1,
+    "an in-flight duplicate read must reuse the original Link request",
+  );
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "dedupe-read-1",
+    result: { ok: true, output: "clean" },
+    served_at_ms: Date.now(),
+  });
+  const [firstResponse, secondResponse] = await Promise.all([first, second]);
+  assert.equal(firstResponse.status, 200);
+  assert.equal(secondResponse.status, 200);
+
+  const thirdResponse = await subject.forwardInternal({
+    kind: "request",
+    requestId: "dedupe-read-3",
+    op: "herdr_git",
+    args: { root: "/repo", action: "status" },
+    readDedupeKey: "read_same_fixture",
+    deadlineMs: Date.now() + 30_000,
+  });
+  assert.equal(thirdResponse.status, 200);
+  assert.equal(
+    events.filter((event) => event[0] === "send" && event[1].kind === "tool_request").length,
+    1,
+    "an immediate settled duplicate read must reuse the recent completion",
+  );
+  assert.deepEqual(events.filter((event) => event[0] !== "send"), [], "read dedupe must stay storage-free");
+});
+
+test("a mutation invalidates recent read dedupe state", async () => {
+  const { subject, events } = makeSubject();
+  await init(subject, events);
+  const readKey = "read_invalidated_by_mutation";
+  const first = subject.forwardInternal({
+    kind: "request",
+    requestId: "invalidate-read-1",
+    op: "herdr_git",
+    args: { root: "/repo", action: "status" },
+    readDedupeKey: readKey,
+    deadlineMs: Date.now() + 30_000,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "invalidate-read-1",
+    result: { ok: true, output: "before" },
+    served_at_ms: Date.now(),
+  });
+  await first;
+
+  const mutation = subject.forwardInternal({
+    kind: "request",
+    requestId: "invalidate-mutation",
+    op: "herdr_prompt",
+    args: { target: "worker", text: "fixture" },
+    idempotencyKey: "invalidate-mutation-idem",
+    deadlineMs: Date.now() + 100,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "invalidate-mutation",
+    result: { ok: true },
+    served_at_ms: Date.now(),
+  });
+  await mutation;
+
+  const afterMutation = subject.forwardInternal({
+    kind: "request",
+    requestId: "invalidate-read-2",
+    op: "herdr_git",
+    args: { root: "/repo", action: "status" },
+    readDedupeKey: readKey,
+    deadlineMs: Date.now() + 30_000,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const sent = events.filter((event) => event[0] === "send" && event[1].kind === "tool_request");
+  assert.deepEqual(
+    sent.map((event) => event[1].request_id),
+    ["invalidate-read-1", "invalidate-mutation", "invalidate-read-2"],
+    "the same read must be delivered again after a mutation boundary",
+  );
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "invalidate-read-2",
+    result: { ok: true, output: "after" },
+    served_at_ms: Date.now(),
+  });
+  assert.equal((await afterMutation).status, 200);
+});
+
+test("a read that settles after a mutation cannot repopulate stale dedupe state", async () => {
+  const { subject, events } = makeSubject();
+  await init(subject, events);
+  const readKey = "read_crossing_mutation";
+  const staleRead = subject.forwardInternal({
+    kind: "request",
+    requestId: "cross-read-1",
+    op: "herdr_git",
+    args: { root: "/repo", action: "status" },
+    readDedupeKey: readKey,
+    deadlineMs: Date.now() + 30_000,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const mutation = subject.forwardInternal({
+    kind: "request",
+    requestId: "cross-mutation",
+    op: "herdr_prompt",
+    args: { target: "worker", text: "fixture" },
+    idempotencyKey: "cross-mutation-idem",
+    deadlineMs: Date.now() + 100,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "cross-mutation",
+    result: { ok: true },
+    served_at_ms: Date.now(),
+  });
+  await mutation;
+
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "cross-read-1",
+    result: { ok: true, output: "stale" },
+    served_at_ms: Date.now(),
+  });
+  await staleRead;
+
+  const freshRead = subject.forwardInternal({
+    kind: "request",
+    requestId: "cross-read-2",
+    op: "herdr_git",
+    args: { root: "/repo", action: "status" },
+    readDedupeKey: readKey,
+    deadlineMs: Date.now() + 30_000,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const sent = events.filter((event) => event[0] === "send" && event[1].kind === "tool_request");
+  assert.deepEqual(
+    sent.map((event) => event[1].request_id),
+    ["cross-read-1", "cross-mutation", "cross-read-2"],
+    "a pre-mutation read settling late must not satisfy a post-mutation duplicate",
+  );
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "cross-read-2",
+    result: { ok: true, output: "fresh" },
+    served_at_ms: Date.now(),
+  });
+  assert.equal((await freshRead).status, 200);
+});
