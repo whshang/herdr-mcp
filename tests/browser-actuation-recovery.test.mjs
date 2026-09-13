@@ -338,6 +338,7 @@ function selfArchiveHarness(overrides = {}) {
     archiveClickThrows: false,
     onArchiveClick: null,
     verifyGate: null,
+    menuGate: null,
     clicks: [],
     ...ctxOverrides,
   };
@@ -369,13 +370,16 @@ function selfArchiveHarness(overrides = {}) {
     const ADAPTER = { name: "chatgpt" };
     const chatGptConversationId = () => ctx.conversationId;
     const isTurnInProgress = () => ctx.turnInProgress;
-    const openChatGptArchiveMenu = async () => (ctx.archiveAvailable
-      ? { click: () => {
-          ctx.clicks.push(Date.now());
-          if (typeof ctx.onArchiveClick === "function") ctx.onArchiveClick();
-          if (ctx.archiveClickThrows) throw new Error("archive click failed after dispatch");
-        } }
-      : null);
+    const openChatGptArchiveMenu = async () => {
+      if (ctx.menuGate) await ctx.menuGate;
+      return ctx.archiveAvailable
+        ? { click: () => {
+            ctx.clicks.push(Date.now());
+            if (typeof ctx.onArchiveClick === "function") ctx.onArchiveClick();
+            if (ctx.archiveClickThrows) throw new Error("archive click failed after dispatch");
+          } }
+        : null;
+    };
     const fetchChatGptConversation = async () => {
       if (ctx.verifyGate) await ctx.verifyGate;
       return ctx.archiveVerifies ? { ok: true, body: { is_archived: true } } : { ok: false };
@@ -602,6 +606,41 @@ test("a same-key re-entry during the in-flight archive poll cannot click again",
   assert.equal(ctx.clicks.length, 1);
   const records = JSON.parse(String(storage.get(SELF_ARCHIVE_KEY)));
   assert.equal(records[0].deliveryAttempted, true, "the claim survives same-key re-entry");
+});
+
+test("two concurrent same-key calls cannot both click the archive", { timeout: 3000 }, async () => {
+  let releaseMenu;
+  const menuGate = new Promise((resolve) => { releaseMenu = resolve; });
+  const { ctx, api } = selfArchiveHarness({ archiveVerifies: false, menuGate });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-concurrent-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  ctx.turnInProgress = true;
+  await api.performChatGptSessionArchive(command, evidence());
+  ctx.turnInProgress = false;
+
+  // Both calls pass the pre-menu guard, then park on the gated menu await.
+  const draining = api.drain();
+  const direct = api.performChatGptSessionArchive(command, evidence());
+  await flushUntil(() => ctx.clicks.length > 0, 8);
+  assert.equal(ctx.clicks.length, 0, "neither call may click while the menu is unresolved");
+
+  let directResult;
+  try {
+    releaseMenu();
+    directResult = await withTimeout(direct, 1000, "concurrent direct call");
+    await withTimeout(draining, 1000, "concurrent drain");
+  } finally {
+    releaseMenu();
+  }
+  assert.equal(ctx.clicks.length, 1, "exactly one concurrent same-key call may click");
+  assert.equal(directResult.command_accepted, true);
+  assert.notEqual(directResult.rejected, true);
+  assert.equal(directResult.lifecycle_observed, false);
 });
 
 test("an unpersistable delivery claim suppresses the archive click", { timeout: 3000 }, async () => {

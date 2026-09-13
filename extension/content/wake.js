@@ -1504,14 +1504,16 @@ const H2W_CONTENT_VERSION = "0.1.91";
     ));
   }
 
-  // Claims the one-shot delivery for an intent and returns whether the claim is
-  // durable. The claim must be persisted and verified before the archive click
-  // is dispatched, so an unpersistable claim can never mutate the provider.
+  // Claims the one-shot delivery for an intent and returns whether this call
+  // newly claimed it. A claim must be persisted and verified before the archive
+  // click is dispatched, and an already-claimed key returns false so a
+  // concurrent same-key call cannot click a second time.
   function markPendingSelfArchiveClicked(idempotencyKey, sessionRef, generation, conversationId) {
     if (!idempotencyKey) return false;
     const list = readPendingSelfArchives();
     const existing = list.find((item) => item.idempotencyKey === idempotencyKey);
     if (existing) {
+      if (existing.deliveryAttempted === true) return false;
       existing.sessionRef = sessionRef;
       existing.generation = generation;
       existing.conversationId = conversationId;
@@ -1560,7 +1562,13 @@ const H2W_CONTENT_VERSION = "0.1.91";
     // click/poll window cannot replay it and an unpersistable claim never
     // mutates the provider.
     if (!markPendingSelfArchiveClicked(idempotencyKey, identity?.sessionRef, identity?.generation, conversationId)) {
-      return { outcome: "rejected", delivered: false };
+      // Synchronous re-check after the menu await: a concurrent same-key call
+      // may have claimed the delivery while this call waited. An already-claimed
+      // key stays uncertain/delivered; otherwise the claim could not be
+      // persisted and this call must fail closed without mutating.
+      return pendingSelfArchiveAlreadyClicked(idempotencyKey)
+        ? { outcome: "uncertain", delivered: true }
+        : { outcome: "rejected", delivered: false };
     }
     try {
       archive.click();
