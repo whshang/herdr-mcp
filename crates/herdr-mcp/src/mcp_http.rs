@@ -5,7 +5,8 @@ use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{
     self, BrowserActuator, BrowserCallerAuthorization, BrowserCallerGrant,
-    BrowserMutationAdmission, BrowserPostconditionEvidence, PageAssistCallerGrant, RuntimeContext,
+    BrowserMutationAdmission, BrowserPostconditionEvidence, BrowserSourceTurnRegistry,
+    PageAssistCallerGrant, RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -449,6 +450,7 @@ struct AppState {
     browser_actuation: BrowserActuationBroker,
     browser_mutation_gate: Arc<RwLock<()>>,
     browser_mutation_admission: Arc<BrowserMutationAdmission>,
+    browser_source_turns: Arc<BrowserSourceTurnRegistry>,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -506,6 +508,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
+            browser_source_turns: Arc::new(BrowserSourceTurnRegistry::default()),
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -634,6 +637,9 @@ async fn post_extension_browser_registry(State(state): State<AppState>, body: By
         "endpoint.consent" => extension_browser_endpoint_consent(&state, &payload, observed_at),
         "provider.observe" => extension_browser_provider_observe(&state, &payload, observed_at),
         "resource.observe" => extension_browser_resource_observe(&state, &payload, observed_at),
+        "source_turn.observe" => {
+            extension_browser_source_turn_observe(&state, &payload, observed_at)
+        }
         "dispatch.result" => extension_browser_dispatch_result(&state, &payload, observed_at),
         _ => Err("browser_registry_operation_unknown".to_owned()),
     };
@@ -1024,6 +1030,52 @@ fn extension_browser_resource_observe(
             "state": reservation.state,
             "session_ref": reservation.session_ref,
         })),
+    }))
+}
+
+/// Trusted Extension IPC: bind one accepted ChatGPT user turn to the exact
+/// registered session for a short in-memory window. This identity is used only
+/// by current-conversation mutations and expires automatically.
+fn extension_browser_source_turn_observe(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(
+        payload,
+        &["operation", "canonical_url", "user_text", "observed_at"],
+    )?;
+    let canonical_url = browser_registry_string(payload, "canonical_url", 2048)?;
+    let user_text = browser_registry_string(payload, "user_text", MAX_BROWSER_RESULT_TEXT_BYTES)?;
+    if !canonical_url.starts_with("https://chatgpt.com/") {
+        return Err("browser_canonical_url_invalid".to_owned());
+    }
+    let (session_ref, expected_generation) = {
+        let store = state
+            .state_store
+            .lock()
+            .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+        let session_ref = store
+            .browser_session_ref_for_canonical_url(canonical_url)?
+            .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+        let session = store
+            .browser_resource(&session_ref)?
+            .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+        if session.kind != "session" || session.provider != "chatgpt" {
+            return Err("browser_source_session_not_found".to_owned());
+        }
+        (session_ref, session.observation_generation)
+    };
+    state.browser_source_turns.observe(
+        &session_ref,
+        expected_generation,
+        user_text,
+        observed_at,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "session_ref": session_ref,
+        "expected_generation": expected_generation,
     }))
 }
 
@@ -2373,6 +2425,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
+            browser_source_turns: &blocking_state.browser_source_turns,
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -2992,6 +3045,7 @@ mod tests {
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
+            browser_source_turns: Arc::new(BrowserSourceTurnRegistry::default()),
         }
     }
 
@@ -3228,6 +3282,7 @@ mod tests {
         extension_state.trusted_extension_ipc = true;
         extension_state.local_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
         let store = extension_state.state_store.clone();
+        let source_turns = extension_state.browser_source_turns.clone();
         let app = candidate_router(extension_state);
 
         let response = app
@@ -3371,6 +3426,25 @@ mod tests {
             "https://chatgpt.com/c/session-http-locator-1"
         );
         assert_eq!(locator.observation_generation, 1);
+
+        let source_turn = json!({
+            "operation": "source_turn.observe",
+            "canonical_url": "https://chatgpt.com/c/session-http-locator-1",
+            "user_text": "归档当前对话",
+            "observed_at": 1005
+        });
+        let response = app.clone().oneshot(request(source_turn)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let source_result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(source_result["ok"], true);
+        assert_eq!(source_result["session_ref"], session_ref);
+        assert_eq!(source_result["expected_generation"], 1);
+        assert_eq!(
+            source_turns.resolve("归档当前对话", 1006).unwrap(),
+            (session_ref.to_owned(), 1)
+        );
+
         let materialized = store
             .lock()
             .unwrap()

@@ -6399,6 +6399,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "continuity-fields-incomplete" });
         return;
       }
+      try {
+        await postBrowserRegistry({
+          operation: "source_turn.observe",
+          canonical_url: convKey,
+          user_text: userText,
+          observed_at: msg?.startedAt || Date.now(),
+        });
+      } catch (error) {
+        callLog("current source turn observe failed:", error?.message || String(error));
+      }
       let session = [];
       try {
         const bindings = await loadBindings();
