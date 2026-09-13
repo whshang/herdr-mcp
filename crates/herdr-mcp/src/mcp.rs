@@ -2516,6 +2516,155 @@ fn browser_session_create_success(
     })
 }
 
+fn browser_session_create_reconcile_evidence(
+    actuator: &dyn BrowserActuator,
+    reservation_ref: &str,
+    expected_generation: i64,
+) -> Result<Option<BrowserPostconditionEvidence>, String> {
+    const ATTEMPTS: usize = 6;
+    const INTERVAL_MS: u64 = 50;
+
+    for attempt in 0..ATTEMPTS {
+        if let Some(evidence) = actuator.reconcile_dispatch(reservation_ref, expected_generation)? {
+            return Ok(Some(evidence));
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
+        }
+    }
+    Ok(None)
+}
+
+fn browser_session_create_reconcile_uncertain(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+    expected_generation: i64,
+    replayed: bool,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
+) -> Value {
+    {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match promote_materialized_browser_session_delivery(
+            &mut guard,
+            reservation,
+            expected_generation,
+        ) {
+            Ok(Some(promoted)) => {
+                return browser_session_create_success(
+                    &mut guard,
+                    &promoted.reservation_ref,
+                    params,
+                    replayed,
+                    true,
+                    caller_authorization,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => return browser_store_error(error),
+        }
+    }
+
+    let Some(actuator) = actuator else {
+        return json!({
+            "ok": false,
+            "code": "uncertain",
+            "reservation_ref": reservation.reservation_ref,
+            "reservation_state": reservation.state,
+            "delivery_state": BrowserDeliveryState::Uncertain.as_str(),
+            "replayed": replayed,
+            "reconciled": false,
+        });
+    };
+    let evidence = match browser_session_create_reconcile_evidence(
+        actuator,
+        &reservation.reservation_ref,
+        expected_generation,
+    ) {
+        Ok(Some(evidence)) => evidence,
+        Ok(None) => {
+            return json!({
+                "ok": false,
+                "code": "uncertain",
+                "reservation_ref": reservation.reservation_ref,
+                "reservation_state": reservation.state,
+                "delivery_state": BrowserDeliveryState::Uncertain.as_str(),
+                "replayed": replayed,
+                "reconciled": false,
+            });
+        }
+        Err(error) => return browser_store_error(error),
+    };
+    let delivery_state = match browser_delivery_state_from_postcondition(
+        BrowserOperation::SessionCreate,
+        params,
+        expected_generation,
+        &evidence,
+    ) {
+        Ok(state) => state,
+        Err(error) => return browser_store_error(error),
+    };
+    let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
+        Ok(value) => value,
+        Err(error) => return browser_store_error(error),
+    };
+    let Ok(mut guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let settled = match guard.update_browser_session_reservation_delivery(
+        &reservation.reservation_ref,
+        expected_generation,
+        delivery_state,
+        accepted_user_message_ref.as_deref(),
+        browser_epoch_ms(),
+    ) {
+        Ok(record) => record,
+        Err(error) => return browser_store_error(error),
+    };
+    if delivery_state == BrowserDeliveryState::Applied {
+        return browser_session_create_success(
+            &mut guard,
+            &settled.reservation_ref,
+            params,
+            replayed,
+            true,
+            caller_authorization,
+        );
+    }
+    if delivery_state == BrowserDeliveryState::Uncertain {
+        match promote_materialized_browser_session_delivery(
+            &mut guard,
+            &settled,
+            expected_generation,
+        ) {
+            Ok(Some(promoted)) => {
+                return browser_session_create_success(
+                    &mut guard,
+                    &promoted.reservation_ref,
+                    params,
+                    replayed,
+                    true,
+                    caller_authorization,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => return browser_store_error(error),
+        }
+    }
+    json!({
+        "ok": false,
+        "code": delivery_state.as_str(),
+        "reservation_ref": settled.reservation_ref,
+        "reservation_state": settled.state,
+        "delivery_state": settled.delivery_state,
+        "replayed": replayed,
+        "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
+    })
+}
+
 fn browser_session_create_params_from_source(
     store: &StateStore,
     params: &Value,
@@ -2872,120 +3021,15 @@ fn browser_session_create(
         );
     }
     if current_delivery == BrowserDeliveryState::Uncertain {
-        {
-            let Ok(mut guard) = store.lock() else {
-                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
-            };
-            match promote_materialized_browser_session_delivery(
-                &mut guard,
-                &reservation,
-                expected_generation,
-            ) {
-                Ok(Some(promoted)) => {
-                    return browser_session_create_success(
-                        &mut guard,
-                        &promoted.reservation_ref,
-                        params,
-                        true,
-                        true,
-                        caller_authorization,
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => return browser_store_error(error),
-            }
-        }
-        let Some(actuator) = actuator else {
-            return json!({
-                "ok": false,
-                "code": "uncertain",
-                "reservation_ref": reservation.reservation_ref,
-                "reservation_state": reservation.state,
-                "delivery_state": current_delivery.as_str(),
-                "replayed": true,
-            });
-        };
-        let evidence =
-            match actuator.reconcile_dispatch(&reservation.reservation_ref, expected_generation) {
-                Ok(Some(evidence)) => evidence,
-                Ok(None) => {
-                    return json!({
-                        "ok": false,
-                        "code": "uncertain",
-                        "reservation_ref": reservation.reservation_ref,
-                        "reservation_state": reservation.state,
-                        "delivery_state": current_delivery.as_str(),
-                        "replayed": true,
-                    });
-                }
-                Err(error) => return browser_store_error(error),
-            };
-        let delivery_state = match browser_delivery_state_from_postcondition(
-            BrowserOperation::SessionCreate,
+        return browser_session_create_reconcile_uncertain(
+            store,
+            &reservation,
             params,
+            actuator,
             expected_generation,
-            &evidence,
-        ) {
-            Ok(state) => state,
-            Err(error) => return browser_store_error(error),
-        };
-        let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence)
-        {
-            Ok(value) => value,
-            Err(error) => return browser_store_error(error),
-        };
-        let Ok(mut guard) = store.lock() else {
-            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
-        };
-        let settled = match guard.update_browser_session_reservation_delivery(
-            &reservation.reservation_ref,
-            expected_generation,
-            delivery_state,
-            accepted_user_message_ref.as_deref(),
-            browser_epoch_ms(),
-        ) {
-            Ok(record) => record,
-            Err(error) => return browser_store_error(error),
-        };
-        if delivery_state == BrowserDeliveryState::Applied {
-            return browser_session_create_success(
-                &mut guard,
-                &settled.reservation_ref,
-                params,
-                true,
-                true,
-                caller_authorization,
-            );
-        }
-        if delivery_state == BrowserDeliveryState::Uncertain {
-            match promote_materialized_browser_session_delivery(
-                &mut guard,
-                &settled,
-                expected_generation,
-            ) {
-                Ok(Some(promoted)) => {
-                    return browser_session_create_success(
-                        &mut guard,
-                        &promoted.reservation_ref,
-                        params,
-                        true,
-                        true,
-                        caller_authorization,
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => return browser_store_error(error),
-            }
-        }
-        return json!({
-            "ok": false,
-            "code": delivery_state.as_str(),
-            "reservation_ref": settled.reservation_ref,
-            "reservation_state": settled.state,
-            "delivery_state": settled.delivery_state,
-            "replayed": true,
-            "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
-        });
+            true,
+            caller_authorization,
+        );
     }
     if current_delivery != BrowserDeliveryState::NotApplied {
         return json!({
@@ -3069,24 +3113,16 @@ fn browser_session_create(
         );
     }
     if delivery_state == BrowserDeliveryState::Uncertain {
-        match promote_materialized_browser_session_delivery(
-            &mut guard,
+        drop(guard);
+        return browser_session_create_reconcile_uncertain(
+            store,
             &updated,
+            params,
+            actuator,
             expected_generation,
-        ) {
-            Ok(Some(promoted)) => {
-                return browser_session_create_success(
-                    &mut guard,
-                    &promoted.reservation_ref,
-                    params,
-                    replayed,
-                    true,
-                    caller_authorization,
-                );
-            }
-            Ok(None) => {}
-            Err(error) => return browser_store_error(error),
-        }
+            replayed,
+            caller_authorization,
+        );
     }
     json!({
         "ok": false,
@@ -4547,7 +4583,14 @@ fn browser_registry_call_with_grants(
                 Ok(resources) => json!({
                     "ok": true,
                     "resources": resources.into_iter().map(browser_resource_json).collect::<Vec<_>>(),
+                    // `actuation_available` is retained unchanged for shape
+                    // compatibility with older callers. `list` never evaluates
+                    // the actuation intersection, so its legacy `false` is not an
+                    // endpoint/consent health signal. `actuation_evaluated` plus
+                    // `actuation_reason` make that non-evaluation explicit.
                     "actuation_available": false,
+                    "actuation_evaluated": false,
+                    "actuation_reason": "not_evaluated_by_list",
                 }),
                 Err(error) => browser_store_error(error),
             }
@@ -6026,6 +6069,8 @@ mod tests {
         );
         assert_eq!(listed_res["ok"], true);
         assert_eq!(listed_res["actuation_available"], false);
+        assert_eq!(listed_res["actuation_evaluated"], false);
+        assert_eq!(listed_res["actuation_reason"], "not_evaluated_by_list");
 
         let injected = browser_registry_call(
             &store,
@@ -8160,6 +8205,9 @@ mod tests {
             reconcile_calls: AtomicUsize,
             delayed: bool,
             materialized_but_partial: bool,
+            // Number of leading reconcile polls that observe no evidence yet,
+            // simulating provider readback landing after the first create call.
+            reconcile_pending_polls: usize,
         }
 
         impl SessionCreateActuator {
@@ -8274,7 +8322,10 @@ mod tests {
                 expected_generation: i64,
             ) -> Result<Option<BrowserPostconditionEvidence>, String> {
                 assert!(dispatch_id.starts_with("bsr_"));
-                self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+                let poll = self.reconcile_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if poll <= self.reconcile_pending_polls {
+                    return Ok(None);
+                }
                 Ok(Some(Self::applied_evidence(expected_generation)))
             }
         }
@@ -8381,6 +8432,7 @@ mod tests {
             reconcile_calls: AtomicUsize::new(0),
             delayed: false,
             materialized_but_partial: false,
+            reconcile_pending_polls: 0,
         };
         let immediate_params = json!({
             "endpoint_ref": endpoint_ref,
@@ -8419,6 +8471,7 @@ mod tests {
             reconcile_calls: AtomicUsize::new(0),
             delayed: false,
             materialized_but_partial: true,
+            reconcile_pending_polls: 0,
         };
         let materialized_but_partial_params = json!({
             "endpoint_ref": endpoint_ref,
@@ -8525,6 +8578,9 @@ mod tests {
             reconcile_calls: AtomicUsize::new(0),
             delayed: true,
             materialized_but_partial: false,
+            // Provider readback is late: the first reconcile poll is empty and
+            // the second one returns applied evidence within the same call.
+            reconcile_pending_polls: 1,
         };
         let delayed_params = json!({
             "endpoint_ref": endpoint_ref,
@@ -8535,28 +8591,33 @@ mod tests {
             "expected_generation": 7,
             "idempotency_key": "session-create-delayed-1"
         });
-        let uncertain = browser_operation_call_with_grant(
+        let settled = browser_operation_call_with_grant(
             &store,
             "herdr_mcp.browser_session.create",
             &delayed_params,
             true,
             Some(&delayed),
         );
-        assert_eq!(uncertain["ok"], false);
-        assert_eq!(uncertain["delivery_state"], "uncertain");
+        assert_eq!(settled["ok"], true);
+        assert_eq!(settled["delivery_state"], "applied");
+        assert_eq!(settled["replayed"], false);
+        assert_eq!(settled["reconciled"], true);
+        // One actuation; the late readback settles this same call via bounded
+        // reconcile polling instead of forcing a second create mutation.
         assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
-        let reconciled = browser_operation_call_with_grant(
+        assert_eq!(delayed.reconcile_calls.load(Ordering::SeqCst), 2);
+        let replayed = browser_operation_call_with_grant(
             &store,
             "herdr_mcp.browser_session.create",
             &delayed_params,
             true,
             Some(&delayed),
         );
-        assert_eq!(reconciled["ok"], true);
-        assert_eq!(reconciled["replayed"], true);
-        assert_eq!(reconciled["reconciled"], true);
+        assert_eq!(replayed["ok"], true);
+        assert_eq!(replayed["replayed"], true);
+        assert_eq!(replayed["reconciled"], false);
         assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(delayed.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delayed.reconcile_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
