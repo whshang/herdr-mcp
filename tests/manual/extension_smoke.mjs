@@ -470,6 +470,16 @@ ok(
   "manual handoff has one current-conversation UI path in the HUD and reuses the existing safe handoff internals",
 );
 ok(
+  backgroundSource.includes('method: "herdr_mcp.browser_handoff.prepare"')
+    && backgroundSource.includes("canonical_handoff: canonicalHandoff?.handoff || null")
+    && backgroundSource.includes('!continuityId && convInfo.site !== "chatgpt"')
+    && wakeSource.includes('handoffStatus === "failed"')
+    && wakeSource.includes("hudCache?.handoff?.copy_prompt")
+    && wakeSource.includes('hudText("handoff_copy_prompt")')
+    && wakeSource.includes('hudCache?.handoff?.status === "failed"'),
+  "ChatGPT handoff reuses one canonical prepared prompt and exposes Copy Prompt only after confirmed failure, not uncertain delivery",
+);
+ok(
   backgroundSource.includes("HANDOFF_FALLBACK_ALARM_PREFIX")
     && backgroundSource.includes("handleTimedHandoffSummaryFallback")
     && backgroundSource.includes('summary_source: "llm_fallback"')
@@ -777,7 +787,7 @@ ok([enLocale, zhLocale, jaLocale].every((locale) => Boolean(locale.hud_judge_tur
   "manual LLM decision has localized in-progress guidance");
 ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hud_interval" in zhLocale),
   "zh HUD removes legacy drawer, binding, and timing copy while handoff stays a compact conversation action");
-ok(zhLocale.cc_page_handoff === "手动接力"
+ok(zhLocale.cc_page_handoff === "接力"
     && zhLocale.cc_brand === "Herdr"
     && zhLocale.cc_stats === "{working} 运行"
     && zhLocale.cc_workspace_offline_bound.includes("离线")
@@ -911,13 +921,13 @@ ok(backgroundSource.includes('experimentalZAiEnabled: false')
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation is folded into effective Project automation");
-ok(wakeDocEn.includes("The HUD exposes Continue / Check Herdr / LLM decide plus Manual handoff")
-    && wakeDocZh.includes("HUD 提供 `继续 / 查 Herdr / LLM 判断`")
-    && wakeDocEn.includes("calls `continuity.resume` directly")
-    && wakeDocEn.includes("it no longer invokes a fallback LLM")
-    && wakeDocZh.includes("直接调用 `continuity.resume`")
-    && wakeDocZh.includes("不再调用 fallback LLM"),
-  "Wake docs unify manual URL and HUD handoff on durable continuity without ChatGPT summary fallback");
+ok(wakeDocEn.includes("The HUD exposes Continue / Check Herdr / LLM decide plus Handoff")
+    && wakeDocZh.includes("HUD 提供 `继续 / 查 Herdr / LLM 判断` 三个页面级推进动作和“接力”")
+    && wakeDocEn.includes("herdr_mcp.browser_handoff.prepare")
+    && wakeDocEn.includes("manual_delivery.copy_prompt")
+    && wakeDocZh.includes("herdr_mcp.browser_handoff.prepare")
+    && wakeDocZh.includes("manual_delivery.copy_prompt"),
+  "Wake docs unify automatic and Copy Prompt delivery on one durable canonical handoff package");
 const actionClickStart = backgroundSource.indexOf("chrome.action.onClicked.addListener");
 const actionClickEnd = actionClickStart >= 0 ? backgroundSource.indexOf("void rebuildStreams();", actionClickStart) : -1;
 const actionClickBlock = actionClickStart >= 0 && actionClickEnd > actionClickStart

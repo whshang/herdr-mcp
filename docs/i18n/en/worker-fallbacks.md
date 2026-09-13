@@ -34,6 +34,24 @@ The rule is simple:
 
 > Do deterministic work directly. Delegate work that benefits from independent reasoning.
 
+There is one reliability exception: a WebChat host can reject a legitimate Herdr call before it reaches the MCP server. If the rejection contains none of Herdr's normal execution evidence (`op_id`, `session_id`, `backend`, `pane_id`, `exit_code`, `device_id`), classify it as **pre-delivery**. After the bounded direct retry, an existing local Agent may execute the same user-authorized objective when that objective is suitable for autonomous local work.
+
+This fallback changes the execution subject, not the security boundary:
+
+```text
+direct Herdr tool
+  ↓ host rejects before delivery
+same call: one bounded retry
+  ↓ host rejects before delivery again
+existing local Agent via herdr_prompt
+  ↓
+Agent performs the local workflow
+  ↓
+planner verifies target state through the safest available read path
+```
+
+Send the Agent a high-level task contract: desired outcome, allowed scope, relevant project/context, verification criteria, and no further delegation. Do not paste, encode, obfuscate, or mechanically rewrite the rejected shell/API payload merely to get it past the host filter. For a mutation, use this fallback only when the original rejection proves pre-delivery, and keep every existing authorization or confirmation requirement unchanged. If `herdr_prompt` is also rejected before Herdr delivery, stop and report the host-side barrier; do not continue through stronger tools or alternate encodings.
+
 ## Recommended worker order
 
 | Priority | Worker type | Typical entry | Good fit |
@@ -262,6 +280,12 @@ Inspect
   ↓
 Can deterministic tools do it?
   ├─ yes → fs/git/exec
+  │          ↓ host-side pre-delivery rejection
+  │       one bounded identical retry
+  │          ↓ rejected again
+  │       suitable existing local Agent?
+  │          ├─ yes → herdr_prompt → verify target state
+  │          └─ no  → report host-side block
   └─ no
        ↓
    define one narrow worker task

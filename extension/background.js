@@ -23,7 +23,7 @@ import {
   newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
 import {
-  CONTINUITY_JOURNAL_STORAGE_KEY, buildContinuitySeed, turnFingerprint,
+  CONTINUITY_JOURNAL_STORAGE_KEY, turnFingerprint,
 } from "./continuity-journal.js";
 import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
@@ -361,7 +361,7 @@ function hudLabels() {
     "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge",
     "manual_continue_hint", "manual_status_hint", "manual_judge_hint",
     "manual_disabled_auto", "manual_disabled_busy",
-    "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_failed_source_preserved", "handoff_llm_required",
+    "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_failed_source_preserved", "handoff_llm_required", "handoff_copy_prompt", "handoff_copy_prompt_hint", "handoff_prompt_copied", "handoff_prompt_copy_failed",
     "handoff_blocked_unbound", "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
@@ -1837,6 +1837,24 @@ async function postBrowserDispatchResult({ provider, session_ref, expected_gener
   });
 }
 
+function browserProviderCapabilities(provider) {
+  const operations = provider === "chatgpt"
+    ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create"]
+    : ["composer.submit", "generation.status", "generation.stop", "session.inspect"];
+  return {
+    schema_version: 1,
+    operations,
+    input_modalities: ["text"],
+    output_modalities: ["text"],
+    limits: {
+      attachment_count: { status: "known", max: 0, authority: "browser_control_v1" },
+      provider_message_chars: { status: "unknown", authority: "provider" },
+      provider_response_timeout_ms: { status: "unknown", authority: "provider" },
+      provider_model_reasoning_combinations: { status: "unknown", authority: "provider" },
+    },
+  };
+}
+
 async function observeBrowserConversation({
   provider,
   tabId,
@@ -1859,9 +1877,7 @@ async function observeBrowserConversation({
     provider,
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
-    capabilities: { operations: provider === "chatgpt"
-      ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create"]
-      : ["composer.submit", "generation.status", "generation.stop", "session.inspect"] },
+    capabilities: browserProviderCapabilities(provider),
     observed_at: Date.now(),
   });
   let accountLaunchUrl = null;
@@ -2268,6 +2284,33 @@ async function durableChainForConversation(conversationIdRaw) {
   }
 }
 
+async function prepareCanonicalBrowserHandoff({ transferId, continuityId, sourceUrl } = {}) {
+  const params = {
+    continuity_id: String(continuityId || "").trim(),
+    source_url: String(sourceUrl || "").trim(),
+    handoff_id: String(transferId || "").trim(),
+  };
+  const call = await jsonBridgeRpc("tools/call", {
+    name: "herdr_call",
+    arguments: {
+      method: "herdr_mcp.browser_handoff.prepare",
+      params: JSON.stringify(params),
+    },
+  }, 10_000);
+  if (!call?.ok) return { ok: false, error: call?.error || "canonical_handoff_unavailable" };
+  const content = Array.isArray(call.result?.content) ? call.result.content : [];
+  const text = content
+    .filter((item) => item?.type === "text")
+    .map((item) => String(item.text || ""))
+    .join("\n");
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch (_) {}
+  if (!parsed?.ok || !parsed?.handoff?.message) {
+    return { ok: false, error: parsed?.code || parsed?.error || "canonical_handoff_unavailable" };
+  }
+  return parsed;
+}
+
 function latestTransferForConversation(transfers, convKey) {
   let best = null;
   for (const row of Object.values(transfers || {})) {
@@ -2336,6 +2379,7 @@ function handoffView(row, convKey = null) {
     error: row.error || null,
     summary_source: row.summary_source || null,
     fallback_reason: row.fallback_reason || null,
+    copy_prompt: row.canonical_handoff?.message || null,
     can_resume: canResume,
     age_ms: ageMs,
     created_at: row.created_at || null,
@@ -4533,8 +4577,21 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
       return { ok: false, error: "local_runtime_unavailable", reason: runtimeGate.reason };
     }
   }
+  let canonicalHandoff = transfer?.canonical_handoff || null;
+  if (durableAvailable && !canonicalHandoff?.message) {
+    const prepared = await prepareCanonicalBrowserHandoff({
+      transferId,
+      continuityId: transfer.continuity_id,
+      sourceUrl: transfer.source_url,
+    });
+    if (!prepared?.ok) {
+      return { ok: false, error: prepared?.error || "canonical_handoff_unavailable" };
+    }
+    canonicalHandoff = prepared.handoff;
+    await markTransfer(transferId, { canonical_handoff: canonicalHandoff });
+  }
   const seed = durableAvailable
-    ? buildContinuitySeed({ transferId, continuityId: transfer.continuity_id, sourceUrl: transfer.source_url })
+    ? canonicalHandoff.message
     : buildHandoffSeed({
         transferId,
         packet: transfer.handoff_text,
@@ -5014,10 +5071,26 @@ async function startHandoffForTab(tabId, trigger = "manual") {
       durable = resolved;
     }
   }
-  if (!continuityId) continuityId = newContinuityId(now);
+  if (!continuityId && convInfo.site !== "chatgpt") continuityId = newContinuityId(now);
   const durableAvailable = Boolean(durable?.durable && durable?.turn_count > 0);
   if (convInfo.site === "chatgpt" && !durableAvailable) {
     return { ok: false, error: "continuity_unavailable", source_preserved: true, source_url: liveInfo?.url || null };
+  }
+  let canonicalHandoff = null;
+  if (convInfo.site === "chatgpt" && durableAvailable) {
+    canonicalHandoff = await prepareCanonicalBrowserHandoff({
+      transferId,
+      continuityId,
+      sourceUrl: liveInfo?.url,
+    });
+    if (!canonicalHandoff?.ok) {
+      return {
+        ok: false,
+        error: canonicalHandoff?.error || "canonical_handoff_unavailable",
+        source_preserved: true,
+        source_url: liveInfo?.url || null,
+      };
+    }
   }
   let sourceAssistantFp = null;
   let sourceSnapshot = null;
@@ -5047,6 +5120,7 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     source_automation_scope: convInfo.project_id ? "project" : "conversation",
     source_automation_enabled: sourceAutomation.enabled === true,
     handoff_text: null,
+    canonical_handoff: canonicalHandoff?.handoff || null,
     summary_source: durableAvailable ? "continuity_journal" : null,
     fallback_reason: null,
     target_tab_id: null,
