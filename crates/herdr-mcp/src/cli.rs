@@ -25,6 +25,9 @@ pub enum Command {
         refresh: bool,
         probe: bool,
     },
+    ProfileCheck {
+        file: String,
+    },
     Config(ConfigCommand),
     Instance(InstanceCommand),
     Qualification(QualificationCommand),
@@ -231,6 +234,8 @@ pub enum ServiceCommand {
 pub enum UpdateCommand {
     Check { manifest_url: Option<String> },
     Apply { manifest_url: Option<String> },
+    MajorApply,
+    MajorRollback,
     Auto,
     Status,
     Worker { job_id: String },
@@ -322,6 +327,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "permissions" => parse_permissions(&args[1..]),
         "herdr-supervisor" => parse_herdr_supervisor(&args[1..]),
         "scan" => parse_scan(&args[1..]),
+        "profile" => parse_profile(&args[1..]),
         "rollback" => no_extra(args, Command::Service(ServiceCommand::Rollback)),
         "uninstall" => no_extra(args, Command::Uninstall),
         "reinstall" => no_extra(args, Command::Reinstall),
@@ -1243,6 +1249,18 @@ fn parse_scan(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn parse_profile(args: &[String]) -> Result<Command, String> {
+    match args {
+        [subcommand, flag, file] if subcommand == "check" && flag == "--file" => {
+            Ok(Command::ProfileCheck { file: file.clone() })
+        }
+        [] => Err("profile requires check --file <profile.json>".to_owned()),
+        [subcommand, ..] => Err(format!(
+            "invalid profile command or arguments for '{subcommand}'"
+        )),
+    }
+}
+
 fn parse_dev(args: &[String]) -> Result<Command, String> {
     if args.is_empty() {
         return Ok(Command::Dev(DevCommand::Status));
@@ -1425,6 +1443,12 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 manifest_url: Some(value.clone()),
             }))
         }
+        [subcommand] if subcommand == "major-apply" => {
+            Ok(Command::Update(UpdateCommand::MajorApply))
+        }
+        [subcommand] if subcommand == "major-rollback" => {
+            Ok(Command::Update(UpdateCommand::MajorRollback))
+        }
         [subcommand] if subcommand == "auto" => Ok(Command::Update(UpdateCommand::Auto)),
         [subcommand] if subcommand == "status" => Ok(Command::Update(UpdateCommand::Status)),
         [subcommand, flag, value] if subcommand == "worker" && flag == "--job" => {
@@ -1529,6 +1553,7 @@ User path:\n\
   herdr-mcp doctor  (exit 0 = no known failure in probed layers; E2E readiness is DOCTOR_JSON.overall)\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
+  herdr-mcp profile check --file <profile.json>  (read-only desired-vs-actual workstation drift)\n\
   herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
   herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
@@ -1547,7 +1572,7 @@ User path:\n\
   herdr-mcp automation list\n\
   herdr-mcp automation rotate <client-id> --confirm\n\
   herdr-mcp automation revoke <client-id> --confirm\n\
-  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
+  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|major-apply|major-rollback|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback  (macOS product rollback; Linux service rollback is not exposed)\n\
   herdr-mcp reinstall  (macOS product lifecycle; Linux repair uses herdr-mcp install)\n\
@@ -1748,6 +1773,14 @@ mod tests {
                 json: true,
                 refresh: false,
                 probe: true
+            }
+        );
+        assert_eq!(
+            parse(args(&["profile", "check", "--file", "/tmp/profile.json"]))
+                .unwrap()
+                .command,
+            Command::ProfileCheck {
+                file: "/tmp/profile.json".to_owned()
             }
         );
         assert_eq!(
@@ -2084,6 +2117,14 @@ mod tests {
         assert_eq!(
             parse(args(&["update", "auto"])).unwrap().command,
             Command::Update(UpdateCommand::Auto)
+        );
+        assert_eq!(
+            parse(args(&["update", "major-apply"])).unwrap().command,
+            Command::Update(UpdateCommand::MajorApply)
+        );
+        assert_eq!(
+            parse(args(&["update", "major-rollback"])).unwrap().command,
+            Command::Update(UpdateCommand::MajorRollback)
         );
         assert_eq!(
             parse(args(&["link", "status"])).unwrap().command,

@@ -96,7 +96,7 @@ pub fn start(
     object.insert(
         "hint".to_owned(),
         json!(
-            "poll herdr_exec_read with session_id until phase=completed; herdr_exec_kill when done"
+            "for long sessions, prefer private herdr_mcp.exec.wait via herdr_call with a 10-20s bounded wait when advertised; use herdr_exec_read for immediate/delta output or when exec.wait is unavailable; herdr_exec_kill when done"
         ),
     );
     if !working.is_empty() {

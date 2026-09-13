@@ -11,6 +11,8 @@ import {
   sha256Hex,
 } from "./device-crypto.js";
 import {
+  executionFenceForDevice,
+  isRoutableDevice,
   isWorkstationId,
   newDeviceId,
   normalizeDeviceId,
@@ -119,6 +121,21 @@ function parseDeviceRecord(value: unknown): DeviceRecord | null {
 export class DeviceRegistryDO {
   constructor(private readonly state: DurableObjectState, private readonly env: Env) {}
 
+  private async projectExecutionFence(device: DeviceRecord): Promise<boolean> {
+    if (!this.env.WORKSTATION_DO) return false;
+    try {
+      const stub = this.env.WORKSTATION_DO.get(this.env.WORKSTATION_DO.idFromName(device.workstation_id));
+      const response = await stub.fetch(new Request("https://do.internal/internal/execution-fence", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(executionFenceForDevice(device)),
+      }));
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/internal/devices")) return json({ ok: false, code: "not_found" }, 404);
@@ -204,9 +221,43 @@ export class DeviceRegistryDO {
     if (existing && existing.authorization === "revoked") {
       return json({ ok: false, code: "device_revoked" }, 409);
     }
+    if (existing && parsed.workstation_id !== existing.workstation_id) {
+      return json({ ok: false, code: "workstation_id_immutable" }, 409);
+    }
 
-    await this.state.storage.put(DEVICE_PREFIX + deviceId, parsed);
-    return json({ ok: true, device: parsed });
+    // Registry time is the monotonic projection revision. Never trust a caller
+    // supplied timestamp to order cross-DO execution-state transitions.
+    const next: DeviceRecord = {
+      ...parsed,
+      updated_at_ms: Math.max(Date.now(), (existing?.updated_at_ms ?? -1) + 1),
+    };
+    const executionChanged = existing === null
+      || existing.workstation_id !== next.workstation_id
+      || existing.authorization !== next.authorization
+      || existing.scheduling !== next.scheduling;
+
+    // Restrictive transitions fence the WorkstationDO first. If the registry
+    // write then fails, the device is over-blocked rather than over-authorized.
+    if (executionChanged && !isRoutableDevice(next)) {
+      if (!(await this.projectExecutionFence(next))) {
+        return json({ ok: false, code: "execution_fence_unavailable", retryable: true }, 503);
+      }
+    }
+
+    await this.state.storage.put(DEVICE_PREFIX + deviceId, next);
+
+    // Routable writes always refresh the local fence after the registry write.
+    // This makes a widening transition retry-convergent: if the first attempt
+    // persisted Registry state but its projection failed, the second identical
+    // PUT still re-opens the Workstation fence instead of incorrectly treating
+    // the desired state as already converged. Rename-only PUTs also refresh the
+    // non-authoritative display snapshot at negligible control-plane frequency.
+    if (isRoutableDevice(next)) {
+      if (!(await this.projectExecutionFence(next))) {
+        return json({ ok: false, code: "execution_fence_unavailable", retryable: true }, 503);
+      }
+    }
+    return json({ ok: true, device: next });
   }
 
   private async createPairing(request: Request): Promise<Response> {
@@ -424,6 +475,10 @@ export class DeviceRegistryDO {
     if (!constantTimeEqual(enc.encode(credential.verifier_sha256), enc.encode(body.credential_verifier_sha256))) {
       return json({ ok: false, code: "link_auth_failed" }, 401);
     }
+    // Link authentication is a cheap, infrequent opportunity to seed/refresh
+    // the execution fence. Failure is safe: canonical MCP routing will fall
+    // back to DeviceRegistryDO until an authoritative bootstrap succeeds.
+    await this.projectExecutionFence(device);
     return json({ ok: true, device_id: device.device_id, credential_id: credential.credential_id });
   }
 
@@ -474,6 +529,10 @@ export class DeviceRegistryDO {
       await tx.put(canonicalIndexKey, existing.device_id);
       return { ok: true as const, device_id: existing.device_id, credential_id: credentialId, updated_at_ms: now };
     });
+    if (result.ok) {
+      const updated = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+      if (updated) await this.projectExecutionFence(updated);
+    }
     return result.ok ? json(result) : json(result, result.code === "device_not_found" ? 404 : 409);
   }
 
@@ -510,6 +569,7 @@ export class DeviceRegistryDO {
       updated_at_ms: Date.now(),
     };
     await this.state.storage.put(DEVICE_PREFIX + deviceId, renamed);
+    await this.projectExecutionFence(renamed);
     return json({ ok: true, device_id: renamed.device_id, name: renamed.name, updated_at_ms: renamed.updated_at_ms, wrote_registry: true });
   }
 
@@ -521,21 +581,36 @@ export class DeviceRegistryDO {
 
     const now = Date.now();
     const alreadyRevoked = existing.authorization === "revoked";
+    const revoked: DeviceRecord = alreadyRevoked
+      ? existing
+      : {
+          ...existing,
+          authorization: "revoked",
+          revoked_at_ms: existing.revoked_at_ms ?? now,
+          updated_at_ms: Math.max(now, existing.updated_at_ms + 1),
+        };
+
+    // Fast canonical routing no longer consults DeviceRegistryDO. Fence the
+    // target WorkstationDO *before* committing the registry revocation so there
+    // is never a registry-write -> kill-switch gap where a fast route can still
+    // execute. A projection failure leaves the old state untouched and is safe
+    // to retry.
+    if (!(await this.projectExecutionFence(revoked))) {
+      return json(
+        { ok: false, code: "execution_fence_unavailable", retryable: true, device_id: canonical, revoked: alreadyRevoked },
+        503,
+      );
+    }
+
     let wroteRegistry = false;
     if (!alreadyRevoked) {
-      const revoked: DeviceRecord = {
-        ...existing,
-        authorization: "revoked",
-        revoked_at_ms: existing.revoked_at_ms ?? now,
-        updated_at_ms: now,
-      };
       await this.state.storage.put(DEVICE_PREFIX + canonical, revoked);
       wroteRegistry = true;
     }
 
-    // Kill switch: tear down the target device's live WorkstationDO/WebSocket
-    // session. The workstation_id comes from the stored record — never from the
-    // caller — so a revoke can only ever target the device it is bound to.
+    // Kill switch: close the live Link and persist the historical revoke
+    // tombstone. Even if teardown persistence fails, the execution fence above
+    // and registry state both already deny new canonical and directory routes.
     const workstationId = existing.workstation_id;
     let teardownOk = false;
     try {
@@ -549,15 +624,18 @@ export class DeviceRegistryDO {
     }
 
     if (!teardownOk) {
-      // Authorization is already revoked (fail-closed): reconnect and new
-      // routing already deny. A retry performs no registry write and retries
-      // teardown, so this converges. Surface a retryable error.
       return json(
         { ok: false, code: "revoke_teardown_failed", retryable: true, device_id: canonical, revoked: true },
         503,
       );
     }
-    return json({ ok: true, device_id: canonical, revoked: true, revoked_at_ms: existing.revoked_at_ms ?? now, wrote_registry: wroteRegistry });
+    return json({
+      ok: true,
+      device_id: canonical,
+      revoked: true,
+      revoked_at_ms: revoked.revoked_at_ms ?? now,
+      wrote_registry: wroteRegistry,
+    });
   }
 
   private async ensureLegacyDevice(request: Request): Promise<Response> {

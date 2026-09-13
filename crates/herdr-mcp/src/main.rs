@@ -75,6 +75,7 @@ mod updater;
 mod updater_store;
 #[cfg(target_os = "windows")]
 mod windows_service_manager;
+mod workstation_profile;
 // The stable PATH link is a Unix ownership primitive shared by launchd and
 // systemd-user installations.
 #[cfg(any(unix, test))]
@@ -246,6 +247,7 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Qualification(command) => qualification::run(command),
         cli::Command::Worker(command) => worker::run(command),
         cli::Command::Dev(command) => dev::run(command),
+        cli::Command::ProfileCheck { file } => workstation_profile::check(&file),
         cli::Command::Candidate { port } => {
             #[cfg(target_os = "windows")]
             windows_service_manager::prepare_candidate_environment(port)?;
@@ -257,6 +259,7 @@ fn run() -> Result<ExitCode, String> {
             let trigger = match &command {
                 cli::UpdateCommand::Auto => Some("auto_update"),
                 cli::UpdateCommand::Apply { .. } => Some("manual_update"),
+                cli::UpdateCommand::MajorApply => Some("major_update"),
                 _ => None,
             };
             if let Some(trigger) = trigger {

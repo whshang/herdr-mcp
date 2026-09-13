@@ -23,6 +23,53 @@ export interface DeviceRecord {
   revoked_at_ms: number | null;
 }
 
+/**
+ * Minimal execution-state projection copied from DeviceRegistryDO into the
+ * target WorkstationDO. Directory metadata (name/aliases) deliberately stays
+ * registry-owned; this fence only answers whether an already-addressed device
+ * may execute work. `revision` is registry-monotonic and rejects stale writes.
+ */
+export interface DeviceExecutionFence {
+  device_id: string;
+  workstation_id: string;
+  /** Non-authoritative display snapshot; never used for execution permission. */
+  device_name?: string;
+  authorization: DeviceAuthorization;
+  scheduling: DeviceScheduling;
+  revision: number;
+}
+
+export function executionFenceForDevice(record: DeviceRecord): DeviceExecutionFence {
+  return {
+    device_id: record.device_id,
+    workstation_id: record.workstation_id,
+    ...(typeof record.name === "string" && record.name.trim().length > 0 && record.name.length <= 128 ? { device_name: record.name } : {}),
+    authorization: record.authorization,
+    scheduling: record.scheduling,
+    revision: Number.isSafeInteger(record.updated_at_ms) && record.updated_at_ms >= 0 ? record.updated_at_ms : 0,
+  };
+}
+
+export function parseDeviceExecutionFence(value: unknown): DeviceExecutionFence | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const deviceId = typeof record.device_id === "string" ? normalizeDeviceId(record.device_id) : null;
+  if (deviceId === null || deviceId !== record.device_id) return null;
+  if (!isWorkstationId(record.workstation_id)) return null;
+  if (record.device_name !== undefined && (typeof record.device_name !== "string" || record.device_name.trim().length === 0 || record.device_name.length > 128)) return null;
+  if (record.authorization !== "active" && record.authorization !== "suspended" && record.authorization !== "revoked") return null;
+  if (record.scheduling !== "enabled" && record.scheduling !== "draining" && record.scheduling !== "paused") return null;
+  if (!Number.isSafeInteger(record.revision) || (record.revision as number) < 0) return null;
+  return {
+    device_id: deviceId,
+    workstation_id: record.workstation_id,
+    ...(typeof record.device_name === "string" ? { device_name: record.device_name } : {}),
+    authorization: record.authorization,
+    scheduling: record.scheduling,
+    revision: record.revision as number,
+  };
+}
+
 export function normalizeDeviceId(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed.startsWith(DEVICE_ID_PREFIX)) return null;

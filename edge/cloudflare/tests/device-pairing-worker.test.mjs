@@ -1231,14 +1231,16 @@ test("device credentials are isolated: credential A never authenticates or route
 
   const okA = await worker.fetch(wsRequest(a.workstation_id, a.device_secret), env);
   assert.equal(okA.status, 200, "paired credential authenticates its own workstation");
+  const afterOwnAuth = forwarded.length;
+  assert.ok(afterOwnAuth >= 1, "own authentication may seed its execution fence before websocket handoff");
 
   const impersonateB = await worker.fetch(wsRequest(b.workstation_id, a.device_secret), env);
   assert.equal(impersonateB.status, 401);
-  assert.equal(forwarded.length, 1, "credential A must never reach workstation B");
+  assert.equal(forwarded.length, afterOwnAuth, "credential A must never add a call to workstation B");
 
   const legacyOnNewDevice = await worker.fetch(wsRequest(a.workstation_id, "legacy-secret"), env);
   assert.equal(legacyOnNewDevice.status, 401);
-  assert.equal(forwarded.length, 1, "legacy global secret cannot authenticate a paired device");
+  assert.equal(forwarded.length, afterOwnAuth, "legacy global secret cannot add a call to a paired device");
 });
 
 test("a device may revoke only itself with its exact credential", async () => {
@@ -1263,9 +1265,13 @@ test("a device may revoke only itself with its exact credential", async () => {
 
   const reconnect = await worker.fetch(wsRequest(a.workstation_id, a.device_secret), env);
   assert.equal(reconnect.status, 401);
-  // The only forward is the teardown kill-switch call to the target WorkstationDO;
-  // the revoked credential never reaches it as a reconnect.
-  assert.deepEqual(forwarded, ["/internal/revoke"]);
+  // Authentication may refresh the execution fence, then revoke must issue the
+  // teardown kill-switch. The revoked credential never reaches a websocket handoff.
+  assert.deepEqual(forwarded, [
+    "/internal/execution-fence", // successful self-auth refresh
+    "/internal/execution-fence", // revoke must fence execution before registry commit
+    "/internal/revoke",          // then close/persist the historical kill-switch
+  ]);
 });
 
 test("a joined device may explicitly rename only itself", async () => {
@@ -1391,7 +1397,11 @@ test("legacy shared secret is compatibility-only for the default workstation and
   assert.equal(reconnect.status, 401);
   // forwarded[0] is the legacy connect; forwarded[1] is the revoke teardown call.
   // The revoked credential never reaches the WorkstationDO as a reconnect.
-  assert.deepEqual(forwarded, ["/ws/prod-real-runtime", "/internal/revoke"]);
+  assert.deepEqual(forwarded, [
+    "/ws/prod-real-runtime",
+    "/internal/execution-fence",
+    "/internal/revoke",
+  ]);
 });
 
 test("pairing minted by one Worker deployment fails closed against another", async () => {
