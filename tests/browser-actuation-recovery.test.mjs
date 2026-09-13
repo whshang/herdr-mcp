@@ -294,9 +294,9 @@ test("accepted ChatGPT user turns register a current-source identity before cont
 
 test("ChatGPT session.archive targets the exact registered session and verifies provider archive state", () => {
   assert.match(backgroundSource, /"session\.archive"/);
-  const start = wakeSource.indexOf("async function performChatGptSessionArchive");
+  const start = wakeSource.indexOf("const PENDING_SELF_ARCHIVE_STORAGE_KEY");
   const end = wakeSource.indexOf("async function performBrowserActuationCommand", start);
-  assert.ok(start >= 0 && end > start, "session.archive helper must exist before browser actuation");
+  assert.ok(start >= 0 && end > start, "deferred self-archive helper must exist before browser actuation");
   const segment = wakeSource.slice(start, end);
   assert.match(segment, /sessionRef !== registeredBrowserSessionRef/);
   assert.match(segment, /registeredBrowserGeneration/);
@@ -306,6 +306,91 @@ test("ChatGPT session.archive targets the exact registered session and verifies 
   assert.match(segment, /stable_resource_ref_observed = true/);
   assert.match(segment, /lifecycle_observed = true/);
   assert.doesNotMatch(segment, /performWake|dispatchEnterSubmit|findSendButton|delete/);
+});
+
+function selfArchiveHarness(overrides = {}) {
+  const ctx = {
+    turnInProgress: true,
+    generation: 7,
+    sessionRef: "br_self_archive",
+    conversationId: "conv-self-archive",
+    archiveAvailable: true,
+    archiveVerifies: true,
+    clicks: [],
+    ...overrides,
+  };
+  const storage = new Map();
+  const sessionStorage = {
+    getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+    setItem: (key, value) => { storage.set(key, String(value)); },
+    removeItem: (key) => { storage.delete(key); },
+  };
+  const start = wakeSource.indexOf("const PENDING_SELF_ARCHIVE_STORAGE_KEY");
+  const end = wakeSource.indexOf("async function performBrowserActuationCommand", start);
+  assert.ok(start >= 0 && end > start, "deferred self-archive helper must remain extractable");
+  const segment = wakeSource.slice(start, end);
+  const api = new Function("ctx", "sessionStorage", "setTimeout", `
+    const ADAPTER = { name: "chatgpt" };
+    const chatGptConversationId = () => ctx.conversationId;
+    const isTurnInProgress = () => ctx.turnInProgress;
+    const openChatGptArchiveMenu = async () => (ctx.archiveAvailable ? { click: () => { ctx.clicks.push(Date.now()); } } : null);
+    const fetchChatGptConversation = async () => (ctx.archiveVerifies ? { ok: true, body: { is_archived: true } } : { ok: false });
+    const wait = () => Promise.resolve();
+    let registeredBrowserSessionRef = ctx.sessionRef;
+    let registeredBrowserGeneration = ctx.generation;
+    ${segment}
+    return {
+      performChatGptSessionArchive,
+      drain: drainPendingSelfArchives,
+      pendingCount: () => readPendingSelfArchives().length,
+      setGeneration: (value) => { registeredBrowserGeneration = value; },
+      setSession: (value) => { registeredBrowserSessionRef = value; },
+    };
+  `)(ctx, sessionStorage, () => 0);
+  return { ctx, api };
+}
+
+test("deferred self-archive waits for idle, dedupes idempotently, and fails closed on generation drift", async () => {
+  const sessionRef = "br_self_archive";
+  const { ctx, api } = selfArchiveHarness();
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: sessionRef, expected_generation: 7, idempotency_key: "archive-key-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  // While the assistant's own turn is active the request is accepted but must
+  // not archive early.
+  const accepted = await api.performChatGptSessionArchive(command, evidence());
+  assert.equal(accepted.command_accepted, true);
+  assert.equal(accepted.stable_resource_ref_observed, true);
+  assert.equal(accepted.lifecycle_observed, false);
+  assert.notEqual(accepted.rejected, true);
+  assert.equal(ctx.clicks.length, 0);
+  assert.equal(api.pendingCount(), 1);
+
+  // A duplicate idempotent request must not enqueue or actuate a second archive.
+  const duplicate = await api.performChatGptSessionArchive(command, evidence());
+  assert.equal(duplicate.command_accepted, true);
+  assert.equal(ctx.clicks.length, 0);
+  assert.equal(api.pendingCount(), 1);
+
+  // Once the source turn is idle the persisted archive executes exactly once.
+  ctx.turnInProgress = false;
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1);
+  assert.equal(api.pendingCount(), 0);
+
+  // A stale generation drops the persisted intent without actuation.
+  ctx.turnInProgress = true;
+  await api.performChatGptSessionArchive(command, evidence());
+  assert.equal(api.pendingCount(), 1);
+  api.setGeneration(8);
+  ctx.turnInProgress = false;
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1);
+  assert.equal(api.pendingCount(), 0);
 });
 
 test("ChatGPT session.open can restore a disposable view from a local canonical locator", () => {

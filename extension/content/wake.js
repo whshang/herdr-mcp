@@ -1434,6 +1434,128 @@ const H2W_CONTENT_VERSION = "0.1.91";
     return null;
   }
 
+  // ---- Deferred self-archive ----
+  // A ChatGPT assistant that calls browser_session.archive during its own
+  // response turn cannot archive mid-turn: the provider archive menu is not
+  // safe to actuate while the source turn is still generating, and the model is
+  // blocked on this very tool result. Persist the exact self-archive intent and
+  // execute it once the turn settles. The durable intent is keyed by the exact
+  // idempotency key so a duplicate request cannot double-actuate, and a stale
+  // session/generation drops the intent instead of guessing.
+  const PENDING_SELF_ARCHIVE_STORAGE_KEY = "herdrPendingSelfArchiveV1";
+  const PENDING_SELF_ARCHIVE_POLL_MS = 1000;
+  const PENDING_SELF_ARCHIVE_MAX_WAIT_MS = 10 * 60 * 1000;
+
+  function readPendingSelfArchives() {
+    try {
+      const raw = sessionStorage.getItem(PENDING_SELF_ARCHIVE_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      const list = Array.isArray(parsed) ? parsed : [];
+      return list.filter((item) => (
+        item
+        && typeof item.idempotencyKey === "string" && item.idempotencyKey
+        && typeof item.sessionRef === "string" && item.sessionRef
+        && Number.isSafeInteger(item.generation) && item.generation > 0
+        && typeof item.conversationId === "string" && item.conversationId
+        && typeof item.requestedAt === "number"
+      ));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function writePendingSelfArchives(list) {
+    try {
+      if (list.length === 0) sessionStorage.removeItem(PENDING_SELF_ARCHIVE_STORAGE_KEY);
+      else sessionStorage.setItem(PENDING_SELF_ARCHIVE_STORAGE_KEY, JSON.stringify(list));
+    } catch (_) {}
+    return list;
+  }
+
+  function enqueuePendingSelfArchive(params, sessionRef, generation, conversationId) {
+    const idempotencyKey = typeof params.idempotency_key === "string" ? params.idempotency_key : "";
+    if (!idempotencyKey) return false;
+    const list = readPendingSelfArchives();
+    const existing = list.find((item) => item.idempotencyKey === idempotencyKey);
+    if (existing) {
+      // Same logical archive: refresh the still-authoritative identity, but do
+      // not enqueue or actuate a second archive.
+      existing.sessionRef = sessionRef;
+      existing.generation = generation;
+      existing.conversationId = conversationId;
+      writePendingSelfArchives(list);
+      return true;
+    }
+    list.push({ idempotencyKey, sessionRef, generation, conversationId, requestedAt: Date.now() });
+    writePendingSelfArchives(list);
+    return true;
+  }
+
+  function removePendingSelfArchive(idempotencyKey) {
+    const list = readPendingSelfArchives().filter((item) => item.idempotencyKey !== idempotencyKey);
+    writePendingSelfArchives(list);
+  }
+
+  let pendingSelfArchiveDrainTimer = null;
+  let pendingSelfArchiveDraining = false;
+  function schedulePendingSelfArchiveDrain() {
+    if (pendingSelfArchiveDrainTimer || pendingSelfArchiveDraining) return;
+    pendingSelfArchiveDrainTimer = setTimeout(() => {
+      pendingSelfArchiveDrainTimer = null;
+      void drainPendingSelfArchives();
+    }, PENDING_SELF_ARCHIVE_POLL_MS);
+  }
+
+  async function actuateChatGptArchive(conversationId) {
+    const archive = await openChatGptArchiveMenu();
+    if (!archive) return "rejected";
+    archive.click();
+    const deadline = Date.now() + 6000;
+    do {
+      const archived = await fetchChatGptConversation({ conversationId, timeoutMs: 2500 }).catch(() => ({ ok: false }));
+      if (archived?.ok && archived.body?.is_archived === true) return "applied";
+      await wait(200);
+    } while (Date.now() < deadline);
+    return "uncertain";
+  }
+
+  async function drainPendingSelfArchives() {
+    if (pendingSelfArchiveDraining) return;
+    pendingSelfArchiveDraining = true;
+    try {
+      const pending = readPendingSelfArchives();
+      if (pending.length === 0) return;
+      if (isTurnInProgress()
+          || !registeredBrowserSessionRef
+          || !Number.isSafeInteger(registeredBrowserGeneration)) {
+        // Still the assistant's own turn, or the page route has not registered
+        // its exact identity yet (e.g. after a reload): keep the intent
+        // persisted and retry instead of dropping it.
+        schedulePendingSelfArchiveDrain();
+        return;
+      }
+      for (const record of pending) {
+        const stillCurrent = record.sessionRef === registeredBrowserSessionRef
+          && record.generation === registeredBrowserGeneration
+          && record.conversationId === chatGptConversationId();
+        if (!stillCurrent || Date.now() - record.requestedAt > PENDING_SELF_ARCHIVE_MAX_WAIT_MS) {
+          // Fail closed: never actuate an archive for a superseded identity.
+          removePendingSelfArchive(record.idempotencyKey);
+          continue;
+        }
+        if (await actuateChatGptArchive(record.conversationId) === "applied") {
+          removePendingSelfArchive(record.idempotencyKey);
+        }
+      }
+    } finally {
+      pendingSelfArchiveDraining = false;
+      // A record may have been enqueued while this drain was running, or an
+      // attempt may have been accepted-but-unverified; keep retrying until the
+      // bounded wait expires.
+      if (readPendingSelfArchives().length > 0) schedulePendingSelfArchiveDrain();
+    }
+  }
+
   async function performChatGptSessionArchive(command, evidence) {
     if (ADAPTER.name !== "chatgpt") return { ...evidence, resource_available: false };
     const params = command?.params && typeof command.params === "object" ? command.params : {};
@@ -1445,21 +1567,23 @@ const H2W_CONTENT_VERSION = "0.1.91";
     if (evidence.observed_generation !== registeredBrowserGeneration) {
       return { ...evidence, resource_available: false };
     }
-    if (isTurnInProgress()) return { ...evidence, rejected: true };
-    const archive = await openChatGptArchiveMenu();
-    if (!archive) return { ...evidence, rejected: true };
-    archive.click();
+    if (isTurnInProgress()) {
+      // The authoritative self-archive request is accepted and persisted now;
+      // it executes once the source turn is no longer in progress.
+      if (!enqueuePendingSelfArchive(params, sessionRef, registeredBrowserGeneration, conversationId)) {
+        return { ...evidence, rejected: true };
+      }
+      schedulePendingSelfArchiveDrain();
+      evidence.command_accepted = true;
+      evidence.stable_resource_ref_observed = true;
+      evidence.lifecycle_observed = false;
+      return evidence;
+    }
+    const outcome = await actuateChatGptArchive(conversationId);
+    if (outcome === "rejected") return { ...evidence, rejected: true };
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
-    const deadline = Date.now() + 6000;
-    do {
-      const archived = await fetchChatGptConversation({ conversationId, timeoutMs: 2500 }).catch(() => ({ ok: false }));
-      if (archived?.ok && archived.body?.is_archived === true) {
-        evidence.lifecycle_observed = true;
-        return evidence;
-      }
-      await wait(200);
-    } while (Date.now() < deadline);
+    if (outcome === "applied") evidence.lifecycle_observed = true;
     return evidence;
   }
 
@@ -3614,6 +3738,8 @@ const H2W_CONTENT_VERSION = "0.1.91";
     if (ADAPTER.name === "chatgpt") {
       startIdleNudgeWatch();
       startConversationHealthWatch();
+      // Resume a self-archive persisted before a page reload.
+      if (readPendingSelfArchives().length > 0) schedulePendingSelfArchiveDrain();
     }
   })();
 
