@@ -7,8 +7,6 @@
 // the public epoch-2 18-tool contract is unchanged.
 
 export const CONTINUITY_JOURNAL_STORAGE_KEY = "herdrContinuityJournalV1";
-export const CONTINUITY_SEED_PREFIX = "[HERDR_CONTINUITY_REF";
-export const CONTINUITY_SEED_END = "[END_HERDR_CONTINUITY_REF]";
 
 /** FNV-1a deterministic hash, mirroring the queued-insert stableHash. */
 export function stableHash(value) {
@@ -56,28 +54,3 @@ export function continuityMessageId({ messageId, convKey, role, text, startedAt 
  * the authoritative journal, then re-check live Herdr/runtime/Git state before
  * any mutation. New ChatGPT handoffs carry the source URL and use only this durable reference path. HERDR_HANDOFF_V1 remains read-only compatibility for already-existing legacy transfers and provider-specific legacy contracts.
  */
-export function buildContinuitySeed({ transferId, continuityId, sourceUrl } = {}) {
-  const tid = String(transferId || "").trim();
-  const cid = String(continuityId || "").trim();
-  const url = String(sourceUrl || "").trim();
-  if (!tid || !cid) throw new Error("transferId and continuityId are required");
-  return [
-    "继续这个 Herdr 工作链。旧会话 URL 已附在下方，供人工查阅。",
-    "continuity_id 是稳定的工作状态链标识，不是实时状态未变化的证明。",
-    `旧会话：${url}`,
-    "接手后第一步：调用 herdr_call，method 为 continuity.resume。已有 continuity_id 时直接按 ID 恢复；如果只有旧会话 URL，则把该 URL 作为 conversation_url 传给 continuity.resume。",
-    "continuity.resume 之后：重新检查相关 Herdr/runtime/Git 实时状态，再决定是否开始任何 mutation。",
-    "不要重复已经完成的工作，不要为接力生成摘要，也不要为了定位会话枚举浏览器 endpoint、account、Project、generation 或 device。",
-    "",
-    `${CONTINUITY_SEED_PREFIX} id=${tid} continuity_id=${cid}]`,
-    `continuity_id: ${cid}`,
-    `source_url: ${url}`,
-    CONTINUITY_SEED_END,
-  ].join("\n");
-}
-
-export function continuitySeedContainsReference(text, transferId) {
-  const id = String(transferId || "").trim();
-  if (!id) return false;
-  return String(text || "").includes(`${CONTINUITY_SEED_PREFIX} id=${id}`);
-}

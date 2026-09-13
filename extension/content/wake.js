@@ -4155,16 +4155,23 @@ const H2W_CONTENT_VERSION = "0.1.91";
     const transferBusy = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoffStatus)
       && hudCache?.handoff?.can_resume !== true;
     const handoffAvailable = hudCache?.manual_handoff_available === true;
+    const copyPromptReady = handoffStatus === "failed"
+      && typeof hudCache?.handoff?.copy_prompt === "string"
+      && Boolean(hudCache.handoff.copy_prompt.trim());
     const workingCount = Number(hudCache?.bound_working_count || 0);
     const handoffLocked = hudActionBusy
-      || hudCache?.can_handoff !== true
-      || workingCount > 0
-      || transferBusy;
+      || (!copyPromptReady && (
+        hudCache?.can_handoff !== true
+        || workingCount > 0
+        || transferBusy
+      ));
     hudEls.handoff.hidden = !handoffAvailable;
     hudEls.handoff.classList.toggle("locked", handoffLocked);
     hudEls.handoff.disabled = handoffLocked;
     hudEls.handoff.setAttribute("aria-disabled", String(handoffLocked));
-    hudEls.handoff.title = hudActionBusy
+    hudEls.handoff.title = copyPromptReady
+      ? hudText("handoff_copy_prompt_hint")
+      : hudActionBusy
       ? hudText("handoff_blocked_action_busy")
       : workingCount > 0
         ? hudText("handoff_blocked_working", { count: workingCount })
@@ -4240,6 +4247,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
       "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
       "manual_continue", "manual_status", "manual_judge", "handoff", "handoff_hint",
       "handoff_resume", "handoff_working", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_llm_required",
+      "handoff_copy_prompt", "handoff_copy_prompt_hint", "handoff_prompt_copied", "handoff_prompt_copy_failed",
       "automation_on", "automation_off", "aria_toggle_automation",
       "auto_judging", "auto_result", "auto_result_retry", "auto_result_with_cause",
     ];
@@ -4348,6 +4356,37 @@ const H2W_CONTENT_VERSION = "0.1.91";
 
   async function manualHandoffAction() {
     if (hudActionBusy) return { ok: false, error: "action-busy" };
+    const copyPrompt = hudCache?.handoff?.status === "failed"
+      ? String(hudCache?.handoff?.copy_prompt || "").trim()
+      : "";
+    if (copyPrompt) {
+      setHudActionBusy(true);
+      try {
+        let copied = false;
+        try {
+          await navigator.clipboard?.writeText?.(copyPrompt);
+          copied = true;
+        } catch (_) {}
+        if (!copied) {
+          const textarea = document.createElement("textarea");
+          textarea.value = copyPrompt;
+          textarea.setAttribute("readonly", "");
+          textarea.style.position = "fixed";
+          textarea.style.opacity = "0";
+          document.body.appendChild(textarea);
+          textarea.select();
+          copied = document.execCommand("copy") === true;
+          textarea.remove();
+        }
+        showHudToast(
+          copied ? hudText("handoff_prompt_copied") : hudText("handoff_prompt_copy_failed"),
+          copied ? "ok" : "err",
+        );
+        return { ok: copied, fallback: true, copy_prompt: copyPrompt, copied };
+      } finally {
+        setHudActionBusy(false);
+      }
+    }
     if (hudCache?.manual_handoff_available !== true || hudCache?.can_handoff !== true) {
       return { ok: false, error: "handoff_unavailable" };
     }
@@ -4609,10 +4648,15 @@ const H2W_CONTENT_VERSION = "0.1.91";
     const handoffStatus = String(hud?.handoff?.status || "");
     const handoffBusy = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoffStatus)
       && hud?.handoff?.can_resume !== true;
-    ui.handoff.textContent = handoffBusy
-      ? hudText("handoff_working")
-      : (hud?.handoff?.can_resume === true ? hudText("handoff_resume") : hudText("handoff"));
-    ui.handoff.title = hudText("handoff_hint");
+    const copyPromptReady = handoffStatus === "failed"
+      && typeof hud?.handoff?.copy_prompt === "string"
+      && Boolean(hud.handoff.copy_prompt.trim());
+    ui.handoff.textContent = copyPromptReady
+      ? hudText("handoff_copy_prompt")
+      : handoffBusy
+        ? hudText("handoff_working")
+        : (hud?.handoff?.can_resume === true ? hudText("handoff_resume") : hudText("handoff"));
+    ui.handoff.title = copyPromptReady ? hudText("handoff_copy_prompt_hint") : hudText("handoff_hint");
     syncHudManualButtons();
     ui.quick.hidden = !hud?.project_id
       && hud?.conversation_automation_available !== true;
