@@ -107,7 +107,7 @@ ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。
 
 用户**手动**在同一个已绑定 ChatGPT Project 里新开会话时，不需要记住或输入 `continuity_id`。新会话第一条已确认发送的用户消息（例如“继续”）会沿用 Project binding 写入同一条 continuity chain；Web planner 看到“继续 / 接着 / 恢复上次”等意图后，应先通过 `continuity.resolve` / `continuity.search` 搜索，而不是先要求用户提供内部 ID。只有 `conversation_id`、`project_id`、`workspace_id` 这类稳定身份把候选收敛为唯一链时才允许自动 `continuity.resume`。单纯文本匹配即使只剩一个候选也仍需要用户确认；“继续”本身只是触发搜索，不是选择证据。多个候选会返回有界的标题、workspace、更新时间和最近对话摘要供确认，系统禁止用“最近一次”或“最像”直接猜。
 
-手动接力也可以直接从旧 ChatGPT 对话链接开始。用户在新的 Web AI 会话里粘贴旧链接并让 Herdr 继续即可；planner 直接调用 `continuity.resume` 并把完整旧链接作为 `conversation_url` 传入，Rust 在同一次调用里解析 ChatGPT Project / conversation 身份并恢复唯一的持久化 continuity。只有返回 `continuity_ambiguous` 时才使用 `continuity.search` 展示有界候选，禁止按最近时间或文本相似度猜测。这个恢复动作不依赖浏览器插件，也不依赖 ego-browser，更不需要先枚举浏览器 endpoint、账号、Project、generation 或设备。浏览器插件只负责自动记录 turn、自动 rollover，以及替用户生成同一份“旧 URL + continuity”接力提示词。此前从未写入本地 journal 的私有 ChatGPT 会话无法仅凭 URL 经 MCP 拉取正文，因为 MCP 连接本身不携带用户的 ChatGPT 私有会话正文。
+接力只使用一份持久恢复 payload。`herdr_mcp.browser_handoff.prepare` 复用已有 `continuity_id`，把旧 ChatGPT 完整链接保留为 `source_url`，并为自动投递与“复制提示词”返回同一份紧凑 continuation message。没有浏览器自动控制时，用户新建 Web AI 会话后直接粘贴这份提示词即可。旧 URL 仍可独立作为恢复 anchor：只拿到 URL 时，planner 可以把完整链接作为 `conversation_url` 直接调用 `continuity.resume`；只有 `continuity_ambiguous` 才进入有界 `continuity.search`。这个恢复动作不依赖 ego-browser，也不要求预先枚举 endpoint、账号、Project、generation 或设备。此前从未写入本地 journal 的私有 ChatGPT 会话无法仅凭 URL 经 MCP 拉取正文，因为 MCP 连接本身不携带用户的 ChatGPT 私有会话正文。
 
 新的 ChatGPT 接力在 Rust journal 不可用或实时确认失败时直接失败并保留源会话与完整旧 URL，不再请求源 WebChat 或 fallback LLM 生成接力摘要。`HERDR_HANDOFF_V1` 只作为升级前已存在 transfer 和 provider-specific legacy contract（例如 z.ai）的读取/恢复兼容，不再由新的 ChatGPT 接力生成。
 
@@ -123,7 +123,7 @@ Continuity 2.0 会持续把较老 raw turns 压成 rolling semantic checkpoint�
 
 自动化按作用域管理。全局允许 ChatGPT Project 共享 Auto 后，每个 Project 仍从自己的 HUD 显式开启 / 关闭；普通 ChatGPT conversation、z.ai、DeepSeek 在支持时使用 conversation 级 Auto。所有新作用域默认都是 `自动 关`。
 
-HUD 的三个预置推进动作是手动继续、提取 Herdr 状态、LLM 判断；开启 Auto 后它们会锁定，避免两个路径同时推进同一会话。**手动接力是例外，它只有一个 UI 入口：HUD**。支持的会话可以在 Auto 开 / 关时启动接力；transfer 期间源会话的自动 wake 暂停，目标继承源会话 Auto 状态。
+HUD 的三个预置推进动作是手动继续、提取 Herdr 状态、LLM 判断；开启 Auto 后它们会锁定，避免两个路径同时推进同一会话。**接力是例外，它只有一个 UI 入口：HUD**。支持的会话可以在 Auto 开 / 关时启动接力；transfer 期间源会话的自动 wake 暂停，目标继承源会话 Auto 状态。
 
 需要人工接管时，可以先关闭 Auto，再从 HUD 手动继续 / 提取 Herdr 状态 / 运行轻量 LLM 判断；需要主动切换会话时，从 Control Center 的“当前页面”启动接力。
 
@@ -271,7 +271,7 @@ HUD 提供几类显式操作：
 - **herdr监控**：先读取绑定 workspace 的实时状态，再把结果带回网页；
 - **LLM 分析**：用 Options 中配置的小模型判断当前回复是否仍有明显未完成工作；
 
-HUD 提供 `继续 / 查 Herdr / LLM 判断` 三个页面级推进动作和“手动接力”。前三个动作在当前作用域 `自动 开` 时会锁定，避免和自动状态机同时推进同一会话；手动接力在安全门通过时仍可使用。workspace 绑定和本地 Herdr 控制留在 Side Panel。**手动接力只有一个 UI 入口：HUD**；transfer 期间源会话自动 wake 暂停，target 继承 source 的 Auto 状态。
+HUD 提供 `继续 / 查 Herdr / LLM 判断` 三个页面级推进动作和“接力”。前三个动作在当前作用域 `自动 开` 时会锁定，避免和自动状态机同时推进同一会话；接力在安全门通过时仍可使用。workspace 绑定和本地 Herdr 控制留在 Side Panel。**接力只有一个 UI 入口：HUD**；transfer 期间源会话自动 wake 暂停，target 继承 source 的 Auto 状态。
 
 ## 排队：用户下一轮意图优先于自动继续
 
@@ -478,17 +478,17 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
 
 不应该把摘要中的 runtime / Git 状态当成永久事实。新 conversation 开始 mutation 前仍需重新 inspect / Git check。
 
-## 手动接力
+## 接力
 
-手动接力从页面 **HUD 的“接力”**启动，Side Panel 不再复制这个会话操作。它适用于：
+接力从页面 **HUD 的“接力”**启动，Side Panel 不再复制这个会话操作；WebChat 自接力和用户复制提示词新开会话也消费同一份 canonical package。它适用于：
 
 - 你知道这条 conversation 已经很长；
 - 当前工作已经到自然边界；
 - 想主动在状态还清晰时换到新会话。
 
-当前支持已绑定的 ChatGPT Project，以及稳定 `/c/<chat_id>` 的 z.ai 会话。手动接力在当前作用域 `自动 开` 或 `自动 关` 时都可以启动；新目标会话继承源会话的 Auto 状态。ChatGPT 接力只切换 Project binding 的 active target；z.ai 才迁移会话级 binding。接力期间源会话的自动 wake 暂停，workspace 仍有 working Agent 时则拒绝开始，避免 settled/wake 与 cutover 竞争。
+当前支持已绑定的 ChatGPT Project，以及稳定 `/c/<chat_id>` 的 z.ai 会话。接力在当前作用域 `自动 开` 或 `自动 关` 时都可以启动；新目标会话继承源会话的 Auto 状态。ChatGPT 接力只切换 Project binding 的 active target；z.ai 才迁移会话级 binding。接力期间源会话的自动 wake 暂停，workspace 仍有 working Agent 时则拒绝开始，避免 settled/wake 与 cutover 竞争。
 
-手动 ChatGPT Project 接力会先解析持久化 Continuity Journal，并直接用 continuity reference 在同一 Project 的新会话中恢复，不再向源会话发送接力摘要请求。目标提示词始终保留完整旧会话 URL，便于后续人工查阅。binding 中的 continuity 元数据缺失或过期时，本机 runtime 会按当前 conversation identity 找回同一条 chain；没有可用 Journal 时直接失败并保留当前会话，不再调用 fallback LLM。WebChat 自接力使用 `browser_session.create(source_url, message, idempotency_key)`，由 Rust 从 source session 反查同账号、同 Project 与当前 generation，避免事先枚举浏览器资源；若 `message` 尚未包含旧链接，runtime 会自动把原始 `source_url` 附到首条消息中，保证后续始终可人工回查。历史 transfer 与 conversation-scoped provider 的旧契约继续按兼容路径读取。
+ChatGPT 接力会先解析持久化 Continuity Journal，再调用只读 private method `herdr_mcp.browser_handoff.prepare`。返回 package 包含已有 `continuity_id`、精确 `source_url`、可选 `work_chain_id`、最小 target context 和一份紧凑 message；`automatic_delivery.params.message` 与 `manual_delivery.copy_prompt` 字节级一致。自动路径把该 message 原样交给 `browser_session.create`；新会话第一步 `continuity.resume`，随后重新检查实时 workspace / Git / runtime。如果浏览器控制已确认不可用，HUD 的同一个“接力”按钮会变成 **复制提示词**；`seed_uncertain` 或其他 mutation outcome uncertain 状态不会开放复制 fallback，必须先完成 reconciliation，避免误建第二个会话。如果 OpenAI host-side pre-delivery safety 在 Herdr 尚无 execution evidence 时拒绝自动创建，planner 仅允许用相同参数、相同 idempotency key 再试一次，随后直接展示已准备好的同一份 Copy Prompt；禁止编码、混淆、机械改写、更换 transport 或递归包裹被拒 payload。provider-specific 历史 transfer 仍保留兼容恢复契约，新 durable ChatGPT handoff 不再维护第二个 prompt builder。
 
 z.ai 的 handoff 控制消息走 raw channel，不经过 JSON→MCP task wrapper，避免摘要请求被误解释成 coding task。
 
@@ -511,6 +511,6 @@ z.ai 的 handoff 控制消息走 raw channel，不经过 JSON→MCP task wrapper
 5. 有真实新输出时收到 progress；
 6. workspace settled 后网页重新继续；
 7. 故意关闭/刷新页面后，binding 仍指向正确作用域，active target 仍是预期 conversation；
-8. 需要时测试手动 handoff：确认新会话 seed 存在后，ChatGPT Project 才切换 active target；conversation-scoped 站点才迁移 binding。
+8. 需要时测试 handoff：确认新会话 seed 存在后，ChatGPT Project 才切换 active target；已确认投递失败时出现同一份 Copy Prompt，投递结果不确定时不得出现复制 fallback；conversation-scoped 站点才迁移 binding。
 
 测试命令和实现级细节保留在仓库测试与 [CHANGELOG](../../../CHANGELOG.md)，本页只描述当前产品行为。

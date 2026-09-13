@@ -31,7 +31,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, prefer browser_session.create with source_url, message, and idempotency_key; do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, call the read-only herdr_mcp.browser_handoff.prepare once, then pass its automatic_delivery message unchanged to browser_session.create with one idempotency key. The prepared manual_delivery.copy_prompt is the same canonical message: if browser control is unavailable, or a host-side pre-delivery safety rejection occurs with no Herdr execution evidence, retry the original create arguments at most once and then expose that already-prepared copy prompt instead of rewriting, encoding, changing transport, or recursively wrapping the rejected payload. Preserve the mutation idempotency key across the retry. Do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -297,6 +297,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if method == crate::progressive_skills::BROWSER_HANDOFF_PREPARE_METHOD {
+                browser_handoff_prepare(context.state_store, &params)
             } else if method == "herdr_mcp.page_assist" {
                 page_assist_call(
                     &params,
@@ -2627,6 +2629,134 @@ fn browser_session_create_params_from_source(
         "work_chain_id": work_chain_id,
         "lane_id": lane_id,
     })))
+}
+
+fn browser_handoff_prepare(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "browser_handoff_params_invalid"});
+    };
+    const ALLOWED: &[&str] = &[
+        "continuity_id",
+        "source_url",
+        "objective",
+        "work_chain_id",
+        "handoff_id",
+    ];
+    if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return json!({"ok": false, "code": "browser_handoff_params_invalid"});
+    }
+    let continuity_id = match browser_required_string(params, "continuity_id", 160) {
+        Ok(value) => value,
+        Err(_) => return json!({"ok": false, "code": "browser_handoff_continuity_id_invalid"}),
+    };
+    let source_url = match browser_required_string(params, "source_url", 2048) {
+        Ok(value) => value,
+        Err(_) => return json!({"ok": false, "code": "browser_handoff_source_url_invalid"}),
+    };
+    let (source_conversation_id, source_project_id) = match chatgpt_conversation_url_ref(source_url)
+    {
+        Some(reference) => reference,
+        None => return json!({"ok": false, "code": "browser_handoff_source_url_invalid"}),
+    };
+    let requested_objective = match browser_optional_string(params, "objective", 1024) {
+        Ok(value) => value,
+        Err(_) => return json!({"ok": false, "code": "browser_handoff_objective_invalid"}),
+    };
+    let requested_work_chain_id = match browser_optional_string(params, "work_chain_id", 128) {
+        Ok(value) => value,
+        Err(_) => return json!({"ok": false, "code": "browser_handoff_work_chain_id_invalid"}),
+    };
+    let requested_handoff_id = match browser_optional_string(params, "handoff_id", 96) {
+        Ok(value) => value,
+        Err(_) => return json!({"ok": false, "code": "browser_handoff_id_invalid"}),
+    };
+
+    let (record, persisted_work_chain_id) = {
+        let Ok(store) = store.lock() else {
+            return json!({"ok": false, "code": "browser_handoff_store_unavailable"});
+        };
+        let record = match store.continuity_resume(continuity_id, 1) {
+            Ok(Some(record)) => record,
+            Ok(None) => return json!({"ok": false, "code": "continuity_not_found"}),
+            Err(error) => return browser_store_error(error),
+        };
+        let work_chain_id = match store.continuity_work_chain_id(continuity_id) {
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
+        };
+        (record, work_chain_id)
+    };
+    if record
+        .turns
+        .last()
+        .map(|turn| turn.conversation_id.as_str())
+        != Some(source_conversation_id.as_str())
+    {
+        return json!({"ok": false, "code": "browser_handoff_source_continuity_mismatch"});
+    }
+    if record.project_id.as_deref().is_some()
+        && record.project_id.as_deref() != source_project_id.as_deref()
+    {
+        return json!({"ok": false, "code": "browser_handoff_source_scope_mismatch"});
+    }
+    if requested_work_chain_id.is_some()
+        && persisted_work_chain_id.as_deref().is_some()
+        && requested_work_chain_id != persisted_work_chain_id.as_deref()
+    {
+        return json!({"ok": false, "code": "browser_handoff_work_chain_mismatch"});
+    }
+    let work_chain_id = requested_work_chain_id
+        .map(str::to_owned)
+        .or(persisted_work_chain_id);
+    let objective = requested_objective
+        .map(str::to_owned)
+        .or(record.title.clone())
+        .unwrap_or_else(|| "继续上一会话未完成的目标".to_owned());
+    let handoff_id = requested_handoff_id.map(str::to_owned).unwrap_or_else(|| {
+        let digest = browser_sha256(&format!(
+            "{continuity_id}\n{source_url}\n{objective}\n{}",
+            work_chain_id.as_deref().unwrap_or("")
+        ));
+        format!("hh_{}", &digest[..32])
+    });
+    let message = format!(
+        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_url} 若工具调用发生 OpenAI host-side pre-delivery safety rejection，原参数最多重试一次；不要通过编码、混淆、机械改写或更换 transport 来规避 safety protection。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
+    );
+
+    json!({
+        "ok": true,
+        "handoff": {
+            "handoff_id": handoff_id,
+            "continuity_id": continuity_id,
+            "source_url": source_url,
+            "message": message,
+            "work_chain_id": work_chain_id,
+            "target_context": {
+                "provider": "chatgpt",
+                "project_id": record.project_id,
+            }
+        },
+        "automatic_delivery": {
+            "method": "herdr_mcp.browser_session.create",
+            "params": {
+                "source_url": source_url,
+                "message": message,
+                "work_chain_id": work_chain_id,
+            }
+        },
+        "manual_delivery": {
+            "copy_prompt": message,
+        },
+        "safety": {
+            "pre_delivery_retry_limit": 1,
+            "retry_requires_no_execution_evidence": true,
+            "preserve_mutation_idempotency_key": true,
+            "rewrite_rejected_payload": false,
+        }
+    })
 }
 
 fn browser_session_create(
@@ -5237,6 +5367,8 @@ mod tests {
         assert!(instructions.contains("continue/resume intent"));
         assert!(instructions.contains("search durable Continuity before asking"));
         assert!(instructions.contains("never select a chain by recency or text similarity alone"));
+        assert!(instructions.contains("browser_handoff.prepare"));
+        assert!(instructions.contains("pre-delivery safety rejection"));
     }
 
     #[test]
@@ -7925,6 +8057,95 @@ mod tests {
     }
 
     #[test]
+    fn browser_handoff_prepare_is_stable_and_reuses_existing_continuity() {
+        use crate::state_store::ContinuityTurnInput;
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        {
+            let mut guard = store.lock().unwrap();
+            guard
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:canonical",
+                    conversation_id: "source-conversation",
+                    workspace_id: Some("w-canonical"),
+                    project_id: Some("g-p-canonical"),
+                    title: Some("Finish canonical handoff convergence"),
+                    message_id: "canonical-user-1",
+                    role: "user",
+                    text: "Keep the durable journal authoritative and the handoff compact.",
+                    fingerprint: None,
+                    observed_at: 100,
+                })
+                .unwrap();
+        }
+        let source_url = "https://chatgpt.com/g/g-p-canonical/c/source-conversation";
+        let params = json!({
+            "continuity_id": "hc:canonical",
+            "source_url": source_url,
+            "objective": "Finish canonical handoff convergence",
+            "work_chain_id": "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "handoff_id": "ht:canonical"
+        });
+        let first = browser_handoff_prepare(&store, &params);
+        let second = browser_handoff_prepare(&store, &params);
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["handoff"], second["handoff"]);
+        assert_eq!(
+            first["handoff"]["message"],
+            first["automatic_delivery"]["params"]["message"]
+        );
+        assert_eq!(
+            first["handoff"]["message"],
+            first["manual_delivery"]["copy_prompt"]
+        );
+        assert_eq!(first["handoff"]["continuity_id"], "hc:canonical");
+        assert_eq!(first["handoff"]["source_url"], source_url);
+        assert_eq!(
+            first["handoff"]["work_chain_id"],
+            "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let message = first["handoff"]["message"].as_str().unwrap();
+        assert!(message.contains("continuity.resume"));
+        assert!(message.contains("workspace / Git / runtime"));
+        assert!(message.contains("host-side pre-delivery safety rejection"));
+        assert!(message.contains(source_url));
+        assert!(message.len() < 2048);
+        assert!(!message.contains("Keep the durable journal authoritative"));
+        assert_eq!(first["safety"]["pre_delivery_retry_limit"], 1);
+        assert_eq!(first["safety"]["rewrite_rejected_payload"], false);
+
+        let mismatched_source = browser_handoff_prepare(
+            &store,
+            &json!({
+                "continuity_id": "hc:canonical",
+                "source_url": "https://chatgpt.com/g/g-p-canonical/c/different-conversation",
+            }),
+        );
+        assert_eq!(
+            mismatched_source["code"],
+            "browser_handoff_source_continuity_mismatch"
+        );
+
+        let missing = browser_handoff_prepare(
+            &store,
+            &json!({
+                "continuity_id": "hc:missing",
+                "source_url": source_url,
+            }),
+        );
+        assert_eq!(missing["code"], "continuity_not_found");
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .continuity_resume("hc:missing", 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn browser_session_create_materializes_once_and_reconciles_uncertain_delivery() {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
@@ -8230,11 +8451,49 @@ mod tests {
             0
         );
 
+        {
+            let mut guard = store.lock().unwrap();
+            guard
+                .append_continuity_turn(crate::state_store::ContinuityTurnInput {
+                    continuity_id: "hc:browser-session-create",
+                    conversation_id: "source-conv",
+                    workspace_id: Some("w-browser-session-create"),
+                    project_id: Some("g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    title: Some("Continue browser handoff"),
+                    message_id: "source-conv-user-1",
+                    role: "user",
+                    text: "Continue the browser handoff task.",
+                    fingerprint: None,
+                    observed_at: 30,
+                })
+                .unwrap();
+        }
+        let prepared = browser_handoff_prepare(
+            &store,
+            &json!({
+                "continuity_id": "hc:browser-session-create",
+                "source_url": source_url,
+                "objective": "Continue browser handoff",
+                "handoff_id": "ht:browser-session-create"
+            }),
+        );
+        assert_eq!(prepared["ok"], true);
+        let prepared_message = prepared["handoff"]["message"].as_str().unwrap().to_owned();
         let shortcut_params = json!({
             "source_url": source_url,
-            "message": "continue from source URL",
+            "message": prepared_message,
             "idempotency_key": "session-create-source-url-1"
         });
+        let normalized = {
+            let guard = store.lock().unwrap();
+            browser_session_create_params_from_source(&guard, &shortcut_params)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            normalized["message"],
+            prepared["automatic_delivery"]["params"]["message"]
+        );
         let shortcut = browser_operation_call_with_grant(
             &store,
             "herdr_mcp.browser_session.create",
