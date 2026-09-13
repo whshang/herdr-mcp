@@ -16,8 +16,11 @@ herdr-mcp permissions status
 herdr-mcp update
 herdr-mcp update check
 herdr-mcp update apply
+herdr-mcp update major-apply
+herdr-mcp update major-rollback
 herdr-mcp update auto
 herdr-mcp update status
+herdr-mcp profile check --file ./workstation-profile.json
 herdr-mcp rollback
 herdr-mcp reinstall
 herdr-mcp uninstall
@@ -26,6 +29,10 @@ herdr-mcp uninstall
 From v0.4.3 onward, `update` is the normal one-step user upgrade and is equivalent to `update apply`. An installed v0.4.2 binary still treats bare `herdr-mcp update` as the read-only check and reports `herdr-mcp update apply` as `next_action`, so use `herdr-mcp update apply` once when crossing from v0.4.2. Use `update check` only for an explicit read-only availability/provenance check.
 
 For interactive `update` / `update apply`, the CLI keeps the final machine-readable result on stdout and writes human progress to stderr: release/provenance discovery, artifact attestation, bounded download percentage, candidate verification, installer state, and the final health-gated outcome. The downloaded candidate still performs activation in the detached update worker; the foreground CLI observes the durable update job for a bounded interval instead of making the lifecycle mutation itself. If installation legitimately outlives that interval, the command returns an `update_queued` result with `next_action: herdr-mcp update status`. `update auto` remains non-interactive and silent. The immutable v0.4.2 binary predates this progress UI, so its one-time `update apply` can remain quiet while doing network work.
+
+`update apply` intentionally refuses an incompatible durable-state schema. The qualified v0.4.8 (schema 5) → v1.0 (schema 13) transition uses the verified v1.0 binary's `update major-apply` command from an independent terminal. It creates a private consistent schema-5 SQLite backup plus a private executable copy of the exact old runtime binary, hashes both rollback artifacts, confirms the old service can stop, then reuses the normal transactional service install. `update major-rollback` also requires a confirmed service stop before restoring that exact pre-upgrade database and reinstalling the backed-up old runtime. The private binary copy keeps rollback independent of later runtime-generation garbage collection. Rollback removes state created after the v1.0 migration. Both commands refuse execution inside managed `herdr_exec` sessions.
+
+`profile check --file` is a read-only portability/drift gate. Profile JSON uses `schema_version: 1`, requires `secrets_policy: "reauthorize"`, and may declare project `{id, remote, path}` entries plus agent capability requirements such as `can_run_headless`, `supports_code_edit`, `supports_shell`, or `supports_vision`. It compares those declarations with the current filesystem/Git origin and the existing Capability Inventory; it never installs tools, copies files, or carries credentials. Unknown/unprobed agent traits remain drift rather than being guessed. Run `herdr-mcp scan --probe` when the report says the inventory is unavailable.
 
 `update auto` is the scheduler entrypoint. On the default macOS production instance, `service install` reconciles the owned `dev.herdr-mcp.auto-update` LaunchAgent. It runs on load and then daily. Automatic installation is intentionally **PROD-runtime + Stable-release only**: a compiled DEV runtime, `[update] check = false`, named instances, or `preview` all skip before network access. When a strictly newer Stable Release exists, the command reuses the normal provenance-verified detached update transaction; it does not introduce a second downloader or bypass rollback gates. `service uninstall` first arms an owned durable update fence and removes the scheduler; detached workers re-check that fence before activation, so service removal cannot be undone by a queued silent update. An explicit successful install clears the fence.
 

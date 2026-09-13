@@ -61,6 +61,14 @@ An Edge deployment is an operator action independent of Runtime Release publicat
 
 The public [platform and compatibility support matrix](i18n/en/platform-support-matrix.md) is the release-claim boundary for tested MCP versions, N/N-1/N+1 behavior, and macOS/Linux/Windows/WSL security status. A release must not broaden a platform or compatibility claim unless that matrix and its contract test are updated with the qualifying evidence.
 
+### Major state-schema upgrades
+
+The ordinary `update apply` path remains fail-closed across incompatible runtime state schemas. A release that changes the durable state schema must provide an explicit qualified migration path instead of weakening the updater's manifest/candidate checks.
+
+For the supported v0.4.8 (schema 5) → v1.0 (schema 13) boundary, run the downloaded/verified v1.0 binary from an independent terminal with `update major-apply`. The v1.0 binary verifies that the live database is schema 5, creates a private consistent SQLite snapshot plus a private executable copy of the exact v0.4.8 source binary, hashes both rollback artifacts, then reuses the normal transactional service install to migrate and activate schema 13. Keeping the rollback binary inside the private major-upgrade backup set makes rollback independent of later runtime-generation garbage collection. `update major-rollback` first proves the active service can be stopped, restores that exact pre-upgrade schema-5 snapshot, and reinstalls the recorded v0.4.8 binary. This rollback intentionally discards durable state created after the v1.0 migration; use it only as an N-1 recovery operation. Both major lifecycle commands refuse managed `herdr_exec` execution because stopping/replacing the service from the control transaction that carries the command is unsafe.
+
+The schema-5 backup and rollback record are retained until the operator completes or explicitly rolls back the major upgrade. Normal same-schema updates continue to use `update apply`; do not route them through the major-upgrade path.
+
 ## Ownership boundaries
 
 | Identity | Location | Do not confuse with |

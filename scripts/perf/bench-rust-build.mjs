@@ -201,8 +201,8 @@ const command = PHASES[options.phase];
 const env = {
   ...process.env,
   CARGO_TARGET_DIR: targetDir,
-  // Keep the benchmark isolated even when the repository enables Cargo 1.97
-  // build.build-dir for cross-worktree intermediate sharing.
+  // Keep the benchmark isolated even when the repository stores Cargo 1.97
+  // intermediates under CARGO_HOME with per-worktree path hashing.
   CARGO_BUILD_BUILD_DIR: buildDir,
 };
 if (options.ciLike) {

@@ -78,11 +78,36 @@ fn request(op: &str, snapshot: &Value, args: Value) -> Value {
     })
 }
 
+fn binary_under_test() -> PathBuf {
+    let mut root = std::env::current_dir().expect("test working directory");
+    loop {
+        let manifest = root.join("Cargo.toml");
+        if manifest.is_file()
+            && fs::read_to_string(&manifest).is_ok_and(|text| text.contains("[workspace]"))
+        {
+            break;
+        }
+        assert!(root.pop(), "cannot locate workspace root from test cwd");
+    }
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let binary = root.join("target").join(profile).join("herdr-mcp");
+    assert!(
+        binary.is_file(),
+        "missing binary under test: {}",
+        binary.display()
+    );
+    binary
+}
+
 /// Run the real `herdr-mcp __tcc-broker` binary with a JSON request on stdin,
 /// returning the parsed JSON response.
 fn run_broker_binary(request_bytes: &[u8]) -> Value {
-    let binary = env!("CARGO_BIN_EXE_herdr-mcp");
-    let mut child = Command::new(binary)
+    let binary = binary_under_test();
+    let mut child = Command::new(&binary)
         .arg("__tcc-broker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -177,8 +202,8 @@ fn broker_identity_survives_generation_rotation() {
     let broker = config.join("tcc-broker").join("herdr-mcp-broker");
 
     // Install the broker via the real binary.
-    let binary = env!("CARGO_BIN_EXE_herdr-mcp");
-    let status = Command::new(binary)
+    let binary = binary_under_test();
+    let status = Command::new(&binary)
         .args(["tcc-broker", "install"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .status()
@@ -206,7 +231,7 @@ fn broker_identity_survives_generation_rotation() {
     assert_eq!(sha256(&broker), original_sha);
 
     // Re-running install is idempotent and preserves the identity.
-    let status = Command::new(binary)
+    let status = Command::new(&binary)
         .args(["tcc-broker", "install"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .status()
@@ -221,10 +246,10 @@ fn broker_identity_survives_generation_rotation() {
 fn broker_status_reports_installed_identity() {
     let root = test_root("status");
     let config = root.join("config");
-    let binary = env!("CARGO_BIN_EXE_herdr-mcp");
+    let binary = binary_under_test();
 
     // Not installed yet.
-    let output = Command::new(binary)
+    let output = Command::new(&binary)
         .args(["tcc-broker", "status"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .output()
@@ -234,13 +259,13 @@ fn broker_status_reports_installed_identity() {
     assert!(text.contains("not installed"));
 
     // Install then status reports sha256.
-    let status = Command::new(binary)
+    let status = Command::new(&binary)
         .args(["tcc-broker", "install"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .status()
         .unwrap();
     assert!(status.success());
-    let output = Command::new(binary)
+    let output = Command::new(&binary)
         .args(["tcc-broker", "status"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .output()
@@ -258,13 +283,13 @@ fn permissions_status_setup_verify_and_broker_preservation() {
     let root = test_root("permissions");
     let config = root.join("config");
     let broker = config.join("tcc-broker").join("herdr-mcp-broker");
-    let binary = env!("CARGO_BIN_EXE_herdr-mcp");
+    let binary = binary_under_test();
     // Never let this process-level test probe the developer's real protected
     // ~/Documents. The broker still exercises the same read_dir + W_OK path,
     // but against an isolated synthetic HOME.
     fs::create_dir_all(root.join("Documents")).unwrap();
 
-    let output = Command::new(binary)
+    let output = Command::new(&binary)
         .args(["permissions", "status"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .env("HOME", &root)
@@ -284,7 +309,7 @@ fn permissions_status_setup_verify_and_broker_preservation() {
     assert!(text.contains("status:"));
     assert!(!text.to_ascii_lowercase().contains("developer id"));
 
-    let output = Command::new(binary)
+    let output = Command::new(&binary)
         .args(["permissions", "setup"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .env("HERDR_MCP_PERMISSIONS_DRY_RUN", "1")
@@ -308,7 +333,7 @@ fn permissions_status_setup_verify_and_broker_preservation() {
             marker.is_file(),
             "fresh setup must require explicit FDA verification"
         );
-        let status = Command::new(binary)
+        let status = Command::new(&binary)
             .args(["permissions", "status"])
             .env("HERDR_MCP_CONFIG_DIR", &config)
             .env("HOME", &root)
@@ -320,7 +345,7 @@ fn permissions_status_setup_verify_and_broker_preservation() {
         assert!(status_text.contains("probe: skipped_authorization_pending"));
     }
 
-    let output = Command::new(binary)
+    let output = Command::new(&binary)
         .args(["permissions", "verify"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .env("HOME", &root)
@@ -348,7 +373,7 @@ fn permissions_status_setup_verify_and_broker_preservation() {
     }
 
     fs::write(&broker, b"different-stable-broker-identity").unwrap();
-    let output = Command::new(binary)
+    let output = Command::new(&binary)
         .args(["permissions", "setup"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .env("HERDR_MCP_PERMISSIONS_DRY_RUN", "1")

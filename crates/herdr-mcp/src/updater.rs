@@ -16,7 +16,11 @@ use crate::release_trust::{self, ReleaseIdentity};
 use crate::state_store::SCHEMA_VERSION;
 use crate::updater_store::{UpdateJobRecord, UpdateStore};
 use reqwest::blocking::{Client, Response};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use semver::Version;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::env;
@@ -56,6 +60,12 @@ const DOWNLOAD_PROGRESS_STEP_PERCENT: u64 = 5;
 const UPDATE_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const UPDATE_WATCH_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAJOR_SOURCE_SCHEMA: i64 = 5;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAJOR_UPGRADE_RECORD_VERSION: u64 = 1;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAJOR_BACKUP_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseAsset {
@@ -78,6 +88,19 @@ struct ReleasePlan {
 enum AutoUpdatePolicy {
     RunStable,
     Skip(&'static str),
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MajorUpgradeRecord {
+    record_version: u64,
+    source_state_schema: i64,
+    target_state_schema: i64,
+    source_binary: String,
+    source_binary_sha256: String,
+    state_backup: String,
+    state_backup_sha256: String,
+    created_at_ms: i64,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -176,6 +199,8 @@ pub fn run(command: UpdateCommand) -> Result<ExitCode, String> {
     match command {
         UpdateCommand::Check { manifest_url } => check(manifest_url.as_deref()),
         UpdateCommand::Apply { manifest_url } => apply(manifest_url.as_deref()),
+        UpdateCommand::MajorApply => major_apply(),
+        UpdateCommand::MajorRollback => major_rollback(),
         UpdateCommand::Auto => auto(),
         UpdateCommand::Status => status(),
         UpdateCommand::Worker { job_id } => worker(&job_id),
@@ -402,6 +427,582 @@ fn apply_inner(
         }))?;
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn major_apply() -> Result<ExitCode, String> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err("major state-schema upgrade is currently supported on macOS and Linux".to_owned())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        refuse_major_upgrade_inside_managed_exec()?;
+        if SCHEMA_VERSION <= MAJOR_SOURCE_SCHEMA {
+            return Err(format!(
+                "this binary uses state schema {SCHEMA_VERSION}; no schema-{MAJOR_SOURCE_SCHEMA} major upgrade is required"
+            ));
+        }
+        let paths = RuntimePaths::discover()?;
+        let state_path = paths.config_dir.join("state.db");
+        let live_schema = read_raw_state_schema(&state_path)?
+            .ok_or_else(|| format!("state database is missing: {}", state_path.display()))?;
+        if live_schema == SCHEMA_VERSION {
+            return Err(format!(
+                "state database is already schema {SCHEMA_VERSION}; use the normal install/update path"
+            ));
+        }
+        if live_schema != MAJOR_SOURCE_SCHEMA {
+            return Err(format!(
+                "major upgrade is qualified only from state schema {MAJOR_SOURCE_SCHEMA}, found {live_schema}"
+            ));
+        }
+
+        let record = match load_major_upgrade_record(&paths)? {
+            Some(record) => {
+                validate_major_upgrade_record(&paths, &record)?;
+                verify_file_sha256(
+                    Path::new(&record.source_binary),
+                    &record.source_binary_sha256,
+                    BINARY_MAX_BYTES,
+                    "major-upgrade source binary",
+                )?;
+                verify_file_sha256(
+                    Path::new(&record.state_backup),
+                    &record.state_backup_sha256,
+                    MAJOR_BACKUP_MAX_BYTES,
+                    "major-upgrade state backup",
+                )?;
+                record
+            }
+            None => prepare_major_upgrade_record(&paths, &state_path)?,
+        };
+
+        run_service_command(
+            Path::new(&record.source_binary),
+            &paths,
+            &["service", "stop"],
+        )
+        .map_err(|error| format!("cannot stop service before major state migration: {error}"))?;
+
+        let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
+        let install_ok = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
+        let migrated = read_raw_state_schema(&state_path).ok().flatten() == Some(SCHEMA_VERSION);
+        if install_ok && migrated {
+            print_json(&json!({
+                "ok": true,
+                "code": "major_update_succeeded",
+                "source_state_schema": record.source_state_schema,
+                "state_schema": SCHEMA_VERSION,
+                "rollback_command": "herdr-mcp update major-rollback",
+                "rollback_backup": record.state_backup,
+            }))?;
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let install_detail = match install {
+            Ok(code) => format!("service install exited with {code:?}"),
+            Err(error) => error,
+        };
+        let recovery = recover_major_upgrade(&paths, &record);
+        Err(match recovery {
+            Ok(()) => format!(
+                "major update did not complete ({install_detail}); schema-{MAJOR_SOURCE_SCHEMA} state and the previous runtime were restored"
+            ),
+            Err(recovery_error) => format!(
+                "major update did not complete ({install_detail}); automatic recovery also failed: {recovery_error}"
+            ),
+        })
+    }
+}
+
+fn major_rollback() -> Result<ExitCode, String> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err("major state-schema rollback is currently supported on macOS and Linux".to_owned())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        refuse_major_upgrade_inside_managed_exec()?;
+        let paths = RuntimePaths::discover()?;
+        let record = load_major_upgrade_record(&paths)?
+            .ok_or_else(|| "no major-upgrade rollback backup is available".to_owned())?;
+        validate_major_upgrade_record(&paths, &record)?;
+        let state_path = paths.config_dir.join("state.db");
+        let schema = read_raw_state_schema(&state_path)?;
+        if schema.is_some()
+            && schema != Some(record.source_state_schema)
+            && schema != Some(record.target_state_schema)
+        {
+            return Err(format!(
+                "major rollback expected live state schema {} or {}, found {}",
+                record.source_state_schema,
+                record.target_state_schema,
+                schema.map_or_else(|| "missing".to_owned(), |value| value.to_string())
+            ));
+        }
+        recover_major_upgrade(&paths, &record)?;
+        print_json(&json!({
+            "ok": true,
+            "code": "major_update_rolled_back",
+            "state_schema": record.source_state_schema,
+            "restored_binary": record.source_binary,
+        }))?;
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn refuse_major_upgrade_inside_managed_exec() -> Result<(), String> {
+    if env::var_os("HERDR_MCP_EXEC_ID").is_some() {
+        return Err(
+            "major update/rollback must run from an independent terminal, not herdr_exec"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn major_upgrade_dir(paths: &RuntimePaths) -> PathBuf {
+    paths.config_dir.join("backups").join("major-upgrade-v1")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn major_upgrade_record_path(paths: &RuntimePaths) -> PathBuf {
+    major_upgrade_dir(paths).join("rollback.json")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn major_upgrade_backup_path(paths: &RuntimePaths) -> PathBuf {
+    major_upgrade_dir(paths).join(format!(
+        "state-schema-{MAJOR_SOURCE_SCHEMA}-before-{SCHEMA_VERSION}.db"
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn major_upgrade_source_binary_path(paths: &RuntimePaths) -> PathBuf {
+    major_upgrade_dir(paths).join("source-herdr-mcp")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn active_runtime_binary(paths: &RuntimePaths) -> Result<PathBuf, String> {
+    let path = paths.config_dir.join("runtime/current/herdr-mcp");
+    fs::canonicalize(&path)
+        .map_err(|error| format!("cannot resolve active runtime {}: {error}", path.display()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_raw_state_schema(path: &Path) -> Result<Option<i64>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("cannot open state database {}: {error}", path.display()))?;
+    let value = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("cannot read state schema {}: {error}", path.display()))?;
+    value
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| {
+                format!(
+                    "state database {} has an invalid schema version",
+                    path.display()
+                )
+            })
+        })
+        .transpose()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prepare_major_upgrade_record(
+    paths: &RuntimePaths,
+    state_path: &Path,
+) -> Result<MajorUpgradeRecord, String> {
+    let active_source_binary = active_runtime_binary(paths)?;
+
+    let dir = major_upgrade_dir(paths);
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create major-upgrade backup directory: {error}"))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot secure major-upgrade backup directory: {error}"))?;
+    let backup = major_upgrade_backup_path(paths);
+    let source_binary = major_upgrade_source_binary_path(paths);
+    if backup.exists() || source_binary.exists() || major_upgrade_record_path(paths).exists() {
+        return Err(format!(
+            "major-upgrade rollback material already exists under {}; run major-rollback or inspect it before retrying",
+            dir.display()
+        ));
+    }
+
+    snapshot_state_database(state_path, &backup)?;
+    let backup_schema = match read_raw_state_schema(&backup) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            let _ = fs::remove_file(&backup);
+            return Err("major-upgrade backup has no schema version".to_owned());
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&backup);
+            return Err(error);
+        }
+    };
+    if backup_schema != MAJOR_SOURCE_SCHEMA {
+        let _ = fs::remove_file(&backup);
+        return Err(format!(
+            "major-upgrade backup schema changed during snapshot: expected {MAJOR_SOURCE_SCHEMA}, got {backup_schema}"
+        ));
+    }
+    let state_backup_sha256 = match sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_file(&backup);
+            return Err(error);
+        }
+    };
+    if let Err(error) = copy_regular_file_with_mode(
+        &active_source_binary,
+        &source_binary,
+        BINARY_MAX_BYTES,
+        0o700,
+    ) {
+        let _ = fs::remove_file(&source_binary);
+        let _ = fs::remove_file(&backup);
+        return Err(error);
+    }
+    let source_binary_sha256 = match sha256_file(&source_binary, BINARY_MAX_BYTES) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_file(&source_binary);
+            let _ = fs::remove_file(&backup);
+            return Err(error);
+        }
+    };
+    let record = MajorUpgradeRecord {
+        record_version: MAJOR_UPGRADE_RECORD_VERSION,
+        source_state_schema: MAJOR_SOURCE_SCHEMA,
+        target_state_schema: SCHEMA_VERSION,
+        source_binary: source_binary.to_string_lossy().into_owned(),
+        source_binary_sha256,
+        state_backup: backup.to_string_lossy().into_owned(),
+        state_backup_sha256,
+        created_at_ms: now_ms_i64(),
+    };
+    if let Err(error) = write_major_upgrade_record(paths, &record) {
+        let _ = fs::remove_file(&source_binary);
+        let _ = fs::remove_file(&backup);
+        return Err(error);
+    }
+    Ok(record)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_major_upgrade_record(
+    paths: &RuntimePaths,
+    record: &MajorUpgradeRecord,
+) -> Result<(), String> {
+    if record.record_version != MAJOR_UPGRADE_RECORD_VERSION
+        || record.source_state_schema != MAJOR_SOURCE_SCHEMA
+        || record.target_state_schema != SCHEMA_VERSION
+    {
+        return Err("major-upgrade rollback record is incompatible with this binary".to_owned());
+    }
+    if Path::new(&record.source_binary) != major_upgrade_source_binary_path(paths)
+        || Path::new(&record.state_backup) != major_upgrade_backup_path(paths)
+    {
+        return Err(
+            "major-upgrade rollback record points outside its private backup set".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn load_major_upgrade_record(paths: &RuntimePaths) -> Result<Option<MajorUpgradeRecord>, String> {
+    let path = major_upgrade_record_path(paths);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("cannot read major-upgrade rollback record: {error}"))?;
+    if bytes.len() > 64 * 1024 {
+        return Err("major-upgrade rollback record is too large".to_owned());
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("cannot decode major-upgrade rollback record: {error}"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_major_upgrade_record(
+    paths: &RuntimePaths,
+    record: &MajorUpgradeRecord,
+) -> Result<(), String> {
+    let path = major_upgrade_record_path(paths);
+    if path.exists() {
+        return Err(format!(
+            "major-upgrade rollback record already exists: {}",
+            path.display()
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(record)
+        .map_err(|error| format!("cannot encode major-upgrade rollback record: {error}"))?;
+    let temp = path.with_file_name(format!(".rollback-{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(|error| format!("cannot create major-upgrade rollback record: {error}"))?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(format!(
+            "cannot persist major-upgrade rollback record: {error}"
+        ));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!(
+            "cannot commit major-upgrade rollback record: {error}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn snapshot_state_database(source: &Path, target: &Path) -> Result<(), String> {
+    if target.exists() {
+        return Err(format!(
+            "major-upgrade state snapshot already exists: {}",
+            target.display()
+        ));
+    }
+    let conn = Connection::open(source)
+        .map_err(|error| format!("cannot open state database for snapshot: {error}"))?;
+    let target_text = target
+        .to_str()
+        .ok_or_else(|| "major-upgrade snapshot path is not valid UTF-8".to_owned())?;
+    if let Err(error) = conn.execute("VACUUM INTO ?1", [target_text]) {
+        let _ = fs::remove_file(target);
+        return Err(format!(
+            "cannot snapshot state database before major upgrade: {error}"
+        ));
+    }
+    if let Err(error) = fs::set_permissions(target, fs::Permissions::from_mode(0o600)) {
+        let _ = fs::remove_file(target);
+        return Err(format!("cannot secure state snapshot: {error}"));
+    }
+    if let Err(error) = fs::File::open(target).and_then(|file| file.sync_all()) {
+        let _ = fs::remove_file(target);
+        return Err(format!("cannot sync state snapshot: {error}"));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn copy_regular_file(source: &Path, target: &Path, max_bytes: u64) -> Result<(), String> {
+    copy_regular_file_with_mode(source, target, max_bytes, 0o600)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn copy_regular_file_with_mode(
+    source: &Path,
+    target: &Path,
+    max_bytes: u64,
+    mode: u32,
+) -> Result<(), String> {
+    let meta = fs::symlink_metadata(source)
+        .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?;
+    if !meta.file_type().is_file() || meta.len() > max_bytes {
+        return Err(format!(
+            "refusing unsafe or oversized file {}",
+            source.display()
+        ));
+    }
+    fs::copy(source, target).map_err(|error| {
+        format!(
+            "cannot copy {} -> {}: {error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    fs::set_permissions(target, fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("cannot secure {}: {error}", target.display()))?;
+    fs::File::open(target)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("cannot sync {}: {error}", target.display()))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sha256_file(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !meta.file_type().is_file() || meta.len() > max_bytes {
+        return Err(format!(
+            "refusing unsafe or oversized file {}",
+            path.display()
+        ));
+    }
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn verify_file_sha256(
+    path: &Path,
+    expected: &str,
+    max_bytes: u64,
+    label: &str,
+) -> Result<(), String> {
+    if sha256_file(path, max_bytes)? != expected {
+        return Err(format!("{label} sha256 mismatch"));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_service_command(binary: &Path, paths: &RuntimePaths, args: &[&str]) -> Result<(), String> {
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .env("HERDR_MCP_CONFIG_DIR", &paths.config_dir)
+        .env_remove("HERDR_MCP_EXEC_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(name) = paths.instance.name() {
+        command.env("HERDR_MCP_INSTANCE", name);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("cannot execute {}: {error}", binary.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "{} {} failed: {}",
+        binary.display(),
+        args.join(" "),
+        stderr.chars().take(1024).collect::<String>().trim()
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn restore_state_backup(record: &MajorUpgradeRecord, state_path: &Path) -> Result<(), String> {
+    verify_file_sha256(
+        Path::new(&record.state_backup),
+        &record.state_backup_sha256,
+        MAJOR_BACKUP_MAX_BYTES,
+        "major-upgrade state backup",
+    )?;
+    let temp = state_path.with_file_name(format!(".state-restore-{}.tmp", std::process::id()));
+    if temp.exists() {
+        fs::remove_file(&temp)
+            .map_err(|error| format!("cannot clear stale state restore temp file: {error}"))?;
+    }
+    copy_regular_file(
+        Path::new(&record.state_backup),
+        &temp,
+        MAJOR_BACKUP_MAX_BYTES,
+    )?;
+    fs::rename(&temp, state_path)
+        .map_err(|error| format!("cannot restore pre-upgrade state database: {error}"))?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = state_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.exists() {
+            fs::remove_file(&sidecar).map_err(|error| {
+                format!(
+                    "cannot remove restored SQLite sidecar {}: {error}",
+                    sidecar.display()
+                )
+            })?;
+        }
+    }
+    let schema = read_raw_state_schema(state_path)?
+        .ok_or_else(|| "restored state database has no schema version".to_owned())?;
+    if schema != record.source_state_schema {
+        return Err(format!(
+            "restored state schema mismatch: expected {}, got {schema}",
+            record.source_state_schema
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn recover_major_upgrade(paths: &RuntimePaths, record: &MajorUpgradeRecord) -> Result<(), String> {
+    validate_major_upgrade_record(paths, record)?;
+    verify_file_sha256(
+        Path::new(&record.source_binary),
+        &record.source_binary_sha256,
+        BINARY_MAX_BYTES,
+        "major-upgrade source binary",
+    )?;
+    let stop_binary =
+        active_runtime_binary(paths).unwrap_or_else(|_| PathBuf::from(&record.source_binary));
+    run_service_command(&stop_binary, paths, &["service", "stop"])
+        .map_err(|error| format!("cannot stop service before major state restore: {error}"))?;
+    let state_path = paths.config_dir.join("state.db");
+    restore_state_backup(record, &state_path)?;
+    run_service_command(
+        Path::new(&record.source_binary),
+        paths,
+        &["service", "install"],
+    )?;
+    let schema = read_raw_state_schema(&state_path)?
+        .ok_or_else(|| "restored runtime did not expose a state database".to_owned())?;
+    if schema != record.source_state_schema {
+        return Err(format!(
+            "restored runtime changed state schema unexpectedly: expected {}, got {schema}",
+            record.source_state_schema
+        ));
+    }
+    let record_path = major_upgrade_record_path(paths);
+    fs::remove_file(&record_path)
+        .map_err(|error| format!("cannot retire major-upgrade rollback record: {error}"))?;
+    let backup = Path::new(&record.state_backup);
+    if backup.is_file() {
+        fs::remove_file(backup).map_err(|error| {
+            format!("cannot retire consumed major-upgrade state backup: {error}")
+        })?;
+    }
+    let source_binary = Path::new(&record.source_binary);
+    if source_binary.is_file() {
+        fs::remove_file(source_binary).map_err(|error| {
+            format!("cannot retire consumed major-upgrade source binary: {error}")
+        })?;
+    }
+    let dir = major_upgrade_dir(paths);
+    if dir.is_dir() {
+        fs::remove_dir(&dir).map_err(|error| {
+            format!("cannot retire empty major-upgrade backup directory: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 fn status() -> Result<ExitCode, String> {
@@ -1329,6 +1930,301 @@ fn error_kind(error: &reqwest::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn test_runtime_paths(root: &Path) -> RuntimePaths {
+        RuntimePaths {
+            instance: crate::instance::InstanceId::default_instance(),
+            config_dir: root.to_path_buf(),
+            config_file: root.join("config.toml"),
+            dev_state_dir: root.join("dev-state"),
+            herdr_socket: Some(root.join("herdr.sock")),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn write_test_executable(path: &Path, body: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body.as_bytes()).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn write_test_state(path: &Path, schema: i64, sentinel: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE sentinel (value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+            [schema.to_string()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sentinel(value) VALUES (?1)", [sentinel])
+            .unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_upgrade_backup_restores_schema5_state_exactly() {
+        let root = env::temp_dir().join(format!(
+            "herdr-major-upgrade-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let state = root.join("state.db");
+        let backup = root.join("backup.db");
+        let conn = Connection::open(&state).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES ('schema_version', '5');
+             CREATE TABLE sentinel (value TEXT NOT NULL);
+             INSERT INTO sentinel(value) VALUES ('before-major-upgrade');",
+        )
+        .unwrap();
+        drop(conn);
+        snapshot_state_database(&state, &backup).unwrap();
+        let backup_sha256 = sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap();
+
+        let conn = Connection::open(&state).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+            [SCHEMA_VERSION.to_string()],
+        )
+        .unwrap();
+        conn.execute("UPDATE sentinel SET value = 'after-major-upgrade'", [])
+            .unwrap();
+        drop(conn);
+
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: MAJOR_SOURCE_SCHEMA,
+            target_state_schema: SCHEMA_VERSION,
+            source_binary: "/unused/source".to_owned(),
+            source_binary_sha256: "0".repeat(64),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: backup_sha256,
+            created_at_ms: now_ms_i64(),
+        };
+        restore_state_backup(&record, &state).unwrap();
+        assert_eq!(
+            read_raw_state_schema(&state).unwrap(),
+            Some(MAJOR_SOURCE_SCHEMA)
+        );
+        let conn = Connection::open(&state).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "before-major-upgrade");
+        drop(conn);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_upgrade_record_keeps_private_executable_source_binary() {
+        let root = env::temp_dir().join(format!(
+            "herdr-major-source-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+        let active_sha256 = sha256_file(&active, BINARY_MAX_BYTES).unwrap();
+        let state = root.join("state.db");
+        write_test_state(&state, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
+
+        let record = prepare_major_upgrade_record(&paths, &state).unwrap();
+        let rollback_binary = major_upgrade_source_binary_path(&paths);
+        assert_eq!(Path::new(&record.source_binary), rollback_binary);
+        assert!(rollback_binary.is_file());
+        assert_ne!(
+            fs::metadata(&rollback_binary).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert_eq!(record.source_binary_sha256, active_sha256);
+        assert_eq!(
+            sha256_file(&rollback_binary, BINARY_MAX_BYTES).unwrap(),
+            active_sha256
+        );
+        validate_major_upgrade_record(&paths, &record).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_rollback_stop_failure_preserves_live_schema13_state() {
+        let root = env::temp_dir().join(format!(
+            "herdr-major-stop-failure-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\necho stop-failed >&2\nexit 23\n");
+
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        write_test_executable(&source_binary, "#!/bin/sh\nexit 0\n");
+        let state = root.join("state.db");
+        write_test_state(&state, SCHEMA_VERSION, "after-major-upgrade");
+        let backup = major_upgrade_backup_path(&paths);
+        write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: MAJOR_SOURCE_SCHEMA,
+            target_state_schema: SCHEMA_VERSION,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+
+        let error = recover_major_upgrade(&paths, &record).unwrap_err();
+        assert!(error.contains("cannot stop service before major state restore"));
+        assert_eq!(read_raw_state_schema(&state).unwrap(), Some(SCHEMA_VERSION));
+        let conn = Connection::open(&state).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "after-major-upgrade");
+        drop(conn);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_apply_stop_failure_preserves_schema5_and_retry_material() {
+        let _guard = crate::test_env::lock();
+        let root = env::temp_dir().join(format!(
+            "herdr-major-apply-stop-failure-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let previous_config = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_exec = env::var_os("HERDR_MCP_EXEC_ID");
+        let previous_instance = env::var_os("HERDR_MCP_INSTANCE");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &root);
+            env::remove_var("HERDR_MCP_EXEC_ID");
+            env::remove_var("HERDR_MCP_INSTANCE");
+        }
+
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\necho stop-failed >&2\nexit 23\n");
+        let state = root.join("state.db");
+        write_test_state(&state, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
+
+        let error = major_apply().unwrap_err();
+        assert!(error.contains("cannot stop service before major state migration"));
+        assert_eq!(
+            read_raw_state_schema(&state).unwrap(),
+            Some(MAJOR_SOURCE_SCHEMA)
+        );
+        let paths = test_runtime_paths(&root);
+        assert!(major_upgrade_record_path(&paths).is_file());
+        assert!(major_upgrade_backup_path(&paths).is_file());
+        assert!(major_upgrade_source_binary_path(&paths).is_file());
+
+        unsafe {
+            match previous_config {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_exec {
+                Some(value) => env::set_var("HERDR_MCP_EXEC_ID", value),
+                None => env::remove_var("HERDR_MCP_EXEC_ID"),
+            }
+            match previous_instance {
+                Some(value) => env::set_var("HERDR_MCP_INSTANCE", value),
+                None => env::remove_var("HERDR_MCP_INSTANCE"),
+            }
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_rollback_accepts_half_recovered_schema5_state() {
+        let _guard = crate::test_env::lock();
+        let root = env::temp_dir().join(format!(
+            "herdr-major-half-recovered-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let previous_config = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_exec = env::var_os("HERDR_MCP_EXEC_ID");
+        let previous_instance = env::var_os("HERDR_MCP_INSTANCE");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &root);
+            env::remove_var("HERDR_MCP_EXEC_ID");
+            env::remove_var("HERDR_MCP_INSTANCE");
+        }
+
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        write_test_executable(&source_binary, "#!/bin/sh\nexit 0\n");
+        let state = root.join("state.db");
+        write_test_state(&state, MAJOR_SOURCE_SCHEMA, "half-recovered");
+        let backup = major_upgrade_backup_path(&paths);
+        write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: MAJOR_SOURCE_SCHEMA,
+            target_state_schema: SCHEMA_VERSION,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        assert_eq!(major_rollback().unwrap(), ExitCode::SUCCESS);
+        assert_eq!(
+            read_raw_state_schema(&state).unwrap(),
+            Some(MAJOR_SOURCE_SCHEMA)
+        );
+        let conn = Connection::open(&state).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "before-major-upgrade");
+        drop(conn);
+        assert!(!dir.exists());
+
+        unsafe {
+            match previous_config {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_exec {
+                Some(value) => env::set_var("HERDR_MCP_EXEC_ID", value),
+                None => env::remove_var("HERDR_MCP_EXEC_ID"),
+            }
+            match previous_instance {
+                Some(value) => env::set_var("HERDR_MCP_INSTANCE", value),
+                None => env::remove_var("HERDR_MCP_INSTANCE"),
+            }
+        }
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn update_check_failure_is_explicitly_indeterminate() {
