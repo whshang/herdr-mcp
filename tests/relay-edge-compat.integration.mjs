@@ -17,6 +17,7 @@ import {
 import { EPOCH1_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch1.js";
 import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
+import { EPOCH4_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch4.js";
 import { PUBLIC_CONTRACT } from "../edge/cloudflare/dist/contracts/public.js";
 import {
   RUNTIME_EXECUTION_CONTRACT,
@@ -117,4 +118,78 @@ test("public epoch 3 evolves independently while runtime execution stays epoch 2
   assert.equal(isCompatibleRuntimeContract(1, EPOCH1_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH1_CONTRACT.contract_hash), false);
   assert.equal(isCompatibleRuntimeContract(1, EPOCH2_CONTRACT.contract_hash), false);
+});
+
+test("future epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {
+  const readOnly = [
+    "herdr_methods",
+    "herdr_inspect",
+    "herdr_skill",
+    "herdr_since",
+    "herdr_fs_read",
+    "herdr_fs_list",
+    "herdr_fs_grep",
+    "herdr_fs_image",
+    "herdr_git",
+    "herdr_exec_read",
+    "herdr_devices",
+  ];
+  const mutationCapable = [
+    "herdr_call",
+    "herdr_fs_patch",
+    "herdr_fs_edit",
+    "herdr_fs_write",
+    "herdr_exec_start",
+    "herdr_exec_kill",
+    "herdr_exec",
+    "herdr_prompt",
+  ];
+  // Epoch 4 is not yet active: the public surface still resolves to epoch 3.
+  assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
+  assert.equal(EPOCH4_CONTRACT.contract_epoch, 4);
+  assert.equal(EPOCH4_CONTRACT.tool_count, EPOCH3_CONTRACT.tool_count);
+  assert.deepEqual(
+    EPOCH4_CONTRACT.tools.map((tool) => tool.name).sort(),
+    EPOCH3_CONTRACT.tools.map((tool) => tool.name).sort(),
+  );
+  // The declared hash must be the real hash of the annotated catalog.
+  assert.equal(computeContractHash(EPOCH4_CONTRACT.tools), EPOCH4_CONTRACT.contract_hash);
+  for (const name of readOnly) {
+    const tool = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === name);
+    assert.ok(tool, `${name} must exist in epoch 4`);
+    assert.equal(tool.annotations?.readOnlyHint, true, `${name} must be truthfully read-only`);
+  }
+  const closedWorldReadOnly = [
+    "herdr_methods",
+    "herdr_inspect",
+    "herdr_since",
+    "herdr_fs_read",
+    "herdr_fs_list",
+    "herdr_fs_grep",
+    "herdr_fs_image",
+    "herdr_git",
+    "herdr_exec_read",
+    "herdr_devices",
+  ];
+  for (const name of closedWorldReadOnly) {
+    const tool = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === name);
+    assert.ok(tool, `${name} must exist in epoch 4`);
+    assert.equal(tool.annotations?.readOnlyHint, true, `${name} must be truthfully read-only`);
+    assert.equal(tool.annotations?.openWorldHint, false, `${name} must be truthfully closed-world`);
+  }
+  const skill = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === "herdr_skill");
+  assert.equal(skill.annotations?.readOnlyHint, true);
+  assert.notEqual(skill.annotations?.openWorldHint, false, "herdr_skill may refresh configured upstream policy");
+  for (const name of mutationCapable) {
+    const tool = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === name);
+    assert.ok(tool, `${name} must exist in epoch 4`);
+    assert.notEqual(tool.annotations?.readOnlyHint, true, `${name} must not be mislabeled read-only`);
+  }
+  // Only annotations differ from epoch 3; the underlying tool definitions are untouched.
+  const strip = (tools) => tools.map(({ annotations, ...rest }) => rest);
+  assert.deepEqual(strip(EPOCH4_CONTRACT.tools), strip(EPOCH3_CONTRACT.tools));
+  // Frozen prior epochs stayed bit-for-bit identical.
+  assert.equal(EPOCH3_CONTRACT.contract_hash, "sha256:b8b4e5d13ccb3a1a7ab0c2e9ccfa913c076d0e1cd978cfe544d1261ea2509071");
+  assert.equal(computeContractHash(EPOCH3_CONTRACT.tools), EPOCH3_CONTRACT.contract_hash);
+  assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), EPOCH2_CONTRACT.contract_hash);
 });
