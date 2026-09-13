@@ -22,6 +22,10 @@ export type RelayErrorCode =
   | "unsupported_protocol_version"
   | "workstation_mismatch"
   | "link_auth_failed"
+  | "device_route_unverified"
+  | "device_paused"
+  | "device_suspended"
+  | "device_revoked"
   | "edge_capacity_exceeded"
   | "edge_mcp_placeholder"
   | "internal_error";

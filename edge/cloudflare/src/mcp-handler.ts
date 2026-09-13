@@ -13,6 +13,7 @@ import {
 import { checkArgsBudget } from "./payload.js";
 import { newRequestId } from "./pending.js";
 import type { DeviceRouteResult } from "./device-directory.js";
+import { extractDeviceIdFromArgs } from "./device-refs.js";
 import { normalizeDeviceId } from "./device-model.js";
 import type { InternalForwardRequest } from "./workstation-do.js";
 import { discoverFleetControlMethods, invalidFleetControlParam, isFleetControlMethod, type FleetControlMethod } from "./fleet-control.js";
@@ -108,6 +109,7 @@ interface ForwardEnvelope {
     | { status: "ok"; result?: unknown }
     | { status: "error"; error: RelayErrorResult; servedAtMs?: number };
   error?: RelayErrorResult;
+  route_device_name?: string;
 }
 
 const PUBLIC_TOOL_NAMES: ReadonlySet<string> = new Set<string>(PUBLIC_CONTRACT.tools.map((tool) => tool.name));
@@ -122,6 +124,48 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function validId(value: unknown): value is JsonRpcId {
   return value === null || typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
+}
+
+/**
+ * Registry-free route candidate for immutable device identities. This resolves
+ * only the address; execution authorization is still enforced by the
+ * WorkstationDO execution fence. Names, aliases, and implicit defaults remain
+ * DeviceRegistryDO-owned.
+ */
+function canonicalDeviceRouteCandidate(
+  selector: string | undefined,
+  args?: Record<string, unknown>,
+): DeviceRouteResult | null {
+  const extractedRef = args ? extractDeviceIdFromArgs(args) : null;
+  if (extractedRef && (
+    extractedRef.deviceId === "__conflict__"
+    || extractedRef.deviceId === "__type_mismatch__"
+    || extractedRef.deviceId === "__malformed__"
+  )) {
+    return { ok: false, code: "device_ref_conflict" };
+  }
+
+  if (selector !== undefined) {
+    const canonical = normalizeDeviceId(selector.trim());
+    if (!canonical) return null;
+    if (extractedRef && extractedRef.deviceId !== canonical) return { ok: false, code: "device_ref_conflict" };
+    return {
+      ok: true,
+      device_id: canonical,
+      workstation_id: canonical,
+      routing_reason: "explicit_device",
+    };
+  }
+
+  if (extractedRef) {
+    return {
+      ok: true,
+      device_id: extractedRef.deviceId,
+      workstation_id: extractedRef.deviceId,
+      routing_reason: "device_ref",
+    };
+  }
+  return null;
 }
 
 function rpcResult(id: JsonRpcId, result: unknown): McpResponse {
@@ -156,6 +200,26 @@ function callToolResult(structured: Record<string, unknown>, isError = false): R
     structuredContent: structured,
     ...(isError ? { isError: true } : {}),
   };
+}
+
+function routeErrorResponse(
+  id: JsonRpcId,
+  args: Record<string, unknown>,
+  route: Extract<DeviceRouteResult, { ok: false }>,
+): McpResponse {
+  return rpcResult(id, callToolResult({
+    ok: false,
+    code: route.code,
+    retryable: false,
+    delivery_state: "not_delivered",
+    failure_layer: "edge_routing",
+    requested_target: args.target ?? args.pane_id ?? args.pane ?? args.workspace_id ?? args.workspace ?? null,
+    selected_device: route.selected_device ?? null,
+    candidate_devices: route.candidate_devices ?? [],
+    next_action: route.code === "device_ambiguous"
+      ? "retry with an explicit device selector or a device-aware ref"
+      : "inspect device routing state and retry only after selecting an enrolled routable device",
+  }, true));
 }
 
 const PRIVATE_METHOD_ROUTES = [
@@ -984,13 +1048,13 @@ export async function handleMcp(
     }
     const boundAutomationDevice = deps.client?.automationDeviceId ?? null;
     let route: DeviceRouteResult;
+    let usedCanonicalFastRoute = false;
     try {
       if (boundAutomationDevice) {
         // An automation principal is scoped to exactly one enrolled device. An
         // omitted selector routes automatically to the bound device; any explicit
         // selector or device ref referring to a different device fails closed so
         // the automation client can never route to or discover another device.
-        const { extractDeviceIdFromArgs } = await import("./device-refs.js");
         const ref = extractDeviceIdFromArgs(args);
         const refTarget = ref ? ref.deviceId : null;
         if (selectorValue !== undefined && selectorValue.trim() !== "") {
@@ -1018,16 +1082,28 @@ export async function handleMcp(
             bound_device_id: boundAutomationDevice,
           }, true));
         }
-        route = await deps.resolveDevice!(boundAutomationDevice, args);
+        const fast = canonicalDeviceRouteCandidate(boundAutomationDevice, args);
+        if (fast !== null) {
+          route = fast;
+          usedCanonicalFastRoute = fast.ok;
+        } else {
+          route = await deps.resolveDevice!(boundAutomationDevice, args);
+        }
       } else {
-        route = deps.resolveDevice
-          ? await deps.resolveDevice(selectorValue, args)
-          : {
-              ok: true,
-              device_id: null,
-              workstation_id: workstationId,
-              routing_reason: "legacy_default_device",
-            };
+        const fast = canonicalDeviceRouteCandidate(selectorValue, args);
+        if (fast !== null) {
+          route = fast;
+          usedCanonicalFastRoute = fast.ok;
+        } else {
+          route = deps.resolveDevice
+            ? await deps.resolveDevice(selectorValue, args)
+            : {
+                ok: true,
+                device_id: null,
+                workstation_id: workstationId,
+                routing_reason: "legacy_default_device",
+              };
+        }
       }
     } catch {
       return rpcResult(
@@ -1035,21 +1111,12 @@ export async function handleMcp(
         callToolResult({ ok: false, code: "device_registry_unavailable", retryable: true }, true),
       );
     }
-    if (!route.ok) {
-      return rpcResult(id, callToolResult({
-        ok: false,
-        code: route.code,
-        retryable: false,
-        delivery_state: "not_delivered",
-        failure_layer: "edge_routing",
-        requested_target: args.target ?? args.pane_id ?? args.pane ?? args.workspace_id ?? args.workspace ?? null,
-        selected_device: route.selected_device ?? null,
-        candidate_devices: route.candidate_devices ?? [],
-        next_action: route.code === "device_ambiguous"
-          ? "retry with an explicit device selector or a device-aware ref"
-          : "inspect device routing state and retry only after selecting an enrolled routable device",
-      }, true));
-    }
+    if (!route.ok) return routeErrorResponse(id, args, route);
+
+    // Capture the narrowed route identity before the retry loop mutates `route`;
+    // callbacks below must not rely on TypeScript preserving a narrowing across
+    // that later assignment.
+    const initialRouteDeviceId = route.device_id;
 
     // Unwrap device-aware opaque refs before forwarding to the runtime;
     // the runtime contract remains epoch 2 without device metadata.
@@ -1064,18 +1131,18 @@ export async function handleMcp(
       typeof runtimeArgs.idempotency_key === "string" && runtimeArgs.idempotency_key.length > 0
         ? runtimeArgs.idempotency_key
         : undefined;
-    const webchatControlGrants = isBrowserPrivateMethod && route.device_id
+    const webchatControlGrants = isBrowserPrivateMethod && initialRouteDeviceId
       ? (deps.client?.webchatControlGrants ?? [])
-        .filter((grant) => grant.device_id === route.device_id)
+        .filter((grant) => grant.device_id === initialRouteDeviceId)
         .map((grant) => ({
           endpoint_ref: grant.endpoint_ref,
           provider: grant.provider,
           account_ref: grant.account_ref,
         }))
       : [];
-    const pageAssistGrants = isPageAssistPrivateMethod && route.device_id
+    const pageAssistGrants = isPageAssistPrivateMethod && initialRouteDeviceId
       ? (deps.client?.pageAssistGrants ?? [])
-        .filter((grant) => grant.device_id === route.device_id)
+        .filter((grant) => grant.device_id === initialRouteDeviceId)
         .map((grant) => ({ endpoint_ref: grant.endpoint_ref }))
       : [];
     const webchatAuthorization = isBrowserPrivateMethod
@@ -1108,6 +1175,8 @@ export async function handleMcp(
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
       contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
       idempotencyKey,
+      ...(route.device_id ? { routeDeviceId: route.device_id } : {}),
+      ...(route.execution_fence ? { executionFence: route.execution_fence } : {}),
       ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0 || webchatAuthorization
         ? {
           trace: {
@@ -1203,6 +1272,37 @@ export async function handleMcp(
       }
 
       const retryError = forwardEnvelopeError(forwarded);
+      if (
+        usedCanonicalFastRoute
+        && retryError?.code === "device_route_unverified"
+        && deps.resolveDevice
+      ) {
+        let authoritative: DeviceRouteResult;
+        try {
+          authoritative = await deps.resolveDevice(boundAutomationDevice ?? selectorValue, args);
+        } catch {
+          return rpcResult(id, callToolResult({ ok: false, code: "device_registry_unavailable", retryable: true }, true));
+        }
+        if (!authoritative.ok) return routeErrorResponse(id, args, authoritative);
+        const retryRequestId = newRequestId();
+        deps.logger.warn("mcp.tools_call.route_fence_bootstrap", {
+          requestId: activeRequestId,
+          retryRequestId,
+          deviceId: authoritative.device_id,
+          workstationId: authoritative.workstation_id,
+        });
+        route = authoritative;
+        usedCanonicalFastRoute = false;
+        activeRequestId = retryRequestId;
+        activeInternal = {
+          ...activeInternal,
+          requestId: retryRequestId,
+          ...(route.device_id ? { routeDeviceId: route.device_id } : { routeDeviceId: undefined }),
+          ...(route.execution_fence ? { executionFence: route.execution_fence } : { executionFence: undefined }),
+        };
+        forwarded = undefined;
+        continue;
+      }
       if (attempt < GENERATION_SUPERSEDE_RETRY_BACKOFF_MS.length && generationSupersededRetry(retryError)) {
         const retryRequestId = newRequestId();
         const retryDelayMs = generationSupersededRetryDelay(retryError, attempt);
@@ -1244,7 +1344,11 @@ export async function handleMcp(
     if (forwarded.status === "ok" && forwarded.completion?.status === "ok") {
       // For device-routed calls, wrap workspace/pane ids into device-aware opaque refs
       // so follow-up calls retain affinity without trusting arbitrary path strings.
-      const wrapped = wrapResultWithDevice(forwarded.completion.result, route.device_id, route.device_name);
+      const wrapped = wrapResultWithDevice(
+        forwarded.completion.result,
+        route.device_id,
+        route.device_name ?? forwarded.route_device_name,
+      );
       return rpcResult(id, normalizeSuccessfulToolResult(wrapped));
     }
     if (forwarded.status === "ok" && forwarded.completion?.status === "error") {

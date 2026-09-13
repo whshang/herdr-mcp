@@ -252,11 +252,15 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
     { device_id: DEV_A, workstation_id: "ws-a", name: "a", authorization: "active", scheduling: "enabled" },
     { device_id: DEV_B, workstation_id: "ws-b", name: "b", authorization: "active", scheduling: "enabled" },
   ];
+  let registryReads = 0;
   const deps = {
     limits: makeLimits(),
     logger: { warn() {} },
     getStub: (id) => ({ workstationId: id }),
-    resolveDevice: async (sel, args) => resolveDeviceRouteWithContext(registryWith(devices), { selector: sel, args, legacyWorkstationId: "legacy" }),
+    resolveDevice: async (sel, args) => {
+      registryReads += 1;
+      return resolveDeviceRouteWithContext(registryWith(devices), { selector: sel, args, legacyWorkstationId: "legacy" });
+    },
     forward: async (_stub, body) => {
       const parsed = JSON.parse(body);
       assert.equal(Object.hasOwn(parsed.args, "device"), false);
@@ -271,7 +275,11 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
         ],
         structuredContent: { workspaces: [{ workspace_id: "w1" }], ok: true },
       };
-      return new Response(JSON.stringify({ status: "ok", completion: { status: "ok", result: runtimeResult } }), { headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: runtimeResult },
+        route_device_name: parsed.routeDeviceId === DEV_A ? "a" : parsed.routeDeviceId === DEV_B ? "b" : undefined,
+      }), { headers: { "content-type": "application/json" } });
     },
     now: () => 1000,
   };
@@ -287,6 +295,7 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
   assert.equal(r1.body.result.content.length, 2);
   assert.equal(r1.body.result.content[1].type, "image");
   assert.equal(JSON.parse(r1.body.result.content[0].text).device_name, "a");
+  assert.equal(registryReads, 0, "warm explicit canonical route must not consult DeviceRegistryDO");
   // Follow-up uses the opaque ref without explicit device -> must route to same device
   const r2 = await handleMcp({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "herdr_exec", arguments: { workspace: wrappedId, command: "ls" } } }, "legacy", deps);
   assert.equal(r2.body.result.isError, undefined);
@@ -296,9 +305,11 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
   assert.equal(decodeDeviceRef(textRef).d, DEV_A);
   const r2Text = await handleMcp({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "herdr_exec", arguments: { workspace: textRef, command: "ls" } } }, "legacy", deps);
   assert.equal(r2Text.body.result.isError, undefined);
+  assert.equal(registryReads, 0, "device-aware opaque-ref follow-ups must remain registry-free");
   // Ambiguous without selector/ref should fail
   const r3 = await handleMcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "herdr_exec", arguments: { workspace: "w1", command: "ls" } } }, "legacy", deps);
   assert.equal(r3.body.result.isError, true);
+  assert.equal(registryReads, 1, "only the implicit ambiguous route should consult DeviceRegistryDO");
   assert.equal(r3.body.result.structuredContent.code, "device_ambiguous");
   assert.equal(r3.body.result.structuredContent.delivery_state, "not_delivered");
   assert.equal(r3.body.result.structuredContent.candidate_devices.length, 2);
