@@ -114,6 +114,9 @@ const REVOKED_CLOSE_CODE = 4401;
  * completed request. Pending request deadlines remain exact.
  */
 const COMPLETED_CLEANUP_ALARM_GRANULARITY_MS = 60_000;
+/** Suppress immediate identical host-generated read calls without any DO writes. */
+const READ_DUPLICATE_COALESCE_WINDOW_MS = 3_000;
+const MAX_RECENT_READ_DEDUPE_RESULTS = 128;
 
 /**
  * Durable settlement row (completed:<id>). The completed row is the
@@ -182,6 +185,8 @@ export interface InternalForwardRequest {
   contractEpoch?: number;
   contractHash?: string;
   idempotencyKey?: string;
+  /** Edge-generated hash for short-window coalescing of identical read calls. */
+  readDedupeKey?: string;
   trace?: Record<string, unknown>;
   /** Trusted Edge-only route identity. Never forwarded to the workstation Link. */
   routeDeviceId?: string;
@@ -207,6 +212,7 @@ interface EphemeralReadRequest {
   createdAtMs: number;
   sentAtMs?: number;
   deadlineMs: number;
+  readDedupeKey?: string;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -235,6 +241,9 @@ export class WorkstationDO {
   private executionFence: DeviceExecutionFence | undefined;
   /** Known-safe reads are correlated only in memory and never enter DO storage. */
   private readonly ephemeralReads = new Map<string, EphemeralReadRequest>();
+  /** Process-local duplicate suppression only; never persisted across hibernation. */
+  private readonly inFlightReadDedupe = new Map<string, Promise<Completion>>();
+  private readonly recentReadDedupe = new Map<string, { completion: Completion; settledAtMs: number }>();
   /** In-memory resolver cache only; storage remains authoritative. */
   private readonly resolvers = new Map<string, (completion: Completion) => void>();
   /** Brief reconnect grace waiters. Process-local only: zero DO storage/alarm writes. */
@@ -749,8 +758,21 @@ export class WorkstationDO {
     // lifecycle process-local so read-heavy traffic consumes zero Durable
     // Storage rows and zero Durable Object alarm writes.
     if (opClass === "read") {
-      return this.forwardEphemeralRead({ requestId, workstationId, op: req.op, deadlineMs, wire, now, routeDeviceId: req.routeDeviceId });
+      return this.forwardEphemeralRead({
+        requestId,
+        workstationId,
+        op: req.op,
+        deadlineMs,
+        wire,
+        now,
+        routeDeviceId: req.routeDeviceId,
+        readDedupeKey: req.readDedupeKey,
+      });
     }
+
+    // A mutation is a state boundary. Reads after it must observe fresh state.
+    this.inFlightReadDedupe.clear();
+    this.recentReadDedupe.clear();
 
     // Reconcile any durable mutation left past deadline by a previous isolate
     // before admitting a new mutation. If storage is over quota this fails
@@ -945,8 +967,18 @@ export class WorkstationDO {
     wire: ToolRequestMessage;
     now: number;
     routeDeviceId?: string;
+    readDedupeKey?: string;
   }): Promise<Response> {
-    const { requestId, workstationId, op, deadlineMs, wire, now } = opts;
+    const { requestId, workstationId, op, deadlineMs, wire, now, readDedupeKey } = opts;
+    this.pruneRecentReadDedupe(now);
+    if (readDedupeKey) {
+      const inFlight = this.inFlightReadDedupe.get(readDedupeKey);
+      if (inFlight) return this.successfulForwardResponse(await inFlight, opts.routeDeviceId);
+      const recent = this.recentReadDedupe.get(readDedupeKey);
+      if (recent && now - recent.settledAtMs <= READ_DUPLICATE_COALESCE_WINDOW_MS) {
+        return this.successfulForwardResponse(recent.completion, opts.routeDeviceId);
+      }
+    }
     // Preserve one coherent live-request capacity bound, but exclude expired
     // durable rows so historical mutation backlog cannot starve fresh reads.
     if (this.registry.liveCount(now) + this.ephemeralReads.size >= this.limits.maxPendingRequests) {
@@ -966,6 +998,7 @@ export class WorkstationDO {
       state: "queued",
       createdAtMs: now,
       deadlineMs,
+      readDedupeKey,
     };
     this.ephemeralReads.set(requestId, entry);
 
@@ -985,8 +1018,37 @@ export class WorkstationDO {
     }
     entry.state = "sent";
     entry.sentAtMs = now;
-    const completion = await this.awaitEphemeralRead(requestId, deadlineMs);
+    const completionPromise = this.awaitEphemeralRead(requestId, deadlineMs);
+    if (readDedupeKey) this.inFlightReadDedupe.set(readDedupeKey, completionPromise);
+    const completion = await completionPromise;
+    if (readDedupeKey) {
+      const stillCurrent = this.inFlightReadDedupe.get(readDedupeKey) === completionPromise;
+      if (stillCurrent) {
+        this.inFlightReadDedupe.delete(readDedupeKey);
+        if (completion.status === "ok") this.rememberRecentReadDedupe(readDedupeKey, completion, Date.now());
+      }
+    }
     return this.successfulForwardResponse(completion, opts.routeDeviceId);
+  }
+
+  private pruneRecentReadDedupe(now: number): void {
+    for (const [key, entry] of this.recentReadDedupe) {
+      if (now - entry.settledAtMs > READ_DUPLICATE_COALESCE_WINDOW_MS) this.recentReadDedupe.delete(key);
+    }
+  }
+
+  private rememberRecentReadDedupe(key: string, completion: Completion, settledAtMs: number): void {
+    this.recentReadDedupe.set(key, { completion, settledAtMs });
+    if (this.recentReadDedupe.size <= MAX_RECENT_READ_DEDUPE_RESULTS) return;
+    let oldestKey: string | undefined;
+    let oldestAt = Number.POSITIVE_INFINITY;
+    for (const [candidate, entry] of this.recentReadDedupe) {
+      if (entry.settledAtMs < oldestAt) {
+        oldestAt = entry.settledAtMs;
+        oldestKey = candidate;
+      }
+    }
+    if (oldestKey) this.recentReadDedupe.delete(oldestKey);
   }
 
   private awaitEphemeralRead(requestId: string, deadlineMs: number): Promise<Completion> {

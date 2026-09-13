@@ -1468,8 +1468,11 @@ const H2W_CONTENT_VERSION = "0.1.91";
     try {
       if (list.length === 0) sessionStorage.removeItem(PENDING_SELF_ARCHIVE_STORAGE_KEY);
       else sessionStorage.setItem(PENDING_SELF_ARCHIVE_STORAGE_KEY, JSON.stringify(list));
-    } catch (_) {}
-    return list;
+    } catch (_) {
+      // Fail closed: an unpersisted intent must never be treated as durable.
+      return false;
+    }
+    return true;
   }
 
   function enqueuePendingSelfArchive(params, sessionRef, generation, conversationId) {
@@ -1483,17 +1486,56 @@ const H2W_CONTENT_VERSION = "0.1.91";
       existing.sessionRef = sessionRef;
       existing.generation = generation;
       existing.conversationId = conversationId;
-      writePendingSelfArchives(list);
-      return true;
+      return writePendingSelfArchives(list);
     }
     list.push({ idempotencyKey, sessionRef, generation, conversationId, requestedAt: Date.now() });
-    writePendingSelfArchives(list);
-    return true;
+    return writePendingSelfArchives(list);
   }
 
   function removePendingSelfArchive(idempotencyKey) {
     const list = readPendingSelfArchives().filter((item) => item.idempotencyKey !== idempotencyKey);
     writePendingSelfArchives(list);
+  }
+
+  function pendingSelfArchiveAlreadyClicked(idempotencyKey) {
+    if (!idempotencyKey) return false;
+    return readPendingSelfArchives().some((item) => (
+      item.idempotencyKey === idempotencyKey && item.deliveryAttempted === true
+    ));
+  }
+
+  // Claims the one-shot delivery for an intent and returns whether this call
+  // newly claimed it. A claim must be persisted and verified before the archive
+  // click is dispatched, and an already-claimed key returns false so a
+  // concurrent same-key call cannot click a second time.
+  function markPendingSelfArchiveClicked(idempotencyKey, sessionRef, generation, conversationId) {
+    if (!idempotencyKey) return false;
+    const list = readPendingSelfArchives();
+    const existing = list.find((item) => item.idempotencyKey === idempotencyKey);
+    if (existing) {
+      if (existing.deliveryAttempted === true) return false;
+      existing.sessionRef = sessionRef;
+      existing.generation = generation;
+      existing.conversationId = conversationId;
+      existing.deliveryAttempted = true;
+    } else {
+      list.push({
+        idempotencyKey,
+        sessionRef,
+        generation,
+        conversationId,
+        requestedAt: Date.now(),
+        deliveryAttempted: true,
+      });
+    }
+    return writePendingSelfArchives(list) && pendingSelfArchiveAlreadyClicked(idempotencyKey);
+  }
+
+  // A clicked intent is terminal: the provider readback may be inconclusive, but
+  // the archive click has already been dispatched, so only an intent that is
+  // still clearly undelivered may keep a retry alive.
+  function hasRetryablePendingSelfArchive() {
+    return readPendingSelfArchives().some((item) => item.deliveryAttempted !== true);
   }
 
   let pendingSelfArchiveDrainTimer = null;
@@ -1506,17 +1548,40 @@ const H2W_CONTENT_VERSION = "0.1.91";
     }, PENDING_SELF_ARCHIVE_POLL_MS);
   }
 
-  async function actuateChatGptArchive(conversationId) {
+  async function actuateChatGptArchive(conversationId, identity) {
+    const idempotencyKey = typeof identity?.idempotencyKey === "string" ? identity.idempotencyKey : "";
+    if (pendingSelfArchiveAlreadyClicked(idempotencyKey)) {
+      // This exact key already dispatched an archive click whose readback was
+      // inconclusive. Never click a second time; stay honest about uncertainty.
+      return { outcome: "uncertain", delivered: true };
+    }
     const archive = await openChatGptArchiveMenu();
-    if (!archive) return "rejected";
-    archive.click();
+    if (!archive) return { outcome: "rejected", delivered: false };
+    // Converge the one-shot rule here, before the real click: persist and verify
+    // the delivery claim first, so a reload or same-key re-entry inside the
+    // click/poll window cannot replay it and an unpersistable claim never
+    // mutates the provider.
+    if (!markPendingSelfArchiveClicked(idempotencyKey, identity?.sessionRef, identity?.generation, conversationId)) {
+      // Synchronous re-check after the menu await: a concurrent same-key call
+      // may have claimed the delivery while this call waited. An already-claimed
+      // key stays uncertain/delivered; otherwise the claim could not be
+      // persisted and this call must fail closed without mutating.
+      return pendingSelfArchiveAlreadyClicked(idempotencyKey)
+        ? { outcome: "uncertain", delivered: true }
+        : { outcome: "rejected", delivered: false };
+    }
+    try {
+      archive.click();
+    } catch (_) {
+      return { outcome: "uncertain", delivered: true };
+    }
     const deadline = Date.now() + 6000;
     do {
       const archived = await fetchChatGptConversation({ conversationId, timeoutMs: 2500 }).catch(() => ({ ok: false }));
-      if (archived?.ok && archived.body?.is_archived === true) return "applied";
+      if (archived?.ok && archived.body?.is_archived === true) return { outcome: "applied", delivered: true };
       await wait(200);
     } while (Date.now() < deadline);
-    return "uncertain";
+    return { outcome: "uncertain", delivered: true };
   }
 
   async function drainPendingSelfArchives() {
@@ -1531,7 +1596,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
         // Still the assistant's own turn, or the page route has not registered
         // its exact identity yet (e.g. after a reload): keep the intent
         // persisted and retry instead of dropping it.
-        schedulePendingSelfArchiveDrain();
+        if (hasRetryablePendingSelfArchive()) schedulePendingSelfArchiveDrain();
         return;
       }
       for (const record of pending) {
@@ -1543,16 +1608,26 @@ const H2W_CONTENT_VERSION = "0.1.91";
           removePendingSelfArchive(record.idempotencyKey);
           continue;
         }
-        if (await actuateChatGptArchive(record.conversationId) === "applied") {
+        if (record.deliveryAttempted === true) {
+          // A previous drain already dispatched this archive click and the
+          // provider readback stayed inconclusive. Keep the intent terminal:
+          // replaying it could archive a conversation twice.
+          continue;
+        }
+        const attempt = await actuateChatGptArchive(record.conversationId, record);
+        // A verified archive drops the intent. An uncertain or rejected attempt
+        // is not applied: any delivery claim was persisted before the click, so
+        // nothing here may report it as applied or replay it.
+        if (attempt.outcome === "applied") {
           removePendingSelfArchive(record.idempotencyKey);
         }
       }
     } finally {
       pendingSelfArchiveDraining = false;
       // A record may have been enqueued while this drain was running, or an
-      // attempt may have been accepted-but-unverified; keep retrying until the
-      // bounded wait expires.
-      if (readPendingSelfArchives().length > 0) schedulePendingSelfArchiveDrain();
+      // attempt may still be clearly undelivered; retry only those until the
+      // bounded wait expires. A clicked/unverified intent never keeps a timer.
+      if (hasRetryablePendingSelfArchive()) schedulePendingSelfArchiveDrain();
     }
   }
 
@@ -1567,6 +1642,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
     if (evidence.observed_generation !== registeredBrowserGeneration) {
       return { ...evidence, resource_available: false };
     }
+    const idempotencyKey = typeof params.idempotency_key === "string" ? params.idempotency_key : "";
     if (isTurnInProgress()) {
       // The authoritative self-archive request is accepted and persisted now;
       // it executes once the source turn is no longer in progress.
@@ -1579,11 +1655,16 @@ const H2W_CONTENT_VERSION = "0.1.91";
       evidence.lifecycle_observed = false;
       return evidence;
     }
-    const outcome = await actuateChatGptArchive(conversationId);
-    if (outcome === "rejected") return { ...evidence, rejected: true };
+    const attempt = await actuateChatGptArchive(conversationId, {
+      idempotencyKey,
+      sessionRef,
+      generation: registeredBrowserGeneration,
+    });
+    if (attempt.outcome === "rejected") return { ...evidence, rejected: true };
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
-    if (outcome === "applied") evidence.lifecycle_observed = true;
+    if (attempt.outcome === "applied") evidence.lifecycle_observed = true;
+    else evidence.lifecycle_observed = false;
     return evidence;
   }
 
@@ -1832,7 +1913,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
   // instead of guessing; the runtime then matches the already-applied dispatch
   // and fails closed on anything unknown or unbound. No physical tab focus is
   // required: the identities come from the provider snapshot, not tab activity.
-  async function reportBrowserResultSettlement(serverSnapshot) {
+  async function reportBrowserResultSettlement(serverSnapshot, onRejected = () => {}) {
     if (!registeredBrowserSessionRef || !Number.isSafeInteger(registeredBrowserGeneration)) {
       return false;
     }
@@ -1843,10 +1924,14 @@ const H2W_CONTENT_VERSION = "0.1.91";
       || acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.acceptedUserMessageRef
       || null;
     if (!acceptedUserMessageRef) return false;
+    const sessionRef = registeredBrowserSessionRef;
+    const accepted = acceptedDispatchAssignments.get(sessionRef);
+    const generation = accepted?.acceptedUserMessageRef === acceptedUserMessageRef
+      ? accepted.generation : registeredBrowserGeneration;
     const assistantMessageRef = String(serverSnapshot.messageId);
     const assistantText = String(serverSnapshot.text || "").trim();
     if (!assistantText) return false;
-    const pending = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+    const pending = acceptedDispatchAssignments.get(sessionRef);
     if (pending?.reportedAssistantRef === assistantMessageRef
         && pending?.acceptedUserMessageRef === acceptedUserMessageRef) {
       return true;
@@ -1854,21 +1939,89 @@ const H2W_CONTENT_VERSION = "0.1.91";
     const response = await sendBg({
       type: "h2w_browser_result",
       provider: ADAPTER.name,
-      session_ref: registeredBrowserSessionRef,
-      generation: registeredBrowserGeneration,
+      session_ref: sessionRef,
+      generation,
       accepted_user_message_ref: String(acceptedUserMessageRef),
       assistant_message_ref: assistantMessageRef,
       assistant_text: assistantText,
     });
     if (response?.ok === true) {
-      acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
-        generation: registeredBrowserGeneration,
-        acceptedUserMessageRef: String(acceptedUserMessageRef),
-        reportedAssistantRef: assistantMessageRef,
-      });
+      const current = acceptedDispatchAssignments.get(sessionRef);
+      // A newer accepted assignment may arrive while the previous ACK is in
+      // flight. Preserve it so its result still gets observed on the next tick.
+      if (!current || (current.generation === generation
+          && current.acceptedUserMessageRef === acceptedUserMessageRef)) {
+        acceptedDispatchAssignments.set(sessionRef, {
+          generation,
+          acceptedUserMessageRef: String(acceptedUserMessageRef),
+          reportedAssistantRef: assistantMessageRef,
+        });
+      }
       return true;
     }
+    onRejected(response?.error || null);
     return false;
+  }
+
+  // Recover only an existing proven assignment, including its original
+  // generation. A browser reload must not relabel it with a new generation.
+  function restoreBrowserResultAssignment(pending) {
+    if (!registeredBrowserSessionRef || !Number.isSafeInteger(pending?.generation)
+        || pending.generation < 1 || typeof pending.accepted_user_message_ref !== "string"
+        || !pending.accepted_user_message_ref) return;
+    const current = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+    if (!current) {
+      acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
+        generation: pending.generation,
+        acceptedUserMessageRef: pending.accepted_user_message_ref,
+        reportedAssistantRef: null,
+      });
+    }
+  }
+
+  // Browser workers need no native pane binding, automation, or tab focus.
+  // The existing route timer probes only a proven assignment. Transient errors
+  // back off without dropping it; three explicit identity rejections stop it
+  // after a grace window for dispatch persistence, until a new assignment.
+  let browserResultProbeState = null;
+  async function observeBrowserResultSettlement() {
+    const convKey = ADAPTER.getConversationKey();
+    const sessionRef = registeredBrowserSessionRef;
+    const registrationGeneration = registeredBrowserGeneration;
+    const pending = acceptedDispatchAssignments.get(sessionRef);
+    if (ADAPTER.name !== "chatgpt" || !sessionRef || !registrationGeneration
+        || !convKey || convKey !== registeredConvKey || !pending || pending.reportedAssistantRef) return false;
+    if (!browserResultProbeState || browserResultProbeState.pending !== pending
+        || browserResultProbeState.sessionRef !== sessionRef) {
+      browserResultProbeState = { sessionRef, pending, nextAt: 0, inFlight: false, rejected: 0, retryMs: 5000 };
+    }
+    const probe = browserResultProbeState;
+    if (probe.rejected >= 3 || probe.inFlight || Date.now() < probe.nextAt) return false;
+    probe.inFlight = true;
+    probe.nextAt = Date.now() + probe.retryMs;
+    try {
+      const server = await fetchChatGptConversationSnapshot();
+      if (ADAPTER.getConversationKey() !== convKey || registeredConvKey !== convKey
+          || registeredBrowserSessionRef !== sessionRef || registeredBrowserGeneration !== registrationGeneration
+          || acceptedDispatchAssignments.get(sessionRef) !== pending) return false;
+      if (!server?.ok) {
+        probe.retryMs = Math.min(probe.retryMs * 2, 60000);
+        return false;
+      }
+      if (server.currentNodeRole !== "assistant" || server.finished !== true) return false;
+      if (server.userMessageId !== pending.acceptedUserMessageRef) {
+        probe.rejected += 1;
+        return false;
+      }
+      const settled = await reportBrowserResultSettlement(server, (error) => {
+        if (["browser_dispatch_result_unmatched", "browser_dispatch_result_conflict"].includes(error)) probe.rejected += 1;
+      });
+      probe.retryMs = settled ? 5000 : Math.min(probe.retryMs * 2, 60000);
+      return settled;
+    } finally {
+      probe.nextAt = Date.now() + probe.retryMs;
+      probe.inFlight = false;
+    }
   }
 
   // Browser Registry identity cached by the page script survives MV3
@@ -2375,6 +2528,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
       if (browserSessionReservationRef && registeredBrowserSessionRef) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
+      restoreBrowserResultAssignment(response?.browser_pending_dispatch);
       const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
       if (concreteChat) {
         await ensureConversationHealth(convKey);
@@ -2408,6 +2562,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
     // One second is fast enough for UI binding while keeping route detection
     // negligible compared with the existing 5s HUD reconciliation interval.
     setInterval(() => {
+      void observeBrowserResultSettlement().catch(() => {});
       if (document.hidden) return;
       const convKey = ADAPTER.getConversationKey();
       if (convKey && convKey !== registeredConvKey) void registerCurrentConversation("poll");

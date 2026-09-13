@@ -4157,6 +4157,32 @@ impl StateStore {
         Ok(record)
     }
 
+    /// Recover the latest unfinished, proven assignment for a reopened browser
+    /// session. This reads the existing dispatch ledger; it creates no job.
+    pub fn pending_browser_dispatch_for_session(
+        &self,
+        session_ref: &str,
+    ) -> Result<Option<BrowserDispatchRecord>, String> {
+        validate_browser_resource_ref(session_ref)?;
+        let dispatch_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT dispatch_id FROM browser_dispatches
+             WHERE target_session_ref = ?1 AND operation = 'browser_dispatch.submit'
+               AND delivery_state = 'applied' AND accepted_user_message_ref IS NOT NULL
+               AND result_settled_at IS NULL
+             ORDER BY created_at DESC, dispatch_id DESC LIMIT 1",
+                params![session_ref],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read pending browser dispatch: {error}"))?;
+        match dispatch_id {
+            Some(dispatch_id) => self.browser_dispatch(&dispatch_id),
+            None => Ok(None),
+        }
+    }
+
     /// Durably record the exact accepted provider user-message ref for one
     /// already-applied `browser_dispatch.submit`. Generation-fenced and
     /// idempotent: the same ref replays cleanly, a different ref for an

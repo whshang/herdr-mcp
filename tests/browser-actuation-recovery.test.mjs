@@ -75,6 +75,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     const chatGptConversationId = () => null;
     const refreshQueuedInsertStatus = () => {};
     const backfillCurrentChatGptContinuity = () => {};
+    const restoreBrowserResultAssignment = () => {};
     const CONTEXT_PRESSURE = false;
     const usesOperationalHud = () => false;
     const refreshPageHud = () => {};
@@ -308,7 +309,25 @@ test("ChatGPT session.archive targets the exact registered session and verifies 
   assert.doesNotMatch(segment, /performWake|dispatchEnterSubmit|findSendButton|delete/);
 });
 
+const SELF_ARCHIVE_KEY = "herdrPendingSelfArchiveV1";
+
+async function flushUntil(predicate, turns = 24) {
+  for (let i = 0; i < turns; i += 1) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`bounded-wait timeout: ${label}`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 function selfArchiveHarness(overrides = {}) {
+  const { storage: sharedStorage, failWrites = false, ...ctxOverrides } = overrides;
   const ctx = {
     turnInProgress: true,
     generation: 7,
@@ -316,26 +335,56 @@ function selfArchiveHarness(overrides = {}) {
     conversationId: "conv-self-archive",
     archiveAvailable: true,
     archiveVerifies: true,
+    archiveClickThrows: false,
+    onArchiveClick: null,
+    verifyGate: null,
+    menuGate: null,
     clicks: [],
-    ...overrides,
+    ...ctxOverrides,
   };
-  const storage = new Map();
+  const storage = sharedStorage instanceof Map ? sharedStorage : new Map();
+  const writeState = { fail: failWrites };
   const sessionStorage = {
     getItem: (key) => (storage.has(key) ? storage.get(key) : null),
-    setItem: (key, value) => { storage.set(key, String(value)); },
-    removeItem: (key) => { storage.delete(key); },
+    setItem: (key, value) => {
+      if (writeState.fail) throw new Error("sessionStorage write failed");
+      storage.set(key, String(value));
+    },
+    removeItem: (key) => {
+      if (writeState.fail) throw new Error("sessionStorage write failed");
+      storage.delete(key);
+    },
+  };
+  // Virtual clock: the unverified archive path polls to a 6s deadline, which
+  // would otherwise make every uncertainty test take real seconds.
+  const clock = { value: 1_000_000 };
+  const dateShim = {
+    now: () => clock.value,
+    advance: (ms) => { clock.value += Number(ms) || 0; },
   };
   const start = wakeSource.indexOf("const PENDING_SELF_ARCHIVE_STORAGE_KEY");
   const end = wakeSource.indexOf("async function performBrowserActuationCommand", start);
   assert.ok(start >= 0 && end > start, "deferred self-archive helper must remain extractable");
   const segment = wakeSource.slice(start, end);
-  const api = new Function("ctx", "sessionStorage", "setTimeout", `
+  const api = new Function("ctx", "sessionStorage", "setTimeout", "Date", `
     const ADAPTER = { name: "chatgpt" };
     const chatGptConversationId = () => ctx.conversationId;
     const isTurnInProgress = () => ctx.turnInProgress;
-    const openChatGptArchiveMenu = async () => (ctx.archiveAvailable ? { click: () => { ctx.clicks.push(Date.now()); } } : null);
-    const fetchChatGptConversation = async () => (ctx.archiveVerifies ? { ok: true, body: { is_archived: true } } : { ok: false });
-    const wait = () => Promise.resolve();
+    const openChatGptArchiveMenu = async () => {
+      if (ctx.menuGate) await ctx.menuGate;
+      return ctx.archiveAvailable
+        ? { click: () => {
+            ctx.clicks.push(Date.now());
+            if (typeof ctx.onArchiveClick === "function") ctx.onArchiveClick();
+            if (ctx.archiveClickThrows) throw new Error("archive click failed after dispatch");
+          } }
+        : null;
+    };
+    const fetchChatGptConversation = async () => {
+      if (ctx.verifyGate) await ctx.verifyGate;
+      return ctx.archiveVerifies ? { ok: true, body: { is_archived: true } } : { ok: false };
+    };
+    const wait = (ms) => { Date.advance(ms); return Promise.resolve(); };
     let registeredBrowserSessionRef = ctx.sessionRef;
     let registeredBrowserGeneration = ctx.generation;
     ${segment}
@@ -346,8 +395,8 @@ function selfArchiveHarness(overrides = {}) {
       setGeneration: (value) => { registeredBrowserGeneration = value; },
       setSession: (value) => { registeredBrowserSessionRef = value; },
     };
-  `)(ctx, sessionStorage, () => 0);
-  return { ctx, api };
+  `)(ctx, sessionStorage, () => 0, dateShim);
+  return { ctx, api, storage, writeState };
 }
 
 test("deferred self-archive waits for idle, dedupes idempotently, and fails closed on generation drift", async () => {
@@ -391,6 +440,237 @@ test("deferred self-archive waits for idle, dedupes idempotently, and fails clos
   await api.drain();
   assert.equal(ctx.clicks.length, 1);
   assert.equal(api.pendingCount(), 0);
+});
+
+test("an unverified self-archive click is terminal and is never replayed by later drains", async () => {
+  const { ctx, api } = selfArchiveHarness({ archiveVerifies: false });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-uncertain-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  ctx.turnInProgress = true;
+  const accepted = await api.performChatGptSessionArchive(command, evidence());
+  assert.equal(accepted.command_accepted, true);
+  assert.equal(accepted.lifecycle_observed, false);
+  assert.equal(api.pendingCount(), 1);
+
+  ctx.turnInProgress = false;
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1, "the first drain dispatches exactly one archive click");
+  // The provider never confirmed the archive, so the outcome stays unverified
+  // and the intent stays terminal instead of being dropped as applied.
+  assert.equal(api.pendingCount(), 1);
+
+  await api.drain();
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1, "no later drain may replay an already-clicked archive");
+
+  // The same idempotency key re-entering the intent queue stays idempotent.
+  ctx.turnInProgress = true;
+  const reentry = await api.performChatGptSessionArchive(command, evidence());
+  assert.equal(reentry.command_accepted, true);
+  assert.equal(reentry.lifecycle_observed, false);
+  ctx.turnInProgress = false;
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1, "same-key re-entry must not dispatch a second click");
+
+  // The existing identity fence still drops a terminal intent when the
+  // generation is superseded, without actuating it.
+  api.setGeneration(8);
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1);
+  assert.equal(api.pendingCount(), 0);
+});
+
+test("a post-click exception and a reload leave the archive intent terminal, not retryable", async () => {
+  const storage = new Map();
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: "br_self_archive", expected_generation: 7, idempotency_key: "archive-throw-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  const throwing = selfArchiveHarness({ archiveVerifies: false, archiveClickThrows: true, storage });
+  throwing.ctx.turnInProgress = true;
+  await throwing.api.performChatGptSessionArchive(command, evidence());
+  throwing.ctx.turnInProgress = false;
+  await throwing.api.drain();
+  assert.equal(throwing.ctx.clicks.length, 1, "the archive click is dispatched exactly once");
+  await throwing.api.drain();
+  assert.equal(throwing.ctx.clicks.length, 1, "a click that threw after dispatch must not be replayed");
+
+  // Reload: a fresh page instance restores the same sessionStorage intent and
+  // must not actuate it again.
+  const reloaded = selfArchiveHarness({ archiveVerifies: false, storage });
+  reloaded.ctx.turnInProgress = false;
+  await reloaded.api.drain();
+  assert.equal(reloaded.ctx.clicks.length, 0, "a persisted delivered intent must survive reload without replay");
+});
+
+test("a self-archive that is clearly not delivered before the click stays retryable", async () => {
+  const { ctx, api } = selfArchiveHarness({ archiveAvailable: false, archiveVerifies: false });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-retry-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  ctx.turnInProgress = true;
+  await api.performChatGptSessionArchive(command, evidence());
+  ctx.turnInProgress = false;
+  await api.drain();
+  assert.equal(ctx.clicks.length, 0);
+  assert.equal(api.pendingCount(), 1, "a rejected pre-click attempt must stay retryable");
+
+  ctx.archiveAvailable = true;
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1);
+  assert.equal(api.pendingCount(), 1, "the retried click is now terminal and unverified");
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1, "a terminal retry is not replayed either");
+});
+
+test("the delivery claim is durable before the archive click is dispatched", { timeout: 3000 }, async () => {
+  const storage = new Map();
+  let persistedAtClick = null;
+  const harness = selfArchiveHarness({
+    archiveVerifies: false,
+    storage,
+    onArchiveClick: () => { persistedAtClick = storage.get(SELF_ARCHIVE_KEY); },
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: harness.ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-preclick-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  harness.ctx.turnInProgress = true;
+  await harness.api.performChatGptSessionArchive(command, evidence());
+  harness.ctx.turnInProgress = false;
+  await harness.api.drain();
+  assert.equal(harness.ctx.clicks.length, 1);
+
+  // The click callback observes sessionStorage as it is at dispatch time.
+  const atClick = JSON.parse(String(persistedAtClick || "[]"));
+  assert.equal(atClick.length, 1);
+  assert.equal(atClick[0].idempotencyKey, "archive-preclick-1");
+  assert.equal(atClick[0].deliveryAttempted, true, "the delivery claim must persist before the click");
+
+  // Reload inside the click window: a fresh page reading the same
+  // sessionStorage must not replay the already-clicked intent.
+  const reloaded = selfArchiveHarness({ archiveVerifies: false, storage });
+  reloaded.ctx.turnInProgress = false;
+  await reloaded.api.drain();
+  assert.equal(reloaded.ctx.clicks.length, 0, "a click-window reload must not replay the intent");
+});
+
+test("a same-key re-entry during the in-flight archive poll cannot click again", { timeout: 3000 }, async () => {
+  let releasePoll;
+  const pollGate = new Promise((resolve) => { releasePoll = resolve; });
+  const { ctx, api, storage } = selfArchiveHarness({ archiveVerifies: false, verifyGate: pollGate });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-inflight-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  ctx.turnInProgress = true;
+  await api.performChatGptSessionArchive(command, evidence());
+  ctx.turnInProgress = false;
+
+  const draining = withTimeout(api.drain(), 2000, "in-flight drain");
+  await flushUntil(() => ctx.clicks.length > 0);
+  assert.equal(ctx.clicks.length, 1, "the first drain dispatches one click before the poll settles");
+
+  // The click is mid-verification. The direct path for the same key must see the
+  // durable claim and must not dispatch a second click. The poll gate is always
+  // released so a failing assertion here cannot leave the gated drain pending.
+  const reentryPromise = api.performChatGptSessionArchive(command, evidence());
+  try {
+    await flushUntil(() => ctx.clicks.length > 1);
+    assert.equal(ctx.clicks.length, 1, "in-flight same-key re-entry must not click");
+  } finally {
+    releasePoll();
+  }
+  const reentry = await withTimeout(reentryPromise, 1000, "in-flight same-key re-entry");
+  assert.equal(reentry.command_accepted, true);
+  assert.equal(reentry.lifecycle_observed, false);
+  await draining;
+  assert.equal(ctx.clicks.length, 1);
+  const records = JSON.parse(String(storage.get(SELF_ARCHIVE_KEY)));
+  assert.equal(records[0].deliveryAttempted, true, "the claim survives same-key re-entry");
+});
+
+test("two concurrent same-key calls cannot both click the archive", { timeout: 3000 }, async () => {
+  let releaseMenu;
+  const menuGate = new Promise((resolve) => { releaseMenu = resolve; });
+  const { ctx, api } = selfArchiveHarness({ archiveVerifies: false, menuGate });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-concurrent-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  ctx.turnInProgress = true;
+  await api.performChatGptSessionArchive(command, evidence());
+  ctx.turnInProgress = false;
+
+  // Both calls pass the pre-menu guard, then park on the gated menu await.
+  const draining = api.drain();
+  const direct = api.performChatGptSessionArchive(command, evidence());
+  await flushUntil(() => ctx.clicks.length > 0, 8);
+  assert.equal(ctx.clicks.length, 0, "neither call may click while the menu is unresolved");
+
+  let directResult;
+  try {
+    releaseMenu();
+    directResult = await withTimeout(direct, 1000, "concurrent direct call");
+    await withTimeout(draining, 1000, "concurrent drain");
+  } finally {
+    releaseMenu();
+  }
+  assert.equal(ctx.clicks.length, 1, "exactly one concurrent same-key call may click");
+  assert.equal(directResult.command_accepted, true);
+  assert.notEqual(directResult.rejected, true);
+  assert.equal(directResult.lifecycle_observed, false);
+});
+
+test("an unpersistable delivery claim suppresses the archive click", { timeout: 3000 }, async () => {
+  const { ctx, api, writeState } = selfArchiveHarness({ archiveVerifies: false });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-storage-1" },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  ctx.turnInProgress = true;
+  await api.performChatGptSessionArchive(command, evidence());
+  assert.equal(api.pendingCount(), 1);
+  ctx.turnInProgress = false;
+
+  writeState.fail = true;
+  await api.drain();
+  assert.equal(ctx.clicks.length, 0, "a delivery claim that cannot be persisted must not click");
+  assert.equal(api.pendingCount(), 1);
+
+  writeState.fail = false;
+  await api.drain();
+  assert.equal(ctx.clicks.length, 1, "the archive proceeds once the claim is durable");
+
+  // The direct path must also refuse an unpersistable mutation.
+  const direct = selfArchiveHarness({ archiveVerifies: false, failWrites: true });
+  const rejected = await direct.api.performChatGptSessionArchive(command, evidence());
+  assert.equal(rejected.rejected, true);
+  assert.equal(direct.ctx.clicks.length, 0);
 });
 
 test("ChatGPT session.open can restore a disposable view from a local canonical locator", () => {
