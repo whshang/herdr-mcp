@@ -817,7 +817,13 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         parsed.code === "payload_too_large" ? 413 : 400,
       ));
     }
-    mcpMinuteAttribution.record(parsed.value);
+    const attributionOperation = mcpMinuteAttribution.record(parsed.value);
+    // Count only the workstation forward hop(s) this single OpenAI-visible MCP
+    // request issues (normally 1; more on a bounded retry). This is NOT total
+    // Cloudflare DO/subrequest amplification: device-registry, OAuth-store,
+    // planner, fleet and device-resolution DO fetches are excluded. In-process
+    // only, adds no requests.
+    let workstationForwardCount = 0;
     const workstationId = resolveWorkstation(request, env);
     const webchatControlGrants = devAuth.webchatControlGrants ?? [];
     const pageAssistGrants = devAuth.pageAssistGrants ?? [];
@@ -835,6 +841,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         fleetAdmin: Boolean(mcpFleetPrincipal),
       },
       forward: async (stub: unknown, body: string) => {
+        workstationForwardCount += 1;
         const internal = new Request("https://do.internal/internal/forward", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -946,6 +953,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
       },
       logger,
     });
+    mcpMinuteAttribution.recordWorkstationForward(attributionOperation, workstationForwardCount);
     const method =
       parsed.value !== null &&
       typeof parsed.value === "object" &&
