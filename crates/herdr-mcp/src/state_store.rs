@@ -1554,6 +1554,18 @@ impl StateStore {
         }))
     }
 
+    pub fn continuity_work_chain_id(&self, continuity_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT work_chain_id FROM continuity_chains WHERE continuity_id = ?1",
+                [continuity_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(|error| format!("cannot read continuity work chain: {error}"))
+    }
+
     pub fn continuity_candidates(&self, limit: usize) -> Result<Vec<ContinuityCandidate>, String> {
         let limit = i64::try_from(limit.clamp(1, 20)).unwrap_or(20);
         let mut stmt = self
