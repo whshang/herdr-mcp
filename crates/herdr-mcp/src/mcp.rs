@@ -42,6 +42,8 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
 ];
 const BROWSER_ADAPTER_PROTOCOL_VERSION: i64 = 1;
 const BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS: i64 = 250;
+const BROWSER_SOURCE_TURN_TTL_MS: i64 = 5 * 60 * 1000;
+const MAX_BROWSER_SOURCE_TURNS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserCallerGrant {
@@ -55,6 +57,87 @@ pub struct BrowserCallerAuthorization {
     pub principal_ref: String,
     pub connector_id: String,
     pub grant_generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserSourceTurnRecord {
+    session_ref: String,
+    expected_generation: i64,
+    user_text_sha256: String,
+    observed_at: i64,
+}
+
+#[derive(Default)]
+pub struct BrowserSourceTurnRegistry {
+    inner: std::sync::Mutex<std::collections::VecDeque<BrowserSourceTurnRecord>>,
+}
+
+impl BrowserSourceTurnRegistry {
+    pub fn observe(
+        &self,
+        session_ref: &str,
+        expected_generation: i64,
+        user_text: &str,
+        observed_at: i64,
+    ) -> Result<(), String> {
+        let user_text = user_text.trim();
+        if session_ref.is_empty()
+            || expected_generation < 1
+            || user_text.is_empty()
+            || user_text.len() > 262_144
+            || observed_at < 0
+        {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        let user_text_sha256 = browser_sha256(user_text);
+        let mut records = self
+            .inner
+            .lock()
+            .map_err(|_| "browser_current_turn_registry_unavailable".to_owned())?;
+        records.retain(|record| {
+            observed_at.saturating_sub(record.observed_at) <= BROWSER_SOURCE_TURN_TTL_MS
+                && !(record.session_ref == session_ref
+                    && record.user_text_sha256 == user_text_sha256)
+        });
+        records.push_back(BrowserSourceTurnRecord {
+            session_ref: session_ref.to_owned(),
+            expected_generation,
+            user_text_sha256,
+            observed_at,
+        });
+        while records.len() > MAX_BROWSER_SOURCE_TURNS {
+            records.pop_front();
+        }
+        Ok(())
+    }
+
+    pub fn resolve(&self, user_text: &str, now: i64) -> Result<(String, i64), String> {
+        let user_text = user_text.trim();
+        if user_text.is_empty() || user_text.len() > 262_144 || now < 0 {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        let user_text_sha256 = browser_sha256(user_text);
+        let mut records = self
+            .inner
+            .lock()
+            .map_err(|_| "browser_current_turn_registry_unavailable".to_owned())?;
+        records.retain(|record| {
+            now >= record.observed_at
+                && now.saturating_sub(record.observed_at) <= BROWSER_SOURCE_TURN_TTL_MS
+        });
+        let mut matches = records
+            .iter()
+            .filter(|record| record.user_text_sha256 == user_text_sha256)
+            .map(|record| (record.session_ref.clone(), record.expected_generation))
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        match matches.len() {
+            0 => Err("browser_current_turn_not_found".to_owned()),
+            1 => Ok(matches.pop().unwrap()),
+            _ => Err("browser_current_turn_ambiguous".to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +206,7 @@ pub struct RuntimeContext<'a> {
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
+    pub browser_source_turns: &'a BrowserSourceTurnRegistry,
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -316,6 +400,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                         mutation_gate: context.browser_mutation_gate,
                         mutation_admission: context.browser_mutation_admission,
                         caller_authorization: context.caller_webchat_authorization,
+                        source_turns: Some(context.browser_source_turns),
                     },
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
@@ -2759,6 +2844,53 @@ fn browser_handoff_prepare(
     })
 }
 
+fn browser_session_archive_params_from_current_turn(
+    store: &StateStore,
+    source_turns: &BrowserSourceTurnRegistry,
+    params: &Value,
+) -> Result<Option<Value>, Value> {
+    let Some(current_user_message) = params.get("current_user_message") else {
+        return Ok(None);
+    };
+    let Some(object) = params.as_object() else {
+        return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+    };
+    const ALLOWED: &[&str] = &["current_user_message", "idempotency_key"];
+    if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+        return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+    }
+    let Some(current_user_message) = current_user_message
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(json!({"ok": false, "code": "browser_current_turn_invalid"}));
+    };
+    if current_user_message.len() > 262_144 {
+        return Err(json!({"ok": false, "code": "browser_current_turn_invalid"}));
+    }
+    let idempotency_key = browser_required_idempotency_key(params)?;
+    let (session_ref, expected_generation) = source_turns
+        .resolve(current_user_message, browser_epoch_ms())
+        .map_err(browser_store_error)?;
+    let session = match store.browser_resource(&session_ref) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Err(json!({"ok": false, "code": "browser_current_turn_not_found"})),
+        Err(error) => return Err(browser_store_error(error)),
+    };
+    if session.kind != "session" || session.provider != "chatgpt" {
+        return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
+    }
+    if session.observation_generation != expected_generation {
+        return Err(json!({"ok": false, "code": "browser_current_turn_stale"}));
+    }
+    Ok(Some(json!({
+        "session_ref": session_ref,
+        "expected_generation": expected_generation,
+        "idempotency_key": idempotency_key,
+    })))
+}
+
 fn browser_session_create(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -3383,6 +3515,7 @@ struct BrowserOperationControls<'a> {
     mutation_gate: Option<&'a std::sync::RwLock<()>>,
     mutation_admission: Option<&'a BrowserMutationAdmission>,
     caller_authorization: Option<&'a BrowserCallerAuthorization>,
+    source_turns: Option<&'a BrowserSourceTurnRegistry>,
 }
 
 #[cfg(test)]
@@ -3404,6 +3537,7 @@ fn browser_operation_call_with_grants(
             mutation_gate: browser_mutation_gate,
             mutation_admission: None,
             caller_authorization: None,
+            source_turns: None,
         },
     )
 }
@@ -3433,6 +3567,25 @@ fn browser_operation_call_with_controls(
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
         normalized_params = match browser_session_create_params_from_source(&store_guard, params) {
+            Ok(Some(value)) => value,
+            Ok(None) => unreachable!(),
+            Err(error) => return error,
+        };
+        &normalized_params
+    } else if operation == BrowserOperation::SessionArchive
+        && object.contains_key("current_user_message")
+    {
+        let Some(source_turns) = controls.source_turns else {
+            return json!({"ok": false, "code": "browser_current_turn_unavailable"});
+        };
+        let Ok(store_guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        normalized_params = match browser_session_archive_params_from_current_turn(
+            &store_guard,
+            source_turns,
+            params,
+        ) {
             Ok(Some(value)) => value,
             Ok(None) => unreachable!(),
             Err(error) => return error,
@@ -5377,6 +5530,33 @@ mod tests {
             "params": {"protocolVersion": OPENAI_PROBE_PROTOCOL}
         }));
         assert_eq!(result["protocolVersion"], SDK_WIRE_PROTOCOL);
+    }
+
+    #[test]
+    fn browser_source_turn_registry_fails_closed_on_ambiguity_and_expiry() {
+        let registry = BrowserSourceTurnRegistry::default();
+        let now = 1_000_000_i64;
+        registry
+            .observe("br_current", 7, "归档当前对话", now)
+            .unwrap();
+        assert_eq!(
+            registry.resolve("  归档当前对话  ", now + 1_000).unwrap(),
+            ("br_current".to_owned(), 7)
+        );
+
+        registry
+            .observe("br_other", 9, "归档当前对话", now + 2_000)
+            .unwrap();
+        assert_eq!(
+            registry.resolve("归档当前对话", now + 3_000).unwrap_err(),
+            "browser_current_turn_ambiguous"
+        );
+        assert_eq!(
+            registry
+                .resolve("归档当前对话", now + BROWSER_SOURCE_TURN_TTL_MS + 5_000)
+                .unwrap_err(),
+            "browser_current_turn_not_found"
+        );
     }
 
     #[test]
@@ -8375,6 +8555,34 @@ mod tests {
             )
         };
 
+        let source_turns = BrowserSourceTurnRegistry::default();
+        let source_session_ref = store
+            .lock()
+            .unwrap()
+            .browser_session_ref_for_canonical_url(&source_url)
+            .unwrap()
+            .unwrap();
+        let current_turn_now = browser_epoch_ms();
+        source_turns
+            .observe(&source_session_ref, 7, "归档当前对话", current_turn_now)
+            .unwrap();
+        let archive_params = {
+            let guard = store.lock().unwrap();
+            browser_session_archive_params_from_current_turn(
+                &guard,
+                &source_turns,
+                &json!({
+                    "current_user_message": "  归档当前对话  ",
+                    "idempotency_key": "archive-current-source"
+                }),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(archive_params["session_ref"], source_session_ref);
+        assert_eq!(archive_params["expected_generation"], 7);
+        assert_eq!(archive_params["idempotency_key"], "archive-current-source");
+
         let immediate = SessionCreateActuator {
             store: store.clone(),
             calls: AtomicUsize::new(0),
@@ -8780,6 +8988,7 @@ mod tests {
                 mutation_gate: None,
                 mutation_admission: Some(&admission),
                 caller_authorization: None,
+                source_turns: None,
             },
         );
         assert_eq!(backpressured["code"], "browser_account_backpressure");

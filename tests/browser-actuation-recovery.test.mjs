@@ -279,6 +279,19 @@ test("content script session.open verifies identity, generation, route, canonica
   assert.match(segment, /command_accepted\s*=\s*true/);
 });
 
+test("accepted ChatGPT user turns register a current-source identity before continuity binding", () => {
+  const start = backgroundSource.indexOf('if (msg?.type === "h2w_turn_started")');
+  const end = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")', start);
+  assert.ok(start >= 0 && end > start, "turn-start handler must remain extractable");
+  const segment = backgroundSource.slice(start, end);
+  const sourceObserve = segment.indexOf('operation: "source_turn.observe"');
+  const bindingLookup = segment.indexOf('loadBindings()');
+  assert.ok(sourceObserve >= 0, "accepted turn must register current-source identity");
+  assert.ok(bindingLookup > sourceObserve, "source identity must not depend on continuity binding");
+  assert.match(segment, /canonical_url:\s*convKey/);
+  assert.match(segment, /user_text:\s*userText/);
+});
+
 test("ChatGPT session.archive targets the exact registered session and verifies provider archive state", () => {
   assert.match(backgroundSource, /"session\.archive"/);
   const start = wakeSource.indexOf("async function performChatGptSessionArchive");
