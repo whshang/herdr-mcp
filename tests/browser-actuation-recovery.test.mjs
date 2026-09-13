@@ -75,6 +75,7 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     const chatGptConversationId = () => null;
     const refreshQueuedInsertStatus = () => {};
     const backfillCurrentChatGptContinuity = () => {};
+    const restoreBrowserResultAssignment = () => {};
     const CONTEXT_PRESSURE = false;
     const usesOperationalHud = () => false;
     const refreshPageHud = () => {};

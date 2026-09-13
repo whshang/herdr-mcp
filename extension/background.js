@@ -1988,6 +1988,7 @@ async function observeBrowserConversation({
   return {
     sessionRef,
     observationGeneration,
+    pendingDispatch: session.pending_dispatch || null,
     accountRef: account.resource?.resource_ref || null,
     spaceRef,
   };
@@ -5638,6 +5639,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           status: first.status || null,
           bindings: matched.map((b) => bindingView(b)),
           browser_session_ref: browserObservation?.sessionRef || null,
+          browser_pending_dispatch: browserObservation?.pendingDispatch || null,
           browser_generation: browserObservation?.observationGeneration || null,
           browser_account_ref: browserObservation?.accountRef || null,
           browser_space_ref: browserObservation?.spaceRef || null,
@@ -5646,6 +5648,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({
           bound: false,
           browser_session_ref: browserObservation?.sessionRef || null,
+          browser_pending_dispatch: browserObservation?.pendingDispatch || null,
           browser_generation: browserObservation?.observationGeneration || null,
           browser_account_ref: browserObservation?.accountRef || null,
           browser_space_ref: browserObservation?.spaceRef || null,

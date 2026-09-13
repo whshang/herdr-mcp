@@ -1019,8 +1019,17 @@ fn extension_browser_resource_observe(
     } else {
         None
     };
+    let pending_dispatch = if kind == "session" {
+        store.pending_browser_dispatch_for_session(&resource.resource_ref)?
+    } else {
+        None
+    };
     Ok(json!({
         "ok": true,
+        "pending_dispatch": pending_dispatch.map(|dispatch| json!({
+            "accepted_user_message_ref": dispatch.accepted_user_message_ref,
+            "generation": dispatch.expected_generation,
+        })),
         "resource": browser_resource_http_json(resource),
         "reservation": materialized_reservation.map(|reservation| json!({
             "reservation_ref": reservation.reservation_ref,
@@ -3692,6 +3701,18 @@ mod tests {
             session.resource_ref
         };
 
+        let pending = store
+            .lock()
+            .unwrap()
+            .pending_browser_dispatch_for_session(&session_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending.accepted_user_message_ref.as_deref(),
+            Some("provider-user-route")
+        );
+        assert_eq!(pending.expected_generation, 7);
+
         let app = candidate_router(extension_state);
         let request = |payload: Value| {
             Request::builder()
@@ -3713,6 +3734,14 @@ mod tests {
         });
         let response = app.clone().oneshot(request(payload.clone())).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .pending_browser_dispatch_for_session(&session_ref)
+                .unwrap()
+                .is_none()
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let result: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(result["ok"], true);

@@ -8,7 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 
-const settlementStart = wakeSource.indexOf("  async function reportBrowserResultSettlement(serverSnapshot) {");
+const settlementStart = wakeSource.indexOf("  async function reportBrowserResultSettlement(serverSnapshot,");
 const settlementEnd = wakeSource.indexOf("  // Browser Registry identity cached by the page script", settlementStart);
 assert.ok(settlementStart >= 0 && settlementEnd > settlementStart, "settlement helper must remain extractable");
 const settlementSource = wakeSource.slice(settlementStart, settlementEnd);
@@ -171,4 +171,118 @@ test("background handles h2w_browser_result and never blocks on tab focus", () =
   assert.match(handler, /postBrowserDispatchResult\(/);
   assert.match(handler, /browser_result_fields_incomplete/);
   assert.doesNotMatch(handler, /document\.hidden|chrome\.tabs/);
+});
+
+function observationHarness({ accepted = true, recovered = null, snapshots = [], sends = [] } = {}) {
+  let now = 10000;
+  let route = "chatgpt:/c/worker";
+  let probes = 0;
+  let callback;
+  const sent = [];
+  const assignments = new Map();
+  if (accepted) assignments.set("br_worker", { generation: 7, acceptedUserMessageRef: "user-1", reportedAssistantRef: null });
+  const routeStart = wakeSource.indexOf("  function startConversationRouteWatch() {");
+  const routeEnd = wakeSource.indexOf("  function assistantSignature", routeStart);
+  const observe = new Function(
+    "registeredBrowserSessionRef", "registeredBrowserGeneration", "registeredConvKey",
+    "acceptedDispatchAssignments", "sendBg", "ADAPTER", "fetchChatGptConversationSnapshot",
+    "Date", "setInterval", "document", "window", "recovered",
+    `${settlementSource}\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
+  )("br_worker", 7, route, assignments, async (payload) => {
+    sent.push(payload);
+    return sends.shift() || { ok: true };
+  }, { name: "chatgpt", getConversationKey: () => route }, async () => {
+    probes += 1;
+    const snapshot = snapshots.shift();
+    return typeof snapshot === "function" ? snapshot() : snapshot;
+  }, { now: () => now }, (fn) => { callback = fn; }, { hidden: true, addEventListener() {} }, { addEventListener() {} }, recovered);
+  return { observe, sent, assignments, tick: () => callback(), advance: (ms = 5000) => { now += ms; }, navigate: () => { route = "chatgpt:/c/other"; }, probes: () => probes };
+}
+
+const completedWorkerSnapshot = {
+  ok: true, currentNodeRole: "assistant", finished: true,
+  messageId: "assistant-1", userMessageId: "user-1", text: "worker answer",
+};
+
+test("route watch settles a hidden browser worker without native binding or automation", async () => {
+  const h = observationHarness({ snapshots: [{ ...completedWorkerSnapshot, finished: false }, completedWorkerSnapshot] });
+  h.tick();
+  await new Promise(setImmediate);
+  assert.equal(h.sent.length, 0);
+  h.advance();
+  h.tick();
+  await new Promise(setImmediate);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].accepted_user_message_ref, "user-1");
+  h.advance();
+  h.tick();
+  await new Promise(setImmediate);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.probes(), 2);
+});
+
+test("accepted worker result retries a failed acknowledgement and throttles probes", async () => {
+  const h = observationHarness({ snapshots: [completedWorkerSnapshot, completedWorkerSnapshot], sends: [{ ok: false }, { ok: true }] });
+  assert.equal(await h.observe(), false);
+  assert.equal(await h.observe(), false);
+  assert.equal(h.probes(), 1);
+  h.advance(10000);
+  assert.equal(await h.observe(), true);
+  assert.equal(h.sent.length, 2);
+});
+
+test("reopened worker recovers exact finalized result without an in-memory assignment", async () => {
+  const h = observationHarness({ accepted: false, recovered: { generation: 6, accepted_user_message_ref: "user-1" }, snapshots: [completedWorkerSnapshot] });
+  assert.equal(await h.observe(), true);
+  assert.equal(h.sent[0].session_ref, "br_worker");
+  assert.equal(h.sent[0].generation, 6);
+});
+
+test("in-flight result observation cannot cross a conversation route change", async () => {
+  let resolve;
+  const h = observationHarness({ snapshots: [() => new Promise((done) => { resolve = done; })] });
+  const first = h.observe();
+  h.advance();
+  assert.equal(await h.observe(), false);
+  assert.equal(h.probes(), 1);
+  h.navigate();
+  resolve(completedWorkerSnapshot);
+  assert.equal(await first, false);
+  assert.equal(h.sent.length, 0);
+});
+
+test("an older result ACK preserves a newer accepted worker assignment", async () => {
+  let resolve;
+  const h = settlementHarness({ sessionRef: "br_worker", generation: 7, accepted: "user-1", sends: [() => new Promise((done) => { resolve = done; })] });
+  const report = h.report(completedWorkerSnapshot);
+  const newer = { generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null };
+  h.acceptedDispatchAssignments.set("br_worker", newer);
+  resolve({ ok: true });
+  assert.equal(await report, true);
+  assert.deepEqual(h.acceptedDispatchAssignments.get("br_worker"), newer);
+});
+
+test("ordinary registered pages with no assignment perform no provider probes", async () => {
+  const h = observationHarness({ accepted: false });
+  for (let i = 0; i < 100; i += 1) { await h.observe(); h.advance(60000); }
+  assert.equal(h.probes(), 0);
+  assert.equal(h.sent.length, 0);
+});
+
+test("recovered assignment survives more than three transient result failures", async () => {
+  const h = observationHarness({ accepted: false, recovered: { generation: 6, accepted_user_message_ref: "user-1" }, snapshots: Array(5).fill(completedWorkerSnapshot), sends: [...Array(4).fill({ ok: false, error: "browser-registry-http-503" }), { ok: true }] });
+  for (let i = 0; i < 4; i += 1) { assert.equal(await h.observe(), false); h.advance(60000); }
+  assert.equal(await h.observe(), true);
+  assert.equal(h.sent.length, 5);
+  assert.ok(h.sent.every((message) => message.generation === 6));
+});
+
+test("persistent identity rejection stops retries but a new assignment can proceed", async () => {
+  const h = observationHarness({ snapshots: [...Array(3).fill(completedWorkerSnapshot), { ...completedWorkerSnapshot, userMessageId: "user-2", messageId: "assistant-2" }], sends: [...Array(3).fill({ ok: false, error: "browser_dispatch_result_unmatched" }), { ok: true }] });
+  for (let i = 0; i < 10; i += 1) { await h.observe(); h.advance(60000); }
+  assert.equal(h.probes(), 3);
+  assert.equal(h.sent.length, 3);
+  h.assignments.set("br_worker", { generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null });
+  assert.equal(await h.observe(), true);
+  assert.equal(h.sent.length, 4);
 });

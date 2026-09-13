@@ -1832,7 +1832,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
   // instead of guessing; the runtime then matches the already-applied dispatch
   // and fails closed on anything unknown or unbound. No physical tab focus is
   // required: the identities come from the provider snapshot, not tab activity.
-  async function reportBrowserResultSettlement(serverSnapshot) {
+  async function reportBrowserResultSettlement(serverSnapshot, onRejected = () => {}) {
     if (!registeredBrowserSessionRef || !Number.isSafeInteger(registeredBrowserGeneration)) {
       return false;
     }
@@ -1843,10 +1843,14 @@ const H2W_CONTENT_VERSION = "0.1.91";
       || acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.acceptedUserMessageRef
       || null;
     if (!acceptedUserMessageRef) return false;
+    const sessionRef = registeredBrowserSessionRef;
+    const accepted = acceptedDispatchAssignments.get(sessionRef);
+    const generation = accepted?.acceptedUserMessageRef === acceptedUserMessageRef
+      ? accepted.generation : registeredBrowserGeneration;
     const assistantMessageRef = String(serverSnapshot.messageId);
     const assistantText = String(serverSnapshot.text || "").trim();
     if (!assistantText) return false;
-    const pending = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+    const pending = acceptedDispatchAssignments.get(sessionRef);
     if (pending?.reportedAssistantRef === assistantMessageRef
         && pending?.acceptedUserMessageRef === acceptedUserMessageRef) {
       return true;
@@ -1854,21 +1858,89 @@ const H2W_CONTENT_VERSION = "0.1.91";
     const response = await sendBg({
       type: "h2w_browser_result",
       provider: ADAPTER.name,
-      session_ref: registeredBrowserSessionRef,
-      generation: registeredBrowserGeneration,
+      session_ref: sessionRef,
+      generation,
       accepted_user_message_ref: String(acceptedUserMessageRef),
       assistant_message_ref: assistantMessageRef,
       assistant_text: assistantText,
     });
     if (response?.ok === true) {
-      acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
-        generation: registeredBrowserGeneration,
-        acceptedUserMessageRef: String(acceptedUserMessageRef),
-        reportedAssistantRef: assistantMessageRef,
-      });
+      const current = acceptedDispatchAssignments.get(sessionRef);
+      // A newer accepted assignment may arrive while the previous ACK is in
+      // flight. Preserve it so its result still gets observed on the next tick.
+      if (!current || (current.generation === generation
+          && current.acceptedUserMessageRef === acceptedUserMessageRef)) {
+        acceptedDispatchAssignments.set(sessionRef, {
+          generation,
+          acceptedUserMessageRef: String(acceptedUserMessageRef),
+          reportedAssistantRef: assistantMessageRef,
+        });
+      }
       return true;
     }
+    onRejected(response?.error || null);
     return false;
+  }
+
+  // Recover only an existing proven assignment, including its original
+  // generation. A browser reload must not relabel it with a new generation.
+  function restoreBrowserResultAssignment(pending) {
+    if (!registeredBrowserSessionRef || !Number.isSafeInteger(pending?.generation)
+        || pending.generation < 1 || typeof pending.accepted_user_message_ref !== "string"
+        || !pending.accepted_user_message_ref) return;
+    const current = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+    if (!current) {
+      acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
+        generation: pending.generation,
+        acceptedUserMessageRef: pending.accepted_user_message_ref,
+        reportedAssistantRef: null,
+      });
+    }
+  }
+
+  // Browser workers need no native pane binding, automation, or tab focus.
+  // The existing route timer probes only a proven assignment. Transient errors
+  // back off without dropping it; three explicit identity rejections stop it
+  // after a grace window for dispatch persistence, until a new assignment.
+  let browserResultProbeState = null;
+  async function observeBrowserResultSettlement() {
+    const convKey = ADAPTER.getConversationKey();
+    const sessionRef = registeredBrowserSessionRef;
+    const registrationGeneration = registeredBrowserGeneration;
+    const pending = acceptedDispatchAssignments.get(sessionRef);
+    if (ADAPTER.name !== "chatgpt" || !sessionRef || !registrationGeneration
+        || !convKey || convKey !== registeredConvKey || !pending || pending.reportedAssistantRef) return false;
+    if (!browserResultProbeState || browserResultProbeState.pending !== pending
+        || browserResultProbeState.sessionRef !== sessionRef) {
+      browserResultProbeState = { sessionRef, pending, nextAt: 0, inFlight: false, rejected: 0, retryMs: 5000 };
+    }
+    const probe = browserResultProbeState;
+    if (probe.rejected >= 3 || probe.inFlight || Date.now() < probe.nextAt) return false;
+    probe.inFlight = true;
+    probe.nextAt = Date.now() + probe.retryMs;
+    try {
+      const server = await fetchChatGptConversationSnapshot();
+      if (ADAPTER.getConversationKey() !== convKey || registeredConvKey !== convKey
+          || registeredBrowserSessionRef !== sessionRef || registeredBrowserGeneration !== registrationGeneration
+          || acceptedDispatchAssignments.get(sessionRef) !== pending) return false;
+      if (!server?.ok) {
+        probe.retryMs = Math.min(probe.retryMs * 2, 60000);
+        return false;
+      }
+      if (server.currentNodeRole !== "assistant" || server.finished !== true) return false;
+      if (server.userMessageId !== pending.acceptedUserMessageRef) {
+        probe.rejected += 1;
+        return false;
+      }
+      const settled = await reportBrowserResultSettlement(server, (error) => {
+        if (["browser_dispatch_result_unmatched", "browser_dispatch_result_conflict"].includes(error)) probe.rejected += 1;
+      });
+      probe.retryMs = settled ? 5000 : Math.min(probe.retryMs * 2, 60000);
+      return settled;
+    } finally {
+      probe.nextAt = Date.now() + probe.retryMs;
+      probe.inFlight = false;
+    }
   }
 
   // Browser Registry identity cached by the page script survives MV3
@@ -2375,6 +2447,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
       if (browserSessionReservationRef && registeredBrowserSessionRef) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
+      restoreBrowserResultAssignment(response?.browser_pending_dispatch);
       const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
       if (concreteChat) {
         await ensureConversationHealth(convKey);
@@ -2408,6 +2481,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
     // One second is fast enough for UI binding while keeping route detection
     // negligible compared with the existing 5s HUD reconciliation interval.
     setInterval(() => {
+      void observeBrowserResultSettlement().catch(() => {});
       if (document.hidden) return;
       const convKey = ADAPTER.getConversationKey();
       if (convKey && convKey !== registeredConvKey) void registerCurrentConversation("poll");
