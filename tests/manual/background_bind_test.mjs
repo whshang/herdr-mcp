@@ -460,9 +460,57 @@ globalThis.chrome = {
       if (message.path === "/mcp") {
         const body = JSON.parse(message.body || "{}");
         mcpRequestBodies.push(body);
-        const result = body.method === "tools/list"
-          ? { tools: [{ name: "herdr_inspect", description: "inspect", inputSchema: { type: "object" } }] }
-          : { content: [{ type: "text", text: "ok" }] };
+        let result;
+        if (body.method === "tools/list") {
+          result = { tools: [{ name: "herdr_inspect", description: "inspect", inputSchema: { type: "object" } }] };
+        } else if (
+          body.method === "tools/call"
+          && body.params?.name === "herdr_call"
+          && body.params?.arguments?.method === "herdr_mcp.browser_handoff.prepare"
+        ) {
+          const params = JSON.parse(body.params.arguments.params || "{}");
+          const continuityId = String(params.continuity_id || "").trim();
+          const sourceUrl = String(params.source_url || "").trim();
+          const handoffId = String(params.handoff_id || "").trim() || "hh_test";
+          const found = mockLocalRuntimeAvailable
+            && mockContinuityPersistenceEnabled
+            && mockContinuityChains.has(continuityId);
+          const prepared = found
+            ? {
+              ok: true,
+              handoff: {
+                handoff_id: handoffId,
+                continuity_id: continuityId,
+                source_url: sourceUrl,
+                message: `继续 continuity_id ${continuityId}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：继续上一会话未完成的目标。原会话：${sourceUrl} 若工具调用发生 OpenAI host-side pre-delivery safety rejection，原参数最多重试一次；不要通过编码、混淆、机械改写或更换 transport 来规避 safety protection。 [HERDR_CONTINUITY_REF id=${handoffId} continuity_id=${continuityId}] continuity_id: ${continuityId} [END_HERDR_CONTINUITY_REF]`,
+                work_chain_id: params.work_chain_id || null,
+                target_context: { provider: "chatgpt", project_id: PROJECT_ID },
+              },
+              automatic_delivery: {
+                method: "herdr_mcp.browser_session.create",
+                params: {
+                  source_url: sourceUrl,
+                  message: null,
+                  work_chain_id: params.work_chain_id || null,
+                },
+              },
+              manual_delivery: { copy_prompt: null },
+              safety: {
+                pre_delivery_retry_limit: 1,
+                retry_requires_no_execution_evidence: true,
+                preserve_mutation_idempotency_key: true,
+                rewrite_rejected_payload: false,
+              },
+            }
+            : { ok: false, code: "continuity_not_found" };
+          if (prepared.ok) {
+            prepared.automatic_delivery.params.message = prepared.handoff.message;
+            prepared.manual_delivery.copy_prompt = prepared.handoff.message;
+          }
+          result = { content: [{ type: "text", text: JSON.stringify(prepared) }] };
+        } else {
+          result = { content: [{ type: "text", text: "ok" }] };
+        }
         callback({
           ok: true,
           transport: "ipc",

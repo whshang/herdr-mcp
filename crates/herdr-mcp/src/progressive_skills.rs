@@ -32,6 +32,7 @@ pub const BROWSER_ENDPOINT_INSPECT_METHOD: &str = "herdr_mcp.browser_endpoint.in
 pub const BROWSER_RESOURCE_LIST_METHOD: &str = "herdr_mcp.browser_resource.list";
 pub const BROWSER_RESOURCE_INSPECT_METHOD: &str = "herdr_mcp.browser_resource.inspect";
 pub const BROWSER_RESOURCE_RESOLVE_METHOD: &str = "herdr_mcp.browser_resource.resolve";
+pub const BROWSER_HANDOFF_PREPARE_METHOD: &str = "herdr_mcp.browser_handoff.prepare";
 pub const BROWSER_SPACE_CREATE_METHOD: &str = "herdr_mcp.browser_space.create";
 pub const BROWSER_SPACE_OPEN_METHOD: &str = "herdr_mcp.browser_space.open";
 pub const BROWSER_SPACE_INSPECT_METHOD: &str = "herdr_mcp.browser_space.inspect";
@@ -586,6 +587,23 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 "empty": false,
             },
         }),
+        json!({
+            "method": BROWSER_HANDOFF_PREPARE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "continuity_id": {"type": "string", "maxLength": 160},
+                    "source_url": {"type": "string", "maxLength": 2048},
+                    "objective": {"type": ["string", "null"], "maxLength": 1024},
+                    "work_chain_id": {"type": ["string", "null"], "maxLength": 128},
+                    "handoff_id": {"type": ["string", "null"], "maxLength": 96}
+                },
+                "required": ["continuity_id", "source_url"],
+                "empty": false
+            }
+        }),
     ];
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -775,7 +793,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
     },
     BuiltinSkillSpec {
         id: "agent-dispatch",
-        description: "Select and submit safe compatible coding-agent work from live capability facts.",
+        description: "Select and submit safe compatible local-agent work from live capability facts, including bounded fallback after a host-side pre-delivery rejection.",
         content: AGENT_DISPATCH,
         triggers: &[
             "delegate",
@@ -783,6 +801,9 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
             "review",
             "parallel implementation",
             "audit",
+            "pre-delivery",
+            "host rejection",
+            "safety rejection",
         ],
         requires_capabilities: &["live agent state"],
         related_skills: &["workstation-control", "development-orchestration"],
@@ -2071,6 +2092,37 @@ mod tests {
     }
 
     #[test]
+    fn agent_dispatch_is_discoverable_for_host_pre_delivery_fallback() {
+        let service = ProgressiveSkillService::new();
+        let descriptor = service
+            .catalog()
+            .into_iter()
+            .find(|item| item.id == "agent-dispatch")
+            .expect("agent-dispatch must be in the builtin catalog");
+        assert!(descriptor.description.contains("pre-delivery rejection"));
+        for expected in ["pre-delivery", "host rejection", "safety rejection"] {
+            assert!(
+                descriptor
+                    .triggers
+                    .iter()
+                    .any(|trigger| trigger == expected)
+            );
+        }
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["agent-dispatch"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["ok"], true);
+        let content = loaded["skills"][0]["content"].as_str().unwrap();
+        assert!(content.contains("Host-side pre-delivery rejection"));
+        assert!(content.contains("existing compatible local Agent"));
+        assert!(content.contains("fallback chain stops"));
+    }
+
+    #[test]
     fn engineering_robustness_reference_is_discoverable_and_loadable() {
         let service = ProgressiveSkillService::new();
         let descriptor = service
@@ -2480,7 +2532,7 @@ mod tests {
         assert_eq!(methods[5]["params"]["oneOf"].as_array().unwrap().len(), 2);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
-        assert_eq!(methods.len(), 18);
+        assert_eq!(methods.len(), 19);
         assert_eq!(methods[0]["method"], BROWSER_ENDPOINT_LIST_METHOD);
         assert_eq!(methods[1]["method"], BROWSER_ENDPOINT_INSPECT_METHOD);
         assert_eq!(methods[2]["method"], BROWSER_RESOURCE_LIST_METHOD);
@@ -2526,12 +2578,18 @@ mod tests {
         assert_eq!(methods[15]["method"], BROWSER_DISPATCH_SUBMIT_METHOD);
         assert_eq!(methods[16]["method"], BROWSER_DISPATCH_STATUS_METHOD);
         assert_eq!(methods[17]["method"], BROWSER_DISPATCH_STOP_METHOD);
+        assert_eq!(methods[18]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
+        assert_eq!(methods[18]["access"], "read_only");
+        assert_eq!(
+            methods[18]["params"]["required"],
+            json!(["continuity_id", "source_url"])
+        );
         assert_eq!(
             methods
                 .iter()
                 .filter(|method| method["access"] == "read_only")
                 .count(),
-            8
+            9
         );
         assert!(methods.iter().all(|method| {
             let name = method["method"].as_str().unwrap();

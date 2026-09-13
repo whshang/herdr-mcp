@@ -17,8 +17,11 @@ herdr-mcp doctor
 herdr-mcp update
 herdr-mcp update check
 herdr-mcp update apply
+herdr-mcp update major-apply
+herdr-mcp update major-rollback
 herdr-mcp update auto
 herdr-mcp update status
+herdr-mcp profile check --file ./workstation-profile.json
 herdr-mcp rollback
 herdr-mcp reinstall
 herdr-mcp uninstall
@@ -27,6 +30,10 @@ herdr-mcp uninstall
 从 v0.4.3 起，`update` 是普通用户的一步升级入口，等价于 `update apply`。已安装的 v0.4.2 binary 仍会把 bare `herdr-mcp update` 当作只读检查，并把 `herdr-mcp update apply` 返回为 `next_action`，因此从 v0.4.2 跨版本升级时应执行一次 `herdr-mcp update apply`。只有明确需要只读检查版本与 provenance 时才使用 `update check`。
 
 交互式 `update` / `update apply` 会继续把最终机器可读结果写到 stdout，同时把人类可读进度写到 stderr：检查 Release/provenance、验证 artifact attestation、按百分比显示下载进度、校验 candidate、显示 installer 状态，并最终给出经过 health gate 的成功/失败结果。真正的 activation 仍由 detached update worker 执行；前台 CLI 只在有界时间内观察 durable update job，不自行执行 service lifecycle mutation。如果安装确实超过观察窗口，命令会返回 `update_queued`，并带 `next_action: herdr-mcp update status`。`update auto` 继续保持非交互、静默后台模式。已经发布且不可变的 v0.4.2 binary 早于这套进度 UI，因此从 v0.4.2 执行一次 `update apply` 时，网络阶段仍可能暂时没有输出。
+
+`update apply` 对不兼容的持久化 state schema 继续 fail-closed。经过资格验证的 v0.4.8（schema 5）→ v1.0（schema 13）升级，应从独立终端使用已验证的 v1.0 binary 执行 `update major-apply`。它先生成私有、一致的 schema-5 SQLite 备份和一份可执行的旧 runtime binary 私有副本，对两份 rollback artifact 都做哈希校验，并确认旧服务可以停止后，才复用正常的事务式 service install 完成迁移和激活。`update major-rollback` 同样要求先确认服务成功停止，再恢复升级前数据库并重新安装备份的旧 runtime；私有 binary 副本使回滚不依赖后续 runtime generation GC。回滚会丢弃 v1.0 迁移后新产生的持久化状态。这两个命令都会拒绝在 managed `herdr_exec` 会话内执行。
+
+`profile check --file` 是只读的设备可移植性 / drift 门禁。Profile JSON 使用 `schema_version: 1`，强制 `secrets_policy: "reauthorize"`，可声明项目 `{id, remote, path}`，以及 `can_run_headless`、`supports_code_edit`、`supports_shell`、`supports_vision` 等 Agent 能力要求。检查只会对比当前文件系统/Git origin 与已有 Capability Inventory，不安装工具、不复制文件、不携带凭据；未探测的能力保持 drift，不会猜值。报告 inventory 不可用时再执行 `herdr-mcp scan --probe`。
 
 `update auto` 是后台调度入口。默认 macOS PROD 实例执行 `service install` 时会 reconcile 归属明确的 `dev.herdr-mcp.auto-update` LaunchAgent；任务在加载时先执行一次，随后每天触发。自动安装严格限制为 **PROD runtime + Stable Release**：编译为 DEV 的 runtime、`[update] check = false`、named instance、`preview` 都会在访问网络前直接跳过。发现严格更高的 Stable Release 后，继续复用正常的 provenance 验签、detached worker 和 rollback-safe 更新事务，不新增第二套下载器，也不绕过回滚门槛。`service uninstall` 会先写入归属明确的持久 update fence 并移除 scheduler；detached worker 在真正 activation 前会再次检查该 fence，因此已经排队的静默更新不能在卸载后复活服务。显式成功的 install 才会解除 fence。
 

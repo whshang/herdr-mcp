@@ -237,7 +237,11 @@ test("A to B to A registration cannot resurrect an older A response", async () =
 });
 
 test("ChatGPT session.open is the only supported existing-view open", () => {
-  assert.match(backgroundSource, /capabilities:\s*\{\s*operations:\s*provider === "chatgpt"/);
+  assert.match(backgroundSource, /capabilities:\s*browserProviderCapabilities\(provider\)/);
+  assert.match(backgroundSource, /input_modalities:\s*\["text"\]/);
+  assert.match(backgroundSource, /attachment_count:\s*\{\s*status:\s*"known",\s*max:\s*0/);
+  assert.match(backgroundSource, /provider_message_chars:\s*\{\s*status:\s*"unknown"/);
+  assert.match(backgroundSource, /provider_model_reasoning_combinations:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /"session\.open"/);
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
   // No provider except chatgpt should ever reach the open postcondition.
