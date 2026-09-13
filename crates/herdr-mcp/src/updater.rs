@@ -458,32 +458,7 @@ fn major_apply() -> Result<ExitCode, String> {
             ));
         }
 
-        let record = match load_major_upgrade_record(&paths)? {
-            Some(record) => {
-                validate_major_upgrade_record(&paths, &record)?;
-                verify_file_sha256(
-                    Path::new(&record.source_binary),
-                    &record.source_binary_sha256,
-                    BINARY_MAX_BYTES,
-                    "major-upgrade source binary",
-                )?;
-                verify_file_sha256(
-                    Path::new(&record.state_backup),
-                    &record.state_backup_sha256,
-                    MAJOR_BACKUP_MAX_BYTES,
-                    "major-upgrade state backup",
-                )?;
-                record
-            }
-            None => prepare_major_upgrade_record(&paths, &state_path)?,
-        };
-
-        run_service_command(
-            Path::new(&record.source_binary),
-            &paths,
-            &["service", "stop"],
-        )
-        .map_err(|error| format!("cannot stop service before major state migration: {error}"))?;
+        let record = prepare_major_upgrade_record(&paths, &state_path)?;
 
         let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
         let install_ok = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
@@ -531,12 +506,11 @@ fn major_rollback() -> Result<ExitCode, String> {
         validate_major_upgrade_record(&paths, &record)?;
         let state_path = paths.config_dir.join("state.db");
         let schema = read_raw_state_schema(&state_path)?;
-        if schema.is_some()
-            && schema != Some(record.source_state_schema)
-            && schema != Some(record.target_state_schema)
-        {
+        if schema.is_some_and(|version| {
+            !(record.source_state_schema..=record.target_state_schema).contains(&version)
+        }) {
             return Err(format!(
-                "major rollback expected live state schema {} or {}, found {}",
+                "major rollback expected live state schema {} through {}, found {}",
                 record.source_state_schema,
                 record.target_state_schema,
                 schema.map_or_else(|| "missing".to_owned(), |value| value.to_string())
@@ -626,7 +600,41 @@ fn prepare_major_upgrade_record(
     state_path: &Path,
 ) -> Result<MajorUpgradeRecord, String> {
     let active_source_binary = active_runtime_binary(paths)?;
+    let dir = major_upgrade_dir(paths);
+    if major_upgrade_backup_path(paths).exists()
+        || major_upgrade_source_binary_path(paths).exists()
+        || major_upgrade_record_path(paths).exists()
+    {
+        return Err(format!(
+            "major-upgrade rollback material already exists under {}; run major-rollback or inspect it before retrying",
+            dir.display()
+        ));
+    }
+    // The final snapshot must include writes committed while the old service stops.
+    run_service_command(&active_source_binary, paths, &["service", "stop"])
+        .map_err(|error| format!("cannot stop service before major state migration: {error}"))?;
+    match snapshot_major_upgrade_record(paths, state_path, &active_source_binary) {
+        Ok(record) => Ok(record),
+        Err(error) => {
+            let restart = run_service_command(&active_source_binary, paths, &["service", "start"]);
+            Err(match restart {
+                Ok(()) => {
+                    format!("major-upgrade backup failed ({error}); previous service restarted")
+                }
+                Err(restart_error) => format!(
+                    "major-upgrade backup failed ({error}); previous service restart failed: {restart_error}"
+                ),
+            })
+        }
+    }
+}
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn snapshot_major_upgrade_record(
+    paths: &RuntimePaths,
+    state_path: &Path,
+    active_source_binary: &Path,
+) -> Result<MajorUpgradeRecord, String> {
     let dir = major_upgrade_dir(paths);
     fs::create_dir_all(&dir)
         .map_err(|error| format!("cannot create major-upgrade backup directory: {error}"))?;
@@ -667,7 +675,7 @@ fn prepare_major_upgrade_record(
         }
     };
     if let Err(error) = copy_regular_file_with_mode(
-        &active_source_binary,
+        active_source_binary,
         &source_binary,
         BINARY_MAX_BYTES,
         0o700,
@@ -898,6 +906,10 @@ fn run_service_command(binary: &Path, paths: &RuntimePaths, args: &[&str]) -> Re
         .output()
         .map_err(|error| format!("cannot execute {}: {error}", binary.display()))?;
     if output.status.success() {
+        #[cfg(target_os = "macos")]
+        if args == ["service", "stop"] {
+            verify_major_upgrade_service_stopped(paths)?;
+        }
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -905,6 +917,34 @@ fn run_service_command(binary: &Path, paths: &RuntimePaths, args: &[&str]) -> Re
         "{} {} failed: {}",
         binary.display(),
         args.join(" "),
+        stderr.chars().take(1024).collect::<String>().trim()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_major_upgrade_service_stopped(paths: &RuntimePaths) -> Result<(), String> {
+    // Older source binaries treat every failed launchctl lookup as "not loaded".
+    // Independently require an explicit absence before taking or restoring a snapshot.
+    let uid = unsafe { libc::getuid() };
+    let label = paths.instance.service_label();
+    let target = format!("gui/{uid}/{label}");
+    let output = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot verify stopped service {target}: {error}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success()
+        && stderr.lines().any(|line| {
+            line == format!("Could not find service \"{label}\" in domain for user gui: {uid}")
+        })
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot confirm service {target} is stopped ({}): {}",
+        output.status,
         stderr.chars().take(1024).collect::<String>().trim()
     ))
 }
@@ -1934,7 +1974,11 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn test_runtime_paths(root: &Path) -> RuntimePaths {
         RuntimePaths {
-            instance: crate::instance::InstanceId::default_instance(),
+            instance: crate::instance::InstanceId::parse(&format!(
+                "major-test-{}",
+                std::process::id()
+            ))
+            .unwrap(),
             config_dir: root.to_path_buf(),
             config_file: root.join("config.toml"),
             dev_state_dir: root.join("dev-state"),
@@ -2034,7 +2078,10 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let paths = test_runtime_paths(&root);
         let active = root.join("runtime/current/herdr-mcp");
-        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+        write_test_executable(
+            &active,
+            "#!/bin/sh\nif [ \"$1 $2\" = \"service stop\" ]; then\n/usr/bin/python3 -c \"import os,sqlite3; c=sqlite3.connect(os.environ['HERDR_MCP_CONFIG_DIR']+'/state.db'); c.execute(\\\"UPDATE sentinel SET value='committed-before-stop'\\\"); c.commit()\"\nfi\n",
+        );
         let active_sha256 = sha256_file(&active, BINARY_MAX_BYTES).unwrap();
         let state = root.join("state.db");
         write_test_state(&state, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
@@ -2053,12 +2100,30 @@ mod tests {
             active_sha256
         );
         validate_major_upgrade_record(&paths, &record).unwrap();
+        let backup = Connection::open(&record.state_backup).unwrap();
+        let value: String = backup
+            .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "committed-before-stop");
+        drop(backup);
+        let live = Connection::open(&state).unwrap();
+        live.execute("UPDATE sentinel SET value='later-write'", [])
+            .unwrap();
+        assert!(prepare_major_upgrade_record(&paths, &state).is_err());
+        let value: String = live
+            .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            value, "later-write",
+            "a retry must not stop or reuse old material"
+        );
+        drop(live);
         fs::remove_dir_all(root).ok();
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn major_rollback_stop_failure_preserves_live_schema13_state() {
+    fn major_rollback_stop_failure_preserves_live_current_schema_state() {
         let root = env::temp_dir().join(format!(
             "herdr-major-stop-failure-{}-{}",
             std::process::id(),
@@ -2103,7 +2168,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn major_apply_stop_failure_preserves_schema5_and_retry_material() {
+    fn major_apply_stop_failure_preserves_schema5_without_stale_retry_material() {
         let _guard = crate::test_env::lock();
         let root = env::temp_dir().join(format!(
             "herdr-major-apply-stop-failure-{}-{}",
@@ -2117,7 +2182,10 @@ mod tests {
         unsafe {
             env::set_var("HERDR_MCP_CONFIG_DIR", &root);
             env::remove_var("HERDR_MCP_EXEC_ID");
-            env::remove_var("HERDR_MCP_INSTANCE");
+            env::set_var(
+                "HERDR_MCP_INSTANCE",
+                format!("major-test-{}", std::process::id()),
+            );
         }
 
         let active = root.join("runtime/current/herdr-mcp");
@@ -2132,9 +2200,9 @@ mod tests {
             Some(MAJOR_SOURCE_SCHEMA)
         );
         let paths = test_runtime_paths(&root);
-        assert!(major_upgrade_record_path(&paths).is_file());
-        assert!(major_upgrade_backup_path(&paths).is_file());
-        assert!(major_upgrade_source_binary_path(&paths).is_file());
+        assert!(!major_upgrade_record_path(&paths).exists());
+        assert!(!major_upgrade_backup_path(&paths).exists());
+        assert!(!major_upgrade_source_binary_path(&paths).exists());
 
         unsafe {
             match previous_config {
@@ -2155,7 +2223,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn major_rollback_accepts_half_recovered_schema5_state() {
+    fn major_rollback_accepts_source_and_partial_migration_states() {
         let _guard = crate::test_env::lock();
         let root = env::temp_dir().join(format!(
             "herdr-major-half-recovered-{}-{}",
@@ -2169,45 +2237,51 @@ mod tests {
         unsafe {
             env::set_var("HERDR_MCP_CONFIG_DIR", &root);
             env::remove_var("HERDR_MCP_EXEC_ID");
-            env::remove_var("HERDR_MCP_INSTANCE");
+            env::set_var(
+                "HERDR_MCP_INSTANCE",
+                format!("major-test-{}", std::process::id()),
+            );
         }
 
-        let paths = test_runtime_paths(&root);
-        let active = root.join("runtime/current/herdr-mcp");
-        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
-        let dir = major_upgrade_dir(&paths);
-        fs::create_dir_all(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let source_binary = major_upgrade_source_binary_path(&paths);
-        write_test_executable(&source_binary, "#!/bin/sh\nexit 0\n");
-        let state = root.join("state.db");
-        write_test_state(&state, MAJOR_SOURCE_SCHEMA, "half-recovered");
-        let backup = major_upgrade_backup_path(&paths);
-        write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
-        let record = MajorUpgradeRecord {
-            record_version: MAJOR_UPGRADE_RECORD_VERSION,
-            source_state_schema: MAJOR_SOURCE_SCHEMA,
-            target_state_schema: SCHEMA_VERSION,
-            source_binary: source_binary.to_string_lossy().into_owned(),
-            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
-            state_backup: backup.to_string_lossy().into_owned(),
-            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
-            created_at_ms: now_ms_i64(),
-        };
-        write_major_upgrade_record(&paths, &record).unwrap();
+        for live_schema in [MAJOR_SOURCE_SCHEMA, MAJOR_SOURCE_SCHEMA + 1] {
+            let paths = test_runtime_paths(&root);
+            let active = root.join("runtime/current/herdr-mcp");
+            write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+            let dir = major_upgrade_dir(&paths);
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let source_binary = major_upgrade_source_binary_path(&paths);
+            write_test_executable(&source_binary, "#!/bin/sh\nexit 0\n");
+            let state = root.join("state.db");
+            write_test_state(&state, live_schema, "half-recovered");
+            let backup = major_upgrade_backup_path(&paths);
+            write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
+            let record = MajorUpgradeRecord {
+                record_version: MAJOR_UPGRADE_RECORD_VERSION,
+                source_state_schema: MAJOR_SOURCE_SCHEMA,
+                target_state_schema: SCHEMA_VERSION,
+                source_binary: source_binary.to_string_lossy().into_owned(),
+                source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+                state_backup: backup.to_string_lossy().into_owned(),
+                state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+                created_at_ms: now_ms_i64(),
+            };
+            write_major_upgrade_record(&paths, &record).unwrap();
 
-        assert_eq!(major_rollback().unwrap(), ExitCode::SUCCESS);
-        assert_eq!(
-            read_raw_state_schema(&state).unwrap(),
-            Some(MAJOR_SOURCE_SCHEMA)
-        );
-        let conn = Connection::open(&state).unwrap();
-        let value: String = conn
-            .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(value, "before-major-upgrade");
-        drop(conn);
-        assert!(!dir.exists());
+            assert_eq!(major_rollback().unwrap(), ExitCode::SUCCESS);
+            assert_eq!(
+                read_raw_state_schema(&state).unwrap(),
+                Some(MAJOR_SOURCE_SCHEMA)
+            );
+            let conn = Connection::open(&state).unwrap();
+            let value: String = conn
+                .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "before-major-upgrade");
+            drop(conn);
+            assert!(!dir.exists());
+            fs::remove_file(&state).unwrap();
+        }
 
         unsafe {
             match previous_config {
@@ -2223,6 +2297,37 @@ mod tests {
                 None => env::remove_var("HERDR_MCP_INSTANCE"),
             }
         }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_snapshot_failure_restarts_source_without_rollback_material() {
+        let root = env::temp_dir().join(format!(
+            "herdr-major-snapshot-failure-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(
+            &active,
+            "#!/bin/sh\nif [ \"$1 $2\" = \"service start\" ]; then\n: > \"$HERDR_MCP_CONFIG_DIR/restarted\"\nfi\n",
+        );
+        let state = root.join("state.db");
+        write_test_state(&state, MAJOR_SOURCE_SCHEMA + 1, "untouched");
+        let error = prepare_major_upgrade_record(&paths, &state).unwrap_err();
+        assert!(error.contains("backup schema changed during snapshot"));
+        assert!(error.contains("previous service restarted"));
+        assert!(root.join("restarted").exists());
+        assert_eq!(
+            read_raw_state_schema(&state).unwrap(),
+            Some(MAJOR_SOURCE_SCHEMA + 1)
+        );
+        assert!(!major_upgrade_record_path(&paths).exists());
+        assert!(!major_upgrade_backup_path(&paths).exists());
+        assert!(!major_upgrade_source_binary_path(&paths).exists());
         fs::remove_dir_all(root).ok();
     }
 
