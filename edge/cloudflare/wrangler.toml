@@ -21,7 +21,7 @@ EDGE_ENV = "dev"
 EDGE_PROJECT = "herdr-edge-dev"
 EDGE_VERSION = "0.1.0-dev"
 DEFAULT_WORKSTATION_ID = "dev-real-runtime"
-OAUTH_ISSUER = "https://herdr-mcp.agentforme.cc.cd"
+OAUTH_ISSUER = "https://herdr-edge-dev.whshang.workers.dev"
 
 [durable_objects]
 bindings = [

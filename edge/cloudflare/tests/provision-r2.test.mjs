@@ -20,6 +20,19 @@ test("provisioner parses private ARTIFACT_BUCKET bindings from wrangler configs"
   assert.deepEqual(user, []);
 });
 
+test("development Wrangler config keeps OAuth identity on the development Worker origin", () => {
+  const dev = readFileSync(path.join(DIR, "../wrangler.toml"), "utf8");
+  const prod = readFileSync(path.join(DIR, "../wrangler.prod.toml"), "utf8");
+  const devIssuer = dev.match(/^OAUTH_ISSUER\s*=\s*"([^"]+)"$/m)?.[1];
+  const prodIssuer = prod.match(/^OAUTH_ISSUER\s*=\s*"([^"]+)"$/m)?.[1];
+  assert.ok(devIssuer, "dev config must declare OAUTH_ISSUER");
+  assert.ok(prodIssuer, "prod config must declare OAUTH_ISSUER");
+  const devUrl = new URL(devIssuer);
+  assert.equal(devUrl.protocol, "https:");
+  assert.match(devUrl.hostname, /^herdr-edge-dev\..+\.workers\.dev$/);
+  assert.notEqual(devIssuer, prodIssuer, "dev OAuth issuer must never reuse the production identity");
+});
+
 test("provisioner treats already-exists as success and can no-op deploy", async () => {
   assert.equal(isAlreadyExistsError("A bucket with the name herdr-edge-prod-artifacts already exists."), true);
   const calls = [];
