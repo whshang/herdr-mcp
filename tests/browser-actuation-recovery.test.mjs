@@ -237,7 +237,11 @@ test("A to B to A registration cannot resurrect an older A response", async () =
 });
 
 test("ChatGPT session.open is the only supported existing-view open", () => {
-  assert.match(backgroundSource, /capabilities:\s*\{\s*operations:\s*provider === "chatgpt"/);
+  assert.match(backgroundSource, /capabilities:\s*browserProviderCapabilities\(provider\)/);
+  assert.match(backgroundSource, /input_modalities:\s*\["text"\]/);
+  assert.match(backgroundSource, /attachment_count:\s*\{\s*status:\s*"known",\s*max:\s*0/);
+  assert.match(backgroundSource, /provider_message_chars:\s*\{\s*status:\s*"unknown"/);
+  assert.match(backgroundSource, /provider_model_reasoning_combinations:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /"session\.open"/);
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
   // No provider except chatgpt should ever reach the open postcondition.
@@ -273,6 +277,19 @@ test("content script session.open verifies identity, generation, route, canonica
   assert.match(segment, /lifecycle_observed\s*=\s*true/);
   assert.match(segment, /canonical_url_observed\s*=\s*true/);
   assert.match(segment, /command_accepted\s*=\s*true/);
+});
+
+test("accepted ChatGPT user turns register a current-source identity before continuity binding", () => {
+  const start = backgroundSource.indexOf('if (msg?.type === "h2w_turn_started")');
+  const end = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")', start);
+  assert.ok(start >= 0 && end > start, "turn-start handler must remain extractable");
+  const segment = backgroundSource.slice(start, end);
+  const sourceObserve = segment.indexOf('operation: "source_turn.observe"');
+  const bindingLookup = segment.indexOf('loadBindings()');
+  assert.ok(sourceObserve >= 0, "accepted turn must register current-source identity");
+  assert.ok(bindingLookup > sourceObserve, "source identity must not depend on continuity binding");
+  assert.match(segment, /canonical_url:\s*convKey/);
+  assert.match(segment, /user_text:\s*userText/);
 });
 
 test("ChatGPT session.archive targets the exact registered session and verifies provider archive state", () => {

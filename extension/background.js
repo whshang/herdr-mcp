@@ -1837,6 +1837,24 @@ async function postBrowserDispatchResult({ provider, session_ref, expected_gener
   });
 }
 
+function browserProviderCapabilities(provider) {
+  const operations = provider === "chatgpt"
+    ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create"]
+    : ["composer.submit", "generation.status", "generation.stop", "session.inspect"];
+  return {
+    schema_version: 1,
+    operations,
+    input_modalities: ["text"],
+    output_modalities: ["text"],
+    limits: {
+      attachment_count: { status: "known", max: 0, authority: "browser_control_v1" },
+      provider_message_chars: { status: "unknown", authority: "provider" },
+      provider_response_timeout_ms: { status: "unknown", authority: "provider" },
+      provider_model_reasoning_combinations: { status: "unknown", authority: "provider" },
+    },
+  };
+}
+
 async function observeBrowserConversation({
   provider,
   tabId,
@@ -1859,9 +1877,7 @@ async function observeBrowserConversation({
     provider,
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
-    capabilities: { operations: provider === "chatgpt"
-      ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create"]
-      : ["composer.submit", "generation.status", "generation.stop", "session.inspect"] },
+    capabilities: browserProviderCapabilities(provider),
     observed_at: Date.now(),
   });
   let accountLaunchUrl = null;
@@ -6382,6 +6398,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!convKey || !userText) {
         sendResponse({ ok: false, error: "continuity-fields-incomplete" });
         return;
+      }
+      try {
+        await postBrowserRegistry({
+          operation: "source_turn.observe",
+          canonical_url: convKey,
+          user_text: userText,
+          observed_at: msg?.startedAt || Date.now(),
+        });
+      } catch (error) {
+        callLog("current source turn observe failed:", error?.message || String(error));
       }
       let session = [];
       try {

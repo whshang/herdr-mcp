@@ -74,6 +74,11 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /after a second host rejection, stop instead of changing transport.*tool power/s);
     assert.match(r.content, /Do not build a tool\/command blacklist from a single rejection/);
     assert.match(r.content, /one bounded single-purpose read\/probe per call/);
+    assert.match(r.content, /one logical intent, one authority boundary, and at most one mutation boundary/);
+    assert.match(r.content, /internal Herdr\/Edge batching, caching and coalescing remain encouraged/i);
+    assert.match(r.content, /concatenating unrelated host, file, database, network, or service actions into one freeform `herdr_exec`/);
+    assert.match(r.content, /must stay separate public calls even when that costs an extra round trip/);
+    assert.match(r.content, /does not by itself make any tool "absolutely safe".*not permission to weaken authorization/s);
     assert.match(r.content, /existing local Agent.*execution fallback/s);
     assert.match(r.content, /Use `herdr_prompt` with one high-level task contract/s);
     assert.match(r.content, /Agent fallback is an alternate execution subject.*not a privilege or safety bypass/s);
@@ -82,7 +87,8 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /never escalate to a more powerful tool solely to force a rejected request through/);
     assert.match(r.content, /herdr_git status.*diff.*log.*herdr_exec.*herdr_fs_grep.*compacted/s);
     assert.match(r.content, /counts.*compacted.*summarized `output`/s);
-    assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start` \/ `herdr_exec_read`/);
+    assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start`, not the visible utility pane or a blocking `herdr_exec`/);
+    assert.match(r.content, /herdr_mcp\.exec\.wait/);
     assert.match(r.content, /GitHub Actions artifact downloads.*`herdr_exec_start`/s);
     assert.match(r.content, /destination-file growth.*never start a duplicate transfer/s);
     assert.match(r.content, /herdr_exec_read\(offset=next_offset\)/);

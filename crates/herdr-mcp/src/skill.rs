@@ -711,11 +711,14 @@ mod tests {
         assert!(content.contains("## 1A. Latency-aware tool scheduling"));
         assert!(content.contains("dependency-aware **wave**"));
         assert!(content.contains("are already compacted"));
+        assert!(content.contains("Long build/test/process work belongs in `herdr_exec_start`"));
+        assert!(
+            content.contains(
+                "follow the bounded-wait policy below instead of polling `herdr_exec_read`"
+            )
+        );
         assert!(content.contains(
-            "Long build/test/process work belongs in `herdr_exec_start` / `herdr_exec_read`"
-        ));
-        assert!(content.contains(
-            "prefer `herdr_exec_start` -> `herdr_exec_read` (delta) over a blocking `herdr_exec`"
+            "prefer one bounded wait (normally 10 seconds, maximum 20 seconds) over repeated empty `herdr_exec_read` polling"
         ));
         assert!(content.contains("phase=started"));
         assert!(content.contains("phase=completed"));

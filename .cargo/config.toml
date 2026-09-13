@@ -1,4 +1,4 @@
 [build]
-# Cargo 1.97 stores intermediate artifacts here while keeping final binaries,
-# package output, docs, and timing reports in each worktree's own target dir.
-build-dir = "{cargo-cache-home}/herdr-mcp-build"
+# Keep intermediates under CARGO_HOME, but isolate them by manifest path so
+# concurrent worktrees cannot reuse stale local-crate artifacts.
+build-dir = "{cargo-cache-home}/herdr-mcp-build/{workspace-path-hash}"

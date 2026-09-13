@@ -470,11 +470,16 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "access": "mutation",
             "params": {
                 "properties": {
-                    "session_ref": {"type": "string", "maxLength": 96},
-                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "session_ref": {"type": ["string", "null"], "maxLength": 96},
+                    "current_user_message": {"type": ["string", "null"], "maxLength": 262144},
+                    "expected_generation": {"type": ["integer", "null"], "minimum": 1},
                     "idempotency_key": {"type": "string", "maxLength": 256},
                 },
-                "required": ["session_ref", "expected_generation", "idempotency_key"],
+                "required": ["idempotency_key"],
+                "oneOf": [
+                    {"required": ["session_ref", "expected_generation"]},
+                    {"required": ["current_user_message"]},
+                ],
                 "empty": false,
             },
         }),
@@ -2571,6 +2576,14 @@ mod tests {
         );
         assert_eq!(methods[9]["method"], BROWSER_SESSION_OPEN_METHOD);
         assert_eq!(methods[10]["method"], BROWSER_SESSION_ARCHIVE_METHOD);
+        assert_eq!(
+            methods[10]["params"]["required"],
+            json!(["idempotency_key"])
+        );
+        assert_eq!(
+            methods[10]["params"]["properties"]["current_user_message"]["maxLength"],
+            262144
+        );
         assert_eq!(methods[11]["method"], BROWSER_SESSION_INSPECT_METHOD);
         assert_eq!(methods[12]["method"], BROWSER_MESSAGE_APPEND_METHOD);
         assert_eq!(methods[13]["method"], BROWSER_COMPOSER_SET_REASONING_METHOD);
