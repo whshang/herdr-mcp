@@ -30,10 +30,15 @@ use std::os::unix::fs::OpenOptionsExt;
 /// How long a writer waits on a locked database before erroring.
 pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 
+/// Durable retention window for a current-conversation source turn. An
+/// observation older than this is no longer resolvable and is pruned on the
+/// next observe/resolve.
+pub const BROWSER_SOURCE_TURN_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -493,6 +498,26 @@ CREATE INDEX IF NOT EXISTS idx_browser_dispatches_authorization
     WHERE authorization_connector_id IS NOT NULL;
 "#;
 
+/// Migration 14: durable current-conversation source-turn identity.
+///
+/// A browser session keeps exactly one row: the most recent user turn observed
+/// by the trusted Extension IPC. Only the SHA-256 of the trimmed user text is
+/// stored; the plaintext turn is never persisted. `observed_at` drives the 24h
+/// retention window, and a late-arriving older observation must not overwrite a
+/// newer one (`observe_browser_source_turn` enforces that in SQL).
+const MIGRATION_V14: &str = r#"
+CREATE TABLE IF NOT EXISTS browser_source_turns (
+    session_ref         TEXT PRIMARY KEY NOT NULL,
+    expected_generation INTEGER NOT NULL,
+    user_text_sha256    TEXT NOT NULL,
+    observed_at         INTEGER NOT NULL,
+    CHECK (expected_generation > 0),
+    CHECK (observed_at >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_browser_source_turns_hash
+    ON browser_source_turns(user_text_sha256);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -509,6 +534,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V11,
     MIGRATION_V12,
     MIGRATION_V13,
+    MIGRATION_V14,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -3414,6 +3440,94 @@ impl StateStore {
         }
     }
 
+    /// Persist the latest observed user turn for one browser session.
+    ///
+    /// Only the caller-computed SHA-256 of the trimmed user text is accepted;
+    /// plaintext never reaches the database. One row is kept per session, and a
+    /// late-arriving older observation must not overwrite a newer one. The
+    /// retention window is enforced by deleting expired rows first.
+    pub fn observe_browser_source_turn(
+        &mut self,
+        session_ref: &str,
+        expected_generation: i64,
+        user_text_sha256: &str,
+        observed_at: i64,
+    ) -> Result<(), String> {
+        validate_browser_resource_ref(session_ref)?;
+        if expected_generation < 1 || observed_at < 0 || !is_browser_digest(user_text_sha256) {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        self.prune_browser_source_turns(observed_at)?;
+        self.conn
+            .execute(
+                "INSERT INTO browser_source_turns(
+                     session_ref, expected_generation, user_text_sha256, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_ref) DO UPDATE SET
+                     expected_generation = excluded.expected_generation,
+                     user_text_sha256 = excluded.user_text_sha256,
+                     observed_at = excluded.observed_at
+                 WHERE excluded.observed_at >= browser_source_turns.observed_at",
+                params![
+                    session_ref,
+                    expected_generation,
+                    user_text_sha256,
+                    observed_at
+                ],
+            )
+            .map_err(|error| format!("cannot observe browser source turn: {error}"))?;
+        Ok(())
+    }
+
+    /// Resolve exactly one session from a user-text digest.
+    ///
+    /// Zero durable matches is `not_found`; more than one session sharing the
+    /// same digest is `ambiguous` (the caller must not guess). Expired rows are
+    /// pruned before lookup, and future-dated observations stay hidden until
+    /// their observed time catches up with the caller clock.
+    pub fn resolve_browser_source_turn(
+        &mut self,
+        user_text_sha256: &str,
+        now: i64,
+    ) -> Result<(String, i64), String> {
+        if now < 0 || !is_browser_digest(user_text_sha256) {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+        self.prune_browser_source_turns(now)?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_ref, expected_generation
+                 FROM browser_source_turns
+                 WHERE user_text_sha256 = ?1 AND observed_at <= ?2
+                 ORDER BY session_ref
+                 LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare browser source turn lookup: {error}"))?;
+        let mut matches = stmt
+            .query_map(params![user_text_sha256, now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| format!("cannot query browser source turn lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser source turn lookup: {error}"))?;
+        match matches.len() {
+            0 => Err("browser_current_turn_not_found".to_owned()),
+            1 => Ok(matches.pop().unwrap()),
+            _ => Err("browser_current_turn_ambiguous".to_owned()),
+        }
+    }
+
+    fn prune_browser_source_turns(&mut self, reference_at: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM browser_source_turns WHERE observed_at < ?1",
+                params![reference_at.saturating_sub(BROWSER_SOURCE_TURN_RETENTION_MS)],
+            )
+            .map_err(|error| format!("cannot prune browser source turns: {error}"))?;
+        Ok(())
+    }
+
     pub fn reserve_browser_session(
         &mut self,
         input: BrowserSessionReservationInput<'_>,
@@ -4750,15 +4864,18 @@ fn validate_browser_dispatch_id(value: &str) -> Result<(), String> {
 }
 
 fn validate_browser_digest(value: &str, field: &str) -> Result<(), String> {
-    if value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if is_browser_digest(value) {
         Ok(())
     } else {
         Err(format!("browser_{field}_invalid"))
     }
+}
+
+fn is_browser_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn validate_browser_resource_kind(value: &str) -> Result<(), String> {
@@ -6564,6 +6681,7 @@ mod tests {
             "service_events",
             "service_rollbacks",
             "browser_dispatches",
+            "browser_source_turns",
         ] {
             assert!(tables.contains(&table.to_owned()), "missing table {table}");
         }
@@ -6579,6 +6697,7 @@ mod tests {
             "idx_service_rollbacks_ready",
             "idx_service_rollbacks_created",
             "idx_browser_dispatches_idempotency",
+            "idx_browser_source_turns_hash",
         ] {
             assert!(indexes.contains(&index.to_owned()), "missing index {index}");
         }
@@ -6592,6 +6711,17 @@ mod tests {
         assert_eq!(
             sensitive_exec_columns, 0,
             "durable exec schema must not store command/cwd"
+        );
+        let source_turn_columns = store
+            .scalar_i64(
+                "SELECT COUNT(*) FROM pragma_table_info('browser_source_turns') \
+                 WHERE name IN ('user_text', 'text', 'message')",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source_turn_columns, 0,
+            "durable source turns must store only the user-text digest"
         );
         std::fs::remove_file(&path).ok();
     }
@@ -8412,7 +8542,8 @@ mod tests {
             vec![
                 "browser_dispatches",
                 "browser_resource_locators",
-                "browser_session_reservations"
+                "browser_session_reservations",
+                "browser_source_turns"
             ]
         );
         assert!(!tables_after.contains(&"browser_delivery_events".to_owned()));
@@ -8600,6 +8731,160 @@ mod tests {
             Some(1)
         );
         drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn schema_v13_upgrades_to_v14_with_source_turn_table() {
+        let path = temp_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(13) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '13')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+        }
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .scalar_i64("SELECT COUNT(*) FROM pragma_table_info('browser_source_turns')")
+                .unwrap(),
+            Some(4)
+        );
+        for column in [
+            "session_ref",
+            "expected_generation",
+            "user_text_sha256",
+            "observed_at",
+        ] {
+            assert_eq!(
+                store
+                    .scalar_i64(&format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('browser_source_turns') WHERE name = '{column}'"
+                    ))
+                    .unwrap(),
+                Some(1),
+                "missing browser_source_turns column {column}"
+            );
+        }
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM pragma_table_info('browser_source_turns') \
+                     WHERE name IN ('user_text', 'text', 'message')",
+                )
+                .unwrap(),
+            Some(0),
+            "durable source turns must store only the user-text digest"
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn browser_source_turns_keep_latest_and_survive_reopen() {
+        let path = temp_db_path();
+        let session = format!("br_{}", "a".repeat(64));
+        let other = format!("br_{}", "b".repeat(64));
+        let first = "c".repeat(64);
+        let second = "d".repeat(64);
+        let now = 100_000_i64;
+
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            store
+                .observe_browser_source_turn(&session, 7, &first, now)
+                .unwrap();
+            // A newer observation supersedes the previous turn for the session.
+            store
+                .observe_browser_source_turn(&session, 8, &second, now + 1_000)
+                .unwrap();
+            assert_eq!(
+                store
+                    .resolve_browser_source_turn(&first, now + 2_000)
+                    .unwrap_err(),
+                "browser_current_turn_not_found"
+            );
+            assert_eq!(
+                store
+                    .resolve_browser_source_turn(&second, now + 2_000)
+                    .unwrap(),
+                (session.clone(), 8)
+            );
+            // A late-arriving older observation must not overwrite the newer turn.
+            store
+                .observe_browser_source_turn(&session, 7, &first, now + 500)
+                .unwrap();
+            assert_eq!(
+                store
+                    .resolve_browser_source_turn(&first, now + 2_000)
+                    .unwrap_err(),
+                "browser_current_turn_not_found"
+            );
+            assert_eq!(
+                store
+                    .resolve_browser_source_turn(&second, now + 2_000)
+                    .unwrap(),
+                (session.clone(), 8)
+            );
+            // Far beyond the retired 5-minute window but inside 24h retention.
+            assert_eq!(
+                store
+                    .resolve_browser_source_turn(&second, now + 30 * 60 * 1000)
+                    .unwrap(),
+                (session.clone(), 8)
+            );
+        }
+
+        {
+            let mut reopened = StateStore::open(&path).unwrap();
+            assert_eq!(
+                reopened
+                    .resolve_browser_source_turn(&second, now + 60_000)
+                    .unwrap(),
+                (session.clone(), 8)
+            );
+            // Past the 24h retention window the turn is pruned, not resolved.
+            assert_eq!(
+                reopened
+                    .resolve_browser_source_turn(&second, now + 24 * 60 * 60 * 1000 + 2_000)
+                    .unwrap_err(),
+                "browser_current_turn_not_found"
+            );
+            assert_eq!(
+                reopened
+                    .scalar_i64("SELECT COUNT(*) FROM browser_source_turns")
+                    .unwrap(),
+                Some(0)
+            );
+        }
+
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            store
+                .observe_browser_source_turn(&session, 8, &second, now)
+                .unwrap();
+            store
+                .observe_browser_source_turn(&other, 9, &second, now + 1)
+                .unwrap();
+            assert_eq!(
+                store
+                    .resolve_browser_source_turn(&second, now + 2)
+                    .unwrap_err(),
+                "browser_current_turn_ambiguous"
+            );
+        }
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();

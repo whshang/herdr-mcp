@@ -5,8 +5,7 @@ use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{
     self, BrowserActuator, BrowserCallerAuthorization, BrowserCallerGrant,
-    BrowserMutationAdmission, BrowserPostconditionEvidence, BrowserSourceTurnRegistry,
-    PageAssistCallerGrant, RuntimeContext,
+    BrowserMutationAdmission, BrowserPostconditionEvidence, PageAssistCallerGrant, RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -450,7 +449,6 @@ struct AppState {
     browser_actuation: BrowserActuationBroker,
     browser_mutation_gate: Arc<RwLock<()>>,
     browser_mutation_admission: Arc<BrowserMutationAdmission>,
-    browser_source_turns: Arc<BrowserSourceTurnRegistry>,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -508,7 +506,6 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
-            browser_source_turns: Arc::new(BrowserSourceTurnRegistry::default()),
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -1034,8 +1031,9 @@ fn extension_browser_resource_observe(
 }
 
 /// Trusted Extension IPC: bind one accepted ChatGPT user turn to the exact
-/// registered session for a short in-memory window. This identity is used only
-/// by current-conversation mutations and expires automatically.
+/// registered session. The identity is durable StateStore state (only the
+/// user-text digest is stored) so current-conversation mutations survive a
+/// runtime restart and expire after the 24h retention window.
 fn extension_browser_source_turn_observe(
     state: &AppState,
     payload: &Value,
@@ -1050,26 +1048,25 @@ fn extension_browser_source_turn_observe(
     if !canonical_url.starts_with("https://chatgpt.com/") {
         return Err("browser_canonical_url_invalid".to_owned());
     }
-    let (session_ref, expected_generation) = {
-        let store = state
-            .state_store
-            .lock()
-            .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
-        let session_ref = store
-            .browser_session_ref_for_canonical_url(canonical_url)?
-            .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
-        let session = store
-            .browser_resource(&session_ref)?
-            .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
-        if session.kind != "session" || session.provider != "chatgpt" {
-            return Err("browser_source_session_not_found".to_owned());
-        }
-        (session_ref, session.observation_generation)
-    };
-    state.browser_source_turns.observe(
+    let user_text_sha256 = mcp::browser_sha256(user_text.trim());
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let session_ref = store
+        .browser_session_ref_for_canonical_url(canonical_url)?
+        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+    let session = store
+        .browser_resource(&session_ref)?
+        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+    if session.kind != "session" || session.provider != "chatgpt" {
+        return Err("browser_source_session_not_found".to_owned());
+    }
+    let expected_generation = session.observation_generation;
+    store.observe_browser_source_turn(
         &session_ref,
         expected_generation,
-        user_text,
+        &user_text_sha256,
         observed_at,
     )?;
     Ok(json!({
@@ -2425,7 +2422,6 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
-            browser_source_turns: &blocking_state.browser_source_turns,
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -3045,7 +3041,6 @@ mod tests {
             browser_actuation: BrowserActuationBroker::default(),
             browser_mutation_gate: Arc::new(RwLock::new(())),
             browser_mutation_admission: Arc::new(BrowserMutationAdmission::default()),
-            browser_source_turns: Arc::new(BrowserSourceTurnRegistry::default()),
         }
     }
 
@@ -3282,7 +3277,6 @@ mod tests {
         extension_state.trusted_extension_ipc = true;
         extension_state.local_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
         let store = extension_state.state_store.clone();
-        let source_turns = extension_state.browser_source_turns.clone();
         let app = candidate_router(extension_state);
 
         let response = app
@@ -3441,7 +3435,24 @@ mod tests {
         assert_eq!(source_result["session_ref"], session_ref);
         assert_eq!(source_result["expected_generation"], 1);
         assert_eq!(
-            source_turns.resolve("归档当前对话", 1006).unwrap(),
+            store
+                .lock()
+                .unwrap()
+                .resolve_browser_source_turn(&mcp::browser_sha256("归档当前对话"), 1006)
+                .unwrap(),
+            (session_ref.to_owned(), 1)
+        );
+        assert!(
+            !source_result.to_string().contains("归档当前对话"),
+            "the trusted IPC response must not echo user plaintext"
+        );
+        // The trusted IPC observation is durable: a fresh store handle on the
+        // same state file resolves it after the request completes.
+        let mut reopened = StateStore::open(root.join("extension").join("state-test.db")).unwrap();
+        assert_eq!(
+            reopened
+                .resolve_browser_source_turn(&mcp::browser_sha256("归档当前对话"), 1006)
+                .unwrap(),
             (session_ref.to_owned(), 1)
         );
 
