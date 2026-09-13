@@ -1,5 +1,5 @@
 import { sha256Hex } from "./device-crypto.js";
-import { isRoutableDevice, normalizeDeviceId, type DeviceRecord } from "./device-model.js";
+import { executionFenceForDevice, isRoutableDevice, normalizeDeviceId, type DeviceExecutionFence, type DeviceRecord } from "./device-model.js";
 
 interface FetchStub {
   fetch(request: Request): Promise<Response>;
@@ -292,6 +292,8 @@ export type DeviceRouteResult =
       device_name?: string;
       workstation_id: string;
       routing_reason: "explicit_device" | "device_ref" | "single_available_device" | "legacy_default_device";
+      /** Present only after DeviceRegistryDO authoritatively verified the route. */
+      execution_fence?: DeviceExecutionFence;
     }
   | {
       ok: false;
@@ -406,6 +408,7 @@ export async function resolveDeviceRouteWithContext(
       device_name: selected.name,
       workstation_id: selected.workstation_id,
       routing_reason: "explicit_device",
+      ...(Number.isSafeInteger(selected.updated_at_ms) ? { execution_fence: executionFenceForDevice(selected) } : {}),
     };
   }
 
@@ -420,6 +423,7 @@ export async function resolveDeviceRouteWithContext(
       device_name: device.name,
       workstation_id: device.workstation_id,
       routing_reason: "device_ref",
+      ...(Number.isSafeInteger(device.updated_at_ms) ? { execution_fence: executionFenceForDevice(device) } : {}),
     };
   }
 
@@ -446,6 +450,7 @@ export async function resolveDeviceRouteWithContext(
       device_name: selected.name,
       workstation_id: selected.workstation_id,
       routing_reason: "legacy_default_device",
+      ...(Number.isSafeInteger(selected.updated_at_ms) ? { execution_fence: executionFenceForDevice(selected) } : {}),
     };
   }
 
@@ -457,6 +462,7 @@ export async function resolveDeviceRouteWithContext(
       device_name: routable[0].name,
       workstation_id: routable[0].workstation_id,
       routing_reason: "single_available_device",
+      ...(Number.isSafeInteger(routable[0].updated_at_ms) ? { execution_fence: executionFenceForDevice(routable[0]) } : {}),
     };
   }
   if (routable.length > 1) {

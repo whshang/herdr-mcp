@@ -32,6 +32,7 @@
  */
 
 import type { Env } from "./env.js";
+import { parseDeviceExecutionFence, type DeviceExecutionFence } from "./device-model.js";
 import {
   errorResult,
   mapLinkErrorCode,
@@ -103,6 +104,7 @@ const PREFIX_IDEM = "idem:";
 const KEY_SESSION = "session";
 /** Immutable revocation tombstone. Written once on first revoke; never cleared. */
 const KEY_REVOKED = "revoked";
+const KEY_EXECUTION_FENCE = "device_execution_fence";
 /** Policy close code for a revoked device link. */
 const REVOKED_CLOSE_CODE = 4401;
 /**
@@ -181,6 +183,10 @@ export interface InternalForwardRequest {
   contractHash?: string;
   idempotencyKey?: string;
   trace?: Record<string, unknown>;
+  /** Trusted Edge-only route identity. Never forwarded to the workstation Link. */
+  routeDeviceId?: string;
+  /** Authoritative registry snapshot used to bootstrap/refresh the local fence. */
+  executionFence?: DeviceExecutionFence;
 }
 
 export type ForwardOutcome =
@@ -225,6 +231,8 @@ export class WorkstationDO {
    *  from storage on init). A revoke without a persisted tombstone must not
    *  report success; retries keep re-attempting persistence. */
   private revokedPersisted = false;
+  /** Registry-owned execution permission projected into this WorkstationDO. */
+  private executionFence: DeviceExecutionFence | undefined;
   /** Known-safe reads are correlated only in memory and never enter DO storage. */
   private readonly ephemeralReads = new Map<string, EphemeralReadRequest>();
   /** In-memory resolver cache only; storage remains authoritative. */
@@ -265,6 +273,9 @@ export class WorkstationDO {
         this.revokedPersisted = true;
         this.revokedAtMs = revokedRaw.revoked_at_ms;
       }
+      const fenceRaw = await this.state.storage.get<unknown>(KEY_EXECUTION_FENCE);
+      const parsedFence = parseDeviceExecutionFence(fenceRaw);
+      if (parsedFence) this.executionFence = parsedFence;
       const workstationId = this.workstationId();
       if (this.session === undefined) this.session = makeEmptySession(workstationId, Date.now());
       this.lastSeenPersistedAtMs = this.session.lastSeenAtMs ?? 0;
@@ -389,6 +400,9 @@ export class WorkstationDO {
     }
     if (request.method === "POST" && url.pathname === "/internal/forward") {
       return this.handleForward(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/execution-fence") {
+      return this.handleExecutionFence(request);
     }
     if (request.method === "POST" && url.pathname === "/internal/revoke") {
       return this.handleRevoke();
@@ -544,6 +558,92 @@ export class WorkstationDO {
     return this.json({ ok: true, revoked: true, revoked_at_ms: this.revokedAtMs ?? now });
   }
 
+  // --------------------------------------------- execution route fence
+
+  private async applyExecutionFence(next: DeviceExecutionFence): Promise<"updated" | "unchanged" | "stale" | "conflict"> {
+    if (next.workstation_id !== this.workstationId()) return "conflict";
+    const current = this.executionFence;
+    if (current) {
+      if (next.device_id !== current.device_id || next.workstation_id !== current.workstation_id) return "conflict";
+      if (next.revision < current.revision) return "stale";
+      if (next.revision === current.revision) {
+        return next.authorization === current.authorization && next.scheduling === current.scheduling
+          ? "unchanged"
+          : "conflict";
+      }
+    }
+    this.executionFence = next;
+    await this.state.storage.put(KEY_EXECUTION_FENCE, next);
+    return "updated";
+  }
+
+  private async handleExecutionFence(request: Request): Promise<Response> {
+    const parsed = await readBodyBounded(request, 4 * 1024);
+    if (!parsed.ok) return this.json({ ok: false, code: parsed.code }, parsed.code === "payload_too_large" ? 413 : 400);
+    const fence = parseDeviceExecutionFence(parsed.value);
+    if (!fence) return this.json({ ok: false, code: "invalid_execution_fence" }, 400);
+    const applied = await this.applyExecutionFence(fence);
+    if (applied === "conflict") return this.json({ ok: false, code: "execution_fence_conflict" }, 409);
+    return this.json({ ok: true, applied, revision: this.executionFence?.revision ?? fence.revision });
+  }
+
+  private async enforceExecutionFence(req: InternalForwardRequest, requestId: string, workstationId: string): Promise<Response | null> {
+    if (!req.routeDeviceId) return null;
+    if (req.executionFence) {
+      const parsed = parseDeviceExecutionFence(req.executionFence);
+      if (!parsed || parsed.device_id !== req.routeDeviceId || parsed.workstation_id !== workstationId) {
+        return this.json({ status: "error", error: errorResult("device_route_unverified", {
+          requestId, workstationId, delivery_state: "not_delivered", message: "device route fence bootstrap was invalid",
+        }) }, 409);
+      }
+      const applied = await this.applyExecutionFence(parsed);
+      if (applied === "conflict") {
+        return this.json({ status: "error", error: errorResult("device_route_unverified", {
+          requestId, workstationId, delivery_state: "not_delivered", message: "device route fence conflicted with newer workstation state",
+        }) }, 409);
+      }
+    }
+    if (this.revoked) {
+      return this.json({ status: "error", error: errorResult("device_revoked", {
+        requestId, workstationId, delivery_state: "not_delivered", message: "device is revoked",
+      }) }, 403);
+    }
+    const fence = this.executionFence;
+    if (!fence || fence.device_id !== req.routeDeviceId || fence.workstation_id !== workstationId) {
+      return this.json({ status: "error", error: errorResult("device_route_unverified", {
+        requestId, workstationId, delivery_state: "not_delivered", message: "device execution fence is not initialized",
+      }) }, 428);
+    }
+    if (fence.authorization === "revoked") {
+      return this.json({ status: "error", error: errorResult("device_revoked", {
+        requestId, workstationId, delivery_state: "not_delivered", message: "device is revoked",
+      }) }, 403);
+    }
+    if (fence.authorization === "suspended") {
+      return this.json({ status: "error", error: errorResult("device_suspended", {
+        requestId, workstationId, delivery_state: "not_delivered", message: "device is suspended",
+      }) }, 403);
+    }
+    if (fence.scheduling !== "enabled") {
+      return this.json({ status: "error", error: errorResult("device_paused", {
+        requestId, workstationId, delivery_state: "not_delivered", message: `device scheduling is ${fence.scheduling}`,
+      }) }, 409);
+    }
+    return null;
+  }
+
+  private successfulForwardResponse(completion: Completion, routeDeviceId?: string): Response {
+    const routeDeviceName = routeDeviceId
+      && this.executionFence?.device_id === routeDeviceId
+      ? this.executionFence.device_name
+      : undefined;
+    return this.json({
+      status: "ok",
+      completion,
+      ...(routeDeviceName ? { route_device_name: routeDeviceName } : {}),
+    });
+  }
+
   // ------------------------------------------------- internal forward
 
   private async handleForward(request: Request): Promise<Response> {
@@ -565,6 +665,10 @@ export class WorkstationDO {
     const now = Date.now();
     const workstationId = this.workstationId();
     const requestId = req.requestId ?? newRequestId();
+    if (req.routeDeviceId) {
+      const fenceError = await this.enforceExecutionFence(req, requestId, workstationId);
+      if (fenceError) return fenceError;
+    }
 
     // Fail closed after revocation: reject immediately, without reconnect-grace
     // waiting, so a stolen link can never continue tool requests.
@@ -645,7 +749,7 @@ export class WorkstationDO {
     // lifecycle process-local so read-heavy traffic consumes zero Durable
     // Storage rows and zero Durable Object alarm writes.
     if (opClass === "read") {
-      return this.forwardEphemeralRead({ requestId, workstationId, op: req.op, deadlineMs, wire, now });
+      return this.forwardEphemeralRead({ requestId, workstationId, op: req.op, deadlineMs, wire, now, routeDeviceId: req.routeDeviceId });
     }
 
     // Reconcile any durable mutation left past deadline by a previous isolate
@@ -683,7 +787,7 @@ export class WorkstationDO {
     });
 
     if (add.status === "idem_hit") {
-      return this.json({ status: "ok", completion: add.completion });
+      return this.successfulForwardResponse(add.completion, req.routeDeviceId);
     }
     if (add.status === "capacity_full") {
       return this.json({ status: "error", error: capacityResult({ requestId, workstationId, atMs: now }) }, 429);
@@ -736,7 +840,7 @@ export class WorkstationDO {
     if (!stillOwned) {
       const settledCompletion = this.registry.completedFor(entry.requestId);
       if (settledCompletion) {
-        return this.json({ status: "ok", completion: settledCompletion });
+        return this.successfulForwardResponse(settledCompletion, req.routeDeviceId);
       }
       return this.json(
         { status: "error", error: reconnectingResult({ requestId: entry.requestId, workstationId, atMs: now }) },
@@ -795,7 +899,7 @@ export class WorkstationDO {
       return this.json({ status: "error", error: offlineResult({ requestId: entry.requestId, workstationId, atMs: now }) }, 503);
     }
     const completion = await this.awaitCompletion(entry.requestId, deadlineMs);
-    return this.json({ status: "ok", completion });
+    return this.successfulForwardResponse(completion, req.routeDeviceId);
   }
 
   private hasActiveLink(): boolean {
@@ -840,6 +944,7 @@ export class WorkstationDO {
     deadlineMs: number;
     wire: ToolRequestMessage;
     now: number;
+    routeDeviceId?: string;
   }): Promise<Response> {
     const { requestId, workstationId, op, deadlineMs, wire, now } = opts;
     // Preserve one coherent live-request capacity bound, but exclude expired
@@ -881,7 +986,7 @@ export class WorkstationDO {
     entry.state = "sent";
     entry.sentAtMs = now;
     const completion = await this.awaitEphemeralRead(requestId, deadlineMs);
-    return this.json({ status: "ok", completion });
+    return this.successfulForwardResponse(completion, opts.routeDeviceId);
   }
 
   private awaitEphemeralRead(requestId: string, deadlineMs: number): Promise<Completion> {
