@@ -42,8 +42,6 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
 ];
 const BROWSER_ADAPTER_PROTOCOL_VERSION: i64 = 1;
 const BROWSER_ACCOUNT_MUTATION_RETRY_AFTER_MS: i64 = 250;
-const BROWSER_SOURCE_TURN_TTL_MS: i64 = 5 * 60 * 1000;
-const MAX_BROWSER_SOURCE_TURNS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserCallerGrant {
@@ -57,87 +55,6 @@ pub struct BrowserCallerAuthorization {
     pub principal_ref: String,
     pub connector_id: String,
     pub grant_generation: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BrowserSourceTurnRecord {
-    session_ref: String,
-    expected_generation: i64,
-    user_text_sha256: String,
-    observed_at: i64,
-}
-
-#[derive(Default)]
-pub struct BrowserSourceTurnRegistry {
-    inner: std::sync::Mutex<std::collections::VecDeque<BrowserSourceTurnRecord>>,
-}
-
-impl BrowserSourceTurnRegistry {
-    pub fn observe(
-        &self,
-        session_ref: &str,
-        expected_generation: i64,
-        user_text: &str,
-        observed_at: i64,
-    ) -> Result<(), String> {
-        let user_text = user_text.trim();
-        if session_ref.is_empty()
-            || expected_generation < 1
-            || user_text.is_empty()
-            || user_text.len() > 262_144
-            || observed_at < 0
-        {
-            return Err("browser_current_turn_invalid".to_owned());
-        }
-        let user_text_sha256 = browser_sha256(user_text);
-        let mut records = self
-            .inner
-            .lock()
-            .map_err(|_| "browser_current_turn_registry_unavailable".to_owned())?;
-        records.retain(|record| {
-            observed_at.saturating_sub(record.observed_at) <= BROWSER_SOURCE_TURN_TTL_MS
-                && !(record.session_ref == session_ref
-                    && record.user_text_sha256 == user_text_sha256)
-        });
-        records.push_back(BrowserSourceTurnRecord {
-            session_ref: session_ref.to_owned(),
-            expected_generation,
-            user_text_sha256,
-            observed_at,
-        });
-        while records.len() > MAX_BROWSER_SOURCE_TURNS {
-            records.pop_front();
-        }
-        Ok(())
-    }
-
-    pub fn resolve(&self, user_text: &str, now: i64) -> Result<(String, i64), String> {
-        let user_text = user_text.trim();
-        if user_text.is_empty() || user_text.len() > 262_144 || now < 0 {
-            return Err("browser_current_turn_invalid".to_owned());
-        }
-        let user_text_sha256 = browser_sha256(user_text);
-        let mut records = self
-            .inner
-            .lock()
-            .map_err(|_| "browser_current_turn_registry_unavailable".to_owned())?;
-        records.retain(|record| {
-            now >= record.observed_at
-                && now.saturating_sub(record.observed_at) <= BROWSER_SOURCE_TURN_TTL_MS
-        });
-        let mut matches = records
-            .iter()
-            .filter(|record| record.user_text_sha256 == user_text_sha256)
-            .map(|record| (record.session_ref.clone(), record.expected_generation))
-            .collect::<Vec<_>>();
-        matches.sort();
-        matches.dedup();
-        match matches.len() {
-            0 => Err("browser_current_turn_not_found".to_owned()),
-            1 => Ok(matches.pop().unwrap()),
-            _ => Err("browser_current_turn_ambiguous".to_owned()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +123,6 @@ pub struct RuntimeContext<'a> {
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
-    pub browser_source_turns: &'a BrowserSourceTurnRegistry,
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -400,7 +316,6 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                         mutation_gate: context.browser_mutation_gate,
                         mutation_admission: context.browser_mutation_admission,
                         caller_authorization: context.caller_webchat_authorization,
-                        source_turns: Some(context.browser_source_turns),
                     },
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
@@ -2994,8 +2909,7 @@ fn browser_handoff_prepare(
 }
 
 fn browser_session_archive_params_from_current_turn(
-    store: &StateStore,
-    source_turns: &BrowserSourceTurnRegistry,
+    store: &mut StateStore,
     params: &Value,
 ) -> Result<Option<Value>, Value> {
     let Some(current_user_message) = params.get("current_user_message") else {
@@ -3019,8 +2933,8 @@ fn browser_session_archive_params_from_current_turn(
         return Err(json!({"ok": false, "code": "browser_current_turn_invalid"}));
     }
     let idempotency_key = browser_required_idempotency_key(params)?;
-    let (session_ref, expected_generation) = source_turns
-        .resolve(current_user_message, browser_epoch_ms())
+    let (session_ref, expected_generation) = store
+        .resolve_browser_source_turn(&browser_sha256(current_user_message), browser_epoch_ms())
         .map_err(browser_store_error)?;
     let session = match store.browser_resource(&session_ref) {
         Ok(Some(value)) => value,
@@ -3469,7 +3383,7 @@ fn browser_dispatch_work_memory_writeback(
     }
 }
 
-fn browser_sha256(value: &str) -> String {
+pub(crate) fn browser_sha256(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
@@ -3551,7 +3465,6 @@ struct BrowserOperationControls<'a> {
     mutation_gate: Option<&'a std::sync::RwLock<()>>,
     mutation_admission: Option<&'a BrowserMutationAdmission>,
     caller_authorization: Option<&'a BrowserCallerAuthorization>,
-    source_turns: Option<&'a BrowserSourceTurnRegistry>,
 }
 
 #[cfg(test)]
@@ -3573,7 +3486,6 @@ fn browser_operation_call_with_grants(
             mutation_gate: browser_mutation_gate,
             mutation_admission: None,
             caller_authorization: None,
-            source_turns: None,
         },
     )
 }
@@ -3611,21 +3523,15 @@ fn browser_operation_call_with_controls(
     } else if operation == BrowserOperation::SessionArchive
         && object.contains_key("current_user_message")
     {
-        let Some(source_turns) = controls.source_turns else {
-            return json!({"ok": false, "code": "browser_current_turn_unavailable"});
-        };
-        let Ok(store_guard) = store.lock() else {
+        let Ok(mut store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
-        normalized_params = match browser_session_archive_params_from_current_turn(
-            &store_guard,
-            source_turns,
-            params,
-        ) {
-            Ok(Some(value)) => value,
-            Ok(None) => unreachable!(),
-            Err(error) => return error,
-        };
+        normalized_params =
+            match browser_session_archive_params_from_current_turn(&mut store_guard, params) {
+                Ok(Some(value)) => value,
+                Ok(None) => unreachable!(),
+                Err(error) => return error,
+            };
         &normalized_params
     } else {
         params
@@ -5576,30 +5482,216 @@ mod tests {
     }
 
     #[test]
-    fn browser_source_turn_registry_fails_closed_on_ambiguity_and_expiry() {
-        let registry = BrowserSourceTurnRegistry::default();
+    fn browser_source_turn_archive_resolution_is_durable_and_generation_fenced() {
+        let mut store = StateStore::open(":memory:").unwrap();
         let now = 1_000_000_i64;
-        registry
-            .observe("br_current", 7, "归档当前对话", now)
+        let hash = browser_sha256("归档当前对话");
+        let session_ref = format!("br_{}", "a".repeat(64));
+        store
+            .observe_browser_source_turn(&session_ref, 7, &hash, now)
             .unwrap();
         assert_eq!(
-            registry.resolve("  归档当前对话  ", now + 1_000).unwrap(),
-            ("br_current".to_owned(), 7)
+            store
+                .resolve_browser_source_turn(&hash, now + 1_000)
+                .unwrap(),
+            (session_ref.clone(), 7)
         );
 
-        registry
-            .observe("br_other", 9, "归档当前对话", now + 2_000)
-            .unwrap();
+        // Beyond the retired 5-minute in-memory window but inside 24h retention.
         assert_eq!(
-            registry.resolve("归档当前对话", now + 3_000).unwrap_err(),
-            "browser_current_turn_ambiguous"
+            store
+                .resolve_browser_source_turn(&hash, now + 6 * 60 * 1000)
+                .unwrap(),
+            (session_ref.clone(), 7)
         );
+
+        // Past the 24h retention window the turn is gone.
         assert_eq!(
-            registry
-                .resolve("归档当前对话", now + BROWSER_SOURCE_TURN_TTL_MS + 5_000)
+            store
+                .resolve_browser_source_turn(&hash, now + 24 * 60 * 60 * 1000 + 5_000)
                 .unwrap_err(),
             "browser_current_turn_not_found"
         );
+
+        // Two sessions sharing one digest fail closed instead of guessing.
+        let shared = browser_sha256("共享的消息");
+        let other_ref = format!("br_{}", "b".repeat(64));
+        store
+            .observe_browser_source_turn(&session_ref, 7, &shared, now)
+            .unwrap();
+        store
+            .observe_browser_source_turn(&other_ref, 9, &shared, now + 1)
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_browser_source_turn(&shared, now + 2)
+                .unwrap_err(),
+            "browser_current_turn_ambiguous"
+        );
+    }
+
+    #[test]
+    fn browser_source_turn_archive_resolves_in_fresh_runtime_context() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-mcp-source-turn-fresh-runtime-{}-{suffix}.sqlite",
+            std::process::id()
+        ));
+        let observed_at = browser_epoch_ms();
+        let session_ref = {
+            let mut guard = StateStore::open(&path).unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "fresh-runtime-source-turn-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: "{\"operations\":[\"session.archive\"]}",
+                    observed_at,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "fresh-runtime-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at,
+                })
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "fresh-runtime-session",
+                    display_label: Some("Current"),
+                    observation_generation: 7,
+                    observed_at,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    "https://chatgpt.com/c/fresh-runtime-current",
+                    7,
+                    observed_at,
+                )
+                .unwrap();
+            guard
+                .observe_browser_source_turn(
+                    &session.resource_ref,
+                    7,
+                    &browser_sha256("归档当前对话"),
+                    observed_at,
+                )
+                .unwrap();
+            session.resource_ref
+        };
+
+        // A fresh runtime context (reopened durable store, no in-memory
+        // registry) resolves the archive from StateStore alone.
+        let mut reopened = StateStore::open(&path).unwrap();
+        let archive = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "归档当前对话",
+                "idempotency_key": "archive-fresh-runtime"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(archive["session_ref"], session_ref);
+        assert_eq!(archive["expected_generation"], 7);
+
+        // A generation drift observed after the source turn fails closed.
+        let (endpoint_ref, account_ref) = {
+            let session = reopened.browser_resource(&session_ref).unwrap().unwrap();
+            (
+                session.endpoint_ref.clone(),
+                session.parent_ref.clone().unwrap(),
+            )
+        };
+        reopened
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 8,
+                capabilities_json: "{\"operations\":[\"session.archive\"]}",
+                observed_at,
+            })
+            .unwrap();
+        let account = reopened
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "fresh-runtime-account",
+                display_label: None,
+                observation_generation: 8,
+                observed_at,
+            })
+            .unwrap();
+        assert_eq!(account.resource_ref, account_ref);
+        let drifted = reopened
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&account_ref),
+                native_identity: "fresh-runtime-session",
+                display_label: Some("Current"),
+                observation_generation: 8,
+                observed_at,
+            })
+            .unwrap();
+        assert_eq!(drifted.resource_ref, session_ref);
+        let drift = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "归档当前对话",
+                "idempotency_key": "archive-fresh-runtime-drift"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(drift["code"], "browser_current_turn_stale");
+        drop(reopened);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 
     #[test]
@@ -8606,7 +8698,6 @@ mod tests {
             )
         };
 
-        let source_turns = BrowserSourceTurnRegistry::default();
         let source_session_ref = store
             .lock()
             .unwrap()
@@ -8614,14 +8705,20 @@ mod tests {
             .unwrap()
             .unwrap();
         let current_turn_now = browser_epoch_ms();
-        source_turns
-            .observe(&source_session_ref, 7, "归档当前对话", current_turn_now)
+        store
+            .lock()
+            .unwrap()
+            .observe_browser_source_turn(
+                &source_session_ref,
+                7,
+                &browser_sha256("归档当前对话"),
+                current_turn_now,
+            )
             .unwrap();
         let archive_params = {
-            let guard = store.lock().unwrap();
+            let mut guard = store.lock().unwrap();
             browser_session_archive_params_from_current_turn(
-                &guard,
-                &source_turns,
+                &mut guard,
                 &json!({
                     "current_user_message": "  归档当前对话  ",
                     "idempotency_key": "archive-current-source"
@@ -9049,7 +9146,6 @@ mod tests {
                 mutation_gate: None,
                 mutation_admission: Some(&admission),
                 caller_authorization: None,
-                source_turns: None,
             },
         );
         assert_eq!(backpressured["code"], "browser_account_backpressure");
