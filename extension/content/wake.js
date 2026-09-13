@@ -1468,8 +1468,11 @@ const H2W_CONTENT_VERSION = "0.1.91";
     try {
       if (list.length === 0) sessionStorage.removeItem(PENDING_SELF_ARCHIVE_STORAGE_KEY);
       else sessionStorage.setItem(PENDING_SELF_ARCHIVE_STORAGE_KEY, JSON.stringify(list));
-    } catch (_) {}
-    return list;
+    } catch (_) {
+      // Fail closed: an unpersisted intent must never be treated as durable.
+      return false;
+    }
+    return true;
   }
 
   function enqueuePendingSelfArchive(params, sessionRef, generation, conversationId) {
@@ -1483,12 +1486,10 @@ const H2W_CONTENT_VERSION = "0.1.91";
       existing.sessionRef = sessionRef;
       existing.generation = generation;
       existing.conversationId = conversationId;
-      writePendingSelfArchives(list);
-      return true;
+      return writePendingSelfArchives(list);
     }
     list.push({ idempotencyKey, sessionRef, generation, conversationId, requestedAt: Date.now() });
-    writePendingSelfArchives(list);
-    return true;
+    return writePendingSelfArchives(list);
   }
 
   function removePendingSelfArchive(idempotencyKey) {
@@ -1496,8 +1497,18 @@ const H2W_CONTENT_VERSION = "0.1.91";
     writePendingSelfArchives(list);
   }
 
+  function pendingSelfArchiveAlreadyClicked(idempotencyKey) {
+    if (!idempotencyKey) return false;
+    return readPendingSelfArchives().some((item) => (
+      item.idempotencyKey === idempotencyKey && item.deliveryAttempted === true
+    ));
+  }
+
+  // Claims the one-shot delivery for an intent and returns whether the claim is
+  // durable. The claim must be persisted and verified before the archive click
+  // is dispatched, so an unpersistable claim can never mutate the provider.
   function markPendingSelfArchiveClicked(idempotencyKey, sessionRef, generation, conversationId) {
-    if (!idempotencyKey) return;
+    if (!idempotencyKey) return false;
     const list = readPendingSelfArchives();
     const existing = list.find((item) => item.idempotencyKey === idempotencyKey);
     if (existing) {
@@ -1515,7 +1526,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
         deliveryAttempted: true,
       });
     }
-    writePendingSelfArchives(list);
+    return writePendingSelfArchives(list) && pendingSelfArchiveAlreadyClicked(idempotencyKey);
   }
 
   // A clicked intent is terminal: the provider readback may be inconclusive, but
@@ -1535,12 +1546,22 @@ const H2W_CONTENT_VERSION = "0.1.91";
     }, PENDING_SELF_ARCHIVE_POLL_MS);
   }
 
-  async function actuateChatGptArchive(conversationId) {
+  async function actuateChatGptArchive(conversationId, identity) {
+    const idempotencyKey = typeof identity?.idempotencyKey === "string" ? identity.idempotencyKey : "";
+    if (pendingSelfArchiveAlreadyClicked(idempotencyKey)) {
+      // This exact key already dispatched an archive click whose readback was
+      // inconclusive. Never click a second time; stay honest about uncertainty.
+      return { outcome: "uncertain", delivered: true };
+    }
     const archive = await openChatGptArchiveMenu();
     if (!archive) return { outcome: "rejected", delivered: false };
-    // The click is a one-shot delivery. Once it has been dispatched it must
-    // never be replayed, even when the provider readback cannot confirm it,
-    // because an exception after the click does not prove it did not apply.
+    // Converge the one-shot rule here, before the real click: persist and verify
+    // the delivery claim first, so a reload or same-key re-entry inside the
+    // click/poll window cannot replay it and an unpersistable claim never
+    // mutates the provider.
+    if (!markPendingSelfArchiveClicked(idempotencyKey, identity?.sessionRef, identity?.generation, conversationId)) {
+      return { outcome: "rejected", delivered: false };
+    }
     try {
       archive.click();
     } catch (_) {
@@ -1585,18 +1606,12 @@ const H2W_CONTENT_VERSION = "0.1.91";
           // replaying it could archive a conversation twice.
           continue;
         }
-        const attempt = await actuateChatGptArchive(record.conversationId);
+        const attempt = await actuateChatGptArchive(record.conversationId, record);
+        // A verified archive drops the intent. An uncertain or rejected attempt
+        // is not applied: any delivery claim was persisted before the click, so
+        // nothing here may report it as applied or replay it.
         if (attempt.outcome === "applied") {
           removePendingSelfArchive(record.idempotencyKey);
-        } else if (attempt.delivered) {
-          // Clicked but unverified. This is not an applied archive, and it must
-          // not be reported as one or replayed automatically.
-          markPendingSelfArchiveClicked(
-            record.idempotencyKey,
-            record.sessionRef,
-            record.generation,
-            record.conversationId,
-          );
         }
       }
     } finally {
@@ -1620,18 +1635,6 @@ const H2W_CONTENT_VERSION = "0.1.91";
       return { ...evidence, resource_available: false };
     }
     const idempotencyKey = typeof params.idempotency_key === "string" ? params.idempotency_key : "";
-    if (idempotencyKey
-        && readPendingSelfArchives().some((item) => (
-          item.idempotencyKey === idempotencyKey && item.deliveryAttempted === true
-        ))) {
-      // This exact idempotency key already dispatched an archive click and the
-      // readback stayed inconclusive. Replaying it would archive twice, so
-      // report the accepted-but-unverified outcome instead of guessing applied.
-      evidence.command_accepted = true;
-      evidence.stable_resource_ref_observed = true;
-      evidence.lifecycle_observed = false;
-      return evidence;
-    }
     if (isTurnInProgress()) {
       // The authoritative self-archive request is accepted and persisted now;
       // it executes once the source turn is no longer in progress.
@@ -1644,15 +1647,16 @@ const H2W_CONTENT_VERSION = "0.1.91";
       evidence.lifecycle_observed = false;
       return evidence;
     }
-    const attempt = await actuateChatGptArchive(conversationId);
+    const attempt = await actuateChatGptArchive(conversationId, {
+      idempotencyKey,
+      sessionRef,
+      generation: registeredBrowserGeneration,
+    });
     if (attempt.outcome === "rejected") return { ...evidence, rejected: true };
-    if (attempt.delivered && attempt.outcome !== "applied") {
-      // Persist the one-shot delivery so a same-key re-entry cannot click again.
-      markPendingSelfArchiveClicked(idempotencyKey, sessionRef, registeredBrowserGeneration, conversationId);
-    }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
     if (attempt.outcome === "applied") evidence.lifecycle_observed = true;
+    else evidence.lifecycle_observed = false;
     return evidence;
   }
 
