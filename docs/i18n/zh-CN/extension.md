@@ -37,13 +37,21 @@ herdr-mcp extension standalone install
 herdr-mcp native-host use standalone
 ```
 
-正式 runtime 默认使用编译时记录的不可变 source commit；开发构建无法证明 build commit 时才回退 `main`。需要明确追踪仓库最新源码时可执行 `herdr-mcp extension standalone install --ref main`。下载结果稳定放在 `~/.config/herdr-mcp/extensions/standalone/current`，Chrome 首次进入 `chrome://extensions` → Developer mode → Load unpacked 后选择该目录，后续更新继续复用同一路径。
+正式 runtime 默认使用编译时记录的不可变 source commit；开发构建无法证明 build commit 时才回退 `main`。需要明确追踪仓库最新源码时可执行 `herdr-mcp extension standalone install --ref main`。
+
+支持 `--path` 的 runtime 可以显式指定 Chrome “加载已解压的扩展程序”看到的路径：
+
+```bash
+herdr-mcp extension standalone install --ref extension-v0.1.91 --path ~/Documents/herdr-mcp/extension
+```
+
+`--path` 可省略，默认用户可见路径为 `~/Documents/herdr-mcp/extension`。自定义路径必须解析到用户 HOME 目录以内。真实受管副本始终保留在 `~/.config/herdr-mcp/extensions/standalone/current`，指定路径只是指向受管副本的稳定软链，因此改变 `--path` 不会改变 standalone 扩展身份。用户显式指定的路径若已被占用，命令直接失败而不是覆盖；默认路径冲突则保持原内容不动，并回退到受管路径。自动化需要确定 `chrome://extensions` → Developer mode → Load unpacked 应选择哪个目录时，运行 `herdr-mcp extension standalone status` 并读取 `chrome.load_unpacked_path`；后续更新继续复用同一路径。
 
 下载器先把 ref 解析为不可变 commit SHA，再只下载该 commit 下 Git 跟踪的 `extension/` 文件。除 `manifest.json` 为固定 STANDALONE ID 注入公开 `key` 外，其余文件必须与该 commit 的 `extension/` 字节一致；repo/worktree 中的 DEV `extension/manifest.json` 不会被修改。可用 `herdr-mcp extension standalone status` 查看已安装 commit、版本、ID 和路径。
 
 扩展打包 workflow（`.github/workflows/extension-store.yml`）在 Store ZIP 之外还会生成手工安装包。`herdr-mcp-extension-X.Y.Z.zip` 是 Chrome Web Store 上传包；`herdr-mcp-extension-standalone-X.Y.Z.zip` 及其 `.sha256` 用于手工 **Load unpacked**。只有 standalone ZIP 注入公开固定 manifest `key`，用于保持 Native Messaging 要求的 STANDALONE Chromium ID，因此不要把 Store ZIP 当作手工包加载。先执行 `shasum -a 256 -c herdr-mcp-extension-standalone-X.Y.Z.zip.sha256` 校验，再解压到新的干净目录，不要覆盖旧版本目录。
 
-macOS 安装或更新 STANDALONE 后还应执行一次 `herdr-mcp doctor`。`standalone status` 说明受管目录里的文件状态；`doctor` 会额外只读取 Google Chrome profile preferences 中 **Herdr 这个固定 extension ID** 的精确条目，并把 Chrome 当前 Load unpacked 的实际路径与上面的受管路径比较。若出现 `WARN standalone-extension-load state=drift`，说明相同固定 ID 仍从另一目录加载，常见于旧的 Downloads/开发副本仍留在 Chrome。打开 `chrome://extensions`，找到 Herdr 扩展，按 `doctor` 给出的 `expected` 路径重新 Load unpacked/Reload。不要仅为修复路径漂移而切换 Native Host channel、删除扩展数据或复制凭据。该检查只诊断，不会重写 Chrome 配置，也不会刷新标签页。
+macOS 安装或更新 STANDALONE 后还应执行一次 `herdr-mcp doctor`。`standalone status` 说明受管目录里的文件状态；`doctor` 会额外只读取 Google Chrome profile preferences 中 **Herdr 这个固定 extension ID** 的精确条目，并把 Chrome 当前 Load unpacked 的实际路径与上面的受管路径比较。它同时接受受管 `~/.config/herdr-mcp/extensions/standalone/current` 目录和用户配置的 `--path` 软链，两者解析到同一份安装，因此改变 `--path` 不会误报 `drift`。若出现 `WARN standalone-extension-load state=drift`，说明相同固定 ID 仍从另一目录加载，常见于旧的 Downloads/开发副本仍留在 Chrome。打开 `chrome://extensions`，找到 Herdr 扩展，按 `doctor` 给出的 `expected` 路径重新 Load unpacked/Reload。不要仅为修复路径漂移而切换 Native Host channel、删除扩展数据或复制凭据。该检查只诊断，不会重写 Chrome 配置，也不会刷新标签页。
 
 选择通道后验证：
 
