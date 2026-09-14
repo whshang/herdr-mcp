@@ -19,6 +19,7 @@ import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch4.js";
 import { EPOCH5_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch5.js";
+import { EPOCH6_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch6.js";
 import { PUBLIC_CONTRACT, resolvePublicContract } from "../edge/cloudflare/dist/contracts/public.js";
 import {
   RUNTIME_EXECUTION_CONTRACT,
@@ -126,9 +127,9 @@ test("public epoch 3 evolves independently while runtime execution advances to e
   assert.equal(isCompatibleRuntimeContract(3, EPOCH2_CONTRACT.contract_hash), false);
 });
 
-test("public contract resolver enables epoch 5 for explicit first-party dev and prod environments", () => {
-  assert.equal(resolvePublicContract("dev"), EPOCH5_CONTRACT);
-  assert.equal(resolvePublicContract("prod"), EPOCH5_CONTRACT);
+test("public contract resolver enables epoch 6 for explicit first-party dev and prod environments", () => {
+  assert.equal(resolvePublicContract("dev"), EPOCH6_CONTRACT);
+  assert.equal(resolvePublicContract("prod"), EPOCH6_CONTRACT);
   assert.equal(resolvePublicContract(), EPOCH3_CONTRACT);
   assert.equal(resolvePublicContract("unknown"), EPOCH3_CONTRACT);
 });
@@ -275,4 +276,63 @@ test("public epoch 5 shapes only the herdr_exec description over a frozen epoch 
   // Frozen prior epochs stayed bit-for-bit identical.
   assert.equal(EPOCH4_CONTRACT.contract_hash, "sha256:0c756a7479ff5d5c70891d7cf5c9810841a1e936327d91aa0770abe67faf83af");
   assert.equal(computeContractHash(EPOCH4_CONTRACT.tools), EPOCH4_CONTRACT.contract_hash);
+});
+
+test("public epoch 6 removes planner workflow policy from model-visible descriptions", () => {
+  assert.equal(EPOCH6_CONTRACT.contract_epoch, 6);
+  assert.equal(EPOCH6_CONTRACT.tool_count, EPOCH5_CONTRACT.tool_count);
+  assert.equal(computeContractHash(EPOCH6_CONTRACT.tools), EPOCH6_CONTRACT.contract_hash);
+  assert.equal(
+    EPOCH6_CONTRACT.contract_hash,
+    "sha256:addcde324850f88cd2f87bf38de1edb7fc34e90e8cd178b37cc49694b56636cf",
+  );
+  assert.deepEqual(
+    EPOCH6_CONTRACT.tools.map((tool) => tool.name).sort(),
+    EPOCH5_CONTRACT.tools.map((tool) => tool.name).sort(),
+  );
+  const banned = [
+    /before any agent operation/i,
+    /call herdr_skill/i,
+    /call herdr_/i,
+    /typical session start/i,
+    /you \(web\) are the planner/i,
+    /\bplanner\b/i,
+    /\bprefer\b/i,
+    /\bshould\b/i,
+    /never blind[- ]retry/i,
+    /verify with herdr_/i,
+    /do not prompt/i,
+    /should already have been read/i,
+    /prefer herdr_prompt/i,
+  ];
+  const descriptionStrings = (value) => {
+    if (typeof value === "string") return [];
+    if (!value || typeof value !== "object") return [];
+    return Object.entries(value).flatMap(([key, child]) => [
+      ...(key === "description" && typeof child === "string" ? [child] : []),
+      ...descriptionStrings(child),
+    ]);
+  };
+  for (const tool of EPOCH6_CONTRACT.tools) {
+    for (const description of descriptionStrings(tool)) {
+      for (const pattern of banned) {
+        assert.doesNotMatch(description, pattern, `${tool.name}: ${description}`);
+      }
+    }
+  }
+  const stripDescriptions = (value) => {
+    if (Array.isArray(value)) return value.map(stripDescriptions);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => key !== "description")
+        .map(([key, child]) => [key, stripDescriptions(child)]),
+    );
+  };
+  assert.deepEqual(
+    stripDescriptions(EPOCH6_CONTRACT.tools.map((tool) => tool.inputSchema)),
+    stripDescriptions(EPOCH5_CONTRACT.tools.map((tool) => tool.inputSchema)),
+  );
+  assert.equal(EPOCH5_CONTRACT.contract_hash, "sha256:560dc151053f2a54fc1271c299fb6ed4464d5b9651a6c172c5eb6c9d63396e39");
+  assert.equal(EPOCH4_CONTRACT.contract_hash, "sha256:0c756a7479ff5d5c70891d7cf5c9810841a1e936327d91aa0770abe67faf83af");
 });

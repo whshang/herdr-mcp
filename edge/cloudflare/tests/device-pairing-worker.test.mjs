@@ -159,8 +159,8 @@ async function pair(env, name) {
 
 test("health and info expose the same explicit first-party public contract identity", async () => {
   for (const [edgeEnv, expectedEpoch] of [
-    ["dev", 5],
-    ["prod", 5],
+    ["dev", 6],
+    ["prod", 6],
     [undefined, 3],
     ["unknown", 3],
   ]) {

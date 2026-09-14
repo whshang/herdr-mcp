@@ -17,7 +17,7 @@ use crate::state_store::{
     ContinuitySearchInput, OperationReservation, StateStore, WorkMemoryBindingInput,
     WorkMemoryCheckpointInput, WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput,
     WorkMemorySearchBoundary, WorkMemorySearchPage, WorkMemorySearchPageOptions,
-    WorkMemoryTurnInput,
+    WorkMemoryTurnInput, validate_browser_lane_id, validate_browser_work_chain_id,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
@@ -2520,6 +2520,66 @@ fn promote_materialized_browser_session_delivery(
         .map(Some)
 }
 
+fn browser_session_materialized_uncertain(
+    store: &StateStore,
+    reservation: &BrowserSessionReservationRecord,
+    replayed: bool,
+) -> Result<Option<Value>, String> {
+    if reservation.state != "materialized" || reservation.delivery_state != "uncertain" {
+        return Ok(None);
+    }
+    let session_ref = reservation
+        .session_ref
+        .as_deref()
+        .ok_or_else(|| "browser_session_materialization_missing".to_owned())?;
+    let session = store
+        .browser_resource(session_ref)?
+        .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+    let expected_parent = reservation
+        .space_ref
+        .as_deref()
+        .unwrap_or(&reservation.account_ref);
+    if session.endpoint_ref != reservation.endpoint_ref
+        || session.provider != reservation.provider
+        || session.kind != "session"
+        || session.parent_ref.as_deref() != Some(expected_parent)
+        || session.observation_generation != reservation.expected_generation
+    {
+        return Err("browser_session_materialization_scope_mismatch".to_owned());
+    }
+    let locator = store
+        .browser_resource_locator(session_ref)?
+        .ok_or_else(|| "browser_session_materialization_locator_missing".to_owned())?;
+    if locator.observation_generation != reservation.expected_generation {
+        return Err("browser_session_materialization_locator_missing".to_owned());
+    }
+    Ok(Some(json!({
+        "ok": false,
+        "code": "uncertain",
+        "operation": BrowserOperation::SessionCreate.method(),
+        "reservation_ref": reservation.reservation_ref,
+        "reservation_state": reservation.state,
+        "session_ref": session_ref,
+        "canonical_url": locator.canonical_url,
+        "display_label": session.display_label,
+        "route": {
+            "endpoint_ref": reservation.endpoint_ref,
+            "provider": reservation.provider,
+            "account_ref": reservation.account_ref,
+            "space_ref": reservation.space_ref,
+            "expected_generation": reservation.expected_generation,
+        },
+        "delivery_state": BrowserDeliveryState::Uncertain.as_str(),
+        "delivery_evidence": {
+            "session_materialized": true,
+            "canonical_url_observed": true,
+            "accepted_user_message_ref": reservation.accepted_user_message_ref,
+        },
+        "replayed": replayed,
+        "reconciled": true,
+    })))
+}
+
 fn browser_session_create_success(
     store: &mut StateStore,
     reservation_ref: &str,
@@ -2549,6 +2609,18 @@ fn browser_session_create_success(
         });
     }
     let session_ref = reservation.session_ref.clone().unwrap();
+    let session = match store.browser_resource(&session_ref) {
+        Ok(Some(resource)) => resource,
+        Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
+        Err(error) => return browser_store_error(error),
+    };
+    let canonical_url = match store.browser_resource_locator(&session_ref) {
+        Ok(Some(locator)) => locator.canonical_url,
+        Ok(None) => {
+            return json!({"ok": false, "code": "browser_session_materialization_locator_missing"});
+        }
+        Err(error) => return browser_store_error(error),
+    };
     let (dispatch, work_memory_writeback) =
         match browser_created_session_dispatch(store, &reservation, params, caller_authorization) {
             Ok(value) => value,
@@ -2561,6 +2633,15 @@ fn browser_session_create_success(
         "reservation_ref": reservation.reservation_ref,
         "reservation_state": reservation.state,
         "session_ref": session_ref,
+        "canonical_url": canonical_url,
+        "display_label": session.display_label,
+        "route": {
+            "endpoint_ref": reservation.endpoint_ref,
+            "provider": reservation.provider,
+            "account_ref": reservation.account_ref,
+            "space_ref": reservation.space_ref,
+            "expected_generation": reservation.expected_generation,
+        },
         "delivery_state": BrowserDeliveryState::Applied.as_str(),
         "dispatch": browser_dispatch_json(dispatch),
         "replayed": replayed,
@@ -2597,13 +2678,20 @@ fn browser_session_create_reconcile_uncertain(
     replayed: bool,
     caller_authorization: Option<&BrowserCallerAuthorization>,
 ) -> Value {
-    {
+    let current = {
         let Ok(mut guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
+        let current = match guard.browser_session_reservation(&reservation.reservation_ref) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return json!({"ok": false, "code": "browser_session_reservation_not_found"});
+            }
+            Err(error) => return browser_store_error(error),
+        };
         match promote_materialized_browser_session_delivery(
             &mut guard,
-            reservation,
+            &current,
             expected_generation,
         ) {
             Ok(Some(promoted)) => {
@@ -2619,14 +2707,23 @@ fn browser_session_create_reconcile_uncertain(
             Ok(None) => {}
             Err(error) => return browser_store_error(error),
         }
-    }
+        current
+    };
 
     let Some(actuator) = actuator else {
+        let Ok(guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match browser_session_materialized_uncertain(&guard, &current, replayed) {
+            Ok(Some(result)) => return result,
+            Ok(None) => {}
+            Err(error) => return browser_store_error(error),
+        }
         return json!({
             "ok": false,
             "code": "uncertain",
-            "reservation_ref": reservation.reservation_ref,
-            "reservation_state": reservation.state,
+            "reservation_ref": current.reservation_ref,
+            "reservation_state": current.state,
             "delivery_state": BrowserDeliveryState::Uncertain.as_str(),
             "replayed": replayed,
             "reconciled": false,
@@ -2639,11 +2736,26 @@ fn browser_session_create_reconcile_uncertain(
     ) {
         Ok(Some(evidence)) => evidence,
         Ok(None) => {
+            let Ok(guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            let latest = match guard.browser_session_reservation(&reservation.reservation_ref) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    return json!({"ok": false, "code": "browser_session_reservation_not_found"});
+                }
+                Err(error) => return browser_store_error(error),
+            };
+            match browser_session_materialized_uncertain(&guard, &latest, replayed) {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(error) => return browser_store_error(error),
+            }
             return json!({
                 "ok": false,
                 "code": "uncertain",
-                "reservation_ref": reservation.reservation_ref,
-                "reservation_state": reservation.state,
+                "reservation_ref": latest.reservation_ref,
+                "reservation_state": latest.state,
                 "delivery_state": BrowserDeliveryState::Uncertain.as_str(),
                 "replayed": replayed,
                 "reconciled": false,
@@ -2703,6 +2815,11 @@ fn browser_session_create_reconcile_uncertain(
                     caller_authorization,
                 );
             }
+            Ok(None) => {}
+            Err(error) => return browser_store_error(error),
+        }
+        match browser_session_materialized_uncertain(&guard, &settled, replayed) {
+            Ok(Some(result)) => return result,
             Ok(None) => {}
             Err(error) => return browser_store_error(error),
         }
@@ -4067,8 +4184,12 @@ fn validate_browser_operation_params(
             browser_required_apps(params, true)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
-            let _ = browser_optional_string(params, "work_chain_id", 128)?;
-            let _ = browser_optional_string(params, "lane_id", 160)?;
+            if let Some(work_chain_id) = browser_optional_string(params, "work_chain_id", 128)? {
+                validate_browser_work_chain_id(work_chain_id).map_err(browser_store_error)?;
+            }
+            if let Some(lane_id) = browser_optional_string(params, "lane_id", 160)? {
+                validate_browser_lane_id(lane_id).map_err(browser_store_error)?;
+            }
         }
         BrowserOperation::SessionOpen => {
             browser_required_string(params, "session_ref", 96)?;
@@ -4108,8 +4229,12 @@ fn validate_browser_operation_params(
             browser_required_apps(params, true)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
-            let _ = browser_optional_string(params, "work_chain_id", 128)?;
-            let _ = browser_optional_string(params, "lane_id", 160)?;
+            if let Some(work_chain_id) = browser_optional_string(params, "work_chain_id", 128)? {
+                validate_browser_work_chain_id(work_chain_id).map_err(browser_store_error)?;
+            }
+            if let Some(lane_id) = browser_optional_string(params, "lane_id", 160)? {
+                validate_browser_lane_id(lane_id).map_err(browser_store_error)?;
+            }
         }
         BrowserOperation::DispatchStatus => {
             browser_required_string(params, "dispatch_id", 96)?;
@@ -4654,9 +4779,27 @@ fn browser_operation_inspect_resource(
                 .as_ref()
                 .map(|state| browser_public_capabilities(&state.capabilities_json))
                 .unwrap_or_else(|| json!({"status": "unknown"}));
+            let canonical_url = if kind == "session" {
+                match store.browser_resource_locator(&resource.resource_ref) {
+                    Ok(locator) => locator.map(|locator| locator.canonical_url),
+                    Err(error) => return browser_store_error(error),
+                }
+            } else {
+                None
+            };
+            let latest_dispatch = if kind == "session" {
+                match store.latest_browser_dispatch_for_session(&resource.resource_ref) {
+                    Ok(dispatch) => dispatch.map(browser_dispatch_json),
+                    Err(error) => return browser_store_error(error),
+                }
+            } else {
+                None
+            };
             json!({
                 "ok": true,
                 "resource": browser_resource_json(resource),
+                "canonical_url": canonical_url,
+                "latest_dispatch": latest_dispatch,
                 "route": {
                     "endpoint_ref": route_endpoint_ref,
                     "provider": route_provider,
@@ -9196,6 +9339,7 @@ mod tests {
             store: Arc<Mutex<StateStore>>,
             calls: AtomicUsize,
             reconcile_calls: AtomicUsize,
+            materialize_on_actuate: bool,
             delayed: bool,
             materialized_but_partial: bool,
             // Number of leading reconcile polls that observe no evidence yet,
@@ -9244,7 +9388,7 @@ mod tests {
                         kind: "session",
                         parent_ref: reservation.space_ref.as_deref().or(Some(account_ref)),
                         native_identity: &native_identity,
-                        display_label: Some(&reservation.display_label),
+                        display_label: None,
                         observation_generation: expected_generation,
                         observed_at: 20,
                     })
@@ -9294,7 +9438,9 @@ mod tests {
                     );
                 }
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                self.materialize(params, expected_generation);
+                if self.materialize_on_actuate {
+                    self.materialize(params, expected_generation);
+                }
                 let mut evidence = Self::applied_evidence(expected_generation);
                 if self.materialized_but_partial {
                     evidence.stable_resource_ref_observed = false;
@@ -9459,10 +9605,73 @@ mod tests {
             store: store.clone(),
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
+            materialize_on_actuate: true,
             delayed: false,
             materialized_but_partial: false,
             reconcile_pending_polls: 0,
         };
+        for (params, expected_code) in [
+            (
+                json!({
+                    "endpoint_ref": endpoint_ref,
+                    "provider": "chatgpt",
+                    "account_ref": account_ref,
+                    "display_label": "Invalid chain",
+                    "message": "must fail before actuation",
+                    "expected_generation": 7,
+                    "idempotency_key": "session-create-invalid-chain",
+                    "work_chain_id": "not-a-work-chain"
+                }),
+                "browser_work_chain_id_invalid",
+            ),
+            (
+                json!({
+                    "endpoint_ref": endpoint_ref,
+                    "provider": "chatgpt",
+                    "account_ref": "br_0000000000000000000000000000000000000000000000000000000000000000",
+                    "display_label": "Missing account",
+                    "message": "must fail before actuation",
+                    "expected_generation": 7,
+                    "idempotency_key": "session-create-missing-account"
+                }),
+                "browser_resource_not_found",
+            ),
+            (
+                json!({
+                    "endpoint_ref": endpoint_ref,
+                    "provider": "chatgpt",
+                    "account_ref": account_ref,
+                    "display_label": "Stale generation",
+                    "message": "must fail before actuation",
+                    "expected_generation": 8,
+                    "idempotency_key": "session-create-stale-generation"
+                }),
+                "stale_capability_generation",
+            ),
+            (
+                json!({
+                    "endpoint_ref": endpoint_ref,
+                    "provider": "chatgpt",
+                    "account_ref": account_ref,
+                    "space_ref": source_session_ref,
+                    "display_label": "Wrong space",
+                    "message": "must fail before actuation",
+                    "expected_generation": 7,
+                    "idempotency_key": "session-create-wrong-space"
+                }),
+                "browser_resource_kind_mismatch",
+            ),
+        ] {
+            let failed = browser_operation_call_with_grant(
+                &store,
+                "herdr_mcp.browser_session.create",
+                &params,
+                true,
+                Some(&immediate),
+            );
+            assert_eq!(failed["code"], expected_code);
+            assert_eq!(immediate.calls.load(Ordering::SeqCst), 0);
+        }
         let immediate_params = json!({
             "endpoint_ref": endpoint_ref,
             "provider": "chatgpt",
@@ -9470,7 +9679,8 @@ mod tests {
             "display_label": "Worker A",
             "message": "do bounded task A",
             "expected_generation": 7,
-            "idempotency_key": "session-create-immediate-1"
+            "idempotency_key": "session-create-immediate-1",
+            "lane_id": "lane-worker-a"
         });
         let created = browser_operation_call_with_grant(
             &store,
@@ -9481,8 +9691,40 @@ mod tests {
         );
         assert_eq!(created["ok"], true);
         assert!(created["session_ref"].as_str().unwrap().starts_with("br_"));
+        assert_eq!(created["display_label"], "Worker A");
+        assert!(
+            created["canonical_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://chatgpt.com/c/")
+        );
+        assert_eq!(created["route"]["provider"], "chatgpt");
+        assert_eq!(created["route"]["account_ref"], account_ref);
+        assert_eq!(created["route"]["expected_generation"], 7);
         assert_eq!(created["dispatch"]["delivery_state"], "applied");
+        assert_eq!(created["dispatch"]["lane_id"], "lane-worker-a");
         assert_eq!(immediate.calls.load(Ordering::SeqCst), 1);
+        let created_session_ref = created["session_ref"].as_str().unwrap();
+        let inspected = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.inspect",
+            &json!({"session_ref": created_session_ref}),
+            true,
+            None,
+        );
+        assert_eq!(inspected["ok"], true);
+        assert_eq!(inspected["resource"]["display_label"], "Worker A");
+        assert!(
+            inspected["canonical_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://chatgpt.com/c/")
+        );
+        assert_eq!(inspected["latest_dispatch"]["lane_id"], "lane-worker-a");
+        assert_eq!(
+            inspected["latest_dispatch"]["target_session_ref"],
+            created_session_ref
+        );
         let replay = browser_operation_call_with_grant(
             &store,
             "herdr_mcp.browser_session.create",
@@ -9498,6 +9740,7 @@ mod tests {
             store: store.clone(),
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
+            materialize_on_actuate: true,
             delayed: false,
             materialized_but_partial: true,
             reconcile_pending_polls: 0,
@@ -9532,6 +9775,114 @@ mod tests {
                 .load(Ordering::SeqCst),
             0
         );
+
+        let materialized_without_completion = SessionCreateActuator {
+            store: store.clone(),
+            calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            materialize_on_actuate: true,
+            delayed: true,
+            materialized_but_partial: false,
+            reconcile_pending_polls: usize::MAX,
+        };
+        let materialized_without_completion_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker response lost",
+            "message": "do bounded task after response loss",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-response-lost-1"
+        });
+        let response_lost = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &materialized_without_completion_params,
+            true,
+            Some(&materialized_without_completion),
+        );
+        assert_eq!(response_lost["ok"], false);
+        assert_eq!(response_lost["code"], "uncertain");
+        assert_eq!(response_lost["reservation_state"], "materialized");
+        assert_eq!(response_lost["delivery_state"], "uncertain");
+        assert_eq!(response_lost["reconciled"], true);
+        assert_eq!(response_lost["display_label"], "Worker response lost");
+        assert!(
+            response_lost["session_ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("br_")
+        );
+        assert!(
+            response_lost["canonical_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://chatgpt.com/c/")
+        );
+        assert_eq!(
+            response_lost["delivery_evidence"]["session_materialized"],
+            true
+        );
+        assert_eq!(
+            response_lost["delivery_evidence"]["accepted_user_message_ref"],
+            Value::Null
+        );
+        assert_eq!(
+            materialized_without_completion.calls.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            materialized_without_completion
+                .reconcile_calls
+                .load(Ordering::SeqCst),
+            6
+        );
+        let response_lost_replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &materialized_without_completion_params,
+            true,
+            Some(&materialized_without_completion),
+        );
+        assert_eq!(response_lost_replay["replayed"], true);
+        assert_eq!(response_lost_replay["reconciled"], true);
+        assert_eq!(
+            materialized_without_completion.calls.load(Ordering::SeqCst),
+            1
+        );
+
+        let no_observation = SessionCreateActuator {
+            store: store.clone(),
+            calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            materialize_on_actuate: false,
+            delayed: true,
+            materialized_but_partial: false,
+            reconcile_pending_polls: usize::MAX,
+        };
+        let no_observation_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker no observation",
+            "message": "do bounded task without registry evidence",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-no-observation-1"
+        });
+        let not_reconciled = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &no_observation_params,
+            true,
+            Some(&no_observation),
+        );
+        assert_eq!(not_reconciled["ok"], false);
+        assert_eq!(not_reconciled["code"], "uncertain");
+        assert_eq!(not_reconciled["reservation_state"], "pending");
+        assert_eq!(not_reconciled["reconciled"], false);
+        assert_eq!(not_reconciled["session_ref"], Value::Null);
+        assert_eq!(no_observation.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(no_observation.reconcile_calls.load(Ordering::SeqCst), 6);
 
         {
             let mut guard = store.lock().unwrap();
@@ -9605,6 +9956,7 @@ mod tests {
             store: store.clone(),
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
+            materialize_on_actuate: true,
             delayed: true,
             materialized_but_partial: false,
             // Provider readback is late: the first reconcile poll is empty and

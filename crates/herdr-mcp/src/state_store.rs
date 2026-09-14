@@ -3340,7 +3340,7 @@ impl StateStore {
             }
             tx.execute(
                 "UPDATE browser_resources
-                 SET display_label = ?2,
+                 SET display_label = COALESCE(?2, display_label),
                      observation_generation = ?3,
                      last_observed_at = MAX(last_observed_at, ?4)
                  WHERE resource_ref = ?1",
@@ -3980,6 +3980,13 @@ impl StateStore {
         if locator_generation != Some(reservation.expected_generation) {
             return Err("browser_session_materialization_locator_missing".to_owned());
         }
+        tx.execute(
+            "UPDATE browser_resources
+             SET display_label = COALESCE(display_label, ?2)
+             WHERE resource_ref = ?1",
+            params![session_ref, reservation.display_label],
+        )
+        .map_err(|error| format!("cannot project browser session display label: {error}"))?;
         let changed = tx
             .execute(
                 "UPDATE browser_session_reservations
@@ -4176,13 +4183,11 @@ impl StateStore {
             return Err("browser_reasoning_effort_invalid".to_owned());
         }
         let required_apps_json = normalize_browser_required_apps(input.required_apps)?;
-        if let Some(work_chain_id) = input.work_chain_id
-            && !valid_work_chain_id(work_chain_id)
-        {
-            return Err("browser_work_chain_id_invalid".to_owned());
+        if let Some(work_chain_id) = input.work_chain_id {
+            validate_browser_work_chain_id(work_chain_id)?;
         }
         if let Some(lane_id) = input.lane_id {
-            validate_browser_ref_text(lane_id, 160, "lane_id")?;
+            validate_browser_lane_id(lane_id)?;
         }
 
         let tx = self
@@ -4332,6 +4337,28 @@ impl StateStore {
             )
             .optional()
             .map_err(|error| format!("cannot read pending browser dispatch: {error}"))?;
+        match dispatch_id {
+            Some(dispatch_id) => self.browser_dispatch(&dispatch_id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn latest_browser_dispatch_for_session(
+        &self,
+        session_ref: &str,
+    ) -> Result<Option<BrowserDispatchRecord>, String> {
+        validate_browser_resource_ref(session_ref)?;
+        let dispatch_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT dispatch_id FROM browser_dispatches
+                 WHERE target_session_ref = ?1 AND operation = 'browser_dispatch.submit'
+                 ORDER BY created_at DESC, dispatch_id DESC LIMIT 1",
+                params![session_ref],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read latest browser dispatch: {error}"))?;
         match dispatch_id {
             Some(dispatch_id) => self.browser_dispatch(&dispatch_id),
             None => Ok(None),
@@ -5489,6 +5516,18 @@ fn valid_work_chain_id(value: &str) -> bool {
         && value[3..]
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+pub(crate) fn validate_browser_work_chain_id(value: &str) -> Result<(), String> {
+    if valid_work_chain_id(value) {
+        Ok(())
+    } else {
+        Err("browser_work_chain_id_invalid".to_owned())
+    }
+}
+
+pub(crate) fn validate_browser_lane_id(value: &str) -> Result<(), String> {
+    validate_browser_ref_text(value, 160, "lane_id")
 }
 
 fn valid_local_evidence_id(value: &str) -> bool {
@@ -10028,6 +10067,60 @@ mod tests {
     }
 
     #[test]
+    fn browser_dispatch_result_settlement_survives_store_reopen() {
+        let path = temp_db_path();
+        let dispatch_id;
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            let (_endpoint_ref, created_dispatch_id) = applied_submit_fixture(
+                &mut store,
+                None,
+                "persistent browser dispatch",
+                "settle-reopen",
+            );
+            dispatch_id = created_dispatch_id;
+            store
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(7),
+                    accepted_user_message_ref: Some("provider-user-reopen"),
+                    updated_at: 12,
+                })
+                .unwrap();
+            let session_ref = store
+                .browser_dispatch(&dispatch_id)
+                .unwrap()
+                .unwrap()
+                .target_session_ref;
+            store
+                .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                    provider: "chatgpt",
+                    session_ref: &session_ref,
+                    expected_generation: 7,
+                    accepted_user_message_ref: "provider-user-reopen",
+                    assistant_message_ref: "provider-assistant-reopen",
+                    assistant_text: "durable answer after restart",
+                    observed_at: 13,
+                })
+                .unwrap();
+        }
+
+        let reopened = StateStore::open(&path).unwrap();
+        let dispatch = reopened.browser_dispatch(&dispatch_id).unwrap().unwrap();
+        assert_eq!(dispatch.delivery_state, BrowserDeliveryState::Applied);
+        assert_eq!(dispatch.generation_owner, Some(7));
+        assert_eq!(
+            dispatch.result_assistant_message_ref.as_deref(),
+            Some("provider-assistant-reopen")
+        );
+        assert_eq!(dispatch.result_settled_at, Some(13));
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn duplicate_same_text_dispatches_disambiguate_results_by_provider_user_message() {
         const WORK_CHAIN: &str = "wc_dddddddddddddddddddddddddddddddd";
         let mut store = StateStore::open(":memory:").unwrap();
@@ -10129,6 +10222,97 @@ mod tests {
             .unwrap();
         assert_eq!(b.dispatch.dispatch_id, dispatch_ids[1]);
         assert_eq!(work_memory_result_counts(&store), (2, 2));
+    }
+
+    #[test]
+    fn browser_session_materialization_fails_closed_on_identity_ambiguity() {
+        let path = temp_db_path();
+        let mut store = StateStore::open(&path).unwrap();
+        let (endpoint_ref, session_a, session_b) =
+            browser_dispatch_fixture(&mut store, 7, "materialize-scope");
+        let account_ref = store
+            .browser_resource(&session_a)
+            .unwrap()
+            .unwrap()
+            .parent_ref
+            .unwrap();
+        let wrong_account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "materialize-scope-wrong-account",
+                display_label: None,
+                observation_generation: 7,
+                observed_at: 6,
+            })
+            .unwrap();
+        let wrong_session = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&wrong_account.resource_ref),
+                native_identity: "materialize-scope-wrong-session",
+                display_label: None,
+                observation_generation: 7,
+                observed_at: 7,
+            })
+            .unwrap();
+        for (session_ref, url) in [
+            (&wrong_session.resource_ref, "https://chatgpt.com/c/wrong"),
+            (&session_a, "https://chatgpt.com/c/a"),
+            (&session_b, "https://chatgpt.com/c/b"),
+        ] {
+            store
+                .upsert_browser_resource_locator(session_ref, url, 7, 8)
+                .unwrap();
+        }
+        let BrowserSessionReservation::Reserved(reservation) = store
+            .reserve_browser_session(BrowserSessionReservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                account_ref: &account_ref,
+                space_ref: None,
+                display_label: "Lane scope",
+                expected_generation: 7,
+                idempotency_key_digest: &sha256_text("materialize-scope-key"),
+                request_digest: &sha256_text("materialize-scope-request"),
+                created_at: 10,
+                expires_at: 10_000,
+            })
+            .unwrap()
+        else {
+            panic!("expected a reserved browser session");
+        };
+        assert_eq!(
+            store
+                .materialize_browser_session_reservation(
+                    &reservation.reservation_ref,
+                    &wrong_session.resource_ref,
+                    11,
+                )
+                .unwrap_err(),
+            "browser_session_materialization_scope_mismatch"
+        );
+        let materialized = store
+            .materialize_browser_session_reservation(&reservation.reservation_ref, &session_a, 12)
+            .unwrap();
+        assert_eq!(
+            materialized.session_ref.as_deref(),
+            Some(session_a.as_str())
+        );
+        assert_eq!(
+            store
+                .materialize_browser_session_reservation(
+                    &reservation.reservation_ref,
+                    &session_b,
+                    15,
+                )
+                .unwrap_err(),
+            "browser_session_materialization_conflict"
+        );
     }
 
     #[test]

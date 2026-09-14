@@ -2008,7 +2008,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
         probe.retryMs = Math.min(probe.retryMs * 2, 60000);
         return false;
       }
-      if (server.currentNodeRole !== "assistant" || server.finished !== true) return false;
+      if (server.finished !== true || !server.messageId) return false;
       if (server.userMessageId !== pending.acceptedUserMessageRef) {
         probe.rejected += 1;
         return false;
@@ -4048,7 +4048,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
 
     const serverSnapshotMatchesPendingTurn = (server) => {
       if (!hasPendingReply() || !server?.ok) return false;
-      if (server.currentNodeRole !== "assistant" || server.finished !== true) return false;
+      if (server.finished !== true || !server.messageId) return false;
       const submitAt = syncPendingSubmitAnchor();
       const expectedUser = pendingUserTextHint();
       const serverUser = normText(server.userText || "");
