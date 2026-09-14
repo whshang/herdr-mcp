@@ -522,6 +522,7 @@ fn continuity_call(
                         };
                         let records = store.continuity_search(ContinuitySearchInput {
                             project_id: Some(project_id),
+                            repo_id: None,
                             workspace_id: None,
                             conversation_id: None,
                             query: None,
@@ -625,6 +626,7 @@ fn continuity_call(
             };
             const ALLOWED: &[&str] = &[
                 "project_id",
+                "repo_id",
                 "workspace_id",
                 "conversation_id",
                 "conversation_url",
@@ -639,6 +641,10 @@ fn continuity_call(
                 });
             }
             let explicit_project_id = match continuity_search_string(params, "project_id", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let repo_id = match continuity_search_string(params, "repo_id", 512) {
                 Ok(value) => value,
                 Err(error) => return error,
             };
@@ -720,6 +726,9 @@ fn continuity_call(
             if project_id.is_some() {
                 match_reasons.push("project_id");
             }
+            if repo_id.is_some() {
+                match_reasons.push("repo_id");
+            }
             if workspace_id.is_some() {
                 match_reasons.push("workspace_id");
             }
@@ -728,6 +737,7 @@ fn continuity_call(
             }
             match store.continuity_search(ContinuitySearchInput {
                 project_id,
+                repo_id,
                 workspace_id,
                 conversation_id,
                 query,
@@ -737,6 +747,7 @@ fn continuity_call(
                     let identity_match = if exact_identity_hint {
                         store.continuity_search(ContinuitySearchInput {
                             project_id,
+                            repo_id,
                             workspace_id,
                             conversation_id,
                             query: None,
@@ -764,10 +775,25 @@ fn continuity_call(
                     let candidates = records
                         .into_iter()
                         .map(|record| {
+                            let work_memory = match (
+                                record.project_ref.as_deref(),
+                                record.repo_id.as_deref(),
+                                record.work_chain_id.as_deref(),
+                            ) {
+                                (Some(project_ref), Some(repo_id), Some(work_chain_id)) => {
+                                    Some(json!({
+                                        "project_ref": project_ref,
+                                        "repo_id": repo_id,
+                                        "work_chain_id": work_chain_id,
+                                    }))
+                                }
+                                _ => None,
+                            };
                             json!({
                                 "continuity_id": record.continuity_id,
                                 "title": record.title,
                                 "project_id": record.project_id,
+                                "work_memory": work_memory,
                                 "workspace_ids": record.workspace_ids,
                                 "status": record.status,
                                 "updated_at": record.updated_at,
@@ -5778,7 +5804,7 @@ mod tests {
     }
     #[test]
     fn continuity_search_requires_confirmation_without_stable_identity() {
-        use crate::state_store::ContinuityTurnInput;
+        use crate::state_store::{ContinuityTurnInput, WorkMemoryBindingInput};
         use std::sync::{Arc, Mutex};
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
@@ -5830,6 +5856,19 @@ mod tests {
                     })
                     .unwrap();
             }
+            guard
+                .bind_work_memory(WorkMemoryBindingInput {
+                    continuity_id: "hc:alpha",
+                    project_ref: "project:herdr-mcp",
+                    repo_id: "github.com/whshang/herdr-mcp",
+                    work_chain_id: "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    provider: "chatgpt",
+                    account_ref: Some("account-a"),
+                    space_ref: Some("project-a"),
+                    session_ref: "br_session_alpha",
+                    bound_at: 110,
+                })
+                .unwrap();
         }
 
         let bare = continuity_call(&store, "continuity.search", &json!({}));
@@ -5917,6 +5956,29 @@ mod tests {
         assert_eq!(text_only["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(text_only["resolution"], "confirmation_required");
         assert_eq!(text_only["auto_resume_safe"], false);
+
+        let repo_scoped = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({"repo_id": "github.com/whshang/herdr-mcp"}),
+        );
+        assert_eq!(repo_scoped["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(repo_scoped["candidates"][0]["continuity_id"], "hc:alpha");
+        assert_eq!(repo_scoped["candidates"][0]["match_reasons"][0], "repo_id");
+        assert_eq!(repo_scoped["resolution"], "confirmation_required");
+        assert_eq!(repo_scoped["auto_resume_safe"], false);
+        assert_eq!(
+            repo_scoped["candidates"][0]["work_memory"]["project_ref"],
+            "project:herdr-mcp"
+        );
+        assert_eq!(
+            repo_scoped["candidates"][0]["work_memory"]["repo_id"],
+            "github.com/whshang/herdr-mcp"
+        );
+        assert_eq!(
+            repo_scoped["candidates"][0]["work_memory"]["work_chain_id"],
+            "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
 
         {
             let mut guard = store.lock().unwrap();

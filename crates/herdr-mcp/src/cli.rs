@@ -6,6 +6,8 @@ pub enum HelpSection {
     Automation,
     Instance,
     Qualification,
+    Continuity,
+    Memory,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -195,6 +197,7 @@ pub enum ContinuityCommand {
     Search {
         query: String,
         project_id: Option<String>,
+        project_path: Option<String>,
         workspace_id: Option<String>,
         limit: usize,
     },
@@ -454,16 +457,40 @@ fn parse_agent_skill(args: &[String]) -> Result<Command, String> {
 
 fn parse_continuity(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("help" | "--help" | "-h") if args.len() == 1 => Ok(Command::Help {
+            section: HelpSection::Continuity,
+        }),
+        Some("search")
+            if args
+                .get(1)
+                .is_some_and(|value| matches!(value.as_str(), "--help" | "-h"))
+                && args.len() == 2 =>
+        {
+            Ok(Command::Help {
+                section: HelpSection::Continuity,
+            })
+        }
+        Some("resume")
+            if args
+                .get(1)
+                .is_some_and(|value| matches!(value.as_str(), "--help" | "-h"))
+                && args.len() == 2 =>
+        {
+            Ok(Command::Help {
+                section: HelpSection::Continuity,
+            })
+        }
         Some("search") => {
             let query = args
                 .get(1)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    "continuity search requires <query> [--project-id ID] [--workspace-id ID] [--limit N]"
+                    "continuity search requires <query> [--project-id ID] [--project-path PATH] [--workspace-id ID] [--limit N]"
                         .to_owned()
                 })?
                 .clone();
             let mut project_id = None;
+            let mut project_path = None;
             let mut workspace_id = None;
             let mut limit = 8usize;
             let mut index = 2;
@@ -474,6 +501,7 @@ fn parse_continuity(args: &[String]) -> Result<Command, String> {
                     .ok_or_else(|| format!("{flag} requires a value"))?;
                 match flag {
                     "--project-id" => project_id = Some(value.clone()),
+                    "--project-path" => project_path = Some(value.clone()),
                     "--workspace-id" => workspace_id = Some(value.clone()),
                     "--limit" => limit = parse_bounded_usize(value, "--limit", 1, 20)?,
                     _ => return Err(format!("unknown continuity search flag '{flag}'")),
@@ -483,6 +511,7 @@ fn parse_continuity(args: &[String]) -> Result<Command, String> {
             Ok(Command::Continuity(ContinuityCommand::Search {
                 query,
                 project_id,
+                project_path,
                 workspace_id,
                 limit,
             }))
@@ -504,6 +533,19 @@ fn parse_continuity(args: &[String]) -> Result<Command, String> {
 
 fn parse_memory(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("help" | "--help" | "-h") if args.len() == 1 => Ok(Command::Help {
+            section: HelpSection::Memory,
+        }),
+        Some("resume" | "search")
+            if args
+                .get(1)
+                .is_some_and(|value| matches!(value.as_str(), "--help" | "-h"))
+                && args.len() == 2 =>
+        {
+            Ok(Command::Help {
+                section: HelpSection::Memory,
+            })
+        }
         Some("resume") => {
             if args.len() != 4 && args.len() != 6 {
                 return Err(
@@ -2079,6 +2121,34 @@ writes a pending sibling; --apply rewrites the live control file only with\n\
 HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"
 }
 
+pub fn continuity_help() -> &'static str {
+    "Herdr-MCP durable continuity\n\n\
+Usage:\n\
+  herdr-mcp continuity search <query> [--project-id ID] [--project-path PATH] [--workspace-id ID] [--limit N]\n\
+  herdr-mcp continuity resume <continuity_id>\n\n\
+Search returns bounded candidate evidence only; it does not read the full journal.\n\
+Text-only uniqueness remains confirmation_required. Use --project-path to scope by\n\
+the checkout's canonical Git repository identity without needing an internal ChatGPT\n\
+Project id. When a candidate exposes work_memory, its project_ref/repo_id/work_chain_id\n\
+can be passed to `herdr-mcp memory ...` after that candidate has been selected safely.\n\n\
+Examples:\n\
+  herdr-mcp continuity search \"WebChat handoff\" --project-path ~/Documents/herdr-mcp\n\
+  herdr-mcp continuity search \"archive retry\" --workspace-id wDG --limit 5\n\
+  herdr-mcp continuity resume hc:example\n"
+}
+
+pub fn memory_help() -> &'static str {
+    "Herdr-MCP bounded Work Memory\n\n\
+Usage:\n\
+  herdr-mcp memory resume <project_ref> <repo_id> <work_chain_id> [--max-turns N]\n\
+  herdr-mcp memory search <project_ref> <repo_id> <work_chain_id> <query> [--limit N]\n\n\
+Work Memory access requires the exact partition tuple. Prefer the work_memory locator\n\
+returned by a safely selected Continuity candidate; never invent partition ids.\n\n\
+Examples:\n\
+  herdr-mcp memory resume project:herdr-mcp github.com/whshang/herdr-mcp wc_...\n\
+  herdr-mcp memory search project:herdr-mcp github.com/whshang/herdr-mcp wc_... \"archive retry\" --limit 5\n"
+}
+
 pub fn worker_help() -> &'static str {
     "Herdr MCP device / worker management\n\n\
 Use bootstrap only when no Herdr Worker/fleet exists yet. The other management\n\
@@ -2233,6 +2303,20 @@ mod tests {
             Command::AgentSkill(AgentSkillCommand::Sync)
         );
         assert_eq!(
+            parse(args(&["continuity", "--help"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Continuity
+            }
+        );
+        assert_eq!(
+            parse(args(&["memory", "--help"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Memory
+            }
+        );
+        assert!(continuity_help().contains("--project-path PATH"));
+        assert!(memory_help().contains("work_memory"));
+        assert_eq!(
             parse(args(&[
                 "continuity",
                 "search",
@@ -2247,8 +2331,27 @@ mod tests {
             Command::Continuity(ContinuityCommand::Search {
                 query: "archive retry".to_owned(),
                 project_id: None,
+                project_path: None,
                 workspace_id: Some("wDG".to_owned()),
                 limit: 3,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "continuity",
+                "search",
+                "handoff",
+                "--project-path",
+                "/tmp/herdr-mcp",
+            ]))
+            .unwrap()
+            .command,
+            Command::Continuity(ContinuityCommand::Search {
+                query: "handoff".to_owned(),
+                project_id: None,
+                project_path: Some("/tmp/herdr-mcp".to_owned()),
+                workspace_id: None,
+                limit: 8,
             })
         );
         assert_eq!(

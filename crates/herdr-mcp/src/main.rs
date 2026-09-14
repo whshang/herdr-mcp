@@ -142,6 +142,8 @@ fn run() -> Result<ExitCode, String> {
                 cli::HelpSection::Automation => cli::automation_help(),
                 cli::HelpSection::Instance => cli::instance_help(),
                 cli::HelpSection::Qualification => cli::qualification_help(),
+                cli::HelpSection::Continuity => cli::continuity_help(),
+                cli::HelpSection::Memory => cli::memory_help(),
             };
             print!("{text}");
             Ok(ExitCode::SUCCESS)

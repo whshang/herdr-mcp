@@ -6,20 +6,29 @@ use crate::link::request_core::RuntimeRequest;
 use crate::paths::RuntimePaths;
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::process::ExitCode;
+use std::path::Path;
+use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
+use url::Url;
 
 pub(crate) fn run_continuity(command: ContinuityCommand) -> Result<ExitCode, String> {
     match command {
         ContinuityCommand::Search {
             query,
             project_id,
+            project_path,
             workspace_id,
             limit,
         } => {
             let mut params = Map::new();
             params.insert("query".to_owned(), json!(query));
             insert_optional(&mut params, "project_id", project_id);
+            if let Some(project_path) = project_path {
+                params.insert(
+                    "repo_id".to_owned(),
+                    json!(repo_id_for_project_path(Path::new(&project_path))?),
+                );
+            }
             insert_optional(&mut params, "workspace_id", workspace_id);
             params.insert("limit".to_owned(), json!(limit));
             print_private_result(call_private(
@@ -360,6 +369,66 @@ fn insert_optional(map: &mut Map<String, Value>, key: &str, value: Option<String
     }
 }
 
+fn repo_id_for_project_path(path: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .map_err(|error| {
+            format!(
+                "cannot inspect Git origin for project path {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "project path {} has no readable Git origin",
+            path.display()
+        ));
+    }
+    let remote = String::from_utf8(output.stdout)
+        .map_err(|_| "project Git origin is not valid UTF-8".to_owned())?;
+    canonical_repo_id_from_remote(remote.trim()).ok_or_else(|| {
+        format!(
+            "project Git origin for {} cannot be mapped to a canonical Work Memory repo_id",
+            path.display()
+        )
+    })
+}
+
+fn canonical_repo_id_from_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    if remote.is_empty() {
+        return None;
+    }
+    let (host, raw_path) = if remote.contains("://") {
+        let url = Url::parse(remote).ok()?;
+        let host = url.host_str()?.to_ascii_lowercase();
+        (host, url.path().trim_matches('/').to_owned())
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        let host = authority.rsplit('@').next()?.to_ascii_lowercase();
+        (host, path.trim_matches('/').to_owned())
+    };
+    let raw_path = raw_path.strip_suffix(".git").unwrap_or(&raw_path);
+    let mut parts = raw_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    if host == "github.com" {
+        parts
+            .iter_mut()
+            .for_each(|part| part.make_ascii_lowercase());
+    }
+    let repo_id = format!("{host}/{}", parts.join("/"));
+    crate::state_store::valid_canonical_work_memory_repo_id(&repo_id).then_some(repo_id)
+}
+
 fn print_private_result(value: Value) -> Result<ExitCode, String> {
     println!(
         "{}",
@@ -413,5 +482,24 @@ mod tests {
         });
         assert_eq!(trace["webchat_control_grants"][0]["provider"], "chatgpt");
         assert!(trace.get("bearer_token").is_none());
+    }
+
+    #[test]
+    fn canonical_repo_id_accepts_common_git_remote_forms() {
+        for remote in [
+            "git@github.com:WhShang/Herdr-MCP.git",
+            "ssh://git@github.com/WhShang/Herdr-MCP.git",
+            "https://github.com/WhShang/Herdr-MCP.git",
+        ] {
+            assert_eq!(
+                canonical_repo_id_from_remote(remote).as_deref(),
+                Some("github.com/whshang/herdr-mcp")
+            );
+        }
+        assert_eq!(
+            canonical_repo_id_from_remote("https://git.example.com/Team/Repo.git").as_deref(),
+            Some("git.example.com/Team/Repo")
+        );
+        assert!(canonical_repo_id_from_remote("/tmp/repo").is_none());
     }
 }

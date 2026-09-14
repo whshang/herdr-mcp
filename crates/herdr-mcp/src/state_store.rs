@@ -603,6 +603,7 @@ pub struct ContinuityCandidate {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ContinuitySearchInput<'a> {
     pub project_id: Option<&'a str>,
+    pub repo_id: Option<&'a str>,
     pub workspace_id: Option<&'a str>,
     pub conversation_id: Option<&'a str>,
     pub query: Option<&'a str>,
@@ -614,6 +615,9 @@ pub struct ContinuitySearchCandidate {
     pub continuity_id: String,
     pub title: Option<String>,
     pub project_id: Option<String>,
+    pub project_ref: Option<String>,
+    pub repo_id: Option<String>,
+    pub work_chain_id: Option<String>,
     pub status: String,
     pub updated_at: i64,
     pub workspace_ids: Vec<String>,
@@ -1630,6 +1634,10 @@ impl StateStore {
             .project_id
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let repo_id = input
+            .repo_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let workspace_id = input
             .workspace_id
             .map(str::trim)
@@ -1643,39 +1651,54 @@ impl StateStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT c.continuity_id, c.title, c.project_id, c.status, c.updated_at
+                "SELECT c.continuity_id, c.title, c.project_id, c.status, c.updated_at,
+                        c.project_ref, c.repo_id, c.work_chain_id
                  FROM continuity_chains c
                  WHERE c.status = 'active'
                    AND (?1 IS NULL OR c.project_id = ?1)
-                   AND (?2 IS NULL OR EXISTS (
-                       SELECT 1 FROM continuity_bindings bw
-                       WHERE bw.continuity_id = c.continuity_id AND bw.workspace_id = ?2
-                   ))
+                   AND (?2 IS NULL OR c.repo_id = ?2)
                    AND (?3 IS NULL OR EXISTS (
-                       SELECT 1 FROM continuity_bindings bc
-                       WHERE bc.continuity_id = c.continuity_id AND bc.conversation_id = ?3
+                       SELECT 1 FROM continuity_bindings bw
+                       WHERE bw.continuity_id = c.continuity_id AND bw.workspace_id = ?3
                    ))
-                   AND (?4 IS NULL
-                        OR instr(lower(COALESCE(c.title, '')), lower(?4)) > 0
+                   AND (?4 IS NULL OR EXISTS (
+                       SELECT 1 FROM continuity_bindings bc
+                       WHERE bc.continuity_id = c.continuity_id AND bc.conversation_id = ?4
+                   ))
+                   AND (?5 IS NULL
+                        OR instr(lower(COALESCE(c.title, '')), lower(?5)) > 0
                         OR EXISTS (
                             SELECT 1 FROM continuity_turns tq
                             WHERE tq.continuity_id = c.continuity_id
-                              AND instr(lower(tq.text), lower(?4)) > 0
+                              AND instr(lower(tq.text), lower(?5)) > 0
                         ))
                  ORDER BY c.updated_at DESC
-                 LIMIT ?5",
+                 LIMIT ?6",
             )
             .map_err(|error| format!("cannot prepare continuity search: {error}"))?;
         let rows = stmt
             .query_map(
-                params![project_id, workspace_id, conversation_id, query, limit],
+                params![
+                    project_id,
+                    repo_id,
+                    workspace_id,
+                    conversation_id,
+                    query,
+                    limit
+                ],
                 |row| {
-                    Ok(ContinuityCandidate {
+                    Ok(ContinuitySearchCandidate {
                         continuity_id: row.get(0)?,
                         title: row.get(1)?,
                         project_id: row.get(2)?,
                         status: row.get(3)?,
                         updated_at: row.get(4)?,
+                        project_ref: row.get(5)?,
+                        repo_id: row.get(6)?,
+                        work_chain_id: row.get(7)?,
+                        workspace_ids: Vec::new(),
+                        recent_user_excerpt: None,
+                        recent_assistant_excerpt: None,
                     })
                 },
             )
@@ -1747,6 +1770,9 @@ impl StateStore {
                 continuity_id: candidate.continuity_id,
                 title: candidate.title,
                 project_id: candidate.project_id,
+                project_ref: candidate.project_ref,
+                repo_id: candidate.repo_id,
+                work_chain_id: candidate.work_chain_id,
                 status: candidate.status,
                 updated_at: candidate.updated_at,
                 workspace_ids,
@@ -5171,7 +5197,7 @@ pub(crate) fn validate_work_memory_partition_identity(
     Ok(())
 }
 
-fn valid_canonical_work_memory_repo_id(value: &str) -> bool {
+pub(crate) fn valid_canonical_work_memory_repo_id(value: &str) -> bool {
     if value.is_empty()
         || value.len() > 512
         || value.contains(['\\', ':', '~'])
