@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "base_contract": "contracts/epoch2.json",
+  "contract_epoch": 3,
+  "contract_hash": "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",
+  "tool_count": 18,
+  "shape": {
+    "tool": "herdr_exec",
+    "set": {
+      "description": "Run a non-interactive command on the workstation inside a selected project root of the target workspace (explicit project_root, or the workspace's single current project root) and return its bounded result synchronously: start a durable native exec session, wait up to timeout_ms, then return exit_code + effective_cwd/project_root + output. Ordinary roots do not open a pane and never depend on a pane's foreground cwd. When the workspace has MULTIPLE project roots and project_root is omitted, the call is REFUSED and returns candidates (one of them is the exact value to pass next). Gated by HERDR_MCP_READONLY / HERDR_MCP_WRITE_ROOTS. If any agent in that project is working, refused unless confirm_busy:true (returns warnings.working). Freeform shell is NOT secret-path gated (unlike herdr_fs_* — a command can still read .env); prefer fs tools for file IO. On timeout the command keeps running as the returned session_id; partial output is returned with ok:false code:exec_timeout and must be resumed with herdr_exec_read, never re-sent. macOS user-protected roots (Documents/Desktop/Downloads) use the persistent VISIBLE utility pane (label 'herdr-mcp:utility') so execution stays under the TCC-authorized Herdr terminal host."
+    }
+  }
+}

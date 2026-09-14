@@ -1,5 +1,4 @@
-use crate::exec_compact;
-use crate::exec_sessions::{ExecRegistry, enriched_exec_path, resolve_exec_shell};
+use crate::exec_sessions::ExecRegistry;
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
 use crate::projects;
@@ -7,35 +6,24 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(unix)]
-use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 const UTILITY_LABEL: &str = "herdr-mcp:utility";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 60_000;
 const PRE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
-const OUTPUT_LIMIT: usize = 8_000;
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_STRUCTURED_STEPS: usize = 16;
 const MAX_STRUCTURED_ARGS: usize = 128;
-static NEXT_EXEC: AtomicU64 = AtomicU64::new(0);
 static UTILITY_PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static UTILITY_PANE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-type LocalChunks = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
 #[derive(Debug, Clone)]
 struct WorkspaceRecord {
@@ -62,21 +50,37 @@ enum PrepareError {
     Other { code: String, message: String },
 }
 
-#[derive(Debug)]
-struct LocalResult {
-    exit_code: Option<i32>,
-    signal: Option<String>,
-    output: String,
-    timed_out: bool,
-    truncated: bool,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StructuredExecStep {
     program: String,
     #[serde(default)]
     args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ExecInvocation {
+    Command(String),
+    Steps(Vec<StructuredExecStep>),
+}
+
+impl ExecInvocation {
+    fn rendered(&self) -> String {
+        match self {
+            Self::Command(command) => command.clone(),
+            Self::Steps(steps) => steps
+                .iter()
+                .map(|step| {
+                    std::iter::once(step.program.as_str())
+                        .chain(step.args.iter().map(String::as_str))
+                        .map(shell_quote)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join(" && "),
+        }
+    }
 }
 
 pub fn run_durable(
@@ -89,10 +93,11 @@ pub fn run_durable(
         Ok(value) => value,
         Err(error) => return error,
     };
-    let command = match resolve_exec_command(args) {
+    let invocation = match resolve_exec_invocation(args) {
         Ok(value) => value,
         Err(error) => return error,
     };
+    let command = invocation.rendered();
     let project_root = match optional_str(args, "project_root") {
         Ok(value) => value,
         Err(error) => return error,
@@ -157,48 +162,67 @@ pub fn run_durable(
             Ok(working) => working,
             Err(error) => return error,
         };
-    let _ = cleanup_stale_scripts();
 
-    #[cfg(windows)]
-    {
-        let _ = client;
-        let _ = registry;
-        return json!({
-            "ok": false,
-            "code": "unsupported_platform",
-            "message": "visible utility-pane execution requires the Windows Herdr named-pipe transport, which is still pending",
-            "workspace": workspace.id,
-            "command": command,
-            "effective_cwd": effective_root.to_string_lossy(),
-            "project_root": effective_root.to_string_lossy(),
-        });
+    // Ordinary, non-interactive execution reuses the durable native
+    // `ExecRegistry` backend as start + bounded synchronous wait + result. The
+    // visible utility pane is retained only for macOS protected user paths,
+    // where the rotating runtime must not become the TCC responsible client.
+    // Both backends share one session registry, so a timed-out command stays
+    // readable through `herdr_exec_read` and is never re-sent.
+    if crate::macos_permissions::is_protected_user_path(&effective_root) {
+        #[cfg(unix)]
+        {
+            let _ = cleanup_stale_scripts();
+            return run_unix_durable(
+                client,
+                snapshot,
+                registry,
+                (&workspace.id, &effective_root),
+                &command,
+                timeout_ms,
+                &working,
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            return json!({
+                "ok": false,
+                "code": "unsupported_platform",
+                "message": "protected-path execution requires the macOS utility-pane transport",
+                "workspace": workspace.id,
+                "command": command,
+                "effective_cwd": effective_root.to_string_lossy(),
+                "project_root": effective_root.to_string_lossy(),
+            });
+        }
     }
 
-    #[cfg(unix)]
-    run_unix_durable(
-        client,
-        snapshot,
+    #[cfg(not(unix))]
+    let _ = (client, snapshot);
+
+    run_native_durable(
         registry,
         (&workspace.id, &effective_root),
+        &invocation,
         &command,
         timeout_ms,
         &working,
     )
 }
 
-fn resolve_exec_command(args: &Value) -> Result<String, Value> {
+fn resolve_exec_invocation(args: &Value) -> Result<ExecInvocation, Value> {
     let command = optional_str(args, "command")?;
     let steps = args.get("steps");
     match (command, steps) {
         (Some(""), _) => Err(invalid("command must not be empty")),
         (Some(_), Some(_)) => Err(invalid("exactly one of command or steps is allowed")),
-        (Some(command), None) => Ok(command.to_owned()),
-        (None, Some(steps)) => structured_steps_command(steps),
+        (Some(command), None) => Ok(ExecInvocation::Command(command.to_owned())),
+        (None, Some(steps)) => structured_steps(steps).map(ExecInvocation::Steps),
         (None, None) => Err(invalid("exactly one of command or steps is required")),
     }
 }
 
-fn structured_steps_command(value: &Value) -> Result<String, Value> {
+fn structured_steps(value: &Value) -> Result<Vec<StructuredExecStep>, Value> {
     let steps: Vec<StructuredExecStep> = serde_json::from_value(value.clone())
         .map_err(|_| invalid("steps must be an array of {program,args} objects"))?;
     if steps.is_empty() || steps.len() > MAX_STRUCTURED_STEPS {
@@ -206,7 +230,6 @@ fn structured_steps_command(value: &Value) -> Result<String, Value> {
             "steps must contain 1..={MAX_STRUCTURED_STEPS} items"
         )));
     }
-    let mut commands = Vec::with_capacity(steps.len());
     for (index, step) in steps.iter().enumerate() {
         if step.program.is_empty() || step.program.contains('\0') {
             return Err(invalid(&format!(
@@ -218,15 +241,8 @@ fn structured_steps_command(value: &Value) -> Result<String, Value> {
                 "steps[{index}].args must contain at most {MAX_STRUCTURED_ARGS} NUL-free strings"
             )));
         }
-        commands.push(
-            std::iter::once(step.program.as_str())
-                .chain(step.args.iter().map(String::as_str))
-                .map(shell_quote)
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
     }
-    Ok(commands.join(" && "))
+    Ok(steps)
 }
 
 pub(crate) fn start_reusable_pane_session(
@@ -260,16 +276,7 @@ pub(crate) fn start_reusable_pane_session(
             match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
                 Ok(value) => value,
                 Err(PrepareError::ControlPlane(message)) => {
-                    return json!({
-                        "ok": false,
-                        "code": "utility_pane_unavailable",
-                        "message": message,
-                        "workspace": workspace_id,
-                        "command": command,
-                        "delivery_state": "not_delivered",
-                        "safe_retry_mode": "retry_after_control_plane_recovery",
-                        "hint": "failed to prepare canonical utility pane before command delivery",
-                    });
+                    return utility_pane_control_plane_error(workspace_id, command, message);
                 }
                 Err(PrepareError::Other { code, message }) => {
                     return json!({
@@ -335,15 +342,7 @@ fn run_unix_durable(
         match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
             Ok(value) => value,
             Err(PrepareError::ControlPlane(message)) => {
-                return local_fallback(
-                    command,
-                    effective_root,
-                    workspace_id,
-                    timeout_ms,
-                    "control_plane_taskgroup_before_send",
-                    working,
-                    Some(message),
-                );
+                return utility_pane_control_plane_error(workspace_id, command, message);
             }
             Err(PrepareError::Other { code, message }) => {
                 return json!({
@@ -464,6 +463,170 @@ fn run_unix_durable(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Native-default synchronous execution: start one durable native session, then
+/// wait a bounded time for it. A single structured step uses literal argv via
+/// `start_native_program`; a multi-step sequence reuses the shell-quoted
+/// `&&` chain so it stays sequential, stops on the first non-zero exit, and
+/// shares one bounded timeout. No second executor, queue, or scheduler is
+/// introduced.
+fn run_native_durable(
+    registry: &ExecRegistry,
+    target: (&str, &Path),
+    invocation: &ExecInvocation,
+    command: &str,
+    timeout_ms: u64,
+    working: &[Value],
+) -> Value {
+    let (workspace_id, effective_root) = target;
+    let started = Instant::now();
+    let started_result = match invocation {
+        ExecInvocation::Command(command) => registry.start_native(effective_root, command),
+        ExecInvocation::Steps(steps) => match steps.as_slice() {
+            [step] => registry.start_native_program(effective_root, &step.program, &step.args),
+            _ => registry.start_native(effective_root, &invocation.rendered()),
+        },
+    };
+    let start = match started_result {
+        Ok(value) => value,
+        Err(message) => {
+            return json!({
+                "ok": false,
+                "code": "exec_start_failed",
+                "message": message,
+                "backend": "native",
+                "workspace": workspace_id,
+                "command": command,
+                "delivery_state": "unknown",
+                "hint": "native command start did not complete cleanly; inspect session/process state before retrying",
+            });
+        }
+    };
+    let Some(session_id) = start.get("session_id").and_then(Value::as_str) else {
+        return json!({
+            "ok": false,
+            "code": "exec_start_failed",
+            "message": "native exec start returned no session_id",
+            "backend": "native",
+        });
+    };
+    let session_id = session_id.to_owned();
+    let deadline = Duration::from_millis(timeout_ms);
+    loop {
+        let read = registry.read(&session_id, "both", 0, 65_536);
+        if read.get("phase").and_then(Value::as_str) == Some("completed") {
+            return native_completed_result(
+                workspace_id,
+                effective_root,
+                command,
+                &session_id,
+                &read,
+                working,
+            );
+        }
+        if started.elapsed() >= deadline {
+            return native_timeout_result(
+                workspace_id,
+                effective_root,
+                command,
+                &session_id,
+                &read,
+                working,
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn native_completed_result(
+    workspace_id: &str,
+    effective_root: &Path,
+    command: &str,
+    session_id: &str,
+    read: &Value,
+    working: &[Value],
+) -> Value {
+    let exit_code = read.get("exit_code").cloned().unwrap_or(Value::Null);
+    let ok = exit_code.as_i64() == Some(0);
+    let output = read.get("text").cloned().unwrap_or_else(|| json!(""));
+    let mut result = Map::new();
+    result.insert("ok".to_owned(), json!(ok));
+    result.insert("backend".to_owned(), json!("native"));
+    result.insert("workspace".to_owned(), json!(workspace_id));
+    result.insert("command".to_owned(), json!(command));
+    result.insert("session_id".to_owned(), json!(session_id));
+    result.insert("op_id".to_owned(), json!(session_id));
+    result.insert("phase".to_owned(), json!("completed"));
+    result.insert("exit_code".to_owned(), exit_code);
+    result.insert("output".to_owned(), output);
+    result.insert(
+        "effective_cwd".to_owned(),
+        json!(effective_root.to_string_lossy()),
+    );
+    result.insert(
+        "project_root".to_owned(),
+        json!(effective_root.to_string_lossy()),
+    );
+    for key in ["progress", "truncated", "compacted", "counts", "signal"] {
+        if let Some(value) = read.get(key) {
+            result.insert(key.to_owned(), value.clone());
+        }
+    }
+    add_working_warning(&mut result, working);
+    Value::Object(result)
+}
+
+fn native_timeout_result(
+    workspace_id: &str,
+    effective_root: &Path,
+    command: &str,
+    session_id: &str,
+    read: &Value,
+    working: &[Value],
+) -> Value {
+    let partial = read.get("text").cloned().unwrap_or_else(|| json!(""));
+    let mut result = Map::new();
+    result.insert("ok".to_owned(), json!(false));
+    result.insert("code".to_owned(), json!("exec_timeout"));
+    result.insert("backend".to_owned(), json!("native"));
+    result.insert("workspace".to_owned(), json!(workspace_id));
+    result.insert("command".to_owned(), json!(command));
+    result.insert("session_id".to_owned(), json!(session_id));
+    result.insert("op_id".to_owned(), json!(session_id));
+    result.insert("phase".to_owned(), json!("running"));
+    result.insert("partial_output".to_owned(), partial);
+    result.insert(
+        "effective_cwd".to_owned(),
+        json!(effective_root.to_string_lossy()),
+    );
+    result.insert(
+        "project_root".to_owned(),
+        json!(effective_root.to_string_lossy()),
+    );
+    if let Some(progress) = read.get("progress") {
+        result.insert("progress".to_owned(), progress.clone());
+    }
+    add_working_warning(&mut result, working);
+    result.insert(
+        "hint".to_owned(),
+        json!("command is still tracked; call herdr_exec_read with this session_id for final status/output and do not re-send it"),
+    );
+    Value::Object(result)
+}
+
+fn utility_pane_control_plane_error(workspace_id: &str, command: &str, message: String) -> Value {
+    json!({
+        "ok": false,
+        "code": "utility_pane_unavailable",
+        "message": message,
+        "backend": "utility_pane",
+        "workspace": workspace_id,
+        "command": command,
+        "delivery_state": "not_delivered",
+        "safe_retry_mode": "retry_after_control_plane_recovery",
+        "hint": "failed to prepare canonical utility pane before command delivery",
+    })
 }
 
 fn utility_pane_contention_result(
@@ -796,56 +959,8 @@ fn finite_pid(value: Option<&Value>) -> Option<u64> {
         })
 }
 
-#[cfg(unix)]
-fn build_utility_exec_script(
-    exec_shell: &Path,
-    cwd: &Path,
-    command: &str,
-    exec_id: &str,
-) -> String {
-    [
-        format!("#!{}", exec_shell.display()),
-        "set +e".to_owned(),
-        // Visible utility-pane commands are Herdr-managed executions just like
-        // native exec sessions. Preserve that identity in the child process so
-        // service/dev lifecycle guards cannot be bypassed by running a mutation
-        // through herdr_exec and severing the control path that submitted it.
-        format!("export HERDR_MCP_EXEC_ID={}", shell_quote(exec_id)),
-        "export PAGER=cat".to_owned(),
-        "export GIT_PAGER=cat".to_owned(),
-        "export GH_PAGER=cat".to_owned(),
-        "export SYSTEMD_PAGER=cat".to_owned(),
-        "export MANPAGER=cat".to_owned(),
-        "export DELTA_PAGER=cat".to_owned(),
-        "trap 'rm -f -- \"$0\"' EXIT".to_owned(),
-        format!(
-            "cd -- {} || exit 127",
-            shell_quote(cwd.to_string_lossy().as_ref())
-        ),
-        command.to_owned(),
-    ]
-    .join("\n")
-        + "\n"
-}
-
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-#[cfg(unix)]
-fn write_executable_script(path: &Path, body: &str) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(path)
-        .map_err(|error| format!("cannot create utility script: {error}"))?;
-    file.write_all(body.as_bytes())
-        .and_then(|_| file.sync_all())
-        .map_err(|error| format!("cannot write utility script: {error}"))?;
-    file.set_permissions(fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("cannot secure utility script: {error}"))?;
-    Ok(())
 }
 
 fn cleanup_stale_scripts() -> usize {
@@ -884,223 +999,6 @@ fn is_control_plane_taskgroup(message: &str) -> bool {
         || lower.contains("unhandled errors in a taskgroup")
         || (lower.contains("taskgroup")
             && (lower.contains("unhandled") || lower.contains("sub-exception")))
-}
-
-fn unwrap_control_plane_message(message: &str) -> String {
-    let lines = message
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    if let Some(concrete) = lines.iter().find(|line| {
-        let lower = line.to_ascii_lowercase();
-        !lower.starts_with("exceptiongroup")
-            && !lower.starts_with("unhandled errors in a taskgroup")
-            && !lower.contains("sub-exception")
-    }) {
-        return (*concrete).to_owned();
-    }
-    "herdr control-plane TaskGroup blip (sub-exception not expanded by daemon)".to_owned()
-}
-
-#[cfg(unix)]
-fn local_fallback(
-    command: &str,
-    cwd: &Path,
-    workspace_id: &str,
-    timeout_ms: u64,
-    reason: &str,
-    working: &[Value],
-    detail: Option<String>,
-) -> Value {
-    let started_at_ms = now_ms();
-    let local = run_local_shell(command, cwd, timeout_ms, OUTPUT_LIMIT);
-    let mut result = Map::new();
-    result.insert(
-        "ok".to_owned(),
-        json!(!local.timed_out && local.exit_code == Some(0)),
-    );
-    if local.timed_out {
-        result.insert("code".to_owned(), json!("exec_timeout"));
-    }
-    result.insert("backend".to_owned(), json!("local_fallback"));
-    result.insert("fallback_reason".to_owned(), json!(reason));
-    if let Some(detail) = detail {
-        result.insert(
-            "fallback_detail".to_owned(),
-            json!(unwrap_control_plane_message(&detail)),
-        );
-    }
-    result.insert("workspace".to_owned(), json!(workspace_id));
-    result.insert("command".to_owned(), json!(command));
-    result.insert("exit_code".to_owned(), json!(local.exit_code));
-    result.insert("signal".to_owned(), json!(local.signal));
-    result.insert("effective_cwd".to_owned(), json!(cwd.to_string_lossy()));
-    result.insert("project_root".to_owned(), json!(cwd.to_string_lossy()));
-    result.insert("truncated".to_owned(), json!(local.truncated));
-    exec_compact::insert_compacted_or_raw(
-        &mut result,
-        "output",
-        &local.output,
-        !local.timed_out && local.exit_code == Some(0) && !local.truncated,
-    );
-    insert_sync_completion(&mut result, started_at_ms, local.output.len());
-    if local.timed_out {
-        result.insert(
-            "hint".to_owned(),
-            json!("local fallback timed out; its isolated process group was terminated"),
-        );
-    }
-    add_working_warning(&mut result, working);
-    Value::Object(result)
-}
-
-#[cfg(unix)]
-fn run_local_shell(command: &str, cwd: &Path, timeout_ms: u64, max_bytes: usize) -> LocalResult {
-    let sequence = NEXT_EXEC.fetch_add(1, Ordering::Relaxed);
-    let exec_id = format!("local-{}-{sequence}", std::process::id());
-    let shell = resolve_exec_shell();
-    let script_path = env::temp_dir().join(format!(
-        "herdr-mcp-local-{}-{sequence}.sh",
-        std::process::id()
-    ));
-    let body = build_utility_exec_script(&shell, cwd, command, &exec_id);
-    if write_executable_script(&script_path, &body).is_err() {
-        return LocalResult {
-            exit_code: None,
-            signal: None,
-            output: String::new(),
-            timed_out: false,
-            truncated: false,
-        };
-    }
-
-    let mut child = match Command::new(&shell)
-        .arg(&script_path)
-        .current_dir(cwd)
-        .env("PATH", enriched_exec_path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => {
-            let _ = fs::remove_file(&script_path);
-            return LocalResult {
-                exit_code: None,
-                signal: None,
-                output: String::new(),
-                timed_out: false,
-                truncated: false,
-            };
-        }
-    };
-    let pid = child.id();
-    let chunks = Arc::new(Mutex::new(Vec::<(u64, Vec<u8>)>::new()));
-    let sequence_counter = Arc::new(AtomicU64::new(0));
-    let stdout_thread = child.stdout.take().map(|stdout| {
-        spawn_local_reader(stdout, Arc::clone(&chunks), Arc::clone(&sequence_counter))
-    });
-    let stderr_thread = child.stderr.take().map(|stderr| {
-        spawn_local_reader(stderr, Arc::clone(&chunks), Arc::clone(&sequence_counter))
-    });
-    let started = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms.max(1));
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() >= timeout => {
-                timed_out = true;
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGTERM);
-                }
-                thread::sleep(Duration::from_millis(800));
-                if child.try_wait().ok().flatten().is_none() {
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                    }
-                }
-                break child.wait().ok();
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(_) => break child.wait().ok(),
-        }
-    };
-    if let Some(handle) = stdout_thread {
-        let _ = handle.join();
-    }
-    if let Some(handle) = stderr_thread {
-        let _ = handle.join();
-    }
-    let _ = fs::remove_file(&script_path);
-    let mut chunks = chunks
-        .lock()
-        .map(|chunks| chunks.clone())
-        .unwrap_or_default();
-    chunks.sort_by_key(|(seq, _)| *seq);
-    let mut bytes = Vec::new();
-    let mut truncated = false;
-    for (_, chunk) in chunks {
-        let room = max_bytes.saturating_sub(bytes.len());
-        if room == 0 {
-            truncated = true;
-            break;
-        }
-        let take = chunk.len().min(room);
-        bytes.extend_from_slice(&chunk[..take]);
-        if take < chunk.len() {
-            truncated = true;
-            break;
-        }
-    }
-    let mut output = String::from_utf8_lossy(&bytes).into_owned();
-    if truncated {
-        output.push_str("\n…[truncated]");
-    }
-    LocalResult {
-        exit_code: status.as_ref().and_then(ExitStatus::code),
-        signal: status
-            .as_ref()
-            .and_then(|status| status.signal())
-            .map(signal_name),
-        output,
-        timed_out,
-        truncated,
-    }
-}
-
-#[cfg(unix)]
-fn spawn_local_reader<R: Read + Send + 'static>(
-    mut reader: R,
-    chunks: LocalChunks,
-    sequence: Arc<AtomicU64>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let read = match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => read,
-            };
-            let seq = sequence.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut chunks) = chunks.lock() {
-                chunks.push((seq, buffer[..read].to_vec()));
-            }
-        }
-    })
-}
-
-#[cfg(unix)]
-fn signal_name(signal: i32) -> String {
-    match signal {
-        libc::SIGTERM => "SIGTERM".to_owned(),
-        libc::SIGKILL => "SIGKILL".to_owned(),
-        libc::SIGINT => "SIGINT".to_owned(),
-        other => format!("SIG{other}"),
-    }
 }
 
 fn add_working_warning(result: &mut Map<String, Value>, working: &[Value]) {
@@ -1146,35 +1044,6 @@ fn optional_u64(args: &Value, key: &str, min: u64, max: u64) -> Result<Option<u6
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
-}
-
-fn iso_from_ms(ms: u64) -> String {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
-        .ok()
-        .and_then(|value| value.format(&Rfc3339).ok())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
-}
-
-fn insert_sync_completion(result: &mut Map<String, Value>, started_at_ms: u64, bytes_total: usize) {
-    let elapsed_ms = now_ms().saturating_sub(started_at_ms);
-    result.insert("started_at".to_owned(), json!(iso_from_ms(started_at_ms)));
-    result.insert("phase".to_owned(), json!("completed"));
-    result.insert(
-        "progress".to_owned(),
-        json!({
-            "bytes_read": bytes_total,
-            "bytes_total": bytes_total,
-            "elapsed_ms": elapsed_ms,
-        }),
-    );
-}
-
 fn invalid(message: &str) -> Value {
     json!({"ok": false, "code": "invalid_params", "message": message})
 }
@@ -1182,6 +1051,8 @@ fn invalid(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::Arc;
 
     #[test]
     fn project_root_selection_is_fail_closed() {
@@ -1199,7 +1070,7 @@ mod tests {
 
     #[test]
     fn structured_exec_compiles_literal_argv_into_one_local_sequence() {
-        let command = resolve_exec_command(&json!({
+        let invocation = resolve_exec_invocation(&json!({
             "workspace": "w1",
             "steps": [
                 {"program": "printf", "args": ["%s\\n", "a; b", "$(uname)", "it's literal"]},
@@ -1207,26 +1078,40 @@ mod tests {
             ]
         }))
         .unwrap();
+        assert!(matches!(invocation, ExecInvocation::Steps(ref steps) if steps.len() == 2));
         assert_eq!(
-            command,
+            invocation.rendered(),
             "'printf' '%s\\n' 'a; b' '$(uname)' 'it'\\''s literal' && '/usr/bin/git' 'status' '--short'"
         );
     }
 
     #[test]
     fn structured_exec_rejects_mixed_modes_and_unknown_step_fields() {
-        let mixed = resolve_exec_command(&json!({
+        let mixed = resolve_exec_invocation(&json!({
             "command": "git status",
             "steps": [{"program": "git", "args": ["status"]}]
         }))
         .unwrap_err();
         assert_eq!(mixed["code"], "invalid_params");
 
-        let unknown = resolve_exec_command(&json!({
+        let unknown = resolve_exec_invocation(&json!({
             "steps": [{"program": "git", "shell": true}]
         }))
         .unwrap_err();
         assert_eq!(unknown["code"], "invalid_params");
+    }
+
+    #[test]
+    fn structured_exec_single_step_prefers_native_program_rendering() {
+        let invocation = resolve_exec_invocation(&json!({
+            "steps": [{"program": "printf", "args": ["%s", "a b"]}]
+        }))
+        .unwrap();
+        match &invocation {
+            ExecInvocation::Steps(steps) => assert_eq!(steps.len(), 1),
+            ExecInvocation::Command(_) => panic!("expected structured steps"),
+        }
+        assert_eq!(invocation.rendered(), "'printf' '%s' 'a b'");
     }
 
     #[cfg(unix)]
@@ -1238,7 +1123,10 @@ mod tests {
         let base = env::temp_dir().join(format!(
             "herdr-utility-reuse-{}-{}",
             std::process::id(),
-            now_ms(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
         ));
         fs::create_dir_all(&base).unwrap();
         let socket = base.join("herdr.sock");
@@ -1354,6 +1242,81 @@ mod tests {
     }
 
     #[test]
+    fn utility_pane_control_plane_failure_never_falls_back_locally() {
+        let result = utility_pane_control_plane_error(
+            "w1",
+            "git status",
+            "control plane unavailable".to_owned(),
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "utility_pane_unavailable");
+        assert_eq!(result["backend"], "utility_pane");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(
+            result["safe_retry_mode"],
+            "retry_after_control_plane_recovery"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_durable_protected_documents_root_uses_utility_path_on_control_plane_failure() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "id": request["id"].clone(),
+                        "error": {
+                            "code": "snapshot_error",
+                            "message": "unhandled errors in a TaskGroup (1 sub-exception)"
+                        }
+                    })
+                )
+                .unwrap();
+            }
+        });
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on macOS"));
+        let root = home.join("Documents").join(format!(
+            "herdr-protected-routing-test-{}",
+            std::process::id()
+        ));
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(&socket);
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"workspace": "w1", "command": "printf 'must-not-run-natively\\n'"}),
+        );
+
+        assert_eq!(result["ok"], false, "unexpected result: {result}");
+        assert_eq!(result["code"], "utility_pane_unavailable");
+        assert_eq!(result["backend"], "utility_pane");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert!(registry.list_views().is_empty());
+
+        server.join().unwrap();
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn utility_pane_contention_is_explicitly_retryable_before_delivery() {
         let readiness = PaneReadiness {
             ready: false,
@@ -1371,25 +1334,6 @@ mod tests {
     }
 
     #[test]
-    fn script_disables_pagers_quotes_cwd_and_self_cleans() {
-        #[cfg(unix)]
-        {
-            let script = build_utility_exec_script(
-                Path::new("/bin/sh"),
-                Path::new("/tmp/a'b"),
-                "git log -1",
-                "utility-test-1",
-            );
-            assert!(script.contains("export HERDR_MCP_EXEC_ID='utility-test-1'"));
-            assert!(script.contains("export GIT_PAGER=cat"));
-            assert!(script.contains("export GH_PAGER=cat"));
-            assert!(script.contains("trap 'rm -f -- \"$0\"' EXIT"));
-            assert!(script.contains("cd -- '/tmp/a'\\''b' || exit 127"));
-            assert!(script.ends_with("git log -1\n"));
-        }
-    }
-
-    #[test]
     fn taskgroup_detection_is_narrow() {
         assert!(is_control_plane_taskgroup(
             "unhandled errors in a TaskGroup (1 sub-exception)"
@@ -1398,112 +1342,157 @@ mod tests {
         assert!(!is_control_plane_taskgroup("ordinary command timeout"));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn local_fallback_marks_managed_execution() {
-        let result = local_fallback(
-            "printf '%s' \"$HERDR_MCP_EXEC_ID\"",
-            Path::new("/tmp"),
-            "w1",
-            5_000,
-            "test",
-            &[],
-            None,
-        );
-        assert_eq!(result["ok"], true);
-        let output = result["output"].as_str().expect("fallback output");
-        assert!(output.starts_with("local-"), "unexpected exec id: {output}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn local_fallback_compacts_large_success_only() {
-        let large = local_fallback(
-            "awk 'BEGIN{for(i=0;i<90;i++) print \"line-\" i}'",
-            Path::new("/tmp"),
-            "w1",
-            5_000,
-            "test",
-            &[],
-            None,
-        );
-        assert_eq!(large["ok"], true);
-        assert_eq!(large["phase"], "completed");
-        assert!(large["started_at"].as_str().is_some());
-        assert_eq!(
-            large["progress"]["bytes_read"],
-            large["progress"]["bytes_total"]
-        );
-        assert!(large["progress"]["elapsed_ms"].as_u64().is_some());
-        assert_eq!(large["exit_code"], 0);
-        assert_eq!(
-            large["command"],
-            "awk 'BEGIN{for(i=0;i<90;i++) print \"line-\" i}'"
-        );
-        assert_eq!(large["effective_cwd"], "/tmp");
-        assert_eq!(large["truncated"], false);
-        assert_eq!(large["compacted"], true);
-        assert_eq!(large["counts"]["lines"], 90);
-        let output = large["output"].as_str().unwrap();
-        assert!(output.contains("line-0\n"));
-        assert!(output.contains("…[omitted 30 lines]…"));
-        assert!(!output.contains("line-40\n"));
-
-        let small = local_fallback(
-            "printf 'hello-local\\n'",
-            Path::new("/tmp"),
-            "w1",
-            5_000,
-            "test",
-            &[],
-            None,
-        );
-        assert_eq!(small["ok"], true);
-        assert!(small["output"].as_str().unwrap().contains("hello-local"));
-        assert!(small.get("compacted").is_none());
-
-        let failed = local_fallback(
-            "awk 'BEGIN{for(i=0;i<90;i++) print \"fail-\" i}'; exit 3",
-            Path::new("/tmp"),
-            "w1",
-            5_000,
-            "test",
-            &[],
-            None,
-        );
-        assert_eq!(failed["ok"], false);
-        assert_eq!(failed["exit_code"], 3);
-        assert!(failed.get("compacted").is_none());
-        let fail_output = failed["output"].as_str().unwrap();
-        assert!(fail_output.contains("fail-0\n"));
-        assert!(fail_output.contains("fail-40\n"));
-        assert!(fail_output.contains("fail-89\n"));
-
-        let truncated = local_fallback(
-            "awk 'BEGIN{for(i=0;i<200;i++) print i, \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}'",
-            Path::new("/tmp"),
-            "w1",
-            5_000,
-            "test",
-            &[],
-            None,
-        );
-        assert_eq!(truncated["ok"], true);
-        assert_eq!(truncated["truncated"], true);
-        assert!(truncated.get("compacted").is_none());
-        assert!(
-            truncated["output"]
-                .as_str()
-                .unwrap()
-                .contains("…[truncated]")
-        );
-    }
-
     #[test]
     fn workspace_resolution_accepts_id_or_label() {
         let snapshot = json!({"workspaces": [{"workspace_id": "w1", "label": "demo"}]});
         assert_eq!(resolve_workspace(&snapshot, "w1").unwrap().id, "w1");
         assert_eq!(resolve_workspace(&snapshot, "demo").unwrap().id, "w1");
         assert!(resolve_workspace(&snapshot, "missing").is_none());
+    }
+
+    fn native_test_dir() -> PathBuf {
+        static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let base = env::temp_dir().join(format!(
+            "herdr-native-exec-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            sequence,
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn native_test_snapshot(root: &Path) -> Value {
+        json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": root.to_string_lossy()},
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy(),
+            }],
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_default_succeeds_without_a_pane_socket() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = native_test_snapshot(&root);
+        // Point the client at a socket that does not exist: the default native
+        // path must not need the Herdr control plane at all.
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"workspace": "w1", "command": "printf 'native-default-ok\\n'"}),
+        );
+
+        assert_eq!(result["ok"], true, "unexpected result: {result}");
+        assert_eq!(result["backend"], "native");
+        assert_eq!(result["phase"], "completed");
+        assert_eq!(result["exit_code"], 0);
+        assert!(result["session_id"].as_str().is_some());
+        assert_eq!(result["op_id"], result["session_id"]);
+        assert!(result.get("pane_id").is_none());
+        assert!(result.get("created_utility_pane").is_none());
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .contains("native-default-ok")
+        );
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_default_timeout_keeps_the_same_session_and_never_restarts() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"workspace": "w1", "command": "sleep 30", "timeout_ms": 250}),
+        );
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "exec_timeout");
+        assert_eq!(result["backend"], "native");
+        assert_eq!(result["phase"], "running");
+        let session_id = result["session_id"]
+            .as_str()
+            .expect("timeout keeps session_id");
+        assert!(result["hint"].as_str().unwrap().contains("do not re-send"));
+
+        // The timed-out command is still the single tracked session; the
+        // client can resume it instead of starting a second execution.
+        let views = registry.list_views();
+        assert_eq!(views.len(), 1, "unexpected sessions: {views:?}");
+        assert_eq!(views[0]["session_id"], session_id);
+        let read = registry.read(session_id, "both", 0, 65_536);
+        assert_eq!(read["ok"], true);
+        assert_eq!(read["phase"], "running");
+        assert_eq!(registry.kill(session_id)["killed"], true);
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_structured_steps_stop_on_first_non_zero_exit() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({
+                "workspace": "w1",
+                "steps": [
+                    {"program": "printf", "args": ["first-ok"]},
+                    {"program": "/bin/sh", "args": ["-c", "exit 7"]},
+                    {"program": "printf", "args": ["never-runs"]}
+                ]
+            }),
+        );
+
+        assert_eq!(result["ok"], false, "unexpected result: {result}");
+        assert_eq!(result["backend"], "native");
+        assert_eq!(result["exit_code"], 7);
+        let output = result["output"].as_str().unwrap();
+        assert!(
+            output.contains("first-ok"),
+            "missing first step output: {output}"
+        );
+        assert!(
+            !output.contains("never-runs"),
+            "steps must stop on first failure: {output}"
+        );
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
     }
 }

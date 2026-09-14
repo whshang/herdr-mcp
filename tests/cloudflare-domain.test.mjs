@@ -6,7 +6,8 @@ import test from "node:test";
 
 import {
   attach, config, detach, preflight, status, watch,
-  CONTRACT_EPOCH, CONTRACT_HASH, REQUIRED_TOOL_COUNT, RUNTIME_VERSION,
+  CONTRACT_EPOCH, CONTRACT_HASH, PREVIOUS_CONTRACT_EPOCH, PREVIOUS_CONTRACT_HASH,
+  REQUIRED_TOOL_COUNT, RUNTIME_VERSION,
 } from "../bin/herdr-cloudflare-domain";
 
 function json(body, statusCode = 200) {
@@ -67,8 +68,10 @@ function handler({ domains = [], publicHealthy = true, publicToolCount = REQUIRE
         ok: true,
         contractEpoch: 3,
         contractHash: "sha256:public-v3",
-        runtimeContractEpoch: CONTRACT_EPOCH,
-        runtimeContractHash: CONTRACT_HASH,
+        runtimeContractEpoch: PREVIOUS_CONTRACT_EPOCH,
+        runtimeContractHash: PREVIOUS_CONTRACT_HASH,
+        currentRuntimeContractEpoch: CONTRACT_EPOCH,
+        currentRuntimeContractHash: CONTRACT_HASH,
       }) : json({ ok: false }, 503);
       if (u.pathname === "/status/prod-real-runtime") return healthy ? json({ ok: true, online: true, runtimeVersion: RUNTIME_VERSION, contractEpoch: CONTRACT_EPOCH, contractHash: CONTRACT_HASH }) : json({ ok: false }, 503);
       if (u.pathname === "/mcp") return healthy ? json({ jsonrpc: "2.0", id: "domain-probe", result: { tools: [{ name: "herdr_skill" }, ...Array.from({ length: publicToolCount - 1 }, (_, i) => ({ name: `tool_${i}` }))], _meta: { herdr: { contract_hash: "sha256:public-v3" } } } }) : json({ ok: false }, 503);

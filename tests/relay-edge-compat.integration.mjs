@@ -18,6 +18,7 @@ import { EPOCH1_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch1.js";
 import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch4.js";
+import { EPOCH5_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch5.js";
 import { PUBLIC_CONTRACT, resolvePublicContract } from "../edge/cloudflare/dist/contracts/public.js";
 import {
   RUNTIME_EXECUTION_CONTRACT,
@@ -103,9 +104,11 @@ test("tracked Cloudflare epoch-2 catalog stays frozen to the captured 18-tool co
   assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), expected);
 });
 
-test("public epoch 3 evolves independently while runtime execution stays epoch 2", () => {
+test("public epoch 3 evolves independently while runtime execution advances to epoch 3", () => {
   assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 3);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5");
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
   assert.equal(PUBLIC_CONTRACT.contract_epoch, 3);
   assert.equal(PUBLIC_CONTRACT.tool_count, 19);
   assert.equal(PUBLIC_CONTRACT.tools.some((tool) => tool.name === "herdr_devices"), true);
@@ -114,18 +117,20 @@ test("public epoch 3 evolves independently while runtime execution stays epoch 2
   const runtimeInspect = EPOCH2_CONTRACT.tools.find((tool) => tool.name === "herdr_inspect");
   assert.equal(publicInspect.inputSchema.properties.device.type, "string");
   assert.equal(Object.hasOwn(runtimeInspect.inputSchema.properties, "device"), false);
+  // Edge/Relay acceptance window: current runtime contract plus the immediately
+  // previous rollback baseline, and nothing older.
+  assert.equal(isCompatibleRuntimeContract(3, RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH2_CONTRACT.contract_hash), true);
-  assert.equal(isCompatibleRuntimeContract(1, EPOCH1_CONTRACT.contract_hash), true);
+  assert.equal(isCompatibleRuntimeContract(1, EPOCH1_CONTRACT.contract_hash), false);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH1_CONTRACT.contract_hash), false);
-  assert.equal(isCompatibleRuntimeContract(1, EPOCH2_CONTRACT.contract_hash), false);
+  assert.equal(isCompatibleRuntimeContract(3, EPOCH2_CONTRACT.contract_hash), false);
 });
 
-test("public contract resolver enables epoch 4 for explicit first-party dev and prod environments", () => {
-  assert.equal(resolvePublicContract("dev"), EPOCH4_CONTRACT);
-  assert.equal(resolvePublicContract("prod"), EPOCH4_CONTRACT);
+test("public contract resolver enables epoch 5 for explicit first-party dev and prod environments", () => {
+  assert.equal(resolvePublicContract("dev"), EPOCH5_CONTRACT);
+  assert.equal(resolvePublicContract("prod"), EPOCH5_CONTRACT);
   assert.equal(resolvePublicContract(), EPOCH3_CONTRACT);
   assert.equal(resolvePublicContract("unknown"), EPOCH3_CONTRACT);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
 });
 
 test("epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {
@@ -245,4 +250,29 @@ test("epoch 4 annotates only read-only tools and leaves prior hashes unchanged",
   assert.equal(EPOCH3_CONTRACT.contract_hash, "sha256:b8b4e5d13ccb3a1a7ab0c2e9ccfa913c076d0e1cd978cfe544d1261ea2509071");
   assert.equal(computeContractHash(EPOCH3_CONTRACT.tools), EPOCH3_CONTRACT.contract_hash);
   assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), EPOCH2_CONTRACT.contract_hash);
+});
+
+test("public epoch 5 shapes only the herdr_exec description over a frozen epoch 4", () => {
+  assert.equal(EPOCH5_CONTRACT.contract_epoch, 5);
+  assert.equal(EPOCH5_CONTRACT.tool_count, EPOCH4_CONTRACT.tool_count);
+  assert.equal(computeContractHash(EPOCH5_CONTRACT.tools), EPOCH5_CONTRACT.contract_hash);
+  assert.notEqual(EPOCH5_CONTRACT.contract_hash, EPOCH4_CONTRACT.contract_hash);
+  assert.deepEqual(
+    EPOCH5_CONTRACT.tools.map((tool) => tool.name).sort(),
+    EPOCH4_CONTRACT.tools.map((tool) => tool.name).sort(),
+  );
+  const changed = EPOCH5_CONTRACT.tools.filter((tool, index) => {
+    const previous = EPOCH4_CONTRACT.tools[index];
+    return JSON.stringify(tool) !== JSON.stringify(previous);
+  });
+  assert.deepEqual(changed.map((tool) => tool.name), ["herdr_exec"]);
+  const epoch5Exec = EPOCH5_CONTRACT.tools.find((tool) => tool.name === "herdr_exec");
+  const epoch4Exec = EPOCH4_CONTRACT.tools.find((tool) => tool.name === "herdr_exec");
+  assert.notEqual(epoch5Exec.description, epoch4Exec.description);
+  assert.match(epoch5Exec.description, /native session/i);
+  assert.match(epoch5Exec.description, /protected roots.*visible utility pane/i);
+  assert.deepEqual(epoch5Exec.inputSchema, epoch4Exec.inputSchema);
+  // Frozen prior epochs stayed bit-for-bit identical.
+  assert.equal(EPOCH4_CONTRACT.contract_hash, "sha256:0c756a7479ff5d5c70891d7cf5c9810841a1e936327d91aa0770abe67faf83af");
+  assert.equal(computeContractHash(EPOCH4_CONTRACT.tools), EPOCH4_CONTRACT.contract_hash);
 });

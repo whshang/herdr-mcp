@@ -783,7 +783,7 @@ mod tests {
             "active_binary+runtime_generation_manager"
         );
         assert!(runtime.get("self_update").is_none());
-        assert_eq!(runtime["tool_execution"]["contract_epoch"], 2);
+        assert_eq!(runtime["tool_execution"]["contract_epoch"], 3);
         assert_eq!(runtime["tool_execution"]["tool_count"], 18);
         assert_eq!(
             runtime["tool_execution"]["server_concurrent_requests"],

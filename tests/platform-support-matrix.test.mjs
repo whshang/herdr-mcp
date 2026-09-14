@@ -29,8 +29,7 @@ test("published support matrix tracks the live protocol compatibility identities
   const handler = read("edge/cloudflare/src/mcp-handler.ts");
   const epoch1 = read("edge/cloudflare/src/contracts/epoch1.ts");
   const epoch2 = read("edge/cloudflare/src/contracts/epoch2.ts");
-  const epoch3 = read("edge/cloudflare/src/contracts/epoch3.ts");
-  const runtime = read("edge/cloudflare/src/contracts/runtime.ts");
+  const epoch3 = read("edge/cloudflare/src/contracts/epoch3.ts");  const runtime = read("edge/cloudflare/src/contracts/runtime.ts");
   const relay = read("src/relay/protocol.ts");
 
   const versions = protocolVersions(handler);
@@ -47,7 +46,6 @@ test("published support matrix tracks the live protocol compatibility identities
   assert.match(zh, /明确降到 legacy baseline `2025-11-25`/);
 
   const identities = [
-    [epoch1, en, zh],
     [epoch2, en, zh],
     [epoch3, en, zh],
   ];
@@ -59,10 +57,13 @@ test("published support matrix tracks the live protocol compatibility identities
       assert.match(doc, new RegExp(`\\*\\*${count}\\*\\*`));
     }
   }
+  // The frozen epoch-1 catalog still exists but is no longer an accepted runtime baseline.
+  assert.equal(numberField(epoch1, "contract_epoch"), 1);
+  assert.equal(numberField(epoch1, "tool_count"), 17);
 
-  assert.match(runtime, /COMPATIBLE_RUNTIME_CONTRACTS\s*=\s*\[EPOCH2_CONTRACT, EPOCH1_CONTRACT\]/);
-  assert.match(en, /N-1 runtime execution[\s\S]*epoch-1/i);
-  assert.match(zh, /N-1 runtime execution[\s\S]*epoch-1/i);
+  assert.match(runtime, /COMPATIBLE_RUNTIME_CONTRACTS\s*=\s*\[RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT\]/);
+  assert.match(en, /N-1 runtime execution[\s\S]*epoch-2/i);
+  assert.match(zh, /N-1 runtime execution[\s\S]*epoch-2/i);
   assert.match(relay, /protocol_version` is the number `1` on every message/);
   assert.match(en, /protocol_version = 1/);
   assert.match(zh, /protocol_version = 1/);

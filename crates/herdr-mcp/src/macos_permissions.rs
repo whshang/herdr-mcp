@@ -50,18 +50,47 @@ pub(crate) fn is_protected_user_path(path: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-            return false;
+            return true;
         };
-        ["Documents", "Desktop", "Downloads"]
-            .into_iter()
-            .map(|name| home.join(name))
-            .any(|protected| path.starts_with(protected))
+        is_protected_user_path_for_home(path, &home)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = path;
         false
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_protected_user_path_for_home(path: &Path, home: &Path) -> bool {
+    let protected_roots = ["Documents", "Desktop", "Downloads"]
+        .into_iter()
+        .map(|name| home.join(name))
+        .collect::<Vec<_>>();
+
+    if protected_roots
+        .iter()
+        .any(|protected| path.starts_with(protected))
+    {
+        return true;
+    }
+
+    // A lexical path outside the protected folders may still traverse a
+    // symlink whose real target is inside Documents/Desktop/Downloads. Route
+    // by the real path before choosing native execution so the rotating Rust
+    // runtime never accidentally becomes the TCC client. If realpath cannot
+    // be established, fail closed to the protected-path transport; managed
+    // project roots are expected to exist, and a false native classification
+    // is the unsafe outcome here.
+    let resolved_path = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(_) => return true,
+    };
+    protected_roots.iter().any(|protected| {
+        let resolved_protected =
+            std::fs::canonicalize(protected).unwrap_or_else(|_| protected.clone());
+        resolved_path.starts_with(resolved_protected)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -831,6 +860,40 @@ mod tests {
 
         let _ = fs::remove_file(&marker);
         let _ = fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn protected_path_detection_resolves_symlinks_into_documents() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir("protected-symlink");
+        let home = base.join("home");
+        let protected = home.join("Documents").join("project");
+        let ordinary = base.join("ordinary");
+        let alias = base.join("project-link");
+        fs::create_dir_all(&protected).unwrap();
+        fs::create_dir_all(&ordinary).unwrap();
+        symlink(&protected, &alias).unwrap();
+
+        assert!(is_protected_user_path_for_home(&alias, &home));
+        assert!(!is_protected_user_path_for_home(&ordinary, &home));
+
+        let _ = fs::remove_file(&alias);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn protected_path_detection_fails_closed_when_realpath_is_unknown() {
+        let base = temp_dir("protected-realpath-fail-closed");
+        let home = base.join("home");
+        fs::create_dir_all(home.join("Documents")).unwrap();
+
+        assert!(is_protected_user_path_for_home(
+            &base.join("missing-project"),
+            &home
+        ));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

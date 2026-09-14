@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn epoch2_public_contract_hash_is_exact() {
         // Embedded frozen public catalog; the canonical hash must be byte-exact.
-        let catalog = crate::contract::tool_catalog().expect("embedded epoch2 tools");
+        let catalog = crate::contract::epoch2_tool_catalog().expect("embedded epoch2 tools");
         let expected = "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
         assert_eq!(compute_contract_hash(&catalog).unwrap(), expected);
         assert!(verify_contract_hash(expected, &catalog));
@@ -190,5 +190,18 @@ mod tests {
         let mut rev = catalog.clone();
         rev.reverse();
         assert_eq!(compute_contract_hash(&rev).unwrap(), expected);
+    }
+
+    #[test]
+    fn current_runtime_exec_contract_hash_is_pinned() {
+        let catalog = crate::contract::tool_catalog().expect("embedded current runtime tools");
+        let identity = crate::contract::identity().expect("current runtime identity");
+        assert_eq!(identity.epoch, 3);
+        assert_eq!(compute_contract_hash(&catalog).unwrap(), identity.hash);
+        assert!(verify_contract_hash(&identity.hash, &catalog));
+        assert_eq!(
+            identity.hash,
+            "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"
+        );
     }
 }

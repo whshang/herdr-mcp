@@ -212,8 +212,10 @@ Deno.test("verifyUpstreamHealth requires status 200 and verified service name", 
     new Response(
       JSON.stringify({
         service: "herdr-edge-prod",
-        runtimeContractEpoch: EXPECTED_RUNTIME_CONTRACT_EPOCH,
-        runtimeContractHash: EXPECTED_RUNTIME_CONTRACT_HASH,
+        runtimeContractEpoch: 2,
+        runtimeContractHash: "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
+        currentRuntimeContractEpoch: EXPECTED_RUNTIME_CONTRACT_EPOCH,
+        currentRuntimeContractHash: EXPECTED_RUNTIME_CONTRACT_HASH,
       }),
       { status: 200 },
     );
@@ -434,9 +436,9 @@ Deno.test("relay socket lifetime hook resolves on error", async () => {
   await held;
 });
 
-Deno.test("relay expected runtime contract matches authoritative contracts/epoch2.json", async () => {
+Deno.test("relay expected runtime contract matches authoritative contracts/runtime-exec-v3.json", async () => {
   const text = await Deno.readTextFile(
-    new URL("../../contracts/epoch2.json", import.meta.url),
+    new URL("../../contracts/runtime-exec-v3.json", import.meta.url),
   );
   const fixture = JSON.parse(text);
   assertEquals(EXPECTED_RUNTIME_CONTRACT_EPOCH, fixture.contract_epoch);
