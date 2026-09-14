@@ -208,11 +208,28 @@ test("epoch 4 annotates only read-only tools and leaves prior hashes unchanged",
   assert.equal(epoch4Exec.inputSchema.oneOf.length, 2);
   assert.equal(epoch4Exec.inputSchema.properties.steps.maxItems, 16);
   assert.equal(epoch4Exec.inputSchema.properties.steps.items.properties.args.maxItems, 128);
-  assert.deepEqual(epoch4ExecStart.inputSchema.required, ["root", "command"]);
+  assert.deepEqual(epoch4ExecStart.inputSchema.required, ["root"]);
   assert.equal("workspace" in epoch4ExecStart.inputSchema.properties, false);
   assert.equal("project_root" in epoch4ExecStart.inputSchema.properties, false);
-  assert.match(epoch4ExecStart.description, /Pass root directly.*does not take workspace or project_root/i);
+  assert.equal("steps" in epoch4ExecStart.inputSchema.properties, false);
+  assert.ok(epoch4ExecStart.inputSchema.properties.program);
+  assert.ok(epoch4ExecStart.inputSchema.properties.args);
+  assert.equal(epoch4ExecStart.inputSchema.properties.args.maxItems, 128);
+  assert.deepEqual(epoch4ExecStart.inputSchema.oneOf, [
+    {
+      required: ["command"],
+      not: { anyOf: [{ required: ["program"] }, { required: ["args"] }] },
+    },
+    { required: ["program"], not: { required: ["command"] } },
+  ]);
+  assert.match(
+    epoch4ExecStart.description,
+    /does not take workspace or project_root.*does not take steps.*Prefer program \+ args.*Use legacy command only when shell semantics/is,
+  );
   assert.match(epoch4ExecStart.inputSchema.properties.root.description, /takes root directly.*workspace or project_root/i);
+  assert.match(epoch4ExecStart.inputSchema.properties.command.description, /shell command.*shell syntax.*program \+ args/is);
+  assert.match(epoch4ExecStart.inputSchema.properties.program.description, /Executable name or path.*args/is);
+  assert.match(epoch4ExecStart.inputSchema.properties.args.description, /Defaults to \[\].*no shell expansion/is);
 
   // Apart from the deliberate execution descriptions and herdr_exec's
   // structured schema, epoch 4 only adds annotations to the frozen epoch-3 catalog.

@@ -490,12 +490,41 @@ impl ExecRegistry {
     }
 
     pub(crate) fn start_native(&self, cwd: &Path, command: &str) -> Result<Value, String> {
-        self.prune();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
         }
+        self.start_native_process(cwd, command, |id| shell_command(command, id))
+    }
+
+    pub(crate) fn start_native_program(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+    ) -> Result<Value, String> {
+        if program.is_empty() {
+            return Err("program must not be empty".to_owned());
+        }
+        let rendered = render_exec_argv(program, args);
+        self.start_native_process(cwd, &rendered, |_| {
+            let mut process = Command::new(program);
+            process.args(args);
+            process
+        })
+    }
+
+    fn start_native_process<F>(
+        &self,
+        cwd: &Path,
+        command: &str,
+        build_process: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce(&str) -> Command,
+    {
+        self.prune();
         let id = new_session_id();
-        let mut process = shell_command(command, &id);
+        let mut process = build_process(&id);
         process
             .current_dir(cwd)
             .env("HERDR_MCP_EXEC_ID", &id)
@@ -1170,6 +1199,14 @@ fn pane_script_path(id: &str) -> PathBuf {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub(crate) fn render_exec_argv(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn pane_spool_paths(id: &str) -> PaneSpoolPaths {
@@ -1965,6 +2002,30 @@ mod tests {
         assert!(text.contains("out"));
         assert!(text.contains("err"));
         assert!(view.get("compacted").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_program_mode_passes_literal_argv_without_shell_expansion() {
+        let registry = registry();
+        let args = vec!["%s\\n".to_owned(), "$HOME;$(uname)* literal".to_owned()];
+        let started = registry
+            .start_native_program(Path::new("/tmp"), "/usr/bin/printf", &args)
+            .unwrap();
+        assert_eq!(
+            started["command"],
+            "'/usr/bin/printf' '%s\\n' '$HOME;$(uname)* literal'"
+        );
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait_until_closed(&registry, &id, "stdout", 65536);
+        assert_eq!(view["exit_code"], 0);
+        assert_eq!(view["text"], "$HOME;$(uname)* literal\n");
+        let listed = registry
+            .list_views()
+            .into_iter()
+            .find(|entry| entry["session_id"] == id)
+            .unwrap();
+        assert_eq!(listed["command"], started["command"]);
     }
 
     #[test]

@@ -70,12 +70,14 @@ function withExecutionGuidance(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
   if (tool.name === "herdr_exec_start") {
     const inputSchema = tool.inputSchema as typeof tool.inputSchema & {
       properties: Record<string, unknown>;
+      required?: readonly string[];
     };
     const root = inputSchema.properties.root as Record<string, unknown>;
+    const command = inputSchema.properties.command as Record<string, unknown>;
     return {
       ...tool,
       description:
-        "Start one long-running shell command in a managed project root as a background session (local process, not the herdr utility pane). Pass root directly as the managed git project cwd; unlike herdr_exec, herdr_exec_start does not take workspace or project_root. Returns session_id. Then poll with herdr_exec_read and finish with herdr_exec_kill. For short commands prefer herdr_exec.",
+        "Start one long-running process in a managed project root as a background session. Pass root directly as the managed git project cwd; unlike herdr_exec, herdr_exec_start does not take workspace or project_root and does not take steps. Prefer program + args for an ordinary executable with literal argv. Use legacy command only when shell semantics such as pipes, redirects, variable expansion, or command substitution are required. Exactly one mode is accepted: command, or program with optional args (default []). Returns session_id. Then poll with herdr_exec_read and finish with herdr_exec_kill. For short commands prefer herdr_exec.",
       inputSchema: {
         ...inputSchema,
         properties: {
@@ -85,7 +87,33 @@ function withExecutionGuidance(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
             description:
               "Managed git project root used as cwd. herdr_exec_start takes root directly; do not pass herdr_exec's workspace or project_root fields.",
           },
+          command: {
+            ...command,
+            description:
+              "Legacy freeform shell command. Use only when shell syntax is required; otherwise prefer program + args.",
+          },
+          program: {
+            type: "string",
+            minLength: 1,
+            description:
+              "Executable name or path for the single long-running process. Prefer this with args when shell syntax is not required.",
+          },
+          args: {
+            type: "array",
+            maxItems: 128,
+            items: { type: "string" },
+            description:
+              "Optional literal argv entries passed to program. Defaults to []; no shell expansion or interpretation is applied.",
+          },
         },
+        required: ["root"],
+        oneOf: [
+          {
+            required: ["command"],
+            not: { anyOf: [{ required: ["program"] }, { required: ["args"] }] },
+          },
+          { required: ["program"], not: { required: ["command"] } },
+        ],
       },
     } as unknown as (typeof EPOCH3_CONTRACT.tools)[number];
   }
@@ -167,7 +195,7 @@ function withReadOnlyHint(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
 /** Epoch 3's catalog with `readOnlyHint: true` only on genuinely read-only tools. */
 export const EPOCH4_CONTRACT = {
   contract_epoch: 4,
-  contract_hash: "sha256:16edce86e7096410e21603d4cd1d90186490b9e8c685511521f07d3e91eca7c9",
+  contract_hash: "sha256:0c756a7479ff5d5c70891d7cf5c9810841a1e936327d91aa0770abe67faf83af",
   tool_count: 19,
   tools: EPOCH3_CONTRACT.tools.map((tool) => {
     const shaped = withExecutionGuidance(tool);
