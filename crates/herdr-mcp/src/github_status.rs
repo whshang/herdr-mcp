@@ -870,10 +870,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn single_page_pr_status_uses_exactly_two_gh_commands() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = temp_repo();
-        let gh = root.join("fake-gh");
+        let gh = PathBuf::from("/bin/sh");
+        let script_path = root.join("api");
         let script = r#"#!/bin/sh
 +LOG="$(dirname "$0")/gh-calls.log"
 +printf 'call\n' >> "$LOG"
@@ -886,10 +885,7 @@ mod tests {
 +  exit 99
 +fi
 +"#;
-        fs::write(&gh, script.replace("\n+", "\n")).unwrap();
-        let mut permissions = fs::metadata(&gh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&gh, permissions).unwrap();
+        fs::write(&script_path, script.replace("\n+", "\n")).unwrap();
 
         let (repo, pr, pr_id) = fetch_pr_metadata(&gh, &root, "o/r", 401).unwrap();
         let (all, required) = fetch_pr_checks(&gh, &root, &pr_id, &pr).unwrap();
