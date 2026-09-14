@@ -828,6 +828,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
     const webchatControlGrants = devAuth.webchatControlGrants ?? [];
     const pageAssistGrants = devAuth.pageAssistGrants ?? [];
     const dev = await handleMcp(parsed.value, workstationId, {
+      edgeEnv: env.EDGE_ENV,
       limits,
       client: {
         userAgent: request.headers.get("user-agent"),

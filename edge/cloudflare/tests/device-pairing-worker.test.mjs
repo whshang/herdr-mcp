@@ -157,6 +157,24 @@ async function pair(env, name) {
   return consume.json();
 }
 
+test("health and info expose the same dev-only public contract identity", async () => {
+  for (const [edgeEnv, expectedEpoch] of [
+    ["dev", 4],
+    ["prod", 3],
+    [undefined, 3],
+    ["unknown", 3],
+  ]) {
+    const h = makeEnv(edgeEnv === undefined ? {} : { EDGE_ENV: edgeEnv });
+    const health = await (await worker.fetch(get("/health"), h.env)).json();
+    const info = await (await worker.fetch(get("/info"), h.env)).json();
+    assert.equal(health.contractEpoch, expectedEpoch);
+    assert.equal(info.publicContract.epoch, expectedEpoch);
+    assert.equal(health.contractHash, info.publicContract.hash);
+    assert.equal(health.runtimeContractEpoch, 2);
+    assert.equal(info.runtimeContract.epoch, 2);
+  }
+});
+
 test("legacy public-PEM JWT keeps ordinary compatibility until its client grant is revoked", async () => {
   const h = makeEnv({ OAUTH_ISSUER: "https://edge.example" });
   const oauthStorage = new FakeStorage();

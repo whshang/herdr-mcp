@@ -18,7 +18,7 @@ import { EPOCH1_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch1.js";
 import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch4.js";
-import { PUBLIC_CONTRACT } from "../edge/cloudflare/dist/contracts/public.js";
+import { PUBLIC_CONTRACT, resolvePublicContract } from "../edge/cloudflare/dist/contracts/public.js";
 import {
   RUNTIME_EXECUTION_CONTRACT,
   isCompatibleRuntimeContract,
@@ -120,7 +120,15 @@ test("public epoch 3 evolves independently while runtime execution stays epoch 2
   assert.equal(isCompatibleRuntimeContract(1, EPOCH2_CONTRACT.contract_hash), false);
 });
 
-test("future epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {
+test("public contract resolver enables epoch 4 only for the explicit dev environment", () => {
+  assert.equal(resolvePublicContract("dev"), EPOCH4_CONTRACT);
+  assert.equal(resolvePublicContract("prod"), EPOCH3_CONTRACT);
+  assert.equal(resolvePublicContract(), EPOCH3_CONTRACT);
+  assert.equal(resolvePublicContract("unknown"), EPOCH3_CONTRACT);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
+});
+
+test("development epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {
   const readOnly = [
     "herdr_methods",
     "herdr_inspect",
@@ -144,7 +152,7 @@ test("future epoch 4 annotates only read-only tools and leaves prior hashes unch
     "herdr_exec",
     "herdr_prompt",
   ];
-  // Epoch 4 is not yet active: the public surface still resolves to epoch 3.
+  // The production-default public surface stays on epoch 3.
   assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
   assert.equal(EPOCH4_CONTRACT.contract_epoch, 4);
   assert.equal(EPOCH4_CONTRACT.tool_count, EPOCH3_CONTRACT.tool_count);

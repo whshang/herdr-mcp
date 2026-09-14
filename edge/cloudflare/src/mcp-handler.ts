@@ -1,6 +1,6 @@
 /** Stateless MCP/JSON-RPC handler used by both development and production Edge. */
 
-import { PUBLIC_CONTRACT } from "./contracts/public.js";
+import { PUBLIC_CONTRACT, resolvePublicContract } from "./contracts/public.js";
 import { RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 import { MCP_SERVER_VERSION } from "./version.js";
 import { relayErrorRequiresHuman, type RelayErrorResult } from "./errors.js";
@@ -85,6 +85,7 @@ export interface McpClientContext {
 }
 
 export interface McpDeps {
+  edgeEnv?: string;
   limits: EdgeLimits;
   forward(stub: unknown, body: string): Promise<Response>;
   getStub(workstationId: string): unknown;
@@ -388,15 +389,16 @@ function forwardEnvelopeError(forwarded: ForwardEnvelope): RelayErrorResult | un
   return undefined;
 }
 
-export function publicContractTools(): readonly unknown[] {
-  return PUBLIC_CONTRACT.tools;
+export function publicContractTools(edgeEnv?: string): readonly unknown[] {
+  return resolvePublicContract(edgeEnv).tools;
 }
 
-export function publicContractIdentity(): Record<string, unknown> {
+export function publicContractIdentity(edgeEnv?: string): Record<string, unknown> {
+  const publicContract = resolvePublicContract(edgeEnv);
   return {
-    contract_epoch: PUBLIC_CONTRACT.contract_epoch,
-    contract_hash: PUBLIC_CONTRACT.contract_hash,
-    tool_count: PUBLIC_CONTRACT.tool_count,
+    contract_epoch: publicContract.contract_epoch,
+    contract_hash: publicContract.contract_hash,
+    tool_count: publicContract.tool_count,
   };
 }
 
@@ -424,6 +426,7 @@ export async function handleMcp(
   workstationId: string,
   deps: McpDeps,
 ): Promise<McpResponse> {
+  const publicContract = resolvePublicContract(deps.edgeEnv);
   if (!isRecord(input)) return rpcError(null, -32600, "Invalid Request");
 
   const request = input as McpRequest;
@@ -445,8 +448,8 @@ export async function handleMcp(
       protocolVersion: negotiateProtocolVersion(params.protocolVersion),
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
-      instructions: `Herdr Edge public contract epoch ${PUBLIC_CONTRACT.contract_epoch}; workstation execution uses a separate authenticated runtime contract.`,
-      _meta: { herdr: publicContractIdentity() },
+      instructions: `Herdr Edge public contract epoch ${publicContract.contract_epoch}; workstation execution uses a separate authenticated runtime contract.`,
+      _meta: { herdr: publicContractIdentity(deps.edgeEnv) },
     });
   }
 
@@ -455,7 +458,7 @@ export async function handleMcp(
       resultType: "complete",
       supportedVersions: discoverSupportedVersions(deps.client),
       capabilities: { tools: { listChanged: false } },
-      instructions: `Herdr Edge public MCP contract epoch ${PUBLIC_CONTRACT.contract_epoch}.`,
+      instructions: `Herdr Edge public MCP contract epoch ${publicContract.contract_epoch}.`,
       ttlMs: 3_600_000,
       cacheScope: "private",
       _meta: {
@@ -463,7 +466,7 @@ export async function handleMcp(
           name: MCP_SERVER_NAME,
           version: MCP_SERVER_VERSION,
         },
-        herdr: publicContractIdentity(),
+        herdr: publicContractIdentity(deps.edgeEnv),
       },
     });
   }
@@ -473,8 +476,8 @@ export async function handleMcp(
       return rpcError(id, -32602, "Invalid params");
     }
     return rpcResult(id, {
-      tools: PUBLIC_CONTRACT.tools,
-      _meta: { herdr: publicContractIdentity() },
+      tools: publicContract.tools,
+      _meta: { herdr: publicContractIdentity(deps.edgeEnv) },
     });
   }
 
@@ -482,7 +485,7 @@ export async function handleMcp(
     if (!isRecord(request.params)) return rpcError(id, -32602, "Invalid params");
     const name = request.params.name;
     if (typeof name !== "string" || !PUBLIC_TOOL_NAMES.has(name)) {
-      return rpcError(id, -32602, "Invalid params", { reason: `tool is not in public contract epoch ${PUBLIC_CONTRACT.contract_epoch}` });
+      return rpcError(id, -32602, "Invalid params", { reason: `tool is not in public contract epoch ${publicContract.contract_epoch}` });
     }
     const rawArgs = request.params.arguments;
     if (rawArgs !== undefined && rawArgs !== null && !isRecord(rawArgs)) {
