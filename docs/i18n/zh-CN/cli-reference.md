@@ -52,9 +52,9 @@ herdr-mcp dev sync
 herdr-mcp dev rollback
 ```
 
-- `dev status` 只读，显示 runtime channel、active/dev/prod generation、source repo/branch/commit/dirty provenance、`runtime/current` 是否与记录一致，以及固定 PROD 快照是否通过校验。
+- `dev status` 只读，显示 runtime channel、active/dev/prod generation、source repo/branch/commit/dirty provenance、`runtime/current` 是否与记录一致、固定 PROD 快照是否通过校验，以及最近一次真实 `dev sync` 的 `last_transaction`。该持久记录包含 transaction ID、phase、目标源码、expected/final generation、终态错误和可用的 activation evidence，因此 runtime 自重启后调用方可以直接确认上一笔结果，而不是重放 sync。
 - `dev sync --dry-run` 只展示计划，不构建、不切换 runtime。
-- `dev sync` 默认要求 clean source checkout，把源码构建成例如 `<version>-dev` 的 DEV identity；进入 DEV 前先把现有 PROD binary 与 SHA-256 evidence 固定保存在 `~/.config/herdr-mcp/runtime/channels/prod/`，再复用正式 transactional service install。只有 server、Native Host、`dev.herdr-mcp.link-prod` 都 reconcile 到同一个 managed generation，激活才算成功。
+- `dev sync` 默认要求 clean source checkout，把源码构建成例如 `<version>-dev` 的 DEV identity；进入 DEV 前先把现有 PROD binary 与 SHA-256 evidence 固定保存在 `~/.config/herdr-mcp/runtime/channels/prod/`，并在可能耗时较长的 build 之前把 transaction 写入现有 channel state，再复用正式 transactional service install。只有 server、Native Host、`dev.herdr-mcp.link-prod` 都 reconcile 到同一个 managed generation，transaction 才记录为 `succeeded`。
 - `dev sync --allow-dirty` 是给明确的本地实验使用的 provenance override，不应作为日常默认值。
 - `dev rollback` 校验并重新安装固定 PROD binary。连续多次 DEV sync 保留最初固定的 PROD 恢复源，不会把“上一个 DEV generation”当作新的 PROD。
 

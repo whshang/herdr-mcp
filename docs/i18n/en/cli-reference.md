@@ -51,9 +51,9 @@ herdr-mcp dev sync
 herdr-mcp dev rollback
 ```
 
-- `dev status` is read-only. It reports current runtime channel, active/dev/prod generations, source repo/branch/commit/dirty provenance, whether `runtime/current` matches recorded state, and whether the pinned PROD snapshot validates.
+- `dev status` is read-only. It reports current runtime channel, active/dev/prod generations, source repo/branch/commit/dirty provenance, whether `runtime/current` matches recorded state, whether the pinned PROD snapshot validates, and `last_transaction` for the latest real `dev sync`. That durable record includes its transaction ID, phase, target source, expected/final generation, terminal error, and activation evidence when available, so callers can resolve the outcome after a self-restart without replaying the sync.
 - `dev sync --dry-run` shows the intended transaction without building or switching runtime state.
-- `dev sync` requires a clean source checkout by default, builds a DEV identity such as `<version>-dev`, pins the pre-existing PROD binary and SHA-256 evidence under `~/.config/herdr-mcp/runtime/channels/prod/`, then reuses the normal transactional service install path. Server, Native Host and `dev.herdr-mcp.link-prod` must reconcile to the same managed generation before activation is accepted.
+- `dev sync` requires a clean source checkout by default, builds a DEV identity such as `<version>-dev`, pins the pre-existing PROD binary and SHA-256 evidence under `~/.config/herdr-mcp/runtime/channels/prod/`, and persists its transaction in the existing channel state before the potentially long build. It then reuses the normal transactional service install path. Server, Native Host and `dev.herdr-mcp.link-prod` must reconcile to the same managed generation before the transaction is recorded as `succeeded`.
 - `dev sync --allow-dirty` is an explicit provenance override for deliberate local experiments. Do not make it the default.
 - `dev rollback` verifies and reinstalls the pinned PROD binary. Repeated DEV syncs preserve that fixed PROD recovery source rather than treating the previous DEV generation as PROD.
 
