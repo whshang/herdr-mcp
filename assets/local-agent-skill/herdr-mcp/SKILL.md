@@ -25,6 +25,8 @@ Discover the capability first, then act:
 3. `herdr-mcp webchat inspect REF` — exact identity, consent, and observation generation.
 4. Follow `references/webchat-control.md` for the workflow, mutation safety, and the current support boundary.
 
+Handing the current task to a Web AI (continuation/handoff) has one canonical path: `herdr-mcp webchat handoff --continuity-id HC --source-url URL`. It reuses the canonical handoff preparation, keeps `automatic_delivery` and the manual Copy Prompt byte-identical, requires the target conversation to resume the same `continuity_id`, and never creates a second continuity chain. If it reports `automatic_delivery.completed=false`, nothing was created — hand the user `manual_delivery.copy_prompt` instead of re-running with a new `--idempotency-key`.
+
 Keep historical read levels explicit: `continuity search` discovers bounded candidates, `continuity resume` reads the selected authoritative journal, and `memory resume/search` reads one exact Work Memory partition. State which level you actually reached; never describe a search candidate summary as a resumed journal.
 
 Do not search history for an independent task merely because history exists. After any historical resume/search, re-check current Git/files/runtime before mutating anything.

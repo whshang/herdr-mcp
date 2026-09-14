@@ -142,6 +142,7 @@ Herdr を迂回して Playwright、AppleScript、DOM 注入で ChatGPT を操作
 ```bash
 herdr-mcp webchat endpoints
 herdr-mcp webchat resources --kind session
+herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.com/g/g-p-.../c/...'
 ```
 
 [ローカル Agent による WebChat 操作](docs/i18n/ja/local-agent-webchat-control.md) · [Browser continuity](docs/i18n/en/browser-continuity.md) · [Browser extension](docs/i18n/en/extension.md)

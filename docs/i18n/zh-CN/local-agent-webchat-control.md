@@ -142,7 +142,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `browser_composer.set_reasoning` / `set_apps` | — | 不支持 |
 | `browser_space.create` / `browser_space.open` | — | 不支持 |
 | 带 `reasoning_effort` 或 `required_apps` 的 `dispatch.submit` | — | 不支持（普通调用支持） |
-| `herdr_mcp.browser_handoff.prepare` | — | 支持的只读私有方法，无 CLI 包装 |
+| `herdr_mcp.browser_handoff.prepare` | `herdr-mcp webchat handoff` | 支持（canonical packet，可选自动投递） |
 
 能力缺失时如实报告，不要悄悄改用另一套自动化栈。
 
@@ -239,13 +239,42 @@ continuity_id（持久任务状态）
 - 若 host 在 Herdr 尚无执行证据时拒绝投递，最多用**相同**参数与相同 idempotency key 重试一次，随后直接展示已准备好的 Copy Prompt。
 - delivery 不确定时，在 reconciliation 证明首次投递未生效之前不会开放 Copy Prompt 路径，因此不会凭猜测创建出第二个会话。
 
-**当前暴露边界**：`herdr_mcp.browser_handoff.prepare` 与基于 `source_url` 的 `browser_session.create` 路由都是私有方法。**没有** `herdr-mcp webchat handoff` 子命令，`herdr-mcp webchat create` 也不接受 `source_url`。当前调用方是 Web planner 路径与扩展 HUD（handoff / Copy Prompt）。
+**正式入口**：
 
-对只有 CLI 的本地 Agent，这意味着：
+```bash
+herdr-mcp webchat handoff \
+  --continuity-id hc:... \
+  --source-url 'https://chatgpt.com/g/g-p-.../c/...' \
+  [--objective TEXT] [--work-chain-id ID] [--handoff-id ID] \
+  [--idempotency-key KEY] [--prepare-only]
+```
 
-- 可用的本地表面是 `herdr-mcp continuity ...` 加 `herdr-mcp webchat create/send/dispatch-status/archive`；
-- 如果新会话要继续同一个任务，请把消息写成**第一步调用 `continuity.resume <continuity_id>`**，复用已有链，并在该链已有 work chain 时传 `--work-chain-id`；
-- 不要声称本地拼出的消息是 canonical handoff packet，也不要为了让说法更顺而另建一条平行的 continuity 链。
+`webchat handoff` 是上面那套 canonical 实现的本地薄包装，不是第二套 handoff 实现：
+
+- 它向 runtime 索取 canonical packet（`herdr_mcp.browser_handoff.prepare`），与 Web planner、扩展 HUD 用的是同一条路径；
+- 然后把该 packet 自己的 `automatic_delivery.params` **原样**交给基于 source 的 `browser_session.create`：CLI 绝不拼接、改写或重新编码消息；
+- `--source-url` 既是审计锚点也是唯一的路由输入：runtime 从已注册会话解析出现有 WebChat 路由（endpoint / account / Project），命令行上不需要传任何 routing id；
+- `--objective` / `--work-chain-id` / `--handoff-id` 映射到同一组 `prepare` 入参；`--handoff-id` 还让 packet 拥有稳定身份。
+
+输出是 canonical packet 加投递证据：
+
+| 字段 | 含义 |
+| --- | --- |
+| `handoff` | canonical packet（continuity_id、source_url、message、work_chain_id、target_context） |
+| `automatic_delivery.params` | canonical 创建参数，与 packet 逐字节一致 |
+| `automatic_delivery.attempted` / `completed` | 是否发起投递，以及是否到达 `applied` |
+| `automatic_delivery.delivery_state` / `reason` / `replayed` | runtime 自己的 delivery 词表与 replay 标记 |
+| `automatic_delivery.session_ref` / `dispatch_id` / `result` | 创建出的会话与其 dispatch 证据 |
+| `manual_delivery.copy_prompt` | 同一条 canonical 消息，用于手动继续 |
+| `instruction` | 用自然语言说明实际发生了什么 |
+
+Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-key` 时，CLI 复用 canonical `handoff_id`，因此“原样重跑同一条命令”就是同一次 logical handoff——这正是 canonical 的“用同一 key 最多重试一次”规则。重试绝不要换新 key，也不要期待 CLI 替你重试 uncertain 投递。
+
+`--prepare-only` 跳过投递，只返回 packet（`automatic_delivery.attempted=false`、`reason="prepare_only"`）。
+
+**准备完成不等于已投递。** 当源会话当前未注册、或 browser control 不可用时，packet 与 `manual_delivery.copy_prompt` 仍会返回，同时 `automatic_delivery.attempted=false` 并带上 runtime 的原因。这是可用于手工接力的结果，**不是**已完成的 handoff：只有 `automatic_delivery.completed=true`（即 `delivery_state=applied`）才代表真的新建了会话。`uncertain` 状态会如实返回，绝不会自动重试。
+
+**仍然成立**：`herdr-mcp webchat create` 不接受 `source_url`。基于 source 的投递只留在这条 handoff 路径里，普通 create 接口依旧要求显式 routing id。
 
 ## 7. 本地 Agent 示例
 
@@ -258,10 +287,9 @@ Agent 应按这个顺序做：
 1. **能力发现** —— `herdr-mcp webchat endpoints`、`herdr-mcp webchat resources --kind space`、`herdr-mcp webchat inspect SPACE_REF`。确认 `consent.webchat_control` 为真并记录 `observation_generation`。
 2. **解析身份** —— 从返回资源里挑出确切的 `endpoint_ref` / `account_ref` / `space_ref`。不要猜，也不要复用来自其它机器或其它 Project 的 ref。
 3. **解析持久状态** —— `herdr-mcp continuity resume hc:...`（先做有界的 `herdr-mcp continuity search ... --project-path <checkout>` 也可以，但必须遵守 `confirmation_required`）。这是任务持久状态的唯一来源。
-4. **准备接力** —— 如果 canonical prepare 对你可用（Web planner 路径），原样使用它的 `automatic_delivery.params`。如果只有 CLI，则把 `continuity.resume <continuity_id>` 写成消息的第一步，并传入已有的 `--work-chain-id`。
-5. **创建 / dispatch** —— `herdr-mcp webchat create ...`，使用唯一且稳定的 idempotency key。永远不要换新 key 重试。
-6. **验证交付** —— 检查返回的 `delivery_state`；用 `herdr-mcp webchat dispatch-status DISPATCH_ID` 获取 settlement 证据，而不是把“没有报错”当成成功。
-7. **汇报** —— 返回精确的 `session_ref`、交付状态，以及要求目标做什么。明确说明 `continuity.resume` 在目标侧执行，并且你没有创建第二条链。
+4. **执行 canonical handoff** —— `herdr-mcp webchat handoff --continuity-id hc:... --source-url '<确切会话 URL>'`（该链已有 work chain 时加 `--work-chain-id`）。它一步完成 canonical 准备与自动投递；`--prepare-only` 只返回 packet。
+5. **验证交付** —— 读 `automatic_delivery.completed` / `delivery_state`。若 `completed=false`，说明什么都没创建：改用 `manual_delivery.copy_prompt`，已有 dispatch 时可用 `herdr-mcp webchat dispatch-status <dispatch_id>`。绝不要换新 `--idempotency-key` 重试。
+6. **汇报** —— 返回精确的 `session_ref`、交付状态，以及要求目标做什么。明确说明 `continuity.resume` 在目标侧执行，且“只准备好”不等于已完成 handoff。
 
 永远不要把真实账号 id、token 或生产密钥写进计划、消息或汇报。CLI 返回的 ref 是不透明标识，可以传回 CLI 并向用户报告，但它们不是凭据。
 
@@ -319,8 +347,8 @@ Agent 应按这个顺序做：
 这一节刻意写清楚，避免有人针对尚不存在的能力写文档或做开发：
 
 - **不支持的浏览器操作**（runtime 返回 `code: "unsupported"`）：`browser_space.create`、`browser_space.open`、`browser_message.append`、`browser_composer.set_reasoning`、`browser_composer.set_apps`，以及带 `reasoning_effort` 或 `required_apps` 的 `browser_dispatch.submit`。
-- **支持但当前没有 CLI 包装**：`browser_session.open`、`browser_dispatch.stop`、`browser_handoff.prepare`、`browser_endpoint.inspect`、`browser_space.inspect`。它们可通过 runtime MCP 私有方法边界调用，本地 CLI 没有对应子命令。
-- **Handoff**：canonical 准备路径是 Web planner 与扩展 HUD 使用的私有 `herdr_mcp.browser_handoff.prepare`。没有 `herdr-mcp webchat handoff` CLI，CLI 的 `create` 也不能传 `source_url`。
+- **支持但当前没有 CLI 包装**：`browser_session.open`、`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。它们可通过 runtime MCP 私有方法边界调用，本地 CLI 没有对应子命令。
+- **Handoff**：canonical 准备路径是 `herdr_mcp.browser_handoff.prepare`，本地 Agent 通过 `herdr-mcp webchat handoff` 使用它（复用它并接着做基于 source 的投递）。Web planner 与扩展 HUD 仍直接调用该私有方法。`webchat create` 仍不接受 `source_url`，也没有对应的 handoff 参数。
 - **`ego-browser`** 是开发/UAT 基础设施，既不是用户依赖，也不是这条 control plane 的替代品。
 - **完全没有暴露**：读取用户 ChatGPT 私有历史正文、经 dispatch 契约发送附件、任意 DOM 访问，以及 registry 未报告的任何 provider。
 

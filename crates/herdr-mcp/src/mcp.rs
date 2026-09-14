@@ -2762,38 +2762,65 @@ fn browser_session_create_params_from_source(
     let idempotency_key = browser_required_idempotency_key(params)?;
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
-    let session_ref = match store.browser_session_ref_for_canonical_url(source_url) {
-        Ok(Some(value)) => value,
-        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_session_not_found"})),
-        Err(error) => return Err(browser_store_error(error)),
-    };
-    let session = match store.browser_resource(&session_ref) {
-        Ok(Some(value)) => value,
-        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_session_not_found"})),
-        Err(error) => return Err(browser_store_error(error)),
-    };
+    let route = browser_source_route(store, source_url).map_err(browser_store_error)?;
+    Ok(Some(json!({
+        "endpoint_ref": route.endpoint_ref,
+        "provider": route.provider,
+        "account_ref": route.account_ref,
+        "space_ref": route.space_ref,
+        "display_label": route.display_label,
+        "message": message,
+        "expected_generation": route.expected_generation,
+        "idempotency_key": idempotency_key,
+        "work_chain_id": work_chain_id,
+        "lane_id": lane_id,
+    })))
+}
+
+/// The registered ChatGPT conversation that an exact canonical source URL resolves to,
+/// together with the browser create scope derived from it.
+///
+/// The source-anchored `browser_session.create` normalization and the read-only canonical
+/// handoff preparation both use this one resolution so a source URL can never produce two
+/// different routes.
+struct BrowserSourceRoute {
+    session_ref: String,
+    provider: String,
+    endpoint_ref: String,
+    account_ref: String,
+    space_ref: Option<String>,
+    display_label: String,
+    expected_generation: i64,
+}
+
+fn browser_source_route(
+    store: &StateStore,
+    source_url: &str,
+) -> Result<BrowserSourceRoute, String> {
+    let session_ref = store
+        .browser_session_ref_for_canonical_url(source_url)?
+        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+    let session = store
+        .browser_resource(&session_ref)?
+        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
     let Some(parent_ref) = session.parent_ref.as_deref() else {
-        return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+        return Err("browser_source_scope_missing".to_owned());
     };
-    let parent = match store.browser_resource(parent_ref) {
-        Ok(Some(value)) => value,
-        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_scope_missing"})),
-        Err(error) => return Err(browser_store_error(error)),
-    };
+    let parent = store
+        .browser_resource(parent_ref)?
+        .ok_or_else(|| "browser_source_scope_missing".to_owned())?;
     let (space_ref, account) = if parent.kind == "space" {
         let Some(account_ref) = parent.parent_ref.as_deref() else {
-            return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+            return Err("browser_source_scope_missing".to_owned());
         };
-        let account = match store.browser_resource(account_ref) {
-            Ok(Some(value)) => value,
-            Ok(None) => return Err(json!({"ok": false, "code": "browser_source_scope_missing"})),
-            Err(error) => return Err(browser_store_error(error)),
-        };
-        (Some(parent.resource_ref.as_str()), account)
+        let account = store
+            .browser_resource(account_ref)?
+            .ok_or_else(|| "browser_source_scope_missing".to_owned())?;
+        (Some(parent.resource_ref.clone()), account)
     } else if parent.kind == "account" {
         (None, parent.clone())
     } else {
-        return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+        return Err("browser_source_scope_missing".to_owned());
     };
     if session.provider != "chatgpt"
         || parent.provider != session.provider
@@ -2804,25 +2831,23 @@ fn browser_session_create_params_from_source(
         || parent.observation_generation != session.observation_generation
         || account.observation_generation != session.observation_generation
     {
-        return Err(json!({"ok": false, "code": "browser_source_scope_mismatch"}));
+        return Err("browser_source_scope_mismatch".to_owned());
     }
     let display_label = parent
         .display_label
         .as_deref()
         .or(session.display_label.as_deref())
-        .unwrap_or("ChatGPT continuation");
-    Ok(Some(json!({
-        "endpoint_ref": session.endpoint_ref,
-        "provider": "chatgpt",
-        "account_ref": account.resource_ref,
-        "space_ref": space_ref,
-        "display_label": display_label,
-        "message": message,
-        "expected_generation": session.observation_generation,
-        "idempotency_key": idempotency_key,
-        "work_chain_id": work_chain_id,
-        "lane_id": lane_id,
-    })))
+        .unwrap_or("ChatGPT continuation")
+        .to_owned();
+    Ok(BrowserSourceRoute {
+        session_ref,
+        provider: session.provider.clone(),
+        endpoint_ref: session.endpoint_ref.clone(),
+        account_ref: account.resource_ref.clone(),
+        space_ref,
+        display_label,
+        expected_generation: session.observation_generation,
+    })
 }
 
 fn browser_handoff_prepare(
@@ -2868,7 +2893,7 @@ fn browser_handoff_prepare(
         Err(_) => return json!({"ok": false, "code": "browser_handoff_id_invalid"}),
     };
 
-    let (record, persisted_work_chain_id) = {
+    let (record, persisted_work_chain_id, source_route, source_route_error) = {
         let Ok(store) = store.lock() else {
             return json!({"ok": false, "code": "browser_handoff_store_unavailable"});
         };
@@ -2881,7 +2906,25 @@ fn browser_handoff_prepare(
             Ok(value) => value,
             Err(error) => return browser_store_error(error),
         };
-        (record, work_chain_id)
+        // Route resolution stays best-effort: a handoff whose source conversation is not
+        // currently registered still yields the canonical packet and Copy Prompt. Only the
+        // automatic delivery step needs this scope, and it fails closed without it.
+        let (route, route_error) = match browser_source_route(&store, source_url) {
+            Ok(route) => (
+                json!({
+                    "session_ref": route.session_ref,
+                    "provider": route.provider,
+                    "endpoint_ref": route.endpoint_ref,
+                    "account_ref": route.account_ref,
+                    "space_ref": route.space_ref,
+                    "display_label": route.display_label,
+                    "expected_generation": route.expected_generation,
+                }),
+                Value::Null,
+            ),
+            Err(error) => (Value::Null, json!(error)),
+        };
+        (record, work_chain_id, route, route_error)
     };
     if record
         .turns
@@ -2922,6 +2965,8 @@ fn browser_handoff_prepare(
 
     json!({
         "ok": true,
+        "source_route": source_route,
+        "source_route_error": source_route_error,
         "handoff": {
             "handoff_id": handoff_id,
             "continuity_id": continuity_id,
@@ -8639,6 +8684,13 @@ mod tests {
         let first = browser_handoff_prepare(&store, &params);
         let second = browser_handoff_prepare(&store, &params);
         assert_eq!(first["ok"], true);
+        // No browser registry entry exists for this source URL, so the canonical packet is
+        // still prepared while automatic delivery scope stays explicitly unavailable.
+        assert_eq!(first["source_route"], Value::Null);
+        assert_eq!(
+            first["source_route_error"],
+            "browser_source_session_not_found"
+        );
         assert_eq!(first["handoff"], second["handoff"]);
         assert_eq!(
             first["handoff"]["message"],
@@ -8692,6 +8744,151 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn browser_handoff_prepare_reports_the_registered_source_route() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput, ContinuityTurnInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let source_url = "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, account_ref, space_ref, session_ref);
+        {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "handoff-route-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create","composer.submit"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "handoff-route-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let space = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "space",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "handoff-route-project",
+                    display_label: Some("herdr-mcp"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    native_identity: "handoff-route-source",
+                    display_label: Some("Source"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(&session.resource_ref, source_url, 7, 12)
+                .unwrap();
+            store
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap();
+            store
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:routed",
+                    conversation_id: "source-conv",
+                    workspace_id: Some("w-routed"),
+                    project_id: Some("g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    title: Some("Routed handoff"),
+                    message_id: "routed-user-1",
+                    role: "user",
+                    text: "route this canonical handoff",
+                    fingerprint: None,
+                    observed_at: 100,
+                })
+                .unwrap();
+            endpoint_ref = endpoint.endpoint_ref;
+            account_ref = account.resource_ref;
+            space_ref = space.resource_ref;
+            session_ref = session.resource_ref;
+        }
+        let store = Arc::new(Mutex::new(store));
+        let prepared = browser_handoff_prepare(
+            &store,
+            &json!({"continuity_id": "hc:routed", "source_url": source_url}),
+        );
+        assert_eq!(prepared["ok"], true);
+        assert_eq!(prepared["source_route_error"], Value::Null);
+        assert_eq!(prepared["source_route"]["session_ref"], session_ref);
+        assert_eq!(prepared["source_route"]["provider"], "chatgpt");
+        assert_eq!(prepared["source_route"]["endpoint_ref"], endpoint_ref);
+        assert_eq!(prepared["source_route"]["account_ref"], account_ref);
+        assert_eq!(prepared["source_route"]["space_ref"], space_ref);
+        assert_eq!(prepared["source_route"]["expected_generation"], 7);
+        assert_eq!(prepared["source_route"]["display_label"], "herdr-mcp");
+        assert_eq!(
+            prepared["handoff"]["message"],
+            prepared["manual_delivery"]["copy_prompt"]
+        );
+        assert_eq!(
+            prepared["handoff"]["message"],
+            prepared["automatic_delivery"]["params"]["message"]
+        );
+        assert_eq!(
+            prepared["automatic_delivery"]["params"]["source_url"],
+            source_url
+        );
+        // The source-anchored create must derive exactly the same scope from the same URL,
+        // because both callers share one route resolution.
+        let create_params = browser_session_create_params_from_source(
+            &store.lock().unwrap(),
+            &json!({
+                "source_url": source_url,
+                "message": "continue from the canonical packet",
+                "idempotency_key": "handoff-route-1"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(create_params["endpoint_ref"], endpoint_ref);
+        assert_eq!(create_params["account_ref"], account_ref);
+        assert_eq!(create_params["space_ref"], space_ref);
+        assert_eq!(create_params["expected_generation"], 7);
+        assert_eq!(create_params["display_label"], "herdr-mcp");
+        assert_eq!(create_params["provider"], "chatgpt");
     }
 
     #[test]

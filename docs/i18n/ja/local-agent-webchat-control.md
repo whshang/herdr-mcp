@@ -142,7 +142,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `browser_composer.set_reasoning` / `set_apps` | — | 非対応 |
 | `browser_space.create` / `browser_space.open` | — | 非対応 |
 | `reasoning_effort` または `required_apps` 付き `dispatch.submit` | — | 非対応（通常呼び出しは対応） |
-| `herdr_mcp.browser_handoff.prepare` | — | 対応する読み取り専用の私有メソッド、CLI ラッパーなし |
+| `herdr_mcp.browser_handoff.prepare` | `herdr-mcp webchat handoff` | 対応（canonical packet、任意で自動配送） |
 
 能力が無い場合は正直に報告し、別の自動化スタックへ黙って切り替えないでください。
 
@@ -239,13 +239,42 @@ continuity_id（永続タスク状態）
 - host が Herdr の実行証拠なしに事前拒否した場合、**同じ**引数と同じ idempotency key で最大 1 回だけ再試行し、その後は準備済みの Copy Prompt を提示します。
 - delivery が不確実な間は、reconciliation で最初の試行が適用されていないと証明されるまで Copy Prompt 経路を開きません。したがって推測で二つ目の会話を作ることはできません。
 
-**現在の公開境界**：`herdr_mcp.browser_handoff.prepare` と `source_url` ベースの `browser_session.create` ルートは私有メソッドです。`herdr-mcp webchat handoff` サブコマンドは**存在せず**、`herdr-mcp webchat create` も `source_url` を受け取りません。現在の呼び出し元は Web planner 経路と extension HUD（handoff / Copy Prompt）です。
+**正式な入口**：
 
-CLI しか持たないローカル Agent にとって、これは次を意味します。
+```bash
+herdr-mcp webchat handoff \
+  --continuity-id hc:... \
+  --source-url 'https://chatgpt.com/g/g-p-.../c/...' \
+  [--objective TEXT] [--work-chain-id ID] [--handoff-id ID] \
+  [--idempotency-key KEY] [--prepare-only]
+```
 
-- 使えるローカル面は `herdr-mcp continuity ...` と `herdr-mcp webchat create/send/dispatch-status/archive` です。
-- 同じタスクを続ける会話なら、メッセージの**最初の指示を `continuity.resume <continuity_id>`** にし、既存チェーンを再利用し、そのチェーンに work chain があれば `--work-chain-id` を渡します。
-- ローカルで組み立てたメッセージを canonical handoff packet と主張せず、説明を簡単にするために並行する continuity チェーンを作らないでください。
+`webchat handoff` は上記 canonical 実装の薄いローカルラッパーであり、二つ目の handoff 実装ではありません。
+
+- Web planner と extension HUD と同じ経路で runtime に canonical packet（`herdr_mcp.browser_handoff.prepare`）を要求します。
+- その packet 自身の `automatic_delivery.params` を**そのまま** source ベースの `browser_session.create` に渡します。CLI がメッセージを組み立てたり、書き換えたり、再エンコードしたりすることはありません。
+- `--source-url` は監査アンカーであり唯一のルート入力です。runtime が登録済み会話から既存 WebChat ルート（endpoint / account / Project）を解決するため、コマンドラインに routing id は不要です。
+- `--objective` / `--work-chain-id` / `--handoff-id` は同じ `prepare` 入力に対応します。`--handoff-id` は packet に安定した identity を与えます。
+
+出力は canonical packet と配送証拠です。
+
+| フィールド | 意味 |
+| --- | --- |
+| `handoff` | canonical packet（continuity_id、source_url、message、work_chain_id、target_context） |
+| `automatic_delivery.params` | canonical な作成パラメータ。packet とバイト単位で一致 |
+| `automatic_delivery.attempted` / `completed` | 配送を試みたか、`applied` に到達したか |
+| `automatic_delivery.delivery_state` / `reason` / `replayed` | runtime 自身の delivery 語彙と replay フラグ |
+| `automatic_delivery.session_ref` / `dispatch_id` / `result` | 作成された会話と dispatch 証拠 |
+| `manual_delivery.copy_prompt` | 同じ canonical メッセージ（手動継続用） |
+| `instruction` | 実際に何が起きたかの平易な説明 |
+
+冪等性：一つの logical handoff は一つの key を使います。`--idempotency-key` を渡さない場合、CLI は canonical な `handoff_id` を再利用するため、「同じコマンドをそのまま再実行する」ことが同じ logical handoff になります。これが canonical の「同じ key で 1 回だけ再試行」ルールを満たします。再試行で新しい key を渡さず、CLI が uncertain な配送を自動再試行することも期待しないでください。
+
+`--prepare-only` は配送をスキップし、packet のみを返します（`automatic_delivery.attempted=false`、`reason="prepare_only"`）。
+
+**準備済みは配送済みではありません。** ソース会話が未登録、または browser control が利用できない場合でも packet と `manual_delivery.copy_prompt` は返り、`automatic_delivery.attempted=false` と runtime の理由が付きます。これは手動継続に使える結果ですが、**完了した handoff ではありません**。実際に会話が作成されたのは `automatic_delivery.completed=true`（つまり `delivery_state=applied`）のときだけです。`uncertain` はそのまま報告され、自動再試行はしません。
+
+**引き続き真実**：`herdr-mcp webchat create` は `source_url` を受け取りません。source ベースの配送はこの handoff 経路だけに閉じ込め、通常の create インタフェースは明示的な routing id を要求し続けます。
 
 ## 7. ローカル Agent の例
 
@@ -258,10 +287,9 @@ Agent は次の順で進めます。
 1. **能力検出** —— `herdr-mcp webchat endpoints`、`herdr-mcp webchat resources --kind space`、`herdr-mcp webchat inspect SPACE_REF`。`consent.webchat_control` が真であることと `observation_generation` を確認します。
 2. **identity の解決** —— 返されたリソースから正確な `endpoint_ref` / `account_ref` / `space_ref` を選びます。推測せず、別マシン・別 Project の ref を再利用しません。
 3. **永続状態の解決** —— `herdr-mcp continuity resume hc:...`（先に境界付きの `herdr-mcp continuity search ... --project-path <checkout>` でも可。ただし `confirmation_required` に従うこと）。これがタスク永続状態の唯一の情報源です。
-4. **引き継ぎの準備** —— canonical prepare が使える場合（Web planner 経路）は `automatic_delivery.params` をそのまま使います。CLI しか無い場合は `continuity.resume <continuity_id>` をメッセージの最初の指示にし、既存の `--work-chain-id` を渡します。
-5. **作成 / dispatch** —— `herdr-mcp webchat create ...` を安定した一つの idempotency key で実行します。新しい key で再試行しないでください。
-6. **配送の検証** —— 返された `delivery_state` を確認し、settlement 証拠は `herdr-mcp webchat dispatch-status DISPATCH_ID` で取得します。「エラーが無い」を成功とみなしません。
-7. **報告** —— 正確な `session_ref`、delivery state、対象に依頼した内容を返します。`continuity.resume` は対象側で実行されること、二つ目のチェーンを作っていないことを明示します。
+4. **canonical handoff を実行** —— `herdr-mcp webchat handoff --continuity-id hc:... --source-url '<正確な会話 URL>'`（チェーンに work chain があれば `--work-chain-id` を追加）。canonical な準備と自動配送を一度に行います。`--prepare-only` は packet だけを返します。
+5. **配送の検証** —— `automatic_delivery.completed` / `delivery_state` を読みます。`completed=false` なら何も作成されていません。`manual_delivery.copy_prompt` を使い、dispatch がある場合は `herdr-mcp webchat dispatch-status <dispatch_id>` で確認します。新しい `--idempotency-key` で再試行しないでください。
+6. **報告** —— 正確な `session_ref`、delivery state、対象に依頼した内容を返します。`continuity.resume` は対象側で実行されること、準備済みは完了した handoff ではないことを明示します。
 
 実際のアカウント id、トークン、本番 secret を計画・メッセージ・報告に含めないでください。CLI が返す ref は不透明な識別子で、CLI に戻したりユーザーに報告してよいものですが、資格情報ではありません。
 
@@ -319,7 +347,8 @@ Agent は次の順で進めます。
 存在しない能力に対して文書や実装を積み上げないよう、ここを明示します。
 
 - **非対応の browser 操作**（runtime は `code: "unsupported"` を返す）：`browser_space.create`、`browser_space.open`、`browser_message.append`、`browser_composer.set_reasoning`、`browser_composer.set_apps`、および `reasoning_effort` か `required_apps` を伴う `browser_dispatch.submit`。
-- **対応しているが現在 CLI ラッパーが無いもの**：`browser_session.open`、`browser_dispatch.stop`、`browser_handoff.prepare`、`browser_endpoint.inspect`、`browser_space.inspect`。runtime MCP の私有メソッド境界から到達でき、ローカル CLI にサブコマンドはありません。
+- **対応しているが現在 CLI ラッパーが無いもの**：`browser_session.open`、`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。runtime MCP の私有メソッド境界から到達でき、ローカル CLI にサブコマンドはありません。
+- **Handoff**：canonical な準備経路は `herdr_mcp.browser_handoff.prepare` で、ローカル Agent は `herdr-mcp webchat handoff` から使います（再利用し、続けて source ベースの配送を行う）。Web planner と extension HUD は引き続き私有メソッドを直接呼びます。`webchat create` は今も `source_url` を受け取らず、対応する handoff フラグもありません。
 - **Handoff**：canonical な準備経路は Web planner と extension HUD が使う私有 `herdr_mcp.browser_handoff.prepare` です。`herdr-mcp webchat handoff` CLI は無く、CLI の `create` は `source_url` を受け取りません。
 - **`ego-browser`** は開発/UAT インフラで、ユーザー依存でも、この control plane の代替でもありません。
 - **公開されていないもの**：ユーザーの非公開 ChatGPT 履歴本文の読み出し、dispatch 契約での添付送信、任意の DOM アクセス、registry が報告しない provider。

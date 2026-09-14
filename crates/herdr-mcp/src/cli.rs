@@ -8,6 +8,7 @@ pub enum HelpSection {
     Qualification,
     Continuity,
     Memory,
+    WebChat,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -263,6 +264,15 @@ pub enum WebChatCommand {
         session_ref: String,
         expected_generation: i64,
         idempotency_key: String,
+    },
+    Handoff {
+        continuity_id: String,
+        source_url: String,
+        objective: Option<String>,
+        work_chain_id: Option<String>,
+        handoff_id: Option<String>,
+        idempotency_key: Option<String>,
+        prepare_only: bool,
     },
 }
 
@@ -608,6 +618,9 @@ fn parse_memory(args: &[String]) -> Result<Command, String> {
 
 fn parse_webchat(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("help" | "--help" | "-h") if args.len() == 1 => Ok(Command::Help {
+            section: HelpSection::WebChat,
+        }),
         Some("endpoints") => {
             let limit = parse_optional_limit_flag(&args[1..], 32)?;
             Ok(Command::WebChat(WebChatCommand::Endpoints { limit }))
@@ -632,11 +645,12 @@ fn parse_webchat(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some("archive") => parse_webchat_archive(&args[1..]),
+        Some("handoff") => parse_webchat_handoff(&args[1..]),
         Some(value) => Err(format!(
-            "unknown webchat command '{value}' (expected endpoints, resources, inspect, create, send, dispatch-status, or archive)"
+            "unknown webchat command '{value}' (expected endpoints, resources, inspect, create, send, dispatch-status, archive, or handoff)"
         )),
         None => Err(
-            "webchat requires endpoints, resources, inspect, create, send, dispatch-status, or archive"
+            "webchat requires endpoints, resources, inspect, create, send, dispatch-status, archive, or handoff"
                 .to_owned(),
         ),
     }
@@ -783,6 +797,61 @@ fn parse_webchat_archive(args: &[String]) -> Result<Command, String> {
         expected_generation: expected_generation
             .ok_or_else(|| "webchat archive requires --expected-generation".to_owned())?,
         idempotency_key: required_flag(idempotency_key, "--idempotency-key")?,
+    }))
+}
+
+fn parse_webchat_handoff(args: &[String]) -> Result<Command, String> {
+    let mut continuity_id = None;
+    let mut source_url = None;
+    let mut objective = None;
+    let mut work_chain_id = None;
+    let mut handoff_id = None;
+    let mut idempotency_key = None;
+    let mut prepare_only = false;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--help" | "-h" => {
+                return Ok(Command::Help {
+                    section: HelpSection::WebChat,
+                });
+            }
+            "--prepare-only" => {
+                prepare_only = true;
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match flag {
+            "--continuity-id" => continuity_id = Some(value.clone()),
+            "--source-url" => source_url = Some(value.clone()),
+            "--objective" => objective = Some(value.clone()),
+            "--work-chain-id" => work_chain_id = Some(value.clone()),
+            "--handoff-id" => handoff_id = Some(value.clone()),
+            "--idempotency-key" => idempotency_key = Some(value.clone()),
+            _ => return Err(format!("unknown webchat handoff flag '{flag}'")),
+        }
+        index += 2;
+    }
+    if prepare_only && idempotency_key.is_some() {
+        return Err(
+            "webchat handoff --prepare-only does not deliver, so --idempotency-key is unused"
+                .to_owned(),
+        );
+    }
+    Ok(Command::WebChat(WebChatCommand::Handoff {
+        continuity_id: required_flag(continuity_id, "--continuity-id")?,
+        source_url: required_flag(source_url, "--source-url")?,
+        objective,
+        work_chain_id,
+        handoff_id,
+        idempotency_key,
+        prepare_only,
     }))
 }
 
@@ -2047,7 +2116,7 @@ User path:\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
   herdr-mcp memory <resume|search> ...  (bounded Work Memory access for local coding agents)\n\
-  herdr-mcp webchat <endpoints|resources|create|send|dispatch-status|archive> ...  (supported local WebChat control)\n\
+  herdr-mcp webchat <endpoints|resources|create|send|dispatch-status|archive|handoff> ...  (supported local WebChat control)\n\
   herdr-mcp profile check --file <profile.json>  (read-only desired-vs-actual workstation drift)\n\
   herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
@@ -2139,6 +2208,39 @@ Examples:\n\
   herdr-mcp continuity resume hc:example\n"
 }
 
+pub fn webchat_help() -> &'static str {
+    "Herdr-MCP supported local WebChat control\n\n\
+Usage:\n\
+  herdr-mcp webchat endpoints [--limit N]\n\
+  herdr-mcp webchat resources [--endpoint-ref REF] [--provider PROVIDER] [--kind account|space|session] [--parent-ref REF] [--limit N]\n\
+  herdr-mcp webchat inspect <resource_ref>\n\
+  herdr-mcp webchat create --endpoint-ref REF --provider PROVIDER --account-ref REF --display-label LABEL --message MESSAGE --expected-generation N --idempotency-key KEY [--space-ref REF] [--work-chain-id ID]\n\
+  herdr-mcp webchat send --session-ref REF --message MESSAGE --expected-generation N --idempotency-key KEY [--work-chain-id ID]\n\
+  herdr-mcp webchat dispatch-status <dispatch_id>\n\
+  herdr-mcp webchat archive --session-ref REF --expected-generation N --idempotency-key KEY\n\
+  herdr-mcp webchat handoff --continuity-id HC --source-url URL [--objective TEXT] [--work-chain-id ID] [--handoff-id ID] [--idempotency-key KEY] [--prepare-only]\n\n\
+Discover capability first: endpoints -> resources -> inspect. Refs are opaque; never\n\
+synthesize them, and pass the observed observation_generation as --expected-generation.\n\n\
+webchat handoff is the canonical continuation path for one existing Continuity chain.\n\
+It prepares the canonical handoff packet, then attempts automatic delivery into a new\n\
+WebChat conversation and reports the delivery evidence.\n\
+  - It reuses the existing continuity_id; it never creates a second chain, a second\n\
+    handoff message generator, or a second state model.\n\
+  - automatic_delivery.params.message and manual_delivery.copy_prompt are the same\n\
+    canonical string; the CLI never rewrites or re-encodes it.\n\
+  - --source-url is the audit anchor and resolves the existing WebChat route\n\
+    (endpoint/account/Project) from the registered conversation, so no routing ids are\n\
+    passed on the command line.\n\
+  - When browser control is unavailable the packet is still returned: deliver it manually\n\
+    with manual_delivery.copy_prompt. Only automatic_delivery.delivery_state=applied\n\
+    means a browser delivery happened; a prepared packet alone is not a completed handoff.\n\
+  - One logical handoff keeps one idempotency key. Without --idempotency-key the CLI reuses\n\
+    the canonical handoff_id, so a plain re-run is the same logical handoff and satisfies\n\
+    the 'retry once with the same key' rule. Never pass a new key to retry.\n\
+  - The CLI never retries an uncertain delivery; read automatic_delivery and\n\
+    webchat dispatch-status first.\n"
+}
+
 pub fn memory_help() -> &'static str {
     "Herdr-MCP bounded Work Memory\n\n\
 Usage:\n\
@@ -2193,6 +2295,146 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn webchat_handoff_parses_minimal_inputs_and_exposes_help() {
+        assert_eq!(
+            parse(args(&[
+                "webchat",
+                "handoff",
+                "--continuity-id",
+                "hc:canonical",
+                "--source-url",
+                "https://chatgpt.com/c/source-conv",
+            ]))
+            .unwrap()
+            .command,
+            Command::WebChat(WebChatCommand::Handoff {
+                continuity_id: "hc:canonical".to_owned(),
+                source_url: "https://chatgpt.com/c/source-conv".to_owned(),
+                objective: None,
+                work_chain_id: None,
+                handoff_id: None,
+                idempotency_key: None,
+                prepare_only: false,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "webchat",
+                "handoff",
+                "--continuity-id",
+                "hc:canonical",
+                "--source-url",
+                "https://chatgpt.com/c/source-conv",
+                "--objective",
+                "Finish the continuation",
+                "--work-chain-id",
+                "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--handoff-id",
+                "hh_given",
+                "--idempotency-key",
+                "handoff-key-1",
+            ]))
+            .unwrap()
+            .command,
+            Command::WebChat(WebChatCommand::Handoff {
+                continuity_id: "hc:canonical".to_owned(),
+                source_url: "https://chatgpt.com/c/source-conv".to_owned(),
+                objective: Some("Finish the continuation".to_owned()),
+                work_chain_id: Some("wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                handoff_id: Some("hh_given".to_owned()),
+                idempotency_key: Some("handoff-key-1".to_owned()),
+                prepare_only: false,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "webchat",
+                "handoff",
+                "--continuity-id",
+                "hc:canonical",
+                "--source-url",
+                "https://chatgpt.com/c/source-conv",
+                "--prepare-only",
+            ]))
+            .unwrap()
+            .command,
+            Command::WebChat(WebChatCommand::Handoff {
+                continuity_id: "hc:canonical".to_owned(),
+                source_url: "https://chatgpt.com/c/source-conv".to_owned(),
+                objective: None,
+                work_chain_id: None,
+                handoff_id: None,
+                idempotency_key: None,
+                prepare_only: true,
+            })
+        );
+        assert!(
+            parse(args(&[
+                "webchat",
+                "handoff",
+                "--source-url",
+                "https://chatgpt.com/c/source-conv"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "webchat",
+                "handoff",
+                "--continuity-id",
+                "hc:canonical"
+            ]))
+            .is_err()
+        );
+        assert!(parse(args(&["webchat", "handoff"])).is_err());
+        assert!(
+            parse(args(&[
+                "webchat",
+                "handoff",
+                "--continuity-id",
+                "hc:canonical",
+                "--source-url",
+                "https://chatgpt.com/c/source-conv",
+                "--idempotency-key",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "webchat",
+                "handoff",
+                "--continuity-id",
+                "hc:canonical",
+                "--source-url",
+                "https://chatgpt.com/c/source-conv",
+                "--prepare-only",
+                "--idempotency-key",
+                "handoff-key-1",
+            ]))
+            .is_err()
+        );
+        assert_eq!(
+            parse(args(&["webchat", "--help"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::WebChat
+            }
+        );
+        assert_eq!(
+            parse(args(&["webchat", "handoff", "--help"]))
+                .unwrap()
+                .command,
+            Command::Help {
+                section: HelpSection::WebChat
+            }
+        );
+        let help = webchat_help();
+        assert!(help.contains("herdr-mcp webchat handoff --continuity-id HC --source-url URL"));
+        assert!(help.contains("manual_delivery.copy_prompt"));
+        assert!(help.contains("idempotency key"));
+        assert!(crate::cli::help().contains("handoff>"));
     }
 
     #[test]

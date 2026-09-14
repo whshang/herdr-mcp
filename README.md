@@ -152,6 +152,7 @@ Do not bypass Herdr with your own Playwright, AppleScript, or DOM automation aga
 ```bash
 herdr-mcp webchat endpoints
 herdr-mcp webchat resources --kind session
+herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.com/g/g-p-.../c/...'
 ```
 
 [Local agent WebChat control](docs/i18n/en/local-agent-webchat-control.md) · [Browser continuity](docs/i18n/en/browser-continuity.md) · [Extension guide](docs/i18n/en/extension.md)

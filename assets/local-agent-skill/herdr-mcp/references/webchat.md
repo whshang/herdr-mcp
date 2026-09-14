@@ -73,3 +73,12 @@ herdr-mcp webchat archive \
 Archive sessions created/owned by the current task after their result/evidence has been captured. Do not archive a user session or another task's session merely because it looks idle.
 
 Browser mutations remain gated by local extension consent, observed capability generation, account-scoped serialization, and Herdr-MCP delivery/idempotency rules. The CLI acquires the local trusted grant internally; it never prints the runtime bearer or browser secrets.
+
+## Canonical continuation (handoff)
+
+```sh
+herdr-mcp webchat handoff --continuity-id HC --source-url URL \
+  [--objective TEXT] [--work-chain-id ID] [--idempotency-key KEY] [--prepare-only]
+```
+
+This is the canonical handoff path: it reuses the existing Continuity chain, keeps automatic delivery and Copy Prompt byte-identical, and reports `automatic_delivery.completed`. See `references/webchat-control.md`.

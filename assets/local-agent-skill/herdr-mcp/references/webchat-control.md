@@ -55,17 +55,29 @@ herdr-mcp webchat archive --session-ref SESSION_REF --expected-generation N --id
 
 Continuation / handoff contract:
 
+```sh
+herdr-mcp webchat handoff --continuity-id HC --source-url URL \
+  [--objective TEXT] [--work-chain-id ID] [--handoff-id ID] \
+  [--idempotency-key KEY] [--prepare-only]
+```
+
+`webchat handoff` is the canonical continuation path for local agents: it requests the canonical packet from the existing `herdr_mcp.browser_handoff.prepare`, then hands that packet's own `automatic_delivery.params` to the source-anchored `browser_session.create` unchanged.
+
 ```text
 continuity_id
   -> herdr_mcp.browser_handoff.prepare { continuity_id, source_url }   (read-only private method)
      -> automatic_delivery.params == { source_url, message, work_chain_id }
      -> manual_delivery.copy_prompt == the same message, byte-for-byte
-  -> herdr_mcp.browser_session.create (params passed unchanged)
+  -> herdr_mcp.browser_session.create (params passed unchanged, CLI-added idempotency key)
   -> the target conversation's first step is continuity.resume <continuity_id>
 ```
 
+- Output is the canonical packet plus `automatic_delivery{attempted, completed, delivery_state, reason, replayed, session_ref, dispatch_id, result}` and an `instruction`.
+- `--source-url` is the audit anchor and the only route input: the runtime resolves endpoint/account/Project from the registered conversation. Pass the exact conversation URL.
 - Reuse the existing `continuity_id`; never create a second continuity chain and never treat the page as task-state authority.
-- Automatic delivery and Copy Prompt must stay byte-identical; never rewrite, encode, obfuscate, switch transport, or recursively wrap a rejected payload.
+- Automatic delivery and Copy Prompt must stay byte-identical; never compose your own continuation prompt and call it canonical.
+- Without `--idempotency-key` the CLI reuses the canonical `handoff_id`, so re-running the same command is the same logical handoff. Never pass a new key to retry.
+- `automatic_delivery.completed=false` (including `uncertain`, `browser_offline`, `resource_unavailable`, or a missing source route) means nothing was created: report that, use `manual_delivery.copy_prompt`, and inspect any returned `dispatch_id` with `webchat dispatch-status` before acting again.
 
 ## Mutation safety
 
@@ -85,8 +97,7 @@ continuity_id
 ## Current boundaries (do not document or emulate past these)
 
 - Not supported today (runtime returns `code: "unsupported"`): `browser_space.create`, `browser_space.open`, `browser_message.append`, `browser_composer.set_reasoning`, `browser_composer.set_apps`, and `dispatch.submit` with `reasoning_effort` or `required_apps`.
-- Supported private methods with **no CLI wrapper**: `browser_session.open`, `browser_dispatch.stop`, `browser_handoff.prepare`, `browser_endpoint.inspect`, `browser_space.inspect`. There is no `herdr-mcp webchat handoff` subcommand, and `webchat create` cannot pass `source_url`.
-- A CLI-only agent continuing the same task should compose the message so that `continuity.resume <continuity_id>` is the first instruction, reuse the existing chain, and pass `--work-chain-id` when it already exists. Do not claim that message is the canonical handoff packet.
+- Supported private methods with **no CLI wrapper**: `browser_session.open`, `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`. `browser_handoff.prepare` is reached through `herdr-mcp webchat handoff`. `webchat create` still cannot pass `source_url`.
 - `code: "caller_grant_missing"` means you are not on the trusted local path (for example a raw TCP MCP client); grants cannot be asserted over TCP. Use the CLI.
 - `ego-browser` is development/UAT infrastructure, never a user dependency.
 

@@ -142,6 +142,7 @@ Web AI 并不是 Herdr 浏览器能力的唯一调用方。本机的 coding Agen
 ```bash
 herdr-mcp webchat endpoints
 herdr-mcp webchat resources --kind session
+herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.com/g/g-p-.../c/...'
 ```
 
 [本地 Agent 控制 WebChat](docs/i18n/zh-CN/local-agent-webchat-control.md) · [浏览器连续工作](docs/i18n/zh-CN/browser-continuity.md) · [扩展说明](docs/i18n/zh-CN/extension.md)

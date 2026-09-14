@@ -142,7 +142,7 @@ The private method `herdr_mcp.browser_endpoint.inspect` additionally exposes the
 | `browser_composer.set_reasoning` / `set_apps` | — | not supported |
 | `browser_space.create` / `browser_space.open` | — | not supported |
 | `dispatch.submit` with `reasoning_effort` or `required_apps` | — | not supported (the plain call is) |
-| `herdr_mcp.browser_handoff.prepare` | — | supported read-only private method, no CLI wrapper |
+| `herdr_mcp.browser_handoff.prepare` | `herdr-mcp webchat handoff` | supported (canonical packet, optional automatic delivery) |
 
 When a capability is missing, report the honest outcome; do not silently fall back to another automation stack.
 
@@ -239,13 +239,42 @@ Rules that make this safe:
 - If the host reports a pre-delivery safety rejection with no Herdr execution evidence, retry the original create arguments at most once with the **same** idempotency key, then expose the already-prepared Copy Prompt.
 - An uncertain delivery does not expose the Copy Prompt path until reconciliation proves the first attempt did not apply, so a second conversation cannot be created by guessing.
 
-**Current exposure boundary:** `herdr_mcp.browser_handoff.prepare` and the `source_url`-based `browser_session.create` route are private methods. There is **no** `herdr-mcp webchat handoff` subcommand, and the `herdr-mcp webchat create` CLI does not accept `source_url`. The Web planner path and the extension HUD (handoff / Copy Prompt) are the current callers.
+**The supported way to run it:**
 
-For a CLI-only local agent this means:
+```bash
+herdr-mcp webchat handoff \
+  --continuity-id hc:... \
+  --source-url 'https://chatgpt.com/g/g-p-.../c/...' \
+  [--objective TEXT] [--work-chain-id ID] [--handoff-id ID] \
+  [--idempotency-key KEY] [--prepare-only]
+```
 
-- the supported local surface is `herdr-mcp continuity ...` + `herdr-mcp webchat create/send/dispatch-status/archive`;
-- if a conversation continues the same task, compose the message so its **first instruction is `continuity.resume <continuity_id>`**, reuse the existing chain, and pass `--work-chain-id` when the chain already has one;
-- do not claim that a locally composed message is the canonical handoff packet, and do not create a parallel continuity chain to make the story simpler.
+`webchat handoff` is a thin local wrapper around the canonical implementation above, not a second handoff implementation:
+
+- it asks the runtime for the canonical packet (`herdr_mcp.browser_handoff.prepare`) exactly like the Web planner and the extension HUD do;
+- it then hands that packet's own `automatic_delivery.params` to the source-anchored `browser_session.create`, unchanged — the CLI never composes, rewrites, or re-encodes the message;
+- `--source-url` is the audit anchor and the only route input: the runtime resolves the existing WebChat route (endpoint / account / Project) from the registered conversation, so no routing ids are passed on the command line;
+- `--objective` / `--work-chain-id` / `--handoff-id` map to the same `prepare` inputs; `--handoff-id` also gives the packet a stable identity.
+
+Output is the canonical packet plus the delivery evidence:
+
+| Field | Meaning |
+| --- | --- |
+| `handoff` | The canonical packet (continuity_id, source_url, message, work_chain_id, target_context) |
+| `automatic_delivery.params` | The canonical create params, byte-identical to the packet |
+| `automatic_delivery.attempted` / `completed` | Whether a delivery was sent, and whether it reached `applied` |
+| `automatic_delivery.delivery_state` / `reason` / `replayed` | The runtime's own delivery vocabulary and replay flag |
+| `automatic_delivery.session_ref` / `dispatch_id` / `result` | The created conversation and its dispatch evidence |
+| `manual_delivery.copy_prompt` | The same canonical message, for manual continuation |
+| `instruction` | Plain-language statement of what actually happened |
+
+Idempotency: one logical handoff keeps one key. Without `--idempotency-key` the CLI reuses the canonical `handoff_id`, so a plain re-run is the same logical handoff — that is what satisfies the canonical "retry once with the same key" rule. Never pass a new key to retry, and never expect the CLI to retry an uncertain delivery for you.
+
+`--prepare-only` skips delivery and returns the packet (with `automatic_delivery.attempted=false`, `reason="prepare_only"`).
+
+**Prepared is not delivered.** When the source conversation is not currently registered, or browser control is unavailable, the packet and `manual_delivery.copy_prompt` are still returned with `automatic_delivery.attempted=false` and the runtime's reason. That is a usable result for manual continuation, and it is **not** a completed handoff: only `automatic_delivery.completed=true` (that is, `delivery_state=applied`) means a new conversation was actually created. An `uncertain` delivery is reported as-is and never retried automatically.
+
+**Still true:** `herdr-mcp webchat create` does not accept `source_url`. Source-anchored delivery stays inside this handoff path so the ordinary create interface keeps requiring explicit routing ids.
 
 ## 7. Local agent example
 
@@ -258,10 +287,9 @@ The agent should proceed in this order:
 1. **Capability discovery** — `herdr-mcp webchat endpoints`, `herdr-mcp webchat resources --kind space`, `herdr-mcp webchat inspect SPACE_REF`. Confirm `consent.webchat_control` is true and capture `observation_generation`.
 2. **Resolve identity** — pick the exact `endpoint_ref` / `account_ref` / `space_ref` from the returned resources. Do not guess, do not reuse a ref from another machine or another Project.
 3. **Resolve durable state** — `herdr-mcp continuity resume hc:...` (or a bounded `herdr-mcp continuity search ... --project-path <checkout>` first, honoring `confirmation_required`). This is the only source of the task's durable state.
-4. **Prepare the continuation** — if the canonical prepare method is available to you (Web planner path), use its `automatic_delivery.params` unchanged. If you only have the CLI, compose the message with `continuity.resume <continuity_id>` as the first instruction and pass the existing `--work-chain-id`.
-5. **Create / dispatch** — `herdr-mcp webchat create ...` with one stable idempotency key. Never retry with a new key.
-6. **Verify delivery** — check the returned `delivery_state`; use `herdr-mcp webchat dispatch-status DISPATCH_ID` for settlement evidence instead of treating "no error" as success.
-7. **Report** — return the exact `session_ref`, the delivery state, and what the target was asked to do. State explicitly that `continuity.resume` runs on the target side and that you did not create a second chain.
+4. **Run the canonical handoff** — `herdr-mcp webchat handoff --continuity-id hc:... --source-url '<exact conversation URL>'` (add `--work-chain-id` when the chain already has one). This performs canonical preparation *and* the automatic delivery in one step; `--prepare-only` returns just the packet.
+5. **Verify delivery** — read `automatic_delivery.completed` / `delivery_state`. If `completed=false`, nothing was created: use `manual_delivery.copy_prompt`, or `herdr-mcp webchat dispatch-status <dispatch_id>` when a dispatch exists. Never retry with a new `--idempotency-key`.
+6. **Report** — return the exact `session_ref`, the delivery state, and what the target was asked to do. State explicitly that `continuity.resume` runs on the target side, and that a prepared-only result is not a completed handoff.
 
 Never place real account ids, tokens, or production secrets in a plan, a message, or a report. Refs returned by the CLI are opaque identifiers; they are safe to pass back to the CLI and to report to the user, but they are not credentials.
 
@@ -319,8 +347,8 @@ The practical failure mode is collapsing these into one "session id". `continuit
 This section is deliberately explicit so nobody documents or builds against a capability that does not exist yet:
 
 - **Unsupported browser operations** (runtime returns `code: "unsupported"`): `browser_space.create`, `browser_space.open`, `browser_message.append`, `browser_composer.set_reasoning`, `browser_composer.set_apps`, and `browser_dispatch.submit` with `reasoning_effort` or `required_apps`.
-- **Supported but without a CLI wrapper today:** `browser_session.open`, `browser_dispatch.stop`, `browser_handoff.prepare`, `browser_endpoint.inspect`, `browser_space.inspect`. They are reachable as private methods through the runtime MCP boundary; the local CLI does not expose a subcommand for them.
-- **Handoff:** the canonical preparation path is the private `herdr_mcp.browser_handoff.prepare` method used by the Web planner and the extension HUD. There is no `herdr-mcp webchat handoff` CLI, and the CLI's `create` cannot take `source_url`.
+- **Supported but without a CLI wrapper today:** `browser_session.open`, `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`. They are reachable as private methods through the runtime MCP boundary; the local CLI does not expose a subcommand for them.
+- **Handoff:** the canonical preparation path is `herdr_mcp.browser_handoff.prepare`, exposed to local agents as `herdr-mcp webchat handoff` (which reuses it and then performs the source-anchored delivery). The Web planner and the extension HUD keep calling the private method directly. There is still no `herdr-mcp webchat handoff`-style flag on `webchat create`, and `webchat create` does not accept `source_url`.
 - **`ego-browser`** is development/UAT infrastructure, never a user dependency and never a substitute for this control plane.
 - **Not exposed at all:** reading a user's private ChatGPT history body, attachments through the dispatch contract, arbitrary DOM access, and any provider other than the ones the registry actually reports.
 

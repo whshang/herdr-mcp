@@ -144,6 +144,7 @@ fn run() -> Result<ExitCode, String> {
                 cli::HelpSection::Qualification => cli::qualification_help(),
                 cli::HelpSection::Continuity => cli::continuity_help(),
                 cli::HelpSection::Memory => cli::memory_help(),
+                cli::HelpSection::WebChat => cli::webchat_help(),
             };
             print!("{text}");
             Ok(ExitCode::SUCCESS)
