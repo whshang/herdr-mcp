@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../dist/contracts/epoch4.js";
+import { EPOCH5_CONTRACT } from "../dist/contracts/epoch5.js";
+import { RUNTIME_EXECUTION_CONTRACT } from "../dist/contracts/runtime.js";
 import { encodeDeviceRef } from "../dist/device-refs.js";
 import { makeLimits } from "../dist/limits.js";
 import { handleMcp } from "../dist/mcp-handler.js";
@@ -263,10 +265,10 @@ test("tools/list exposes runtime tools plus edge-local herdr_devices", async () 
   assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
 });
 
-test("public contract selection uses epoch 4 for first-party dev/prod and stays consistent across discovery surfaces", async () => {
+test("public contract selection uses epoch 5 for first-party dev/prod and stays consistent across discovery surfaces", async () => {
   for (const [edgeEnv, expected] of [
-    ["dev", EPOCH4_CONTRACT],
-    ["prod", EPOCH4_CONTRACT],
+    ["dev", EPOCH5_CONTRACT],
+    ["prod", EPOCH5_CONTRACT],
     [undefined, EPOCH3_CONTRACT],
     ["staging", EPOCH3_CONTRACT],
   ]) {
@@ -304,8 +306,8 @@ test("all 18 workstation contract tools pass the Edge routing boundary", async (
     assert.equal(response.body.result.isError, undefined, `${tool.name} must not be blocked at Edge`);
   }
   assert.deepEqual(d.calls.map((call) => call.op), EPOCH2_CONTRACT.tools.map((tool) => tool.name));
-  assert.equal(d.calls.every((call) => call.contractEpoch === EPOCH2_CONTRACT.contract_epoch), true);
-  assert.equal(d.calls.every((call) => call.contractHash === EPOCH2_CONTRACT.contract_hash), true);
+  assert.equal(d.calls.every((call) => call.contractEpoch === RUNTIME_EXECUTION_CONTRACT.contract_epoch), true);
+  assert.equal(d.calls.every((call) => call.contractHash === RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
 });
 
 test("all 18 workstation contract tools honor the same explicit device route", async () => {
@@ -350,8 +352,8 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(r.body.result.structuredContent.served, true);
   assert.equal(d.calls.length, 1);
   assert.equal(d.calls[0].op, "herdr_inspect");
-  assert.equal(d.calls[0].contractEpoch, 2);
-  assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
+  assert.equal(d.calls[0].contractEpoch, RUNTIME_EXECUTION_CONTRACT.contract_epoch);
+  assert.equal(d.calls[0].contractHash, RUNTIME_EXECUTION_CONTRACT.contract_hash);
   assert.equal(d.calls[0].deadlineMs, 31_000);
   assert.equal(d.calls[0].trace, undefined, "browser grants must not alter non-browser MCP forwarding");
 });
@@ -963,8 +965,8 @@ test("explicit device routing selects one workstation and strips Edge-only devic
   assert.equal(routeCalls, 0);
   assert.deepEqual(d.targets, [DEVICE_A]);
   assert.equal(Object.hasOwn(d.calls[0].args, "device"), false);
-  assert.equal(d.calls[0].contractEpoch, EPOCH2_CONTRACT.contract_epoch);
-  assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
+  assert.equal(d.calls[0].contractEpoch, RUNTIME_EXECUTION_CONTRACT.contract_epoch);
+  assert.equal(d.calls[0].contractHash, RUNTIME_EXECUTION_CONTRACT.contract_hash);
 });
 
 test("ambiguous device routing fails closed before workstation delivery", async () => {

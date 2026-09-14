@@ -22,8 +22,8 @@ test("Rust release manifest is target-complete, hashed, and contract-pinned", as
   await mkdir(assetsDir, { recursive: true });
   await writeFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), '[package]\nname = "herdr-mcp"\nversion = "1.2.3-alpha.4"\n');
   await writeFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), 'pub const SCHEMA_VERSION: i64 = 4;\n');
-  await writeFile(join(root, "contracts", "epoch2.json"), JSON.stringify({
-    contract_epoch: 2,
+  await writeFile(join(root, "contracts", "runtime-exec-v3.json"), JSON.stringify({
+    contract_epoch: 3,
     contract_hash: "sha256:test",
     tool_count: 18,
   }));
@@ -62,7 +62,7 @@ test("Rust release manifest is target-complete, hashed, and contract-pinned", as
       issuer: RUST_RELEASE_PROVENANCE.issuer,
       runner_environment: RUST_RELEASE_PROVENANCE.runnerEnvironment,
     });
-    assert.deepEqual(manifest.contract, { epoch: 2, hash: "sha256:test", tool_count: 18 });
+    assert.deepEqual(manifest.contract, { epoch: 3, hash: "sha256:test", tool_count: 18 });
     assert.deepEqual(RUST_RELEASE_MATRIX, [
       { runner: "macos-15", target: "aarch64-apple-darwin" },
       { runner: "ubuntu-24.04", target: "x86_64-unknown-linux-musl" },
@@ -109,7 +109,7 @@ test("Rust release manifest refuses incomplete assets and tag/version drift", as
   await mkdir(assetsDir, { recursive: true });
   await writeFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), '[package]\nversion = "1.0.0"\n');
   await writeFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), 'pub const SCHEMA_VERSION: i64 = 4;\n');
-  await writeFile(join(root, "contracts", "epoch2.json"), JSON.stringify({ contract_epoch: 2, contract_hash: "h", tool_count: 18 }));
+  await writeFile(join(root, "contracts", "runtime-exec-v3.json"), JSON.stringify({ contract_epoch: 3, contract_hash: "h", tool_count: 18 }));
   try {
     await assert.rejects(
       buildRustReleaseManifest({

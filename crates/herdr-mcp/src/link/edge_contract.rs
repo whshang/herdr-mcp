@@ -1,9 +1,13 @@
 //! Edge `/health` runtime-contract probe for Rust Link soak/install.
 //!
 //! The Edge public MCP contract may evolve independently from the workstation
-//! runtime execution contract. New Edges publish `runtimeContractEpoch` /
-//! `runtimeContractHash`; v0.4.2 Edges only publish `contractEpoch` /
-//! `contractHash`, so parsing keeps that pair as a compatibility fallback.
+//! runtime execution contract. During an N/N-1 rollout, new Edges publish
+//! `currentRuntimeContractEpoch` / `currentRuntimeContractHash` for the current
+//! runtime while retaining `runtimeContractEpoch` / `runtimeContractHash` as
+//! the frozen rollback view consumed by old Links. v0.4.2 Edges only publish
+//! `contractEpoch` / `contractHash`, so parsing keeps each older pair as a
+//! compatibility fallback but the current Link still requires the current
+//! identity before it connects.
 
 use crate::link::daemon::{
     LEGACY_EPOCH1_CONTRACT_HASH, PUBLIC_CONTRACT_EPOCH, PUBLIC_CONTRACT_HASH,
@@ -70,23 +74,26 @@ pub fn parse_edge_health_contract(body: &str) -> Result<EdgeHealthContract, Edge
         EdgeContractError::Message(format!("Edge /health returned non-JSON: {error}"))
     })?;
     let epoch = value
-        .get("runtimeContractEpoch")
+        .get("currentRuntimeContractEpoch")
+        .or_else(|| value.get("runtimeContractEpoch"))
         .or_else(|| value.get("contractEpoch"))
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| {
             EdgeContractError::Message(
-                "Edge /health missing numeric runtimeContractEpoch/contractEpoch".to_owned(),
+                "Edge /health missing numeric currentRuntimeContractEpoch/runtimeContractEpoch/contractEpoch".to_owned(),
             )
         })?;
     let hash = value
-        .get("runtimeContractHash")
+        .get("currentRuntimeContractHash")
+        .or_else(|| value.get("runtimeContractHash"))
         .or_else(|| value.get("contractHash"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             EdgeContractError::Message(
-                "Edge /health missing runtimeContractHash/contractHash".to_owned(),
+                "Edge /health missing currentRuntimeContractHash/runtimeContractHash/contractHash"
+                    .to_owned(),
             )
         })?
         .to_owned();
@@ -101,7 +108,11 @@ pub fn parse_edge_health_contract(body: &str) -> Result<EdgeHealthContract, Edge
     })
 }
 
-/// Rust Link requires an Edge that accepts the current runtime execution contract.
+/// The current Rust Link requires proof that the Edge understands the current
+/// runtime execution contract. N-1 is supported in the opposite direction:
+/// the new Edge accepts an epoch-2 workstation hello so an old binary can be
+/// rolled back. A new binary must not treat a legacy-only Edge as compatible,
+/// because that Edge cannot accept the epoch-3 hello.
 pub fn rust_link_accepts_edge_contract(contract: &EdgeHealthContract) -> bool {
     contract.contract_epoch == PUBLIC_CONTRACT_EPOCH
         && contract.contract_hash == PUBLIC_CONTRACT_HASH
@@ -111,12 +122,15 @@ pub fn rust_link_accepts_edge_contract(contract: &EdgeHealthContract) -> bool {
 pub fn refuse_edge_for_rust_link(contract: &EdgeHealthContract) -> EdgeContractError {
     if contract.contract_epoch == 1 && contract.contract_hash == LEGACY_EPOCH1_CONTRACT_HASH {
         return EdgeContractError::Message(format!(
-            "Edge runtime contract is still epoch 1 ({}); Rust link run requires runtime epoch 2 ({}). Point HERDR_EDGE_URL at a compatible Edge or deploy an Edge that accepts runtime epoch 2",
-            contract.contract_hash, PUBLIC_CONTRACT_HASH
+            "Edge runtime contract is still epoch 1 ({}); Rust link run requires runtime epoch {} ({}). Point HERDR_EDGE_URL at a compatible Edge or deploy an Edge that accepts runtime epoch {}",
+            contract.contract_hash,
+            PUBLIC_CONTRACT_EPOCH,
+            PUBLIC_CONTRACT_HASH,
+            PUBLIC_CONTRACT_EPOCH
         ));
     }
     EdgeContractError::Message(format!(
-        "Edge runtime contract epoch {} hash {} is incompatible with Rust link run (requires epoch {} hash {})",
+        "Edge runtime contract epoch {} hash {} is incompatible with Rust link run (requires current epoch {} hash {})",
         contract.contract_epoch,
         contract.contract_hash,
         PUBLIC_CONTRACT_EPOCH,
@@ -191,18 +205,34 @@ mod tests {
 
     #[test]
     fn parses_prod_shaped_health() {
-        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":2,"contractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"}"#;
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":3,"contractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
         assert!(rust_link_accepts_edge_contract(&contract));
         assert_eq!(contract.service.as_deref(), Some("herdr-edge-prod"));
     }
 
     #[test]
-    fn prefers_runtime_contract_when_public_contract_has_advanced() {
-        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":3,"contractHash":"sha256:public-v3","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"}"#;
+    fn prefers_current_runtime_contract_over_legacy_rollback_fields() {
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":5,"contractHash":"sha256:public-v5","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8","currentRuntimeContractEpoch":3,"currentRuntimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
         assert!(rust_link_accepts_edge_contract(&contract));
-        assert_eq!(contract.contract_epoch, 2);
+        assert_eq!(contract.contract_epoch, PUBLIC_CONTRACT_EPOCH);
+        assert_eq!(contract.contract_hash, PUBLIC_CONTRACT_HASH);
+    }
+
+    #[test]
+    fn refuses_legacy_only_previous_runtime_edge_for_current_link() {
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":4,"contractHash":"sha256:public-v4","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"}"#;
+        let contract = parse_edge_health_contract(body).unwrap();
+        assert!(!rust_link_accepts_edge_contract(&contract));
+    }
+
+    #[test]
+    fn prefers_runtime_contract_when_public_contract_has_advanced() {
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":4,"contractHash":"sha256:public-v4","runtimeContractEpoch":3,"runtimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
+        let contract = parse_edge_health_contract(body).unwrap();
+        assert!(rust_link_accepts_edge_contract(&contract));
+        assert_eq!(contract.contract_epoch, 3);
         assert_eq!(contract.contract_hash, PUBLIC_CONTRACT_HASH);
     }
 
@@ -213,7 +243,7 @@ mod tests {
         assert!(!rust_link_accepts_edge_contract(&contract));
         let err = refuse_edge_for_rust_link(&contract).to_string();
         assert!(err.contains("epoch 1"));
-        assert!(err.contains("runtime epoch 2"));
+        assert!(err.contains("runtime epoch 3"));
         assert!(err.contains("compatible Edge"));
     }
 

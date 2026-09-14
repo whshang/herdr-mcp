@@ -29,31 +29,39 @@ const contractFixture = JSON.parse(
   await readFile(new URL("../contracts/epoch2.json", import.meta.url), "utf8"),
 );
 
-test("public epoch 3 is independent while runtime/link operational contract stays epoch 2", () => {
-  const expectedHash = contractFixture.contract_hash;
-  const expectedEpoch = contractFixture.contract_epoch;
-  const expectedCount = contractFixture.tool_count;
+test("runtime execution contract epoch 3 is independent of the public contract epochs", () => {
+  const frozenHash = contractFixture.contract_hash;
+  const frozenEpoch = contractFixture.contract_epoch;
+  const frozenCount = contractFixture.tool_count;
 
   assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
   assert.deepEqual(EPOCH2_CONTRACT, contractFixture);
-  assert.equal(expectedEpoch, 2);
-  assert.equal(expectedCount, 18);
+  assert.equal(frozenEpoch, 2);
+  assert.equal(frozenCount, 18);
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), true);
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name.startsWith("herdr_mcp.")), false);
 
-  assert.equal(PUBLIC_CONTRACT_EPOCH, expectedEpoch);
-  assert.equal(PUBLIC_CONTRACT_HASH, expectedHash);
+  // Current runtime execution contract: epoch-3 identity over the frozen 18-tool shape.
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 3);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, PUBLIC_CONTRACT_HASH);
+
+  assert.equal(PUBLIC_CONTRACT_EPOCH, 3);
+  assert.equal(PUBLIC_CONTRACT_HASH, "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5");
   assert.equal(EDGE_EPOCH, 3);
   assert.equal(EDGE_HASH, EPOCH3_CONTRACT.contract_hash);
   assert.equal(EPOCH3_CONTRACT.tool_count, 19);
   assert.equal(EPOCH3_CONTRACT.tools.some((tool) => tool.name === "herdr_devices"), true);
-  assert.equal(SELF_UPDATE_HASH, expectedHash);
-  assert.equal(SELF_UPDATE_TOOL_COUNT, expectedCount);
+
+  // The legacy Node self-update path stays pinned to the frozen epoch-2 catalog.
+  assert.equal(SELF_UPDATE_HASH, frozenHash);
+  assert.equal(SELF_UPDATE_TOOL_COUNT, frozenCount);
   assert.equal(PUBLIC_CONTRACT_PROFILE, "epoch2");
-  assert.equal(DOMAIN_EPOCH, expectedEpoch);
-  assert.equal(DOMAIN_HASH, expectedHash);
-  assert.equal(DOMAIN_TOOL_COUNT, expectedCount);
+
+  // The cutover/domain probe follows the current runtime execution contract.
+  assert.equal(DOMAIN_EPOCH, 3);
+  assert.equal(DOMAIN_HASH, PUBLIC_CONTRACT_HASH);
+  assert.equal(DOMAIN_TOOL_COUNT, 18);
 });
 
 test("public MCP identity version follows package/runtime release version", () => {

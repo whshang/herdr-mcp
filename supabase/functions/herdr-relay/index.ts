@@ -24,9 +24,21 @@ export const MAX_FRAME_BYTES = 1024 * 1024; // 1 MiB
 export const MAX_AUTH_HEX_LEN = 1024; // 512 bytes * 2 hex chars
 export const HEALTH_PROBE_TIMEOUT_MS = 3_000;
 export const MAX_HEALTH_RESPONSE_BYTES = 64 * 1024;
-export const EXPECTED_RUNTIME_CONTRACT_EPOCH = 2;
+export const EXPECTED_RUNTIME_CONTRACT_EPOCH = 3;
 export const EXPECTED_RUNTIME_CONTRACT_HASH =
-  "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
+  "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
+/** Previous runtime baseline accepted during the Edge rollout window. */
+export const COMPATIBLE_RUNTIME_CONTRACTS = [
+  {
+    epoch: EXPECTED_RUNTIME_CONTRACT_EPOCH,
+    hash: EXPECTED_RUNTIME_CONTRACT_HASH,
+  },
+  {
+    epoch: 2,
+    hash:
+      "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
+  },
+] as const;
 
 // Relay Protocol v1 workstation identity grammar. This intentionally accepts
 // legacy installed ids such as `prod-real-runtime` as well as canonical
@@ -303,11 +315,15 @@ export async function verifyUpstreamHealth(
       };
     }
 
-    const runtimeEpoch = parsed.runtimeContractEpoch ?? parsed.contractEpoch;
-    const runtimeHash = parsed.runtimeContractHash ?? parsed.contractHash;
+    const runtimeEpoch = parsed.currentRuntimeContractEpoch ??
+      parsed.runtimeContractEpoch ?? parsed.contractEpoch;
+    const runtimeHash = parsed.currentRuntimeContractHash ??
+      parsed.runtimeContractHash ?? parsed.contractHash;
     if (
-      runtimeEpoch !== EXPECTED_RUNTIME_CONTRACT_EPOCH ||
-      runtimeHash !== EXPECTED_RUNTIME_CONTRACT_HASH
+      !COMPATIBLE_RUNTIME_CONTRACTS.some(
+        (contract) =>
+          contract.epoch === runtimeEpoch && contract.hash === runtimeHash,
+      )
     ) {
       return {
         ok: false,

@@ -159,8 +159,8 @@ async function pair(env, name) {
 
 test("health and info expose the same explicit first-party public contract identity", async () => {
   for (const [edgeEnv, expectedEpoch] of [
-    ["dev", 4],
-    ["prod", 4],
+    ["dev", 5],
+    ["prod", 5],
     [undefined, 3],
     ["unknown", 3],
   ]) {
@@ -171,7 +171,9 @@ test("health and info expose the same explicit first-party public contract ident
     assert.equal(info.publicContract.epoch, expectedEpoch);
     assert.equal(health.contractHash, info.publicContract.hash);
     assert.equal(health.runtimeContractEpoch, 2);
-    assert.equal(info.runtimeContract.epoch, 2);
+    assert.equal(health.currentRuntimeContractEpoch, 3);
+    assert.equal(info.runtimeContract.epoch, 3);
+    assert.equal(info.previousRuntimeContract.epoch, 2);
   }
 });
 

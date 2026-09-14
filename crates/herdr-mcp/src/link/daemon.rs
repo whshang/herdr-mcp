@@ -33,12 +33,30 @@ use super::transport::{
     TransportConfig,
 };
 
-/// Public epoch-2 contract identity shared with Node `daemon.ts`.
-pub const PUBLIC_CONTRACT_EPOCH: u64 = 2;
+/// Current runtime execution contract epoch 3, shaped from the frozen epoch-2
+/// catalog by the `contracts/runtime-exec-v3.json` descriptor.
+pub const PUBLIC_CONTRACT_EPOCH: u64 = 3;
 pub const PUBLIC_CONTRACT_HASH: &str =
+    "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
+/// Immediately previous runtime execution contract (frozen epoch 2). The
+/// current Rust binary never *runs* it — rollback activates the old binary —
+/// but Edge/Relay must keep accepting an epoch-2 workstation hello during the
+/// rollout window, and a new Link may still probe an Edge that has not yet been
+/// redeployed.
+pub const PREVIOUS_PUBLIC_CONTRACT_EPOCH: u64 = 2;
+pub const PREVIOUS_PUBLIC_CONTRACT_HASH: &str =
     "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
 pub const LEGACY_EPOCH1_CONTRACT_HASH: &str =
     "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
+
+/// Edge/Relay acceptance window for a workstation hello: the current runtime
+/// execution contract or its immediately previous rollback baseline. Purely an
+/// interoperability window; it never makes the current binary run the previous
+/// contract locally.
+pub fn is_runtime_rollback_compatible(epoch: u64, hash: &str) -> bool {
+    (epoch == PUBLIC_CONTRACT_EPOCH && hash == PUBLIC_CONTRACT_HASH)
+        || (epoch == PREVIOUS_PUBLIC_CONTRACT_EPOCH && hash == PREVIOUS_PUBLIC_CONTRACT_HASH)
+}
 
 const DAEMON_TRANSPORT_PING_MS: i64 = 15_000;
 // Transport liveness is covered by RFC WebSocket ping/pong. Keep the
@@ -556,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_config_uses_public_epoch2_identity_and_loopback_mcp_default() {
+    fn daemon_config_uses_current_runtime_identity_and_loopback_mcp_default() {
         let cfg = read_link_daemon_config(&env(&[])).expect("config");
         assert_eq!(cfg.contract_epoch, PUBLIC_CONTRACT_EPOCH);
         assert_eq!(cfg.contract_hash, PUBLIC_CONTRACT_HASH);
@@ -565,6 +583,22 @@ mod tests {
         assert_eq!(cfg.edge_url, "wss://herdr-edge-dev.example/ws");
         assert_eq!(cfg.workstation_id, "dev-w1");
         assert_eq!(cfg.preferred_route_kind, None);
+    }
+
+    #[test]
+    fn daemon_config_rejects_the_previous_runtime_contract() {
+        // Rollback activates the previous binary; the current binary must not
+        // run a mixed/previous runtime contract from config.
+        let error = read_link_daemon_config(&env(&[
+            ("HERDR_CONTRACT_EPOCH", "2"),
+            ("HERDR_CONTRACT_HASH", PREVIOUS_PUBLIC_CONTRACT_HASH),
+        ]))
+        .expect_err("previous runtime contract");
+        assert!(
+            error
+                .to_string()
+                .contains("not a supported public or rollback contract")
+        );
     }
 
     #[test]
@@ -665,7 +699,7 @@ mod tests {
             .unwrap()
             .block_on(run_link_daemon(cfg))
             .expect_err("epoch1 run");
-        assert!(error.contains("requires contract epoch 2"));
+        assert!(error.contains("requires contract epoch 3"));
     }
 
     #[tokio::test]
