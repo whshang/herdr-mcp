@@ -5093,6 +5093,14 @@ const ALLOWED_BROWSER_CAPABILITY_OPERATIONS: &[&str] = &[
     "space.rename",
 ];
 
+/// Normalize the provider capability snapshot reported by a browser adapter.
+///
+/// The registry stores exactly one shape — the allowed `operations` list — while an
+/// adapter may report a richer object (`schema_version`, `input_modalities`,
+/// `limits`, ...). Only `operations` is authoritative: every reported operation must
+/// be in the allowlist, and sibling keys are dropped rather than persisted or treated
+/// as a hard failure. Anything without a usable `operations` array is still rejected,
+/// so a payload that only carries unrelated (possibly secret-like) fields fails closed.
 fn normalize_browser_capabilities(value: &str) -> Result<String, String> {
     if value.is_empty() || value.len() > 16 * 1024 {
         return Err("browser_capabilities_invalid".to_owned());
@@ -5102,9 +5110,6 @@ fn normalize_browser_capabilities(value: &str) -> Result<String, String> {
     let serde_json::Value::Object(object) = parsed else {
         return Err("browser_capabilities_invalid".to_owned());
     };
-    if object.len() != 1 || !object.contains_key("operations") {
-        return Err("browser_capabilities_invalid".to_owned());
-    }
     let Some(ops) = object
         .get("operations")
         .and_then(serde_json::Value::as_array)
@@ -10409,13 +10414,15 @@ mod tests {
         assert_eq!(migrated_family.consent_revision, 3);
         assert!(migrated_family.tool_bridge_mutation_allowed);
 
-        // Provider capabilities: allowlist only. Unknown keys, apiKey, password, account_id all fail closed.
+        // Provider capabilities: allowlist only. Secret-like payloads that carry no
+        // usable `operations` list, unknown operations, and wrong shapes fail closed.
+        // Sibling keys next to a valid `operations` list are dropped, not persisted.
         for forbidden in [
             r#"{"apiKey":"secret-123"}"#,
             r#"{"password":"hunter2"}"#,
             r#"{"account_id":"user_123"}"#,
             r#"{"token":"tok_123"}"#,
-            r#"{"operations":["identity.inspect"],"extra_field":true}"#,
+            r#"{"unknown_looking_sibling":true}"#,
             r#"{"operations":["unknown.op"]}"#,
             r#"{"operations":[123]}"#,
             r#"{"operations":"not_an_array"}"#,
@@ -10671,6 +10678,97 @@ mod tests {
             !resource_columns
                 .iter()
                 .any(|name| name == "native_identity")
+        );
+    }
+
+    #[test]
+    fn browser_provider_capabilities_accept_the_adapter_shape_and_store_only_operations() {
+        // The adapter may report a richer capability object; only `operations` is
+        // authoritative and everything else is dropped, never persisted.
+        let adapter_shape = r#"{"schema_version":1,"operations":["composer.submit","session.create","generation.status","generation.stop","session.archive","session.inspect","session.open","composer.select_tool"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"},"provider_message_chars":{"status":"unknown","authority":"provider"},"provider_response_timeout_ms":{"status":"unknown","authority":"provider"},"provider_model_reasoning_combinations":{"status":"unknown","authority":"provider"}},"apiKey":"must-not-be-persisted"}"#;
+        let normalized = normalize_browser_capabilities(adapter_shape).unwrap();
+        assert_eq!(
+            normalized,
+            r#"{"operations":["composer.select_tool","composer.submit","generation.status","generation.stop","session.archive","session.create","session.inspect","session.open"]}"#
+        );
+        assert!(!normalized.contains("apiKey"));
+        assert!(!normalized.contains("schema_version"));
+        assert_eq!(
+            normalize_browser_capabilities(r#"{"operations":[]}"#).unwrap(),
+            r#"{"operations":[]}"#
+        );
+        // Duplicates collapse and the stored value is ordered deterministically.
+        assert_eq!(
+            normalize_browser_capabilities(
+                r#"{"operations":["session.create","session.create","space.list"]}"#
+            )
+            .unwrap(),
+            r#"{"operations":["session.create","space.list"]}"#
+        );
+        for invalid in [
+            r#"{}"#,
+            r#"{"schema_version":1,"input_modalities":["text"]}"#,
+            r#"{"operations":"session.create"}"#,
+            r#"{"operations":[1]}"#,
+            r#"{"operations":["unknown.operation"]}"#,
+            r#""not-an-object""#,
+            r#"[]"#,
+            r#"null"#,
+        ] {
+            assert_eq!(
+                normalize_browser_capabilities(invalid).unwrap_err(),
+                "browser_capabilities_invalid",
+                "must reject {invalid}"
+            );
+        }
+        let too_many = format!(
+            r#"{{"operations":[{}]}}"#,
+            (0..65)
+                .map(|_| r#""session.create""#)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            normalize_browser_capabilities(&too_many).unwrap_err(),
+            "browser_capabilities_invalid"
+        );
+        let oversized = format!(
+            r#"{{"operations":["session.create"],"padding":"{}"}}"#,
+            "x".repeat(17 * 1024)
+        );
+        assert_eq!(
+            normalize_browser_capabilities(&oversized).unwrap_err(),
+            "browser_capabilities_invalid"
+        );
+    }
+
+    #[test]
+    fn browser_provider_observe_accepts_the_extension_capability_object() {
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const PROFILE_SEED: &str = "profile-seed-extension-capability";
+        let mut store = StateStore::open(":memory:").unwrap();
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: DEVICE,
+                profile_seed: PROFILE_SEED,
+                browser_family: "ego",
+                extension_version: "0.1.91",
+                observed_at: 10,
+            })
+            .unwrap();
+        let observed = store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 1_789_378_392_882,
+                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","composer.select_tool","generation.status","generation.stop","session.archive","session.inspect","session.open","session.create"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"}}}"#,
+                observed_at: 11,
+            })
+            .unwrap();
+        assert_eq!(
+            observed.capabilities_json,
+            r#"{"operations":["composer.select_tool","composer.submit","generation.status","generation.stop","session.archive","session.create","session.inspect","session.open"]}"#
         );
     }
 }
