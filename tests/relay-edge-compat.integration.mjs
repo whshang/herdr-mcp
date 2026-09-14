@@ -185,9 +185,24 @@ test("future epoch 4 annotates only read-only tools and leaves prior hashes unch
     assert.ok(tool, `${name} must exist in epoch 4`);
     assert.notEqual(tool.annotations?.readOnlyHint, true, `${name} must not be mislabeled read-only`);
   }
-  // Only annotations differ from epoch 3; the underlying tool definitions are untouched.
+  const epoch3Exec = EPOCH3_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec");
+  const epoch4Exec = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec");
+  assert.ok(epoch3Exec && epoch4Exec, "herdr_exec must exist in both epochs");
+  assert.ok(epoch4Exec.inputSchema.properties.steps, "epoch 4 must advertise structured exec steps");
+  assert.deepEqual(epoch4Exec.inputSchema.required, ["workspace"]);
+  assert.equal(epoch4Exec.inputSchema.oneOf.length, 2);
+  assert.equal(epoch4Exec.inputSchema.properties.steps.maxItems, 16);
+  assert.equal(epoch4Exec.inputSchema.properties.steps.items.properties.args.maxItems, 128);
+
+  // Apart from herdr_exec's deliberate structured schema/description, epoch 4
+  // only adds annotations to the frozen epoch-3 catalog.
   const strip = (tools) => tools.map(({ annotations, ...rest }) => rest);
-  assert.deepEqual(strip(EPOCH4_CONTRACT.tools), strip(EPOCH3_CONTRACT.tools));
+  assert.deepEqual(
+    strip(EPOCH4_CONTRACT.tools.filter((tool) => tool.name !== "herdr_exec")),
+    strip(EPOCH3_CONTRACT.tools.filter((tool) => tool.name !== "herdr_exec")),
+  );
+  const stripExecDelta = ({ annotations, description, inputSchema, ...rest }) => rest;
+  assert.deepEqual(stripExecDelta(epoch4Exec), stripExecDelta(epoch3Exec));
   // Frozen prior epochs stayed bit-for-bit identical.
   assert.equal(EPOCH3_CONTRACT.contract_hash, "sha256:b8b4e5d13ccb3a1a7ab0c2e9ccfa913c076d0e1cd978cfe544d1261ea2509071");
   assert.equal(computeContractHash(EPOCH3_CONTRACT.tools), EPOCH3_CONTRACT.contract_hash);

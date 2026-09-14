@@ -3,6 +3,7 @@ use crate::exec_sessions::{ExecRegistry, enriched_exec_path, resolve_exec_shell}
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
 use crate::projects;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::env;
@@ -29,6 +30,8 @@ const PRE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: usize = 8_000;
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_STRUCTURED_STEPS: usize = 16;
+const MAX_STRUCTURED_ARGS: usize = 128;
 static NEXT_EXEC: AtomicU64 = AtomicU64::new(0);
 static UTILITY_PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static UTILITY_PANE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -68,6 +71,14 @@ struct LocalResult {
     truncated: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredExecStep {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 pub fn run_durable(
     client: &HerdrClient,
     snapshot: &Value,
@@ -78,8 +89,7 @@ pub fn run_durable(
         Ok(value) => value,
         Err(error) => return error,
     };
-    let command = match required_str(args, "command") {
-        Ok("") => return invalid("command must not be empty"),
+    let command = match resolve_exec_command(args) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -170,10 +180,53 @@ pub fn run_durable(
         snapshot,
         registry,
         (&workspace.id, &effective_root),
-        command,
+        &command,
         timeout_ms,
         &working,
     )
+}
+
+fn resolve_exec_command(args: &Value) -> Result<String, Value> {
+    let command = optional_str(args, "command")?;
+    let steps = args.get("steps");
+    match (command, steps) {
+        (Some(""), _) => Err(invalid("command must not be empty")),
+        (Some(_), Some(_)) => Err(invalid("exactly one of command or steps is allowed")),
+        (Some(command), None) => Ok(command.to_owned()),
+        (None, Some(steps)) => structured_steps_command(steps),
+        (None, None) => Err(invalid("exactly one of command or steps is required")),
+    }
+}
+
+fn structured_steps_command(value: &Value) -> Result<String, Value> {
+    let steps: Vec<StructuredExecStep> = serde_json::from_value(value.clone())
+        .map_err(|_| invalid("steps must be an array of {program,args} objects"))?;
+    if steps.is_empty() || steps.len() > MAX_STRUCTURED_STEPS {
+        return Err(invalid(&format!(
+            "steps must contain 1..={MAX_STRUCTURED_STEPS} items"
+        )));
+    }
+    let mut commands = Vec::with_capacity(steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        if step.program.is_empty() || step.program.contains('\0') {
+            return Err(invalid(&format!(
+                "steps[{index}].program must be non-empty and contain no NUL"
+            )));
+        }
+        if step.args.len() > MAX_STRUCTURED_ARGS || step.args.iter().any(|arg| arg.contains('\0')) {
+            return Err(invalid(&format!(
+                "steps[{index}].args must contain at most {MAX_STRUCTURED_ARGS} NUL-free strings"
+            )));
+        }
+        commands.push(
+            std::iter::once(step.program.as_str())
+                .chain(step.args.iter().map(String::as_str))
+                .map(shell_quote)
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    Ok(commands.join(" && "))
 }
 
 pub(crate) fn start_reusable_pane_session(
@@ -1142,6 +1195,38 @@ mod tests {
             select_project_root(Some("/tmp/c"), &roots).unwrap_err(),
             PathBuf::from("/tmp/c")
         );
+    }
+
+    #[test]
+    fn structured_exec_compiles_literal_argv_into_one_local_sequence() {
+        let command = resolve_exec_command(&json!({
+            "workspace": "w1",
+            "steps": [
+                {"program": "printf", "args": ["%s\\n", "a; b", "$(uname)", "it's literal"]},
+                {"program": "/usr/bin/git", "args": ["status", "--short"]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            command,
+            "'printf' '%s\\n' 'a; b' '$(uname)' 'it'\\''s literal' && '/usr/bin/git' 'status' '--short'"
+        );
+    }
+
+    #[test]
+    fn structured_exec_rejects_mixed_modes_and_unknown_step_fields() {
+        let mixed = resolve_exec_command(&json!({
+            "command": "git status",
+            "steps": [{"program": "git", "args": ["status"]}]
+        }))
+        .unwrap_err();
+        assert_eq!(mixed["code"], "invalid_params");
+
+        let unknown = resolve_exec_command(&json!({
+            "steps": [{"program": "git", "shell": true}]
+        }))
+        .unwrap_err();
+        assert_eq!(unknown["code"], "invalid_params");
     }
 
     #[cfg(unix)]

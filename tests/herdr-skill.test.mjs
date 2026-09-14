@@ -100,7 +100,10 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /Do not wait for the user to notice accumulated panes/);
     assert.match(r.content, /settled Agent.*does not need to remain open.*preserve task history/s);
     assert.match(r.content, /canonical reusable `herdr-mcp:utility` pane/);
-    assert.match(r.content, /same WebChat conversation\/task.*same workspace\/project.*one `herdr_exec` wave/s);
+    assert.match(r.content, /current public schema advertises `herdr_exec\.steps`.*transparent structured `program` \+ `args`/s);
+    assert.match(r.content, /Use freeform `herdr_exec\.command` only when actual shell semantics/s);
+    assert.match(r.content, /Do not concatenate several otherwise independent process invocations with `&&`, `;`/s);
+    assert.match(r.content, /same WebChat conversation\/task.*same workspace\/project.*structured `herdr_exec\.steps`/s);
     assert.match(r.content, /Do not use `pane\.split` or `herdr_exec_start` merely to get another shell/);
     assert.match(r.content, /macOS privacy-protected roots.*canonical utility pane.*ordinary roots.*native background-process path/s);
     assert.match(r.content, /Bounded SSH maintenance\/recovery.*canonical utility pane.*same `session_id`/s);
