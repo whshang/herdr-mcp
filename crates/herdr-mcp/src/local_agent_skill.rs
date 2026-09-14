@@ -408,12 +408,50 @@ where
         }
         files.push((entry.path.clone(), bytes));
     }
+    let entrypoint = files
+        .iter()
+        .find(|(path, _)| path == "SKILL.md")
+        .map(|(_, bytes)| bytes.as_slice())
+        .ok_or_else(|| "agent Skill bundle is missing SKILL.md".to_owned())?;
+    validate_skill_entrypoint(entrypoint)?;
     Ok(SkillBundle {
         manifest_bytes,
         manifest_sha256,
         manifest,
         files,
     })
+}
+
+fn validate_skill_entrypoint(bytes: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "agent Skill SKILL.md is not valid UTF-8".to_owned())?;
+    let body = text
+        .strip_prefix("---\n")
+        .ok_or_else(|| "agent Skill SKILL.md is missing YAML frontmatter".to_owned())?;
+    let (frontmatter, _) = body
+        .split_once("\n---\n")
+        .ok_or_else(|| "agent Skill SKILL.md has unterminated YAML frontmatter".to_owned())?;
+    let mut name = None;
+    let mut description = None;
+    for line in frontmatter.lines() {
+        if let Some(value) = line.strip_prefix("name: ") {
+            name = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("description: ") {
+            let parsed: String = serde_json::from_str(value).map_err(|_| {
+                "agent Skill description must be a JSON-compatible quoted YAML scalar".to_owned()
+            })?;
+            description = Some(parsed);
+        }
+    }
+    if name != Some(SKILL_NAME) {
+        return Err("agent Skill SKILL.md frontmatter name mismatch".to_owned());
+    }
+    let description = description
+        .ok_or_else(|| "agent Skill SKILL.md frontmatter is missing description".to_owned())?;
+    if !valid_identity_text(&description, 2048) {
+        return Err("agent Skill SKILL.md frontmatter description is invalid".to_owned());
+    }
+    Ok(())
 }
 
 fn fetch_local_git_file(
@@ -906,6 +944,21 @@ mod tests {
     }
 
     #[test]
+    fn skill_entrypoint_requires_a_quoted_description_scalar() {
+        let valid =
+            b"---\nname: herdr-mcp\ndescription: \"Recover history: safely\"\n---\n\n# Skill\n";
+        validate_skill_entrypoint(valid).unwrap();
+
+        let ambiguous =
+            b"---\nname: herdr-mcp\ndescription: Recover history: safely\n---\n\n# Skill\n";
+        assert!(
+            validate_skill_entrypoint(ambiguous)
+                .unwrap_err()
+                .contains("quoted YAML scalar")
+        );
+    }
+
+    #[test]
     fn local_dev_fetch_reads_exact_commit_objects_not_the_working_tree() {
         let root = test_dir("local-dev-git");
         let init = Command::new("git")
@@ -922,9 +975,11 @@ mod tests {
 
         let tracked = root.join(SOURCE_ROOT);
         fs::create_dir_all(&tracked).unwrap();
-        let committed = bundle(&[("SKILL.md", b"committed-skill")]);
+        let committed_skill =
+            b"---\nname: herdr-mcp\ndescription: \"Committed skill\"\n---\n\n# Skill\n";
+        let committed = bundle(&[("SKILL.md", committed_skill)]);
         fs::write(tracked.join("manifest.json"), &committed.manifest_bytes).unwrap();
-        fs::write(tracked.join("SKILL.md"), b"committed-skill").unwrap();
+        fs::write(tracked.join("SKILL.md"), committed_skill).unwrap();
         run_git(&root, &["add", "assets/local-agent-skill/herdr-mcp"]);
         run_git(&root, &["commit", "--quiet", "-m", "test skill"]);
         let commit = run_git(&root, &["rev-parse", "HEAD"]);
@@ -942,7 +997,7 @@ mod tests {
             fetch_local_git_file(&root, &commit, repo_path, max_bytes)
         })
         .unwrap();
-        assert_eq!(fetched.files[0].1, b"committed-skill");
+        assert_eq!(fetched.files[0].1, committed_skill);
         assert_ne!(
             fetched.files[0].1,
             fs::read(tracked.join("SKILL.md")).unwrap()

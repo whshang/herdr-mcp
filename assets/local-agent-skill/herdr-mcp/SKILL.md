@@ -1,6 +1,6 @@
 ---
 name: herdr-mcp
-description: Use when a local coding agent needs Herdr-MCP collaboration: recover prior project work, search Work Memory, control supported WebChat sessions through the browser extension, inspect/install the extension bridge, or clean up Herdr/WebChat resources created by the current task.
+description: "Use when a local coding agent needs Herdr-MCP collaboration: recover prior project work, search Work Memory, control supported WebChat sessions through the browser extension, inspect/install the extension bridge, or clean up Herdr/WebChat resources created by the current task."
 ---
 
 # Herdr-MCP local agent
