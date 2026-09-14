@@ -24,7 +24,56 @@ function isNativeHostMissing(message) {
   return text.includes("native messaging host") && text.includes("not found");
 }
 
-function nativeMessage(message) {
+function normalizedNativeFailure(message) {
+  const err = String(message || "native-host-error");
+  if (isNativeHostMissing(err)) return { ok: false, error: NATIVE_HOST_NOT_INSTALLED };
+  if (isNativeAdmissionDenied(err)) {
+    return { ok: true, active: false, reason: NATIVE_ORIGIN_NOT_ACTIVE };
+  }
+  return { ok: false, error: err };
+}
+
+function nativePortMessage(message, timeoutMs = 30_000) {
+  return new Promise((resolve) => {
+    if (!globalThis.chrome?.runtime?.connectNative) {
+      resolve(null);
+      return;
+    }
+    let port = null;
+    let settled = false;
+    let timer = null;
+    const finish = (value, disconnect = false) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (disconnect) {
+        try { port?.disconnect(); } catch (_) {}
+      }
+      resolve(value);
+    };
+    try {
+      port = chrome.runtime.connectNative(HERDR_NATIVE_HOST);
+      port.onMessage.addListener((response) => {
+        finish(response && typeof response === "object"
+          ? response
+          : { ok: false, error: "native-host-empty-response" }, true);
+      });
+      port.onDisconnect.addListener(() => {
+        if (settled) return;
+        const err = chrome.runtime.lastError?.message;
+        finish(normalizedNativeFailure(err || "native-host-empty-response"));
+      });
+      timer = setTimeout(() => {
+        finish({ ok: false, error: "native-host-timeout" }, true);
+      }, Math.max(1_000, Math.min(Number(timeoutMs) || 30_000, 60_000)));
+      port.postMessage(message);
+    } catch (error) {
+      finish(normalizedNativeFailure(error?.message || error || "native-host-error"), true);
+    }
+  });
+}
+
+function legacyNativeMessage(message) {
   return new Promise((resolve) => {
     if (!globalThis.chrome?.runtime?.sendNativeMessage) {
       resolve({ ok: false, error: "native-messaging-unavailable" });
@@ -34,15 +83,7 @@ function nativeMessage(message) {
       chrome.runtime.sendNativeMessage(HERDR_NATIVE_HOST, message, (response) => {
         const err = chrome.runtime.lastError?.message;
         if (err) {
-          if (isNativeHostMissing(err)) {
-            resolve({ ok: false, error: NATIVE_HOST_NOT_INSTALLED });
-            return;
-          }
-          if (isNativeAdmissionDenied(err)) {
-            resolve({ ok: true, active: false, reason: NATIVE_ORIGIN_NOT_ACTIVE });
-            return;
-          }
-          resolve({ ok: false, error: err });
+          resolve(normalizedNativeFailure(err));
           return;
         }
         resolve(response && typeof response === "object"
@@ -53,6 +94,11 @@ function nativeMessage(message) {
       resolve({ ok: false, error: String(error?.message || error || "native-host-error") });
     }
   });
+}
+
+async function nativeMessage(message, timeoutMs = 30_000) {
+  const response = await nativePortMessage(message, timeoutMs);
+  return response ?? legacyNativeMessage(message);
 }
 
 function normalizedHeaders(headers) {
@@ -90,7 +136,7 @@ function nativeRequestPayload(input, init = {}) {
 }
 
 export async function getNativeExtensionOwnerStatus() {
-  return nativeMessage({ type: "identity" });
+  return nativeMessage({ type: "identity" }, 5_000);
 }
 
 // Dedicated ChatGPT Web generated-image capture over Native Messaging.
@@ -121,15 +167,16 @@ export async function captureWebArtifactNative(artifact) {
     bytes_b64: artifact.bytes_b64,
   };
   if (artifact.sha256 != null) strict.sha256 = artifact.sha256;
-  return nativeMessage({ type: "artifact_capture", ...strict });
+  return nativeMessage({ type: "artifact_capture", ...strict }, 60_000);
 }
 
 
 export async function localHerdrFetch(input, init = {}) {
+  const nativeTimeoutMs = Number(init.nativeTimeoutMs || 10_000);
   const response = await nativeMessage({
     type: "request",
     ...nativeRequestPayload(input, init),
-  });
+  }, nativeTimeoutMs + 1_500);
   // Standby is a successful transport answer with no active owner origin. It
   // must surface as a diagnosable failure instead of an empty 500 response.
   if (response?.active === false && response?.reason === NATIVE_ORIGIN_NOT_ACTIVE) {
@@ -157,7 +204,11 @@ export async function localHerdrBatchFetch(requests = []) {
   } catch (error) {
     return { ok: false, error: "native-request-batch-invalid", detail: String(error?.message || error || "") };
   }
-  const response = await nativeMessage({ type: "request_batch", requests: encoded });
+  const nativeTimeoutMs = Math.max(10_000, ...encoded.map((request) => Number(request.timeout_ms || 10_000)));
+  const response = await nativeMessage(
+    { type: "request_batch", requests: encoded },
+    nativeTimeoutMs + 1_500,
+  );
   if (response?.ok !== true) {
     return { ok: false, error: String(response?.error || "native-host-request-batch-failed") };
   }

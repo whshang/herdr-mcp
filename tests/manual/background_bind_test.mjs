@@ -542,7 +542,21 @@ globalThis.chrome = {
               if (disconnected) return;
               for (const fn of messageListeners) fn({ type: "stream_open", status: 200, transport: "ipc" });
             });
+            return;
           }
+          globalThis.chrome.runtime.sendNativeMessage("dev.herdr.mcp", message, (response) => {
+            const err = globalThis.chrome.runtime.lastError?.message || null;
+            queueMicrotask(() => {
+              if (disconnected) return;
+              if (err) {
+                globalThis.chrome.runtime.lastError = { message: err };
+                for (const fn of disconnectListeners) fn();
+                globalThis.chrome.runtime.lastError = null;
+                return;
+              }
+              for (const fn of messageListeners) fn(response);
+            });
+          });
         },
         disconnect() {
           if (disconnected) return;

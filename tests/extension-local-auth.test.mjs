@@ -43,6 +43,62 @@ test("extension proxies localhost requests through Native Messaging without forw
   }
 });
 
+test("one-shot local requests prefer a short-lived connectNative port", async () => {
+  const oldChrome = globalThis.chrome;
+  const messageListeners = [];
+  const disconnectListeners = [];
+  let posted = null;
+  let disconnected = false;
+  let legacyCalls = 0;
+  globalThis.chrome = {
+    runtime: {
+      id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      lastError: null,
+      connectNative(host) {
+        assert.equal(host, HERDR_NATIVE_HOST);
+        return {
+          onMessage: { addListener(fn) { messageListeners.push(fn); } },
+          onDisconnect: { addListener(fn) { disconnectListeners.push(fn); } },
+          postMessage(message) {
+            posted = message;
+            queueMicrotask(() => {
+              for (const fn of messageListeners) {
+                fn({
+                  ok: true,
+                  transport: "ipc",
+                  status: 200,
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ ok: true, source: "connectNative" }),
+                });
+              }
+            });
+          },
+          disconnect() {
+            disconnected = true;
+            for (const fn of disconnectListeners) fn();
+          },
+        };
+      },
+      sendNativeMessage() {
+        legacyCalls += 1;
+      },
+    },
+  };
+
+  try {
+    const response = await localHerdrFetch("http://127.0.0.1:8772/push/state", {
+      nativeTimeoutMs: 4321,
+    });
+    assert.deepEqual(await response.json(), { ok: true, source: "connectNative" });
+    assert.equal(posted.type, "request");
+    assert.equal(posted.timeout_ms, 4321);
+    assert.equal(disconnected, true);
+    assert.equal(legacyCalls, 0, "sendNativeMessage is compatibility-only when connectNative exists");
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
 test("extension receives push SSE bytes over one persistent Native Messaging stream", async () => {
   const oldChrome = globalThis.chrome;
   const messageListeners = [];
