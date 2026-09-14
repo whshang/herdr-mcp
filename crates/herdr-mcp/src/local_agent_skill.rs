@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -249,16 +249,33 @@ fn classify_installed_skill(
 fn sync_from_runtime() -> Result<Value, String> {
     let source = current_source_identity()?;
     let target = skill_target_dir()?;
-    let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
-        .user_agent(format!("herdr-mcp/{}", source.runtime_version))
-        .build()
-        .map_err(|error| format!("cannot create agent Skill fetch client: {error}"))?;
     let source_commit = source.source_commit.clone();
-    let bundle = fetch_bundle(&source, |repo_path, max_bytes| {
-        fetch_repo_file(&client, &source_commit, repo_path, max_bytes)
-    })?;
+    let local_dev_repo = if source.runtime_channel == "dev" {
+        crate::dev::local_agent_skill_source_repo(&source_commit)?
+    } else {
+        None
+    };
+    let (bundle, source_origin) = if let Some(repo) = local_dev_repo.as_ref() {
+        (
+            fetch_bundle(&source, |repo_path, max_bytes| {
+                fetch_local_git_file(repo, &source_commit, repo_path, max_bytes)
+            })?,
+            "local_dev_git_object",
+        )
+    } else {
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(15))
+            .user_agent(format!("herdr-mcp/{}", source.runtime_version))
+            .build()
+            .map_err(|error| format!("cannot create agent Skill fetch client: {error}"))?;
+        (
+            fetch_bundle(&source, |repo_path, max_bytes| {
+                fetch_repo_file(&client, &source_commit, repo_path, max_bytes)
+            })?,
+            "release_repository",
+        )
+    };
     let outcome = install_bundle(&target, &source, &bundle)?;
     let mut result = json!({
         "ok": true,
@@ -267,6 +284,7 @@ fn sync_from_runtime() -> Result<Value, String> {
         "runtime_version": source.runtime_version,
         "runtime_channel": source.runtime_channel,
         "source_commit": source.source_commit,
+        "source_origin": source_origin,
         "manifest_sha256": bundle.manifest_sha256,
         "file_count": bundle.manifest.files.len(),
     });
@@ -396,6 +414,72 @@ where
         manifest,
         files,
     })
+}
+
+fn fetch_local_git_file(
+    repo: &Path,
+    source_commit: &str,
+    repo_path: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if !valid_commit(source_commit) || !valid_repo_path(repo_path) {
+        return Err("invalid local DEV agent Skill repository source identity".to_owned());
+    }
+    let object = format!("{source_commit}:{repo_path}");
+    let size_output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-s", object.as_str()])
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .output()
+        .map_err(|error| {
+            format!(
+                "cannot inspect exact DEV agent Skill source {repo_path} in {}: {error}",
+                repo.display()
+            )
+        })?;
+    if !size_output.status.success() {
+        return Err(format!(
+            "exact DEV agent Skill source {repo_path} is unavailable at {source_commit} in {}",
+            repo.display()
+        ));
+    }
+    let size_text = String::from_utf8(size_output.stdout)
+        .map_err(|_| format!("invalid Git size for DEV agent Skill source {repo_path}"))?;
+    let size = size_text
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("invalid Git size for DEV agent Skill source {repo_path}"))?;
+    if size > max_bytes {
+        return Err(format!(
+            "DEV agent Skill source {repo_path} exceeds the size limit"
+        ));
+    }
+
+    let content_output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "blob", object.as_str()])
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .output()
+        .map_err(|error| {
+            format!(
+                "cannot read exact DEV agent Skill source {repo_path} in {}: {error}",
+                repo.display()
+            )
+        })?;
+    if !content_output.status.success() {
+        return Err(format!(
+            "cannot read exact DEV agent Skill source {repo_path} at {source_commit} in {}",
+            repo.display()
+        ));
+    }
+    if content_output.stdout.len() != size || content_output.stdout.len() > max_bytes {
+        return Err(format!(
+            "DEV agent Skill source {repo_path} changed or exceeded the size limit while reading"
+        ));
+    }
+    Ok(content_output.stdout)
 }
 
 fn fetch_repo_file(
@@ -803,6 +887,67 @@ mod tests {
                 .map(|(path, bytes)| ((*path).to_owned(), (*bytes).to_vec()))
                 .collect(),
         }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn local_dev_fetch_reads_exact_commit_objects_not_the_working_tree() {
+        let root = test_dir("local-dev-git");
+        let init = Command::new("git")
+            .args(["init", "--quiet", "--object-format=sha1"])
+            .arg(&root)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        run_git(&root, &["config", "user.name", "Herdr Test"]);
+        run_git(
+            &root,
+            &["config", "user.email", "herdr-test@example.invalid"],
+        );
+
+        let tracked = root.join(SOURCE_ROOT);
+        fs::create_dir_all(&tracked).unwrap();
+        let committed = bundle(&[("SKILL.md", b"committed-skill")]);
+        fs::write(tracked.join("manifest.json"), &committed.manifest_bytes).unwrap();
+        fs::write(tracked.join("SKILL.md"), b"committed-skill").unwrap();
+        run_git(&root, &["add", "assets/local-agent-skill/herdr-mcp"]);
+        run_git(&root, &["commit", "--quiet", "-m", "test skill"]);
+        let commit = run_git(&root, &["rev-parse", "HEAD"]);
+        assert!(valid_commit(&commit));
+
+        // A later working-tree edit must never be mislabeled as the Skill for
+        // the already-running DEV commit.
+        fs::write(tracked.join("SKILL.md"), b"working-tree-skill").unwrap();
+        let source = SourceIdentity {
+            runtime_version: "1.0.0-test".to_owned(),
+            runtime_channel: "dev".to_owned(),
+            source_commit: commit.clone(),
+        };
+        let fetched = fetch_bundle(&source, |repo_path, max_bytes| {
+            fetch_local_git_file(&root, &commit, repo_path, max_bytes)
+        })
+        .unwrap();
+        assert_eq!(fetched.files[0].1, b"committed-skill");
+        assert_ne!(
+            fetched.files[0].1,
+            fs::read(tracked.join("SKILL.md")).unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

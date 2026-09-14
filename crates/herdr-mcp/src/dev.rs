@@ -1351,6 +1351,45 @@ fn dev_paths(runtime: &RuntimePaths) -> DevPaths {
     }
 }
 
+/// Return the repository recorded as the source of the currently active clean
+/// DEV runtime when it matches the exact source commit requested by the local
+/// Agent Skill installer. The caller must still read content from that commit's
+/// Git objects rather than from the mutable working tree.
+pub(crate) fn local_agent_skill_source_repo(
+    source_commit: &str,
+) -> Result<Option<PathBuf>, String> {
+    let runtime = RuntimePaths::discover()?;
+    let paths = dev_paths(&runtime);
+    let state = read_state(&paths.state)?;
+    let Some(repo_text) = state
+        .as_ref()
+        .and_then(|state| matching_clean_dev_source_repo(state, source_commit))
+    else {
+        return Ok(None);
+    };
+    let repo = PathBuf::from(repo_text);
+    match fs::canonicalize(&repo) {
+        Ok(repo) if repo.is_dir() => Ok(Some(repo)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot resolve recorded DEV source repository {}: {error}",
+            repo.display()
+        )),
+    }
+}
+
+fn matching_clean_dev_source_repo<'a>(
+    state: &'a DevRuntimeState,
+    source_commit: &str,
+) -> Option<&'a str> {
+    (state.channel == "dev"
+        && !state.source_dirty
+        && state.source_commit.as_deref() == Some(source_commit))
+    .then_some(state.source_repo.as_deref())
+    .flatten()
+}
+
 fn current_generation(config_dir: &Path) -> Result<Option<String>, String> {
     let current = config_dir.join("runtime/current");
     match fs::symlink_metadata(&current) {
@@ -2020,6 +2059,40 @@ mod tests {
         ));
         assert_eq!(state.dev_generation.as_deref(), Some("rust-dev"));
         assert_eq!(state.updated_at_ms, 2);
+    }
+
+    #[test]
+    fn local_agent_skill_source_requires_clean_exact_dev_provenance() {
+        let mut state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "1.0.0-dev".to_owned(),
+            source_repo: Some("/tmp/herdr-mcp".to_owned()),
+            source_branch: Some("main".to_owned()),
+            source_commit: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            source_dirty: false,
+            dev_generation: Some("rust-dev".to_owned()),
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "0.4.8".to_owned(),
+            prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
+            prod_snapshot_sha256: "0".repeat(64),
+            updated_at_ms: 1,
+        };
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            matching_clean_dev_source_repo(&state, commit),
+            Some("/tmp/herdr-mcp")
+        );
+        assert_eq!(
+            matching_clean_dev_source_repo(&state, &"f".repeat(40)),
+            None
+        );
+
+        state.source_dirty = true;
+        assert_eq!(matching_clean_dev_source_repo(&state, commit), None);
+        state.source_dirty = false;
+        state.channel = "prod".to_owned();
+        assert_eq!(matching_clean_dev_source_repo(&state, commit), None);
     }
 
     #[test]
