@@ -760,6 +760,12 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   );
   assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
   assert.match(createSegment, /registeredBrowserSessionRef/);
+  const createRegistration = createSegment.indexOf("registerCurrentConversation(\"browser-session-create\")");
+  const createSettlementAssignment = createSegment.indexOf("acceptedDispatchAssignments.set(registeredBrowserSessionRef");
+  assert.ok(
+    createRegistration >= 0 && createSettlementAssignment > createRegistration,
+    "session.create must register its reservation-backed session before storing the accepted dispatch settlement assignment",
+  );
   assert.doesNotMatch(createSegment, /reasoning != null \|\| requiredApps\.length > 0/);
   assert.match(createSegment, /ensureRequiredComposerApps\(requiredApps\)/);
   assert.match(createSegment, /evidence\.required_apps_readback = appSelection\.apps/);
