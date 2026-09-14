@@ -2695,7 +2695,7 @@ fn browser_session_create_params_from_source(
     if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     }
-    let message = browser_required_string(params, "message", 262_144)?;
+    let message = browser_required_message(params, 262_144)?;
     let message = if message.contains(source_url) {
         message.to_owned()
     } else {
@@ -3845,7 +3845,7 @@ fn validate_browser_operation_params(
             browser_required_string(params, "account_ref", 96)?;
             let _ = browser_optional_string(params, "space_ref", 96)?;
             browser_required_string(params, "display_label", 256)?;
-            browser_required_string(params, "message", 262_144)?;
+            browser_required_message(params, 262_144)?;
             browser_required_reasoning_effort(params, true)?;
             browser_required_apps(params, true)?;
             browser_required_generation(params)?;
@@ -3868,7 +3868,7 @@ fn validate_browser_operation_params(
         }
         BrowserOperation::MessageAppend => {
             browser_required_string(params, "session_ref", 96)?;
-            browser_required_string(params, "message", 262_144)?;
+            browser_required_message(params, 262_144)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
         }
@@ -3886,7 +3886,7 @@ fn validate_browser_operation_params(
         }
         BrowserOperation::DispatchSubmit => {
             browser_required_string(params, "session_ref", 96)?;
-            browser_required_string(params, "message", 262_144)?;
+            browser_required_message(params, 262_144)?;
             browser_required_reasoning_effort(params, true)?;
             browser_required_apps(params, true)?;
             browser_required_generation(params)?;
@@ -4859,6 +4859,33 @@ fn browser_required_string<'a>(
                 "actual_bytes": value.len(),
             }
         }));
+    }
+    Ok(value)
+}
+
+// Message payloads keep embedded newlines/tabs (multi-line prompts) while
+// ordinary string fields stay single-line via `browser_required_string`.
+fn browser_required_message(params: &Value, max_bytes: usize) -> Result<&str, Value> {
+    let Some(value) = params.get("message").and_then(Value::as_str) else {
+        return Err(json!({"ok": false, "code": "browser_message_required"}));
+    };
+    if value.len() > max_bytes {
+        return Err(json!({
+            "ok": false,
+            "code": "browser_message_invalid",
+            "limit": {
+                "kind": "max_bytes",
+                "max_bytes": max_bytes,
+                "actual_bytes": value.len(),
+            }
+        }));
+    }
+    if value.trim().is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(json!({"ok": false, "code": "browser_message_invalid"}));
     }
     Ok(value)
 }
@@ -6575,6 +6602,85 @@ mod tests {
         assert_eq!(oversized["limit"]["kind"], "max_bytes");
         assert_eq!(oversized["limit"]["max_bytes"], 262_144);
         assert_eq!(oversized["limit"]["actual_bytes"], 262_145);
+    }
+
+    #[test]
+    fn browser_entrypoints_accept_multiline_messages() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let endpoint_ref = format!("bep_{}", "a".repeat(64));
+        let account_ref = format!("br_{}", "b".repeat(64));
+        let space_ref = format!("br_{}", "c".repeat(64));
+        let session_ref = format!("br_{}", "d".repeat(64));
+        let message = "first line\n\nsecond paragraph\twith tab\r\nthird";
+        let mut outcomes = Vec::new();
+        for (method, params) in [
+            (
+                "herdr_mcp.browser_session.create",
+                json!({
+                    "endpoint_ref": endpoint_ref,
+                    "provider": "chatgpt",
+                    "account_ref": account_ref,
+                    "space_ref": space_ref,
+                    "display_label": "Conversation",
+                    "message": message,
+                    "expected_generation": 7,
+                    "idempotency_key": "session-create-multiline-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_message.append",
+                json!({
+                    "session_ref": session_ref,
+                    "message": message,
+                    "expected_generation": 7,
+                    "idempotency_key": "message-append-multiline-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_dispatch.submit",
+                json!({
+                    "session_ref": session_ref,
+                    "message": message,
+                    "reasoning_effort": "thorough",
+                    "required_apps": ["herdr"],
+                    "expected_generation": 7,
+                    "idempotency_key": "dispatch-multiline-1"
+                }),
+            ),
+        ] {
+            let result = browser_operation_call(&store, method, &params);
+            let code = result["code"].as_str().unwrap_or("ok");
+            outcomes.push(format!("{method}: {code}"));
+        }
+        assert!(
+            !outcomes
+                .iter()
+                .any(|entry| entry.contains("browser_message_")),
+            "multiline messages must not fail message validation: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_entrypoints_reject_unsafe_messages() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let session_ref = format!("br_{}", "d".repeat(64));
+        for message in ["unsafe\u{0}message", "   \n\t  "] {
+            let result = browser_operation_call(
+                &store,
+                "herdr_mcp.browser_message.append",
+                &json!({
+                    "session_ref": session_ref,
+                    "message": message,
+                    "expected_generation": 7,
+                    "idempotency_key": "message-append-unsafe-1"
+                }),
+            );
+            assert_eq!(result["code"], "browser_message_invalid", "{message:?}");
+        }
     }
 
     #[test]
