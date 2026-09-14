@@ -92,6 +92,7 @@ let testClockOffsetMs = 0;
 Date.now = () => realDateNow() + testClockOffsetMs;
 let mockStateWorkspaces = [];
 let mockLocalRuntimeAvailable = true;
+let mockNativeHostLastError = null;
 let hangAutomationNotifications = false;
 let failQueuedInsertStorage = false;
 const queuedInsertDeliveries = [];
@@ -285,6 +286,12 @@ globalThis.chrome = {
     onInstalled: { addListener: (fn) => listeners.onInstalled.push(fn) },
     openOptionsPage: () => {},
     sendNativeMessage(_host, message, callback) {
+      if (mockNativeHostLastError) {
+        globalThis.chrome.runtime.lastError = { message: mockNativeHostLastError };
+        callback(undefined);
+        globalThis.chrome.runtime.lastError = null;
+        return;
+      }
       if (message?.type === "request_batch") {
         nativeBatchRequests.push(message);
         const responses = (message.requests || []).map((request) => {
@@ -3223,6 +3230,26 @@ console.log("\n[page-assist injection idempotency]");
 
   tabs.delete(paTabId);
   tabs.delete(noListenerTabId);
+}
+
+console.log("\n[Native host fleet diagnostics]");
+{
+  const fleetCases = [
+    ["Specified native messaging host not found.", "native_host_not_installed", "native-host-not-installed"],
+    ["Access to the specified native messaging host is forbidden.", "native_origin_not_active", "native-origin-not-active"],
+    ["Error when communicating with the native messaging host.", "device_inventory_unavailable", "Error when communicating with the native messaging host."],
+  ];
+  for (const [nativeError, expectedCode, expectedError] of fleetCases) {
+    mockNativeHostLastError = nativeError;
+    let resolveFleet;
+    const fleetP = new Promise((resolve) => { resolveFleet = resolve; });
+    onMsg({ type: "herdr_control_fleet" }, {}, (response) => resolveFleet(response));
+    const fleet = await fleetP;
+    ok(fleet?.ok === false && fleet?.code === expectedCode && fleet?.error === expectedError,
+      `fleet failure "${nativeError}" reports ${expectedCode}`,
+      JSON.stringify(fleet));
+  }
+  mockNativeHostLastError = null;
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

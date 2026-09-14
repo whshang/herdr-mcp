@@ -339,6 +339,8 @@
   "cc_devices_owner_required": "当前电脑没有可用的 Worker fleet 凭据，无法读取完整设备列表。",
   "cc_devices_runtime_unavailable": "当前本机 Runtime 尚未提供 0.4.5 设备视图。",
   "cc_devices_unavailable": "读取 Worker 设备失败：{error}",
+  "cc_devices_native_owner_inactive": "当前扩展不是 Herdr Native Host 的活动 owner。Store 版请运行 herdr-mcp native-host use store，standalone 版请运行 herdr-mcp native-host use standalone，然后重新加载本扩展并刷新当前页面。",
+  "cc_devices_native_host_missing": "当前浏览器尚未安装 Herdr Native Host。运行 herdr-mcp native-host install，然后重新加载本扩展并刷新当前页面。",
   "cc_device_this": "本机",
   "cc_device_authorization_active": "已授权",
   "cc_device_authorization_suspended": "已暂停授权",

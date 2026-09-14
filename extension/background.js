@@ -5408,10 +5408,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           ? { ...payload, local_http_status: response.status }
           : { ok: false, code: "device_inventory_invalid_response", http_status: response.status });
       } catch (error) {
+        const detail = String(error?.message || error || "device-inventory-request-failed");
         sendResponse({
           ok: false,
-          code: "device_inventory_unavailable",
-          error: String(error?.message || error || "device-inventory-request-failed"),
+          code: detail === "native-origin-not-active"
+            ? "native_origin_not_active"
+            : detail === "native-host-not-installed"
+              ? "native_host_not_installed"
+              : "device_inventory_unavailable",
+          error: detail,
         });
       }
     })();

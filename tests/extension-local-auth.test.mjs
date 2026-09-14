@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
 
 test("extension proxies localhost requests through Native Messaging without forwarding bearer auth", async () => {
@@ -183,6 +184,109 @@ test("extension treats Chromium native-host admission denial as standby", async 
   } finally {
     globalThis.chrome = oldChrome;
   }
+});
+
+test("extension normalizes Chromium native-host-missing errors into a distinct product state", async () => {
+  const oldChrome = globalThis.chrome;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(_host, _message, callback) {
+        globalThis.chrome.runtime.lastError = {
+          message: "Specified native messaging host not found.",
+        };
+        callback(undefined);
+        globalThis.chrome.runtime.lastError = null;
+      },
+    },
+  };
+  try {
+    await assert.rejects(
+      localHerdrFetch("http://127.0.0.1:8772/extension/fleet"),
+      /native-host-not-installed/,
+    );
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("installed-but-inactive native-host ownership fails local requests distinctly from a missing host", async () => {
+  const oldChrome = globalThis.chrome;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(_host, _message, callback) {
+        globalThis.chrome.runtime.lastError = {
+          message: "Access to the specified native messaging host is forbidden.",
+        };
+        callback(undefined);
+        globalThis.chrome.runtime.lastError = null;
+      },
+    },
+  };
+  try {
+    // Standby is a successful transport answer with no active owner origin; it
+    // must not degrade into an empty 200/500 Response that hides the cause.
+    await assert.rejects(
+      localHerdrFetch("http://127.0.0.1:8772/extension/fleet"),
+      (error) => error?.message === "native-origin-not-active",
+    );
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("unrelated native-host failures are never misreported as missing or inactive", async () => {
+  const oldChrome = globalThis.chrome;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(_host, _message, callback) {
+        globalThis.chrome.runtime.lastError = {
+          message: "Error when communicating with the native messaging host.",
+        };
+        callback(undefined);
+        globalThis.chrome.runtime.lastError = null;
+      },
+    },
+  };
+  try {
+    const result = await getNativeExtensionOwnerStatus();
+    assert.deepEqual(result, {
+      ok: false,
+      error: "Error when communicating with the native messaging host.",
+    });
+    await assert.rejects(
+      localHerdrFetch("http://127.0.0.1:8772/extension/fleet"),
+      (error) => error?.message === "Error when communicating with the native messaging host.",
+    );
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("fleet native diagnostic codes map to localized Control Center copy", async () => {
+  const locales = ["en", "ja", "zh"];
+  const keys = ["cc_devices_native_owner_inactive", "cc_devices_native_host_missing"];
+  for (const locale of locales) {
+    const copy = JSON.parse(readFileSync(new URL(`../extension/locales/${locale}.json`, import.meta.url), "utf8"));
+    for (const key of keys) {
+      assert.equal(typeof copy[key], "string", `${locale} is missing ${key}`);
+      assert.equal(copy[key].trim().length > 0, true, `${locale}.${key} must not be empty`);
+    }
+    // The remediation command must match the current STORE-default channel and
+    // the existing native_host_help wording (no standalone-only command).
+    assert.match(copy.cc_devices_native_host_missing, /herdr-mcp native-host install/);
+    assert.match(copy.cc_devices_native_owner_inactive, /herdr-mcp native-host use store/);
+  }
+
+  const background = readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
+  assert.match(background, /detail === "native-origin-not-active"[\s\S]{0,80}"native_origin_not_active"/);
+  assert.match(background, /detail === "native-host-not-installed"[\s\S]{0,80}"native_host_not_installed"/);
+
+  const controlCenter = readFileSync(new URL("../extension/control-center.js", import.meta.url), "utf8");
+  assert.match(controlCenter, /code === "native_origin_not_active"[\s\S]{0,80}t\("cc_devices_native_owner_inactive"\)/);
+  assert.match(controlCenter, /code === "native_host_not_installed"[\s\S]{0,80}t\("cc_devices_native_host_missing"\)/);
 });
 
 test("generated-image capture forwards only the strict non-secret artifact shape", async () => {

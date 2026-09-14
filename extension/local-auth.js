@@ -14,6 +14,14 @@ function isNativeAdmissionDenied(message) {
     || text.includes("permission denied");
 }
 
+// Chromium reports a missing Native Messaging manifest as "Specified native
+// messaging host not found." That is a different product state from an
+// installed host whose registered origin is not this extension.
+function isNativeHostMissing(message) {
+  const text = String(message || "").toLowerCase();
+  return text.includes("native messaging host") && text.includes("not found");
+}
+
 function nativeMessage(message) {
   return new Promise((resolve) => {
     if (!globalThis.chrome?.runtime?.sendNativeMessage) {
@@ -24,6 +32,10 @@ function nativeMessage(message) {
       chrome.runtime.sendNativeMessage(HERDR_NATIVE_HOST, message, (response) => {
         const err = chrome.runtime.lastError?.message;
         if (err) {
+          if (isNativeHostMissing(err)) {
+            resolve({ ok: false, error: "native-host-not-installed" });
+            return;
+          }
           if (isNativeAdmissionDenied(err)) {
             resolve({ ok: true, active: false, reason: "native-origin-not-active" });
             return;
@@ -116,6 +128,11 @@ export async function localHerdrFetch(input, init = {}) {
     type: "request",
     ...nativeRequestPayload(input, init),
   });
+  // Standby is a successful transport answer with no active owner origin. It
+  // must surface as a diagnosable failure instead of an empty 500 response.
+  if (response?.active === false && response?.reason === "native-origin-not-active") {
+    throw new Error("native-origin-not-active");
+  }
   if (response?.ok !== true) {
     throw new Error(String(response?.error || "native-host-request-failed"));
   }

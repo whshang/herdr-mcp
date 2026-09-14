@@ -339,6 +339,8 @@
   "cc_devices_owner_required": "このコンピューターには利用可能な Worker fleet 資格情報がないため、完全なデバイス一覧を読み取れません。",
   "cc_devices_runtime_unavailable": "現在のローカル Runtime はまだ 0.4.5 のデバイス表示を提供していません。",
   "cc_devices_unavailable": "Worker デバイスの読み取りに失敗しました: {error}",
+  "cc_devices_native_owner_inactive": "この拡張機能は Herdr Native Host の有効な owner ではありません。Store 版では herdr-mcp native-host use store、standalone 版では herdr-mcp native-host use standalone を実行し、この拡張を再読み込みして、このページを更新してください。",
+  "cc_devices_native_host_missing": "このブラウザーには Herdr Native Host がインストールされていません。herdr-mcp native-host install を実行し、この拡張を再読み込みして、このページを更新してください。",
   "cc_device_this": "このデバイス",
   "cc_device_authorization_active": "有効",
   "cc_device_authorization_suspended": "一時停止",
