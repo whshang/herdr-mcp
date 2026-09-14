@@ -356,7 +356,39 @@ test("ChatGPT DOM fallback recognizes current data-turn structure without treati
   assert.match(source, /data-turn-id/);
   assert.match(source, /const exactMessageId = authored/);
   assert.match(source, /role === "user" \? turnId : null/);
+  assert.match(source, /exactMessageId: Boolean\(exactMessageId\)/);
   assert.match(source, /function chatGptDomTurnSequence\(\)/);
+});
+
+test("ChatGPT dispatch accepts only a changed exact DOM user message identity when snapshot lookup is unavailable", () => {
+  const start = wakeSource.indexOf("  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message) {");
+  const end = wakeSource.indexOf("\n  function providerCanonicalConversationObserved()", start);
+  assert.ok(start >= 0 && end > start, "exact DOM accepted-user helper must remain extractable");
+  const exactDomAcceptedUserMessageRef = new Function(
+    `${wakeSource.slice(start, end)}; return exactDomAcceptedUserMessageRef;`,
+  )();
+  const before = { messageId: "user-old", exactMessageId: true, text: "old" };
+  assert.equal(exactDomAcceptedUserMessageRef(before, {
+    messageId: "user-new",
+    exactMessageId: true,
+    text: "Reply with exactly ACK and nothing else.",
+  }, "Reply with exactly ACK and nothing else."), "user-new");
+  assert.equal(exactDomAcceptedUserMessageRef(before, {
+    messageId: "turn-only",
+    exactMessageId: false,
+    text: "Reply with exactly ACK and nothing else.",
+  }, "Reply with exactly ACK and nothing else."), null);
+  assert.equal(exactDomAcceptedUserMessageRef(before, {
+    messageId: "user-old",
+    exactMessageId: true,
+    text: "Reply with exactly ACK and nothing else.",
+  }, "Reply with exactly ACK and nothing else."), null);
+  assert.equal(exactDomAcceptedUserMessageRef(before, {
+    messageId: "user-new",
+    exactMessageId: true,
+    text: "different prompt",
+  }, "Reply with exactly ACK and nothing else."), null);
+  assert.match(wakeSource, /serverAdvanced \? afterServer\.userMessageId : exactDomUserMessageRef/);
 });
 
 test("late accepted-dispatch observation preserves an already reported assistant identity", () => {

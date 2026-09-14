@@ -1386,6 +1386,24 @@ const H2W_CONTENT_VERSION = "0.1.91";
     };
   }
 
+  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message) {
+    if (afterDom?.exactMessageId !== true
+        || typeof afterDom.messageId !== "string"
+        || !afterDom.messageId
+        || afterDom.messageId === beforeDom?.messageId) {
+      return null;
+    }
+    const observed = String(afterDom.text || "").replace(/\s+/g, " ").trim();
+    const expected = String(message || "").replace(/\s+/g, " ").trim();
+    if (!observed || !expected) return null;
+    const expectedPrefix = expected.slice(0, 120);
+    const observedPrefix = observed.slice(0, 120);
+    if (!observed.includes(expectedPrefix) && !expected.includes(observedPrefix)) {
+      return null;
+    }
+    return afterDom.messageId;
+  }
+
   function providerCanonicalConversationObserved() {
     try {
       if (typeof ADAPTER.getCanonicalConversationUrl === "function") {
@@ -1859,8 +1877,11 @@ const H2W_CONTENT_VERSION = "0.1.91";
       evidence.accepted_message_observed = serverAdvanced || domAdvanced;
       evidence.message_baseline_advanced = domAdvanced;
       evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      const exactDomUserMessageRef = exactChatGptDispatchIdentity
+        ? exactDomAcceptedUserMessageRef(beforeDom, afterDom, message)
+        : null;
       const acceptedUserMessageRef = exactChatGptDispatchIdentity
-        ? (serverAdvanced ? afterServer.userMessageId : null)
+        ? (serverAdvanced ? afterServer.userMessageId : exactDomUserMessageRef)
         : ((afterServer?.ok ? afterServer.userMessageId : null) || afterDom?.messageId || null);
       if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef) {
         // The existing actuation evidence.result object carries the exact
@@ -2741,6 +2762,7 @@ const H2W_CONTENT_VERSION = "0.1.91";
     const parsedTime = timeNode?.getAttribute?.("datetime") ? Date.parse(timeNode.getAttribute("datetime")) : NaN;
     return {
       messageId,
+      exactMessageId: Boolean(exactMessageId),
       text: String(textRoot?.innerText || textRoot?.textContent || "").replace(/\s+/g, " ").trim(),
       messageAt: Number.isFinite(parsedTime) ? parsedTime : null,
       turnId,
