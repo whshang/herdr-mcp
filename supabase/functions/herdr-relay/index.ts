@@ -29,10 +29,14 @@ export const EXPECTED_RUNTIME_CONTRACT_HASH =
   "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
 /** Previous runtime baseline accepted during the Edge rollout window. */
 export const COMPATIBLE_RUNTIME_CONTRACTS = [
-  { epoch: EXPECTED_RUNTIME_CONTRACT_EPOCH, hash: EXPECTED_RUNTIME_CONTRACT_HASH },
+  {
+    epoch: EXPECTED_RUNTIME_CONTRACT_EPOCH,
+    hash: EXPECTED_RUNTIME_CONTRACT_HASH,
+  },
   {
     epoch: 2,
-    hash: "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
+    hash:
+      "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
   },
 ] as const;
 
@@ -311,11 +315,14 @@ export async function verifyUpstreamHealth(
       };
     }
 
-    const runtimeEpoch = parsed.currentRuntimeContractEpoch ?? parsed.runtimeContractEpoch ?? parsed.contractEpoch;
-    const runtimeHash = parsed.currentRuntimeContractHash ?? parsed.runtimeContractHash ?? parsed.contractHash;
+    const runtimeEpoch = parsed.currentRuntimeContractEpoch ??
+      parsed.runtimeContractEpoch ?? parsed.contractEpoch;
+    const runtimeHash = parsed.currentRuntimeContractHash ??
+      parsed.runtimeContractHash ?? parsed.contractHash;
     if (
       !COMPATIBLE_RUNTIME_CONTRACTS.some(
-        (contract) => contract.epoch === runtimeEpoch && contract.hash === runtimeHash,
+        (contract) =>
+          contract.epoch === runtimeEpoch && contract.hash === runtimeHash,
       )
     ) {
       return {
