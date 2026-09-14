@@ -5150,7 +5150,7 @@ fn validate_work_memory_partition(
     validate_work_memory_partition_identity(project_ref, repo_id, work_chain_id)
 }
 
-fn validate_work_memory_partition_identity(
+pub(crate) fn validate_work_memory_partition_identity(
     project_ref: &str,
     repo_id: &str,
     work_chain_id: &str,

@@ -137,6 +137,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             return Ok(ExitCode::SUCCESS);
         }
         write_state(&paths.state, state)?;
+        crate::local_agent_skill::sync_after_install_best_effort();
         print_json(&json!({
             "ok": true,
             "action": "dev_sync_recovered",
@@ -335,6 +336,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         || run_service_rollback(&built_binary),
         || restore_state(&paths.state, previous_state.as_ref()),
     )?;
+    crate::local_agent_skill::sync_after_install_best_effort();
 
     print_json(&json!({
         "ok": true,
@@ -513,6 +515,7 @@ fn rollback() -> Result<ExitCode, String> {
     state.prod_generation = active_after.clone();
     state.updated_at_ms = now_ms();
     write_state(&paths.state, &state)?;
+    crate::local_agent_skill::sync_after_install_best_effort();
     print_json(&json!({
         "ok": true,
         "action": "dev_rollback",

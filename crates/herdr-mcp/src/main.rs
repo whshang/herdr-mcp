@@ -34,6 +34,8 @@ mod instance_admin;
 mod link;
 #[cfg(any(target_os = "linux", test))]
 mod linux_service_manager;
+mod local_agent_cli;
+mod local_agent_skill;
 mod local_skills;
 mod macos_credential_helper;
 mod macos_keychain;
@@ -246,6 +248,10 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Instance(command) => instance_admin::run(command),
         cli::Command::Qualification(command) => qualification::run(command),
         cli::Command::Worker(command) => worker::run(command),
+        cli::Command::AgentSkill(command) => local_agent_skill::run(command),
+        cli::Command::Continuity(command) => local_agent_cli::run_continuity(command),
+        cli::Command::Memory(command) => local_agent_cli::run_memory(command),
+        cli::Command::WebChat(command) => local_agent_cli::run_webchat(command),
         cli::Command::Dev(command) => dev::run(command),
         cli::Command::ProfileCheck { file } => workstation_profile::check(&file),
         cli::Command::Candidate { port } => {
@@ -254,7 +260,17 @@ fn run() -> Result<ExitCode, String> {
             eprintln!("{}", child_process::reap_confirmed_orphans_on_boot());
             mcp_http::serve_candidate(port)
         }
-        cli::Command::Service(command) => service_lifecycle::run(command),
+        cli::Command::Service(command) => {
+            let refresh_agent_skill = matches!(
+                command,
+                cli::ServiceCommand::Install { .. } | cli::ServiceCommand::Rollback
+            );
+            let result = service_lifecycle::run(command)?;
+            if refresh_agent_skill && result == ExitCode::SUCCESS {
+                local_agent_skill::sync_after_install_best_effort();
+            }
+            Ok(result)
+        }
         cli::Command::Update(command) => {
             let trigger = match &command {
                 cli::UpdateCommand::Auto => Some("auto_update"),

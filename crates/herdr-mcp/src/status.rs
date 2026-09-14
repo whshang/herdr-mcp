@@ -144,6 +144,10 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
         crate::link::relay_manifest::status_line(paths, unix_now_seconds())
     );
     println!("relay use: {}", crate::link::RELAY_POLICY_DESCRIPTION);
+    println!(
+        "local agent skill: {}",
+        crate::local_agent_skill::status_line()
+    );
 }
 
 pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
@@ -177,6 +181,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let code_identity = macos_privacy::probe_code_identity();
     let authenticated_local_mcp = probe_authenticated_local_mcp(config.runtime_port);
     let standalone_browser = crate::standalone_extension::doctor_report();
+    let local_agent_skill = crate::local_agent_skill::status_summary();
     let windows_service_healthy = if cfg!(target_os = "windows") {
         service_manager::doctor_status()
             .ok()
@@ -215,6 +220,8 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     println!("{}", herdr_supervisor::doctor_line());
     println!("{}", crate::child_process::doctor_line());
     println!("{}", standalone_browser.doctor_line());
+    print_check("local agent Skill", local_agent_skill.0);
+    println!("LAYER local-agent-skill {}", local_agent_skill.1);
     let remote = print_layer_ownership(paths, config, &report);
     println!(
         "LAYER authenticated-local-mcp {}",

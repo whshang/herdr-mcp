@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "skill": "herdr-mcp",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "sha256": "2bad7ebca034185d6721a7a13fecf78041550580ae5f229a8658122c878bdd93"
+    },
+    {
+      "path": "references/memory.md",
+      "sha256": "2059942fea59ec79214b625f928a56442b6ff3a8358861d5b32e58cf0d792669"
+    },
+    {
+      "path": "references/webchat.md",
+      "sha256": "13f589774320d6800e7ef748d6c95ac4f9d1bfb1b5756cac51ba2fb479f6fc46"
+    },
+    {
+      "path": "references/resources.md",
+      "sha256": "e43a6803f9d0f9b2755a227d3215bd2a50007df3568aac848e8484ece8e0d046"
+    }
+  ]
+}
