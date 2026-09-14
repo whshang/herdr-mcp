@@ -6,7 +6,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +22,7 @@ const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneInstallOptions {
     pub reference: Option<String>,
+    pub load_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +73,7 @@ pub(crate) struct StandaloneBrowserDoctor {
     installed: bool,
     extension_id: String,
     expected_path: Option<PathBuf>,
+    configured_load_path: Option<PathBuf>,
     loads: Vec<ChromeExtensionLoad>,
     unreadable_profiles: usize,
     reason: Option<String>,
@@ -88,9 +90,7 @@ impl StandaloneBrowserDoctor {
                     "profile": load.profile,
                     "path": load.path,
                     "location": load.location,
-                    "matches_expected": self.expected_path.as_deref().is_some_and(|expected| {
-                        paths_equivalent(expected, &load.path)
-                    }),
+                    "matches_expected": self.matches(&load.path),
                 })
             })
             .collect::<Vec<_>>();
@@ -99,6 +99,7 @@ impl StandaloneBrowserDoctor {
             "installed": self.installed,
             "extension_id": self.extension_id,
             "expected_path": self.expected_path,
+            "configured_load_path": self.configured_load_path,
             "loaded": loaded,
             "drift_count": self.drift_count(),
             "unreadable_profiles": self.unreadable_profiles,
@@ -109,11 +110,7 @@ impl StandaloneBrowserDoctor {
     pub(crate) fn doctor_line(&self) -> String {
         match self.state {
             "drift" => {
-                let drift = self.loads.iter().find(|load| {
-                    self.expected_path
-                        .as_deref()
-                        .is_some_and(|expected| !paths_equivalent(expected, &load.path))
-                });
+                let drift = self.loads.iter().find(|load| !self.matches(&load.path));
                 format!(
                     "WARN standalone-extension-load state=drift extension_id={} expected={} actual={} browser=\"Google Chrome\" profile={} action=reload-from-managed-path-via-chrome://extensions",
                     self.extension_id,
@@ -151,13 +148,28 @@ impl StandaloneBrowserDoctor {
     }
 
     fn drift_count(&self) -> usize {
-        let Some(expected) = self.expected_path.as_deref() else {
+        if self.expected_path.is_none() {
             return 0;
-        };
+        }
         self.loads
             .iter()
-            .filter(|load| !paths_equivalent(expected, &load.path))
+            .filter(|load| !self.matches(&load.path))
             .count()
+    }
+
+    /// A Chrome load is expected when it resolves to the managed `current`
+    /// directory or equals the Chrome-facing path recorded by the last install.
+    /// The recorded comparison is lexical only: macOS TCC can deny
+    /// `lstat`/`readlink` on `~/Documents`, and equivalence must never depend
+    /// on being able to inspect the user-visible path.
+    fn matches(&self, path: &Path) -> bool {
+        self.expected_path
+            .as_deref()
+            .is_some_and(|expected| paths_equivalent(expected, path))
+            || self
+                .configured_load_path
+                .as_deref()
+                .is_some_and(|configured| lexical_path_eq(configured, path))
     }
 }
 
@@ -166,10 +178,11 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
         Ok(identity) => identity,
         Err(error) => return doctor_not_probed(None, String::new(), error),
     };
-    let current = match base_dir() {
-        Ok(base) => base.join("current"),
+    let home = match home_dir() {
+        Ok(home) => home,
         Err(error) => return doctor_not_probed(None, identity.extension_id, error),
     };
+    let current = base_dir_for(&home).join("current");
     let manifest = read_json(&current.join("manifest.json")).ok();
     let key_ok = manifest
         .as_ref()
@@ -182,6 +195,7 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
             installed: false,
             extension_id: identity.extension_id,
             expected_path: Some(current),
+            configured_load_path: None,
             loads: Vec::new(),
             unreadable_profiles: 0,
             reason: None,
@@ -190,17 +204,20 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
 
     #[cfg(target_os = "macos")]
     {
-        let Some(home) = env::var_os("HOME") else {
-            return doctor_not_probed(
-                Some(current),
-                identity.extension_id,
-                "HOME is unavailable".to_owned(),
-            );
-        };
+        // `doctor` accepts the managed `current` directory or the exact
+        // Chrome-facing path recorded by the last install. The recorded value
+        // comes from `~/.config` state and is compared lexically, so a
+        // TCC-denied `~/Documents` (or a moved `--path`) cannot turn a healthy
+        // managed install into a false `drift`; only a genuinely different
+        // directory (for example an old Downloads copy) is drift.
+        let state = read_json(&base_dir_for(&home).join("state.json")).ok();
+        let configured_load_path =
+            reported_load_path(&home, state.as_ref()).filter(|path| path != &current);
         diagnose_chrome_load(
             &current,
+            configured_load_path.as_deref(),
             &identity.extension_id,
-            &PathBuf::from(home).join("Library/Application Support/Google/Chrome"),
+            &home.join("Library/Application Support/Google/Chrome"),
         )
     }
 
@@ -217,15 +234,21 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
 #[cfg(any(target_os = "macos", test))]
 fn diagnose_chrome_load(
     expected_path: &Path,
+    configured_load_path: Option<&Path>,
     extension_id: &str,
     chrome_root: &Path,
 ) -> StandaloneBrowserDoctor {
+    let matches = |candidate: &Path| {
+        paths_equivalent(expected_path, candidate)
+            || configured_load_path.is_some_and(|configured| lexical_path_eq(configured, candidate))
+    };
     if !chrome_root.is_dir() {
         return StandaloneBrowserDoctor {
             state: "chrome_not_found",
             installed: true,
             extension_id: extension_id.to_owned(),
             expected_path: Some(expected_path.to_path_buf()),
+            configured_load_path: configured_load_path.map(Path::to_path_buf),
             loads: Vec::new(),
             unreadable_profiles: 0,
             reason: None,
@@ -291,10 +314,7 @@ fn diagnose_chrome_load(
         "not_probed"
     } else if loads.is_empty() {
         "not_loaded"
-    } else if loads
-        .iter()
-        .any(|load| !paths_equivalent(expected_path, &load.path))
-    {
+    } else if loads.iter().any(|load| !matches(&load.path)) {
         "drift"
     } else {
         "pass"
@@ -304,6 +324,7 @@ fn diagnose_chrome_load(
         installed: true,
         extension_id: extension_id.to_owned(),
         expected_path: Some(expected_path.to_path_buf()),
+        configured_load_path: configured_load_path.map(Path::to_path_buf),
         loads,
         unreadable_profiles,
         reason: (state == "not_probed")
@@ -321,6 +342,7 @@ fn doctor_not_probed(
         installed: expected_path.is_some(),
         extension_id,
         expected_path,
+        configured_load_path: None,
         loads: Vec::new(),
         unreadable_profiles: 0,
         reason: Some(reason),
@@ -353,7 +375,8 @@ pub fn run_install(options: StandaloneInstallOptions) -> Result<ExitCode, String
 }
 
 pub fn run_status() -> Result<ExitCode, String> {
-    let base = base_dir()?;
+    let home = home_dir()?;
+    let base = base_dir_for(&home);
     let current = base.join("current");
     let identity = crate::browser_extension_identity::official_standalone_identity()?;
     let manifest = read_json(&current.join("manifest.json")).ok();
@@ -366,10 +389,17 @@ pub fn run_status() -> Result<ExitCode, String> {
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
     let installed = current.is_dir() && manifest.is_some() && key_ok;
+    let (user_visible_path, load_unpacked_path) = status_load_view(&home, &current, state.as_ref());
     let view = json!({
         "ok": installed,
         "installed": installed,
         "path": current,
+        "user_visible_path": user_visible_path,
+        "chrome": {
+            "url": "chrome://extensions",
+            "action": "Developer mode -> Load unpacked",
+            "load_unpacked_path": load_unpacked_path,
+        },
         "extension_id": identity.extension_id,
         "manifest_key_matches": key_ok,
         "state": state,
@@ -388,11 +418,22 @@ pub fn run_status() -> Result<ExitCode, String> {
 fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
     let requested_ref = options.reference.unwrap_or_else(default_source_ref);
     validate_ref(&requested_ref)?;
+    let home = home_dir()?;
+    let base = base_dir_for(&home);
+    let current = base.join("current");
+    let explicit_load_path = options
+        .load_path
+        .as_deref()
+        .map(|value| resolve_load_path(&home, value))
+        .transpose()?;
+    if let Some(path) = explicit_load_path.as_deref() {
+        preflight_explicit_load_path(path, &current)?;
+    }
+
     let client = client()?;
     let commit = resolve_ref(&client, &requested_ref)?;
     let blobs = list_blobs(&client, &commit)?;
 
-    let base = base_dir()?;
     fs::create_dir_all(&base).map_err(|e| format!("cannot create standalone directory: {e}"))?;
     let staging = base.join(format!(".staging-{}-{}", std::process::id(), now_ms()));
     fs::create_dir_all(&staging).map_err(|e| format!("cannot create staging directory: {e}"))?;
@@ -417,7 +458,6 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         }
     };
 
-    let current = base.join("current");
     let backup = base.join(format!(".previous-{}-{}", std::process::id(), now_ms()));
     let had_current = current.exists();
     if had_current {
@@ -431,6 +471,24 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         return Err(format!("cannot activate standalone extension: {error}"));
     }
 
+    let user_visible_path = match explicit_load_path.as_deref() {
+        Some(path) if path == current => json!({
+            "ready": true,
+            "status": "managed",
+            "path": current,
+            "target": current,
+        }),
+        Some(path) => match ensure_explicit_alias(&home, path, &current) {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_activation(&current, &backup, had_current);
+                return Err(error);
+            }
+        },
+        None => ensure_user_visible_alias(&home, &current),
+    };
+    let load_unpacked_path = preferred_load_unpacked_path(&user_visible_path, &current);
+
     let state = json!({
         "schema_version": 1,
         "repository": REPOSITORY,
@@ -441,12 +499,11 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         "source_manifest_sha256": prepared.source_sha256,
         "installed_at_unix_ms": now_ms(),
         "path": current,
+        "load_unpacked_path": load_unpacked_path,
     });
     if let Err(error) = atomic_json(&base.join("state.json"), &state) {
-        let _ = fs::remove_dir_all(&current);
-        if had_current {
-            let _ = fs::rename(&backup, &current);
-        }
+        remove_alias_if_created(&user_visible_path, &current);
+        rollback_activation(&current, &backup, had_current);
         return Err(error);
     }
     if backup.exists() {
@@ -462,10 +519,11 @@ fn install(options: StandaloneInstallOptions) -> Result<Value, String> {
         "extension_version": state["extension_version"],
         "extension_id": state["extension_id"],
         "path": current,
+        "user_visible_path": user_visible_path,
         "chrome": {
             "url": "chrome://extensions",
             "action": "Developer mode -> Load unpacked",
-            "load_unpacked_path": current,
+            "load_unpacked_path": load_unpacked_path,
         },
         "next_command": "herdr-mcp native-host use standalone",
         "note": "All Git-tracked extension/ files come from the pinned commit; manifest.json differs only by the injected standalone public key.",
@@ -703,9 +761,321 @@ fn safe_rel(value: &str) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-fn base_dir() -> Result<PathBuf, String> {
-    let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
-    Ok(PathBuf::from(home).join(".config/herdr-mcp/extensions/standalone"))
+fn home_dir() -> Result<PathBuf, String> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_owned())
+}
+
+fn base_dir_for(home: &Path) -> PathBuf {
+    home.join(".config/herdr-mcp/extensions/standalone")
+}
+
+fn user_visible_alias_path(home: &Path) -> PathBuf {
+    home.join("Documents/herdr-mcp/extension")
+}
+
+fn inspect_user_visible_alias(home: &Path, current: &Path) -> Value {
+    let path = user_visible_alias_path(home);
+    inspect_alias(&path, current)
+}
+
+/// Read-only projection of the Chrome-facing load path recorded by the last
+/// install. The value lives in `~/.config`, so it is a stable string authority
+/// that does not require `lstat`/`readlink` on `~/Documents`, which macOS TCC
+/// can deny. It is only reported/matched here and is never used to mutate the
+/// filesystem; a value that escapes HOME is ignored.
+fn reported_load_path(home: &Path, state: Option<&Value>) -> Option<PathBuf> {
+    let path = state
+        .and_then(|value| value.get("load_unpacked_path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)?;
+    is_below_home(home, &path).then_some(path)
+}
+
+/// Lexical HOME containment used as a read-only sanity bound. It is not a
+/// filesystem check and must not be treated as ownership proof for a mutation;
+/// mutations only ever use the validated `--path` argument.
+fn is_below_home(home: &Path, path: &Path) -> bool {
+    path.is_absolute() && path != home && path.starts_with(home)
+}
+
+/// Path equality that never touches the filesystem. Chrome persists the exact
+/// directory string it was given, so the recorded path can be compared even
+/// when the user-visible alias cannot be inspected.
+fn lexical_path_eq(left: &Path, right: &Path) -> bool {
+    fn normalize(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        text.strip_suffix('/').unwrap_or(&text).to_owned()
+    }
+    normalize(left) == normalize(right)
+}
+
+/// Resolve the Chrome-facing load path and its alias evidence for `status`.
+/// The recorded `load_unpacked_path` is authoritative; inspecting the alias is
+/// best-effort reporting and never gates the reported path.
+fn status_load_view(home: &Path, current: &Path, state: Option<&Value>) -> (Value, PathBuf) {
+    let reported = reported_load_path(home, state);
+    let user_visible_path = match reported.as_deref() {
+        Some(path) if path != current => inspect_alias(path, current),
+        Some(_) => json!({
+            "ready": true,
+            "status": "managed",
+            "path": current,
+            "target": current,
+        }),
+        None => inspect_user_visible_alias(home, current),
+    };
+    let load_unpacked_path =
+        reported.unwrap_or_else(|| preferred_load_unpacked_path(&user_visible_path, current));
+    (user_visible_path, load_unpacked_path)
+}
+
+fn inspect_alias(path: &Path, current: &Path) -> Value {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({
+            "ready": false,
+            "status": "missing",
+            "path": path,
+            "target": current,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => json!({
+            "ready": false,
+            "status": "unverified",
+            "path": path,
+            "target": current,
+            "error": error.to_string(),
+        }),
+        Err(error) => json!({
+            "ready": false,
+            "status": "error",
+            "path": path,
+            "target": current,
+            "error": error.to_string(),
+        }),
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(path) {
+            Ok(existing_target) if existing_target == current => json!({
+                "ready": true,
+                "status": "ready",
+                "path": path,
+                "target": current,
+            }),
+            Ok(existing_target) => json!({
+                "ready": false,
+                "status": "occupied",
+                "kind": "symlink",
+                "path": path,
+                "target": current,
+                "existing_target": existing_target,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => json!({
+                "ready": false,
+                "status": "unverified",
+                "path": path,
+                "target": current,
+                "error": error.to_string(),
+            }),
+            Err(error) => json!({
+                "ready": false,
+                "status": "error",
+                "path": path,
+                "target": current,
+                "error": error.to_string(),
+            }),
+        },
+        Ok(metadata) => json!({
+            "ready": false,
+            "status": "occupied",
+            "kind": if metadata.is_dir() { "directory" } else if metadata.is_file() { "file" } else { "other" },
+            "path": path,
+            "target": current,
+        }),
+    }
+}
+
+fn ensure_user_visible_alias(home: &Path, current: &Path) -> Value {
+    let path = user_visible_alias_path(home);
+    ensure_alias(home, &path, current)
+}
+
+fn ensure_alias(home: &Path, path: &Path, current: &Path) -> Value {
+    let initial = inspect_alias(path, current);
+    if initial.get("status").and_then(Value::as_str) != Some("missing") {
+        return initial;
+    }
+    let Some(parent) = path.parent() else {
+        return json!({
+            "ready": false,
+            "status": "error",
+            "path": path,
+            "target": current,
+            "error": "user-visible extension path has no parent",
+        });
+    };
+    if let Err(error) = ensure_alias_parent(home, parent) {
+        return json!({
+            "ready": false,
+            "status": "error",
+            "path": path,
+            "target": current,
+            "error": error,
+        });
+    }
+    match create_directory_symlink(current, path) {
+        Ok(()) => json!({
+            "ready": true,
+            "status": "created",
+            "path": path,
+            "target": current,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => inspect_alias(path, current),
+        Err(error) => json!({
+            "ready": false,
+            "status": "error",
+            "path": path,
+            "target": current,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn ensure_explicit_alias(home: &Path, path: &Path, current: &Path) -> Result<Value, String> {
+    let result = ensure_alias(home, path, current);
+    if result.get("ready").and_then(Value::as_bool) == Some(true) {
+        return Ok(result);
+    }
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Err(format!(
+        "requested standalone --path '{}' is not usable ({status}); choose an unused path or the existing standalone symlink",
+        path.display()
+    ))
+}
+
+fn preflight_explicit_load_path(path: &Path, current: &Path) -> Result<(), String> {
+    if path == current {
+        return Ok(());
+    }
+    let state = inspect_alias(path, current);
+    match state.get("status").and_then(Value::as_str) {
+        Some("missing" | "ready") => Ok(()),
+        Some("unverified") => Err(format!(
+            "requested standalone --path '{}' cannot be inspected (permission denied); refusing to overwrite it",
+            path.display()
+        )),
+        Some(status) => Err(format!(
+            "requested standalone --path '{}' is already occupied ({status}); refusing to overwrite it",
+            path.display()
+        )),
+        None => Err(format!(
+            "requested standalone --path '{}' cannot be inspected safely",
+            path.display()
+        )),
+    }
+}
+
+fn resolve_load_path(home: &Path, value: &str) -> Result<PathBuf, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 4096 || value.chars().any(|ch| ch.is_control()) {
+        return Err("invalid standalone --path".to_owned());
+    }
+    let path = if value == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        let raw = PathBuf::from(value);
+        if raw.is_absolute() {
+            raw
+        } else {
+            home.join(raw)
+        }
+    };
+    if path
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err("standalone --path must not contain '..'".to_owned());
+    }
+    if path == home || !path.starts_with(home) {
+        return Err("standalone --path must resolve below HOME".to_owned());
+    }
+    Ok(path)
+}
+
+fn ensure_alias_parent(home: &Path, parent: &Path) -> Result<(), String> {
+    let canonical_home = fs::canonicalize(home)
+        .map_err(|e| format!("cannot resolve HOME for standalone --path: {e}"))?;
+    let mut ancestor = parent;
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| "standalone --path has no existing ancestor".to_owned())?;
+    }
+    let canonical_ancestor = fs::canonicalize(ancestor)
+        .map_err(|e| format!("cannot resolve standalone --path ancestor: {e}"))?;
+    if !canonical_ancestor.starts_with(&canonical_home) {
+        return Err("standalone --path would escape HOME through a symlinked parent".to_owned());
+    }
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot create standalone --path parent: {e}"))?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|e| format!("cannot resolve standalone --path parent: {e}"))?;
+    if !canonical_parent.starts_with(canonical_home) {
+        return Err("standalone --path parent resolves outside HOME".to_owned());
+    }
+    Ok(())
+}
+
+fn rollback_activation(current: &Path, backup: &Path, had_current: bool) {
+    let _ = fs::remove_dir_all(current);
+    if had_current {
+        let _ = fs::rename(backup, current);
+    }
+}
+
+fn remove_alias_if_created(alias: &Value, current: &Path) {
+    if alias.get("status").and_then(Value::as_str) != Some("created") {
+        return;
+    }
+    let Some(path) = alias.get("path").and_then(Value::as_str).map(PathBuf::from) else {
+        return;
+    };
+    if fs::read_link(&path).ok().as_deref() == Some(current) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn preferred_load_unpacked_path(alias: &Value, current: &Path) -> PathBuf {
+    if alias.get("ready").and_then(Value::as_bool) == Some(true) {
+        alias
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| current.to_path_buf())
+    } else {
+        current.to_path_buf()
+    }
+}
+
+#[cfg(unix)]
+fn create_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_directory_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_directory_symlink(_target: &Path, _link: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory symlinks are unsupported on this platform",
+    ))
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -795,7 +1165,7 @@ mod tests {
         fs::create_dir_all(&stale).unwrap();
         write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &stale);
 
-        let report = diagnose_chrome_load(&expected, "abcdefghijklmnop", &chrome);
+        let report = diagnose_chrome_load(&expected, None, "abcdefghijklmnop", &chrome);
         assert_eq!(report.state, "drift");
         assert_eq!(report.drift_count(), 1);
         assert_eq!(report.loads[0].path, stale);
@@ -812,7 +1182,7 @@ mod tests {
         fs::create_dir_all(&expected).unwrap();
         write_chrome_profile(&chrome, "Profile 1", "abcdefghijklmnop", &expected);
 
-        let report = diagnose_chrome_load(&expected, "abcdefghijklmnop", &chrome);
+        let report = diagnose_chrome_load(&expected, None, "abcdefghijklmnop", &chrome);
         assert_eq!(report.state, "pass");
         assert_eq!(report.drift_count(), 0);
         assert_eq!(report.as_json()["loaded"][0]["matches_expected"], true);
@@ -831,6 +1201,170 @@ mod tests {
         assert_eq!(manifest["key"], identity.manifest_key.unwrap());
         assert_eq!(prepared.extension_id, identity.extension_id);
         assert_eq!(prepared.source_sha256, sha256(source));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_doctor_stays_stable_after_user_changes_load_path() {
+        // Chrome still loads the previous alias while install has already moved
+        // the recorded load path. Switching `--path` must not turn a healthy
+        // managed install into a false `drift`.
+        let root = env::temp_dir().join(format!("herdr-browser-alias-change-{}", now_ms()));
+        let chrome = root.join("Chrome");
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        fs::create_dir_all(&current).unwrap();
+        let previous = home.join("Documents/first");
+        let configured = home.join("Documents/second");
+        for path in [&previous, &configured] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&current, path).unwrap();
+        }
+        fs::create_dir_all(base_dir_for(&home)).unwrap();
+        fs::write(
+            base_dir_for(&home).join("state.json"),
+            serde_json::to_vec(&json!({ "load_unpacked_path": configured })).unwrap(),
+        )
+        .unwrap();
+        let state = read_json(&base_dir_for(&home).join("state.json")).ok();
+        let recorded = reported_load_path(&home, state.as_ref());
+        assert_eq!(recorded.as_deref(), Some(configured.as_path()));
+
+        write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &previous);
+        let report =
+            diagnose_chrome_load(&current, recorded.as_deref(), "abcdefghijklmnop", &chrome);
+        assert_eq!(report.state, "pass");
+        assert_eq!(report.drift_count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recorded_load_path_matches_without_probing_documents() {
+        // macOS TCC can deny lstat/readlink on ~/Documents. The recorded
+        // Chrome-facing path lives in ~/.config state, so both `status` and
+        // `doctor` must match Chrome's persisted string lexically without the
+        // alias existing or being inspectable.
+        let root = env::temp_dir().join(format!("herdr-recorded-load-path-{}", now_ms()));
+        let chrome = root.join("Chrome");
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        fs::create_dir_all(&current).unwrap();
+        let recorded = home.join("Documents/herdr-mcp/extension");
+        fs::create_dir_all(base_dir_for(&home)).unwrap();
+        fs::write(
+            base_dir_for(&home).join("state.json"),
+            serde_json::to_vec(&json!({ "load_unpacked_path": recorded })).unwrap(),
+        )
+        .unwrap();
+        let state = read_json(&base_dir_for(&home).join("state.json")).ok();
+
+        // The alias is intentionally absent, so every filesystem-based
+        // equivalence fails exactly like a TCC-denied directory.
+        assert!(!recorded.exists());
+        let (_, load_unpacked_path) = status_load_view(&home, &current, state.as_ref());
+        assert_eq!(load_unpacked_path, recorded);
+
+        write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &recorded);
+        let configured = reported_load_path(&home, state.as_ref()).filter(|path| path != &current);
+        let report =
+            diagnose_chrome_load(&current, configured.as_deref(), "abcdefghijklmnop", &chrome);
+        assert_eq!(report.state, "pass");
+        assert_eq!(report.drift_count(), 0);
+        assert_eq!(
+            report.as_json()["configured_load_path"],
+            json!(recorded.to_string_lossy())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_load_paths_expand_under_home_and_reject_escape() {
+        let home = PathBuf::from("/Users/example");
+        assert_eq!(
+            resolve_load_path(&home, "~/Documents/herdr/extension").unwrap(),
+            home.join("Documents/herdr/extension")
+        );
+        assert_eq!(
+            resolve_load_path(&home, "Downloads/herdr-extension").unwrap(),
+            home.join("Downloads/herdr-extension")
+        );
+        assert!(resolve_load_path(&home, "~/../outside").is_err());
+        assert!(resolve_load_path(&home, "/tmp/herdr-extension").is_err());
+        assert!(resolve_load_path(&home, "~").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_load_path_is_created_and_conflicts_fail_closed() {
+        let root = env::temp_dir().join(format!("herdr-standalone-custom-alias-{}", now_ms()));
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        let custom = home.join("Downloads/herdr-extension");
+        fs::create_dir_all(&current).unwrap();
+
+        preflight_explicit_load_path(&custom, &current).unwrap();
+        let created = ensure_explicit_alias(&home, &custom, &current).unwrap();
+        assert_eq!(created["status"], "created");
+        assert_eq!(fs::read_link(&custom).unwrap(), current);
+        preflight_explicit_load_path(&custom, &current).unwrap();
+
+        fs::remove_file(&custom).unwrap();
+        fs::create_dir_all(&custom).unwrap();
+        let error = preflight_explicit_load_path(&custom, &current).unwrap_err();
+        assert!(error.contains("refusing to overwrite"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_visible_alias_is_created_once_and_reused() {
+        let root = env::temp_dir().join(format!("herdr-standalone-alias-test-{}", now_ms()));
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        fs::create_dir_all(&current).unwrap();
+
+        let created = ensure_user_visible_alias(&home, &current);
+        assert_eq!(created["ready"], true);
+        assert_eq!(created["status"], "created");
+        let alias = user_visible_alias_path(&home);
+        assert_eq!(fs::read_link(&alias).unwrap(), current);
+
+        let reused = ensure_user_visible_alias(&home, &current);
+        assert_eq!(reused["ready"], true);
+        assert_eq!(reused["status"], "ready");
+        assert_eq!(preferred_load_unpacked_path(&reused, &current), alias);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn user_visible_alias_never_overwrites_an_occupied_path() {
+        let root = env::temp_dir().join(format!("herdr-standalone-alias-conflict-{}", now_ms()));
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        let alias = user_visible_alias_path(&home);
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&alias).unwrap();
+
+        let occupied = ensure_user_visible_alias(&home, &current);
+        assert_eq!(occupied["ready"], false);
+        assert_eq!(occupied["status"], "occupied");
+        assert_eq!(occupied["kind"], "directory");
+        assert!(alias.is_dir());
+        assert_eq!(preferred_load_unpacked_path(&occupied, &current), current);
+
+        #[cfg(unix)]
+        {
+            fs::remove_dir(&alias).unwrap();
+            let other = root.join("other-extension");
+            fs::create_dir_all(&other).unwrap();
+            std::os::unix::fs::symlink(&other, &alias).unwrap();
+            let wrong_link = ensure_user_visible_alias(&home, &current);
+            assert_eq!(wrong_link["ready"], false);
+            assert_eq!(wrong_link["status"], "occupied");
+            assert_eq!(wrong_link["kind"], "symlink");
+            assert_eq!(fs::read_link(&alias).unwrap(), other);
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

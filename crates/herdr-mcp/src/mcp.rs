@@ -31,7 +31,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, call the read-only herdr_mcp.browser_handoff.prepare once, then pass its automatic_delivery message unchanged to browser_session.create with one idempotency key. The prepared manual_delivery.copy_prompt is the same canonical message: if browser control is unavailable, or a host-side pre-delivery safety rejection occurs with no Herdr execution evidence, retry the original create arguments at most once and then expose that already-prepared copy prompt instead of rewriting, encoding, changing transport, or recursively wrapping the rejected payload. Preserve the mutation idempotency key across the retry. Do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic steps whose arguments are already known and share one safety boundary, use one bounded herdr_exec or patch and perform local checks inside it; do not use remote tool results as thinking checkpoints between already-planned steps. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, call the read-only herdr_mcp.browser_handoff.prepare once, then pass its automatic_delivery message unchanged to browser_session.create with one idempotency key. The prepared manual_delivery.copy_prompt is the same canonical message: if browser control is unavailable, or a host-side pre-delivery safety rejection occurs with no Herdr execution evidence, retry the original create arguments at most once and then expose that already-prepared copy prompt instead of rewriting, encoding, changing transport, or recursively wrapping the rejected payload. Preserve the mutation idempotency key across the retry. Do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic same-boundary process steps, prefer transparent herdr_exec.steps when the current public schema advertises it; otherwise keep each freeform shell command narrow and single-purpose. Do not concatenate independent process invocations with shell operators solely to reduce remote calls. Use herdr_exec.command only when actual shell syntax is required. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -55,6 +55,12 @@ pub struct BrowserCallerAuthorization {
     pub principal_ref: String,
     pub connector_id: String,
     pub grant_generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCallerSessionIdentity {
+    pub provider: String,
+    pub opaque_session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +125,7 @@ pub struct RuntimeContext<'a> {
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
     pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
     pub caller_webchat_authorization: Option<&'a BrowserCallerAuthorization>,
+    pub caller_browser_session: Option<&'a BrowserCallerSessionIdentity>,
     pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
@@ -316,6 +323,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                         mutation_gate: context.browser_mutation_gate,
                         mutation_admission: context.browser_mutation_admission,
                         caller_authorization: context.caller_webchat_authorization,
+                        caller_browser_session: context.caller_browser_session,
                     },
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
@@ -522,6 +530,7 @@ fn continuity_call(
                         };
                         let records = store.continuity_search(ContinuitySearchInput {
                             project_id: Some(project_id),
+                            repo_id: None,
                             workspace_id: None,
                             conversation_id: None,
                             query: None,
@@ -625,6 +634,7 @@ fn continuity_call(
             };
             const ALLOWED: &[&str] = &[
                 "project_id",
+                "repo_id",
                 "workspace_id",
                 "conversation_id",
                 "conversation_url",
@@ -639,6 +649,10 @@ fn continuity_call(
                 });
             }
             let explicit_project_id = match continuity_search_string(params, "project_id", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let repo_id = match continuity_search_string(params, "repo_id", 512) {
                 Ok(value) => value,
                 Err(error) => return error,
             };
@@ -713,21 +727,22 @@ fn continuity_call(
             };
             let exact_identity_hint =
                 project_id.is_some() || workspace_id.is_some() || conversation_id.is_some();
-            let mut match_reasons = Vec::new();
+            let mut common_match_reasons = Vec::new();
             if conversation_id.is_some() {
-                match_reasons.push("conversation_id");
+                common_match_reasons.push("conversation_id");
             }
             if project_id.is_some() {
-                match_reasons.push("project_id");
+                common_match_reasons.push("project_id");
             }
             if workspace_id.is_some() {
-                match_reasons.push("workspace_id");
+                common_match_reasons.push("workspace_id");
             }
             if query.is_some() {
-                match_reasons.push("query");
+                common_match_reasons.push("query");
             }
             match store.continuity_search(ContinuitySearchInput {
                 project_id,
+                repo_id,
                 workspace_id,
                 conversation_id,
                 query,
@@ -737,6 +752,7 @@ fn continuity_call(
                     let identity_match = if exact_identity_hint {
                         store.continuity_search(ContinuitySearchInput {
                             project_id,
+                            repo_id,
                             workspace_id,
                             conversation_id,
                             query: None,
@@ -764,19 +780,54 @@ fn continuity_call(
                     let candidates = records
                         .into_iter()
                         .map(|record| {
+                            let mut match_reasons = common_match_reasons.clone();
+                            let repo_scope = match repo_id {
+                                Some(expected_repo_id)
+                                    if record.repo_id.as_deref() == Some(expected_repo_id) =>
+                                {
+                                    match_reasons.push("repo_id");
+                                    Some("exact")
+                                }
+                                Some(_) if record.repo_id.is_none() => {
+                                    match_reasons.push("legacy_repo_unbound");
+                                    Some("legacy_unbound")
+                                }
+                                Some(_) => Some("mismatch"),
+                                None => None,
+                            };
+                            let work_memory = match (
+                                record.project_ref.as_deref(),
+                                record.repo_id.as_deref(),
+                                record.work_chain_id.as_deref(),
+                            ) {
+                                (Some(project_ref), Some(repo_id), Some(work_chain_id)) => {
+                                    Some(json!({
+                                        "project_ref": project_ref,
+                                        "repo_id": repo_id,
+                                        "work_chain_id": work_chain_id,
+                                    }))
+                                }
+                                _ => None,
+                            };
                             json!({
                                 "continuity_id": record.continuity_id,
                                 "title": record.title,
                                 "project_id": record.project_id,
+                                "work_memory": work_memory,
                                 "workspace_ids": record.workspace_ids,
                                 "status": record.status,
                                 "updated_at": record.updated_at,
                                 "recent_user_excerpt": record.recent_user_excerpt,
                                 "recent_assistant_excerpt": record.recent_assistant_excerpt,
+                                "repo_scope": repo_scope,
                                 "match_reasons": match_reasons,
                             })
                         })
                         .collect::<Vec<_>>();
+                    let has_legacy_repo_unbound = candidates.iter().any(|candidate| {
+                        candidate.get("repo_scope").and_then(Value::as_str)
+                            == Some("legacy_unbound")
+                    });
                     json!({
                         "ok": true,
                         "resolution": resolution,
@@ -785,6 +836,8 @@ fn continuity_call(
                         "candidates": candidates,
                         "instruction": if auto_resume_safe {
                             "Exactly one active chain matched a stable identity hint. Resume that continuity_id, then re-check live Herdr/runtime/Git state before mutation."
+                        } else if has_legacy_repo_unbound {
+                            "A legacy repo-unbound candidate matched the query, but the requested repository is not verified identity. Show the bounded evidence to the planner/user for confirmation; do not auto-resume or invent a Work Memory locator."
                         } else if resolution == "confirmation_required" {
                             "Do not choose by recency or textual similarity alone. Show the bounded candidate evidence to the user and ask which prior work chain to continue; after confirmation, resume exactly that continuity_id."
                         } else {
@@ -2695,7 +2748,7 @@ fn browser_session_create_params_from_source(
     if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     }
-    let message = browser_required_string(params, "message", 262_144)?;
+    let message = browser_required_message(params, 262_144)?;
     let message = if message.contains(source_url) {
         message.to_owned()
     } else {
@@ -2717,38 +2770,65 @@ fn browser_session_create_params_from_source(
     let idempotency_key = browser_required_idempotency_key(params)?;
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
-    let session_ref = match store.browser_session_ref_for_canonical_url(source_url) {
-        Ok(Some(value)) => value,
-        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_session_not_found"})),
-        Err(error) => return Err(browser_store_error(error)),
-    };
-    let session = match store.browser_resource(&session_ref) {
-        Ok(Some(value)) => value,
-        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_session_not_found"})),
-        Err(error) => return Err(browser_store_error(error)),
-    };
+    let route = browser_source_route(store, source_url).map_err(browser_store_error)?;
+    Ok(Some(json!({
+        "endpoint_ref": route.endpoint_ref,
+        "provider": route.provider,
+        "account_ref": route.account_ref,
+        "space_ref": route.space_ref,
+        "display_label": route.display_label,
+        "message": message,
+        "expected_generation": route.expected_generation,
+        "idempotency_key": idempotency_key,
+        "work_chain_id": work_chain_id,
+        "lane_id": lane_id,
+    })))
+}
+
+/// The registered ChatGPT conversation that an exact canonical source URL resolves to,
+/// together with the browser create scope derived from it.
+///
+/// The source-anchored `browser_session.create` normalization and the read-only canonical
+/// handoff preparation both use this one resolution so a source URL can never produce two
+/// different routes.
+struct BrowserSourceRoute {
+    session_ref: String,
+    provider: String,
+    endpoint_ref: String,
+    account_ref: String,
+    space_ref: Option<String>,
+    display_label: String,
+    expected_generation: i64,
+}
+
+fn browser_source_route(
+    store: &StateStore,
+    source_url: &str,
+) -> Result<BrowserSourceRoute, String> {
+    let session_ref = store
+        .browser_session_ref_for_canonical_url(source_url)?
+        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
+    let session = store
+        .browser_resource(&session_ref)?
+        .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
     let Some(parent_ref) = session.parent_ref.as_deref() else {
-        return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+        return Err("browser_source_scope_missing".to_owned());
     };
-    let parent = match store.browser_resource(parent_ref) {
-        Ok(Some(value)) => value,
-        Ok(None) => return Err(json!({"ok": false, "code": "browser_source_scope_missing"})),
-        Err(error) => return Err(browser_store_error(error)),
-    };
+    let parent = store
+        .browser_resource(parent_ref)?
+        .ok_or_else(|| "browser_source_scope_missing".to_owned())?;
     let (space_ref, account) = if parent.kind == "space" {
         let Some(account_ref) = parent.parent_ref.as_deref() else {
-            return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+            return Err("browser_source_scope_missing".to_owned());
         };
-        let account = match store.browser_resource(account_ref) {
-            Ok(Some(value)) => value,
-            Ok(None) => return Err(json!({"ok": false, "code": "browser_source_scope_missing"})),
-            Err(error) => return Err(browser_store_error(error)),
-        };
-        (Some(parent.resource_ref.as_str()), account)
+        let account = store
+            .browser_resource(account_ref)?
+            .ok_or_else(|| "browser_source_scope_missing".to_owned())?;
+        (Some(parent.resource_ref.clone()), account)
     } else if parent.kind == "account" {
         (None, parent.clone())
     } else {
-        return Err(json!({"ok": false, "code": "browser_source_scope_missing"}));
+        return Err("browser_source_scope_missing".to_owned());
     };
     if session.provider != "chatgpt"
         || parent.provider != session.provider
@@ -2759,25 +2839,23 @@ fn browser_session_create_params_from_source(
         || parent.observation_generation != session.observation_generation
         || account.observation_generation != session.observation_generation
     {
-        return Err(json!({"ok": false, "code": "browser_source_scope_mismatch"}));
+        return Err("browser_source_scope_mismatch".to_owned());
     }
     let display_label = parent
         .display_label
         .as_deref()
         .or(session.display_label.as_deref())
-        .unwrap_or("ChatGPT continuation");
-    Ok(Some(json!({
-        "endpoint_ref": session.endpoint_ref,
-        "provider": "chatgpt",
-        "account_ref": account.resource_ref,
-        "space_ref": space_ref,
-        "display_label": display_label,
-        "message": message,
-        "expected_generation": session.observation_generation,
-        "idempotency_key": idempotency_key,
-        "work_chain_id": work_chain_id,
-        "lane_id": lane_id,
-    })))
+        .unwrap_or("ChatGPT continuation")
+        .to_owned();
+    Ok(BrowserSourceRoute {
+        session_ref,
+        provider: session.provider.clone(),
+        endpoint_ref: session.endpoint_ref.clone(),
+        account_ref: account.resource_ref.clone(),
+        space_ref,
+        display_label,
+        expected_generation: session.observation_generation,
+    })
 }
 
 fn browser_handoff_prepare(
@@ -2823,7 +2901,7 @@ fn browser_handoff_prepare(
         Err(_) => return json!({"ok": false, "code": "browser_handoff_id_invalid"}),
     };
 
-    let (record, persisted_work_chain_id) = {
+    let (record, persisted_work_chain_id, source_route, source_route_error) = {
         let Ok(store) = store.lock() else {
             return json!({"ok": false, "code": "browser_handoff_store_unavailable"});
         };
@@ -2836,7 +2914,25 @@ fn browser_handoff_prepare(
             Ok(value) => value,
             Err(error) => return browser_store_error(error),
         };
-        (record, work_chain_id)
+        // Route resolution stays best-effort: a handoff whose source conversation is not
+        // currently registered still yields the canonical packet and Copy Prompt. Only the
+        // automatic delivery step needs this scope, and it fails closed without it.
+        let (route, route_error) = match browser_source_route(&store, source_url) {
+            Ok(route) => (
+                json!({
+                    "session_ref": route.session_ref,
+                    "provider": route.provider,
+                    "endpoint_ref": route.endpoint_ref,
+                    "account_ref": route.account_ref,
+                    "space_ref": route.space_ref,
+                    "display_label": route.display_label,
+                    "expected_generation": route.expected_generation,
+                }),
+                Value::Null,
+            ),
+            Err(error) => (Value::Null, json!(error)),
+        };
+        (record, work_chain_id, route, route_error)
     };
     if record
         .turns
@@ -2877,6 +2973,8 @@ fn browser_handoff_prepare(
 
     json!({
         "ok": true,
+        "source_route": source_route,
+        "source_route_error": source_route_error,
         "handoff": {
             "handoff_id": handoff_id,
             "continuity_id": continuity_id,
@@ -2911,6 +3009,9 @@ fn browser_handoff_prepare(
 fn browser_session_archive_params_from_current_turn(
     store: &mut StateStore,
     params: &Value,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
+    caller_authorization: Option<&BrowserCallerAuthorization>,
+    caller_browser_session: Option<&BrowserCallerSessionIdentity>,
 ) -> Result<Option<Value>, Value> {
     let Some(current_user_message) = params.get("current_user_message") else {
         return Ok(None);
@@ -2933,6 +3034,37 @@ fn browser_session_archive_params_from_current_turn(
         return Err(json!({"ok": false, "code": "browser_current_turn_invalid"}));
     }
     let idempotency_key = browser_required_idempotency_key(params)?;
+
+    if let (Some(authorization), Some(caller_session)) =
+        (caller_authorization, caller_browser_session)
+        && caller_session.provider == "chatgpt"
+    {
+        let bound_session_ref = store
+            .resolve_browser_caller_session(
+                &authorization.principal_ref,
+                &caller_session.provider,
+                &caller_session.opaque_session_id,
+            )
+            .map_err(browser_store_error)?;
+        if let Some(session_ref) = bound_session_ref {
+            let session = match store.browser_resource(&session_ref) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
+                }
+                Err(error) => return Err(browser_store_error(error)),
+            };
+            if session.kind != "session" || session.provider != "chatgpt" {
+                return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
+            }
+            return Ok(Some(json!({
+                "session_ref": session_ref,
+                "expected_generation": session.observation_generation,
+                "idempotency_key": idempotency_key,
+            })));
+        }
+    }
+
     let (session_ref, expected_generation) = store
         .resolve_browser_source_turn(&browser_sha256(current_user_message), browser_epoch_ms())
         .map_err(browser_store_error)?;
@@ -2946,6 +3078,29 @@ fn browser_session_archive_params_from_current_turn(
     }
     if session.observation_generation != expected_generation {
         return Err(json!({"ok": false, "code": "browser_current_turn_stale"}));
+    }
+    if let (Some(authorization), Some(caller_session)) =
+        (caller_authorization, caller_browser_session)
+        && caller_session.provider == "chatgpt"
+    {
+        let account_ref =
+            browser_resource_account_ref(store, &session).map_err(browser_store_error)?;
+        let granted = caller_webchat_control_grants.iter().any(|grant| {
+            grant.endpoint_ref == session.endpoint_ref
+                && grant.provider == session.provider
+                && grant.account_ref == account_ref
+        });
+        if granted {
+            store
+                .bind_browser_caller_session(
+                    &authorization.principal_ref,
+                    &caller_session.provider,
+                    &caller_session.opaque_session_id,
+                    &session_ref,
+                    browser_epoch_ms(),
+                )
+                .map_err(browser_store_error)?;
+        }
     }
     Ok(Some(json!({
         "session_ref": session_ref,
@@ -3465,6 +3620,7 @@ struct BrowserOperationControls<'a> {
     mutation_gate: Option<&'a std::sync::RwLock<()>>,
     mutation_admission: Option<&'a BrowserMutationAdmission>,
     caller_authorization: Option<&'a BrowserCallerAuthorization>,
+    caller_browser_session: Option<&'a BrowserCallerSessionIdentity>,
 }
 
 #[cfg(test)]
@@ -3486,6 +3642,7 @@ fn browser_operation_call_with_grants(
             mutation_gate: browser_mutation_gate,
             mutation_admission: None,
             caller_authorization: None,
+            caller_browser_session: None,
         },
     )
 }
@@ -3526,12 +3683,17 @@ fn browser_operation_call_with_controls(
         let Ok(mut store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
-        normalized_params =
-            match browser_session_archive_params_from_current_turn(&mut store_guard, params) {
-                Ok(Some(value)) => value,
-                Ok(None) => unreachable!(),
-                Err(error) => return error,
-            };
+        normalized_params = match browser_session_archive_params_from_current_turn(
+            &mut store_guard,
+            params,
+            caller_webchat_control_grants,
+            controls.caller_authorization,
+            controls.caller_browser_session,
+        ) {
+            Ok(Some(value)) => value,
+            Ok(None) => unreachable!(),
+            Err(error) => return error,
+        };
         &normalized_params
     } else {
         params
@@ -3688,6 +3850,61 @@ fn browser_operation_call_with_controls(
             browser_actuator,
             controls.caller_authorization,
         ),
+        BrowserOperation::SessionArchive => {
+            let expected_generation = params
+                .get("expected_generation")
+                .and_then(Value::as_i64)
+                .unwrap();
+            let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+            let mut actuation_params = params.clone();
+            let Ok(guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            let session = match guard.browser_resource(session_ref) {
+                Ok(Some(resource)) if resource.kind == "session" => resource,
+                Ok(Some(_)) => {
+                    return json!({"ok": false, "code": "browser_resource_kind_mismatch"});
+                }
+                Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
+                Err(error) => return browser_store_error(error),
+            };
+            if let Some(object) = actuation_params.as_object_mut() {
+                object.insert("provider".to_owned(), json!(session.provider));
+                match guard.browser_resource_locator(session_ref) {
+                    Ok(Some(locator)) if locator.observation_generation == expected_generation => {
+                        object.insert("canonical_url".to_owned(), json!(locator.canonical_url));
+                    }
+                    Ok(Some(_)) => {
+                        return json!({"ok": false, "code": "stale_capability_generation"});
+                    }
+                    Ok(None) => {}
+                    Err(error) => return browser_store_error(error),
+                }
+            }
+            drop(guard);
+            let evidence = match browser_actuator {
+                Some(actuator) => match actuator.actuate(
+                    operation.method(),
+                    &actuation_params,
+                    expected_generation,
+                    None,
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(error) => return browser_store_error(error),
+                },
+                None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+            };
+            let delivery_state = match browser_delivery_state_from_postcondition(
+                operation,
+                params,
+                expected_generation,
+                &evidence,
+            ) {
+                Ok(state) => state,
+                Err(error) => return browser_store_error(error),
+            };
+            browser_operation_delivery_result(operation, delivery_state)
+        }
         _ => {
             let expected_generation = params
                 .get("expected_generation")
@@ -3845,7 +4062,7 @@ fn validate_browser_operation_params(
             browser_required_string(params, "account_ref", 96)?;
             let _ = browser_optional_string(params, "space_ref", 96)?;
             browser_required_string(params, "display_label", 256)?;
-            browser_required_string(params, "message", 262_144)?;
+            browser_required_message(params, 262_144)?;
             browser_required_reasoning_effort(params, true)?;
             browser_required_apps(params, true)?;
             browser_required_generation(params)?;
@@ -3868,7 +4085,7 @@ fn validate_browser_operation_params(
         }
         BrowserOperation::MessageAppend => {
             browser_required_string(params, "session_ref", 96)?;
-            browser_required_string(params, "message", 262_144)?;
+            browser_required_message(params, 262_144)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
         }
@@ -3886,7 +4103,7 @@ fn validate_browser_operation_params(
         }
         BrowserOperation::DispatchSubmit => {
             browser_required_string(params, "session_ref", 96)?;
-            browser_required_string(params, "message", 262_144)?;
+            browser_required_message(params, 262_144)?;
             browser_required_reasoning_effort(params, true)?;
             browser_required_apps(params, true)?;
             browser_required_generation(params)?;
@@ -4863,6 +5080,33 @@ fn browser_required_string<'a>(
     Ok(value)
 }
 
+// Message payloads keep embedded newlines/tabs (multi-line prompts) while
+// ordinary string fields stay single-line via `browser_required_string`.
+fn browser_required_message(params: &Value, max_bytes: usize) -> Result<&str, Value> {
+    let Some(value) = params.get("message").and_then(Value::as_str) else {
+        return Err(json!({"ok": false, "code": "browser_message_required"}));
+    };
+    if value.len() > max_bytes {
+        return Err(json!({
+            "ok": false,
+            "code": "browser_message_invalid",
+            "limit": {
+                "kind": "max_bytes",
+                "max_bytes": max_bytes,
+                "actual_bytes": value.len(),
+            }
+        }));
+    }
+    if value.trim().is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(json!({"ok": false, "code": "browser_message_invalid"}));
+    }
+    Ok(value)
+}
+
 fn browser_optional_string<'a>(
     params: &'a Value,
     field: &str,
@@ -5629,11 +5873,82 @@ mod tests {
                 "current_user_message": "归档当前对话",
                 "idempotency_key": "archive-fresh-runtime"
             }),
+            &[],
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
         assert_eq!(archive["session_ref"], session_ref);
         assert_eq!(archive["expected_generation"], 7);
+
+        // ChatGPT's opaque MCP session metadata is only a correlation key. The
+        // first exact source-turn match may bind it, but only when the Connector
+        // grant covers the resolved browser account.
+        let initial_session = reopened.browser_resource(&session_ref).unwrap().unwrap();
+        let initial_account_ref = initial_session.parent_ref.clone().unwrap();
+        let grants = vec![BrowserCallerGrant {
+            endpoint_ref: initial_session.endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: initial_account_ref.clone(),
+        }];
+        let authorization = BrowserCallerAuthorization {
+            principal_ref: "connector:conn_current_chat_test".to_owned(),
+            connector_id: "conn_current_chat_test".to_owned(),
+            grant_generation: 1,
+        };
+        let caller_session = BrowserCallerSessionIdentity {
+            provider: "chatgpt".to_owned(),
+            opaque_session_id: "opaque-openai-session-current-chat".to_owned(),
+        };
+        let ungranted = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "归档当前对话",
+                "idempotency_key": "archive-current-chat-without-grant"
+            }),
+            &[],
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ungranted["session_ref"], session_ref);
+        assert!(
+            reopened
+                .resolve_browser_caller_session(
+                    &authorization.principal_ref,
+                    "chatgpt",
+                    &caller_session.opaque_session_id,
+                )
+                .unwrap()
+                .is_none(),
+            "opaque caller sessions must not become durable authority without a matching browser grant"
+        );
+        let bootstrap = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "归档当前对话",
+                "idempotency_key": "archive-bind-current-chat"
+            }),
+            &grants,
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bootstrap["session_ref"], session_ref);
+        assert_eq!(
+            reopened
+                .resolve_browser_caller_session(
+                    &authorization.principal_ref,
+                    "chatgpt",
+                    &caller_session.opaque_session_id,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(session_ref.as_str())
+        );
 
         // A generation drift observed after the source turn fails closed.
         let (endpoint_ref, account_ref) = {
@@ -5685,9 +6000,39 @@ mod tests {
                 "current_user_message": "归档当前对话",
                 "idempotency_key": "archive-fresh-runtime-drift"
             }),
+            &[],
+            None,
+            None,
         )
         .unwrap_err();
         assert_eq!(drift["code"], "browser_current_turn_stale");
+
+        // Expire the source-turn row entirely. The durable opaque caller-session
+        // binding still resolves the same browser session and deliberately uses
+        // its latest observed generation instead of replaying stale generation 7.
+        assert_eq!(
+            reopened
+                .resolve_browser_source_turn(
+                    &browser_sha256("归档当前对话"),
+                    observed_at + 24 * 60 * 60 * 1000 + 5_000,
+                )
+                .unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+        let rebound = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "这条消息没有 source-turn 记录",
+                "idempotency_key": "archive-bound-after-source-expiry"
+            }),
+            &grants,
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rebound["session_ref"], session_ref);
+        assert_eq!(rebound["expected_generation"], 8);
         drop(reopened);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
@@ -5751,7 +6096,7 @@ mod tests {
     }
     #[test]
     fn continuity_search_requires_confirmation_without_stable_identity() {
-        use crate::state_store::ContinuityTurnInput;
+        use crate::state_store::{ContinuityTurnInput, WorkMemoryBindingInput};
         use std::sync::{Arc, Mutex};
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
@@ -5803,6 +6148,19 @@ mod tests {
                     })
                     .unwrap();
             }
+            guard
+                .bind_work_memory(WorkMemoryBindingInput {
+                    continuity_id: "hc:alpha",
+                    project_ref: "project:herdr-mcp",
+                    repo_id: "github.com/whshang/herdr-mcp",
+                    work_chain_id: "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    provider: "chatgpt",
+                    account_ref: Some("account-a"),
+                    space_ref: Some("project-a"),
+                    session_ref: "br_session_alpha",
+                    bound_at: 110,
+                })
+                .unwrap();
         }
 
         let bare = continuity_call(&store, "continuity.search", &json!({}));
@@ -5890,6 +6248,74 @@ mod tests {
         assert_eq!(text_only["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(text_only["resolution"], "confirmation_required");
         assert_eq!(text_only["auto_resume_safe"], false);
+
+        let repo_scoped = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({"repo_id": "github.com/whshang/herdr-mcp"}),
+        );
+        assert_eq!(repo_scoped["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(repo_scoped["candidates"][0]["continuity_id"], "hc:alpha");
+        assert_eq!(repo_scoped["candidates"][0]["repo_scope"], "exact");
+        assert_eq!(repo_scoped["candidates"][0]["match_reasons"][0], "repo_id");
+        assert_eq!(repo_scoped["resolution"], "confirmation_required");
+        assert_eq!(repo_scoped["auto_resume_safe"], false);
+        assert_eq!(
+            repo_scoped["candidates"][0]["work_memory"]["project_ref"],
+            "project:herdr-mcp"
+        );
+        assert_eq!(
+            repo_scoped["candidates"][0]["work_memory"]["repo_id"],
+            "github.com/whshang/herdr-mcp"
+        );
+        assert_eq!(
+            repo_scoped["candidates"][0]["work_memory"]["work_chain_id"],
+            "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+
+        let legacy_repo_scoped = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "query": "provider"
+            }),
+        );
+        assert_eq!(
+            legacy_repo_scoped["candidates"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            legacy_repo_scoped["candidates"][0]["continuity_id"],
+            "hc:beta"
+        );
+        assert_eq!(
+            legacy_repo_scoped["candidates"][0]["repo_scope"],
+            "legacy_unbound"
+        );
+        assert_eq!(
+            legacy_repo_scoped["candidates"][0]["work_memory"],
+            Value::Null
+        );
+        assert_eq!(legacy_repo_scoped["resolution"], "confirmation_required");
+        assert_eq!(legacy_repo_scoped["auto_resume_safe"], false);
+        assert_eq!(legacy_repo_scoped["confirmation_required"], true);
+        assert!(
+            legacy_repo_scoped["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("legacy repo-unbound")
+        );
+        let legacy_reasons = legacy_repo_scoped["candidates"][0]["match_reasons"]
+            .as_array()
+            .unwrap();
+        assert!(
+            legacy_reasons
+                .iter()
+                .any(|value| value == "legacy_repo_unbound")
+        );
+        assert!(legacy_reasons.iter().any(|value| value == "query"));
+        assert!(!legacy_reasons.iter().any(|value| value == "repo_id"));
 
         {
             let mut guard = store.lock().unwrap();
@@ -6575,6 +7001,85 @@ mod tests {
         assert_eq!(oversized["limit"]["kind"], "max_bytes");
         assert_eq!(oversized["limit"]["max_bytes"], 262_144);
         assert_eq!(oversized["limit"]["actual_bytes"], 262_145);
+    }
+
+    #[test]
+    fn browser_entrypoints_accept_multiline_messages() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let endpoint_ref = format!("bep_{}", "a".repeat(64));
+        let account_ref = format!("br_{}", "b".repeat(64));
+        let space_ref = format!("br_{}", "c".repeat(64));
+        let session_ref = format!("br_{}", "d".repeat(64));
+        let message = "first line\n\nsecond paragraph\twith tab\r\nthird";
+        let mut outcomes = Vec::new();
+        for (method, params) in [
+            (
+                "herdr_mcp.browser_session.create",
+                json!({
+                    "endpoint_ref": endpoint_ref,
+                    "provider": "chatgpt",
+                    "account_ref": account_ref,
+                    "space_ref": space_ref,
+                    "display_label": "Conversation",
+                    "message": message,
+                    "expected_generation": 7,
+                    "idempotency_key": "session-create-multiline-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_message.append",
+                json!({
+                    "session_ref": session_ref,
+                    "message": message,
+                    "expected_generation": 7,
+                    "idempotency_key": "message-append-multiline-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_dispatch.submit",
+                json!({
+                    "session_ref": session_ref,
+                    "message": message,
+                    "reasoning_effort": "thorough",
+                    "required_apps": ["herdr"],
+                    "expected_generation": 7,
+                    "idempotency_key": "dispatch-multiline-1"
+                }),
+            ),
+        ] {
+            let result = browser_operation_call(&store, method, &params);
+            let code = result["code"].as_str().unwrap_or("ok");
+            outcomes.push(format!("{method}: {code}"));
+        }
+        assert!(
+            !outcomes
+                .iter()
+                .any(|entry| entry.contains("browser_message_")),
+            "multiline messages must not fail message validation: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn browser_entrypoints_reject_unsafe_messages() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let session_ref = format!("br_{}", "d".repeat(64));
+        for message in ["unsafe\u{0}message", "   \n\t  "] {
+            let result = browser_operation_call(
+                &store,
+                "herdr_mcp.browser_message.append",
+                &json!({
+                    "session_ref": session_ref,
+                    "message": message,
+                    "expected_generation": 7,
+                    "idempotency_key": "message-append-unsafe-1"
+                }),
+            );
+            assert_eq!(result["code"], "browser_message_invalid", "{message:?}");
+        }
     }
 
     #[test]
@@ -7941,7 +8446,7 @@ mod tests {
                     provider: "chatgpt",
                     adapter_protocol_version: 1,
                     observation_generation: 7,
-                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    capabilities_json: r#"{"operations":["session.archive","session.open","session.inspect"]}"#,
                     observed_at: 11,
                 })
                 .unwrap();
@@ -7980,6 +8485,14 @@ mod tests {
                     observation_generation: 7,
                     observed_at: 13,
                 })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    "https://chatgpt.com/c/session-hidden-unique",
+                    7,
+                    13,
+                )
                 .unwrap();
             guard
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
@@ -8128,6 +8641,62 @@ mod tests {
 
         // Ensure no message was ever submitted via the session.open path.
         assert_eq!(replay["idempotent_replay"], true);
+
+        struct SessionArchiveActuator {
+            expected_session_ref: String,
+        }
+        impl BrowserActuator for SessionArchiveActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, "herdr_mcp.browser_session.archive");
+                assert_eq!(expected_generation, 7);
+                assert!(dispatch_id.is_none());
+                assert_eq!(params["session_ref"], self.expected_session_ref);
+                assert_eq!(params["provider"], "chatgpt");
+                assert_eq!(
+                    params["canonical_url"],
+                    "https://chatgpt.com/c/session-hidden-unique"
+                );
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: None,
+                })
+            }
+        }
+        let archived = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.archive",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 7,
+                "idempotency_key": "archive-reopens-canonical-url"
+            }),
+            true,
+            Some(&SessionArchiveActuator {
+                expected_session_ref: session_ref.clone(),
+            }),
+        );
+        assert_eq!(archived["ok"], true);
+        assert_eq!(archived["delivery_state"], "applied");
     }
 
     #[test]
@@ -8407,6 +8976,13 @@ mod tests {
         let first = browser_handoff_prepare(&store, &params);
         let second = browser_handoff_prepare(&store, &params);
         assert_eq!(first["ok"], true);
+        // No browser registry entry exists for this source URL, so the canonical packet is
+        // still prepared while automatic delivery scope stays explicitly unavailable.
+        assert_eq!(first["source_route"], Value::Null);
+        assert_eq!(
+            first["source_route_error"],
+            "browser_source_session_not_found"
+        );
         assert_eq!(first["handoff"], second["handoff"]);
         assert_eq!(
             first["handoff"]["message"],
@@ -8460,6 +9036,151 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn browser_handoff_prepare_reports_the_registered_source_route() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput, ContinuityTurnInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let source_url = "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, account_ref, space_ref, session_ref);
+        {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "handoff-route-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.91",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.create","composer.submit"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "handoff-route-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let space = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "space",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "handoff-route-project",
+                    display_label: Some("herdr-mcp"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    native_identity: "handoff-route-source",
+                    display_label: Some("Source"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(&session.resource_ref, source_url, 7, 12)
+                .unwrap();
+            store
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap();
+            store
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:routed",
+                    conversation_id: "source-conv",
+                    workspace_id: Some("w-routed"),
+                    project_id: Some("g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    title: Some("Routed handoff"),
+                    message_id: "routed-user-1",
+                    role: "user",
+                    text: "route this canonical handoff",
+                    fingerprint: None,
+                    observed_at: 100,
+                })
+                .unwrap();
+            endpoint_ref = endpoint.endpoint_ref;
+            account_ref = account.resource_ref;
+            space_ref = space.resource_ref;
+            session_ref = session.resource_ref;
+        }
+        let store = Arc::new(Mutex::new(store));
+        let prepared = browser_handoff_prepare(
+            &store,
+            &json!({"continuity_id": "hc:routed", "source_url": source_url}),
+        );
+        assert_eq!(prepared["ok"], true);
+        assert_eq!(prepared["source_route_error"], Value::Null);
+        assert_eq!(prepared["source_route"]["session_ref"], session_ref);
+        assert_eq!(prepared["source_route"]["provider"], "chatgpt");
+        assert_eq!(prepared["source_route"]["endpoint_ref"], endpoint_ref);
+        assert_eq!(prepared["source_route"]["account_ref"], account_ref);
+        assert_eq!(prepared["source_route"]["space_ref"], space_ref);
+        assert_eq!(prepared["source_route"]["expected_generation"], 7);
+        assert_eq!(prepared["source_route"]["display_label"], "herdr-mcp");
+        assert_eq!(
+            prepared["handoff"]["message"],
+            prepared["manual_delivery"]["copy_prompt"]
+        );
+        assert_eq!(
+            prepared["handoff"]["message"],
+            prepared["automatic_delivery"]["params"]["message"]
+        );
+        assert_eq!(
+            prepared["automatic_delivery"]["params"]["source_url"],
+            source_url
+        );
+        // The source-anchored create must derive exactly the same scope from the same URL,
+        // because both callers share one route resolution.
+        let create_params = browser_session_create_params_from_source(
+            &store.lock().unwrap(),
+            &json!({
+                "source_url": source_url,
+                "message": "continue from the canonical packet",
+                "idempotency_key": "handoff-route-1"
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(create_params["endpoint_ref"], endpoint_ref);
+        assert_eq!(create_params["account_ref"], account_ref);
+        assert_eq!(create_params["space_ref"], space_ref);
+        assert_eq!(create_params["expected_generation"], 7);
+        assert_eq!(create_params["display_label"], "herdr-mcp");
+        assert_eq!(create_params["provider"], "chatgpt");
     }
 
     #[test]
@@ -8723,6 +9444,9 @@ mod tests {
                     "current_user_message": "  归档当前对话  ",
                     "idempotency_key": "archive-current-source"
                 }),
+                &[],
+                None,
+                None,
             )
             .unwrap()
             .unwrap()
@@ -9146,6 +9870,7 @@ mod tests {
                 mutation_gate: None,
                 mutation_admission: Some(&admission),
                 caller_authorization: None,
+                caller_browser_session: None,
             },
         );
         assert_eq!(backpressured["code"], "browser_account_backpressure");

@@ -1,4 +1,4 @@
-use crate::exec_sessions::ExecRegistry;
+use crate::exec_sessions::{ExecRegistry, render_exec_argv};
 use crate::fs_security;
 use crate::herdr::HerdrClient;
 use crate::mutation;
@@ -10,6 +10,23 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const MAX_TYPED_ARGS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartInvocation {
+    Command(String),
+    Program { program: String, args: Vec<String> },
+}
+
+impl StartInvocation {
+    fn rendered(&self) -> String {
+        match self {
+            Self::Command(command) => command.clone(),
+            Self::Program { program, args } => render_exec_argv(program, args),
+        }
+    }
+}
+
 pub fn start(
     client: &HerdrClient,
     snapshot: &Value,
@@ -20,8 +37,7 @@ pub fn start(
         Ok(value) => value,
         Err(error) => return error,
     };
-    let command = match required_str(args, "command") {
-        Ok("") => return invalid("command must not be empty"),
+    let invocation = match resolve_start_invocation(args) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -61,6 +77,7 @@ pub fn start(
     let workspace_id = projects::workspaces_for_root(&topology, &managed.root)
         .into_iter()
         .next();
+    let rendered = invocation.rendered();
     let mut result = if protected_root {
         let Some(workspace_id) = workspace_id.as_deref() else {
             return json!({
@@ -76,10 +93,16 @@ pub fn start(
             registry,
             workspace_id,
             &managed.real,
-            command,
+            &rendered,
         )
     } else {
-        match registry.start_native(&managed.real, command) {
+        let started = match &invocation {
+            StartInvocation::Command(command) => registry.start_native(&managed.real, command),
+            StartInvocation::Program { program, args } => {
+                registry.start_native_program(&managed.real, program, args)
+            }
+        };
+        match started {
             Ok(value) => value,
             Err(message) => {
                 return json!({"ok": false, "reason": "exec_start_failed", "message": message});
@@ -103,6 +126,73 @@ pub fn start(
         object.insert("warnings".to_owned(), json!({"working": working}));
     }
     result
+}
+
+fn resolve_start_invocation(args: &Value) -> Result<StartInvocation, Value> {
+    let command = strict_optional_str(args, "command")?;
+    let program = strict_optional_str(args, "program")?;
+    let raw_args = args.get("args");
+
+    if command.is_some() && (program.is_some() || raw_args.is_some()) {
+        return Err(invalid(
+            "command and program/args modes are mutually exclusive",
+        ));
+    }
+    if let Some(command) = command {
+        if command.is_empty() {
+            return Err(invalid("command must not be empty"));
+        }
+        return Ok(StartInvocation::Command(command.to_owned()));
+    }
+
+    if let Some(program) = program {
+        if program.is_empty() || program.contains('\0') {
+            return Err(invalid("program must be non-empty and contain no NUL"));
+        }
+        let args = parse_typed_args(raw_args)?;
+        return Ok(StartInvocation::Program {
+            program: program.to_owned(),
+            args,
+        });
+    }
+
+    if raw_args.is_some() {
+        return Err(invalid("program is required when args is provided"));
+    }
+    Err(invalid("exactly one of command or program is required"))
+}
+
+fn parse_typed_args(value: Option<&Value>) -> Result<Vec<String>, Value> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(invalid("args must be an array of strings"));
+    };
+    if values.len() > MAX_TYPED_ARGS {
+        return Err(invalid(&format!(
+            "args must contain at most {MAX_TYPED_ARGS} strings"
+        )));
+    }
+    let mut args = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Err(invalid("args must be an array of strings"));
+        };
+        if value.contains('\0') {
+            return Err(invalid("args must contain only NUL-free strings"));
+        }
+        args.push(value.to_owned());
+    }
+    Ok(args)
+}
+
+fn strict_optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, Value> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        _ => Err(invalid(&format!("{key} must be a string"))),
+    }
 }
 
 pub fn read(registry: &ExecRegistry, args: &Value) -> Value {
@@ -244,8 +334,50 @@ fn invalid(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::wait_view_ready;
+    use super::{StartInvocation, resolve_start_invocation, wait_view_ready};
     use serde_json::json;
+
+    #[test]
+    fn exec_start_keeps_legacy_command_and_defaults_typed_args() {
+        assert_eq!(
+            resolve_start_invocation(&json!({"command": "printf legacy"})).unwrap(),
+            StartInvocation::Command("printf legacy".to_owned())
+        );
+        let typed = resolve_start_invocation(&json!({"program": "printf"})).unwrap();
+        assert_eq!(
+            typed,
+            StartInvocation::Program {
+                program: "printf".to_owned(),
+                args: Vec::new(),
+            }
+        );
+        assert_eq!(typed.rendered(), "'printf'");
+    }
+
+    #[test]
+    fn exec_start_typed_mode_is_literal_and_mutually_exclusive() {
+        let typed = resolve_start_invocation(&json!({
+            "program": "printf",
+            "args": ["%s\\n", "a; $(uname) *", "it's literal"]
+        }))
+        .unwrap();
+        assert_eq!(
+            typed.rendered(),
+            "'printf' '%s\\n' 'a; $(uname) *' 'it'\\''s literal'"
+        );
+
+        for invalid_args in [
+            json!({"command": "printf legacy", "program": "printf"}),
+            json!({"command": "printf legacy", "args": []}),
+            json!({"args": ["orphan"]}),
+            json!({"program": "printf", "args": "not-an-array"}),
+        ] {
+            assert_eq!(
+                resolve_start_invocation(&invalid_args).unwrap_err()["code"],
+                "invalid_params"
+            );
+        }
+    }
 
     #[test]
     fn exec_wait_stops_only_for_output_completion_or_error() {

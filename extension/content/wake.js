@@ -4364,16 +4364,25 @@ const H2W_CONTENT_VERSION = "0.1.91";
 
   function syncDocumentTitle(hud, state) {
     captureNativeConversationTitle();
+    const bound = hud?.bound === true;
+    titleSnapshot = bound ? { hud, state } : null;
+    syncDocumentFavicon(hud, state);
+    if (!bound) {
+      const wasHerdrTitle = Boolean(renderedHerdrTitle) && normText(document.title) === renderedHerdrTitle;
+      const originalTitle = nativeConversationTitle;
+      renderedHerdrTitle = "";
+      if (wasHerdrTitle && originalTitle && document.title !== originalTitle) {
+        document.title = originalTitle;
+      }
+      return;
+    }
     const project = chatGptDomProjectTitle()
       || hud?.active_workspace_label
       || hud?.workspace_label
       || hud?.workspace_id
-      || hudLabels?.states?.unbound
-      || "unbound";
+      || "Herdr";
     const conversation = chatGptDomConversationTitle() || nativeConversationTitle || ADAPTER.name || "conversation";
-    const next = [project, conversation].map((value) => normText(value)).filter(Boolean).join("-");
-    titleSnapshot = { hud, state };
-    syncDocumentFavicon(hud, state);
+    const next = [project, conversation].map((value) => normText(value)).filter(Boolean).join("：");
     if (!next || document.title === next) {
       renderedHerdrTitle = next;
       return;

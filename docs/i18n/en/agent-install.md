@@ -43,7 +43,7 @@ herdr-mcp doctor
 
 If `~/.local/bin/herdr-mcp` exists but the interactive shell cannot resolve it, classify this as `installed_but_not_on_shell_path`, repair the user's PATH, and verify a fresh shell. Do not reinstall or create a second PATH owner. Use [Troubleshooting](troubleshooting.md) only if the PATH repair is needed.
 
-On macOS, run `herdr-mcp permissions status` before Cloudflare work. If it reports `needs_setup`, grant Full Disk Access once to the stable Herdr-MCP broker, then run `herdr-mcp permissions verify`; do not probe protected paths first or use `sudo`. The broker carries MCP/native Herdr TCC; use `permissions setup --upgrade-broker` only for migration. Linux uses the user-service/process backend. Windows uses a Startup-folder shortcut, user processes and Credential Manager without elevation; it can start installed `herdr server` if needed. Normal install needs no Node.js, Wrangler, npm or Cargo.
+On macOS, run `herdr-mcp permissions status` before Cloudflare work. If it reports `needs_setup`, grant Full Disk Access once to the stable Herdr-MCP broker, then run `herdr-mcp permissions verify`; do not probe protected paths first or use `sudo`. The broker carries MCP file/Git TCC, not pane shell; panes follow their execution host's TCC. Linux uses the user-service/process backend. Windows uses a Startup-folder shortcut, user processes and Credential Manager without elevation; it can start installed `herdr server` if needed. Normal install needs no Node.js, Wrangler, npm or Cargo.
 
 ## 4. First Worker: Cloudflare + bootstrap
 

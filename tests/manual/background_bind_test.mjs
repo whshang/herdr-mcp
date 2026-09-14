@@ -92,6 +92,7 @@ let testClockOffsetMs = 0;
 Date.now = () => realDateNow() + testClockOffsetMs;
 let mockStateWorkspaces = [];
 let mockLocalRuntimeAvailable = true;
+let mockNativeHostLastError = null;
 let hangAutomationNotifications = false;
 let failQueuedInsertStorage = false;
 const queuedInsertDeliveries = [];
@@ -285,6 +286,12 @@ globalThis.chrome = {
     onInstalled: { addListener: (fn) => listeners.onInstalled.push(fn) },
     openOptionsPage: () => {},
     sendNativeMessage(_host, message, callback) {
+      if (mockNativeHostLastError) {
+        globalThis.chrome.runtime.lastError = { message: mockNativeHostLastError };
+        callback(undefined);
+        globalThis.chrome.runtime.lastError = null;
+        return;
+      }
       if (message?.type === "request_batch") {
         nativeBatchRequests.push(message);
         const responses = (message.requests || []).map((request) => {
@@ -362,7 +369,7 @@ globalThis.chrome = {
             endpoint: {
               endpoint_ref: "bep_test",
               device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              browser_family: "chrome",
+              browser_family: "ego",
               extension_version: body.extension_version,
               consent: {
                 webchat_control: false,
@@ -379,7 +386,7 @@ globalThis.chrome = {
               endpoint: {
                 endpoint_ref: "bep_test",
                 device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                browser_family: "chrome",
+                browser_family: "ego",
                 extension_version: "0.1.90",
                 consent: {
                   webchat_control: body.webchat_control_allowed === true,
@@ -535,7 +542,21 @@ globalThis.chrome = {
               if (disconnected) return;
               for (const fn of messageListeners) fn({ type: "stream_open", status: 200, transport: "ipc" });
             });
+            return;
           }
+          globalThis.chrome.runtime.sendNativeMessage("dev.herdr.mcp", message, (response) => {
+            const err = globalThis.chrome.runtime.lastError?.message || null;
+            queueMicrotask(() => {
+              if (disconnected) return;
+              if (err) {
+                globalThis.chrome.runtime.lastError = { message: err };
+                for (const fn of disconnectListeners) fn();
+                globalThis.chrome.runtime.lastError = null;
+                return;
+              }
+              for (const fn of messageListeners) fn(response);
+            });
+          });
         },
         disconnect() {
           if (disconnected) return;
@@ -831,14 +852,15 @@ ok(coldHud?.ok === true
   JSON.stringify(coldHud?.labels || {}));
 
 console.log("\n[browser endpoint registry bootstrap]");
-ok(await waitForTest(() => browserRegistryRequests.length === 1),
-  "service-worker startup attempts browser endpoint registration through Native Messaging");
+ok(await waitForTest(() => browserRegistryRequests.length >= 2),
+  "service-worker startup attempts browser endpoint registration before the Native Messaging push stream and the first active surface can recover an injected failure");
 const browserRegister = browserRegistryRequests[0] || {};
+const browserRegisterRetry = browserRegistryRequests[1] || {};
 ok(browserRegister.operation === "endpoint.register"
-    && browserRegister.browser_family === "chrome"
+    && !Object.prototype.hasOwnProperty.call(browserRegister, "browser_family")
     && browserRegister.extension_version === "0.1.91"
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
-  "browser endpoint registration carries one opaque profile seed and product identity",
+  "browser endpoint registration carries one opaque profile seed and leaves browser product identity to the native host",
   JSON.stringify(browserRegister));
 ok(!Object.prototype.hasOwnProperty.call(browserRegister, "device_id")
     && !Object.prototype.hasOwnProperty.call(browserRegister, "authorization")
@@ -847,16 +869,19 @@ ok(!Object.prototype.hasOwnProperty.call(browserRegister, "device_id")
 const storedBrowserSeed = storage.herdrBrowserProfileSeedV1;
 ok(storedBrowserSeed === browserRegister.profile_seed,
   "browser profile seed persists only in extension local storage");
+ok(browserRegisterRetry.operation === "endpoint.register"
+    && browserRegisterRetry.profile_seed === storedBrowserSeed,
+  "endpoint bootstrap recovery reuses the stable browser profile seed after the injected startup failure");
+const recoveredRegistrationCount = browserRegistryRequests.length;
 const keepaliveAlarm = listeners.onAlarm[0];
 ok(!!keepaliveAlarm, "browser keepalive alarm listener registered");
 keepaliveAlarm({ name: "h2w-keepalive" });
-ok(await waitForTest(() => browserRegistryRequests.length === 2),
-  "keepalive retries endpoint bootstrap after the initial runtime failure");
-ok(browserRegistryRequests[1]?.profile_seed === storedBrowserSeed,
-  "endpoint bootstrap retry reuses the stable browser profile seed");
+await new Promise((resolve) => setTimeout(resolve, 0));
+ok(browserRegistryRequests.length === recoveredRegistrationCount,
+  "keepalive does not duplicate endpoint registration after recovery");
 for (const startup of listeners.onStartup) startup();
 await new Promise((resolve) => setTimeout(resolve, 0));
-ok(browserRegistryRequests.length === 2 && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
+ok(browserRegistryRequests.length === recoveredRegistrationCount && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
   "browser startup does not create a second endpoint registration loop or rotate the profile seed");
 
 const deniedConsent = await dispatchMessage({
@@ -3223,6 +3248,46 @@ console.log("\n[page-assist injection idempotency]");
 
   tabs.delete(paTabId);
   tabs.delete(noListenerTabId);
+}
+
+console.log("\n[Native host fleet diagnostics]");
+{
+  const fleetCases = [
+    ["Specified native messaging host not found.", "native_host_not_installed", "native-host-not-installed"],
+    ["Access to the specified native messaging host is forbidden.", "native_origin_not_active", "native-origin-not-active"],
+    ["Error when communicating with the native messaging host.", "device_inventory_unavailable", "Error when communicating with the native messaging host."],
+  ];
+  for (const [nativeError, expectedCode, expectedError] of fleetCases) {
+    mockNativeHostLastError = nativeError;
+    let resolveFleet;
+    const fleetP = new Promise((resolve) => { resolveFleet = resolve; });
+    onMsg({ type: "herdr_control_fleet" }, {}, (response) => resolveFleet(response));
+    const fleet = await fleetP;
+    ok(fleet?.ok === false && fleet?.code === expectedCode && fleet?.error === expectedError,
+      `fleet failure "${nativeError}" reports ${expectedCode}`,
+      JSON.stringify(fleet));
+  }
+  mockNativeHostLastError = null;
+}
+
+console.log("\n[Native host runtime snapshot diagnostics]");
+{
+  const snapshotCases = [
+    ["Specified native messaging host not found.", "native-host-not-installed"],
+    ["Access to the specified native messaging host is forbidden.", "native-origin-not-active"],
+    ["Error when communicating with the native messaging host.", "Error when communicating with the native messaging host."],
+  ];
+  for (const [nativeError, expectedError] of snapshotCases) {
+    mockNativeHostLastError = nativeError;
+    let resolveSnapshot;
+    const snapshotP = new Promise((resolve) => { resolveSnapshot = resolve; });
+    onMsg({ type: "herdr_control_center_subscribe", force: true }, {}, (response) => resolveSnapshot(response));
+    const snapshot = await snapshotP;
+    ok(snapshot?.ok === false && snapshot?.error === expectedError,
+      `Control Center snapshot failure "${nativeError}" surfaces "${expectedError}" for runtimeErrorPresentation`,
+      JSON.stringify(snapshot));
+  }
+  mockNativeHostLastError = null;
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

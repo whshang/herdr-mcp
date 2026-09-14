@@ -30,8 +30,8 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
         Err(error) => return error,
     };
     let action = match required_str(args, "action") {
-        Ok(value @ ("status" | "diff" | "log")) => value,
-        Ok(_) => return invalid("action must be one of status, diff, log"),
+        Ok(value @ ("status" | "diff" | "log" | "identity")) => value,
+        Ok(_) => return invalid("action must be one of status, diff, log, identity"),
         Err(error) => return error,
     };
     let managed = match fs_security::validate_existing(snapshot, root_input) {
@@ -57,6 +57,10 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value,
         Err(error) => return error,
     };
+
+    if action == "identity" {
+        return git_identity(&managed.root);
+    }
 
     let mut safe_diff_target: Option<PathBuf> = None;
     let mut command_args = Vec::<String>::new();
@@ -751,6 +755,55 @@ fn run_git(
         stderr,
         truncated,
     })
+}
+
+/// Exact `HEAD` identity for one managed root: fixed `rev-parse` argv executed
+/// by the stable broker identity, so the rotating runtime never becomes the
+/// TCC client for protected Git metadata and no caller-supplied Git argument
+/// reaches this path. `branch` is `null` for a detached HEAD.
+fn git_identity(root: &Path) -> Value {
+    let failed =
+        |message: String| crate::macos_permissions::git_failure_to_value(root, "identity", message);
+    let commit = match git_identity_rev_parse(root, &["rev-parse", "HEAD"]) {
+        Ok(value) => value,
+        Err(message) => return failed(message),
+    };
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return failed(format!(
+            "git rev-parse HEAD returned invalid object id '{commit}'"
+        ));
+    }
+    let branch = match git_identity_rev_parse(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(value) => value,
+        Err(message) => return failed(message),
+    };
+    let detached = branch == "HEAD";
+    json!({
+        "ok": true,
+        "root": root.to_string_lossy(),
+        "action": "identity",
+        "commit": commit.to_ascii_lowercase(),
+        "branch": (!detached).then_some(branch),
+        "detached": detached,
+    })
+}
+
+fn git_identity_rev_parse(root: &Path, args: &[&str]) -> Result<String, String> {
+    let argv = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    let result = run_git(root, &argv, 4096, TIMEOUT)?;
+    if result.exit_code != 0 || result.truncated {
+        return Err(format!(
+            "git {} exited with status {}: {}",
+            args.join(" "),
+            result.exit_code,
+            result.stderr.trim()
+        ));
+    }
+    let value = result.stdout.trim().to_owned();
+    if value.is_empty() {
+        return Err(format!("git {} returned no output", args.join(" ")));
+    }
+    Ok(value)
 }
 
 fn read_capped<R: Read>(mut input: R, cap: usize) -> Vec<u8> {

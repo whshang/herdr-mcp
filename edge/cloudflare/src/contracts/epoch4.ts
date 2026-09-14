@@ -1,13 +1,13 @@
 import { EPOCH3_CONTRACT } from "./epoch3.js";
 
 /**
- * FUTURE (not yet active) public contract epoch 4.
+ * First-party deployed public contract epoch 4.
  *
- * Epoch 4 is byte-for-byte the epoch-3 catalog (same 19 tools, same schemas and
- * descriptions, same `device` routing selector) with truthful MCP safety hints
- * added only where the complete reachable surface justifies them. Epoch 2 and
- * epoch 3 stay frozen and are never mutated in place, so their recorded hashes
- * below are unchanged.
+ * Epoch 4 keeps the same 19-tool catalog and `device` routing selector while
+ * adding two deliberate model-visible improvements: truthful MCP safety hints
+ * for genuinely read-only tools, and a transparent structured `steps` form for
+ * `herdr_exec`. Epoch 2 and epoch 3 stay frozen and are never mutated in place,
+ * so their recorded hashes remain unchanged.
  *
  * The annotation is a client-side safety hint only. It does not enlarge
  * authorization, does not remove any managed-root / dirty / busy / secret-path
@@ -21,12 +21,12 @@ import { EPOCH3_CONTRACT } from "./epoch3.js";
  *   - `herdr_prompt`    — dispatches work to a local Agent
  * `herdr_devices` is Edge-local read-only and is already annotated in epoch 3.
  *
- * ACTIVATION: this file is intentionally NOT referenced by `public.ts`. Wiring a
- * new epoch into the ChatGPT-visible surface is a deliberate deployment step
- * (bump the Edge version/contract identity, redeploy, re-verify), never an
- * ordinary build or runtime side effect. After deployment, refresh/recreate the
- * ChatGPT custom-app action snapshot before A/B testing; otherwise the host can
- * keep using its previously approved frozen tool metadata.
+ * ACTIVATION: `public.ts` selects this contract for explicit first-party
+ * `EDGE_ENV=dev` and `EDGE_ENV=prod`. Missing and unknown environments keep the
+ * conservative epoch-3 fallback so ordinary/self-hosted deployments do not
+ * change contract epoch implicitly. After deployment, the host may need to
+ * refresh its previously approved frozen tool metadata before it exposes the
+ * new structured `herdr_exec.steps` schema.
  */
 
 /** Tools whose only reachable effects are reads of workstation/Edge state. */
@@ -66,6 +66,123 @@ export const EPOCH4_CLOSED_WORLD_READ_TOOL_NAMES = [
 
 const CLOSED_WORLD_READ_TOOL_NAMES_SET = new Set<string>(EPOCH4_CLOSED_WORLD_READ_TOOL_NAMES);
 
+function withExecutionGuidance(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
+  if (tool.name === "herdr_exec_start") {
+    const inputSchema = tool.inputSchema as typeof tool.inputSchema & {
+      properties: Record<string, unknown>;
+      required?: readonly string[];
+    };
+    const root = inputSchema.properties.root as Record<string, unknown>;
+    const command = inputSchema.properties.command as Record<string, unknown>;
+    return {
+      ...tool,
+      description:
+        "Start one long-running process in a managed project root as a background session. Pass root directly as the managed git project cwd; unlike herdr_exec, herdr_exec_start does not take workspace or project_root and does not take steps. Prefer program + args for an ordinary executable with literal argv. Use legacy command only when shell semantics such as pipes, redirects, variable expansion, or command substitution are required. Exactly one mode is accepted: command, or program with optional args (default []). Returns session_id. Then poll with herdr_exec_read and finish with herdr_exec_kill. For short commands prefer herdr_exec.",
+      inputSchema: {
+        ...inputSchema,
+        properties: {
+          ...inputSchema.properties,
+          root: {
+            ...root,
+            description:
+              "Managed git project root used as cwd. herdr_exec_start takes root directly; do not pass herdr_exec's workspace or project_root fields.",
+          },
+          command: {
+            ...command,
+            description:
+              "Legacy freeform shell command. Use only when shell syntax is required; otherwise prefer program + args.",
+          },
+          program: {
+            type: "string",
+            minLength: 1,
+            description:
+              "Executable name or path for the single long-running process. Prefer this with args when shell syntax is not required.",
+          },
+          args: {
+            type: "array",
+            maxItems: 128,
+            items: { type: "string" },
+            description:
+              "Optional literal argv entries passed to program. Defaults to []; no shell expansion or interpretation is applied.",
+          },
+        },
+        required: ["root"],
+        oneOf: [
+          {
+            required: ["command"],
+            not: { anyOf: [{ required: ["program"] }, { required: ["args"] }] },
+          },
+          { required: ["program"], not: { required: ["command"] } },
+        ],
+      },
+    } as unknown as (typeof EPOCH3_CONTRACT.tools)[number];
+  }
+  if (tool.name !== "herdr_exec") return tool;
+  const inputSchema = tool.inputSchema as typeof tool.inputSchema & {
+    properties: Record<string, unknown>;
+    required?: readonly string[];
+  };
+  const command = inputSchema.properties.command as Record<string, unknown>;
+  const workspace = inputSchema.properties.workspace as Record<string, unknown>;
+  const projectRoot = inputSchema.properties.project_root as Record<string, unknown>;
+  return {
+    ...tool,
+    description:
+      "Run commands on the workstation inside the target workspace's persistent visible utility pane. herdr_exec requires workspace and optionally accepts project_root to select a project within that workspace; it does not take root. root belongs to herdr_exec_start, which starts one long-running process without workspace/project_root. Prefer transparent structured steps for sequential program/argv execution when shell syntax is not required; steps run in order and stop on the first non-zero exit. Use command only when pipes, redirects, expansion, or other shell syntax are actually needed. Exactly one of command or steps is accepted. The same managed-root, busy-project, timeout, and delivery-evidence rules apply to both modes. Freeform command remains a high-capability shell boundary and is not secret-path gated; prefer fs/git tools for ordinary file and Git operations.",
+    inputSchema: {
+      ...inputSchema,
+      properties: {
+        ...inputSchema.properties,
+        workspace: {
+          ...workspace,
+          description:
+            "Required herdr_exec workspace_id or label (from herdr_inspect). Do not pass root here; root is the herdr_exec_start cwd field.",
+        },
+        command: {
+          ...command,
+          description:
+            "Single freeform shell command. Use only when shell syntax is required; otherwise prefer steps.",
+        },
+        project_root: {
+          ...projectRoot,
+          description:
+            "Optional herdr_exec project root within this workspace (workspaces[].projects[].root from herdr_inspect). Required when the workspace has multiple project roots. Do not rename this to root; herdr_exec_start uses root instead.",
+        },
+        steps: {
+          type: "array",
+          minItems: 1,
+          maxItems: 16,
+          description:
+            "Sequential transparent process steps. Each step is one executable plus argv; no pipe, redirect, shell expansion, or command substitution semantics are inferred from args.",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              program: {
+                type: "string",
+                minLength: 1,
+                description: "Executable name or path for this step.",
+              },
+              args: {
+                type: "array",
+                maxItems: 128,
+                items: { type: "string" },
+                description: "Literal argv entries passed to the executable.",
+              },
+            },
+            required: ["program"],
+          },
+        },
+      },
+      required: ["workspace"],
+      oneOf: [
+        { required: ["command"], not: { required: ["steps"] } },
+        { required: ["steps"], not: { required: ["command"] } },
+      ],
+    },
+  } as unknown as (typeof EPOCH3_CONTRACT.tools)[number];
+}
+
 function withReadOnlyHint(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
   const annotations = {
     ...((tool as { annotations?: Record<string, unknown> }).annotations ?? {}),
@@ -78,9 +195,10 @@ function withReadOnlyHint(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
 /** Epoch 3's catalog with `readOnlyHint: true` only on genuinely read-only tools. */
 export const EPOCH4_CONTRACT = {
   contract_epoch: 4,
-  contract_hash: "sha256:437ba1826dd612c8d265afb8d3203976df9db8b8370fa91ce62fa672c78a4c62",
+  contract_hash: "sha256:0c756a7479ff5d5c70891d7cf5c9810841a1e936327d91aa0770abe67faf83af",
   tool_count: 19,
-  tools: EPOCH3_CONTRACT.tools.map((tool) =>
-    READ_ONLY_TOOL_NAMES_SET.has(tool.name) ? withReadOnlyHint(tool) : tool,
-  ),
+  tools: EPOCH3_CONTRACT.tools.map((tool) => {
+    const shaped = withExecutionGuidance(tool);
+    return READ_ONLY_TOOL_NAMES_SET.has(shaped.name) ? withReadOnlyHint(shaped) : shaped;
+  }),
 } as const;

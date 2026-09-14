@@ -161,7 +161,9 @@ The browser extension binds a conversation to a Herdr workspace and can route pr
 
 That extension is not another runtime. Continuity, Control Center, Queue, and JSON → MCP are browser surfaces over the same trusted local bridge, while Herdr remains the runtime truth.
 
-See [Browser continuity](browser-continuity.md).
+A local coding agent uses the same browser control plane from the other side. Through the `herdr-mcp` CLI it can create, continue, dispatch into, observe, and hand off supported WebChat conversations under the same consent, identity, idempotency, and delivery rules. That is a second first-class caller of the control plane — not a second runtime, and not a message bus.
+
+See [Local agent WebChat control](local-agent-webchat-control.md) and [Browser continuity](browser-continuity.md).
 
 ## Why the workstation connects outward
 

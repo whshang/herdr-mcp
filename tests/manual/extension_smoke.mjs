@@ -155,7 +155,11 @@ ok(backgroundSource.includes("automationRuntimeGate")
     && wakeSource.includes('automationRuntimeAvailable ? "automation-disabled" : "local-runtime-unavailable"'),
   "automatic continuation fails closed when the local Herdr runtime is unavailable");
 ok(wakeSource.includes("syncDocumentTitle")
-    && wakeSource.includes('.join("-")')
+    && wakeSource.includes('const bound = hud?.bound === true')
+    && wakeSource.includes('titleSnapshot = bound ? { hud, state } : null')
+    && wakeSource.includes('if (!bound)')
+    && wakeSource.includes('document.title = originalTitle')
+    && wakeSource.includes('.join("：")')
     && wakeSource.includes("chatGptDomConversationTitle")
     && wakeSource.includes("chatGptDomProjectTitle")
     && wakeSource.includes("syncDocumentFavicon")
@@ -163,7 +167,7 @@ ok(wakeSource.includes("syncDocumentTitle")
     && wakeSource.includes('data-herdr-status-favicon')
     && backgroundSource.includes("active_workspace_label: labels[0] || null")
     && backgroundSource.includes("liveSession = state?.ok"),
-  "page title keeps project-conversation text while status moves to the favicon");
+  "unbound pages preserve the native title while bound pages use compact project：conversation text and status stays in the favicon");
 ok(wakeSource.includes('const next = [project, conversation]')
     && !wakeSource.includes('const next = [status, project, conversation]'),
   "page title no longer injects the status emoji");
@@ -275,8 +279,12 @@ ok(
     && backgroundSource.includes("crypto.getRandomValues(new Uint8Array(32))")
     && backgroundSource.includes("/extension/browser/registry")
     && backgroundSource.includes('operation: "endpoint.register"')
-    && backgroundSource.includes('browser_family: "chrome"')
+    && !backgroundSource.includes('browser_family: "chrome"')
     && backgroundSource.includes("extension_version: H2W_SCRIPT_VERSION")
+    && rustNativeHostSource.includes("detect_parent_browser_family")
+    && rustNativeHostSource.includes("inject_browser_family")
+    && backgroundSource.indexOf("if (!browserEndpoint) await registerLocalBrowserEndpoint();", backgroundSource.indexOf("async function rebuildStreams()"))
+      < backgroundSource.indexOf("ensurePushStream(bindings);", backgroundSource.indexOf("async function rebuildStreams()"))
     && !backgroundSource.includes('operation: "endpoint.register",\n        device_id:')
     && rustNativeHostSource.includes('"/extension/browser/registry"'),
   "browser endpoint bootstrap uses one local profile seed and the exact Native Messaging registry route",

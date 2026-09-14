@@ -5,16 +5,43 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  extensionIdFromManifestKey,
   extensionSha256Name,
   extensionZipName,
+  injectManifestKey,
+  packageZipName,
   packExtension,
   readExtensionVersion,
+  standaloneExtensionZipName,
 } from "../scripts/pack-extension.mjs";
+
+function readStoredZipEntry(zipBytes, wantedName) {
+  let offset = 0;
+  while (offset + 30 <= zipBytes.length && zipBytes.readUInt32LE(offset) === 0x04034b50) {
+    const size = zipBytes.readUInt32LE(offset + 18);
+    const nameLength = zipBytes.readUInt16LE(offset + 26);
+    const extraLength = zipBytes.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const name = zipBytes.subarray(nameStart, nameStart + nameLength).toString("utf8");
+    if (name === wantedName) return zipBytes.subarray(dataStart, dataStart + size);
+    offset = dataStart + size;
+  }
+  throw new Error(`zip entry not found: ${wantedName}`);
+}
 
 test("pack-extension reads version from extension manifest", () => {
   assert.equal(readExtensionVersion(JSON.stringify({ version: "0.1.64" })), "0.1.64");
   assert.equal(extensionZipName("0.1.64"), "herdr-mcp-extension-0.1.64.zip");
+  assert.equal(standaloneExtensionZipName("0.1.64"), "herdr-mcp-extension-standalone-0.1.64.zip");
+  assert.equal(packageZipName("0.1.64", "standalone"), "herdr-mcp-extension-standalone-0.1.64.zip");
+  assert.equal(packageZipName("0.1.64"), "herdr-mcp-extension-0.1.64.zip");
   assert.equal(extensionSha256Name("0.1.64"), "herdr-mcp-extension-0.1.64.zip.sha256");
+  assert.equal(
+    extensionSha256Name("0.1.64", "standalone"),
+    "herdr-mcp-extension-standalone-0.1.64.zip.sha256",
+  );
+  assert.throws(() => packageZipName("0.1.64", "dev"), /unsupported extension package channel/);
   assert.throws(() => readExtensionVersion("{}"), /invalid/);
 });
 
@@ -70,9 +97,93 @@ test("repo pack-extension uses live extension manifest version", async () => {
     }
     const result = await packExtension({ root: repoRoot, outDir });
     assert.equal(result.version, manifest.version);
+    assert.equal(result.channel, "store");
     assert.equal(result.zipName, `herdr-mcp-extension-${manifest.version}.zip`);
     assert.ok(result.fileCount > 10);
   } finally {
     await rm(outDir, { recursive: true, force: true });
+  }
+});
+
+test("repo standalone package injects the contract key, derives the contract ID, and matches its sidecar", async () => {
+  const repoRoot = new URL("../", import.meta.url).pathname;
+  const outDir = await mkdtemp(join(tmpdir(), "herdr-pack-ext-standalone-"));
+  const manifestPath = join(repoRoot, "extension", "manifest.json");
+  try {
+    const source = await readFile(manifestPath, "utf8");
+    const sourceManifest = JSON.parse(source);
+    const contract = JSON.parse(
+      await readFile(join(repoRoot, "contracts", "browser-extension-standalone.json"), "utf8"),
+    );
+    assert.equal(
+      extensionIdFromManifestKey(contract.standalone.manifest_key),
+      contract.standalone.extension_id,
+      "contract manifest key must derive the declared STANDALONE extension_id",
+    );
+
+    const result = await packExtension({ root: repoRoot, outDir, channel: "standalone" });
+    assert.equal(result.channel, "standalone");
+    assert.equal(result.zipName, `herdr-mcp-extension-standalone-${sourceManifest.version}.zip`);
+    assert.equal(result.sha256Name, `${result.zipName}.sha256`);
+    assert.match(result.sha256, /^[a-f0-9]{64}$/);
+
+    const zipBytes = await readFile(result.zipPath);
+    assert.equal(createHash("sha256").update(zipBytes).digest("hex"), result.sha256);
+    const sidecar = await readFile(join(outDir, result.sha256Name), "utf8");
+    assert.equal(sidecar, `${result.sha256}  ${result.zipName}\n`);
+
+    const packagedManifest = JSON.parse(readStoredZipEntry(zipBytes, "manifest.json").toString("utf8"));
+    assert.equal(packagedManifest.key, contract.standalone.manifest_key);
+    assert.equal(sourceManifest.key, undefined);
+    assert.equal(await readFile(manifestPath, "utf8"), source, "source manifest must never be mutated");
+
+    const second = await packExtension({ root: repoRoot, outDir, channel: "standalone" });
+    assert.equal(second.sha256, result.sha256);
+  } finally {
+    await rm(outDir, { recursive: true, force: true });
+  }
+});
+
+test("standalone packaging refuses an unsupported channel and a key that does not derive the contract ID", async () => {
+  const root = await mkdtemp(join(tmpdir(), "herdr-pack-ext-standalone-bad-"));
+  const contractKey = JSON.parse(
+    await readFile(join(new URL("../", import.meta.url).pathname, "contracts", "browser-extension-standalone.json"), "utf8"),
+  ).standalone.manifest_key;
+  try {
+    await mkdir(join(root, "contracts"), { recursive: true });
+    await mkdir(join(root, "extension"), { recursive: true });
+    await writeFile(
+      join(root, "extension", "manifest.json"),
+      `${JSON.stringify({ manifest_version: 3, name: "t", version: "9.8.7" }, null, 2)}\n`,
+    );
+    await writeFile(
+      join(root, "contracts", "browser-extension-standalone.json"),
+      JSON.stringify({
+        schema_version: 1,
+        standalone: { extension_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", manifest_key: contractKey },
+      }),
+    );
+
+    await assert.rejects(
+      () => packExtension({ root, outDir: join(root, "out"), channel: "dev" }),
+      /unsupported extension package channel/,
+    );
+    await assert.rejects(
+      () => packExtension({ root, outDir: join(root, "out"), channel: "standalone" }),
+      (error) => {
+        assert.match(error.message, /^standalone manifest key derives [a-p]{32}/);
+        assert.match(error.message, /expected contract extension_id a{32}$/);
+        return true;
+      },
+    );
+
+    const source = '{\n  "manifest_version": 3,\n  "name": "Herdr",\n  "version": "0.1.91"\n}\n';
+    const injected = injectManifestKey(source, contractKey);
+    assert.equal(JSON.parse(injected).key, contractKey);
+    assert.equal(source.includes('"key"'), false);
+    assert.throws(() => injectManifestKey(injected, "other-key"), /conflicting key/);
+    assert.throws(() => injectManifestKey('{"version":"0.1.91","key":7}\n', contractKey), /non-string key/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

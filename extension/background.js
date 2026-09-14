@@ -30,6 +30,7 @@ import {
 } from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc, parseMcpJsonResponseText } from "./mcp-json-rpc.js";
+import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
 import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrBatchFetch, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
   originToMatchPattern,
@@ -2059,7 +2060,6 @@ async function registerLocalBrowserEndpoint() {
       body: JSON.stringify({
         operation: "endpoint.register",
         profile_seed: profileSeed,
-        browser_family: "chrome",
         extension_version: H2W_SCRIPT_VERSION,
         observed_at: Date.now(),
       }),
@@ -3039,6 +3039,26 @@ async function handleBrowserActuation(command) {
   if (!target) {
     const recovered = await recoverBrowserSessionTarget(sessionRef, expectedGeneration);
     target = recovered.target;
+    if (!target && operation === "herdr_mcp.browser_session.archive") {
+      const providerArchive = String(params.provider || "");
+      const canonicalUrl = String(params.canonical_url || "");
+      const canonicalInfo = browserConversationInfo(providerArchive, canonicalUrl);
+      if (providerArchive === "chatgpt" && canonicalInfo?.conversation_id) {
+        let createdTab = null;
+        try {
+          createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
+        } catch (_) {}
+        if (createdTab?.id) {
+          const deadline = Date.now() + 8000;
+          do {
+            target = browserSessionTargets.get(sessionRef) || null;
+            if (target?.tabId === createdTab.id) break;
+            target = null;
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          } while (Date.now() < deadline);
+        }
+      }
+    }
     if (!target) {
       await postBrowserActuationEvidence(
         actuationId,
@@ -5408,10 +5428,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           ? { ...payload, local_http_status: response.status }
           : { ok: false, code: "device_inventory_invalid_response", http_status: response.status });
       } catch (error) {
+        const detail = String(error?.message || error || "device-inventory-request-failed");
         sendResponse({
           ok: false,
-          code: "device_inventory_unavailable",
-          error: String(error?.message || error || "device-inventory-request-failed"),
+          code: detail === NATIVE_ORIGIN_NOT_ACTIVE
+            ? "native_origin_not_active"
+            : detail === NATIVE_HOST_NOT_INSTALLED
+              ? "native_host_not_installed"
+              : "device_inventory_unavailable",
+          error: detail,
         });
       }
     })();
@@ -6667,6 +6692,9 @@ async function rebuildStreams() {
     reconcileProgressTimers({});
     return;
   }
+  // Bootstrap Browser Registry before the long-lived Native Messaging push
+  // stream so endpoint identity does not depend on opening Control Center later.
+  if (!browserEndpoint) await registerLocalBrowserEndpoint();
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,

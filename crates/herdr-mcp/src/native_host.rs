@@ -7,6 +7,8 @@
 
 use serde_json::{Value, json};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::process::Command;
 use std::process::ExitCode;
 
 #[cfg(unix)]
@@ -97,6 +99,7 @@ const FORWARDED_HEADERS: &[&str] = &[
 struct HostConfig {
     expected_origin: String,
     socket_path: PathBuf,
+    browser_family: String,
     #[cfg(test)]
     enforce_owner_fence: bool,
 }
@@ -111,10 +114,47 @@ impl HostConfig {
         Ok(Self {
             expected_origin,
             socket_path,
+            browser_family: detect_parent_browser_family(),
             #[cfg(test)]
             enforce_owner_fence: true,
         })
     }
+}
+
+#[cfg(unix)]
+fn classify_browser_family(command: &str) -> &'static str {
+    let command = command.to_ascii_lowercase();
+    if command.contains("ego lite") || command.contains("/ego.app/") {
+        "ego"
+    } else if command.contains("microsoft edge") || command.contains("msedge") {
+        "edge"
+    } else if command.contains("brave browser") || command.contains("brave-browser") {
+        "brave"
+    } else if command.contains("google chrome") || command.contains("chrome for testing") {
+        "chrome"
+    } else {
+        "chromium"
+    }
+}
+
+#[cfg(unix)]
+fn detect_parent_browser_family() -> String {
+    // Chromium launches a Native Messaging host as a direct child of the
+    // browser process. Trust that process boundary instead of page JS/UA or a
+    // browser-family value supplied by the extension.
+    let parent_pid = unsafe { libc::getppid() };
+    if parent_pid <= 1 {
+        return "chromium".to_owned();
+    }
+    let parent_pid = parent_pid.to_string();
+    let command = Command::new("ps")
+        .args(["-p", parent_pid.as_str(), "-o", "command="])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    classify_browser_family(&command).to_owned()
 }
 
 #[cfg(target_os = "macos")]
@@ -200,6 +240,7 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
                     "ok": true,
                     "active": active,
                     "extension_origin": config.expected_origin,
+                    "browser_family": config.browser_family,
                     "transport": "native",
                 }),
             )?;
@@ -454,6 +495,28 @@ fn body_text(value: Option<&Value>) -> String {
 }
 
 #[cfg(unix)]
+fn inject_browser_family(
+    path: &str,
+    method: &Method,
+    body: String,
+    browser_family: &str,
+) -> Result<String, String> {
+    if path != "/extension/browser/registry" || method != Method::POST || body.is_empty() {
+        return Ok(body);
+    }
+    let mut payload: Value = serde_json::from_str(&body)
+        .map_err(|_| "native_browser_registry_body_invalid".to_owned())?;
+    if payload.get("operation").and_then(Value::as_str) != Some("endpoint.register") {
+        return Ok(body);
+    }
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| "native_browser_registry_body_invalid".to_owned())?;
+    object.insert("browser_family".to_owned(), json!(browser_family));
+    serde_json::to_string(&payload).map_err(|_| "native_browser_registry_body_invalid".to_owned())
+}
+
+#[cfg(unix)]
 fn proxy_method(value: Option<&Value>) -> Result<Method, String> {
     let method = value
         .and_then(Value::as_str)
@@ -576,7 +639,12 @@ async fn proxy_request(config: &HostConfig, message: &Value) -> Result<Value, St
     validate_base_url(message.get("base_url"))?;
     let path = validate_proxy_path(message.get("path"))?;
     let method = proxy_method(message.get("method"))?;
-    let body = body_text(message.get("body"));
+    let body = inject_browser_family(
+        &path,
+        &method,
+        body_text(message.get("body")),
+        &config.browser_family,
+    )?;
     if body.len() > MAX_REQUEST_BODY {
         return Err("native_request_too_large".to_owned());
     }
@@ -941,6 +1009,61 @@ mod tests {
         assert!(!owner_is_active(expected, None));
     }
 
+    #[test]
+    fn browser_family_is_derived_from_the_native_host_parent_process() {
+        assert_eq!(
+            classify_browser_family("/Applications/ego lite.app/Contents/MacOS/ego lite"),
+            "ego"
+        );
+        assert_eq!(
+            classify_browser_family(
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+            ),
+            "edge"
+        );
+        assert_eq!(
+            classify_browser_family("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            "chrome"
+        );
+        assert_eq!(
+            classify_browser_family("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+            "brave"
+        );
+        assert_eq!(classify_browser_family("/usr/bin/chromium"), "chromium");
+        assert_eq!(classify_browser_family("/opt/custom-browser"), "chromium");
+    }
+
+    #[test]
+    fn browser_registry_registration_gets_host_derived_family() {
+        let body = inject_browser_family(
+            "/extension/browser/registry",
+            &Method::POST,
+            json!({
+                "operation": "endpoint.register",
+                "profile_seed": "seed",
+                "browser_family": "chrome",
+                "extension_version": "0.1.91"
+            })
+            .to_string(),
+            "ego",
+        )
+        .unwrap();
+        let payload: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["browser_family"], "ego");
+
+        let untouched = inject_browser_family(
+            "/extension/browser/registry",
+            &Method::POST,
+            json!({"operation": "endpoint.consent", "browser_family": "chrome"}).to_string(),
+            "ego",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&untouched).unwrap()["browser_family"],
+            "chrome"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn extension_dir_helpers_require_manifest_json() {
@@ -992,6 +1115,7 @@ mod tests {
         let config = HostConfig {
             expected_origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned(),
             socket_path: path.clone(),
+            browser_family: "chrome".to_owned(),
             enforce_owner_fence: false,
         };
         let result = proxy_request(
@@ -1049,6 +1173,7 @@ mod tests {
         let config = HostConfig {
             expected_origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned(),
             socket_path: path.clone(),
+            browser_family: "chrome".to_owned(),
             enforce_owner_fence: false,
         };
         let result = proxy_request_batch(
@@ -1128,6 +1253,7 @@ mod tests {
         let config = HostConfig {
             expected_origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned(),
             socket_path: path.clone(),
+            browser_family: "chrome".to_owned(),
             enforce_owner_fence: false,
         };
         let mut output = Vec::new();

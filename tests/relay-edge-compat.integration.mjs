@@ -18,7 +18,7 @@ import { EPOCH1_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch1.js";
 import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch4.js";
-import { PUBLIC_CONTRACT } from "../edge/cloudflare/dist/contracts/public.js";
+import { PUBLIC_CONTRACT, resolvePublicContract } from "../edge/cloudflare/dist/contracts/public.js";
 import {
   RUNTIME_EXECUTION_CONTRACT,
   isCompatibleRuntimeContract,
@@ -120,7 +120,15 @@ test("public epoch 3 evolves independently while runtime execution stays epoch 2
   assert.equal(isCompatibleRuntimeContract(1, EPOCH2_CONTRACT.contract_hash), false);
 });
 
-test("future epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {
+test("public contract resolver enables epoch 4 for explicit first-party dev and prod environments", () => {
+  assert.equal(resolvePublicContract("dev"), EPOCH4_CONTRACT);
+  assert.equal(resolvePublicContract("prod"), EPOCH4_CONTRACT);
+  assert.equal(resolvePublicContract(), EPOCH3_CONTRACT);
+  assert.equal(resolvePublicContract("unknown"), EPOCH3_CONTRACT);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
+});
+
+test("epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {
   const readOnly = [
     "herdr_methods",
     "herdr_inspect",
@@ -144,7 +152,7 @@ test("future epoch 4 annotates only read-only tools and leaves prior hashes unch
     "herdr_exec",
     "herdr_prompt",
   ];
-  // Epoch 4 is not yet active: the public surface still resolves to epoch 3.
+  // The exported fallback surface stays on epoch 3; explicit dev/prod select epoch 4.
   assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
   assert.equal(EPOCH4_CONTRACT.contract_epoch, 4);
   assert.equal(EPOCH4_CONTRACT.tool_count, EPOCH3_CONTRACT.tool_count);
@@ -185,9 +193,54 @@ test("future epoch 4 annotates only read-only tools and leaves prior hashes unch
     assert.ok(tool, `${name} must exist in epoch 4`);
     assert.notEqual(tool.annotations?.readOnlyHint, true, `${name} must not be mislabeled read-only`);
   }
-  // Only annotations differ from epoch 3; the underlying tool definitions are untouched.
+  const epoch3Exec = EPOCH3_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec");
+  const epoch4Exec = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec");
+  const epoch3ExecStart = EPOCH3_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec_start");
+  const epoch4ExecStart = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec_start");
+  assert.ok(epoch3Exec && epoch4Exec, "herdr_exec must exist in both epochs");
+  assert.ok(epoch3ExecStart && epoch4ExecStart, "herdr_exec_start must exist in both epochs");
+  assert.ok(epoch4Exec.inputSchema.properties.steps, "epoch 4 must advertise structured exec steps");
+  assert.deepEqual(epoch4Exec.inputSchema.required, ["workspace"]);
+  assert.equal("root" in epoch4Exec.inputSchema.properties, false);
+  assert.match(epoch4Exec.description, /requires workspace.*project_root.*does not take root/i);
+  assert.match(epoch4Exec.inputSchema.properties.workspace.description, /Do not pass root here/i);
+  assert.match(epoch4Exec.inputSchema.properties.project_root.description, /herdr_exec_start uses root instead/i);
+  assert.equal(epoch4Exec.inputSchema.oneOf.length, 2);
+  assert.equal(epoch4Exec.inputSchema.properties.steps.maxItems, 16);
+  assert.equal(epoch4Exec.inputSchema.properties.steps.items.properties.args.maxItems, 128);
+  assert.deepEqual(epoch4ExecStart.inputSchema.required, ["root"]);
+  assert.equal("workspace" in epoch4ExecStart.inputSchema.properties, false);
+  assert.equal("project_root" in epoch4ExecStart.inputSchema.properties, false);
+  assert.equal("steps" in epoch4ExecStart.inputSchema.properties, false);
+  assert.ok(epoch4ExecStart.inputSchema.properties.program);
+  assert.ok(epoch4ExecStart.inputSchema.properties.args);
+  assert.equal(epoch4ExecStart.inputSchema.properties.args.maxItems, 128);
+  assert.deepEqual(epoch4ExecStart.inputSchema.oneOf, [
+    {
+      required: ["command"],
+      not: { anyOf: [{ required: ["program"] }, { required: ["args"] }] },
+    },
+    { required: ["program"], not: { required: ["command"] } },
+  ]);
+  assert.match(
+    epoch4ExecStart.description,
+    /does not take workspace or project_root.*does not take steps.*Prefer program \+ args.*Use legacy command only when shell semantics/is,
+  );
+  assert.match(epoch4ExecStart.inputSchema.properties.root.description, /takes root directly.*workspace or project_root/i);
+  assert.match(epoch4ExecStart.inputSchema.properties.command.description, /shell command.*shell syntax.*program \+ args/is);
+  assert.match(epoch4ExecStart.inputSchema.properties.program.description, /Executable name or path.*args/is);
+  assert.match(epoch4ExecStart.inputSchema.properties.args.description, /Defaults to \[\].*no shell expansion/is);
+
+  // Apart from the deliberate execution descriptions and herdr_exec's
+  // structured schema, epoch 4 only adds annotations to the frozen epoch-3 catalog.
   const strip = (tools) => tools.map(({ annotations, ...rest }) => rest);
-  assert.deepEqual(strip(EPOCH4_CONTRACT.tools), strip(EPOCH3_CONTRACT.tools));
+  assert.deepEqual(
+    strip(EPOCH4_CONTRACT.tools.filter((tool) => !["herdr_exec", "herdr_exec_start"].includes(tool.name))),
+    strip(EPOCH3_CONTRACT.tools.filter((tool) => !["herdr_exec", "herdr_exec_start"].includes(tool.name))),
+  );
+  const stripExecDelta = ({ annotations, description, inputSchema, ...rest }) => rest;
+  assert.deepEqual(stripExecDelta(epoch4Exec), stripExecDelta(epoch3Exec));
+  assert.deepEqual(stripExecDelta(epoch4ExecStart), stripExecDelta(epoch3ExecStart));
   // Frozen prior epochs stayed bit-for-bit identical.
   assert.equal(EPOCH3_CONTRACT.contract_hash, "sha256:b8b4e5d13ccb3a1a7ab0c2e9ccfa913c076d0e1cd978cfe544d1261ea2509071");
   assert.equal(computeContractHash(EPOCH3_CONTRACT.tools), EPOCH3_CONTRACT.contract_hash);

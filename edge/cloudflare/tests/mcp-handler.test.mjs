@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
+import { EPOCH4_CONTRACT } from "../dist/contracts/epoch4.js";
 import { encodeDeviceRef } from "../dist/device-refs.js";
 import { makeLimits } from "../dist/limits.js";
 import { handleMcp } from "../dist/mcp-handler.js";
@@ -15,6 +16,7 @@ function deps(over = {}) {
     targets,
     value: {
       limits: makeLimits(),
+      edgeEnv: over.edgeEnv,
       logger: { warn() {} },
       getStub: (workstationId) => {
         targets.push(workstationId);
@@ -259,6 +261,36 @@ test("tools/list exposes runtime tools plus edge-local herdr_devices", async () 
   assert.equal(r.body.result.tools.some((tool) => tool.name === "herdr_skill"), true);
   assert.equal(r.body.result.tools.some((tool) => tool.name === "herdr_devices"), true);
   assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
+});
+
+test("public contract selection uses epoch 4 for first-party dev/prod and stays consistent across discovery surfaces", async () => {
+  for (const [edgeEnv, expected] of [
+    ["dev", EPOCH4_CONTRACT],
+    ["prod", EPOCH4_CONTRACT],
+    [undefined, EPOCH3_CONTRACT],
+    ["staging", EPOCH3_CONTRACT],
+  ]) {
+    const d = deps({ edgeEnv });
+    const initialize = await handleMcp(req(`init-${edgeEnv}`, "initialize", {}), "w1", d.value);
+    const discover = await handleMcp(req(`discover-${edgeEnv}`, "server/discover", {}), "w1", d.value);
+    const listed = await handleMcp(req(`list-${edgeEnv}`, "tools/list", {}), "w1", d.value);
+    for (const identity of [
+      initialize.body.result._meta.herdr,
+      discover.body.result._meta.herdr,
+      listed.body.result._meta.herdr,
+    ]) {
+      assert.equal(identity.contract_epoch, expected.contract_epoch);
+      assert.equal(identity.contract_hash, expected.contract_hash);
+      assert.equal(identity.tool_count, expected.tool_count);
+    }
+    assert.deepEqual(listed.body.result.tools, expected.tools);
+  }
+
+  const dev = deps({ edgeEnv: "dev" });
+  const listed = await handleMcp(req("dev-steps", "tools/list", {}), "w1", dev.value);
+  const exec = listed.body.result.tools.find((tool) => tool.name === "herdr_exec");
+  assert.ok(exec.inputSchema.properties.steps);
+  assert.equal(exec.inputSchema.properties.steps.maxItems, 16);
 });
 
 test("all 18 workstation contract tools pass the Edge routing boundary", async () => {
@@ -1155,6 +1187,7 @@ test("browser and Page Assist private methods require explicit enrolled device s
   const explicit = await handleMcp(
     req(3, "tools/call", {
       name: "herdr_call",
+      _meta: { "openai/session": "openai-session-anon-123" },
       arguments: {
         method: "herdr_mcp.browser_endpoint.list",
         device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -1180,6 +1213,10 @@ test("browser and Page Assist private methods require explicit enrolled device s
       principal_ref: "connector:conn_auditconnector123",
       connector_id: "conn_auditconnector123",
       grant_generation: 7,
+    },
+    browser_caller_session: {
+      provider: "chatgpt",
+      opaque_session_id: "openai-session-anon-123",
     },
   }, "routed browser private methods carry only the selected device grants plus exact Connector authorization provenance");
 

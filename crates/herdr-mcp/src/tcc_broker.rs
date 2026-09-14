@@ -44,7 +44,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Compatibility revision of the long-lived broker implementation. This is
 /// deliberately independent of the rotating `herdr-mcp` runtime bytes. Bump
 /// only when the installed broker itself must be replaced.
-pub const BROKER_COMPAT_REVISION: u32 = 2;
+///
+/// Revision 3 adds the read-only `git` identity action, so a runtime that
+/// needs exact source provenance must ask the operator to upgrade the stable
+/// broker instead of falling back to a direct Git read.
+pub const BROKER_COMPAT_REVISION: u32 = 3;
+/// First broker revision that implements the read-only `git` identity action.
+#[cfg(target_os = "macos")]
+pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
 /// First broker revision that can be a stable TCC parent for `herdr server`.
 #[cfg(any(target_os = "macos", test))]
 pub const HERDR_HOST_MIN_COMPAT_REVISION: u32 = 2;
@@ -958,6 +965,57 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
         return None;
     }
     Some(run_stable_broker(op, snapshot, args))
+}
+
+/// Whether the installed stable broker can answer the read-only `git` identity
+/// action. A missing or invalid compatibility revision fails closed.
+#[cfg(target_os = "macos")]
+pub(crate) fn installed_supports_git_identity(config_dir: &Path) -> bool {
+    installed_compat_revision(config_dir)
+        .is_some_and(|revision| revision >= GIT_IDENTITY_MIN_COMPAT_REVISION)
+}
+
+/// Resolve the exact `HEAD` commit and branch of a managed root through the
+/// installed stable broker. The broker re-validates the root against the live
+/// snapshot's managed roots, so the runtime never needs to name a `gitdir`
+/// path that may live outside them.
+#[cfg(target_os = "macos")]
+pub(crate) fn git_identity_via_stable_broker(
+    snapshot: &Value,
+    root: &Path,
+) -> Result<Value, String> {
+    run_stable_broker(
+        "git",
+        snapshot,
+        &json!({
+            "root": root.to_string_lossy(),
+            "action": "identity",
+        }),
+    )
+}
+
+/// Read bounded repository metadata through the already-installed stable TCC
+/// broker. This reuses the existing `fs_read` wire operation; the caller must
+/// still provide a live Herdr snapshot so the managed-root and secret-path
+/// gates remain identical to an ordinary `herdr_fs_read`. It deliberately does
+/// not depend on `HERDR_MCP_TCC_BROKER`, so a CLI that never inherited the
+/// service's routing flag still reaches the long-lived broker identity.
+#[cfg(target_os = "macos")]
+pub(crate) fn fs_read_via_stable_broker(
+    snapshot: &Value,
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Value, String> {
+    run_stable_broker(
+        "fs_read",
+        snapshot,
+        &json!({
+            "path": path.to_string_lossy(),
+            "start_line": 1,
+            "end_line": 100_000,
+            "max_bytes": max_bytes,
+        }),
+    )
 }
 
 /// Run the already-supported `git status` broker operation even when a direct

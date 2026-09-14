@@ -464,6 +464,7 @@ fn major_apply() -> Result<ExitCode, String> {
         let install_ok = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
         let migrated = read_raw_state_schema(&state_path).ok().flatten() == Some(SCHEMA_VERSION);
         if install_ok && migrated {
+            crate::local_agent_skill::sync_after_install_best_effort();
             print_json(&json!({
                 "ok": true,
                 "code": "major_update_succeeded",
@@ -517,6 +518,7 @@ fn major_rollback() -> Result<ExitCode, String> {
             ));
         }
         recover_major_upgrade(&paths, &record)?;
+        crate::local_agent_skill::sync_after_install_best_effort();
         print_json(&json!({
             "ok": true,
             "code": "major_update_rolled_back",
@@ -1138,6 +1140,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
                 None,
                 now_ms_i64(),
             )?;
+            crate::local_agent_skill::sync_after_install_best_effort();
             cleanup_staging(&binary);
             Ok(ExitCode::SUCCESS)
         } else {

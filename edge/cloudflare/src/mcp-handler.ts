@@ -1,6 +1,6 @@
 /** Stateless MCP/JSON-RPC handler used by both development and production Edge. */
 
-import { PUBLIC_CONTRACT } from "./contracts/public.js";
+import { PUBLIC_CONTRACT, resolvePublicContract } from "./contracts/public.js";
 import { RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 import { MCP_SERVER_VERSION } from "./version.js";
 import { relayErrorRequiresHuman, type RelayErrorResult } from "./errors.js";
@@ -85,6 +85,7 @@ export interface McpClientContext {
 }
 
 export interface McpDeps {
+  edgeEnv?: string;
   limits: EdgeLimits;
   forward(stub: unknown, body: string): Promise<Response>;
   getStub(workstationId: string): unknown;
@@ -130,6 +131,18 @@ const TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS = 2_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function openAiSessionFromToolCall(params: Record<string, unknown>): string | null {
+  const meta = params._meta;
+  if (!isRecord(meta)) return null;
+  const value = meta["openai/session"];
+  if (typeof value !== "string"
+      || value.length === 0
+      || value.length > 256
+      || value !== value.trim()
+      || /[\u0000-\u001f\u007f]/.test(value)) return null;
+  return value;
 }
 
 function validId(value: unknown): value is JsonRpcId {
@@ -388,15 +401,16 @@ function forwardEnvelopeError(forwarded: ForwardEnvelope): RelayErrorResult | un
   return undefined;
 }
 
-export function publicContractTools(): readonly unknown[] {
-  return PUBLIC_CONTRACT.tools;
+export function publicContractTools(edgeEnv?: string): readonly unknown[] {
+  return resolvePublicContract(edgeEnv).tools;
 }
 
-export function publicContractIdentity(): Record<string, unknown> {
+export function publicContractIdentity(edgeEnv?: string): Record<string, unknown> {
+  const publicContract = resolvePublicContract(edgeEnv);
   return {
-    contract_epoch: PUBLIC_CONTRACT.contract_epoch,
-    contract_hash: PUBLIC_CONTRACT.contract_hash,
-    tool_count: PUBLIC_CONTRACT.tool_count,
+    contract_epoch: publicContract.contract_epoch,
+    contract_hash: publicContract.contract_hash,
+    tool_count: publicContract.tool_count,
   };
 }
 
@@ -424,6 +438,7 @@ export async function handleMcp(
   workstationId: string,
   deps: McpDeps,
 ): Promise<McpResponse> {
+  const publicContract = resolvePublicContract(deps.edgeEnv);
   if (!isRecord(input)) return rpcError(null, -32600, "Invalid Request");
 
   const request = input as McpRequest;
@@ -445,8 +460,8 @@ export async function handleMcp(
       protocolVersion: negotiateProtocolVersion(params.protocolVersion),
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
-      instructions: `Herdr Edge public contract epoch ${PUBLIC_CONTRACT.contract_epoch}; workstation execution uses a separate authenticated runtime contract.`,
-      _meta: { herdr: publicContractIdentity() },
+      instructions: `Herdr Edge public contract epoch ${publicContract.contract_epoch}; workstation execution uses a separate authenticated runtime contract.`,
+      _meta: { herdr: publicContractIdentity(deps.edgeEnv) },
     });
   }
 
@@ -455,7 +470,7 @@ export async function handleMcp(
       resultType: "complete",
       supportedVersions: discoverSupportedVersions(deps.client),
       capabilities: { tools: { listChanged: false } },
-      instructions: `Herdr Edge public MCP contract epoch ${PUBLIC_CONTRACT.contract_epoch}.`,
+      instructions: `Herdr Edge public MCP contract epoch ${publicContract.contract_epoch}.`,
       ttlMs: 3_600_000,
       cacheScope: "private",
       _meta: {
@@ -463,7 +478,7 @@ export async function handleMcp(
           name: MCP_SERVER_NAME,
           version: MCP_SERVER_VERSION,
         },
-        herdr: publicContractIdentity(),
+        herdr: publicContractIdentity(deps.edgeEnv),
       },
     });
   }
@@ -473,8 +488,8 @@ export async function handleMcp(
       return rpcError(id, -32602, "Invalid params");
     }
     return rpcResult(id, {
-      tools: PUBLIC_CONTRACT.tools,
-      _meta: { herdr: publicContractIdentity() },
+      tools: publicContract.tools,
+      _meta: { herdr: publicContractIdentity(deps.edgeEnv) },
     });
   }
 
@@ -482,8 +497,9 @@ export async function handleMcp(
     if (!isRecord(request.params)) return rpcError(id, -32602, "Invalid params");
     const name = request.params.name;
     if (typeof name !== "string" || !PUBLIC_TOOL_NAMES.has(name)) {
-      return rpcError(id, -32602, "Invalid params", { reason: `tool is not in public contract epoch ${PUBLIC_CONTRACT.contract_epoch}` });
+      return rpcError(id, -32602, "Invalid params", { reason: `tool is not in public contract epoch ${publicContract.contract_epoch}` });
     }
+    const openaiSession = openAiSessionFromToolCall(request.params);
     const rawArgs = request.params.arguments;
     if (rawArgs !== undefined && rawArgs !== null && !isRecord(rawArgs)) {
       return rpcError(id, -32602, "Invalid params", { reason: "arguments must be an object or null" });
@@ -1165,6 +1181,9 @@ export async function handleMcp(
           grant_generation: Number(deps.client.grantGeneration),
         }
       : null;
+    const browserCallerSession = isBrowserPrivateMethod && openaiSession
+      ? { provider: "chatgpt", opaque_session_id: openaiSession }
+      : null;
     const readDedupeKey = opClass === "read"
       ? `read_${await sha256Hex(JSON.stringify(stableDedupeValue({
           op: name,
@@ -1176,6 +1195,7 @@ export async function handleMcp(
           automation_device_id: deps.client?.automationDeviceId ?? null,
           webchat_control_grants: webchatControlGrants,
           page_assist_grants: pageAssistGrants,
+          browser_caller_session: browserCallerSession,
         })))}`
       : undefined;
     const requestedToolTimeoutMs =
@@ -1201,12 +1221,13 @@ export async function handleMcp(
       readDedupeKey,
       ...(route.device_id ? { routeDeviceId: route.device_id } : {}),
       ...(route.execution_fence ? { executionFence: route.execution_fence } : {}),
-      ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0 || webchatAuthorization
+      ...(webchatControlGrants.length > 0 || pageAssistGrants.length > 0 || webchatAuthorization || browserCallerSession
         ? {
           trace: {
             ...(webchatControlGrants.length > 0 ? { webchat_control_grants: webchatControlGrants } : {}),
             ...(pageAssistGrants.length > 0 ? { page_assist_grants: pageAssistGrants } : {}),
             ...(webchatAuthorization ? { webchat_authorization: webchatAuthorization } : {}),
+            ...(browserCallerSession ? { browser_caller_session: browserCallerSession } : {}),
           },
         }
         : {}),

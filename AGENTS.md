@@ -134,6 +134,20 @@ systemctl --user show herdr-mcp.service herdr-mcp-link.service \
 
 After any lifecycle mutation, verify the active generation, exact launchd job, local health, runtime version, contract epoch/tool count, and rollback state before declaring success.
 
+### Local Agent → Browser / WebChat control
+
+Local coding agents (Pi, Codex, Claude, and similar) may drive supported WebChat sessions through herdr-mcp. Treat this as a second, equally first-class direction of the product: **Web AI → herdr-mcp → workstation** and **Local Agent → herdr-mcp → WebChat/browser** are different contracts with different surfaces, and neither may be documented as if it were the only one.
+
+1. When a local agent needs to act on ChatGPT/WebChat — create a conversation, continue in another conversation, dispatch a message, observe session state, or hand off a task — it must use the Herdr-MCP browser/WebChat control plane instead of starting its own browser automation.
+2. A local agent must not: drive ChatGPT with Playwright/Selenium, click through a browser with AppleScript, inject DOM or page scripts, guess account/Project/session identifiers, or bypass the Herdr extension, Continuity, or the runtime's routing and identity layer.
+3. Browser control is not generic web automation. It is a consented, identity-bound control plane for a small set of supported WebChat operations, with per-operation capability gating and fail-closed delivery semantics.
+4. WebChat mutations must respect: one stable idempotency key per intended mutation; delivery evidence instead of optimistic success; no blind retry of an uncertain mutation; and no synthesized account/Project/session/work-chain identity.
+5. Canonical handoff: Continuity is the durable task state. Handoff must use the project's canonical preparation path (`herdr_mcp.browser_handoff.prepare`), which local agents reach through `herdr-mcp webchat handoff`. Keep automatic delivery and the manual Copy Prompt byte-identical, have the target conversation resume the existing `continuity_id` first, and never create a second task-state authority or a parallel continuity chain. A CLI wrapper may only pass the canonical packet through unchanged; it must never grow its own message builder, state table, or routing.
+6. The browser extension is the browser-side execution, binding, wake, and observation boundary for this control plane. It is not a file transport and must not be used as a general browser RPA layer.
+7. Document and implement against the real exposure boundary: the `herdr-mcp` CLI is the supported local entrypoint for the operations it exposes, while the remaining browser operations are private methods reachable through the runtime MCP boundary. Never document a CLI subcommand that does not exist, and never present a capability the current runtime rejects with `code: "unsupported"` as available. A prepared handoff packet is not a delivered handoff: `automatic_delivery.completed=false` must be reported as such.
+
+`assets/local-agent-skill/herdr-mcp/**` is the discoverability contract for this surface: keep `SKILL.md` triggers and `references/webchat-control.md` aligned with the implementation, and update `manifest.json` hashes in the same change.
+
 ### User CLI migration rule
 
 The historical Bash entrypoint `bin/herdr-mcp` may exist as a compatibility wrapper during the Rust migration. When it is used, Rust lifecycle operations must delegate to `~/.config/herdr-mcp/runtime/current/herdr-mcp`.

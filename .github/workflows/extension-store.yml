@@ -7,6 +7,7 @@ on:
       - 'extension/**'
       - 'contracts/browser-extension-store.json'
       - 'contracts/browser-extension-store-listing.json'
+      - 'contracts/browser-extension-standalone.json'
       - 'scripts/pack-extension.mjs'
       - 'tests/browser-extension-store-contract.test.mjs'
       - 'tests/browser-extension-store-listing.test.mjs'
@@ -58,9 +59,21 @@ jobs:
           VERSION="$(node -p "require('./extension/manifest.json').version")"
           STORE_ID="$(node -p "require('./contracts/browser-extension-store.json').chrome_web_store.extension_id")"
           printf 'extension_id=%s\nversion=%s\nsource_commit=%s\n' "$STORE_ID" "$VERSION" "$GITHUB_SHA" > store-artifact/STORE-RELEASE.txt
+      - name: Build manual standalone package
+        run: |
+          node scripts/pack-extension.mjs --out-dir standalone-artifact --channel standalone
+          VERSION="$(node -p "require('./extension/manifest.json').version")"
+          STANDALONE_ID="$(node -p "require('./contracts/browser-extension-standalone.json').standalone.extension_id")"
+          printf 'extension_id=%s\nversion=%s\nsource_commit=%s\n' "$STANDALONE_ID" "$VERSION" "$GITHUB_SHA" > standalone-artifact/STANDALONE-RELEASE.txt
       - uses: actions/upload-artifact@v4
         with:
           name: chrome-web-store-${{ github.sha }}
           path: store-artifact/*
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chrome-standalone-${{ github.sha }}
+          path: standalone-artifact/*
           if-no-files-found: error
           retention-days: 30

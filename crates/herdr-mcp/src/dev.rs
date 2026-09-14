@@ -85,8 +85,9 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         "dev sync must run inside a herdr-mcp Rust source checkout containing Cargo.toml and crates/herdr-mcp/Cargo.toml"
             .to_owned()
     })?;
-    let source = source_identity(&repo)?;
-    let target_version = source_dev_version(&repo)?;
+    let runtime = RuntimePaths::discover()?;
+    let source = source_identity(&repo, &runtime)?;
+    let target_version = source_dev_version(&repo, &runtime)?;
     if source.dirty && !allow_dirty {
         return Err(
             "dev sync refuses a dirty source tree by default; commit/stash the changes or rerun with --allow-dirty so the provenance is explicit"
@@ -94,7 +95,6 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         );
     }
 
-    let runtime = RuntimePaths::discover()?;
     let paths = dev_paths(&runtime);
     let active_before = current_generation(&runtime.config_dir)?.ok_or_else(|| {
         "dev sync requires an installed managed PROD runtime/current generation".to_owned()
@@ -137,6 +137,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             return Ok(ExitCode::SUCCESS);
         }
         write_state(&paths.state, state)?;
+        crate::local_agent_skill::sync_after_install_best_effort();
         print_json(&json!({
             "ok": true,
             "action": "dev_sync_recovered",
@@ -335,6 +336,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         || run_service_rollback(&built_binary),
         || restore_state(&paths.state, previous_state.as_ref()),
     )?;
+    crate::local_agent_skill::sync_after_install_best_effort();
 
     print_json(&json!({
         "ok": true,
@@ -513,6 +515,7 @@ fn rollback() -> Result<ExitCode, String> {
     state.prod_generation = active_after.clone();
     state.updated_at_ms = now_ms();
     write_state(&paths.state, &state)?;
+    crate::local_agent_skill::sync_after_install_best_effort();
     print_json(&json!({
         "ok": true,
         "action": "dev_rollback",
@@ -524,7 +527,13 @@ fn rollback() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn source_identity(repo: &Path) -> Result<SourceIdentity, String> {
+fn source_identity(repo: &Path, runtime: &RuntimePaths) -> Result<SourceIdentity, String> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = runtime;
+    #[cfg(target_os = "macos")]
+    if source_identity_needs_stable_broker(repo) {
+        return source_identity_via_stable_broker(repo, runtime);
+    }
     let commit = git(repo, &["rev-parse", "HEAD"])?;
     let branch = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
         .ok()
@@ -535,6 +544,190 @@ fn source_identity(repo: &Path) -> Result<SourceIdentity, String> {
         commit,
         dirty,
     })
+}
+
+/// Whether this checkout's Git metadata sits inside a macOS privacy-protected
+/// folder, where reading it directly would make the rotating runtime the TCC
+/// responsible client for Documents/Desktop/Downloads. A Herdr linked worktree
+/// is covered through its `.git` marker, which points into the protected main
+/// repository.
+#[cfg(target_os = "macos")]
+fn source_identity_needs_stable_broker(repo: &Path) -> bool {
+    if crate::macos_permissions::is_protected_user_path(repo) {
+        return true;
+    }
+    fs::read_to_string(repo.join(".git"))
+        .ok()
+        .and_then(|content| {
+            let raw = content.trim().strip_prefix("gitdir:")?.trim().to_owned();
+            (!raw.is_empty()).then(|| {
+                let path = PathBuf::from(raw);
+                if path.is_absolute() {
+                    path
+                } else {
+                    repo.join(path)
+                }
+            })
+        })
+        .is_some_and(|git_dir| crate::macos_permissions::is_protected_user_path(&git_dir))
+}
+
+/// Protected source identity is broker-only: the runtime never shells `git`
+/// here and never names a `gitdir` path, so a linked worktree whose metadata
+/// lives outside the snapshot's managed roots is resolved by Git itself at the
+/// worktree root.
+#[cfg(target_os = "macos")]
+fn source_identity_via_stable_broker(
+    repo: &Path,
+    runtime: &RuntimePaths,
+) -> Result<SourceIdentity, String> {
+    if !crate::tcc_broker::installed_supports_git_identity(&runtime.config_dir) {
+        return Err(stable_broker_upgrade_hint(&runtime.config_dir));
+    }
+    let snapshot = stable_broker_snapshot(runtime)?;
+
+    let status = crate::tcc_broker::git_status_via_stable_broker(&snapshot, repo)
+        .map_err(|error| format!("dev sync stable Git status failed: {error}"))?;
+    if status.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "dev sync stable Git status failed: {}",
+            broker_error(&status)
+        ));
+    }
+    let dirty = broker_git_dirty(&status).ok_or_else(|| {
+        format!(
+            "dev sync stable Git status returned no file counts: {}",
+            broker_error(&status)
+        )
+    })?;
+
+    let identity = crate::tcc_broker::git_identity_via_stable_broker(&snapshot, repo)
+        .map_err(|error| format!("dev sync stable Git identity failed: {error}"))?;
+    let (branch, commit) = git_identity_from_broker(&identity)?;
+    Ok(SourceIdentity {
+        branch,
+        commit,
+        dirty,
+    })
+}
+
+/// Fail closed with the established macOS broker-upgrade flow. `dev sync`
+/// never installs or authorizes the broker itself.
+#[cfg(target_os = "macos")]
+fn stable_broker_upgrade_hint(config_dir: &Path) -> String {
+    let installed = crate::tcc_broker::installed_compat_revision(config_dir)
+        .map(|revision| revision.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "dev sync needs a stable TCC broker that implements the read-only Git identity action (broker revision {} or newer) but the installed broker revision is {installed}; run `herdr-mcp permissions setup --upgrade-broker`, grant Full Disk Access to the stable broker if macOS asks, complete `herdr-mcp permissions verify`, then re-run dev sync",
+        crate::tcc_broker::GIT_IDENTITY_MIN_COMPAT_REVISION
+    )
+}
+
+/// Live Herdr snapshot whose managed roots and secret-path gates the stable
+/// broker re-validates for every read. An unavailable socket or snapshot fails
+/// closed instead of falling back to direct `git`.
+#[cfg(target_os = "macos")]
+fn stable_broker_snapshot(runtime: &RuntimePaths) -> Result<Value, String> {
+    let socket = runtime.herdr_socket.as_ref().ok_or_else(|| {
+        "dev sync needs a live Herdr socket to read protected Git metadata through the stable TCC broker"
+            .to_owned()
+    })?;
+    let envelope = crate::herdr::HerdrClient::new(socket)
+        .call_with_timeout("session.snapshot", json!({}), Duration::from_secs(8))
+        .map_err(|error| {
+            format!(
+                "dev sync cannot read the Herdr snapshot required for stable TCC Git access ({}): {}",
+                error.code, error.message
+            )
+        })?;
+    Ok(envelope.get("snapshot").cloned().unwrap_or(envelope))
+}
+
+/// Read one bounded repository file through the stable broker. Callers must
+/// pass a live snapshot so managed-root and secret-path gates stay identical
+/// to an ordinary `herdr_fs_read`.
+#[cfg(target_os = "macos")]
+fn broker_read_text(snapshot: &Value, path: &Path, max_bytes: usize) -> Result<String, String> {
+    let value = crate::tcc_broker::fs_read_via_stable_broker(snapshot, path, max_bytes)
+        .map_err(|error| format!("stable broker fs_read {} failed: {error}", path.display()))?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "stable broker fs_read {} failed: {}",
+            path.display(),
+            broker_error(&value)
+        ));
+    }
+    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+        return Err(format!(
+            "stable broker metadata read was truncated for {}",
+            path.display()
+        ));
+    }
+    value
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "stable broker metadata read returned no content for {}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn broker_error(value: &Value) -> String {
+    ["message", "reason", "code"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))
+        .unwrap_or("unknown stable broker failure")
+        .to_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn broker_git_dirty(status: &Value) -> Option<bool> {
+    if let Some(files) = status
+        .get("counts")
+        .and_then(|counts| counts.get("files"))
+        .and_then(Value::as_u64)
+    {
+        return Some(files > 0);
+    }
+    let output = status.get("output").and_then(Value::as_str)?;
+    Some(
+        output
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.starts_with("##")),
+    )
+}
+
+/// Validate the stable broker's identity response: the commit must be a full
+/// Git object id, and a missing branch is only accepted for a detached HEAD.
+#[cfg(target_os = "macos")]
+fn git_identity_from_broker(value: &Value) -> Result<(Option<String>, String), String> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "dev sync stable Git identity failed: {}",
+            broker_error(value)
+        ));
+    }
+    let commit = value
+        .get("commit")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "dev sync stable Git identity returned no commit".to_owned())?
+        .to_ascii_lowercase();
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "dev sync stable Git identity returned invalid commit '{commit}'"
+        ));
+    }
+    let branch = value
+        .get("branch")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    Ok((branch, commit))
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -553,7 +746,13 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn source_dev_version(repo: &Path) -> Result<String, String> {
+fn source_dev_version(repo: &Path, runtime: &RuntimePaths) -> Result<String, String> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = runtime;
+    #[cfg(target_os = "macos")]
+    if source_identity_needs_stable_broker(repo) {
+        return source_dev_version_via_stable_broker(repo, runtime);
+    }
     let output = Command::new("cargo")
         .args(["metadata", "--locked", "--no-deps", "--format-version", "1"])
         .current_dir(repo)
@@ -568,6 +767,74 @@ fn source_dev_version(repo: &Path) -> Result<String, String> {
     let metadata: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("cannot decode cargo metadata for DEV target version: {error}"))?;
     dev_version_from_metadata(&metadata)
+}
+
+/// Resolve the DEV target version from the checkout's own manifests through
+/// the stable broker. `cargo metadata` would read privacy-protected files as
+/// the rotating runtime's TCC client. The read stays bounded to the two
+/// manifests that can carry the `herdr-mcp` package version, and the caller has
+/// already gated this path on an identity-capable broker.
+#[cfg(target_os = "macos")]
+fn source_dev_version_via_stable_broker(
+    repo: &Path,
+    runtime: &RuntimePaths,
+) -> Result<String, String> {
+    let snapshot = stable_broker_snapshot(runtime)?;
+    let manifest = repo.join("crates").join("herdr-mcp").join("Cargo.toml");
+    let text = broker_read_text(&snapshot, &manifest, 64 * 1024)?;
+    let version = match toml_section_version(&text, "[package]") {
+        Some(version) => version,
+        None => {
+            // `version.workspace = true`: the workspace root owns the value.
+            let root = repo.join("Cargo.toml");
+            let text = broker_read_text(&snapshot, &root, 64 * 1024)?;
+            toml_section_version(&text, "[workspace.package]").ok_or_else(|| {
+                format!(
+                    "cannot resolve the herdr-mcp package version through the stable broker from {} or {}",
+                    manifest.display(),
+                    root.display()
+                )
+            })?
+        }
+    };
+    dev_version_from_str(&version)
+}
+
+/// Bounded `version = "..."` lookup inside one TOML table. A
+/// `version.workspace = true` line is deliberately not a value.
+#[cfg(target_os = "macos")]
+fn toml_section_version(text: &str, section: &str) -> Option<String> {
+    let mut active = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            active = line == section;
+            continue;
+        }
+        if !active {
+            continue;
+        }
+        let Some(value) = line
+            .strip_prefix("version")
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('='))
+        else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_matches(|character| character == '"' || character == '\'');
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn dev_version_from_str(version: &str) -> Result<String, String> {
+    semver::Version::parse(version)
+        .map_err(|error| format!("invalid herdr-mcp package version '{version}': {error}"))?;
+    Ok(format!("{version}-dev"))
 }
 
 fn dev_version_from_metadata(metadata: &Value) -> Result<String, String> {
@@ -585,9 +852,7 @@ fn dev_version_from_metadata(metadata: &Value) -> Result<String, String> {
         .get("version")
         .and_then(Value::as_str)
         .ok_or_else(|| "cargo metadata missing herdr-mcp package version".to_owned())?;
-    semver::Version::parse(version)
-        .map_err(|error| format!("invalid herdr-mcp package version '{version}': {error}"))?;
-    Ok(format!("{version}-dev"))
+    dev_version_from_str(version)
 }
 
 fn build_dev_binary(
@@ -1086,6 +1351,45 @@ fn dev_paths(runtime: &RuntimePaths) -> DevPaths {
     }
 }
 
+/// Return the repository recorded as the source of the currently active clean
+/// DEV runtime when it matches the exact source commit requested by the local
+/// Agent Skill installer. The caller must still read content from that commit's
+/// Git objects rather than from the mutable working tree.
+pub(crate) fn local_agent_skill_source_repo(
+    source_commit: &str,
+) -> Result<Option<PathBuf>, String> {
+    let runtime = RuntimePaths::discover()?;
+    let paths = dev_paths(&runtime);
+    let state = read_state(&paths.state)?;
+    let Some(repo_text) = state
+        .as_ref()
+        .and_then(|state| matching_clean_dev_source_repo(state, source_commit))
+    else {
+        return Ok(None);
+    };
+    let repo = PathBuf::from(repo_text);
+    match fs::canonicalize(&repo) {
+        Ok(repo) if repo.is_dir() => Ok(Some(repo)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot resolve recorded DEV source repository {}: {error}",
+            repo.display()
+        )),
+    }
+}
+
+fn matching_clean_dev_source_repo<'a>(
+    state: &'a DevRuntimeState,
+    source_commit: &str,
+) -> Option<&'a str> {
+    (state.channel == "dev"
+        && !state.source_dirty
+        && state.source_commit.as_deref() == Some(source_commit))
+    .then_some(state.source_repo.as_deref())
+    .flatten()
+}
+
 fn current_generation(config_dir: &Path) -> Result<Option<String>, String> {
     let current = config_dir.join("runtime/current");
     match fs::symlink_metadata(&current) {
@@ -1309,6 +1613,128 @@ fn print_json(value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn stable_broker_identity_and_manifest_version_are_validated() {
+        let oid = "d2388010d253e34622cc727c88e7f23aba25758c";
+        let (branch, commit) = git_identity_from_broker(&json!({
+            "ok": true,
+            "commit": oid,
+            "branch": "fix/v1-dev-source-identity-broker-20260914",
+            "detached": false,
+        }))
+        .unwrap();
+        assert_eq!(
+            branch.as_deref(),
+            Some("fix/v1-dev-source-identity-broker-20260914")
+        );
+        assert_eq!(commit, oid);
+
+        let (branch, commit) =
+            git_identity_from_broker(&json!({"ok": true, "commit": oid, "branch": null})).unwrap();
+        assert_eq!(branch, None);
+        assert_eq!(commit, oid);
+
+        // A short object id is exactly what the existing broker `log` action
+        // returns; it must never be accepted as exact provenance.
+        assert!(git_identity_from_broker(&json!({"ok": true, "commit": "d2388010"})).is_err());
+        assert!(
+            git_identity_from_broker(&json!({"ok": false, "reason": "not_a_git_repo"})).is_err()
+        );
+
+        assert_eq!(
+            broker_git_dirty(&json!({"counts": {"files": 0}})),
+            Some(false)
+        );
+        assert_eq!(
+            broker_git_dirty(&json!({"counts": {"files": 3}})),
+            Some(true)
+        );
+
+        assert_eq!(
+            toml_section_version(
+                "[package]\nname = \"herdr-mcp\"\nversion = \"1.0.0-alpha.8\"\n",
+                "[package]"
+            )
+            .as_deref(),
+            Some("1.0.0-alpha.8")
+        );
+        assert_eq!(
+            toml_section_version(
+                "[workspace.package]\nversion = \"9.9.9\"\n",
+                "[workspace.package]"
+            )
+            .as_deref(),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            toml_section_version("[package]\nversion.workspace = true\n", "[package]"),
+            None
+        );
+        assert_eq!(
+            dev_version_from_str("1.0.0-alpha.8").unwrap(),
+            "1.0.0-alpha.8-dev"
+        );
+        assert!(dev_version_from_str("not-semver").is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn protected_source_identity_fails_closed_until_the_broker_is_upgraded() {
+        let home = env::var_os("HOME").map(PathBuf::from).unwrap();
+        assert!(source_identity_needs_stable_broker(
+            &home.join("Documents").join("herdr-mcp")
+        ));
+
+        // A linked worktree whose `.git` marker points into the protected main
+        // repository must take the broker path too, and never shell `git`.
+        let root = env::temp_dir().join(format!("herdr-mcp-dev-gitdir-test-{}", now_ms()));
+        let worktree = root.join("checkout");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                home.join("Documents")
+                    .join("herdr-mcp/.git/worktrees/example")
+                    .display()
+            ),
+        )
+        .unwrap();
+        assert!(source_identity_needs_stable_broker(&worktree));
+        assert!(!source_identity_needs_stable_broker(&root));
+
+        let config = root.join("config");
+        let mut runtime = RuntimePaths::discover().unwrap();
+        runtime.config_dir = config.clone();
+        let error = source_identity(&worktree, &runtime).unwrap_err();
+        assert!(
+            error.contains("herdr-mcp permissions setup --upgrade-broker"),
+            "unexpected error: {error}"
+        );
+
+        // Once an identity-capable broker is installed the next missing
+        // requirement is the live snapshot; neither step may fall back to a
+        // direct `git` read.
+        let broker_dir = config.join("tcc-broker");
+        fs::create_dir_all(&broker_dir).unwrap();
+        fs::write(broker_dir.join("herdr-mcp-broker"), b"fixture").unwrap();
+        fs::write(
+            broker_dir.join("metadata.json"),
+            format!(
+                "{{\"schema_version\":1,\"compat_revision\":{},\"preferred_signing_identifier\":\"{}\"}}",
+                crate::tcc_broker::GIT_IDENTITY_MIN_COMPAT_REVISION,
+                crate::tcc_broker::BROKER_SIGNING_IDENTIFIER
+            ),
+        )
+        .unwrap();
+        assert!(crate::tcc_broker::installed_supports_git_identity(&config));
+        runtime.herdr_socket = None;
+        let error = source_identity(&worktree, &runtime).unwrap_err();
+        assert!(error.contains("Herdr socket"), "unexpected error: {error}");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn finds_native_checkout_from_nested_directory() {
@@ -1633,6 +2059,40 @@ mod tests {
         ));
         assert_eq!(state.dev_generation.as_deref(), Some("rust-dev"));
         assert_eq!(state.updated_at_ms, 2);
+    }
+
+    #[test]
+    fn local_agent_skill_source_requires_clean_exact_dev_provenance() {
+        let mut state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "1.0.0-dev".to_owned(),
+            source_repo: Some("/tmp/herdr-mcp".to_owned()),
+            source_branch: Some("main".to_owned()),
+            source_commit: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            source_dirty: false,
+            dev_generation: Some("rust-dev".to_owned()),
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "0.4.8".to_owned(),
+            prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
+            prod_snapshot_sha256: "0".repeat(64),
+            updated_at_ms: 1,
+        };
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            matching_clean_dev_source_repo(&state, commit),
+            Some("/tmp/herdr-mcp")
+        );
+        assert_eq!(
+            matching_clean_dev_source_repo(&state, &"f".repeat(40)),
+            None
+        );
+
+        state.source_dirty = true;
+        assert_eq!(matching_clean_dev_source_repo(&state, commit), None);
+        state.source_dirty = false;
+        state.channel = "prod".to_owned();
+        assert_eq!(matching_clean_dev_source_repo(&state, commit), None);
     }
 
     #[test]

@@ -33,6 +33,7 @@ export const DOC_ORDER = [
   "extension",
   "browser-control-center",
   "browser-json-mcp-bridge",
+  "local-agent-webchat-control",
   "privacy",
   "cloudflare-edge-deployment",
   "cloudflare-edge-token",
@@ -54,7 +55,7 @@ export const READING_ORDER = DOC_ORDER.filter((slug) => !MAINTAINER_DOCS.include
 export const NAV_GROUPS = [
   { slugs: ["agent-install", "existing-worker-connect", "multi-machine-control", "overview", "install", "chatgpt-connector", "quick-start"] },
   { slugs: ["best-practices", "automation", "cli-reference"] },
-  { slugs: ["browser-continuity", "extension", "browser-control-center", "browser-json-mcp-bridge", "privacy"] },
+  { slugs: ["browser-continuity", "extension", "browser-control-center", "browser-json-mcp-bridge", "local-agent-webchat-control", "privacy"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "platform-support-matrix", "worker-fallbacks", "troubleshooting"] },
   { slugs: ["design-philosophy", "architecture", "capability-benchmark", "herdr-vs-ecosystem"] },
   { slugs: MAINTAINER_DOCS, secondary: true },

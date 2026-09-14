@@ -490,12 +490,41 @@ impl ExecRegistry {
     }
 
     pub(crate) fn start_native(&self, cwd: &Path, command: &str) -> Result<Value, String> {
-        self.prune();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
         }
+        self.start_native_process(cwd, command, |id| shell_command(command, id))
+    }
+
+    pub(crate) fn start_native_program(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+    ) -> Result<Value, String> {
+        if program.is_empty() {
+            return Err("program must not be empty".to_owned());
+        }
+        let rendered = render_exec_argv(program, args);
+        self.start_native_process(cwd, &rendered, |_| {
+            let mut process = Command::new(program);
+            process.args(args);
+            process
+        })
+    }
+
+    fn start_native_process<F>(
+        &self,
+        cwd: &Path,
+        command: &str,
+        build_process: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce(&str) -> Command,
+    {
+        self.prune();
         let id = new_session_id();
-        let mut process = shell_command(command, &id);
+        let mut process = build_process(&id);
         process
             .current_dir(cwd)
             .env("HERDR_MCP_EXEC_ID", &id)
@@ -926,6 +955,7 @@ impl ExecRegistry {
                 }
                 keep
             });
+            prune_loaded_closed_sessions(&mut sessions, RECOVERY_MAX_ENTRIES);
         }
         if let Ok(store) = self.inner.state_store.lock() {
             if store.prune_exec_sessions(now).is_err() {
@@ -937,6 +967,38 @@ impl ExecRegistry {
                 clean_expired_spools(&self.inner.state_dir, &unexpired_ids);
             }
         }
+    }
+}
+
+/// Bound the resident set of completed sessions while leaving every durable
+/// spool and `exec_sessions` row untouched, so an evicted session is still
+/// readable through `read`/`wait` recovery instead of being lost.
+///
+/// The keep order deliberately mirrors the `closed_exec_sessions` query
+/// (`COALESCE(ended_at, started_at) DESC, started_at DESC, session_id DESC`),
+/// so the boot-time load and this steady-state cap agree on which sessions are
+/// hot. The oldest entries are dropped first.
+fn prune_loaded_closed_sessions(sessions: &mut HashMap<String, Arc<Session>>, max_closed: usize) {
+    let mut closed = sessions
+        .iter()
+        .filter_map(|(id, session)| {
+            let status = session_status(session);
+            status.closed.then(|| {
+                (
+                    status.ended_at_ms.unwrap_or(session.started_at_ms),
+                    session.started_at_ms,
+                    id.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if closed.len() <= max_closed {
+        return;
+    }
+    closed.sort_unstable();
+    let remove_count = closed.len() - max_closed;
+    for (_, _, id) in closed.drain(..remove_count) {
+        let _ = sessions.remove(&id);
     }
 }
 
@@ -1137,6 +1199,14 @@ fn pane_script_path(id: &str) -> PathBuf {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub(crate) fn render_exec_argv(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn pane_spool_paths(id: &str) -> PaneSpoolPaths {
@@ -1932,6 +2002,30 @@ mod tests {
         assert!(text.contains("out"));
         assert!(text.contains("err"));
         assert!(view.get("compacted").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_program_mode_passes_literal_argv_without_shell_expansion() {
+        let registry = registry();
+        let args = vec!["%s\\n".to_owned(), "$HOME;$(uname)* literal".to_owned()];
+        let started = registry
+            .start_native_program(Path::new("/tmp"), "/usr/bin/printf", &args)
+            .unwrap();
+        assert_eq!(
+            started["command"],
+            "'/usr/bin/printf' '%s\\n' '$HOME;$(uname)* literal'"
+        );
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait_until_closed(&registry, &id, "stdout", 65536);
+        assert_eq!(view["exit_code"], 0);
+        assert_eq!(view["text"], "$HOME;$(uname)* literal\n");
+        let listed = registry
+            .list_views()
+            .into_iter()
+            .find(|entry| entry["session_id"] == id)
+            .unwrap();
+        assert_eq!(listed["command"], started["command"]);
     }
 
     #[test]
@@ -2792,6 +2886,186 @@ mod tests {
 
         drop(restarted);
         let _ = fs::remove_dir_all(&path);
+    }
+
+    fn loaded_completed_session(
+        id: &str,
+        started_at_ms: u64,
+        ended_at_ms: u64,
+        output: &str,
+    ) -> Arc<Session> {
+        Arc::new(Session {
+            id: id.to_owned(),
+            cwd: PathBuf::new(),
+            command: String::new(),
+            started_at_ms,
+            pid: None,
+            backend: SessionBackend::Completed,
+            buffers: Mutex::new(Buffers {
+                chunks: vec![Chunk {
+                    seq: 0,
+                    stream: StreamKind::Stdout,
+                    data: output.as_bytes().to_vec(),
+                }],
+                next_seq: 1,
+                stdout_bytes: output.len(),
+                stderr_bytes: 0,
+                truncated: false,
+            }),
+            status: Mutex::new(SessionStatus {
+                closed: true,
+                exit_code: Some(0),
+                signal: None,
+                ended_at_ms: Some(ended_at_ms),
+            }),
+        })
+    }
+
+    #[test]
+    fn loaded_closed_sessions_are_capped_without_losing_durable_evidence() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-loaded-cap-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let now = now_ms();
+        let base = now.saturating_sub(120_000);
+        let total_closed = RECOVERY_MAX_ENTRIES + 6;
+
+        for i in 0..total_closed {
+            let session_id = format!("es_loaded_{i:03}");
+            let started_at_ms = base + i as u64;
+            let ended_at_ms = started_at_ms + 1;
+            let session = loaded_completed_session(
+                &session_id,
+                started_at_ms,
+                ended_at_ms,
+                &format!("output-{i}\n"),
+            );
+            {
+                let store = registry.inner.state_store.lock().unwrap();
+                store
+                    .record_exec_running(
+                        &session_id,
+                        20_000 + u32::try_from(i).unwrap(),
+                        None,
+                        started_at_ms,
+                    )
+                    .unwrap();
+                store
+                    .settle_exec_session(
+                        &session_id,
+                        "closed",
+                        Some(ended_at_ms),
+                        Some(0),
+                        None,
+                        now + SESSION_TTL_MS,
+                    )
+                    .unwrap();
+            }
+            write_session_spool(&path, &session).unwrap();
+            registry
+                .inner
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(session_id, session);
+        }
+
+        let running_id = "es_loaded_running".to_owned();
+        {
+            let store = registry.inner.state_store.lock().unwrap();
+            store.record_pane_exec_running(&running_id, now).unwrap();
+        }
+        registry.inner.sessions.lock().unwrap().insert(
+            running_id.clone(),
+            Arc::new(Session {
+                id: running_id.clone(),
+                cwd: PathBuf::new(),
+                command: "still-running".to_owned(),
+                started_at_ms: now,
+                pid: None,
+                backend: SessionBackend::Completed,
+                buffers: Mutex::new(Buffers::default()),
+                status: Mutex::new(SessionStatus::default()),
+            }),
+        );
+
+        registry.prune();
+        let views = registry.list_views();
+        assert_eq!(views.len(), RECOVERY_MAX_ENTRIES + 1);
+        assert!(
+            views
+                .iter()
+                .any(|view| view["session_id"] == running_id.as_str() && view["running"] == true)
+        );
+        assert!(
+            !views
+                .iter()
+                .any(|view| view["session_id"] == "es_loaded_000")
+        );
+        let newest = format!("es_loaded_{:03}", total_closed - 1);
+        assert!(
+            views
+                .iter()
+                .any(|view| view["session_id"] == newest.as_str())
+        );
+
+        // Evicting the oldest completion must not delete its durable evidence.
+        let oldest_spool = exec_spool_path(&path, "es_loaded_000");
+        assert!(oldest_spool.exists());
+        let recovered = registry.read("es_loaded_000", "stdout", 0, 64);
+        assert_eq!(recovered["ok"], true);
+        assert_eq!(recovered["phase"], "completed");
+        assert_eq!(recovered["recovered"], true);
+        assert_eq!(recovered["text"], "output-0\n");
+        assert!(oldest_spool.exists());
+
+        // A recovery read rebinds the session, but the next prune re-evicts it
+        // instead of letting the resident set grow past the cap.
+        let rebound = registry.list_views();
+        assert_eq!(rebound.len(), RECOVERY_MAX_ENTRIES + 1);
+        assert!(
+            !rebound
+                .iter()
+                .any(|view| view["session_id"] == "es_loaded_000")
+        );
+
+        drop(registry);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn loaded_closed_sessions_at_the_recovery_limit_are_retained() {
+        let registry = registry();
+        let now = now_ms();
+        for i in 0..RECOVERY_MAX_ENTRIES {
+            let id = format!("es_at_cap_{i:03}");
+            let session = loaded_completed_session(&id, now.saturating_sub(1), now, "output\n");
+            registry.inner.sessions.lock().unwrap().insert(id, session);
+        }
+
+        registry.prune();
+        {
+            let sessions = registry.inner.sessions.lock().unwrap();
+            assert_eq!(sessions.len(), RECOVERY_MAX_ENTRIES);
+            assert!(sessions.contains_key("es_at_cap_000"));
+        }
+
+        // One past the cap evicts exactly the oldest completion, not the newest.
+        registry.inner.sessions.lock().unwrap().insert(
+            "es_at_cap_extra".to_owned(),
+            loaded_completed_session("es_at_cap_extra", now, now, "output\n"),
+        );
+        registry.prune();
+        {
+            let sessions = registry.inner.sessions.lock().unwrap();
+            assert_eq!(sessions.len(), RECOVERY_MAX_ENTRIES);
+            assert!(!sessions.contains_key("es_at_cap_000"));
+            assert!(sessions.contains_key("es_at_cap_extra"));
+            assert!(sessions.contains_key("es_at_cap_063"));
+        }
     }
 
     #[test]

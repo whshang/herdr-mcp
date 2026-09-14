@@ -3,6 +3,7 @@ import { detectOrLoadLocale, setLocale, getLocale, t, onLocaleReady } from "./i1
 import {
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 } from "./binding-core.js";
+import { nativeHostFailure } from "./native-host-diagnostics.js";
 
 const $ = (id) => document.getElementById(id);
 const KEYS = [
@@ -279,6 +280,10 @@ $("test").addEventListener("click", () => {
       return;
     }
     const localError = String(resp?.error || "");
+    if (nativeHostFailure(localError) === "owner-inactive") {
+      setConnectionFailure(`✖ ${t("native_host_owner_inactive")}`);
+      return;
+    }
     if (/native[- ]messaging|native host|native-host|specified native/i.test(localError)) {
       setConnectionFailure(`✖ ${t("native_host_help")}`);
       return;
