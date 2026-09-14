@@ -719,21 +719,18 @@ fn continuity_call(
             };
             let exact_identity_hint =
                 project_id.is_some() || workspace_id.is_some() || conversation_id.is_some();
-            let mut match_reasons = Vec::new();
+            let mut common_match_reasons = Vec::new();
             if conversation_id.is_some() {
-                match_reasons.push("conversation_id");
+                common_match_reasons.push("conversation_id");
             }
             if project_id.is_some() {
-                match_reasons.push("project_id");
-            }
-            if repo_id.is_some() {
-                match_reasons.push("repo_id");
+                common_match_reasons.push("project_id");
             }
             if workspace_id.is_some() {
-                match_reasons.push("workspace_id");
+                common_match_reasons.push("workspace_id");
             }
             if query.is_some() {
-                match_reasons.push("query");
+                common_match_reasons.push("query");
             }
             match store.continuity_search(ContinuitySearchInput {
                 project_id,
@@ -775,6 +772,21 @@ fn continuity_call(
                     let candidates = records
                         .into_iter()
                         .map(|record| {
+                            let mut match_reasons = common_match_reasons.clone();
+                            let repo_scope = match repo_id {
+                                Some(expected_repo_id)
+                                    if record.repo_id.as_deref() == Some(expected_repo_id) =>
+                                {
+                                    match_reasons.push("repo_id");
+                                    Some("exact")
+                                }
+                                Some(_) if record.repo_id.is_none() => {
+                                    match_reasons.push("legacy_repo_unbound");
+                                    Some("legacy_unbound")
+                                }
+                                Some(_) => Some("mismatch"),
+                                None => None,
+                            };
                             let work_memory = match (
                                 record.project_ref.as_deref(),
                                 record.repo_id.as_deref(),
@@ -799,10 +811,15 @@ fn continuity_call(
                                 "updated_at": record.updated_at,
                                 "recent_user_excerpt": record.recent_user_excerpt,
                                 "recent_assistant_excerpt": record.recent_assistant_excerpt,
+                                "repo_scope": repo_scope,
                                 "match_reasons": match_reasons,
                             })
                         })
                         .collect::<Vec<_>>();
+                    let has_legacy_repo_unbound = candidates.iter().any(|candidate| {
+                        candidate.get("repo_scope").and_then(Value::as_str)
+                            == Some("legacy_unbound")
+                    });
                     json!({
                         "ok": true,
                         "resolution": resolution,
@@ -811,6 +828,8 @@ fn continuity_call(
                         "candidates": candidates,
                         "instruction": if auto_resume_safe {
                             "Exactly one active chain matched a stable identity hint. Resume that continuity_id, then re-check live Herdr/runtime/Git state before mutation."
+                        } else if has_legacy_repo_unbound {
+                            "A legacy repo-unbound candidate matched the query, but the requested repository is not verified identity. Show the bounded evidence to the planner/user for confirmation; do not auto-resume or invent a Work Memory locator."
                         } else if resolution == "confirmation_required" {
                             "Do not choose by recency or textual similarity alone. Show the bounded candidate evidence to the user and ask which prior work chain to continue; after confirmation, resume exactly that continuity_id."
                         } else {
@@ -5964,6 +5983,7 @@ mod tests {
         );
         assert_eq!(repo_scoped["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(repo_scoped["candidates"][0]["continuity_id"], "hc:alpha");
+        assert_eq!(repo_scoped["candidates"][0]["repo_scope"], "exact");
         assert_eq!(repo_scoped["candidates"][0]["match_reasons"][0], "repo_id");
         assert_eq!(repo_scoped["resolution"], "confirmation_required");
         assert_eq!(repo_scoped["auto_resume_safe"], false);
@@ -5979,6 +5999,50 @@ mod tests {
             repo_scoped["candidates"][0]["work_memory"]["work_chain_id"],
             "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+
+        let legacy_repo_scoped = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "query": "provider"
+            }),
+        );
+        assert_eq!(
+            legacy_repo_scoped["candidates"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            legacy_repo_scoped["candidates"][0]["continuity_id"],
+            "hc:beta"
+        );
+        assert_eq!(
+            legacy_repo_scoped["candidates"][0]["repo_scope"],
+            "legacy_unbound"
+        );
+        assert_eq!(
+            legacy_repo_scoped["candidates"][0]["work_memory"],
+            Value::Null
+        );
+        assert_eq!(legacy_repo_scoped["resolution"], "confirmation_required");
+        assert_eq!(legacy_repo_scoped["auto_resume_safe"], false);
+        assert_eq!(legacy_repo_scoped["confirmation_required"], true);
+        assert!(
+            legacy_repo_scoped["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("legacy repo-unbound")
+        );
+        let legacy_reasons = legacy_repo_scoped["candidates"][0]["match_reasons"]
+            .as_array()
+            .unwrap();
+        assert!(
+            legacy_reasons
+                .iter()
+                .any(|value| value == "legacy_repo_unbound")
+        );
+        assert!(legacy_reasons.iter().any(|value| value == "query"));
+        assert!(!legacy_reasons.iter().any(|value| value == "repo_id"));
 
         {
             let mut guard = store.lock().unwrap();

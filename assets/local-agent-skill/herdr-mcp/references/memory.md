@@ -20,7 +20,7 @@ When the current task clearly depends on earlier work and no stable chain ID was
 herdr-mcp continuity search "archive retry" [--project-id ID] [--project-path PATH] [--workspace-id ID] [--limit N]
 ```
 
-When the checkout is known but the internal ChatGPT Project id is not, prefer `--project-path /path/to/repo`. Herdr resolves that checkout's Git `origin` to the same canonical `repo_id` used by Work Memory and uses it only as a scope filter. A repo/path match alone is not permission to auto-resume.
+When the checkout is known but the internal ChatGPT Project id is not, prefer `--project-path /path/to/repo`. Herdr resolves that checkout's Git `origin` to the same canonical `repo_id` used by Work Memory and uses it only as a scope filter. Older Continuity chains may predate repo binding; a query hit can therefore appear with `repo_scope=legacy_unbound` and `work_memory=null`. Treat that as an unverified legacy candidate, not as proof that the chain belongs to the requested repository. Such a candidate never reports `auto_resume_safe=true` and stays `confirmation_required`. Scoping by repo/path without a query stays exact-only: it returns just the chains that carry a matching Work Memory repo binding. A repo/path match alone is never permission to auto-resume.
 
 Only resume automatically when the result says `auto_resume_safe=true`. If it returns `confirmation_required`, do not choose by recency or textual similarity; surface the bounded candidates to the planner/user. Resume the selected exact chain with:
 
@@ -28,7 +28,7 @@ Only resume automatically when the result says `auto_resume_safe=true`. If it re
 herdr-mcp continuity resume CONTINUITY_ID
 ```
 
-When a candidate contains a complete `work_memory` object, it supplies the exact `project_ref`, `repo_id`, and `work_chain_id`. Use that locator only after the candidate is safely selected (`auto_resume_safe=true` from a stable identity, or explicit planner/user confirmation). Do not query every candidate's Work Memory to bypass a `confirmation_required` result.
+When a candidate contains a complete `work_memory` object, it supplies the exact `project_ref`, `repo_id`, and `work_chain_id`. Use that locator only after the candidate is safely selected (`auto_resume_safe=true` from a stable identity, or explicit planner/user confirmation). If `work_memory` is null, stop at the Continuity evidence level; never synthesize a partition tuple from the repository path, project title, workspace id, or candidate text. Do not query every candidate's Work Memory to bypass a `confirmation_required` result.
 
 ## Reporting prior status without selecting a chain
 

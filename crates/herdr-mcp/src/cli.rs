@@ -2129,8 +2129,10 @@ Usage:\n\
 Search returns bounded candidate evidence only; it does not read the full journal.\n\
 Text-only uniqueness remains confirmation_required. Use --project-path to scope by\n\
 the checkout's canonical Git repository identity without needing an internal ChatGPT\n\
-Project id. When a candidate exposes work_memory, its project_ref/repo_id/work_chain_id\n\
-can be passed to `herdr-mcp memory ...` after that candidate has been selected safely.\n\n\
+Project id. Query matches from older chains that predate repo binding may still appear with\n\
+repo_scope=legacy_unbound; they remain confirmation_required and are not a verified repo match.\n\
+When a candidate exposes work_memory, its project_ref/repo_id/work_chain_id can be passed to\n\
+`herdr-mcp memory ...` after that candidate has been selected safely.\n\n\
 Examples:\n\
   herdr-mcp continuity search \"WebChat handoff\" --project-path ~/Documents/herdr-mcp\n\
   herdr-mcp continuity search \"archive retry\" --workspace-id wDG --limit 5\n\

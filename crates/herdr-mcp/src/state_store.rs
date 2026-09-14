@@ -1656,7 +1656,9 @@ impl StateStore {
                  FROM continuity_chains c
                  WHERE c.status = 'active'
                    AND (?1 IS NULL OR c.project_id = ?1)
-                   AND (?2 IS NULL OR c.repo_id = ?2)
+                   AND (?2 IS NULL
+                        OR c.repo_id = ?2
+                        OR (?5 IS NOT NULL AND c.repo_id IS NULL))
                    AND (?3 IS NULL OR EXISTS (
                        SELECT 1 FROM continuity_bindings bw
                        WHERE bw.continuity_id = c.continuity_id AND bw.workspace_id = ?3
