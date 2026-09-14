@@ -263,10 +263,10 @@ test("tools/list exposes runtime tools plus edge-local herdr_devices", async () 
   assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
 });
 
-test("public contract selection is dev-only and consistent across discovery surfaces", async () => {
+test("public contract selection uses epoch 4 for first-party dev/prod and stays consistent across discovery surfaces", async () => {
   for (const [edgeEnv, expected] of [
     ["dev", EPOCH4_CONTRACT],
-    ["prod", EPOCH3_CONTRACT],
+    ["prod", EPOCH4_CONTRACT],
     [undefined, EPOCH3_CONTRACT],
     ["staging", EPOCH3_CONTRACT],
   ]) {

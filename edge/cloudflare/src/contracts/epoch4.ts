@@ -1,7 +1,7 @@
 import { EPOCH3_CONTRACT } from "./epoch3.js";
 
 /**
- * Development-only public contract epoch 4.
+ * First-party deployed public contract epoch 4.
  *
  * Epoch 4 keeps the same 19-tool catalog and `device` routing selector while
  * adding two deliberate model-visible improvements: truthful MCP safety hints
@@ -21,11 +21,12 @@ import { EPOCH3_CONTRACT } from "./epoch3.js";
  *   - `herdr_prompt`    — dispatches work to a local Agent
  * `herdr_devices` is Edge-local read-only and is already annotated in epoch 3.
  *
- * ACTIVATION: `public.ts` selects this contract only for an explicit
- * `EDGE_ENV=dev`. Production, missing, and unknown environments stay on epoch 3.
- * After deployment, refresh/recreate the development ChatGPT custom-app action
- * snapshot before A/B testing; otherwise the host can keep using its previously
- * approved frozen tool metadata.
+ * ACTIVATION: `public.ts` selects this contract for explicit first-party
+ * `EDGE_ENV=dev` and `EDGE_ENV=prod`. Missing and unknown environments keep the
+ * conservative epoch-3 fallback so ordinary/self-hosted deployments do not
+ * change contract epoch implicitly. After deployment, the host may need to
+ * refresh its previously approved frozen tool metadata before it exposes the
+ * new structured `herdr_exec.steps` schema.
  */
 
 /** Tools whose only reachable effects are reads of workstation/Edge state. */

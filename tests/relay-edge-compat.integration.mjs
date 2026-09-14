@@ -120,15 +120,15 @@ test("public epoch 3 evolves independently while runtime execution stays epoch 2
   assert.equal(isCompatibleRuntimeContract(1, EPOCH2_CONTRACT.contract_hash), false);
 });
 
-test("public contract resolver enables epoch 4 only for the explicit dev environment", () => {
+test("public contract resolver enables epoch 4 for explicit first-party dev and prod environments", () => {
   assert.equal(resolvePublicContract("dev"), EPOCH4_CONTRACT);
-  assert.equal(resolvePublicContract("prod"), EPOCH3_CONTRACT);
+  assert.equal(resolvePublicContract("prod"), EPOCH4_CONTRACT);
   assert.equal(resolvePublicContract(), EPOCH3_CONTRACT);
   assert.equal(resolvePublicContract("unknown"), EPOCH3_CONTRACT);
   assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
 });
 
-test("development epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {
+test("epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {
   const readOnly = [
     "herdr_methods",
     "herdr_inspect",
@@ -152,7 +152,7 @@ test("development epoch 4 annotates only read-only tools and leaves prior hashes
     "herdr_exec",
     "herdr_prompt",
   ];
-  // The production-default public surface stays on epoch 3.
+  // The exported fallback surface stays on epoch 3; explicit dev/prod select epoch 4.
   assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
   assert.equal(EPOCH4_CONTRACT.contract_epoch, 4);
   assert.equal(EPOCH4_CONTRACT.tool_count, EPOCH3_CONTRACT.tool_count);

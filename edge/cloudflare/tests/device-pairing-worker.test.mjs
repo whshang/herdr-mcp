@@ -157,10 +157,10 @@ async function pair(env, name) {
   return consume.json();
 }
 
-test("health and info expose the same dev-only public contract identity", async () => {
+test("health and info expose the same explicit first-party public contract identity", async () => {
   for (const [edgeEnv, expectedEpoch] of [
     ["dev", 4],
-    ["prod", 3],
+    ["prod", 4],
     [undefined, 3],
     ["unknown", 3],
   ]) {
