@@ -1684,9 +1684,12 @@ const settlementSegment = wakeSource.slice(
 ok(settlementSegment.length > 0
     && !/document\.hidden|chrome\.tabs|active: true/.test(settlementSegment)
     && wakeSource.includes("const acceptedUserMessageRef = exactChatGptDispatchIdentity")
-    && wakeSource.includes("serverAdvanced ? afterServer.userMessageId : null")
+    && wakeSource.includes("serverAdvanced ? afterServer.userMessageId : exactDomUserMessageRef")
+    && wakeSource.includes("exactDomAcceptedUserMessageRef(beforeDom, afterDom, message)")
+    && wakeSource.includes("afterDom?.exactMessageId !== true")
+    && wakeSource.includes("afterDom.messageId === beforeDom?.messageId")
     && wakeSource.includes("!exactChatGptDispatchIdentity || Boolean(acceptedUserMessageRef)"),
-  "result settlement has no physical tab focus dependency and ChatGPT dispatch waits for exact provider user identity");
+  "result settlement has no physical tab focus dependency and ChatGPT dispatch still requires an exact provider user identity");
 
 console.log(`\n=== ${failures === 0 ? "EXTENSION SMOKE ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);
