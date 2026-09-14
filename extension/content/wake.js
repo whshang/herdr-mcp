@@ -1862,13 +1862,6 @@ const H2W_CONTENT_VERSION = "0.1.91";
         // The existing actuation evidence.result object carries the exact
         // provider user-message identity; no new top-level field is added.
         evidence.result = { accepted_user_message_ref: acceptedUserMessageRef };
-        if (registeredBrowserSessionRef) {
-          acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
-            generation: expectedGeneration,
-            acceptedUserMessageRef,
-            reportedAssistantRef: null,
-          });
-        }
       }
       if (creatingSession && evidence.canonical_url_observed) {
         const currentConvKey = ADAPTER.getConversationKey();
@@ -1881,6 +1874,19 @@ const H2W_CONTENT_VERSION = "0.1.91";
           && registeredBrowserGeneration === expectedGeneration,
         );
         evidence.lifecycle_observed = evidence.stable_resource_ref_observed;
+      }
+      // session.create can learn the exact accepted provider user-message ID
+      // before the reservation has finished registering the new session_ref.
+      // Record the settlement assignment only after that registration window,
+      // otherwise this same iteration can return successful actuation evidence
+      // with no assignment for the route watcher to settle later.
+      if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef
+          && registeredBrowserSessionRef) {
+        acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
+          generation: expectedGeneration,
+          acceptedUserMessageRef,
+          reportedAssistantRef: null,
+        });
       }
       const assistantAdvanced = Boolean(
         afterAssistant?.messageId
