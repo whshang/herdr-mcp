@@ -30,6 +30,7 @@ import {
 } from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc, parseMcpJsonResponseText } from "./mcp-json-rpc.js";
+import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
 import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrBatchFetch, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
   originToMatchPattern,
@@ -5411,9 +5412,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const detail = String(error?.message || error || "device-inventory-request-failed");
         sendResponse({
           ok: false,
-          code: detail === "native-origin-not-active"
+          code: detail === NATIVE_ORIGIN_NOT_ACTIVE
             ? "native_origin_not_active"
-            : detail === "native-host-not-installed"
+            : detail === NATIVE_HOST_NOT_INSTALLED
               ? "native_host_not_installed"
               : "device_inventory_unavailable",
           error: detail,

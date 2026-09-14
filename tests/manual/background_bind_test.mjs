@@ -3252,5 +3252,25 @@ console.log("\n[Native host fleet diagnostics]");
   mockNativeHostLastError = null;
 }
 
+console.log("\n[Native host runtime snapshot diagnostics]");
+{
+  const snapshotCases = [
+    ["Specified native messaging host not found.", "native-host-not-installed"],
+    ["Access to the specified native messaging host is forbidden.", "native-origin-not-active"],
+    ["Error when communicating with the native messaging host.", "Error when communicating with the native messaging host."],
+  ];
+  for (const [nativeError, expectedError] of snapshotCases) {
+    mockNativeHostLastError = nativeError;
+    let resolveSnapshot;
+    const snapshotP = new Promise((resolve) => { resolveSnapshot = resolve; });
+    onMsg({ type: "herdr_control_center_subscribe", force: true }, {}, (response) => resolveSnapshot(response));
+    const snapshot = await snapshotP;
+    ok(snapshot?.ok === false && snapshot?.error === expectedError,
+      `Control Center snapshot failure "${nativeError}" surfaces "${expectedError}" for runtimeErrorPresentation`,
+      JSON.stringify(snapshot));
+  }
+  mockNativeHostLastError = null;
+}
+
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);

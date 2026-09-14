@@ -4,6 +4,8 @@
 // its mode-0600 Unix-domain socket. Older extension builds remain compatible
 // with the server's historical /extension/session endpoint.
 
+import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
+
 export const HERDR_NATIVE_HOST = "dev.herdr.mcp";
 
 function isNativeAdmissionDenied(message) {
@@ -33,11 +35,11 @@ function nativeMessage(message) {
         const err = chrome.runtime.lastError?.message;
         if (err) {
           if (isNativeHostMissing(err)) {
-            resolve({ ok: false, error: "native-host-not-installed" });
+            resolve({ ok: false, error: NATIVE_HOST_NOT_INSTALLED });
             return;
           }
           if (isNativeAdmissionDenied(err)) {
-            resolve({ ok: true, active: false, reason: "native-origin-not-active" });
+            resolve({ ok: true, active: false, reason: NATIVE_ORIGIN_NOT_ACTIVE });
             return;
           }
           resolve({ ok: false, error: err });
@@ -130,8 +132,8 @@ export async function localHerdrFetch(input, init = {}) {
   });
   // Standby is a successful transport answer with no active owner origin. It
   // must surface as a diagnosable failure instead of an empty 500 response.
-  if (response?.active === false && response?.reason === "native-origin-not-active") {
-    throw new Error("native-origin-not-active");
+  if (response?.active === false && response?.reason === NATIVE_ORIGIN_NOT_ACTIVE) {
+    throw new Error(NATIVE_ORIGIN_NOT_ACTIVE);
   }
   if (response?.ok !== true) {
     throw new Error(String(response?.error || "native-host-request-failed"));

@@ -11,6 +11,7 @@ import {
   workspaceRowsForPage,
 } from "./control-center-model.js";
 import { boundedTail } from "./browser-state.js";
+import { nativeHostFailure } from "./native-host-diagnostics.js";
 import { detectOrLoadLocale, getLocale, t } from "./i18n.js";
 
 const TARGET_KEY = "herdrControlPinnedTarget";
@@ -82,13 +83,14 @@ function bg(message) {
   });
 }
 
-function isNativeHostError(error) {
-  return /native messaging host|native host|specified native messaging host|forbidden/i.test(String(error || ""));
-}
-
 function runtimeErrorPresentation(response) {
   const raw = String(response?.error || "").trim();
-  if (isNativeHostError(raw)) return { message: t("native_host_help"), detail: raw };
+  const failure = nativeHostFailure(raw);
+  // Distinct remediations: an absent host is installed with native-host
+  // install, while an installed host owned by another origin is switched with
+  // native-host use <channel>. Never echo the raw token as the only message.
+  if (failure === "owner-inactive") return { message: t("native_host_owner_inactive"), detail: raw };
+  if (failure === "host-missing") return { message: t("native_host_help"), detail: raw };
   return {
     message: raw || t("cc_runtime_request_failed", {
       status: response?.status ? ` (${response.status})` : "",
@@ -155,7 +157,7 @@ function deviceLastSeenLabel(value) {
 
 function fleetFailureText(response) {
   const code = String(response?.code || "");
-  if (code === "native_origin_not_active") return t("cc_devices_native_owner_inactive");
+  if (code === "native_origin_not_active") return t("native_host_owner_inactive");
   if (code === "native_host_not_installed") return t("cc_devices_native_host_missing");
   if (code === "device_inventory_admin_required") return t("cc_devices_owner_required");
   if (response?.http_status === 404 || code === "not_found" || code === "device_inventory_platform_unsupported") {
