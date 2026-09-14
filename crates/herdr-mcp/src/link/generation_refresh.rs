@@ -833,9 +833,18 @@ where
                     verify_ownership()?;
                     return Ok(());
                 }
+                let revision_in_flight = matches!(
+                    (evidence.status_processed_revision, evidence.control_revision),
+                    (Some(processed), Some(control)) if processed < control
+                );
                 // Definitive, non-retryable failure of the target candidate
-                // means rollback is correct; do not wait out the budget.
-                if let Some(reason) = evidence.definitive_failure() {
+                // means rollback is correct only when it belongs to the latest
+                // control revision. After reloading an older Link binary, its
+                // pre-restart rejection may remain in runtime-status while the
+                // replacement Link has not consumed the post-restart revision
+                // yet. Treat that stale outcome as in-flight evidence rather
+                // than rolling the service back before the new Link can start.
+                if !revision_in_flight && let Some(reason) = evidence.definitive_failure() {
                     return Err(format!(
                         "production Link reported a definitive failure while converging to {expected}: {reason}"
                     ));
@@ -864,10 +873,6 @@ where
                 // timeout, so do not let the much tighter static-fingerprint
                 // stall detector preempt it. The overall max-poll budget still
                 // bounds a genuinely wedged retry/pending state.
-                let revision_in_flight = matches!(
-                    (evidence.status_processed_revision, evidence.control_revision),
-                    (Some(processed), Some(control)) if processed < control
-                );
                 let retry_in_flight = evidence
                     .status_outcome
                     .as_deref()
@@ -1754,6 +1759,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(probes, 12);
+    }
+
+    #[test]
+    fn stale_contract_rejection_before_latest_revision_allows_reloaded_link_to_activate() {
+        // During an epoch-2 -> epoch-3 runtime rollout the old Link may reject
+        // the candidate before the owned production Link is reloaded. The
+        // post-restart reconcile bumps control to revision 2, so the old
+        // processed=1 rejection is stale and must not preempt the new Link.
+        let mut probes = vec![
+            ConvergenceEvidence {
+                control_desired: Some("rust-new".to_owned()),
+                control_revision: Some(2),
+                status_processed_revision: Some(1),
+                status_outcome: Some("candidate_rejected:contract_mismatch".to_owned()),
+                active_generation: Some("rust-old".to_owned()),
+                transition_seq: Some(1),
+                last_transition_to: Some("rust-new".to_owned()),
+                last_transition_outcome: Some("candidate_rejected:contract_mismatch".to_owned()),
+            },
+            ConvergenceEvidence {
+                control_desired: Some("rust-new".to_owned()),
+                control_revision: Some(2),
+                status_processed_revision: Some(2),
+                status_outcome: Some("activated".to_owned()),
+                active_generation: Some("rust-new".to_owned()),
+                transition_seq: Some(2),
+                last_transition_to: Some("rust-new".to_owned()),
+                last_transition_outcome: Some("activated".to_owned()),
+            },
+        ];
+
+        bounded_convergence_phase(
+            "rust-new",
+            &mut || Ok(()),
+            &mut || Ok(probes.remove(0)),
+            4,
+            3,
+            3,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(probes.is_empty());
+    }
+
+    #[test]
+    fn contract_rejection_for_latest_revision_still_fails_closed() {
+        let mut probes = 0usize;
+        let error = bounded_convergence_phase(
+            "rust-new",
+            &mut || Ok(()),
+            &mut || {
+                probes += 1;
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(2),
+                    status_processed_revision: Some(2),
+                    status_outcome: Some("candidate_rejected:contract_mismatch".to_owned()),
+                    active_generation: Some("rust-old".to_owned()),
+                    transition_seq: Some(2),
+                    last_transition_to: Some("rust-new".to_owned()),
+                    last_transition_outcome: Some(
+                        "candidate_rejected:contract_mismatch".to_owned(),
+                    ),
+                })
+            },
+            4,
+            3,
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("candidate_rejected:contract_mismatch"));
+        assert_eq!(probes, 1);
     }
 
     #[test]
