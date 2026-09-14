@@ -5722,7 +5722,7 @@ impl StateStore {
                 "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
                  FROM exec_sessions
                  WHERE state = 'closed' AND (expires_at IS NULL OR expires_at > ?1)
-                 ORDER BY started_at ASC
+                 ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC, session_id DESC
                  LIMIT ?2",
             )
             .map_err(|error| format!("cannot prepare closed exec sessions query: {error}"))?;
@@ -8355,13 +8355,38 @@ mod tests {
                 .is_none()
         );
 
-        // At t=1500, both closed sessions are unexpired
-        let unexpired = store.closed_exec_sessions(1500, 10).unwrap();
-        assert_eq!(unexpired.len(), 2);
-        assert_eq!(unexpired[0].session_id, "es_closed_a");
-        assert_eq!(unexpired[1].session_id, "es_closed_b");
+        store
+            .record_exec_running("es_tie_alpha", 103, Some(103), 1280)
+            .unwrap();
+        store
+            .settle_exec_session("es_tie_alpha", "closed", Some(1300), Some(0), None, 2000)
+            .unwrap();
+        // Same start/end timestamps as es_tie_alpha: only the session_id tie-break
+        // may decide the order, and LIFO insertion must not leak into the result.
+        store
+            .record_exec_running("es_tie_beta", 104, Some(104), 1280)
+            .unwrap();
+        store
+            .settle_exec_session("es_tie_beta", "closed", Some(1300), Some(0), None, 2000)
+            .unwrap();
 
-        // At t=3000, es_closed_b (expires_at=2000) is filtered out
+        // At t=1500 every closed session is unexpired, and the most recently
+        // completed session comes first so a bounded loader keeps a hot set.
+        // Equal timestamps fall back to started_at then session_id, descending.
+        let unexpired = store.closed_exec_sessions(1500, 10).unwrap();
+        assert_eq!(unexpired.len(), 4);
+        assert_eq!(unexpired[0].session_id, "es_tie_beta");
+        assert_eq!(unexpired[1].session_id, "es_tie_alpha");
+        assert_eq!(unexpired[2].session_id, "es_closed_b");
+        assert_eq!(unexpired[3].session_id, "es_closed_a");
+
+        // The limit keeps the same newest-first prefix, never an arbitrary slice.
+        let limited = store.closed_exec_sessions(1500, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].session_id, "es_tie_beta");
+        assert_eq!(limited[1].session_id, "es_tie_alpha");
+
+        // At t=3000, es_closed_b and both tie sessions (expires_at=2000) are filtered out
         let filtered = store.closed_exec_sessions(3000, 10).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].session_id, "es_closed_a");
