@@ -3039,6 +3039,26 @@ async function handleBrowserActuation(command) {
   if (!target) {
     const recovered = await recoverBrowserSessionTarget(sessionRef, expectedGeneration);
     target = recovered.target;
+    if (!target && operation === "herdr_mcp.browser_session.archive") {
+      const providerArchive = String(params.provider || "");
+      const canonicalUrl = String(params.canonical_url || "");
+      const canonicalInfo = browserConversationInfo(providerArchive, canonicalUrl);
+      if (providerArchive === "chatgpt" && canonicalInfo?.conversation_id) {
+        let createdTab = null;
+        try {
+          createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
+        } catch (_) {}
+        if (createdTab?.id) {
+          const deadline = Date.now() + 8000;
+          do {
+            target = browserSessionTargets.get(sessionRef) || null;
+            if (target?.tabId === createdTab.id) break;
+            target = null;
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          } while (Date.now() < deadline);
+        }
+      }
+    }
     if (!target) {
       await postBrowserActuationEvidence(
         actuationId,

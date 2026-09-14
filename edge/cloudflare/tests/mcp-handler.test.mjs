@@ -1187,6 +1187,7 @@ test("browser and Page Assist private methods require explicit enrolled device s
   const explicit = await handleMcp(
     req(3, "tools/call", {
       name: "herdr_call",
+      _meta: { "openai/session": "openai-session-anon-123" },
       arguments: {
         method: "herdr_mcp.browser_endpoint.list",
         device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -1212,6 +1213,10 @@ test("browser and Page Assist private methods require explicit enrolled device s
       principal_ref: "connector:conn_auditconnector123",
       connector_id: "conn_auditconnector123",
       grant_generation: 7,
+    },
+    browser_caller_session: {
+      provider: "chatgpt",
+      opaque_session_id: "openai-session-anon-123",
     },
   }, "routed browser private methods carry only the selected device grants plus exact Connector authorization provenance");
 

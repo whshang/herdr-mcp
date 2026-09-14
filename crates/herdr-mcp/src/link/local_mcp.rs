@@ -45,6 +45,7 @@ pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 2;
 const LOCAL_MCP_RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
 const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
+const EDGE_BROWSER_CALLER_SESSION_HEADER: &str = "x-herdr-edge-browser-caller-session";
 const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const LOCAL_MCP_MIN_FRAME_BYTES: usize = 64;
@@ -447,6 +448,40 @@ impl LocalMcpTransport {
         .map_err(|_| ())
     }
 
+    fn browser_caller_session_header(
+        trace: Option<&Map<String, Value>>,
+    ) -> Result<Option<String>, ()> {
+        let Some(value) = trace.and_then(|trace| trace.get("browser_caller_session")) else {
+            return Ok(None);
+        };
+        let object = value.as_object().ok_or(())?;
+        if object.len() != 2
+            || !object.contains_key("provider")
+            || !object.contains_key("opaque_session_id")
+        {
+            return Err(());
+        }
+        let provider = object.get("provider").and_then(Value::as_str).ok_or(())?;
+        let opaque_session_id = object
+            .get("opaque_session_id")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        if provider != "chatgpt"
+            || opaque_session_id.is_empty()
+            || opaque_session_id.len() > 256
+            || opaque_session_id != opaque_session_id.trim()
+            || opaque_session_id.chars().any(char::is_control)
+        {
+            return Err(());
+        }
+        serde_json::to_string(&json!({
+            "provider": provider,
+            "opaque_session_id": opaque_session_id,
+        }))
+        .map(Some)
+        .map_err(|_| ())
+    }
+
     fn failure(
         &self,
         code: &str,
@@ -520,6 +555,7 @@ impl LocalMcpTransport {
         webchat_grants_header: Option<&str>,
         page_assist_grants_header: Option<&str>,
         authorization_header: Option<&str>,
+        browser_caller_session_header: Option<&str>,
     ) -> RuntimeToolResult {
         let Some(expected_generation) = self.runtime_generation.as_deref() else {
             return self.failure(
@@ -577,6 +613,9 @@ impl LocalMcpTransport {
         }
         if let Some(value) = authorization_header {
             request_builder = request_builder.header(EDGE_WEBCHAT_AUTHORIZATION_HEADER, value);
+        }
+        if let Some(value) = browser_caller_session_header {
+            request_builder = request_builder.header(EDGE_BROWSER_CALLER_SESSION_HEADER, value);
         }
         let request = match request_builder
             .header(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER, expected_generation)
@@ -636,6 +675,7 @@ impl LocalMcpTransport {
         _webchat_grants_header: Option<&str>,
         _page_assist_grants_header: Option<&str>,
         _authorization_header: Option<&str>,
+        _browser_caller_session_header: Option<&str>,
     ) -> RuntimeToolResult {
         self.failure(
             code::UNREACHABLE,
@@ -729,10 +769,12 @@ impl LocalMcpTransport {
         webchat_grants_header: Option<String>,
         page_assist_grants_header: Option<String>,
         authorization_header: Option<String>,
+        browser_caller_session_header: Option<String>,
     ) -> RuntimeToolResult {
         if webchat_grants_header.is_some()
             || page_assist_grants_header.is_some()
             || authorization_header.is_some()
+            || browser_caller_session_header.is_some()
         {
             self.dispatch_trusted_ipc(
                 body,
@@ -740,6 +782,7 @@ impl LocalMcpTransport {
                 webchat_grants_header.as_deref(),
                 page_assist_grants_header.as_deref(),
                 authorization_header.as_deref(),
+                browser_caller_session_header.as_deref(),
             )
             .await
         } else {
@@ -798,6 +841,18 @@ impl LocalMcpTransport {
                 );
             }
         };
+        let browser_caller_session_header =
+            match Self::browser_caller_session_header(request.trace.as_ref()) {
+                Ok(value) => value,
+                Err(()) => {
+                    return self.failure(
+                        code::BAD_REQUEST,
+                        false,
+                        "invalid trusted caller session context",
+                        None,
+                    );
+                }
+            };
         let body = match serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -867,6 +922,7 @@ impl LocalMcpTransport {
                 webchat_grants_header,
                 page_assist_grants_header,
                 authorization_header,
+                browser_caller_session_header,
             ) => result,
         };
 
@@ -1570,6 +1626,13 @@ mod tests {
                     "grant_generation": 7
                 }),
             ),
+            (
+                "browser_caller_session".to_owned(),
+                json!({
+                    "provider": "chatgpt",
+                    "opaque_session_id": "openai-session-anon-123"
+                }),
+            ),
         ]));
         let outcome = transport.dispatch_request(grant_request).await;
         assert_eq!(
@@ -1583,6 +1646,7 @@ mod tests {
         assert!(lowered.starts_with("post /mcp http/1.1"));
         assert!(lowered.contains("x-herdr-edge-webchat-control-grants:"));
         assert!(lowered.contains("x-herdr-edge-webchat-authorization:"));
+        assert!(lowered.contains("x-herdr-edge-browser-caller-session:"));
         assert!(lowered.contains("x-herdr-edge-page-assist-grants:"));
         assert!(lowered.contains("x-herdr-edge-expected-runtime-generation: rust-test"));
         assert!(
@@ -1594,6 +1658,7 @@ mod tests {
         assert!(raw_request.contains("\"provider\":\"chatgpt\""));
         assert!(raw_request.contains("conn_auditconnector123"));
         assert!(raw_request.contains("\"grant_generation\":7"));
+        assert!(raw_request.contains("openai-session-anon-123"));
         assert!(
             raw_request
                 .contains("be_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
@@ -1606,6 +1671,21 @@ mod tests {
             json!([{"endpoint_ref": "be_only"}]),
         )]));
         let outcome = transport.dispatch_request(malformed).await;
+        assert!(matches!(
+            outcome,
+            RuntimeToolResult::Failure {
+                ref code,
+                retryable: false,
+                ..
+            } if code == super::code::BAD_REQUEST
+        ));
+
+        let mut malformed_session = request("caller-session-bad");
+        malformed_session.trace = Some(serde_json::Map::from_iter([(
+            "browser_caller_session".to_owned(),
+            json!({"provider": "gemini", "opaque_session_id": "wrong-provider"}),
+        )]));
+        let outcome = transport.dispatch_request(malformed_session).await;
         assert!(matches!(
             outcome,
             RuntimeToolResult::Failure {

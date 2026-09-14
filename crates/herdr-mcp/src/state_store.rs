@@ -38,7 +38,7 @@ pub const BROWSER_SOURCE_TURN_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -518,6 +518,27 @@ CREATE INDEX IF NOT EXISTS idx_browser_source_turns_hash
     ON browser_source_turns(user_text_sha256);
 "#;
 
+/// Migration 15: bind ChatGPT's opaque MCP caller-session identity to the
+/// exact browser session after the two surfaces have been correlated once.
+/// Raw host identifiers are never persisted; only their SHA-256 digest is
+/// stored, scoped by Connector principal and provider.
+const MIGRATION_V15: &str = r#"
+CREATE TABLE IF NOT EXISTS browser_caller_sessions (
+    principal_ref         TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    caller_session_sha256 TEXT NOT NULL,
+    session_ref           TEXT NOT NULL,
+    first_bound_at        INTEGER NOT NULL,
+    last_bound_at         INTEGER NOT NULL,
+    PRIMARY KEY (principal_ref, provider, caller_session_sha256),
+    FOREIGN KEY (session_ref) REFERENCES browser_resources(resource_ref) ON DELETE CASCADE,
+    CHECK (first_bound_at >= 0),
+    CHECK (last_bound_at >= first_bound_at)
+);
+CREATE INDEX IF NOT EXISTS idx_browser_caller_sessions_resource
+    ON browser_caller_sessions(session_ref);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -535,6 +556,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V12,
     MIGRATION_V13,
     MIGRATION_V14,
+    MIGRATION_V15,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -3472,6 +3494,90 @@ impl StateStore {
             1 => Ok(refs.pop()),
             _ => Err("browser_canonical_url_ambiguous".to_owned()),
         }
+    }
+
+    /// Persist one fail-closed correlation between an opaque MCP caller session
+    /// and an already-observed browser session. The caller session itself is
+    /// never stored. A key already bound to another browser session is a
+    /// conflict, so late or ambiguous observations cannot silently retarget a
+    /// future mutation.
+    pub fn bind_browser_caller_session(
+        &mut self,
+        principal_ref: &str,
+        provider: &str,
+        caller_session_id: &str,
+        session_ref: &str,
+        observed_at: i64,
+    ) -> Result<(), String> {
+        validate_browser_ref_text(principal_ref, 256, "caller_principal_ref")?;
+        validate_browser_token(provider, 32, "provider")?;
+        validate_browser_ref_text(caller_session_id, 256, "caller_session")?;
+        validate_browser_resource_ref(session_ref)?;
+        if observed_at < 0 {
+            return Err("browser_observed_at_invalid".to_owned());
+        }
+        let session = self
+            .browser_resource(session_ref)?
+            .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+        if session.kind != "session" || session.provider != provider {
+            return Err("browser_resource_kind_mismatch".to_owned());
+        }
+        let caller_session_sha256 = sha256_text(caller_session_id);
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT session_ref FROM browser_caller_sessions
+                 WHERE principal_ref = ?1 AND provider = ?2 AND caller_session_sha256 = ?3",
+                params![principal_ref, provider, caller_session_sha256],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser caller session binding: {error}"))?;
+        if existing
+            .as_deref()
+            .is_some_and(|value| value != session_ref)
+        {
+            return Err("browser_caller_session_conflict".to_owned());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO browser_caller_sessions(
+                    principal_ref, provider, caller_session_sha256, session_ref,
+                    first_bound_at, last_bound_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                 ON CONFLICT(principal_ref, provider, caller_session_sha256) DO UPDATE SET
+                    last_bound_at = MAX(browser_caller_sessions.last_bound_at, excluded.last_bound_at)",
+                params![
+                    principal_ref,
+                    provider,
+                    caller_session_sha256,
+                    session_ref,
+                    observed_at
+                ],
+            )
+            .map_err(|error| format!("cannot bind browser caller session: {error}"))?;
+        Ok(())
+    }
+
+    pub fn resolve_browser_caller_session(
+        &self,
+        principal_ref: &str,
+        provider: &str,
+        caller_session_id: &str,
+    ) -> Result<Option<String>, String> {
+        validate_browser_ref_text(principal_ref, 256, "caller_principal_ref")?;
+        validate_browser_token(provider, 32, "provider")?;
+        validate_browser_ref_text(caller_session_id, 256, "caller_session")?;
+        let caller_session_sha256 = sha256_text(caller_session_id);
+        self.conn
+            .query_row(
+                "SELECT session_ref FROM browser_caller_sessions
+                 WHERE principal_ref = ?1 AND provider = ?2 AND caller_session_sha256 = ?3",
+                params![principal_ref, provider, caller_session_sha256],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve browser caller session: {error}"))
     }
 
     /// Persist the latest observed user turn for one browser session.
@@ -8625,6 +8731,7 @@ mod tests {
         assert_eq!(
             new_tables,
             vec![
+                "browser_caller_sessions",
                 "browser_dispatches",
                 "browser_resource_locators",
                 "browser_session_reservations",
@@ -8872,6 +8979,160 @@ mod tests {
             "durable source turns must store only the user-text digest"
         );
         drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn schema_v14_upgrades_to_v15_with_hashed_caller_session_bindings() {
+        let path = temp_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(14) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '14')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+        }
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            store
+                .scalar_i64("SELECT COUNT(*) FROM pragma_table_info('browser_caller_sessions')")
+                .unwrap(),
+            Some(6)
+        );
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM pragma_table_info('browser_caller_sessions') \
+                     WHERE name IN ('caller_session', 'opaque_session_id', 'native_identity')",
+                )
+                .unwrap(),
+            Some(0),
+            "raw host conversation/session identities must not be persisted"
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn browser_caller_session_binding_is_hashed_durable_and_never_retargets() {
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const PROFILE: &str = "caller-session-profile-seed";
+        const PRINCIPAL: &str = "connector:conn_current_chat_test";
+        const OPAQUE_SESSION: &str = "opaque-openai-session-abc123";
+        let path = temp_db_path();
+        let session_ref;
+        let other_session_ref;
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: DEVICE,
+                    profile_seed: PROFILE,
+                    browser_family: "chrome",
+                    extension_version: "0.1.92",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.archive"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "account-current-chat-test",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "native-conversation-a",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            let other = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "native-conversation-b",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 14,
+                })
+                .unwrap();
+            session_ref = session.resource_ref;
+            other_session_ref = other.resource_ref;
+            store
+                .bind_browser_caller_session(PRINCIPAL, "chatgpt", OPAQUE_SESSION, &session_ref, 20)
+                .unwrap();
+            assert_eq!(
+                store
+                    .resolve_browser_caller_session(PRINCIPAL, "chatgpt", OPAQUE_SESSION)
+                    .unwrap()
+                    .as_deref(),
+                Some(session_ref.as_str())
+            );
+            assert_eq!(
+                store
+                    .scalar_text(
+                        "SELECT caller_session_sha256 FROM browser_caller_sessions LIMIT 1"
+                    )
+                    .unwrap()
+                    .as_deref(),
+                Some(sha256_text(OPAQUE_SESSION).as_str())
+            );
+            assert_eq!(
+                store
+                    .bind_browser_caller_session(
+                        PRINCIPAL,
+                        "chatgpt",
+                        OPAQUE_SESSION,
+                        &other_session_ref,
+                        21,
+                    )
+                    .unwrap_err(),
+                "browser_caller_session_conflict"
+            );
+        }
+        let reopened = StateStore::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .resolve_browser_caller_session(PRINCIPAL, "chatgpt", OPAQUE_SESSION)
+                .unwrap()
+                .as_deref(),
+            Some(session_ref.as_str())
+        );
+        drop(reopened);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();

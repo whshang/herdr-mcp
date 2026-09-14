@@ -694,6 +694,20 @@ test("ChatGPT session.open can restore a disposable view from a local canonical 
   assert.doesNotMatch(contentSegment, /performWake|findSendButton|dispatchEnterSubmit/);
 });
 
+test("ChatGPT session.archive can reopen its durable canonical URL when the target tab is closed", () => {
+  const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
+  const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);
+  assert.ok(start >= 0 && end > start, "archive target routing block must remain extractable");
+  const segment = backgroundSource.slice(start, end);
+  assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive"/);
+  assert.match(segment, /const canonicalUrl = String\(params\.canonical_url \|\| ""\)/);
+  assert.match(segment, /browserConversationInfo\(providerArchive, canonicalUrl\)/);
+  assert.match(segment, /chrome\.tabs\.create\(\{ url: canonicalUrl, active: true \}\)/);
+  assert.match(segment, /browserSessionTargets\.get\(sessionRef\)/);
+  assert.match(segment, /Date\.now\(\) \+ 8000/);
+  assert.match(segment, /createdTab\?\.id/);
+});
+
 test("browser dispatch evicts a stale cached target before exact recovery", () => {
   const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
   const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);

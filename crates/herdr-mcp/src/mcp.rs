@@ -58,6 +58,12 @@ pub struct BrowserCallerAuthorization {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCallerSessionIdentity {
+    pub provider: String,
+    pub opaque_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageAssistCallerGrant {
     pub endpoint_ref: String,
 }
@@ -119,6 +125,7 @@ pub struct RuntimeContext<'a> {
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
     pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
     pub caller_webchat_authorization: Option<&'a BrowserCallerAuthorization>,
+    pub caller_browser_session: Option<&'a BrowserCallerSessionIdentity>,
     pub caller_page_assist_grants: &'a [PageAssistCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
@@ -316,6 +323,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                         mutation_gate: context.browser_mutation_gate,
                         mutation_admission: context.browser_mutation_admission,
                         caller_authorization: context.caller_webchat_authorization,
+                        caller_browser_session: context.caller_browser_session,
                     },
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
@@ -3001,6 +3009,9 @@ fn browser_handoff_prepare(
 fn browser_session_archive_params_from_current_turn(
     store: &mut StateStore,
     params: &Value,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
+    caller_authorization: Option<&BrowserCallerAuthorization>,
+    caller_browser_session: Option<&BrowserCallerSessionIdentity>,
 ) -> Result<Option<Value>, Value> {
     let Some(current_user_message) = params.get("current_user_message") else {
         return Ok(None);
@@ -3023,6 +3034,37 @@ fn browser_session_archive_params_from_current_turn(
         return Err(json!({"ok": false, "code": "browser_current_turn_invalid"}));
     }
     let idempotency_key = browser_required_idempotency_key(params)?;
+
+    if let (Some(authorization), Some(caller_session)) =
+        (caller_authorization, caller_browser_session)
+        && caller_session.provider == "chatgpt"
+    {
+        let bound_session_ref = store
+            .resolve_browser_caller_session(
+                &authorization.principal_ref,
+                &caller_session.provider,
+                &caller_session.opaque_session_id,
+            )
+            .map_err(browser_store_error)?;
+        if let Some(session_ref) = bound_session_ref {
+            let session = match store.browser_resource(&session_ref) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
+                }
+                Err(error) => return Err(browser_store_error(error)),
+            };
+            if session.kind != "session" || session.provider != "chatgpt" {
+                return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
+            }
+            return Ok(Some(json!({
+                "session_ref": session_ref,
+                "expected_generation": session.observation_generation,
+                "idempotency_key": idempotency_key,
+            })));
+        }
+    }
+
     let (session_ref, expected_generation) = store
         .resolve_browser_source_turn(&browser_sha256(current_user_message), browser_epoch_ms())
         .map_err(browser_store_error)?;
@@ -3036,6 +3078,29 @@ fn browser_session_archive_params_from_current_turn(
     }
     if session.observation_generation != expected_generation {
         return Err(json!({"ok": false, "code": "browser_current_turn_stale"}));
+    }
+    if let (Some(authorization), Some(caller_session)) =
+        (caller_authorization, caller_browser_session)
+        && caller_session.provider == "chatgpt"
+    {
+        let account_ref =
+            browser_resource_account_ref(store, &session).map_err(browser_store_error)?;
+        let granted = caller_webchat_control_grants.iter().any(|grant| {
+            grant.endpoint_ref == session.endpoint_ref
+                && grant.provider == session.provider
+                && grant.account_ref == account_ref
+        });
+        if granted {
+            store
+                .bind_browser_caller_session(
+                    &authorization.principal_ref,
+                    &caller_session.provider,
+                    &caller_session.opaque_session_id,
+                    &session_ref,
+                    browser_epoch_ms(),
+                )
+                .map_err(browser_store_error)?;
+        }
     }
     Ok(Some(json!({
         "session_ref": session_ref,
@@ -3555,6 +3620,7 @@ struct BrowserOperationControls<'a> {
     mutation_gate: Option<&'a std::sync::RwLock<()>>,
     mutation_admission: Option<&'a BrowserMutationAdmission>,
     caller_authorization: Option<&'a BrowserCallerAuthorization>,
+    caller_browser_session: Option<&'a BrowserCallerSessionIdentity>,
 }
 
 #[cfg(test)]
@@ -3576,6 +3642,7 @@ fn browser_operation_call_with_grants(
             mutation_gate: browser_mutation_gate,
             mutation_admission: None,
             caller_authorization: None,
+            caller_browser_session: None,
         },
     )
 }
@@ -3616,12 +3683,17 @@ fn browser_operation_call_with_controls(
         let Ok(mut store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
-        normalized_params =
-            match browser_session_archive_params_from_current_turn(&mut store_guard, params) {
-                Ok(Some(value)) => value,
-                Ok(None) => unreachable!(),
-                Err(error) => return error,
-            };
+        normalized_params = match browser_session_archive_params_from_current_turn(
+            &mut store_guard,
+            params,
+            caller_webchat_control_grants,
+            controls.caller_authorization,
+            controls.caller_browser_session,
+        ) {
+            Ok(Some(value)) => value,
+            Ok(None) => unreachable!(),
+            Err(error) => return error,
+        };
         &normalized_params
     } else {
         params
@@ -3778,6 +3850,61 @@ fn browser_operation_call_with_controls(
             browser_actuator,
             controls.caller_authorization,
         ),
+        BrowserOperation::SessionArchive => {
+            let expected_generation = params
+                .get("expected_generation")
+                .and_then(Value::as_i64)
+                .unwrap();
+            let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+            let mut actuation_params = params.clone();
+            let Ok(guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            let session = match guard.browser_resource(session_ref) {
+                Ok(Some(resource)) if resource.kind == "session" => resource,
+                Ok(Some(_)) => {
+                    return json!({"ok": false, "code": "browser_resource_kind_mismatch"});
+                }
+                Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
+                Err(error) => return browser_store_error(error),
+            };
+            if let Some(object) = actuation_params.as_object_mut() {
+                object.insert("provider".to_owned(), json!(session.provider));
+                match guard.browser_resource_locator(session_ref) {
+                    Ok(Some(locator)) if locator.observation_generation == expected_generation => {
+                        object.insert("canonical_url".to_owned(), json!(locator.canonical_url));
+                    }
+                    Ok(Some(_)) => {
+                        return json!({"ok": false, "code": "stale_capability_generation"});
+                    }
+                    Ok(None) => {}
+                    Err(error) => return browser_store_error(error),
+                }
+            }
+            drop(guard);
+            let evidence = match browser_actuator {
+                Some(actuator) => match actuator.actuate(
+                    operation.method(),
+                    &actuation_params,
+                    expected_generation,
+                    None,
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(error) => return browser_store_error(error),
+                },
+                None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+            };
+            let delivery_state = match browser_delivery_state_from_postcondition(
+                operation,
+                params,
+                expected_generation,
+                &evidence,
+            ) {
+                Ok(state) => state,
+                Err(error) => return browser_store_error(error),
+            };
+            browser_operation_delivery_result(operation, delivery_state)
+        }
         _ => {
             let expected_generation = params
                 .get("expected_generation")
@@ -5746,11 +5873,82 @@ mod tests {
                 "current_user_message": "归档当前对话",
                 "idempotency_key": "archive-fresh-runtime"
             }),
+            &[],
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
         assert_eq!(archive["session_ref"], session_ref);
         assert_eq!(archive["expected_generation"], 7);
+
+        // ChatGPT's opaque MCP session metadata is only a correlation key. The
+        // first exact source-turn match may bind it, but only when the Connector
+        // grant covers the resolved browser account.
+        let initial_session = reopened.browser_resource(&session_ref).unwrap().unwrap();
+        let initial_account_ref = initial_session.parent_ref.clone().unwrap();
+        let grants = vec![BrowserCallerGrant {
+            endpoint_ref: initial_session.endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: initial_account_ref.clone(),
+        }];
+        let authorization = BrowserCallerAuthorization {
+            principal_ref: "connector:conn_current_chat_test".to_owned(),
+            connector_id: "conn_current_chat_test".to_owned(),
+            grant_generation: 1,
+        };
+        let caller_session = BrowserCallerSessionIdentity {
+            provider: "chatgpt".to_owned(),
+            opaque_session_id: "opaque-openai-session-current-chat".to_owned(),
+        };
+        let ungranted = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "归档当前对话",
+                "idempotency_key": "archive-current-chat-without-grant"
+            }),
+            &[],
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ungranted["session_ref"], session_ref);
+        assert!(
+            reopened
+                .resolve_browser_caller_session(
+                    &authorization.principal_ref,
+                    "chatgpt",
+                    &caller_session.opaque_session_id,
+                )
+                .unwrap()
+                .is_none(),
+            "opaque caller sessions must not become durable authority without a matching browser grant"
+        );
+        let bootstrap = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "归档当前对话",
+                "idempotency_key": "archive-bind-current-chat"
+            }),
+            &grants,
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bootstrap["session_ref"], session_ref);
+        assert_eq!(
+            reopened
+                .resolve_browser_caller_session(
+                    &authorization.principal_ref,
+                    "chatgpt",
+                    &caller_session.opaque_session_id,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(session_ref.as_str())
+        );
 
         // A generation drift observed after the source turn fails closed.
         let (endpoint_ref, account_ref) = {
@@ -5802,9 +6000,39 @@ mod tests {
                 "current_user_message": "归档当前对话",
                 "idempotency_key": "archive-fresh-runtime-drift"
             }),
+            &[],
+            None,
+            None,
         )
         .unwrap_err();
         assert_eq!(drift["code"], "browser_current_turn_stale");
+
+        // Expire the source-turn row entirely. The durable opaque caller-session
+        // binding still resolves the same browser session and deliberately uses
+        // its latest observed generation instead of replaying stale generation 7.
+        assert_eq!(
+            reopened
+                .resolve_browser_source_turn(
+                    &browser_sha256("归档当前对话"),
+                    observed_at + 24 * 60 * 60 * 1000 + 5_000,
+                )
+                .unwrap_err(),
+            "browser_current_turn_not_found"
+        );
+        let rebound = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "这条消息没有 source-turn 记录",
+                "idempotency_key": "archive-bound-after-source-expiry"
+            }),
+            &grants,
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rebound["session_ref"], session_ref);
+        assert_eq!(rebound["expected_generation"], 8);
         drop(reopened);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
@@ -8218,7 +8446,7 @@ mod tests {
                     provider: "chatgpt",
                     adapter_protocol_version: 1,
                     observation_generation: 7,
-                    capabilities_json: r#"{"operations":["session.open","session.inspect"]}"#,
+                    capabilities_json: r#"{"operations":["session.archive","session.open","session.inspect"]}"#,
                     observed_at: 11,
                 })
                 .unwrap();
@@ -8257,6 +8485,14 @@ mod tests {
                     observation_generation: 7,
                     observed_at: 13,
                 })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    "https://chatgpt.com/c/session-hidden-unique",
+                    7,
+                    13,
+                )
                 .unwrap();
             guard
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
@@ -8405,6 +8641,62 @@ mod tests {
 
         // Ensure no message was ever submitted via the session.open path.
         assert_eq!(replay["idempotent_replay"], true);
+
+        struct SessionArchiveActuator {
+            expected_session_ref: String,
+        }
+        impl BrowserActuator for SessionArchiveActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, "herdr_mcp.browser_session.archive");
+                assert_eq!(expected_generation, 7);
+                assert!(dispatch_id.is_none());
+                assert_eq!(params["session_ref"], self.expected_session_ref);
+                assert_eq!(params["provider"], "chatgpt");
+                assert_eq!(
+                    params["canonical_url"],
+                    "https://chatgpt.com/c/session-hidden-unique"
+                );
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: None,
+                })
+            }
+        }
+        let archived = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.archive",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 7,
+                "idempotency_key": "archive-reopens-canonical-url"
+            }),
+            true,
+            Some(&SessionArchiveActuator {
+                expected_session_ref: session_ref.clone(),
+            }),
+        );
+        assert_eq!(archived["ok"], true);
+        assert_eq!(archived["delivery_state"], "applied");
     }
 
     #[test]
@@ -9152,6 +9444,9 @@ mod tests {
                     "current_user_message": "  归档当前对话  ",
                     "idempotency_key": "archive-current-source"
                 }),
+                &[],
+                None,
+                None,
             )
             .unwrap()
             .unwrap()
@@ -9575,6 +9870,7 @@ mod tests {
                 mutation_gate: None,
                 mutation_admission: Some(&admission),
                 caller_authorization: None,
+                caller_browser_session: None,
             },
         );
         assert_eq!(backpressured["code"], "browser_account_backpressure");

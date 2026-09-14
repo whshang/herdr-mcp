@@ -5,7 +5,8 @@ use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{
     self, BrowserActuator, BrowserCallerAuthorization, BrowserCallerGrant,
-    BrowserMutationAdmission, BrowserPostconditionEvidence, PageAssistCallerGrant, RuntimeContext,
+    BrowserCallerSessionIdentity, BrowserMutationAdmission, BrowserPostconditionEvidence,
+    PageAssistCallerGrant, RuntimeContext,
 };
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
@@ -51,10 +52,12 @@ const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(20);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
 const EDGE_WEBCHAT_AUTHORIZATION_HEADER: &str = "x-herdr-edge-webchat-authorization";
+const EDGE_BROWSER_CALLER_SESSION_HEADER: &str = "x-herdr-edge-browser-caller-session";
 const EDGE_PAGE_ASSIST_GRANTS_HEADER: &str = "x-herdr-edge-page-assist-grants";
 const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
 const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES: usize = 1024;
+const MAX_EDGE_BROWSER_CALLER_SESSION_HEADER_BYTES: usize = 1024;
 const MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
@@ -2373,6 +2376,19 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             );
         }
     };
+    let caller_browser_session = match trusted_edge_browser_caller_session(&state, &headers) {
+        Ok(session) => session,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid trusted caller session context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -2427,6 +2443,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // authority is admitted exclusively from the trusted Unix IPC handoff above.
             caller_webchat_control_grants: &caller_webchat_control_grants,
             caller_webchat_authorization: caller_webchat_authorization.as_ref(),
+            caller_browser_session: caller_browser_session.as_ref(),
             caller_page_assist_grants: &caller_page_assist_grants,
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
@@ -2705,10 +2722,52 @@ fn trusted_edge_webchat_authorization(
     }))
 }
 
+fn trusted_edge_browser_caller_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<BrowserCallerSessionIdentity>, ()> {
+    if !state.trusted_extension_ipc {
+        return Ok(None);
+    }
+    let Some(raw) = headers.get(EDGE_BROWSER_CALLER_SESSION_HEADER) else {
+        return Ok(None);
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > MAX_EDGE_BROWSER_CALLER_SESSION_HEADER_BYTES {
+        return Err(());
+    }
+    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
+    let object = value.as_object().ok_or(())?;
+    if object.len() != 2
+        || !object.contains_key("provider")
+        || !object.contains_key("opaque_session_id")
+    {
+        return Err(());
+    }
+    let provider = object.get("provider").and_then(Value::as_str).ok_or(())?;
+    let opaque_session_id = object
+        .get("opaque_session_id")
+        .and_then(Value::as_str)
+        .ok_or(())?;
+    if provider != "chatgpt"
+        || opaque_session_id.is_empty()
+        || opaque_session_id.len() > 256
+        || opaque_session_id != opaque_session_id.trim()
+        || opaque_session_id.chars().any(char::is_control)
+    {
+        return Err(());
+    }
+    Ok(Some(BrowserCallerSessionIdentity {
+        provider: provider.to_owned(),
+        opaque_session_id: opaque_session_id.to_owned(),
+    }))
+}
+
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
     if !state.trusted_extension_ipc
         || (!headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER)
             && !headers.contains_key(EDGE_WEBCHAT_AUTHORIZATION_HEADER)
+            && !headers.contains_key(EDGE_BROWSER_CALLER_SESSION_HEADER)
             && !headers.contains_key(EDGE_PAGE_ASSIST_GRANTS_HEADER))
     {
         return Ok(());
@@ -4015,6 +4074,12 @@ mod tests {
                 r#"{"principal_ref":"connector:conn_auditconnector123","connector_id":"conn_auditconnector123","grant_generation":7}"#,
             ),
         );
+        headers.insert(
+            EDGE_BROWSER_CALLER_SESSION_HEADER,
+            HeaderValue::from_static(
+                r#"{"provider":"chatgpt","opaque_session_id":"openai-session-anon-123"}"#,
+            ),
+        );
         assert_eq!(
             trusted_edge_runtime_generation_fence(&tcp_state, &headers),
             Ok(()),
@@ -4024,6 +4089,11 @@ mod tests {
             trusted_edge_webchat_authorization(&tcp_state, &headers),
             Ok(None),
             "ordinary TCP cannot inject Connector authorization provenance"
+        );
+        assert_eq!(
+            trusted_edge_browser_caller_session(&tcp_state, &headers),
+            Ok(None),
+            "ordinary TCP cannot inject host conversation correlation"
         );
 
         let mut trusted_state = test_state(&root.join("trusted"));
@@ -4047,6 +4117,30 @@ mod tests {
         );
         assert_eq!(authorization.connector_id, "conn_auditconnector123");
         assert_eq!(authorization.grant_generation, 7);
+        assert_eq!(
+            trusted_edge_browser_caller_session(&trusted_state, &headers),
+            Ok(Some(BrowserCallerSessionIdentity {
+                provider: "chatgpt".to_owned(),
+                opaque_session_id: "openai-session-anon-123".to_owned(),
+            }))
+        );
+        headers.insert(
+            EDGE_BROWSER_CALLER_SESSION_HEADER,
+            HeaderValue::from_static(
+                r#"{"provider":"gemini","opaque_session_id":"openai-session-anon-123"}"#,
+            ),
+        );
+        assert_eq!(
+            trusted_edge_browser_caller_session(&trusted_state, &headers),
+            Err(()),
+            "the OpenAI caller-session channel is provider-scoped and fail-closed"
+        );
+        headers.insert(
+            EDGE_BROWSER_CALLER_SESSION_HEADER,
+            HeaderValue::from_static(
+                r#"{"provider":"chatgpt","opaque_session_id":"openai-session-anon-123"}"#,
+            ),
+        );
         headers.remove(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER);
         assert_eq!(
             trusted_edge_runtime_generation_fence(&trusted_state, &headers),
