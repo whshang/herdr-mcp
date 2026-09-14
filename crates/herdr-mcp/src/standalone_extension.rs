@@ -73,7 +73,7 @@ pub(crate) struct StandaloneBrowserDoctor {
     installed: bool,
     extension_id: String,
     expected_path: Option<PathBuf>,
-    user_visible_path: Option<PathBuf>,
+    configured_load_path: Option<PathBuf>,
     loads: Vec<ChromeExtensionLoad>,
     unreadable_profiles: usize,
     reason: Option<String>,
@@ -99,7 +99,7 @@ impl StandaloneBrowserDoctor {
             "installed": self.installed,
             "extension_id": self.extension_id,
             "expected_path": self.expected_path,
-            "user_visible_path": self.user_visible_path,
+            "configured_load_path": self.configured_load_path,
             "loaded": loaded,
             "drift_count": self.drift_count(),
             "unreadable_profiles": self.unreadable_profiles,
@@ -158,18 +158,18 @@ impl StandaloneBrowserDoctor {
     }
 
     /// A Chrome load is expected when it resolves to the managed `current`
-    /// directory or to the configured user-visible alias (which is a symlink
-    /// to `current`). Accepting both keeps the check stable when a user
-    /// changes `--path`: switching aliases does not turn a healthy managed
-    /// install into a false `drift` report.
+    /// directory or equals the Chrome-facing path recorded by the last install.
+    /// The recorded comparison is lexical only: macOS TCC can deny
+    /// `lstat`/`readlink` on `~/Documents`, and equivalence must never depend
+    /// on being able to inspect the user-visible path.
     fn matches(&self, path: &Path) -> bool {
         self.expected_path
             .as_deref()
             .is_some_and(|expected| paths_equivalent(expected, path))
             || self
-                .user_visible_path
+                .configured_load_path
                 .as_deref()
-                .is_some_and(|alias| paths_equivalent(alias, path))
+                .is_some_and(|configured| lexical_path_eq(configured, path))
     }
 }
 
@@ -195,7 +195,7 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
             installed: false,
             extension_id: identity.extension_id,
             expected_path: Some(current),
-            user_visible_path: None,
+            configured_load_path: None,
             loads: Vec::new(),
             unreadable_profiles: 0,
             reason: None,
@@ -204,15 +204,18 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
 
     #[cfg(target_os = "macos")]
     {
-        // `doctor` accepts either the managed `current` directory or the
-        // configured user-visible alias. The alias is a symlink that resolves
-        // to `current`, so changing `--path` cannot turn a healthy managed
-        // install into a false `drift`; only a genuinely different directory
-        // (for example an old Downloads copy) is drift.
-        let user_visible_path = ready_user_visible_path(&home, &current);
+        // `doctor` accepts the managed `current` directory or the exact
+        // Chrome-facing path recorded by the last install. The recorded value
+        // comes from `~/.config` state and is compared lexically, so a
+        // TCC-denied `~/Documents` (or a moved `--path`) cannot turn a healthy
+        // managed install into a false `drift`; only a genuinely different
+        // directory (for example an old Downloads copy) is drift.
+        let state = read_json(&base_dir_for(&home).join("state.json")).ok();
+        let configured_load_path =
+            reported_load_path(&home, state.as_ref()).filter(|path| path != &current);
         diagnose_chrome_load(
             &current,
-            user_visible_path.as_deref(),
+            configured_load_path.as_deref(),
             &identity.extension_id,
             &home.join("Library/Application Support/Google/Chrome"),
         )
@@ -231,13 +234,13 @@ pub(crate) fn doctor_report() -> StandaloneBrowserDoctor {
 #[cfg(any(target_os = "macos", test))]
 fn diagnose_chrome_load(
     expected_path: &Path,
-    user_visible_alias: Option<&Path>,
+    configured_load_path: Option<&Path>,
     extension_id: &str,
     chrome_root: &Path,
 ) -> StandaloneBrowserDoctor {
     let matches = |candidate: &Path| {
         paths_equivalent(expected_path, candidate)
-            || user_visible_alias.is_some_and(|alias| paths_equivalent(alias, candidate))
+            || configured_load_path.is_some_and(|configured| lexical_path_eq(configured, candidate))
     };
     if !chrome_root.is_dir() {
         return StandaloneBrowserDoctor {
@@ -245,7 +248,7 @@ fn diagnose_chrome_load(
             installed: true,
             extension_id: extension_id.to_owned(),
             expected_path: Some(expected_path.to_path_buf()),
-            user_visible_path: user_visible_alias.map(Path::to_path_buf),
+            configured_load_path: configured_load_path.map(Path::to_path_buf),
             loads: Vec::new(),
             unreadable_profiles: 0,
             reason: None,
@@ -321,7 +324,7 @@ fn diagnose_chrome_load(
         installed: true,
         extension_id: extension_id.to_owned(),
         expected_path: Some(expected_path.to_path_buf()),
-        user_visible_path: user_visible_alias.map(Path::to_path_buf),
+        configured_load_path: configured_load_path.map(Path::to_path_buf),
         loads,
         unreadable_profiles,
         reason: (state == "not_probed")
@@ -339,7 +342,7 @@ fn doctor_not_probed(
         installed: expected_path.is_some(),
         extension_id,
         expected_path,
-        user_visible_path: None,
+        configured_load_path: None,
         loads: Vec::new(),
         unreadable_profiles: 0,
         reason: Some(reason),
@@ -386,17 +389,7 @@ pub fn run_status() -> Result<ExitCode, String> {
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
     let installed = current.is_dir() && manifest.is_some() && key_ok;
-    let configured_load_path = state
-        .as_ref()
-        .and_then(|value| value.get("load_unpacked_path"))
-        .and_then(Value::as_str)
-        .map(PathBuf::from);
-    let user_visible_path = configured_load_path
-        .as_deref()
-        .filter(|path| *path != current)
-        .map(|path| inspect_alias(path, &current))
-        .unwrap_or_else(|| inspect_user_visible_alias(&home, &current));
-    let load_unpacked_path = preferred_load_unpacked_path(&user_visible_path, &current);
+    let (user_visible_path, load_unpacked_path) = status_load_view(&home, &current, state.as_ref());
     let view = json!({
         "ok": installed,
         "installed": installed,
@@ -787,35 +780,55 @@ fn inspect_user_visible_alias(home: &Path, current: &Path) -> Value {
     inspect_alias(&path, current)
 }
 
-/// The user-visible alias recorded by the last install, or the default alias
-/// path when the install did not record one.
-#[cfg(any(target_os = "macos", test))]
-fn configured_alias(home: &Path, current: &Path) -> Value {
-    let configured = read_json(&base_dir_for(home).join("state.json"))
-        .ok()
-        .and_then(|value| {
-            value
-                .get("load_unpacked_path")
-                .and_then(Value::as_str)
-                .map(PathBuf::from)
-        });
-    match configured {
-        Some(path) if path != current => inspect_alias(&path, current),
-        _ => inspect_user_visible_alias(home, current),
-    }
+/// Read-only projection of the Chrome-facing load path recorded by the last
+/// install. The value lives in `~/.config`, so it is a stable string authority
+/// that does not require `lstat`/`readlink` on `~/Documents`, which macOS TCC
+/// can deny. It is only reported/matched here and is never used to mutate the
+/// filesystem; a value that escapes HOME is ignored.
+fn reported_load_path(home: &Path, state: Option<&Value>) -> Option<PathBuf> {
+    let path = state
+        .and_then(|value| value.get("load_unpacked_path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)?;
+    is_below_home(home, &path).then_some(path)
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn ready_user_visible_path(home: &Path, current: &Path) -> Option<PathBuf> {
-    let inspected = configured_alias(home, current);
-    if inspected.get("ready").and_then(Value::as_bool) == Some(true) {
-        inspected
-            .get("path")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-    } else {
-        None
+/// Lexical HOME containment used as a read-only sanity bound. It is not a
+/// filesystem check and must not be treated as ownership proof for a mutation;
+/// mutations only ever use the validated `--path` argument.
+fn is_below_home(home: &Path, path: &Path) -> bool {
+    path.is_absolute() && path != home && path.starts_with(home)
+}
+
+/// Path equality that never touches the filesystem. Chrome persists the exact
+/// directory string it was given, so the recorded path can be compared even
+/// when the user-visible alias cannot be inspected.
+fn lexical_path_eq(left: &Path, right: &Path) -> bool {
+    fn normalize(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        text.strip_suffix('/').unwrap_or(&text).to_owned()
     }
+    normalize(left) == normalize(right)
+}
+
+/// Resolve the Chrome-facing load path and its alias evidence for `status`.
+/// The recorded `load_unpacked_path` is authoritative; inspecting the alias is
+/// best-effort reporting and never gates the reported path.
+fn status_load_view(home: &Path, current: &Path, state: Option<&Value>) -> (Value, PathBuf) {
+    let reported = reported_load_path(home, state);
+    let user_visible_path = match reported.as_deref() {
+        Some(path) if path != current => inspect_alias(path, current),
+        Some(_) => json!({
+            "ready": true,
+            "status": "managed",
+            "path": current,
+            "target": current,
+        }),
+        None => inspect_user_visible_alias(home, current),
+    };
+    let load_unpacked_path =
+        reported.unwrap_or_else(|| preferred_load_unpacked_path(&user_visible_path, current));
+    (user_visible_path, load_unpacked_path)
 }
 
 fn inspect_alias(path: &Path, current: &Path) -> Value {
@@ -825,6 +838,13 @@ fn inspect_alias(path: &Path, current: &Path) -> Value {
             "status": "missing",
             "path": path,
             "target": current,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => json!({
+            "ready": false,
+            "status": "unverified",
+            "path": path,
+            "target": current,
+            "error": error.to_string(),
         }),
         Err(error) => json!({
             "ready": false,
@@ -847,6 +867,13 @@ fn inspect_alias(path: &Path, current: &Path) -> Value {
                 "path": path,
                 "target": current,
                 "existing_target": existing_target,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => json!({
+                "ready": false,
+                "status": "unverified",
+                "path": path,
+                "target": current,
+                "error": error.to_string(),
             }),
             Err(error) => json!({
                 "ready": false,
@@ -934,6 +961,10 @@ fn preflight_explicit_load_path(path: &Path, current: &Path) -> Result<(), Strin
     let state = inspect_alias(path, current);
     match state.get("status").and_then(Value::as_str) {
         Some("missing" | "ready") => Ok(()),
+        Some("unverified") => Err(format!(
+            "requested standalone --path '{}' cannot be inspected (permission denied); refusing to overwrite it",
+            path.display()
+        )),
         Some(status) => Err(format!(
             "requested standalone --path '{}' is already occupied ({status}); refusing to overwrite it",
             path.display()
@@ -1175,31 +1206,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn browser_doctor_accepts_user_visible_alias_without_drift() {
-        let root = env::temp_dir().join(format!("herdr-browser-alias-test-{}", now_ms()));
-        let chrome = root.join("Chrome");
-        let home = root.join("home");
-        let current = base_dir_for(&home).join("current");
-        fs::create_dir_all(&current).unwrap();
-        let alias = user_visible_alias_path(&home);
-        fs::create_dir_all(alias.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&current, &alias).unwrap();
-        write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &alias);
-
-        let report = diagnose_chrome_load(&current, Some(&alias), "abcdefghijklmnop", &chrome);
-        assert_eq!(report.state, "pass");
-        assert_eq!(report.drift_count(), 0);
-        assert_eq!(report.user_visible_path.as_deref(), Some(alias.as_path()));
-        assert_eq!(report.as_json()["loaded"][0]["matches_expected"], true);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn browser_doctor_stays_stable_after_user_changes_load_path() {
-        // Chrome still loads the previous alias, while install has already
-        // moved the configured alias to a new path. Both aliases resolve to
-        // the managed `current` directory, so doctor must not report drift.
+        // Chrome still loads the previous alias while install has already moved
+        // the recorded load path. Switching `--path` must not turn a healthy
+        // managed install into a false `drift`.
         let root = env::temp_dir().join(format!("herdr-browser-alias-change-{}", now_ms()));
         let chrome = root.join("Chrome");
         let home = root.join("home");
@@ -1217,20 +1227,54 @@ mod tests {
             serde_json::to_vec(&json!({ "load_unpacked_path": configured })).unwrap(),
         )
         .unwrap();
+        let state = read_json(&base_dir_for(&home).join("state.json")).ok();
+        let recorded = reported_load_path(&home, state.as_ref());
+        assert_eq!(recorded.as_deref(), Some(configured.as_path()));
 
-        assert_eq!(
-            ready_user_visible_path(&home, &current).as_deref(),
-            Some(configured.as_path())
-        );
         write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &previous);
-        let report = diagnose_chrome_load(
-            &current,
-            Some(configured.as_path()),
-            "abcdefghijklmnop",
-            &chrome,
-        );
+        let report =
+            diagnose_chrome_load(&current, recorded.as_deref(), "abcdefghijklmnop", &chrome);
         assert_eq!(report.state, "pass");
         assert_eq!(report.drift_count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recorded_load_path_matches_without_probing_documents() {
+        // macOS TCC can deny lstat/readlink on ~/Documents. The recorded
+        // Chrome-facing path lives in ~/.config state, so both `status` and
+        // `doctor` must match Chrome's persisted string lexically without the
+        // alias existing or being inspectable.
+        let root = env::temp_dir().join(format!("herdr-recorded-load-path-{}", now_ms()));
+        let chrome = root.join("Chrome");
+        let home = root.join("home");
+        let current = base_dir_for(&home).join("current");
+        fs::create_dir_all(&current).unwrap();
+        let recorded = home.join("Documents/herdr-mcp/extension");
+        fs::create_dir_all(base_dir_for(&home)).unwrap();
+        fs::write(
+            base_dir_for(&home).join("state.json"),
+            serde_json::to_vec(&json!({ "load_unpacked_path": recorded })).unwrap(),
+        )
+        .unwrap();
+        let state = read_json(&base_dir_for(&home).join("state.json")).ok();
+
+        // The alias is intentionally absent, so every filesystem-based
+        // equivalence fails exactly like a TCC-denied directory.
+        assert!(!recorded.exists());
+        let (_, load_unpacked_path) = status_load_view(&home, &current, state.as_ref());
+        assert_eq!(load_unpacked_path, recorded);
+
+        write_chrome_profile(&chrome, "Default", "abcdefghijklmnop", &recorded);
+        let configured = reported_load_path(&home, state.as_ref()).filter(|path| path != &current);
+        let report =
+            diagnose_chrome_load(&current, configured.as_deref(), "abcdefghijklmnop", &chrome);
+        assert_eq!(report.state, "pass");
+        assert_eq!(report.drift_count(), 0);
+        assert_eq!(
+            report.as_json()["configured_load_path"],
+            json!(recorded.to_string_lossy())
+        );
         let _ = fs::remove_dir_all(root);
     }
 
