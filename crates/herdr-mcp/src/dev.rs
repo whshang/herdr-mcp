@@ -24,6 +24,36 @@ const DEV_ACTIVATION_HEALTH_BUDGET: Duration = Duration::from_secs(10);
 const DEV_ACTIVATION_HEALTH_POLL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DevSyncPhase {
+    Building,
+    Activating,
+    Reconciling,
+    Succeeded,
+    RolledBack,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DevSyncTransaction {
+    transaction_id: String,
+    phase: DevSyncPhase,
+    target_version: String,
+    source_repo: String,
+    source_branch: Option<String>,
+    source_commit: String,
+    source_dirty: bool,
+    active_generation_before: String,
+    expected_generation: Option<String>,
+    generation: Option<String>,
+    started_at_ms: u128,
+    updated_at_ms: u128,
+    completed_at_ms: Option<u128>,
+    error: Option<String>,
+    activation_evidence: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DevRuntimeState {
     schema_version: u32,
     channel: String,
@@ -38,6 +68,8 @@ struct DevRuntimeState {
     prod_snapshot_binary: String,
     prod_snapshot_sha256: String,
     updated_at_ms: u128,
+    #[serde(default)]
+    last_transaction: Option<DevSyncTransaction>,
 }
 
 struct DevPaths {
@@ -103,6 +135,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
     if let Some(state) = existing.as_mut()
         && state.channel == "dev"
         && state.dev_generation.is_none()
+        && interrupted_transaction_allows_recovery(state, &active_before)
         && interrupted_dev_state_matches_active_runtime(&runtime, state, &repo, &source)?
     {
         if !verify_snapshot(state)? {
@@ -136,6 +169,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             }))?;
             return Ok(ExitCode::SUCCESS);
         }
+        mark_transaction_succeeded(state, &active_before, activation_evidence.clone(), now_ms());
         write_state(&paths.state, state)?;
         crate::local_agent_skill::sync_after_install_best_effort();
         print_json(&json!({
@@ -153,6 +187,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
                 .get("server_link_generation_reconciled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            "transaction": state.last_transaction.as_ref(),
         }))?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -255,20 +290,57 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         &prod_generation,
     )?;
     let prod_sha = file_sha256(&paths.prod_binary)?;
-    build_dev_binary(&repo, &source, &target_version)?;
+    let started_at_ms = now_ms();
+    let base_state = dev_sync_base_state(
+        existing.as_ref(),
+        &target_version,
+        &prod_generation,
+        &prod_version,
+        &paths.prod_binary,
+        &prod_sha,
+        started_at_ms,
+    );
+    let mut transaction = new_dev_sync_transaction(
+        &repo,
+        &source,
+        &target_version,
+        &active_before,
+        started_at_ms,
+    );
+    write_state(
+        &paths.state,
+        &state_with_transaction(&base_state, &transaction),
+    )?;
+
     let built_binary = repo
         .join("target")
         .join("release")
         .join(executable_name("herdr-mcp"));
-    verify_dev_binary(&built_binary, &target_version)?;
-    let built_sha = file_sha256(&built_binary)?;
-    let expected_dev_generation = generation_from_sha256(&built_sha)?;
+    let expected_dev_generation = match (|| -> Result<String, String> {
+        build_dev_binary(&repo, &source, &target_version)?;
+        verify_dev_binary(&built_binary, &target_version)?;
+        let built_sha = file_sha256(&built_binary)?;
+        generation_from_sha256(&built_sha)
+    })() {
+        Ok(generation) => generation,
+        Err(error) => {
+            return Err(record_failed_dev_sync_transaction(
+                &paths.state,
+                &base_state,
+                &mut transaction,
+                error,
+                now_ms(),
+            ));
+        }
+    };
+    transaction.phase = DevSyncPhase::Activating;
+    transaction.expected_generation = Some(expected_dev_generation.clone());
+    transaction.updated_at_ms = now_ms();
 
     // Persist the PROD recovery source before the service transaction. If the
     // independent terminal disappears during activation, `dev rollback` still
     // has a verified immutable PROD binary instead of relying on "previous",
     // which may already be another DEV generation after repeated syncs.
-    let previous_state = existing.clone();
     let mut state = DevRuntimeState {
         schema_version: STATE_SCHEMA_VERSION,
         channel: "dev".to_owned(),
@@ -283,59 +355,97 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         prod_snapshot_binary: paths.prod_binary.to_string_lossy().into_owned(),
         prod_snapshot_sha256: prod_sha,
         updated_at_ms: now_ms(),
+        last_transaction: Some(transaction.clone()),
     };
-    write_state(&paths.state, &state)?;
+    if let Err(error) = write_state(&paths.state, &state) {
+        return Err(record_failed_dev_sync_transaction(
+            &paths.state,
+            &base_state,
+            &mut transaction,
+            format!("cannot persist DEV activating transaction: {error}"),
+            now_ms(),
+        ));
+    }
     if let Err(error) = run_service_install(&built_binary) {
-        let restore_error = restore_state(&paths.state, previous_state.as_ref()).err();
-        return Err(match restore_error {
-            Some(restore_error) => {
-                format!("{error}; DEV channel-state restore also failed: {restore_error}")
-            }
-            None => error,
-        });
+        return Err(record_failed_dev_sync_transaction(
+            &paths.state,
+            &base_state,
+            &mut transaction,
+            error,
+            now_ms(),
+        ));
     }
 
     let active_after = match current_generation(&runtime.config_dir) {
         Ok(Some(generation)) => generation,
         Ok(None) => {
-            return Err(compensate_post_install_failure(
-                "DEV post-install generation read failed",
-                "dev service activation succeeded but runtime/current is missing",
-                expected_dev_generation != active_before,
+            return Err(compensate_and_record_dev_sync_transaction(
+                &runtime.config_dir,
+                &paths.state,
+                &base_state,
+                &mut transaction,
+                "DEV post-install generation read failed: dev service activation succeeded but runtime/current is missing".to_owned(),
                 || run_service_rollback(&built_binary),
-                || restore_state(&paths.state, previous_state.as_ref()),
             ));
         }
         Err(error) => {
-            return Err(compensate_post_install_failure(
-                "DEV post-install generation read failed",
-                &error,
-                expected_dev_generation != active_before,
+            return Err(compensate_and_record_dev_sync_transaction(
+                &runtime.config_dir,
+                &paths.state,
+                &base_state,
+                &mut transaction,
+                format!("DEV post-install generation read failed: {error}"),
                 || run_service_rollback(&built_binary),
-                || restore_state(&paths.state, previous_state.as_ref()),
             ));
         }
     };
+    transaction.phase = DevSyncPhase::Reconciling;
+    transaction.generation = Some(active_after.clone());
+    transaction.updated_at_ms = now_ms();
+    state.last_transaction = Some(transaction.clone());
+    state.updated_at_ms = transaction.updated_at_ms;
+    if let Err(error) = write_state(&paths.state, &state) {
+        return Err(compensate_and_record_dev_sync_transaction(
+            &runtime.config_dir,
+            &paths.state,
+            &base_state,
+            &mut transaction,
+            format!("DEV reconcile-state commit failed: {error}"),
+            || run_service_rollback(&built_binary),
+        ));
+    }
     let activation_evidence = match verify_runtime_activation(&runtime, &active_after) {
         Ok(evidence) => evidence,
         Err(error) => {
-            return Err(compensate_post_install_failure(
-                "DEV post-activation gate failed",
-                &error,
-                active_after != active_before,
+            return Err(compensate_and_record_dev_sync_transaction(
+                &runtime.config_dir,
+                &paths.state,
+                &base_state,
+                &mut transaction,
+                format!("DEV post-activation gate failed: {error}"),
                 || run_service_rollback(&built_binary),
-                || restore_state(&paths.state, previous_state.as_ref()),
             ));
         }
     };
     state.dev_generation = Some(active_after.clone());
-    state.updated_at_ms = now_ms();
-    persist_committed_dev_state(
-        || write_state(&paths.state, &state),
-        active_after != active_before,
-        || run_service_rollback(&built_binary),
-        || restore_state(&paths.state, previous_state.as_ref()),
-    )?;
+    transaction.phase = DevSyncPhase::Succeeded;
+    transaction.generation = Some(active_after.clone());
+    transaction.activation_evidence = Some(activation_evidence.clone());
+    transaction.error = None;
+    transaction.completed_at_ms = Some(now_ms());
+    transaction.updated_at_ms = transaction.completed_at_ms.unwrap_or_else(now_ms);
+    state.last_transaction = Some(transaction.clone());
+    state.updated_at_ms = transaction.updated_at_ms;
+    if let Err(error) = write_state(&paths.state, &state) {
+        return Err(compensate_and_record_dev_sync_transaction(
+            &runtime.config_dir,
+            &paths.state,
+            &base_state,
+            &mut transaction,
+            format!("DEV channel-state commit failed after activation: {error}"),
+            || run_service_rollback(&built_binary),
+        ));
+    }
     crate::local_agent_skill::sync_after_install_best_effort();
 
     print_json(&json!({
@@ -353,6 +463,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             .get("server_link_generation_reconciled")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "transaction": state.last_transaction.as_ref(),
     }))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -393,6 +504,223 @@ fn interrupted_dev_state_matches_active_runtime(
             checkout_dirty: source.dirty,
         },
     ))
+}
+
+fn new_dev_sync_transaction(
+    repo: &Path,
+    source: &SourceIdentity,
+    target_version: &str,
+    active_generation_before: &str,
+    started_at_ms: u128,
+) -> DevSyncTransaction {
+    DevSyncTransaction {
+        transaction_id: format!("dstx-{started_at_ms:032x}-{:x}", std::process::id()),
+        phase: DevSyncPhase::Building,
+        target_version: target_version.to_owned(),
+        source_repo: repo.to_string_lossy().into_owned(),
+        source_branch: source.branch.clone(),
+        source_commit: source.commit.clone(),
+        source_dirty: source.dirty,
+        active_generation_before: active_generation_before.to_owned(),
+        expected_generation: None,
+        generation: None,
+        started_at_ms,
+        updated_at_ms: started_at_ms,
+        completed_at_ms: None,
+        error: None,
+        activation_evidence: None,
+    }
+}
+
+fn dev_sync_base_state(
+    existing: Option<&DevRuntimeState>,
+    target_version: &str,
+    prod_generation: &str,
+    prod_version: &str,
+    prod_snapshot_binary: &Path,
+    prod_snapshot_sha256: &str,
+    updated_at_ms: u128,
+) -> DevRuntimeState {
+    let mut state = existing.cloned().unwrap_or_else(|| DevRuntimeState {
+        schema_version: STATE_SCHEMA_VERSION,
+        channel: "prod".to_owned(),
+        target_version: target_version.to_owned(),
+        source_repo: None,
+        source_branch: None,
+        source_commit: None,
+        source_dirty: false,
+        dev_generation: None,
+        prod_generation: prod_generation.to_owned(),
+        prod_version: prod_version.to_owned(),
+        prod_snapshot_binary: prod_snapshot_binary.to_string_lossy().into_owned(),
+        prod_snapshot_sha256: prod_snapshot_sha256.to_owned(),
+        updated_at_ms,
+        last_transaction: None,
+    });
+    state.prod_generation = prod_generation.to_owned();
+    state.prod_version = prod_version.to_owned();
+    state.prod_snapshot_binary = prod_snapshot_binary.to_string_lossy().into_owned();
+    state.prod_snapshot_sha256 = prod_snapshot_sha256.to_owned();
+    state.updated_at_ms = updated_at_ms;
+    state
+}
+
+fn state_with_transaction(
+    base_state: &DevRuntimeState,
+    transaction: &DevSyncTransaction,
+) -> DevRuntimeState {
+    let mut state = base_state.clone();
+    state.last_transaction = Some(transaction.clone());
+    state.updated_at_ms = transaction.updated_at_ms;
+    state
+}
+
+fn record_failed_dev_sync_transaction(
+    state_path: &Path,
+    base_state: &DevRuntimeState,
+    transaction: &mut DevSyncTransaction,
+    error: String,
+    completed_at_ms: u128,
+) -> String {
+    transaction.phase = DevSyncPhase::Failed;
+    transaction.error = Some(error.clone());
+    transaction.completed_at_ms = Some(completed_at_ms);
+    transaction.updated_at_ms = completed_at_ms;
+    let terminal_state = state_with_transaction(base_state, transaction);
+    match write_state(state_path, &terminal_state) {
+        Ok(()) => error,
+        Err(state_error) => {
+            format!("{error}; cannot persist failed DEV sync transaction: {state_error}")
+        }
+    }
+}
+
+fn compensate_and_record_dev_sync_transaction<Rollback>(
+    config_dir: &Path,
+    state_path: &Path,
+    base_state: &DevRuntimeState,
+    transaction: &mut DevSyncTransaction,
+    failure: String,
+    rollback: Rollback,
+) -> String
+where
+    Rollback: FnMut() -> Result<(), String>,
+{
+    compensate_and_record_dev_sync_transaction_with(
+        state_path,
+        base_state,
+        transaction,
+        failure,
+        rollback,
+        || current_generation(config_dir),
+    )
+}
+
+fn compensate_and_record_dev_sync_transaction_with<Rollback, ReadGeneration>(
+    state_path: &Path,
+    base_state: &DevRuntimeState,
+    transaction: &mut DevSyncTransaction,
+    failure: String,
+    mut rollback: Rollback,
+    mut read_generation: ReadGeneration,
+) -> String
+where
+    Rollback: FnMut() -> Result<(), String>,
+    ReadGeneration: FnMut() -> Result<Option<String>, String>,
+{
+    let rollback_generation = transaction.active_generation_before.clone();
+    let runtime_changed = transaction
+        .generation
+        .as_deref()
+        .or(transaction.expected_generation.as_deref())
+        .is_some_and(|generation| generation != rollback_generation);
+    let mut rollback_error = None;
+    if runtime_changed {
+        if let Err(error) = rollback() {
+            rollback_error = Some(format!("service rollback failed: {error}"));
+        } else {
+            match read_generation() {
+                Ok(Some(generation)) if generation == rollback_generation => {
+                    transaction.phase = DevSyncPhase::RolledBack;
+                    transaction.generation = Some(generation);
+                }
+                Ok(Some(generation)) => {
+                    rollback_error = Some(format!(
+                        "service rollback returned success but runtime/current is {generation}, expected {rollback_generation}"
+                    ));
+                }
+                Ok(None) => {
+                    rollback_error = Some(
+                        "service rollback returned success but runtime/current is missing"
+                            .to_owned(),
+                    );
+                }
+                Err(error) => {
+                    rollback_error = Some(format!(
+                        "service rollback returned success but runtime/current verification failed: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    if !matches!(transaction.phase, DevSyncPhase::RolledBack) {
+        transaction.phase = DevSyncPhase::Failed;
+    }
+    let combined = format!(
+        "{failure}{}",
+        rollback_error
+            .as_ref()
+            .map(|error| format!("; {error}"))
+            .unwrap_or_default(),
+    );
+    let completed_at_ms = now_ms();
+    transaction.error = Some(combined.clone());
+    transaction.completed_at_ms = Some(completed_at_ms);
+    transaction.updated_at_ms = completed_at_ms;
+    let terminal_state = state_with_transaction(base_state, transaction);
+    match write_state(state_path, &terminal_state) {
+        Ok(()) => combined,
+        Err(state_error) => {
+            format!("{combined}; cannot persist compensated DEV sync transaction: {state_error}")
+        }
+    }
+}
+
+fn interrupted_transaction_allows_recovery(
+    state: &DevRuntimeState,
+    active_generation: &str,
+) -> bool {
+    let Some(transaction) = state.last_transaction.as_ref() else {
+        // Schema-1 states written before durable DEV sync transactions remain
+        // recoverable through the existing exact runtime/source identity gate.
+        return true;
+    };
+    matches!(
+        transaction.phase,
+        DevSyncPhase::Activating | DevSyncPhase::Reconciling
+    ) && transaction.expected_generation.as_deref() == Some(active_generation)
+        && transaction.target_version == state.target_version
+        && state.source_repo.as_deref() == Some(transaction.source_repo.as_str())
+        && state.source_branch.as_deref() == transaction.source_branch.as_deref()
+        && state.source_commit.as_deref() == Some(transaction.source_commit.as_str())
+        && state.source_dirty == transaction.source_dirty
+}
+
+fn mark_transaction_succeeded(
+    state: &mut DevRuntimeState,
+    generation: &str,
+    activation_evidence: Value,
+    completed_at_ms: u128,
+) {
+    let Some(transaction) = state.last_transaction.as_mut() else {
+        return;
+    };
+    transaction.phase = DevSyncPhase::Succeeded;
+    transaction.generation = Some(generation.to_owned());
+    transaction.activation_evidence = Some(activation_evidence);
+    transaction.error = None;
+    transaction.completed_at_ms = Some(completed_at_ms);
+    transaction.updated_at_ms = completed_at_ms;
 }
 
 fn interrupted_dev_state_matches_identity(
@@ -467,6 +795,7 @@ fn status() -> Result<ExitCode, String> {
         "prod_generation": state.as_ref().map(|state| state.prod_generation.as_str()),
         "prod_snapshot_binary": state.as_ref().map(|state| state.prod_snapshot_binary.as_str()),
         "prod_snapshot_ok": prod_snapshot_ok,
+        "last_transaction": state.as_ref().and_then(|state| state.last_transaction.as_ref()),
         "state_path": paths.state,
     }))?;
     Ok(if runtime_matches_state {
@@ -943,57 +1272,6 @@ fn run_service_rollback(binary: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn compensate_post_install_failure<Rollback, Restore>(
-    context: &str,
-    error: &str,
-    runtime_changed: bool,
-    mut rollback: Rollback,
-    mut restore: Restore,
-) -> String
-where
-    Rollback: FnMut() -> Result<(), String>,
-    Restore: FnMut() -> Result<(), String>,
-{
-    let rollback_error = runtime_changed.then(|| rollback().err()).flatten();
-    let restore_error = restore().err();
-    format!(
-        "{context}: {error}{}{}",
-        rollback_error
-            .map(|error| format!("; service rollback failed: {error}"))
-            .unwrap_or_default(),
-        restore_error
-            .map(|error| format!("; DEV channel-state restore failed: {error}"))
-            .unwrap_or_default(),
-    )
-}
-
-fn persist_committed_dev_state<Write, Rollback, Restore>(
-    mut write: Write,
-    runtime_changed: bool,
-    mut rollback: Rollback,
-    mut restore: Restore,
-) -> Result<(), String>
-where
-    Write: FnMut() -> Result<(), String>,
-    Rollback: FnMut() -> Result<(), String>,
-    Restore: FnMut() -> Result<(), String>,
-{
-    let Err(state_error) = write() else {
-        return Ok(());
-    };
-    let rollback_error = runtime_changed.then(|| rollback().err()).flatten();
-    let restore_error = restore().err();
-    Err(format!(
-        "DEV channel-state commit failed after activation: {state_error}{}{}",
-        rollback_error
-            .map(|error| format!("; service rollback failed: {error}"))
-            .unwrap_or_default(),
-        restore_error
-            .map(|error| format!("; DEV channel-state restore failed: {error}"))
-            .unwrap_or_default(),
-    ))
 }
 
 fn is_dev_runtime_version(version: &str) -> bool {
@@ -1479,17 +1757,6 @@ fn write_state(path: &Path, state: &DevRuntimeState) -> Result<(), String> {
     fs::rename(&temp, path).map_err(|error| format!("cannot commit DEV runtime state: {error}"))
 }
 
-fn restore_state(path: &Path, previous: Option<&DevRuntimeState>) -> Result<(), String> {
-    match previous {
-        Some(state) => write_state(path, state),
-        None => match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("cannot remove prepared DEV runtime state: {error}")),
-        },
-    }
-}
-
 fn atomic_copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
     let parent = destination
         .parent()
@@ -1967,6 +2234,7 @@ mod tests {
             prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
             prod_snapshot_sha256: "0".repeat(64),
             updated_at_ms: 1,
+            last_transaction: None,
         };
         let identity = DevRecoveryIdentity {
             current_exe_is_active_runtime: true,
@@ -2047,6 +2315,7 @@ mod tests {
             prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
             prod_snapshot_sha256: "0".repeat(64),
             updated_at_ms: 1,
+            last_transaction: None,
         };
         let before = state.clone();
         assert!(!mark_interrupted_dev_recovery_committed(
@@ -2077,6 +2346,7 @@ mod tests {
             prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
             prod_snapshot_sha256: "0".repeat(64),
             updated_at_ms: 1,
+            last_transaction: None,
         };
         let commit = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
@@ -2105,33 +2375,224 @@ mod tests {
     }
 
     #[test]
-    fn final_dev_state_commit_failure_compensates_runtime_and_state() {
+    fn legacy_schema_one_state_without_transaction_remains_readable() {
+        let root = env::temp_dir().join(format!("herdr-mcp-dev-legacy-state-{}", now_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("channel.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "channel": "dev",
+                "target_version": "1.0.0-dev",
+                "source_repo": "/tmp/repo",
+                "source_branch": "main",
+                "source_commit": "abc123",
+                "source_dirty": false,
+                "dev_generation": "rust-dev",
+                "prod_generation": "rust-prod",
+                "prod_version": "0.4.8",
+                "prod_snapshot_binary": "/tmp/prod/herdr-mcp",
+                "prod_snapshot_sha256": "0".repeat(64),
+                "updated_at_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = read_state(&path).unwrap().unwrap();
+        assert_eq!(state.schema_version, 1);
+        assert_eq!(state.dev_generation.as_deref(), Some("rust-dev"));
+        assert_eq!(state.last_transaction, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_transaction_phase_fences_interrupted_recovery() {
+        let mut state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "1.0.0-dev".to_owned(),
+            source_repo: Some("/tmp/repo".to_owned()),
+            source_branch: Some("main".to_owned()),
+            source_commit: Some("abc123".to_owned()),
+            source_dirty: false,
+            dev_generation: None,
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "0.4.8".to_owned(),
+            prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
+            prod_snapshot_sha256: "0".repeat(64),
+            updated_at_ms: 10,
+            last_transaction: None,
+        };
+        let mut transaction = DevSyncTransaction {
+            transaction_id: "dstx-test".to_owned(),
+            phase: DevSyncPhase::Building,
+            target_version: state.target_version.clone(),
+            source_repo: state.source_repo.clone().unwrap(),
+            source_branch: state.source_branch.clone(),
+            source_commit: state.source_commit.clone().unwrap(),
+            source_dirty: state.source_dirty,
+            active_generation_before: "rust-old".to_owned(),
+            expected_generation: Some("rust-new".to_owned()),
+            generation: None,
+            started_at_ms: 10,
+            updated_at_ms: 10,
+            completed_at_ms: None,
+            error: None,
+            activation_evidence: None,
+        };
+
+        state.last_transaction = Some(transaction.clone());
+        assert!(!interrupted_transaction_allows_recovery(&state, "rust-new"));
+
+        transaction.phase = DevSyncPhase::Activating;
+        state.last_transaction = Some(transaction.clone());
+        assert!(interrupted_transaction_allows_recovery(&state, "rust-new"));
+        assert!(!interrupted_transaction_allows_recovery(
+            &state,
+            "rust-other"
+        ));
+
+        transaction.phase = DevSyncPhase::Reconciling;
+        state.last_transaction = Some(transaction.clone());
+        assert!(interrupted_transaction_allows_recovery(&state, "rust-new"));
+
+        transaction.phase = DevSyncPhase::Succeeded;
+        state.last_transaction = Some(transaction);
+        assert!(!interrupted_transaction_allows_recovery(&state, "rust-new"));
+
+        state.last_transaction = None;
+        assert!(interrupted_transaction_allows_recovery(&state, "rust-new"));
+    }
+
+    #[test]
+    fn building_transaction_preserves_active_channel_until_activation() {
+        let existing = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "0.9.0-dev".to_owned(),
+            source_repo: Some("/tmp/old".to_owned()),
+            source_branch: Some("old".to_owned()),
+            source_commit: Some("old-commit".to_owned()),
+            source_dirty: false,
+            dev_generation: Some("rust-old-dev".to_owned()),
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "0.4.8".to_owned(),
+            prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
+            prod_snapshot_sha256: "a".repeat(64),
+            updated_at_ms: 1,
+            last_transaction: None,
+        };
+        let base = dev_sync_base_state(
+            Some(&existing),
+            "1.0.0-dev",
+            "rust-prod",
+            "0.4.8",
+            Path::new("/tmp/prod/herdr-mcp"),
+            &"b".repeat(64),
+            2,
+        );
+        assert_eq!(base.channel, "dev");
+        assert_eq!(base.dev_generation.as_deref(), Some("rust-old-dev"));
+        assert_eq!(base.target_version, "0.9.0-dev");
+
+        let fresh = dev_sync_base_state(
+            None,
+            "1.0.0-dev",
+            "rust-prod",
+            "0.4.8",
+            Path::new("/tmp/prod/herdr-mcp"),
+            &"b".repeat(64),
+            2,
+        );
+        assert_eq!(fresh.channel, "prod");
+        assert_eq!(fresh.dev_generation, None);
+        assert_eq!(fresh.prod_generation, "rust-prod");
+    }
+
+    #[test]
+    fn compensation_is_rolled_back_only_after_exact_generation_readback() {
         use std::cell::Cell;
 
+        let root = env::temp_dir().join(format!("herdr-mcp-dev-tx-test-{}", now_ms()));
+        let state_path = root.join("runtime/channel.json");
+        let base = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "0.9.0-dev".to_owned(),
+            source_repo: Some("/tmp/old".to_owned()),
+            source_branch: Some("old".to_owned()),
+            source_commit: Some("old-commit".to_owned()),
+            source_dirty: false,
+            dev_generation: Some("rust-old".to_owned()),
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "0.4.8".to_owned(),
+            prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
+            prod_snapshot_sha256: "0".repeat(64),
+            updated_at_ms: 1,
+            last_transaction: None,
+        };
+        let source = SourceIdentity {
+            branch: Some("main".to_owned()),
+            commit: "new-commit".to_owned(),
+            dirty: false,
+        };
+        let mut transaction =
+            new_dev_sync_transaction(Path::new("/tmp/new"), &source, "1.0.0-dev", "rust-old", 10);
+        transaction.phase = DevSyncPhase::Reconciling;
+        transaction.expected_generation = Some("rust-new".to_owned());
+        transaction.generation = Some("rust-new".to_owned());
         let rollback_calls = Cell::new(0usize);
-        let restore_calls = Cell::new(0usize);
-        let error = persist_committed_dev_state(
-            || Err("synthetic state write failure".to_owned()),
-            true,
+
+        let error = compensate_and_record_dev_sync_transaction_with(
+            &state_path,
+            &base,
+            &mut transaction,
+            "DEV post-activation gate failed: synthetic failure".to_owned(),
             || {
                 rollback_calls.set(rollback_calls.get() + 1);
                 Ok(())
             },
-            || {
-                restore_calls.set(restore_calls.get() + 1);
-                Ok(())
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.contains("DEV channel-state commit failed after activation"));
+            || Ok(Some("rust-old".to_owned())),
+        );
+        assert!(error.contains("synthetic failure"));
         assert_eq!(rollback_calls.get(), 1);
-        assert_eq!(restore_calls.get(), 1);
-    }
+        let persisted = read_state(&state_path).unwrap().unwrap();
+        assert_eq!(persisted.channel, "dev");
+        assert_eq!(persisted.dev_generation.as_deref(), Some("rust-old"));
+        let persisted_tx = persisted.last_transaction.unwrap();
+        assert_eq!(persisted_tx.phase, DevSyncPhase::RolledBack);
+        assert_eq!(
+            persisted_tx.expected_generation.as_deref(),
+            Some("rust-new")
+        );
+        assert_eq!(persisted_tx.generation.as_deref(), Some("rust-old"));
+        assert!(persisted_tx.completed_at_ms.is_some());
 
-    #[test]
-    fn post_install_generation_read_failure_uses_expected_generation_for_compensation() {
-        use std::cell::Cell;
+        let mismatch_path = root.join("runtime/channel-mismatch.json");
+        let mut mismatch =
+            new_dev_sync_transaction(Path::new("/tmp/new"), &source, "1.0.0-dev", "rust-old", 30);
+        mismatch.phase = DevSyncPhase::Reconciling;
+        mismatch.expected_generation = Some("rust-new".to_owned());
+        let error = compensate_and_record_dev_sync_transaction_with(
+            &mismatch_path,
+            &base,
+            &mut mismatch,
+            "DEV post-activation gate failed: synthetic mismatch".to_owned(),
+            || Ok(()),
+            || Ok(Some("rust-unexpected".to_owned())),
+        );
+        assert!(error.contains("expected rust-old"));
+        assert_eq!(
+            read_state(&mismatch_path)
+                .unwrap()
+                .unwrap()
+                .last_transaction
+                .unwrap()
+                .phase,
+            DevSyncPhase::Failed
+        );
 
         assert_eq!(
             generation_from_sha256(
@@ -2141,25 +2602,7 @@ mod tests {
             "rust-0123456789abcdef"
         );
         assert!(generation_from_sha256("bad").is_err());
-
-        let rollback_calls = Cell::new(0usize);
-        let restore_calls = Cell::new(0usize);
-        let error = compensate_post_install_failure(
-            "DEV post-install generation read failed",
-            "synthetic runtime/current read failure",
-            true,
-            || {
-                rollback_calls.set(rollback_calls.get() + 1);
-                Ok(())
-            },
-            || {
-                restore_calls.set(restore_calls.get() + 1);
-                Ok(())
-            },
-        );
-        assert!(error.contains("synthetic runtime/current read failure"));
-        assert_eq!(rollback_calls.get(), 1);
-        assert_eq!(restore_calls.get(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2199,6 +2642,7 @@ mod tests {
             prod_snapshot_binary: prod_binary.to_string_lossy().into_owned(),
             prod_snapshot_sha256: prod_sha,
             updated_at_ms: 100,
+            last_transaction: None,
         };
         let before = state.clone();
 
@@ -2267,6 +2711,7 @@ mod tests {
             prod_snapshot_binary: "/tmp/old".to_owned(),
             prod_snapshot_sha256: "old-sha".to_owned(),
             updated_at_ms: 100,
+            last_transaction: None,
         };
 
         transition_state_to_prod(
