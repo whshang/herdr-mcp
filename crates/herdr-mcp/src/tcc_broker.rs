@@ -50,7 +50,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// broker instead of falling back to a direct Git read.
 pub const BROKER_COMPAT_REVISION: u32 = 3;
 /// First broker revision that implements the read-only `git` identity action.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
 /// First broker revision that can be a stable TCC parent for `herdr server`.
 #[cfg(any(target_os = "macos", test))]
@@ -969,7 +969,7 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
 
 /// Whether the installed stable broker can answer the read-only `git` identity
 /// action. A missing or invalid compatibility revision fails closed.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn installed_supports_git_identity(config_dir: &Path) -> bool {
     installed_compat_revision(config_dir)
         .is_some_and(|revision| revision >= GIT_IDENTITY_MIN_COMPAT_REVISION)
@@ -979,7 +979,7 @@ pub(crate) fn installed_supports_git_identity(config_dir: &Path) -> bool {
 /// installed stable broker. The broker re-validates the root against the live
 /// snapshot's managed roots, so the runtime never needs to name a `gitdir`
 /// path that may live outside them.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn git_identity_via_stable_broker(
     snapshot: &Value,
     root: &Path,
@@ -1000,7 +1000,7 @@ pub(crate) fn git_identity_via_stable_broker(
 /// gates remain identical to an ordinary `herdr_fs_read`. It deliberately does
 /// not depend on `HERDR_MCP_TCC_BROKER`, so a CLI that never inherited the
 /// service's routing flag still reaches the long-lived broker identity.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub(crate) fn fs_read_via_stable_broker(
     snapshot: &Value,
     path: &Path,
