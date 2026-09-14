@@ -334,6 +334,7 @@ Agent 应按这个顺序做：
 | 有 endpoint，但 `consent.webchat_control: false` | 该 endpoint 尚未授予扩展控制开关/consent；这是浏览器侧动作，不是 CLI 参数 |
 | account / Project 有歧义 | 重新列举并按返回 ref 选择；不要猜，也不要按“最近一次”选 |
 | `browser_resource_not_found` / session 失效 | 重新执行 `herdr-mcp webchat resources`；会话可能已关闭、归档，或被更新的观测取代 |
+| 同一个会话被两个 browser endpoint 观测过 | canonical URL 会解析到**最新**的那次观测，因此切换浏览器 profile / 扩展 identity 不会让本来新鲜的会话变成不可用；只有当两个不同 session 的最新观测时间完全相同时才 fail closed（`browser_canonical_url_ambiguous`） |
 | dispatch 超时 | 先读 `herdr-mcp webchat dispatch-status DISPATCH_ID`，再观测会话，然后才决策 |
 | 写操作 delivery 不确定 | 先重新观测。不要换新 idempotency key 重发 |
 | `code: "caller_grant_missing"` | 你不在受信任本地路径上（例如裸 TCP MCP 客户端）。请使用 `herdr-mcp` CLI，它自己附带本地 grant；grant 无法通过 TCP 自证 |

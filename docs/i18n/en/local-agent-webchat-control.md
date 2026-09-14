@@ -334,6 +334,7 @@ The practical failure mode is collapsing these into one "session id". `continuit
 | Endpoint present, `consent.webchat_control: false` | The extension's control switch/consent has not been granted on this endpoint; this is a browser-side action, not a CLI flag |
 | Account or Project ambiguous | List again and choose by returned refs; never resolve ambiguity by guessing or by "most recent" |
 | `browser_resource_not_found` / stale session | Re-run `herdr-mcp webchat resources`; the conversation may have been closed, archived, or replaced by a newer observation |
+| The same conversation was observed by two browser endpoints | The canonical URL resolves to the **newest** observation, so a browser-profile or extension-identity switch does not strand an otherwise fresh conversation. Only two distinct sessions sharing that newest timestamp fail closed as `browser_canonical_url_ambiguous` |
 | Dispatch timeout | Read `herdr-mcp webchat dispatch-status DISPATCH_ID`; then observe the session; only then decide |
 | Mutation delivery uncertain | Re-observe first. Do not resend with a new idempotency key |
 | `code: "caller_grant_missing"` | You are not on the trusted local path (for example a raw TCP MCP client). Use the `herdr-mcp` CLI, which attaches the local grant itself; grants cannot be asserted over TCP |

@@ -334,6 +334,7 @@ Agent は次の順で進めます。
 | endpoint はあるが `consent.webchat_control: false` | その endpoint で extension の制御スイッチ／consent が未許可。ブラウザ側の操作で、CLI フラグではありません |
 | account / Project が曖昧 | 再列挙し、返された ref で選ぶ。推測や「最新」での選択はしない |
 | `browser_resource_not_found` / session が古い | `herdr-mcp webchat resources` を再実行。会話が閉じられた、アーカイブされた、または新しい観測に置き換わった可能性 |
+| 同じ会話が 2 つの browser endpoint から観測された | canonical URL は**最新**の観測に解決されるため、ブラウザ profile / extension identity の切り替えで新鮮な会話が使えなくなることはありません。2 つの異なる session が同じ最新時刻を共有する場合だけ `browser_canonical_url_ambiguous` で fail closed します |
 | dispatch タイムアウト | まず `herdr-mcp webchat dispatch-status DISPATCH_ID` を読み、次に会話を観測してから判断 |
 | 変更の delivery が不確実 | まず再観測。新しい idempotency key で再送しない |
 | `code: "caller_grant_missing"` | 信頼されたローカル経路にいない（例：生の TCP MCP クライアント）。`herdr-mcp` CLI を使う。grant は TCP で自称できません |
