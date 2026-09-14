@@ -213,7 +213,8 @@ Deno.test("verifyUpstreamHealth requires status 200 and verified service name", 
       JSON.stringify({
         service: "herdr-edge-prod",
         runtimeContractEpoch: 2,
-        runtimeContractHash: "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
+        runtimeContractHash:
+          "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
         currentRuntimeContractEpoch: EXPECTED_RUNTIME_CONTRACT_EPOCH,
         currentRuntimeContractHash: EXPECTED_RUNTIME_CONTRACT_HASH,
       }),
