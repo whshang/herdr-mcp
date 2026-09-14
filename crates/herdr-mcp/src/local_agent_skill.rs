@@ -198,21 +198,14 @@ pub(crate) fn status_json() -> Result<Value, String> {
         .and_then(|_| verify_installed_files(&target, &manifest))
         .is_ok()
         && manifest_sha256 == marker.manifest_sha256;
+    let runtime_identity_available = expected.is_ok();
     let source_matches = expected.as_ref().ok().is_some_and(|source| {
         source.source_commit == marker.source_commit
             && source.runtime_version == marker.runtime_version
             && source.runtime_channel == marker.runtime_channel
     });
-    let current = integrity && source_matches;
-    let state = if !integrity {
-        "corrupt"
-    } else if expected.is_err() {
-        "runtime_unavailable"
-    } else if source_matches {
-        "current"
-    } else {
-        "drift"
-    };
+    let (state, current) =
+        classify_installed_skill(integrity, runtime_identity_available, source_matches);
     Ok(json!({
         "ok": true,
         "current": current,
@@ -223,12 +216,34 @@ pub(crate) fn status_json() -> Result<Value, String> {
         "installed_source_commit": marker.source_commit,
         "manifest_sha256": marker.manifest_sha256,
         "integrity_ok": integrity,
-        "runtime_identity_available": expected.is_ok(),
+        "runtime_identity_available": runtime_identity_available,
         "runtime_identity_error": expected.as_ref().err().map(|error| one_line(error)),
         "expected_runtime_version": expected.as_ref().ok().map(|source| source.runtime_version.as_str()),
         "expected_runtime_channel": expected.as_ref().ok().map(|source| source.runtime_channel.as_str()),
         "expected_source_commit": expected.as_ref().ok().map(|source| source.source_commit.as_str()),
     }))
+}
+
+/// Classify an installed Skill without conflating content integrity with the
+/// runtime source comparison. An unreadable runtime identity leaves the source
+/// verdict unknowable, so it is reported as `runtime_unavailable` rather than
+/// as content drift.
+fn classify_installed_skill(
+    integrity: bool,
+    runtime_identity_available: bool,
+    source_matches: bool,
+) -> (&'static str, bool) {
+    let current = integrity && runtime_identity_available && source_matches;
+    let state = if !integrity {
+        "corrupt"
+    } else if !runtime_identity_available {
+        "runtime_unavailable"
+    } else if source_matches {
+        "current"
+    } else {
+        "drift"
+    };
+    (state, current)
 }
 
 fn sync_from_runtime() -> Result<Value, String> {
@@ -244,17 +259,23 @@ fn sync_from_runtime() -> Result<Value, String> {
     let bundle = fetch_bundle(&source, |repo_path, max_bytes| {
         fetch_repo_file(&client, &source_commit, repo_path, max_bytes)
     })?;
-    let action = install_bundle(&target, &source, &bundle)?;
-    Ok(json!({
+    let outcome = install_bundle(&target, &source, &bundle)?;
+    let mut result = json!({
         "ok": true,
-        "action": action,
+        "action": outcome.action,
         "path": target,
         "runtime_version": source.runtime_version,
         "runtime_channel": source.runtime_channel,
         "source_commit": source.source_commit,
         "manifest_sha256": bundle.manifest_sha256,
         "file_count": bundle.manifest.files.len(),
-    }))
+    });
+    if !outcome.warnings.is_empty() {
+        // Activation already succeeded; a leftover backup is reported as a
+        // non-fatal warning and never turns an explicit sync into a failure.
+        result["warnings"] = json!(outcome.warnings);
+    }
+    Ok(result)
 }
 
 fn current_source_identity() -> Result<SourceIdentity, String> {
@@ -454,11 +475,37 @@ fn validate_manifest(manifest: &SkillManifest) -> Result<(), String> {
     Ok(())
 }
 
+/// Outcome of refreshing the installed Skill. Activation is reported as
+/// success even when a post-activation cleanup step fails: the new content is
+/// already live, so a leftover backup is a non-fatal warning rather than a
+/// failed sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallOutcome {
+    action: &'static str,
+    warnings: Vec<String>,
+}
+
 fn install_bundle(
     target: &Path,
     source: &SourceIdentity,
     bundle: &SkillBundle,
-) -> Result<&'static str, String> {
+) -> Result<InstallOutcome, String> {
+    install_bundle_with(target, source, bundle, |backup: &Path| {
+        fs::remove_dir_all(backup)
+    })
+}
+
+/// `install_bundle` with the post-activation backup cleanup injectable so a
+/// failing cleanup can be exercised deterministically in tests.
+fn install_bundle_with<F>(
+    target: &Path,
+    source: &SourceIdentity,
+    bundle: &SkillBundle,
+    remove_backup: F,
+) -> Result<InstallOutcome, String>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
     let prior_marker = managed_marker_if_present(target)?;
     if let Some(marker) = prior_marker.as_ref()
         && marker.source_commit == source.source_commit
@@ -467,7 +514,10 @@ fn install_bundle(
         && marker.manifest_sha256 == bundle.manifest_sha256
         && verify_installed_files(target, &bundle.manifest).is_ok()
     {
-        return Ok("unchanged");
+        return Ok(InstallOutcome {
+            action: "unchanged",
+            warnings: Vec::new(),
+        });
     }
     let parent = target
         .parent()
@@ -513,15 +563,21 @@ fn install_bundle(
             "cannot activate refreshed agent Skill; prior version restored when possible: {error}"
         ));
     }
+    let mut warnings = Vec::new();
     if backup.exists()
-        && let Err(error) = fs::remove_dir_all(&backup)
+        && let Err(error) = remove_backup(&backup)
     {
-        eprintln!(
-            "herdr-mcp: agent Skill refresh succeeded; old backup cleanup failed {}: {error}",
+        let warning = format!(
+            "agent Skill refresh succeeded but the previous version backup {} could not be removed: {error}",
             backup.display()
         );
+        eprintln!("herdr-mcp: {warning}");
+        warnings.push(warning);
     }
-    Ok("updated")
+    Ok(InstallOutcome {
+        action: "updated",
+        warnings,
+    })
 }
 
 fn stage_bundle(
@@ -755,7 +811,7 @@ mod tests {
         let target = root.join(SKILL_NAME);
         let first = bundle(&[("SKILL.md", b"first"), ("references/memory.md", b"m1")]);
         assert_eq!(
-            install_bundle(&target, &source(), &first).unwrap(),
+            install_bundle(&target, &source(), &first).unwrap().action,
             "updated"
         );
         assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), b"first");
@@ -764,7 +820,9 @@ mod tests {
         second_source.runtime_version = "1.0.1-test".to_owned();
         let second = bundle(&[("SKILL.md", b"second"), ("references/memory.md", b"m2")]);
         assert_eq!(
-            install_bundle(&target, &second_source, &second).unwrap(),
+            install_bundle(&target, &second_source, &second)
+                .unwrap()
+                .action,
             "updated"
         );
         assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), b"second");
@@ -814,5 +872,58 @@ mod tests {
         verify_installed_files(&tracked_root, &tracked_manifest).unwrap();
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_bundle_reports_a_failed_backup_cleanup_as_a_non_fatal_warning() {
+        let root = test_dir("cleanup-warning");
+        let target = root.join(SKILL_NAME);
+        let first = bundle(&[("SKILL.md", b"first")]);
+        install_bundle(&target, &source(), &first).unwrap();
+
+        let mut second_source = source();
+        second_source.runtime_version = "1.0.1-test".to_owned();
+        let second = bundle(&[("SKILL.md", b"second")]);
+        let outcome = install_bundle_with(&target, &second_source, &second, |_| {
+            Err(std::io::Error::other("simulated cleanup failure"))
+        })
+        .unwrap();
+
+        // Activation already replaced the live Skill, so the refresh must stay
+        // a success and surface the cleanup problem as a non-fatal warning.
+        assert_eq!(outcome.action, "updated");
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("could not be removed"));
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), b"second");
+        assert!(verify_installed_files(&target, &second.manifest).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_distinguishes_unavailable_runtime_identity_from_drift() {
+        // An intact Skill whose runtime identity cannot be read is not drift:
+        // the source comparison never happened, so the verdict stays unknown.
+        assert_eq!(
+            classify_installed_skill(true, false, false),
+            ("runtime_unavailable", false)
+        );
+        // Drift requires a readable runtime identity that disagrees.
+        assert_eq!(
+            classify_installed_skill(true, true, false),
+            ("drift", false)
+        );
+        assert_eq!(
+            classify_installed_skill(true, true, true),
+            ("current", true)
+        );
+        // Broken content is corrupt regardless of the runtime verdict.
+        assert_eq!(
+            classify_installed_skill(false, false, false),
+            ("corrupt", false)
+        );
+        assert_eq!(
+            classify_installed_skill(false, true, true),
+            ("corrupt", false)
+        );
     }
 }
