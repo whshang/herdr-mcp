@@ -2977,16 +2977,22 @@ impl StateStore {
             )
             .optional()
             .map_err(|error| format!("cannot inspect browser endpoint identity: {error}"))?;
-        if let Some((device_id, browser_family)) = existing {
-            if device_id != input.device_id || browser_family != input.browser_family {
+        if let Some((device_id, _browser_family)) = existing {
+            if device_id != input.device_id {
                 return Err("browser_endpoint_identity_conflict".to_owned());
             }
             tx.execute(
                 "UPDATE browser_endpoints
-                 SET extension_version = ?2,
-                     last_observed_at = MAX(last_observed_at, ?3)
+                 SET browser_family = ?2,
+                     extension_version = ?3,
+                     last_observed_at = MAX(last_observed_at, ?4)
                  WHERE endpoint_ref = ?1",
-                params![endpoint_ref, input.extension_version, input.observed_at],
+                params![
+                    endpoint_ref,
+                    input.browser_family,
+                    input.extension_version,
+                    input.observed_at,
+                ],
             )
             .map_err(|error| format!("cannot update browser endpoint: {error}"))?;
         } else {
@@ -10096,6 +10102,23 @@ mod tests {
         assert!(re_registered.tool_bridge_mutation_allowed);
         assert_eq!(re_registered.consent_revision, 3);
         assert_eq!(re_registered.extension_version, "0.1.91");
+
+        // Browser product is observed metadata, not endpoint identity. A native
+        // host that learns the real parent browser may correct a legacy
+        // hard-coded family without rotating the endpoint or resetting consent.
+        let migrated_family = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: DEVICE,
+                profile_seed: PROFILE_SEED,
+                browser_family: "ego",
+                extension_version: "0.1.92",
+                observed_at: 17,
+            })
+            .unwrap();
+        assert_eq!(migrated_family.endpoint_ref, endpoint.endpoint_ref);
+        assert_eq!(migrated_family.browser_family, "ego");
+        assert_eq!(migrated_family.consent_revision, 3);
+        assert!(migrated_family.tool_bridge_mutation_allowed);
 
         // Provider capabilities: allowlist only. Unknown keys, apiKey, password, account_id all fail closed.
         for forbidden in [

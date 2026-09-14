@@ -369,7 +369,7 @@ globalThis.chrome = {
             endpoint: {
               endpoint_ref: "bep_test",
               device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              browser_family: "chrome",
+              browser_family: "ego",
               extension_version: body.extension_version,
               consent: {
                 webchat_control: false,
@@ -386,7 +386,7 @@ globalThis.chrome = {
               endpoint: {
                 endpoint_ref: "bep_test",
                 device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                browser_family: "chrome",
+                browser_family: "ego",
                 extension_version: "0.1.90",
                 consent: {
                   webchat_control: body.webchat_control_allowed === true,
@@ -842,10 +842,10 @@ ok(await waitForTest(() => browserRegistryRequests.length === 1),
   "service-worker startup attempts browser endpoint registration through Native Messaging");
 const browserRegister = browserRegistryRequests[0] || {};
 ok(browserRegister.operation === "endpoint.register"
-    && browserRegister.browser_family === "chrome"
+    && !Object.prototype.hasOwnProperty.call(browserRegister, "browser_family")
     && browserRegister.extension_version === "0.1.91"
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
-  "browser endpoint registration carries one opaque profile seed and product identity",
+  "browser endpoint registration carries one opaque profile seed and leaves browser product identity to the native host",
   JSON.stringify(browserRegister));
 ok(!Object.prototype.hasOwnProperty.call(browserRegister, "device_id")
     && !Object.prototype.hasOwnProperty.call(browserRegister, "authorization")

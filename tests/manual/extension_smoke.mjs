@@ -275,8 +275,10 @@ ok(
     && backgroundSource.includes("crypto.getRandomValues(new Uint8Array(32))")
     && backgroundSource.includes("/extension/browser/registry")
     && backgroundSource.includes('operation: "endpoint.register"')
-    && backgroundSource.includes('browser_family: "chrome"')
+    && !backgroundSource.includes('browser_family: "chrome"')
     && backgroundSource.includes("extension_version: H2W_SCRIPT_VERSION")
+    && rustNativeHostSource.includes("detect_parent_browser_family")
+    && rustNativeHostSource.includes("inject_browser_family")
     && !backgroundSource.includes('operation: "endpoint.register",\n        device_id:')
     && rustNativeHostSource.includes('"/extension/browser/registry"'),
   "browser endpoint bootstrap uses one local profile seed and the exact Native Messaging registry route",

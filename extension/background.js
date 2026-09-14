@@ -2060,7 +2060,6 @@ async function registerLocalBrowserEndpoint() {
       body: JSON.stringify({
         operation: "endpoint.register",
         profile_seed: profileSeed,
-        browser_family: "chrome",
         extension_version: H2W_SCRIPT_VERSION,
         observed_at: Date.now(),
       }),
