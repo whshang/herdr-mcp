@@ -3471,28 +3471,43 @@ impl StateStore {
         {
             return Err("browser_canonical_url_invalid".to_owned());
         }
+        // One canonical conversation URL may be observed by more than one browser
+        // endpoint on this device (for example after a browser profile or DEV
+        // identity switch). The newest observation is the authoritative one; an
+        // exact tie between two distinct sessions stays fail-closed because the
+        // runtime must not pick by an arbitrary order.
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT r.resource_ref
+                "SELECT r.resource_ref, MAX(l.observed_at) AS observed_at
                  FROM browser_resource_locators l
                  JOIN browser_resources r ON r.resource_ref = l.resource_ref
                  WHERE l.canonical_url = ?1
                    AND r.kind = 'session'
                    AND r.provider = 'chatgpt'
-                 ORDER BY l.observed_at DESC, r.resource_ref
+                 GROUP BY r.resource_ref
+                 ORDER BY observed_at DESC, r.resource_ref
                  LIMIT 2",
             )
             .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
         let mut refs = stmt
-            .query_map([canonical_url], |row| row.get::<_, String>(0))
+            .query_map([canonical_url], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
         match refs.len() {
             0 => Ok(None),
-            1 => Ok(refs.pop()),
-            _ => Err("browser_canonical_url_ambiguous".to_owned()),
+            1 => Ok(Some(refs.remove(0).0)),
+            _ => {
+                let (newest_ref, newest_at) = refs.remove(0);
+                let (_, runner_up_at) = refs.remove(0);
+                if runner_up_at == newest_at {
+                    return Err("browser_canonical_url_ambiguous".to_owned());
+                }
+                Ok(Some(newest_ref))
+            }
         }
     }
 
@@ -10739,6 +10754,120 @@ mod tests {
         assert_eq!(
             normalize_browser_capabilities(&oversized).unwrap_err(),
             "browser_capabilities_invalid"
+        );
+    }
+
+    #[test]
+    fn browser_canonical_url_lookup_prefers_the_newest_observation() {
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const URL: &str =
+            "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/conversation-1";
+
+        fn observe_session(
+            store: &mut StateStore,
+            seed: &str,
+            identity: &str,
+            observed_at: i64,
+        ) -> String {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: DEVICE,
+                    profile_seed: seed,
+                    browser_family: "ego",
+                    extension_version: "0.1.91",
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: observed_at,
+                    capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                    observed_at,
+                })
+                .unwrap();
+            let account_identity = format!("{identity}-account");
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: &account_identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    URL,
+                    observed_at,
+                    observed_at,
+                )
+                .unwrap();
+            session.resource_ref
+        }
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let older = observe_session(&mut store, "seed-old-endpoint", "conversation-old", 100);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(older.as_str())
+        );
+        // The same conversation observed by a newer browser endpoint on this device
+        // (for example after a DEV identity or profile switch) becomes the answer.
+        let newer = observe_session(&mut store, "seed-new-endpoint", "conversation-new", 200);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(newer.as_str())
+        );
+        // Re-observing the same session under the same URL is not an ambiguity, and a
+        // late lower-timestamp locator must not move the answer backwards.
+        store
+            .upsert_browser_resource_locator(&newer, URL, 200, 150)
+            .unwrap();
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(newer.as_str())
+        );
+        // Two distinct sessions sharing the newest observation stay fail-closed.
+        observe_session(&mut store, "seed-tied-endpoint", "conversation-tied", 200);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url("https://chatgpt.com/c/never-observed")
+                .unwrap(),
+            None
         );
     }
 
