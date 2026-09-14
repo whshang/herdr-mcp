@@ -3340,7 +3340,7 @@ impl StateStore {
             }
             tx.execute(
                 "UPDATE browser_resources
-                 SET display_label = ?2,
+                 SET display_label = COALESCE(?2, display_label),
                      observation_generation = ?3,
                      last_observed_at = MAX(last_observed_at, ?4)
                  WHERE resource_ref = ?1",
@@ -3471,28 +3471,43 @@ impl StateStore {
         {
             return Err("browser_canonical_url_invalid".to_owned());
         }
+        // One canonical conversation URL may be observed by more than one browser
+        // endpoint on this device (for example after a browser profile or DEV
+        // identity switch). The newest observation is the authoritative one; an
+        // exact tie between two distinct sessions stays fail-closed because the
+        // runtime must not pick by an arbitrary order.
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT r.resource_ref
+                "SELECT r.resource_ref, MAX(l.observed_at) AS observed_at
                  FROM browser_resource_locators l
                  JOIN browser_resources r ON r.resource_ref = l.resource_ref
                  WHERE l.canonical_url = ?1
                    AND r.kind = 'session'
                    AND r.provider = 'chatgpt'
-                 ORDER BY l.observed_at DESC, r.resource_ref
+                 GROUP BY r.resource_ref
+                 ORDER BY observed_at DESC, r.resource_ref
                  LIMIT 2",
             )
             .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
         let mut refs = stmt
-            .query_map([canonical_url], |row| row.get::<_, String>(0))
+            .query_map([canonical_url], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
         match refs.len() {
             0 => Ok(None),
-            1 => Ok(refs.pop()),
-            _ => Err("browser_canonical_url_ambiguous".to_owned()),
+            1 => Ok(Some(refs.remove(0).0)),
+            _ => {
+                let (newest_ref, newest_at) = refs.remove(0);
+                let (_, runner_up_at) = refs.remove(0);
+                if runner_up_at == newest_at {
+                    return Err("browser_canonical_url_ambiguous".to_owned());
+                }
+                Ok(Some(newest_ref))
+            }
         }
     }
 
@@ -3965,6 +3980,13 @@ impl StateStore {
         if locator_generation != Some(reservation.expected_generation) {
             return Err("browser_session_materialization_locator_missing".to_owned());
         }
+        tx.execute(
+            "UPDATE browser_resources
+             SET display_label = COALESCE(display_label, ?2)
+             WHERE resource_ref = ?1",
+            params![session_ref, reservation.display_label],
+        )
+        .map_err(|error| format!("cannot project browser session display label: {error}"))?;
         let changed = tx
             .execute(
                 "UPDATE browser_session_reservations
@@ -4161,13 +4183,11 @@ impl StateStore {
             return Err("browser_reasoning_effort_invalid".to_owned());
         }
         let required_apps_json = normalize_browser_required_apps(input.required_apps)?;
-        if let Some(work_chain_id) = input.work_chain_id
-            && !valid_work_chain_id(work_chain_id)
-        {
-            return Err("browser_work_chain_id_invalid".to_owned());
+        if let Some(work_chain_id) = input.work_chain_id {
+            validate_browser_work_chain_id(work_chain_id)?;
         }
         if let Some(lane_id) = input.lane_id {
-            validate_browser_ref_text(lane_id, 160, "lane_id")?;
+            validate_browser_lane_id(lane_id)?;
         }
 
         let tx = self
@@ -4317,6 +4337,28 @@ impl StateStore {
             )
             .optional()
             .map_err(|error| format!("cannot read pending browser dispatch: {error}"))?;
+        match dispatch_id {
+            Some(dispatch_id) => self.browser_dispatch(&dispatch_id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn latest_browser_dispatch_for_session(
+        &self,
+        session_ref: &str,
+    ) -> Result<Option<BrowserDispatchRecord>, String> {
+        validate_browser_resource_ref(session_ref)?;
+        let dispatch_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT dispatch_id FROM browser_dispatches
+                 WHERE target_session_ref = ?1 AND operation = 'browser_dispatch.submit'
+                 ORDER BY created_at DESC, dispatch_id DESC LIMIT 1",
+                params![session_ref],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read latest browser dispatch: {error}"))?;
         match dispatch_id {
             Some(dispatch_id) => self.browser_dispatch(&dispatch_id),
             None => Ok(None),
@@ -5093,6 +5135,14 @@ const ALLOWED_BROWSER_CAPABILITY_OPERATIONS: &[&str] = &[
     "space.rename",
 ];
 
+/// Normalize the provider capability snapshot reported by a browser adapter.
+///
+/// The registry stores exactly one shape — the allowed `operations` list — while an
+/// adapter may report a richer object (`schema_version`, `input_modalities`,
+/// `limits`, ...). Only `operations` is authoritative: every reported operation must
+/// be in the allowlist, and sibling keys are dropped rather than persisted or treated
+/// as a hard failure. Anything without a usable `operations` array is still rejected,
+/// so a payload that only carries unrelated (possibly secret-like) fields fails closed.
 fn normalize_browser_capabilities(value: &str) -> Result<String, String> {
     if value.is_empty() || value.len() > 16 * 1024 {
         return Err("browser_capabilities_invalid".to_owned());
@@ -5102,9 +5152,6 @@ fn normalize_browser_capabilities(value: &str) -> Result<String, String> {
     let serde_json::Value::Object(object) = parsed else {
         return Err("browser_capabilities_invalid".to_owned());
     };
-    if object.len() != 1 || !object.contains_key("operations") {
-        return Err("browser_capabilities_invalid".to_owned());
-    }
     let Some(ops) = object
         .get("operations")
         .and_then(serde_json::Value::as_array)
@@ -5469,6 +5516,18 @@ fn valid_work_chain_id(value: &str) -> bool {
         && value[3..]
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+pub(crate) fn validate_browser_work_chain_id(value: &str) -> Result<(), String> {
+    if valid_work_chain_id(value) {
+        Ok(())
+    } else {
+        Err("browser_work_chain_id_invalid".to_owned())
+    }
+}
+
+pub(crate) fn validate_browser_lane_id(value: &str) -> Result<(), String> {
+    validate_browser_ref_text(value, 160, "lane_id")
 }
 
 fn valid_local_evidence_id(value: &str) -> bool {
@@ -10008,6 +10067,60 @@ mod tests {
     }
 
     #[test]
+    fn browser_dispatch_result_settlement_survives_store_reopen() {
+        let path = temp_db_path();
+        let dispatch_id;
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            let (_endpoint_ref, created_dispatch_id) = applied_submit_fixture(
+                &mut store,
+                None,
+                "persistent browser dispatch",
+                "settle-reopen",
+            );
+            dispatch_id = created_dispatch_id;
+            store
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(7),
+                    accepted_user_message_ref: Some("provider-user-reopen"),
+                    updated_at: 12,
+                })
+                .unwrap();
+            let session_ref = store
+                .browser_dispatch(&dispatch_id)
+                .unwrap()
+                .unwrap()
+                .target_session_ref;
+            store
+                .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                    provider: "chatgpt",
+                    session_ref: &session_ref,
+                    expected_generation: 7,
+                    accepted_user_message_ref: "provider-user-reopen",
+                    assistant_message_ref: "provider-assistant-reopen",
+                    assistant_text: "durable answer after restart",
+                    observed_at: 13,
+                })
+                .unwrap();
+        }
+
+        let reopened = StateStore::open(&path).unwrap();
+        let dispatch = reopened.browser_dispatch(&dispatch_id).unwrap().unwrap();
+        assert_eq!(dispatch.delivery_state, BrowserDeliveryState::Applied);
+        assert_eq!(dispatch.generation_owner, Some(7));
+        assert_eq!(
+            dispatch.result_assistant_message_ref.as_deref(),
+            Some("provider-assistant-reopen")
+        );
+        assert_eq!(dispatch.result_settled_at, Some(13));
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn duplicate_same_text_dispatches_disambiguate_results_by_provider_user_message() {
         const WORK_CHAIN: &str = "wc_dddddddddddddddddddddddddddddddd";
         let mut store = StateStore::open(":memory:").unwrap();
@@ -10109,6 +10222,97 @@ mod tests {
             .unwrap();
         assert_eq!(b.dispatch.dispatch_id, dispatch_ids[1]);
         assert_eq!(work_memory_result_counts(&store), (2, 2));
+    }
+
+    #[test]
+    fn browser_session_materialization_fails_closed_on_identity_ambiguity() {
+        let path = temp_db_path();
+        let mut store = StateStore::open(&path).unwrap();
+        let (endpoint_ref, session_a, session_b) =
+            browser_dispatch_fixture(&mut store, 7, "materialize-scope");
+        let account_ref = store
+            .browser_resource(&session_a)
+            .unwrap()
+            .unwrap()
+            .parent_ref
+            .unwrap();
+        let wrong_account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "materialize-scope-wrong-account",
+                display_label: None,
+                observation_generation: 7,
+                observed_at: 6,
+            })
+            .unwrap();
+        let wrong_session = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&wrong_account.resource_ref),
+                native_identity: "materialize-scope-wrong-session",
+                display_label: None,
+                observation_generation: 7,
+                observed_at: 7,
+            })
+            .unwrap();
+        for (session_ref, url) in [
+            (&wrong_session.resource_ref, "https://chatgpt.com/c/wrong"),
+            (&session_a, "https://chatgpt.com/c/a"),
+            (&session_b, "https://chatgpt.com/c/b"),
+        ] {
+            store
+                .upsert_browser_resource_locator(session_ref, url, 7, 8)
+                .unwrap();
+        }
+        let BrowserSessionReservation::Reserved(reservation) = store
+            .reserve_browser_session(BrowserSessionReservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                account_ref: &account_ref,
+                space_ref: None,
+                display_label: "Lane scope",
+                expected_generation: 7,
+                idempotency_key_digest: &sha256_text("materialize-scope-key"),
+                request_digest: &sha256_text("materialize-scope-request"),
+                created_at: 10,
+                expires_at: 10_000,
+            })
+            .unwrap()
+        else {
+            panic!("expected a reserved browser session");
+        };
+        assert_eq!(
+            store
+                .materialize_browser_session_reservation(
+                    &reservation.reservation_ref,
+                    &wrong_session.resource_ref,
+                    11,
+                )
+                .unwrap_err(),
+            "browser_session_materialization_scope_mismatch"
+        );
+        let materialized = store
+            .materialize_browser_session_reservation(&reservation.reservation_ref, &session_a, 12)
+            .unwrap();
+        assert_eq!(
+            materialized.session_ref.as_deref(),
+            Some(session_a.as_str())
+        );
+        assert_eq!(
+            store
+                .materialize_browser_session_reservation(
+                    &reservation.reservation_ref,
+                    &session_b,
+                    15,
+                )
+                .unwrap_err(),
+            "browser_session_materialization_conflict"
+        );
     }
 
     #[test]
@@ -10409,13 +10613,15 @@ mod tests {
         assert_eq!(migrated_family.consent_revision, 3);
         assert!(migrated_family.tool_bridge_mutation_allowed);
 
-        // Provider capabilities: allowlist only. Unknown keys, apiKey, password, account_id all fail closed.
+        // Provider capabilities: allowlist only. Secret-like payloads that carry no
+        // usable `operations` list, unknown operations, and wrong shapes fail closed.
+        // Sibling keys next to a valid `operations` list are dropped, not persisted.
         for forbidden in [
             r#"{"apiKey":"secret-123"}"#,
             r#"{"password":"hunter2"}"#,
             r#"{"account_id":"user_123"}"#,
             r#"{"token":"tok_123"}"#,
-            r#"{"operations":["identity.inspect"],"extra_field":true}"#,
+            r#"{"unknown_looking_sibling":true}"#,
             r#"{"operations":["unknown.op"]}"#,
             r#"{"operations":[123]}"#,
             r#"{"operations":"not_an_array"}"#,
@@ -10671,6 +10877,211 @@ mod tests {
             !resource_columns
                 .iter()
                 .any(|name| name == "native_identity")
+        );
+    }
+
+    #[test]
+    fn browser_provider_capabilities_accept_the_adapter_shape_and_store_only_operations() {
+        // The adapter may report a richer capability object; only `operations` is
+        // authoritative and everything else is dropped, never persisted.
+        let adapter_shape = r#"{"schema_version":1,"operations":["composer.submit","session.create","generation.status","generation.stop","session.archive","session.inspect","session.open","composer.select_tool"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"},"provider_message_chars":{"status":"unknown","authority":"provider"},"provider_response_timeout_ms":{"status":"unknown","authority":"provider"},"provider_model_reasoning_combinations":{"status":"unknown","authority":"provider"}},"apiKey":"must-not-be-persisted"}"#;
+        let normalized = normalize_browser_capabilities(adapter_shape).unwrap();
+        assert_eq!(
+            normalized,
+            r#"{"operations":["composer.select_tool","composer.submit","generation.status","generation.stop","session.archive","session.create","session.inspect","session.open"]}"#
+        );
+        assert!(!normalized.contains("apiKey"));
+        assert!(!normalized.contains("schema_version"));
+        assert_eq!(
+            normalize_browser_capabilities(r#"{"operations":[]}"#).unwrap(),
+            r#"{"operations":[]}"#
+        );
+        // Duplicates collapse and the stored value is ordered deterministically.
+        assert_eq!(
+            normalize_browser_capabilities(
+                r#"{"operations":["session.create","session.create","space.list"]}"#
+            )
+            .unwrap(),
+            r#"{"operations":["session.create","space.list"]}"#
+        );
+        for invalid in [
+            r#"{}"#,
+            r#"{"schema_version":1,"input_modalities":["text"]}"#,
+            r#"{"operations":"session.create"}"#,
+            r#"{"operations":[1]}"#,
+            r#"{"operations":["unknown.operation"]}"#,
+            r#""not-an-object""#,
+            r#"[]"#,
+            r#"null"#,
+        ] {
+            assert_eq!(
+                normalize_browser_capabilities(invalid).unwrap_err(),
+                "browser_capabilities_invalid",
+                "must reject {invalid}"
+            );
+        }
+        let too_many = format!(
+            r#"{{"operations":[{}]}}"#,
+            (0..65)
+                .map(|_| r#""session.create""#)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            normalize_browser_capabilities(&too_many).unwrap_err(),
+            "browser_capabilities_invalid"
+        );
+        let oversized = format!(
+            r#"{{"operations":["session.create"],"padding":"{}"}}"#,
+            "x".repeat(17 * 1024)
+        );
+        assert_eq!(
+            normalize_browser_capabilities(&oversized).unwrap_err(),
+            "browser_capabilities_invalid"
+        );
+    }
+
+    #[test]
+    fn browser_canonical_url_lookup_prefers_the_newest_observation() {
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const URL: &str =
+            "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/conversation-1";
+
+        fn observe_session(
+            store: &mut StateStore,
+            seed: &str,
+            identity: &str,
+            observed_at: i64,
+        ) -> String {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: DEVICE,
+                    profile_seed: seed,
+                    browser_family: "ego",
+                    extension_version: "0.1.91",
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: observed_at,
+                    capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                    observed_at,
+                })
+                .unwrap();
+            let account_identity = format!("{identity}-account");
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: &account_identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    URL,
+                    observed_at,
+                    observed_at,
+                )
+                .unwrap();
+            session.resource_ref
+        }
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let older = observe_session(&mut store, "seed-old-endpoint", "conversation-old", 100);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(older.as_str())
+        );
+        // The same conversation observed by a newer browser endpoint on this device
+        // (for example after a DEV identity or profile switch) becomes the answer.
+        let newer = observe_session(&mut store, "seed-new-endpoint", "conversation-new", 200);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(newer.as_str())
+        );
+        // Re-observing the same session under the same URL is not an ambiguity, and a
+        // late lower-timestamp locator must not move the answer backwards.
+        store
+            .upsert_browser_resource_locator(&newer, URL, 200, 150)
+            .unwrap();
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(newer.as_str())
+        );
+        // Two distinct sessions sharing the newest observation stay fail-closed.
+        observe_session(&mut store, "seed-tied-endpoint", "conversation-tied", 200);
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url(URL)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
+        );
+        assert_eq!(
+            store
+                .browser_session_ref_for_canonical_url("https://chatgpt.com/c/never-observed")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_provider_observe_accepts_the_extension_capability_object() {
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const PROFILE_SEED: &str = "profile-seed-extension-capability";
+        let mut store = StateStore::open(":memory:").unwrap();
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: DEVICE,
+                profile_seed: PROFILE_SEED,
+                browser_family: "ego",
+                extension_version: "0.1.91",
+                observed_at: 10,
+            })
+            .unwrap();
+        let observed = store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 1_789_378_392_882,
+                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","composer.select_tool","generation.status","generation.stop","session.archive","session.inspect","session.open","session.create"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"}}}"#,
+                observed_at: 11,
+            })
+            .unwrap();
+        assert_eq!(
+            observed.capabilities_json,
+            r#"{"operations":["composer.select_tool","composer.submit","generation.status","generation.stop","session.archive","session.create","session.inspect","session.open"]}"#
         );
     }
 }

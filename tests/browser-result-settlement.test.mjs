@@ -221,6 +221,20 @@ test("route watch settles a hidden browser worker without native binding or auto
   assert.equal(h.probes(), 2);
 });
 
+test("a finalized assistant ancestor settles even when ChatGPT current node is a hidden tool node", async () => {
+  const h = observationHarness({
+    snapshots: [{
+      ...completedWorkerSnapshot,
+      currentNodeRole: "tool",
+    }],
+  });
+  assert.equal(await h.observe(), true);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].accepted_user_message_ref, "user-1");
+  assert.equal(h.sent[0].assistant_message_ref, "assistant-1");
+  assert.equal(h.sent[0].generation, 7);
+});
+
 test("accepted worker result retries a failed acknowledgement and throttles probes", async () => {
   const h = observationHarness({ snapshots: [completedWorkerSnapshot, completedWorkerSnapshot], sends: [{ ok: false }, { ok: true }] });
   assert.equal(await h.observe(), false);

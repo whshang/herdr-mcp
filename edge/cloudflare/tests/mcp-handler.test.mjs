@@ -5,6 +5,7 @@ import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../dist/contracts/epoch4.js";
 import { EPOCH5_CONTRACT } from "../dist/contracts/epoch5.js";
+import { EPOCH6_CONTRACT } from "../dist/contracts/epoch6.js";
 import { RUNTIME_EXECUTION_CONTRACT } from "../dist/contracts/runtime.js";
 import { encodeDeviceRef } from "../dist/device-refs.js";
 import { makeLimits } from "../dist/limits.js";
@@ -265,10 +266,10 @@ test("tools/list exposes runtime tools plus edge-local herdr_devices", async () 
   assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
 });
 
-test("public contract selection uses epoch 5 for first-party dev/prod and stays consistent across discovery surfaces", async () => {
+test("public contract selection uses epoch 6 for first-party dev/prod and stays consistent across discovery surfaces", async () => {
   for (const [edgeEnv, expected] of [
-    ["dev", EPOCH5_CONTRACT],
-    ["prod", EPOCH5_CONTRACT],
+    ["dev", EPOCH6_CONTRACT],
+    ["prod", EPOCH6_CONTRACT],
     [undefined, EPOCH3_CONTRACT],
     ["staging", EPOCH3_CONTRACT],
   ]) {
