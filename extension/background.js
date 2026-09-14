@@ -6672,6 +6672,9 @@ async function rebuildStreams() {
     reconcileProgressTimers({});
     return;
   }
+  // Bootstrap Browser Registry before the long-lived Native Messaging push
+  // stream so endpoint identity does not depend on opening Control Center later.
+  if (!browserEndpoint) await registerLocalBrowserEndpoint();
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,

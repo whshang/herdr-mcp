@@ -279,6 +279,8 @@ ok(
     && backgroundSource.includes("extension_version: H2W_SCRIPT_VERSION")
     && rustNativeHostSource.includes("detect_parent_browser_family")
     && rustNativeHostSource.includes("inject_browser_family")
+    && backgroundSource.indexOf("if (!browserEndpoint) await registerLocalBrowserEndpoint();", backgroundSource.indexOf("async function rebuildStreams()"))
+      < backgroundSource.indexOf("ensurePushStream(bindings);", backgroundSource.indexOf("async function rebuildStreams()"))
     && !backgroundSource.includes('operation: "endpoint.register",\n        device_id:')
     && rustNativeHostSource.includes('"/extension/browser/registry"'),
   "browser endpoint bootstrap uses one local profile seed and the exact Native Messaging registry route",

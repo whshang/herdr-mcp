@@ -838,9 +838,10 @@ ok(coldHud?.ok === true
   JSON.stringify(coldHud?.labels || {}));
 
 console.log("\n[browser endpoint registry bootstrap]");
-ok(await waitForTest(() => browserRegistryRequests.length === 1),
-  "service-worker startup attempts browser endpoint registration through Native Messaging");
+ok(await waitForTest(() => browserRegistryRequests.length >= 2),
+  "service-worker startup attempts browser endpoint registration before the Native Messaging push stream and the first active surface can recover an injected failure");
 const browserRegister = browserRegistryRequests[0] || {};
+const browserRegisterRetry = browserRegistryRequests[1] || {};
 ok(browserRegister.operation === "endpoint.register"
     && !Object.prototype.hasOwnProperty.call(browserRegister, "browser_family")
     && browserRegister.extension_version === "0.1.91"
@@ -854,16 +855,19 @@ ok(!Object.prototype.hasOwnProperty.call(browserRegister, "device_id")
 const storedBrowserSeed = storage.herdrBrowserProfileSeedV1;
 ok(storedBrowserSeed === browserRegister.profile_seed,
   "browser profile seed persists only in extension local storage");
+ok(browserRegisterRetry.operation === "endpoint.register"
+    && browserRegisterRetry.profile_seed === storedBrowserSeed,
+  "endpoint bootstrap recovery reuses the stable browser profile seed after the injected startup failure");
+const recoveredRegistrationCount = browserRegistryRequests.length;
 const keepaliveAlarm = listeners.onAlarm[0];
 ok(!!keepaliveAlarm, "browser keepalive alarm listener registered");
 keepaliveAlarm({ name: "h2w-keepalive" });
-ok(await waitForTest(() => browserRegistryRequests.length === 2),
-  "keepalive retries endpoint bootstrap after the initial runtime failure");
-ok(browserRegistryRequests[1]?.profile_seed === storedBrowserSeed,
-  "endpoint bootstrap retry reuses the stable browser profile seed");
+await new Promise((resolve) => setTimeout(resolve, 0));
+ok(browserRegistryRequests.length === recoveredRegistrationCount,
+  "keepalive does not duplicate endpoint registration after recovery");
 for (const startup of listeners.onStartup) startup();
 await new Promise((resolve) => setTimeout(resolve, 0));
-ok(browserRegistryRequests.length === 2 && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
+ok(browserRegistryRequests.length === recoveredRegistrationCount && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
   "browser startup does not create a second endpoint registration loop or rotate the profile seed");
 
 const deniedConsent = await dispatchMessage({
