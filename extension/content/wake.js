@@ -1280,7 +1280,9 @@ const H2W_CONTENT_VERSION = "0.1.91";
         return true;
       }
     } catch (_) {}
-    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    const nodes = [...document.querySelectorAll(
+      '[data-message-author-role="assistant"], section[data-turn="assistant"]',
+    )];
     const last = nodes[nodes.length - 1];
     if (!last) return false;
     if (last.getAttribute("data-is-streaming") === "true") return true;
@@ -1298,7 +1300,9 @@ const H2W_CONTENT_VERSION = "0.1.91";
 
   /** Mid-turn: streaming, stop button, or visible tool/MCP invocation still running. */
   function assistantToolsInProgress() {
-    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    const nodes = [...document.querySelectorAll(
+      '[data-message-author-role="assistant"], section[data-turn="assistant"]',
+    )];
     const last = nodes[nodes.length - 1];
     if (!last) return false;
     if (last.querySelector('[aria-busy="true"]')) return true;
@@ -1882,10 +1886,15 @@ const H2W_CONTENT_VERSION = "0.1.91";
       // with no assignment for the route watcher to settle later.
       if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef
           && registeredBrowserSessionRef) {
+        const currentAssignment = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+        const reportedAssistantRef = currentAssignment?.generation === expectedGeneration
+          && currentAssignment?.acceptedUserMessageRef === acceptedUserMessageRef
+          ? (currentAssignment.reportedAssistantRef || null)
+          : null;
         acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
           generation: expectedGeneration,
           acceptedUserMessageRef,
-          reportedAssistantRef: null,
+          reportedAssistantRef,
         });
       }
       const assistantAdvanced = Boolean(
@@ -1985,6 +1994,48 @@ const H2W_CONTENT_VERSION = "0.1.91";
     }
   }
 
+  // ChatGPT may rate-limit the authenticated conversation snapshot endpoint
+  // while the signed-in page already exposes exact provider turn IDs. This is
+  // intentionally stricter than treating visible assistant text as settled: the
+  // latest DOM user turn must equal the accepted dispatch identity, the assistant
+  // needs its own exact provider turn ID and non-empty text, and generation/tool
+  // execution must have stopped. The observer below additionally requires the
+  // same candidate on two probes before durable settlement.
+  function chatGptDomResultCandidate(pending) {
+    if (ADAPTER.name !== "chatgpt" || !pending?.acceptedUserMessageRef || isTurnInProgress()) {
+      return null;
+    }
+    const turns = chatGptDomTurnSequence();
+    let latestUserIndex = -1;
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      if (turns[index]?.role === "user") {
+        latestUserIndex = index;
+        break;
+      }
+    }
+    const user = latestUserIndex >= 0 ? turns[latestUserIndex] : null;
+    if (!user || user.messageId !== pending.acceptedUserMessageRef) {
+      return null;
+    }
+    let assistant = null;
+    for (let index = latestUserIndex + 1; index < turns.length; index += 1) {
+      if (turns[index]?.role === "assistant" && turns[index]?.messageId && turns[index]?.text) {
+        assistant = turns[index];
+      }
+    }
+    if (!assistant) {
+      return null;
+    }
+    return {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: assistant.messageId,
+      userMessageId: user.messageId,
+      text: assistant.text,
+    };
+  }
+
   // Browser workers need no native pane binding, automation, or tab focus.
   // The existing route timer probes only a proven assignment. Transient errors
   // back off without dropping it; three explicit identity rejections stop it
@@ -2010,16 +2061,38 @@ const H2W_CONTENT_VERSION = "0.1.91";
       if (ADAPTER.getConversationKey() !== convKey || registeredConvKey !== convKey
           || registeredBrowserSessionRef !== sessionRef || registeredBrowserGeneration !== registrationGeneration
           || acceptedDispatchAssignments.get(sessionRef) !== pending) return false;
+      let settledSnapshot = server;
       if (!server?.ok) {
-        probe.retryMs = Math.min(probe.retryMs * 2, 60000);
-        return false;
+        const domCandidate = chatGptDomResultCandidate(pending);
+        if (!domCandidate) {
+          probe.domCandidate = null;
+          probe.retryMs = Math.min(probe.retryMs * 2, 60000);
+          return false;
+        }
+        const signature = JSON.stringify([
+          domCandidate.userMessageId,
+          domCandidate.messageId,
+          domCandidate.text,
+        ]);
+        if (!probe.domCandidate || probe.domCandidate.signature !== signature) {
+          probe.domCandidate = { signature, firstSeenAt: Date.now() };
+          probe.retryMs = 1000;
+          return false;
+        }
+        if (Date.now() - probe.domCandidate.firstSeenAt < 1000) {
+          probe.retryMs = 1000;
+          return false;
+        }
+        settledSnapshot = domCandidate;
+      } else {
+        probe.domCandidate = null;
+        if (server.finished !== true || !server.messageId) return false;
       }
-      if (server.finished !== true || !server.messageId) return false;
-      if (server.userMessageId !== pending.acceptedUserMessageRef) {
+      if (settledSnapshot.userMessageId !== pending.acceptedUserMessageRef) {
         probe.rejected += 1;
         return false;
       }
-      const settled = await reportBrowserResultSettlement(server, (error) => {
+      const settled = await reportBrowserResultSettlement(settledSnapshot, (error) => {
         if (["browser_dispatch_result_unmatched", "browser_dispatch_result_conflict"].includes(error)) probe.rejected += 1;
       });
       probe.retryMs = settled ? 5000 : Math.min(probe.retryMs * 2, 60000);
@@ -2640,21 +2713,68 @@ const H2W_CONTENT_VERSION = "0.1.91";
     return "";
   }
 
+  function domMessageSnapshotFromElement(el, role) {
+    if (!el || (role !== "user" && role !== "assistant")) {
+      return { messageId: null, text: "", messageAt: null, turnId: null };
+    }
+    const authored = (el.matches?.(`[data-message-author-role="${role}"]`) ? el : null)
+      || el.querySelector?.(`[data-message-author-role="${role}"]`)
+      || null;
+    const exactMessageId = authored?.getAttribute?.("data-message-id")
+      || authored?.closest?.("[data-message-id]")?.getAttribute?.("data-message-id")
+      || el.getAttribute?.("data-message-id")
+      || null;
+    const turnContainer = el.matches?.("section[data-turn]") ? el : el.closest?.("section[data-turn]");
+    const turnId = turnContainer?.getAttribute?.("data-turn-id") || el.getAttribute?.("data-turn-id") || null;
+    // Live ChatGPT currently exposes assistant section[data-turn-id] values that
+    // differ from the provider data-message-id nested inside the same turn. Keep
+    // assistant settlement fail-closed on the exact provider message identity;
+    // a user turn-id is usable only because the candidate path later requires it
+    // to equal the already accepted provider user-message identity.
+    const messageId = exactMessageId || (role === "user" ? turnId : null);
+    const textRoot = authored
+      || (role === "assistant"
+        ? (el.querySelector?.("[data-message-content]") || el.querySelector?.(".markdown") || null)
+        : el);
+    const timeRoot = authored?.closest?.("[data-message-id]") || turnContainer || el;
+    const timeNode = timeRoot?.querySelector?.("time[datetime]") || null;
+    const parsedTime = timeNode?.getAttribute?.("datetime") ? Date.parse(timeNode.getAttribute("datetime")) : NaN;
+    return {
+      messageId,
+      text: String(textRoot?.innerText || textRoot?.textContent || "").replace(/\s+/g, " ").trim(),
+      messageAt: Number.isFinite(parsedTime) ? parsedTime : null,
+      turnId,
+    };
+  }
+
+  function chatGptDomTurnSequence() {
+    const nodes = [...document.querySelectorAll(
+      '[data-message-author-role="user"], section[data-turn="user"], '
+        + '[data-message-author-role="assistant"], section[data-turn="assistant"]',
+    )];
+    const seen = new Set();
+    const turns = [];
+    for (const el of nodes) {
+      const role = el.getAttribute?.("data-message-author-role") || el.getAttribute?.("data-turn") || null;
+      if (role !== "user" && role !== "assistant") continue;
+      const snapshot = domMessageSnapshotFromElement(el, role);
+      const structuralId = snapshot.messageId || snapshot.turnId;
+      if (!structuralId) continue;
+      const key = `${role}:${structuralId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      turns.push({ role, ...snapshot });
+    }
+    return turns;
+  }
+
   function latestDomMessageSnapshot(role) {
     if (role !== "user" && role !== "assistant") {
       return { messageId: null, text: "", messageAt: null };
     }
-    const nodes = [...document.querySelectorAll(`[data-message-author-role="${role}"]`)];
-    const el = nodes[nodes.length - 1] || null;
-    if (!el) return { messageId: null, text: "", messageAt: null };
-    const container = el.closest("[data-message-id]") || el.closest("[data-turn-id]") || el;
-    const timeNode = container?.querySelector?.("time[datetime]") || null;
-    const parsedTime = timeNode?.getAttribute?.("datetime") ? Date.parse(timeNode.getAttribute("datetime")) : NaN;
-    return {
-      messageId: container?.getAttribute?.("data-message-id") || el.getAttribute("data-message-id") || null,
-      text: String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim(),
-      messageAt: Number.isFinite(parsedTime) ? parsedTime : null,
-    };
+    const turns = chatGptDomTurnSequence().filter((turn) => turn.role === role);
+    const last = turns[turns.length - 1] || null;
+    return last || { messageId: null, text: "", messageAt: null };
   }
 
   function latestDomAssistantSnapshot() {
