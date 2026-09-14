@@ -122,6 +122,30 @@ Herdr は Worker control plane で pairing を作成するため、その操作�
 
 長い test/build は `herdr_exec_start` で開始し、`herdr_exec_read(session_id, offset=next_offset)` で継続取得します。terminal scrollback を completion evidence として扱いません。完了済み session は bounded な最終出力と exit evidence を保持し、runtime replacement 後も回復できます。restart 時点で実行中だった process は、安全に takeover されたとは推測しません。
 
+## ローカル Agent からも対応 WebChat セッションを操作できる
+
+Web AI は Herdr のブラウザ能力の唯一の呼び出し元ではありません。このマシンで動く coding Agent（Pi、Codex、Claude、その他）は、独自の Web 自動化を立ち上げる代わりに、herdr-mcp 経由で同じ制御された browser/WebChat control plane を使えます。
+
+典型的な用途：
+
+- 既存の ChatGPT Project 内に新しい会話を作成する。
+- すでにこのマシンに binding された WebChat 会話で作業を続ける。
+- 既存セッションに次のメッセージを dispatch し、配送状態を読む。
+- 依存する前に browser/WebChat セッションが生きているか確認する。
+- canonical handoff でタスクを WebChat planner に引き継ぐ。
+- 文脈が上限に近づいたとき、長いタスクを新しい会話へ続ける。
+
+browser extension がブラウザ側の実行・binding・wake・観測の境界を担い、ローカル Agent の正式な入口は `herdr-mcp` CLI です。CLI 自身が信頼されたローカル grant を付与するため、ローカル Agent がブラウザ資格情報を扱うことも、account / Project / session の識別子を自前で合成することもありません。
+
+Herdr を迂回して Playwright、AppleScript、DOM 注入で ChatGPT を操作しないでください。それらの経路は identity、冪等性、delivery evidence を保てません。
+
+```bash
+herdr-mcp webchat endpoints
+herdr-mcp webchat resources --kind session
+```
+
+[ローカル Agent による WebChat 操作](docs/i18n/ja/local-agent-webchat-control.md) · [Browser continuity](docs/i18n/en/browser-continuity.md) · [Browser extension](docs/i18n/en/extension.md)
+
 ## Chrome extension
 
 ChatGPT → MCP → 開発マシンの基本接続には必須ではありません。会話の継続、queued next-turn、Browser Control Center、対応する ChatGPT artifact capture が必要な場合に追加します。

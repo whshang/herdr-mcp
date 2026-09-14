@@ -122,6 +122,30 @@ Herdr-MCP 可以直接完成确定性的操作。长时间实现、大型重构�
 
 长测试和构建应使用 `herdr_exec_start`，后续通过 `herdr_exec_read(session_id, offset=next_offset)` 接力读取，不把终端滚屏当成完成证据。已经结束的 session 会在有界保留期内保存最终输出摘要与 exit evidence，即使 runtime 被替换也能恢复；仍在运行的进程在重启后不会被假定为已经安全接管。
 
+## 本地 Agent 也可以控制受支持的 WebChat 会话
+
+Web AI 并不是 Herdr 浏览器能力的唯一调用方。本机的 coding Agent（Pi、Codex、Claude，或你自己在用的其它 Agent）可以通过 herdr-mcp 使用同一套受控 browser/WebChat control plane，而不必自己另起一套网页自动化。
+
+典型用途：
+
+- 在已有 ChatGPT Project 内创建新的会话；
+- 继续一个已经绑定到本机的 WebChat 会话；
+- 向已有会话 dispatch 下一条消息并读取交付状态；
+- 在依赖之前确认 browser/WebChat 会话是否还活着；
+- 通过 canonical handoff 把任务交给 WebChat planner；
+- 上下文接近上限时把长任务接到新会话。
+
+浏览器扩展负责浏览器侧的执行、绑定、唤醒与观测边界；本地 Agent 的正式入口是 `herdr-mcp` CLI —— 它自己附带受信任的本地 grant，本地 Agent 既不需要接触浏览器凭据，也不需要自己合成 account / Project / session 标识。
+
+不要绕过 Herdr，自己用 Playwright、AppleScript 或 DOM 注入去操作 ChatGPT：这些路径无法保留身份、幂等和交付证据。
+
+```bash
+herdr-mcp webchat endpoints
+herdr-mcp webchat resources --kind session
+```
+
+[本地 Agent 控制 WebChat](docs/i18n/zh-CN/local-agent-webchat-control.md) · [浏览器连续工作](docs/i18n/zh-CN/browser-continuity.md) · [扩展说明](docs/i18n/zh-CN/extension.md)
+
 ## Chrome 扩展
 
 核心 ChatGPT → MCP → 开发机连接不依赖浏览器扩展。需要长对话连续工作、排队下一轮消息、Browser Control Center 或支持的 ChatGPT artifact 捕获时再安装。

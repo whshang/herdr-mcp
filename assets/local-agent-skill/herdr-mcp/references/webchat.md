@@ -2,6 +2,8 @@
 
 Use only the supported Herdr-MCP CLI. Do not inspect browser profiles/cookies, inject page scripts, or start a separate browser automation stack.
 
+For the local-agent WebChat control workflow — capability discovery, create/continue/dispatch/observe, canonical handoff, and mutation safety — read `references/webchat-control.md`. This file covers installing/checking the browser bridge and the exact CLI surface.
+
 ## Check the bridge
 
 ```sh

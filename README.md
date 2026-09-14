@@ -132,6 +132,30 @@ Herdr 0.9's multi-machine TUI does not yet provide machine-scoped pane/workspace
 
 See [Herdr 0.9 multi-machine and dual-path control](docs/i18n/en/multi-machine-control.md) for the routing rules, verification procedure, and upstream tracking.
 
+## Local agents can control supported WebChat sessions
+
+Web AI is not the only caller of Herdr's browser capability. A local coding agent (Pi, Codex, Claude, or whatever you run on this machine) can drive the same controlled browser/WebChat control plane through herdr-mcp, instead of starting its own automation stack.
+
+Typical uses:
+
+- create a new ChatGPT/WebChat conversation inside an existing Project;
+- continue work in a WebChat conversation that is already bound to this machine;
+- dispatch the next message into an existing session and read its delivery state;
+- check whether a browser/WebChat session is still alive;
+- hand the task to a WebChat planner through the canonical handoff path;
+- continue a long task into a new conversation when the context approaches its limit.
+
+The browser extension supplies the browser-side execution, binding, wake, and observation boundary, and the supported local entrypoint is the `herdr-mcp` CLI. It attaches the trusted local grant itself, so a local agent never handles browser credentials and never synthesizes account, Project, or session identifiers.
+
+Do not bypass Herdr with your own Playwright, AppleScript, or DOM automation against ChatGPT: those paths cannot preserve identity, idempotency, or delivery evidence.
+
+```bash
+herdr-mcp webchat endpoints
+herdr-mcp webchat resources --kind session
+```
+
+[Local agent WebChat control](docs/i18n/en/local-agent-webchat-control.md) · [Browser continuity](docs/i18n/en/browser-continuity.md) · [Extension guide](docs/i18n/en/extension.md)
+
 ## Chrome extension
 
 The browser extension is optional for the core ChatGPT → MCP → workstation connection. Install it when you want conversation continuity, queued next-turn messages, Browser Control Center, or supported ChatGPT artifact capture.

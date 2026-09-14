@@ -178,6 +178,10 @@ Herdr events → local runtime → Native Messaging → browser extension
 
 因此，MCP 负责“网页向机器伸手”；扩展的 Continuity 负责“机器在必要时敲一下正确的网页会话”；Control Center 则把本机真实工作现场送进 Chrome Side Panel，并提供受信任的本地控制面：Agent Prompt 复用 Rust target fencing 与持久化幂等，provider Steer 如实返回 capability outcome，普通终端只开放窄化且有 target fencing 的 `pane.send_input + Enter` 命令路径，而任意 Herdr 方法继续 fail-closed/Preview-only。三者职责不同，但共享同一套本机 runtime 与身份边界。
 
+本地 coding Agent 也从另一侧使用同一套 browser control plane：通过 `herdr-mcp` CLI，它可以在同样的 consent、身份、幂等与 delivery 规则下创建、继续、向受支持的 WebChat 会话 dispatch、观察状态并做接力。这是 control plane 的第二个一等调用方——不是第二个 runtime，也不是消息总线。
+
+详见[本地 Agent 控制 WebChat](local-agent-webchat-control.md)与[浏览器连续工作](browser-continuity.md)。
+
 ## 浏览器为什么不保存 Herdr bearer
 
 扩展运行在浏览器环境，页面脚本、扩展 storage 和 service worker 都不是保存工作站高权限凭据的理想位置。
