@@ -66,25 +66,59 @@ export const EPOCH4_CLOSED_WORLD_READ_TOOL_NAMES = [
 
 const CLOSED_WORLD_READ_TOOL_NAMES_SET = new Set<string>(EPOCH4_CLOSED_WORLD_READ_TOOL_NAMES);
 
-function withStructuredExec(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
+function withExecutionGuidance(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
+  if (tool.name === "herdr_exec_start") {
+    const inputSchema = tool.inputSchema as typeof tool.inputSchema & {
+      properties: Record<string, unknown>;
+    };
+    const root = inputSchema.properties.root as Record<string, unknown>;
+    return {
+      ...tool,
+      description:
+        "Start one long-running shell command in a managed project root as a background session (local process, not the herdr utility pane). Pass root directly as the managed git project cwd; unlike herdr_exec, herdr_exec_start does not take workspace or project_root. Returns session_id. Then poll with herdr_exec_read and finish with herdr_exec_kill. For short commands prefer herdr_exec.",
+      inputSchema: {
+        ...inputSchema,
+        properties: {
+          ...inputSchema.properties,
+          root: {
+            ...root,
+            description:
+              "Managed git project root used as cwd. herdr_exec_start takes root directly; do not pass herdr_exec's workspace or project_root fields.",
+          },
+        },
+      },
+    } as unknown as (typeof EPOCH3_CONTRACT.tools)[number];
+  }
   if (tool.name !== "herdr_exec") return tool;
   const inputSchema = tool.inputSchema as typeof tool.inputSchema & {
     properties: Record<string, unknown>;
     required?: readonly string[];
   };
   const command = inputSchema.properties.command as Record<string, unknown>;
+  const workspace = inputSchema.properties.workspace as Record<string, unknown>;
+  const projectRoot = inputSchema.properties.project_root as Record<string, unknown>;
   return {
     ...tool,
     description:
-      "Run commands on the workstation inside the target workspace's persistent visible utility pane. Prefer transparent structured steps for sequential program/argv execution when shell syntax is not required; steps run in order and stop on the first non-zero exit. Use command only when pipes, redirects, expansion, or other shell syntax are actually needed. Exactly one of command or steps is accepted. The same managed-root, busy-project, timeout, and delivery-evidence rules apply to both modes. Freeform command remains a high-capability shell boundary and is not secret-path gated; prefer fs/git tools for ordinary file and Git operations.",
+      "Run commands on the workstation inside the target workspace's persistent visible utility pane. herdr_exec requires workspace and optionally accepts project_root to select a project within that workspace; it does not take root. root belongs to herdr_exec_start, which starts one long-running process without workspace/project_root. Prefer transparent structured steps for sequential program/argv execution when shell syntax is not required; steps run in order and stop on the first non-zero exit. Use command only when pipes, redirects, expansion, or other shell syntax are actually needed. Exactly one of command or steps is accepted. The same managed-root, busy-project, timeout, and delivery-evidence rules apply to both modes. Freeform command remains a high-capability shell boundary and is not secret-path gated; prefer fs/git tools for ordinary file and Git operations.",
     inputSchema: {
       ...inputSchema,
       properties: {
         ...inputSchema.properties,
+        workspace: {
+          ...workspace,
+          description:
+            "Required herdr_exec workspace_id or label (from herdr_inspect). Do not pass root here; root is the herdr_exec_start cwd field.",
+        },
         command: {
           ...command,
           description:
             "Single freeform shell command. Use only when shell syntax is required; otherwise prefer steps.",
+        },
+        project_root: {
+          ...projectRoot,
+          description:
+            "Optional herdr_exec project root within this workspace (workspaces[].projects[].root from herdr_inspect). Required when the workspace has multiple project roots. Do not rename this to root; herdr_exec_start uses root instead.",
         },
         steps: {
           type: "array",
@@ -133,10 +167,10 @@ function withReadOnlyHint(tool: (typeof EPOCH3_CONTRACT.tools)[number]) {
 /** Epoch 3's catalog with `readOnlyHint: true` only on genuinely read-only tools. */
 export const EPOCH4_CONTRACT = {
   contract_epoch: 4,
-  contract_hash: "sha256:5367650249eb2385098f66f0cdb1a1d643c74164bb5513e2fb4318f8a3171b51",
+  contract_hash: "sha256:16edce86e7096410e21603d4cd1d90186490b9e8c685511521f07d3e91eca7c9",
   tool_count: 19,
   tools: EPOCH3_CONTRACT.tools.map((tool) => {
-    const shaped = withStructuredExec(tool);
+    const shaped = withExecutionGuidance(tool);
     return READ_ONLY_TOOL_NAMES_SET.has(shaped.name) ? withReadOnlyHint(shaped) : shaped;
   }),
 } as const;

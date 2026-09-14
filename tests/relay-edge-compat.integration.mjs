@@ -195,22 +195,35 @@ test("epoch 4 annotates only read-only tools and leaves prior hashes unchanged",
   }
   const epoch3Exec = EPOCH3_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec");
   const epoch4Exec = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec");
+  const epoch3ExecStart = EPOCH3_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec_start");
+  const epoch4ExecStart = EPOCH4_CONTRACT.tools.find((candidate) => candidate.name === "herdr_exec_start");
   assert.ok(epoch3Exec && epoch4Exec, "herdr_exec must exist in both epochs");
+  assert.ok(epoch3ExecStart && epoch4ExecStart, "herdr_exec_start must exist in both epochs");
   assert.ok(epoch4Exec.inputSchema.properties.steps, "epoch 4 must advertise structured exec steps");
   assert.deepEqual(epoch4Exec.inputSchema.required, ["workspace"]);
+  assert.equal("root" in epoch4Exec.inputSchema.properties, false);
+  assert.match(epoch4Exec.description, /requires workspace.*project_root.*does not take root/i);
+  assert.match(epoch4Exec.inputSchema.properties.workspace.description, /Do not pass root here/i);
+  assert.match(epoch4Exec.inputSchema.properties.project_root.description, /herdr_exec_start uses root instead/i);
   assert.equal(epoch4Exec.inputSchema.oneOf.length, 2);
   assert.equal(epoch4Exec.inputSchema.properties.steps.maxItems, 16);
   assert.equal(epoch4Exec.inputSchema.properties.steps.items.properties.args.maxItems, 128);
+  assert.deepEqual(epoch4ExecStart.inputSchema.required, ["root", "command"]);
+  assert.equal("workspace" in epoch4ExecStart.inputSchema.properties, false);
+  assert.equal("project_root" in epoch4ExecStart.inputSchema.properties, false);
+  assert.match(epoch4ExecStart.description, /Pass root directly.*does not take workspace or project_root/i);
+  assert.match(epoch4ExecStart.inputSchema.properties.root.description, /takes root directly.*workspace or project_root/i);
 
-  // Apart from herdr_exec's deliberate structured schema/description, epoch 4
-  // only adds annotations to the frozen epoch-3 catalog.
+  // Apart from the deliberate execution descriptions and herdr_exec's
+  // structured schema, epoch 4 only adds annotations to the frozen epoch-3 catalog.
   const strip = (tools) => tools.map(({ annotations, ...rest }) => rest);
   assert.deepEqual(
-    strip(EPOCH4_CONTRACT.tools.filter((tool) => tool.name !== "herdr_exec")),
-    strip(EPOCH3_CONTRACT.tools.filter((tool) => tool.name !== "herdr_exec")),
+    strip(EPOCH4_CONTRACT.tools.filter((tool) => !["herdr_exec", "herdr_exec_start"].includes(tool.name))),
+    strip(EPOCH3_CONTRACT.tools.filter((tool) => !["herdr_exec", "herdr_exec_start"].includes(tool.name))),
   );
   const stripExecDelta = ({ annotations, description, inputSchema, ...rest }) => rest;
   assert.deepEqual(stripExecDelta(epoch4Exec), stripExecDelta(epoch3Exec));
+  assert.deepEqual(stripExecDelta(epoch4ExecStart), stripExecDelta(epoch3ExecStart));
   // Frozen prior epochs stayed bit-for-bit identical.
   assert.equal(EPOCH3_CONTRACT.contract_hash, "sha256:b8b4e5d13ccb3a1a7ab0c2e9ccfa913c076d0e1cd978cfe544d1261ea2509071");
   assert.equal(computeContractHash(EPOCH3_CONTRACT.tools), EPOCH3_CONTRACT.contract_hash);
