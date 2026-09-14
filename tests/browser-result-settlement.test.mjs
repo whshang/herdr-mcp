@@ -173,11 +173,18 @@ test("background handles h2w_browser_result and never blocks on tab focus", () =
   assert.doesNotMatch(handler, /document\.hidden|chrome\.tabs/);
 });
 
-function observationHarness({ accepted = true, recovered = null, snapshots = [], sends = [] } = {}) {
+function observationHarness({
+  accepted = true,
+  recovered = null,
+  snapshots = [],
+  sends = [],
+  domCandidates = [],
+} = {}) {
   let now = 10000;
   let route = "chatgpt:/c/worker";
   let probes = 0;
   let callback;
+  let currentDomCandidate = null;
   const sent = [];
   const assignments = new Map();
   if (accepted) assignments.set("br_worker", { generation: 7, acceptedUserMessageRef: "user-1", reportedAssistantRef: null });
@@ -186,7 +193,7 @@ function observationHarness({ accepted = true, recovered = null, snapshots = [],
   const observe = new Function(
     "registeredBrowserSessionRef", "registeredBrowserGeneration", "registeredConvKey",
     "acceptedDispatchAssignments", "sendBg", "ADAPTER", "fetchChatGptConversationSnapshot",
-    "Date", "setInterval", "document", "window", "recovered",
+    "chatGptDomTurnSequence", "isTurnInProgress", "Date", "setInterval", "document", "window", "recovered",
     `${settlementSource}\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
   )("br_worker", 7, route, assignments, async (payload) => {
     sent.push(payload);
@@ -195,6 +202,27 @@ function observationHarness({ accepted = true, recovered = null, snapshots = [],
     probes += 1;
     const snapshot = snapshots.shift();
     return typeof snapshot === "function" ? snapshot() : snapshot;
+  }, () => {
+    if (!currentDomCandidate) return [];
+    if (Array.isArray(currentDomCandidate.turns)) return currentDomCandidate.turns;
+    return [
+      {
+        role: "user",
+        messageId: currentDomCandidate.userMessageId || null,
+        text: currentDomCandidate.userText || "user",
+        messageAt: null,
+      },
+      {
+        role: "assistant",
+        messageId: currentDomCandidate.messageId || null,
+        text: currentDomCandidate.text || "",
+        messageAt: null,
+      },
+    ];
+  }, () => {
+    const candidate = domCandidates.shift();
+    currentDomCandidate = typeof candidate === "function" ? candidate() : candidate || null;
+    return currentDomCandidate?.inProgress === true;
   }, { now: () => now }, (fn) => { callback = fn; }, { hidden: true, addEventListener() {} }, { addEventListener() {} }, recovered);
   return { observe, sent, assignments, tick: () => callback(), advance: (ms = 5000) => { now += ms; }, navigate: () => { route = "chatgpt:/c/other"; }, probes: () => probes };
 }
@@ -250,6 +278,114 @@ test("reopened worker recovers exact finalized result without an in-memory assig
   assert.equal(await h.observe(), true);
   assert.equal(h.sent[0].session_ref, "br_worker");
   assert.equal(h.sent[0].generation, 6);
+});
+
+test("rate-limited provider snapshot settles only after an exact stable DOM turn candidate", async () => {
+  const dom = {
+    messageId: "assistant-dom-1",
+    userMessageId: "user-1",
+    text: "final DOM worker answer",
+  };
+  const h = observationHarness({
+    snapshots: [{ ok: false, reason: "http-429" }, { ok: false, reason: "http-429" }],
+    domCandidates: [dom, dom],
+  });
+  assert.equal(await h.observe(), false);
+  assert.equal(h.sent.length, 0);
+  h.advance(1000);
+  assert.equal(await h.observe(), true);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].accepted_user_message_ref, "user-1");
+  assert.equal(h.sent[0].assistant_message_ref, "assistant-dom-1");
+  assert.equal(h.sent[0].assistant_text, "final DOM worker answer");
+});
+
+test("rate-limited provider snapshot never settles a mismatched DOM user turn", async () => {
+  const dom = {
+    messageId: "assistant-dom-1",
+    userMessageId: "other-user",
+    text: "wrong turn",
+  };
+  const h = observationHarness({
+    snapshots: [{ ok: false, reason: "http-429" }, { ok: false, reason: "http-429" }],
+    domCandidates: [dom, dom],
+  });
+  assert.equal(await h.observe(), false);
+  h.advance(1000);
+  assert.equal(await h.observe(), false);
+  assert.equal(h.sent.length, 0);
+});
+
+test("rate-limited provider snapshot never pairs an assistant that precedes the accepted DOM user turn", async () => {
+  const stale = {
+    turns: [
+      { role: "assistant", messageId: "assistant-old", text: "old answer", messageAt: null },
+      { role: "user", messageId: "user-1", text: "accepted prompt", messageAt: null },
+    ],
+  };
+  const h = observationHarness({
+    snapshots: [{ ok: false, reason: "http-429" }, { ok: false, reason: "http-429" }],
+    domCandidates: [stale, stale],
+  });
+  assert.equal(await h.observe(), false);
+  h.advance(1000);
+  assert.equal(await h.observe(), false);
+  assert.equal(h.sent.length, 0);
+});
+
+test("rate-limited provider snapshot never settles while DOM generation is still in progress", async () => {
+  const h = observationHarness({
+    snapshots: [{ ok: false, reason: "http-429" }],
+    domCandidates: [{
+      messageId: "assistant-dom-1",
+      userMessageId: "user-1",
+      text: "partial answer",
+      inProgress: true,
+    }],
+  });
+  assert.equal(await h.observe(), false);
+  assert.equal(h.sent.length, 0);
+});
+
+test("ChatGPT DOM fallback recognizes current data-turn structure without treating assistant turn-id as message-id", () => {
+  const start = wakeSource.indexOf("  function domMessageSnapshotFromElement(el, role) {");
+  const end = wakeSource.indexOf("\n  function latestDomAssistantSnapshot()", start);
+  assert.ok(start >= 0 && end > start);
+  const source = wakeSource.slice(start, end);
+  assert.match(source, /section\[data-turn=/);
+  assert.match(source, /data-turn-id/);
+  assert.match(source, /const exactMessageId = authored/);
+  assert.match(source, /role === "user" \? turnId : null/);
+  assert.match(source, /function chatGptDomTurnSequence\(\)/);
+});
+
+test("late accepted-dispatch observation preserves an already reported assistant identity", () => {
+  const assignmentMarker = wakeSource.indexOf("const currentAssignment = acceptedDispatchAssignments.get(registeredBrowserSessionRef);");
+  const start = wakeSource.lastIndexOf('if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef', assignmentMarker);
+  const end = wakeSource.indexOf("      const assistantAdvanced = Boolean(", start);
+  assert.ok(assignmentMarker >= 0 && start >= 0 && end > start, "accepted assignment write must remain extractable");
+  const apply = new Function(
+    "acceptedDispatchAssignments",
+    "registeredBrowserSessionRef",
+    "expectedGeneration",
+    "acceptedUserMessageRef",
+    `${wakeSource.slice(start, end)}; return acceptedDispatchAssignments.get(registeredBrowserSessionRef);`,
+  );
+  const assignments = new Map([["br_worker", {
+    generation: 7,
+    acceptedUserMessageRef: "user-1",
+    reportedAssistantRef: "assistant-1",
+  }]]);
+  assert.deepEqual(apply(assignments, "br_worker", 7, "user-1"), {
+    generation: 7,
+    acceptedUserMessageRef: "user-1",
+    reportedAssistantRef: "assistant-1",
+  });
+  assert.deepEqual(apply(assignments, "br_worker", 7, "user-2"), {
+    generation: 7,
+    acceptedUserMessageRef: "user-2",
+    reportedAssistantRef: null,
+  });
 });
 
 test("in-flight result observation cannot cross a conversation route change", async () => {
