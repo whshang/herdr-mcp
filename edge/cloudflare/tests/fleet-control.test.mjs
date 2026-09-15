@@ -1248,10 +1248,31 @@ test("fleet authority preserves execution provenance across reconstruction and W
   }, PRINCIPAL_A, 2000);
   assert.equal(createdLane.ok, true);
 
+  const independentBinding = {
+    endpoint_ref: "bep_" + "1".repeat(64),
+    provider: "claude",
+    account_ref: "br_" + "2".repeat(64),
+    space_ref: null,
+    session_ref: "br_" + "3".repeat(64),
+    observation_generation: 9,
+  };
+  const independentLane = await call(first, "herdr_mcp.execution_lane.create", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: createdLane.chain.revision,
+    expected_lease_generation: 1,
+    idempotency_key: "persist-independent-lane",
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: "feat/persist-independent-lane",
+    webchat_binding: independentBinding,
+  }, PRINCIPAL_A, 2000);
+  assert.equal(independentLane.ok, true);
+
   const second = makeRegistry(storage).registry;
   const inspected = await call(second, "herdr_mcp.work_chain.inspect", { work_chain_id: created.chain.work_chain_id }, PRINCIPAL_B, 2001);
   assert.equal(inspected.ok, true);
-  assert.equal(inspected.chain.revision, createdLane.chain.revision);
+  assert.equal(inspected.chain.revision, independentLane.chain.revision);
   assert.equal(inspected.chain.planner_lease.generation, 1);
 
   const laneAfterRestart = await call(second, "herdr_mcp.execution_lane.inspect", {
@@ -1285,7 +1306,7 @@ test("fleet authority preserves execution provenance across reconstruction and W
   };
   const implicitRebound = await call(second, "herdr_mcp.execution_lane.update", {
     work_chain_id: created.chain.work_chain_id,
-    expected_chain_revision: createdLane.chain.revision,
+    expected_chain_revision: independentLane.chain.revision,
     expected_lease_generation: 1,
     lane_id: createdLane.lane.lane_id,
     expected_lane_generation: createdLane.lane.lane_generation,
@@ -1296,7 +1317,7 @@ test("fleet authority preserves execution provenance across reconstruction and W
 
   const rebound = await call(second, "herdr_mcp.execution_lane.update", {
     work_chain_id: created.chain.work_chain_id,
-    expected_chain_revision: createdLane.chain.revision,
+    expected_chain_revision: independentLane.chain.revision,
     expected_lease_generation: 1,
     lane_id: createdLane.lane.lane_id,
     expected_lane_generation: createdLane.lane.lane_generation,
@@ -1319,6 +1340,13 @@ test("fleet authority preserves execution provenance across reconstruction and W
   assert.equal(rebound.lane.webchat_binding_history[0].from_webchat_binding.provider, "chatgpt");
   assert.equal(rebound.lane.webchat_binding_history[0].to_webchat_binding.provider, "gemini");
 
+  const independentAfterReassign = await call(second, "herdr_mcp.execution_lane.inspect", {
+    lane_id: independentLane.lane.lane_id,
+  }, PRINCIPAL_B, 2002);
+  assert.equal(independentAfterReassign.ok, true);
+  assert.deepEqual(independentAfterReassign.lane.webchat_binding, independentLane.lane.webchat_binding);
+  assert.deepEqual(independentAfterReassign.lane.webchat_binding_history, []);
+
   const third = makeRegistry(storage).registry;
   const persistedRoute = await call(third, "herdr_mcp.execution_lane.inspect", { lane_id: createdLane.lane.lane_id }, PRINCIPAL_B, 2003);
   assert.equal(persistedRoute.ok, true);
@@ -1329,6 +1357,13 @@ test("fleet authority preserves execution provenance across reconstruction and W
   assert.equal(persistedRoute.lane.repo_id, "github.com/whshang/herdr-mcp");
   assert.equal(persistedRoute.lane.branch_ref, "feat/persist-lane");
   assert.equal(persistedRoute.lane.work_chain_id, created.chain.work_chain_id);
+
+  const independentAfterRestart = await call(third, "herdr_mcp.execution_lane.inspect", {
+    lane_id: independentLane.lane.lane_id,
+  }, PRINCIPAL_B, 2003);
+  assert.equal(independentAfterRestart.ok, true);
+  assert.deepEqual(independentAfterRestart.lane.webchat_binding, independentLane.lane.webchat_binding);
+  assert.deepEqual(independentAfterRestart.lane.webchat_binding_history, []);
 
   const deviceResponse = await third.fetch(new Request("https://registry.internal/internal/devices/" + DEVICE_A));
   assert.equal(deviceResponse.status, 200);
