@@ -522,6 +522,62 @@ test("ChatGPT session.archive targets the exact registered session and verifies 
   assert.doesNotMatch(segment, /performWake|dispatchEnterSubmit|findSendButton|delete/);
 });
 
+test("durable self-archive is runtime-claimed after turn end or idle reload", () => {
+  const drainStart = backgroundSource.indexOf("async function drainDurableSelfArchive");
+  const drainEnd = backgroundSource.indexOf("\nfunction browserProviderCapabilities", drainStart);
+  assert.ok(drainStart >= 0 && drainEnd > drainStart, "durable archive drain helper must exist");
+  const drain = backgroundSource.slice(drainStart, drainEnd);
+  assert.match(drain, /operation:\s*"archive\.claim"/);
+  assert.match(drain, /claimAttempt = Number\(claim\.claim_attempt/);
+  const beginStart = backgroundSource.indexOf("async function beginDurableSelfArchive");
+  const completeStart = backgroundSource.indexOf("async function completeDurableSelfArchive");
+  const completeEnd = backgroundSource.indexOf("\nasync function drainDurableSelfArchive", completeStart);
+  assert.ok(beginStart >= 0 && beginStart < completeStart, "durable archive begin helper must precede completion helper");
+  assert.match(backgroundSource.slice(beginStart, completeStart), /operation:\s*"archive\.begin"/);
+  assert.ok(completeStart >= 0 && completeEnd > completeStart, "durable archive completion helper must exist");
+  assert.match(backgroundSource.slice(completeStart, completeEnd), /operation:\s*"archive\.complete"/);
+  assert.match(drain, /operation:\s*"herdr_mcp\.browser_session\.archive"/);
+  assert.match(drain, /durable_archive:\s*true/);
+  assert.match(drain, /idempotency_key:\s*archiveRef/);
+  const beginCall = drain.indexOf("await beginDurableSelfArchive(");
+  const sendCall = drain.indexOf("sendBrowserActuationTabMessage(tabId");
+  assert.ok(beginCall >= 0 && sendCall > beginCall, "durable no-replay fence must commit before browser send");
+  assert.match(drain, /command_accepted:\s*true[\s\S]*resource_available:\s*true/);
+  assert.match(drain, /DURABLE_ARCHIVE_CLAIM_RECOVERY_MS/);
+  assert.match(drain, /DURABLE_ARCHIVE_RETRY_MS/);
+  assert.doesNotMatch(drain, /setInterval|setTimeout/);
+
+  const turnStart = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")');
+  const turnEnd = backgroundSource.indexOf('if (msg?.type === "h2w_handoff_start")', turnStart);
+  const turnSegment = backgroundSource.slice(turnStart, turnEnd);
+  assert.match(turnSegment, /drainDurableSelfArchive\(msg\?\.convKey \|\| "", sender\.tab\?\.id, "turn-ended"\)/);
+  assert.ok(
+    turnSegment.indexOf("drainDurableSelfArchive") < turnSegment.indexOf("handleHandoffTurnEnded"),
+    "handoff completion must not short-circuit the durable archive drain",
+  );
+
+  const archiveStart = wakeSource.indexOf("async function performChatGptSessionArchive");
+  const archiveEnd = wakeSource.indexOf("\n  async function performBrowserActuationCommand", archiveStart);
+  const archiveSegment = wakeSource.slice(archiveStart, archiveEnd);
+  assert.match(archiveSegment, /durableAuthority = command\?\.durable_archive === true/);
+  assert.match(archiveSegment, /if \(durableAuthority\)[\s\S]*command_accepted:\s*false/);
+  const durableBranch = archiveSegment.slice(
+    archiveSegment.indexOf("if (durableAuthority)"),
+    archiveSegment.indexOf("// The authoritative self-archive request"),
+  );
+  assert.doesNotMatch(durableBranch, /enqueuePendingSelfArchive/);
+
+  assert.match(wakeSource, /h2w_schedule_durable_archive_retry/);
+  assert.match(wakeSource, /trigger:\s*"bounded-retry"/);
+
+  const startupStart = wakeSource.lastIndexOf("(async () => {");
+  const startupEnd = wakeSource.indexOf("// ---- Idle nudge", startupStart);
+  const startup = wakeSource.slice(startupStart, startupEnd);
+  assert.match(startup, /!isTurnInProgress\(\)/);
+  assert.match(startup, /type:\s*"h2w_durable_archive_ready"/);
+  assert.match(startup, /trigger:\s*"startup-idle"/);
+});
+
 const SELF_ARCHIVE_KEY = "herdrPendingSelfArchiveV1";
 
 async function flushUntil(predicate, turns = 24) {

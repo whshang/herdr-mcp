@@ -137,6 +137,8 @@ const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation";
 const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation";
 const BROWSER_PROFILE_SEED_STORAGE_KEY = "herdrBrowserProfileSeedV1";
 const BROWSER_OBSERVATION_GENERATION_STORAGE_KEY = "herdrBrowserObservationGenerationV1";
+const DURABLE_ARCHIVE_RETRY_MS = 1000;
+const DURABLE_ARCHIVE_CLAIM_RECOVERY_MS = 35000;
 const browserSessionTargets = new Map();
 const browserTabScopes = new Map();
 const archiveTabCloseInFlight = new Set();
@@ -1848,6 +1850,157 @@ async function postBrowserDispatchResult({ provider, session_ref, expected_gener
     assistant_message_ref,
     assistant_text,
   });
+}
+
+async function beginDurableSelfArchive(archiveRef, expectedGeneration, claimAttempt) {
+  return postBrowserRegistry({
+    operation: "archive.begin",
+    archive_ref: archiveRef,
+    observed_generation: expectedGeneration,
+    claim_attempt: claimAttempt,
+    observed_at: Date.now(),
+  });
+}
+
+async function completeDurableSelfArchive(archiveRef, claimAttempt, evidence) {
+  return postBrowserRegistry({
+    operation: "archive.complete",
+    archive_ref: archiveRef,
+    observed_generation: Number(evidence?.observed_generation || 0),
+    claim_attempt: claimAttempt,
+    command_accepted: evidence?.command_accepted === true,
+    browser_online: evidence?.browser_online === true,
+    resource_available: evidence?.resource_available === true,
+    rejected: evidence?.rejected === true,
+    stable_resource_ref_observed: evidence?.stable_resource_ref_observed === true,
+    lifecycle_observed: evidence?.lifecycle_observed === true,
+    observed_at: Date.now(),
+  });
+}
+
+async function scheduleDurableArchiveRetry(tabId, convKey, delayMs, reason) {
+  if (!Number.isSafeInteger(tabId) || tabId < 0 || !convKey) return false;
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, {
+      type: "h2w_schedule_durable_archive_retry",
+      convKey,
+      delay_ms: Math.max(0, Math.min(60000, Number(delayMs) || 0)),
+      reason: String(reason || "retryable"),
+    });
+    return response?.ok === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
+  const info = chatGptConversationInfo(String(convKey || ""));
+  if (!info?.conversation_id || !tabId) return { ok: true, claimed: false, trigger };
+  const claim = await postBrowserRegistry({
+    operation: "archive.claim",
+    canonical_url: String(convKey),
+    observed_at: Date.now(),
+  });
+  if (claim?.claimed !== true) return { ok: true, claimed: false, trigger };
+  const archiveRef = String(claim.archive_ref || "");
+  const sessionRef = String(claim.session_ref || "");
+  const expectedGeneration = Number(claim.expected_generation || 0);
+  const claimAttempt = Number(claim.claim_attempt || 0);
+  if (!archiveRef
+      || !sessionRef
+      || !Number.isSafeInteger(expectedGeneration)
+      || expectedGeneration < 1
+      || !Number.isSafeInteger(claimAttempt)
+      || claimAttempt < 1) {
+    return { ok: false, claimed: true, error: "archive-claim-invalid", trigger };
+  }
+
+  let evidence = unavailableBrowserActuationEvidence(expectedGeneration);
+  // The page owns only a bounded wake-up hint. Runtime SQLite remains the
+  // authority. If the service worker disappears before the no-replay fence,
+  // this later wake lets the runtime reclaim the expired pre-actuation claim.
+  void scheduleDurableArchiveRetry(
+    tabId,
+    String(convKey),
+    DURABLE_ARCHIVE_CLAIM_RECOVERY_MS,
+    "claim-lease-recovery",
+  );
+
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (_) {}
+  const live = chatGptConversationInfo(tab?.url || "");
+  if (!tab || live?.conversation_id !== info.conversation_id) {
+    evidence = { ...evidence, browser_online: true, resource_available: false };
+    const completion = await completeDurableSelfArchive(archiveRef, claimAttempt, evidence);
+    if (completion?.retryable === true) {
+      void scheduleDurableArchiveRetry(
+        tabId,
+        String(convKey),
+        DURABLE_ARCHIVE_RETRY_MS,
+        "pre-actuation-not-delivered",
+      );
+    }
+    return {
+      ok: completion?.ok === true,
+      claimed: true,
+      archive_ref: archiveRef,
+      state: completion?.state || null,
+      retryable: completion?.retryable === true,
+      trigger,
+    };
+  }
+
+  // Commit the no-replay fence before crossing into the content script. If the
+  // worker dies after this succeeds, the durable state stays uncertain rather
+  // than permitting a blind duplicate archive click.
+  await beginDurableSelfArchive(archiveRef, expectedGeneration, claimAttempt);
+  try {
+    const response = await sendBrowserActuationTabMessage(tabId, {
+      type: "h2w_browser_actuation",
+      command: {
+        operation: "herdr_mcp.browser_session.archive",
+        expected_generation: expectedGeneration,
+        durable_archive: true,
+        params: {
+          session_ref: sessionRef,
+          expected_generation: expectedGeneration,
+          idempotency_key: archiveRef,
+        },
+      },
+    });
+    evidence = response?.evidence && typeof response.evidence === "object"
+      ? response.evidence
+      : { ...evidence, command_accepted: true, browser_online: true, resource_available: true };
+  } catch (_) {
+    // `archive.begin` has already committed. Any send-side exception, including
+    // a missing receiver, is therefore delivery-uncertain unless a content
+    // response explicitly proves no actuation occurred.
+    evidence = {
+      ...evidence,
+      command_accepted: true,
+      browser_online: true,
+      resource_available: true,
+    };
+  }
+  const completion = await completeDurableSelfArchive(archiveRef, claimAttempt, evidence);
+  if (completion?.retryable === true) {
+    void scheduleDurableArchiveRetry(
+      tabId,
+      String(convKey),
+      DURABLE_ARCHIVE_RETRY_MS,
+      "retryable-completion",
+    );
+  }
+  return {
+    ok: completion?.ok === true,
+    claimed: true,
+    archive_ref: archiveRef,
+    state: completion?.state || null,
+    retryable: completion?.retryable === true,
+    trigger,
+  };
 }
 
 function browserProviderCapabilities(provider) {
@@ -6553,6 +6706,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true;
   }
+  if (msg?.type === "h2w_durable_archive_ready") {
+    void drainDurableSelfArchive(msg?.convKey || "", sender.tab?.id, msg?.trigger || "idle-recovery")
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error?.message || "durable-self-archive-failed",
+      }));
+    return true;
+  }
   if (msg?.type === "h2w_turn_started") {
     void (async () => {
       const convKey = String(msg?.convKey || "").trim();
@@ -6683,6 +6845,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_turn_ended") {
     void (async () => {
+      try {
+        await drainDurableSelfArchive(msg?.convKey || "", sender.tab?.id, "turn-ended");
+      } catch (error) {
+        callLog("durable self-archive turn-end drain failed:", error?.message || String(error));
+      }
       const handoff = await handleHandoffTurnEnded(msg);
       if (handoff.handled) {
         sendResponse(handoff);

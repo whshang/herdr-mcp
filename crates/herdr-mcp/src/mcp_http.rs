@@ -14,9 +14,9 @@ use crate::runtime_meta;
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
-    BrowserDispatchResultInput, BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
-    BrowserProviderObservationInput, BrowserResourceObservationInput, ContinuityTurnInput,
-    StateStore,
+    BrowserDeliveryState, BrowserDispatchResultInput, BrowserEndpointConsentInput,
+    BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+    BrowserResourceObservationInput, ContinuityTurnInput, StateStore,
 };
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -640,6 +640,9 @@ async fn post_extension_browser_registry(State(state): State<AppState>, body: By
         "source_turn.observe" => {
             extension_browser_source_turn_observe(&state, &payload, observed_at)
         }
+        "archive.claim" => extension_browser_archive_claim(&state, &payload, observed_at),
+        "archive.begin" => extension_browser_archive_begin(&state, &payload, observed_at),
+        "archive.complete" => extension_browser_archive_complete(&state, &payload, observed_at),
         "dispatch.result" => extension_browser_dispatch_result(&state, &payload, observed_at),
         _ => Err("browser_registry_operation_unknown".to_owned()),
     };
@@ -1085,6 +1088,143 @@ fn extension_browser_source_turn_observe(
         "ok": true,
         "session_ref": session_ref,
         "expected_generation": expected_generation,
+    }))
+}
+
+fn extension_browser_archive_claim(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(payload, &["operation", "canonical_url", "observed_at"])?;
+    let canonical_url = browser_registry_string(payload, "canonical_url", 2048)?;
+    if !canonical_url.starts_with("https://chatgpt.com/") {
+        return Err("browser_canonical_url_invalid".to_owned());
+    }
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let Some(session_ref) = store.browser_session_ref_for_canonical_url(canonical_url)? else {
+        return Ok(json!({"ok": true, "claimed": false}));
+    };
+    let Some(intent) = store.claim_browser_session_archive_intent(&session_ref, observed_at)?
+    else {
+        return Ok(json!({"ok": true, "claimed": false}));
+    };
+    Ok(json!({
+        "ok": true,
+        "claimed": true,
+        "archive_ref": intent.archive_ref,
+        "session_ref": intent.session_ref,
+        "expected_generation": intent.execution_generation,
+        "claim_attempt": intent.claim_attempt,
+        "state": intent.state,
+    }))
+}
+
+fn extension_browser_archive_begin(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(
+        payload,
+        &[
+            "operation",
+            "archive_ref",
+            "observed_generation",
+            "claim_attempt",
+            "observed_at",
+        ],
+    )?;
+    let archive_ref = browser_registry_string(payload, "archive_ref", 96)?;
+    let observed_generation = browser_registry_positive_i64(payload, "observed_generation")?;
+    let claim_attempt = browser_registry_positive_i64(payload, "claim_attempt")?;
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let intent = store.begin_browser_session_archive_intent(
+        archive_ref,
+        observed_generation,
+        claim_attempt,
+        observed_at,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "archive_ref": intent.archive_ref,
+        "state": intent.state,
+        "claim_attempt": intent.claim_attempt,
+    }))
+}
+
+fn extension_browser_archive_complete(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(
+        payload,
+        &[
+            "operation",
+            "archive_ref",
+            "observed_generation",
+            "claim_attempt",
+            "command_accepted",
+            "browser_online",
+            "resource_available",
+            "rejected",
+            "stable_resource_ref_observed",
+            "lifecycle_observed",
+            "observed_at",
+        ],
+    )?;
+    let archive_ref = browser_registry_string(payload, "archive_ref", 96)?;
+    let observed_generation = browser_registry_positive_i64(payload, "observed_generation")?;
+    let claim_attempt = browser_registry_positive_i64(payload, "claim_attempt")?;
+    let command_accepted = browser_registry_bool(payload, "command_accepted")?;
+    let browser_online = browser_registry_bool(payload, "browser_online")?;
+    let resource_available = browser_registry_bool(payload, "resource_available")?;
+    let rejected = browser_registry_bool(payload, "rejected")?;
+    let stable_resource_ref_observed =
+        browser_registry_bool(payload, "stable_resource_ref_observed")?;
+    let lifecycle_observed = browser_registry_bool(payload, "lifecycle_observed")?;
+    let delivery_state = if command_accepted
+        && browser_online
+        && resource_available
+        && !rejected
+        && stable_resource_ref_observed
+        && lifecycle_observed
+    {
+        BrowserDeliveryState::Applied
+    } else if !command_accepted {
+        BrowserDeliveryState::NotApplied
+    } else if !browser_online {
+        BrowserDeliveryState::BrowserOffline
+    } else if !resource_available {
+        BrowserDeliveryState::ResourceUnavailable
+    } else if rejected {
+        BrowserDeliveryState::Rejected
+    } else {
+        BrowserDeliveryState::Uncertain
+    };
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let intent = store.complete_browser_session_archive_intent(
+        archive_ref,
+        observed_generation,
+        claim_attempt,
+        delivery_state,
+        observed_at,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "archive_ref": intent.archive_ref,
+        "state": intent.state,
+        "retryable": intent.state == "pending",
     }))
 }
 
@@ -3514,6 +3654,83 @@ mod tests {
             !source_result.to_string().contains("归档当前对话"),
             "the trusted IPC response must not echo user plaintext"
         );
+
+        let archive_ref = {
+            let mut guard = store.lock().unwrap();
+            match guard
+                .reserve_browser_session_archive_intent(
+                    session_ref,
+                    &mcp::browser_sha256("归档当前对话"),
+                    &mcp::browser_sha256("http-archive-request"),
+                    &mcp::browser_sha256("http-archive-idempotency"),
+                    1,
+                    1006,
+                )
+                .unwrap()
+            {
+                crate::state_store::BrowserSessionArchiveIntentReservation::Reserved(record) => {
+                    record.archive_ref
+                }
+                crate::state_store::BrowserSessionArchiveIntentReservation::Existing(_) => {
+                    unreachable!()
+                }
+            }
+        };
+        let claim = json!({
+            "operation": "archive.claim",
+            "canonical_url": "https://chatgpt.com/c/session-http-locator-1",
+            "observed_at": 1007
+        });
+        let response = app.clone().oneshot(request(claim.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let claim_result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(claim_result["claimed"], true);
+        assert_eq!(claim_result["archive_ref"], archive_ref);
+        assert_eq!(claim_result["session_ref"], session_ref);
+        assert_eq!(claim_result["expected_generation"], 1);
+        assert_eq!(claim_result["claim_attempt"], 1);
+
+        let response = app.clone().oneshot(request(claim)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let second_claim: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second_claim["claimed"], false);
+
+        let begin = json!({
+            "operation": "archive.begin",
+            "archive_ref": archive_ref,
+            "observed_generation": 1,
+            "claim_attempt": 1,
+            "observed_at": 1008
+        });
+        let response = app.clone().oneshot(request(begin)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let begin_result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(begin_result["state"], "uncertain");
+        assert_eq!(begin_result["claim_attempt"], 1);
+
+        let complete = json!({
+            "operation": "archive.complete",
+            "archive_ref": archive_ref,
+            "observed_generation": 1,
+            "claim_attempt": 1,
+            "command_accepted": true,
+            "browser_online": true,
+            "resource_available": true,
+            "rejected": false,
+            "stable_resource_ref_observed": true,
+            "lifecycle_observed": true,
+            "observed_at": 1009
+        });
+        let response = app.clone().oneshot(request(complete)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let complete_result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(complete_result["state"], "applied");
+        assert_eq!(complete_result["retryable"], false);
+
         // The trusted IPC observation is durable: a fresh store handle on the
         // same state file resolves it after the request completes.
         let mut reopened = StateStore::open(root.join("extension").join("state-test.db")).unwrap();
