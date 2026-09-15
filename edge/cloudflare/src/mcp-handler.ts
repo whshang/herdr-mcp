@@ -272,6 +272,39 @@ const EDGE_RESERVED_PRIVATE_METHOD_PREFIXES = [
   "herdr_mcp.execution_lane.",
 ] as const;
 
+// ChatGPT can serialize an explicitly requested private browser method through
+// the generic herdr_call surface without the herdr_mcp. prefix (for example
+// `browser_session.archive`). Accept only the exact browser methods that the
+// workstation local registry already owns, then continue through the normal
+// device / authorization / workstation-local routing path. Unknown short names
+// remain untouched and therefore cannot gain private-method authority merely by
+// looking browser-shaped.
+const WORKSTATION_BROWSER_PRIVATE_METHOD_ALIASES = new Map<string, string>([
+  ["browser_endpoint.list", "herdr_mcp.browser_endpoint.list"],
+  ["browser_endpoint.inspect", "herdr_mcp.browser_endpoint.inspect"],
+  ["browser_resource.list", "herdr_mcp.browser_resource.list"],
+  ["browser_resource.inspect", "herdr_mcp.browser_resource.inspect"],
+  ["browser_resource.resolve", "herdr_mcp.browser_resource.resolve"],
+  ["browser_handoff.prepare", "herdr_mcp.browser_handoff.prepare"],
+  ["browser_space.create", "herdr_mcp.browser_space.create"],
+  ["browser_space.open", "herdr_mcp.browser_space.open"],
+  ["browser_space.inspect", "herdr_mcp.browser_space.inspect"],
+  ["browser_session.create", "herdr_mcp.browser_session.create"],
+  ["browser_session.open", "herdr_mcp.browser_session.open"],
+  ["browser_session.archive", "herdr_mcp.browser_session.archive"],
+  ["browser_session.inspect", "herdr_mcp.browser_session.inspect"],
+  ["browser_message.append", "herdr_mcp.browser_message.append"],
+  ["browser_composer.set_reasoning", "herdr_mcp.browser_composer.set_reasoning"],
+  ["browser_composer.set_apps", "herdr_mcp.browser_composer.set_apps"],
+  ["browser_dispatch.submit", "herdr_mcp.browser_dispatch.submit"],
+  ["browser_dispatch.status", "herdr_mcp.browser_dispatch.status"],
+  ["browser_dispatch.stop", "herdr_mcp.browser_dispatch.stop"],
+]);
+
+function canonicalHerdrCallMethod(method: string): string {
+  return WORKSTATION_BROWSER_PRIVATE_METHOD_ALIASES.get(method) ?? method;
+}
+
 function isEdgeReservedPrivateMethod(method: string): boolean {
   return EDGE_RESERVED_PRIVATE_METHOD_PREFIXES.some((prefix) => method.startsWith(prefix));
 }
@@ -515,7 +548,10 @@ export async function handleMcp(
     if (rawArgs !== undefined && rawArgs !== null && !isRecord(rawArgs)) {
       return rpcError(id, -32602, "Invalid params", { reason: "arguments must be an object or null" });
     }
-    const args = rawArgs === null || rawArgs === undefined ? {} : rawArgs;
+    const args = rawArgs === null || rawArgs === undefined ? {} : { ...rawArgs };
+    if (name === "herdr_call" && typeof args.method === "string") {
+      args.method = canonicalHerdrCallMethod(args.method);
+    }
     const budget = checkArgsBudget(args, deps.limits.maxFrameBytes);
     if (!budget.ok) {
       return rpcError(id, -32602, "Invalid params", {
