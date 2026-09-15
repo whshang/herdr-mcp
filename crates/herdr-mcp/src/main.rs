@@ -312,7 +312,11 @@ fn run() -> Result<ExitCode, String> {
                 {
                     windows_service_manager::print_link_status()
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(target_os = "linux")]
+                {
+                    linux_service_manager::print_link_status()
+                }
+                #[cfg(target_os = "macos")]
                 {
                     link::run_link_status()
                 }
