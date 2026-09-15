@@ -315,6 +315,8 @@ Project 自动化需要两层许可：
 
 Project 开关按稳定 `project_id` 共享，因此同一 Project 里的接力后会话可以继承自动化偏好。
 
+Herdr 工具权限卡是唯一不跟随 Auto 的例外：受支持、明确标注的 Herdr 工具权限卡即使 Auto 关闭也会自动接受，因为它只是放行 Herdr connector 自己发起的工具调用，并复用 fail-closed 卡片判定。Auto 仍控制 wake/progress/rollover 行为；关闭它不会让工具调用卡在权限卡上。
+
 ### 普通 ChatGPT / z.ai / DeepSeek
 
 支持的站点使用会话级 Auto，按 conversation identity 保存。
