@@ -3152,40 +3152,48 @@ fn browser_session_archive_params_from_current_turn(
         return Err(json!({"ok": false, "code": "browser_current_turn_invalid"}));
     }
     let idempotency_key = browser_required_idempotency_key(params)?;
-
-    if let (Some(authorization), Some(caller_session)) =
-        (caller_authorization, caller_browser_session)
-        && caller_session.provider == "chatgpt"
+    let source_user_text_sha256 = browser_sha256(current_user_message);
+    let observed_at = browser_epoch_ms();
+    let (session_ref, expected_generation) = match store
+        .resolve_browser_source_turn(&source_user_text_sha256, observed_at)
     {
-        let bound_session_ref = store
-            .resolve_browser_caller_session(
-                &authorization.principal_ref,
-                &caller_session.provider,
-                &caller_session.opaque_session_id,
-            )
-            .map_err(browser_store_error)?;
-        if let Some(session_ref) = bound_session_ref {
-            let session = match store.browser_resource(&session_ref) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
+        Ok(value) => value,
+        Err(error) if error == "browser_current_turn_not_found" => {
+            if let (Some(authorization), Some(caller_session)) =
+                (caller_authorization, caller_browser_session)
+                && caller_session.provider == "chatgpt"
+            {
+                let bound_session_ref = store
+                    .resolve_browser_caller_session(
+                        &authorization.principal_ref,
+                        &caller_session.provider,
+                        &caller_session.opaque_session_id,
+                    )
+                    .map_err(browser_store_error)?;
+                if let Some(session_ref) = bound_session_ref {
+                    let session = match store.browser_resource(&session_ref) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => {
+                            return Err(
+                                json!({"ok": false, "code": "browser_current_turn_not_found"}),
+                            );
+                        }
+                        Err(error) => return Err(browser_store_error(error)),
+                    };
+                    if session.kind != "session" || session.provider != "chatgpt" {
+                        return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
+                    }
+                    return Ok(Some(json!({
+                        "session_ref": session_ref,
+                        "expected_generation": session.observation_generation,
+                        "idempotency_key": idempotency_key,
+                    })));
                 }
-                Err(error) => return Err(browser_store_error(error)),
-            };
-            if session.kind != "session" || session.provider != "chatgpt" {
-                return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
             }
-            return Ok(Some(json!({
-                "session_ref": session_ref,
-                "expected_generation": session.observation_generation,
-                "idempotency_key": idempotency_key,
-            })));
+            return Err(json!({"ok": false, "code": "browser_current_turn_not_found"}));
         }
-    }
-
-    let (session_ref, expected_generation) = store
-        .resolve_browser_source_turn(&browser_sha256(current_user_message), browser_epoch_ms())
-        .map_err(browser_store_error)?;
+        Err(error) => return Err(browser_store_error(error)),
+    };
     let session = match store.browser_resource(&session_ref) {
         Ok(Some(value)) => value,
         Ok(None) => return Err(json!({"ok": false, "code": "browser_current_turn_not_found"})),
@@ -3210,12 +3218,14 @@ fn browser_session_archive_params_from_current_turn(
         });
         if granted {
             store
-                .bind_browser_caller_session(
+                .rebind_browser_caller_session_from_source_turn(
                     &authorization.principal_ref,
                     &caller_session.provider,
                     &caller_session.opaque_session_id,
                     &session_ref,
-                    browser_epoch_ms(),
+                    &source_user_text_sha256,
+                    expected_generation,
+                    observed_at,
                 )
                 .map_err(browser_store_error)?;
         }
@@ -6287,6 +6297,84 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(bootstrap["session_ref"], session_ref);
+        assert_eq!(
+            reopened
+                .resolve_browser_caller_session(
+                    &authorization.principal_ref,
+                    "chatgpt",
+                    &caller_session.opaque_session_id,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(session_ref.as_str())
+        );
+
+        // OpenAI may reuse the same opaque Connector caller session across
+        // multiple ChatGPT conversations. A newer exact source-turn identity
+        // must override the older correlation instead of routing the mutation
+        // back into the previously bound conversation.
+        let second_session = reopened
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &initial_session.endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&initial_account_ref),
+                native_identity: "fresh-runtime-session-second",
+                display_label: Some("Second"),
+                observation_generation: 7,
+                observed_at: observed_at + 1,
+            })
+            .unwrap();
+        reopened
+            .observe_browser_source_turn(
+                &second_session.resource_ref,
+                7,
+                &browser_sha256("归档第二个对话"),
+                observed_at + 1,
+            )
+            .unwrap();
+        let rebound_to_second = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "归档第二个对话",
+                "idempotency_key": "archive-rebind-current-chat-second"
+            }),
+            &grants,
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rebound_to_second["session_ref"],
+            second_session.resource_ref
+        );
+        assert_eq!(
+            reopened
+                .resolve_browser_caller_session(
+                    &authorization.principal_ref,
+                    "chatgpt",
+                    &caller_session.opaque_session_id,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(second_session.resource_ref.as_str()),
+            "fresh exact source-turn evidence must safely retarget a reused opaque caller session"
+        );
+
+        let rebound_to_first = browser_session_archive_params_from_current_turn(
+            &mut reopened,
+            &json!({
+                "current_user_message": "归档当前对话",
+                "idempotency_key": "archive-rebind-current-chat-first"
+            }),
+            &grants,
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rebound_to_first["session_ref"], session_ref);
         assert_eq!(
             reopened
                 .resolve_browser_caller_session(

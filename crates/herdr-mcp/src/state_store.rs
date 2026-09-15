@@ -3642,6 +3642,102 @@ impl StateStore {
         Ok(())
     }
 
+    /// Re-target one opaque caller-session correlation only when the new
+    /// browser session is backed by the exact, fresh source-turn evidence that
+    /// triggered the current operation. ChatGPT may reuse one opaque Connector
+    /// session across multiple conversations, so an older durable correlation
+    /// cannot override a newer exact user-turn identity.
+    pub fn rebind_browser_caller_session_from_source_turn(
+        &mut self,
+        principal_ref: &str,
+        provider: &str,
+        caller_session_id: &str,
+        session_ref: &str,
+        source_user_text_sha256: &str,
+        expected_generation: i64,
+        observed_at: i64,
+    ) -> Result<(), String> {
+        validate_browser_ref_text(principal_ref, 256, "caller_principal_ref")?;
+        validate_browser_token(provider, 32, "provider")?;
+        validate_browser_ref_text(caller_session_id, 256, "caller_session")?;
+        validate_browser_resource_ref(session_ref)?;
+        validate_browser_digest(source_user_text_sha256, "source_user_text_sha256")?;
+        if expected_generation < 1 || observed_at < 0 {
+            return Err("browser_current_turn_invalid".to_owned());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser caller-session rebind: {error}"))?;
+        let evidence = tx
+            .query_row(
+                "SELECT r.kind, r.provider, r.observation_generation,
+                        s.expected_generation, s.user_text_sha256, s.observed_at
+                 FROM browser_resources r
+                 JOIN browser_source_turns s ON s.session_ref = r.resource_ref
+                 WHERE r.resource_ref = ?1",
+                params![session_ref],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                format!("cannot inspect browser caller-session rebind evidence: {error}")
+            })?
+            .ok_or_else(|| "browser_current_turn_not_found".to_owned())?;
+        let (
+            kind,
+            resource_provider,
+            resource_generation,
+            source_generation,
+            source_digest,
+            source_observed_at,
+        ) = evidence;
+        if kind != "session" || resource_provider != provider {
+            return Err("browser_resource_kind_mismatch".to_owned());
+        }
+        if resource_generation != expected_generation || source_generation != expected_generation {
+            return Err("browser_current_turn_stale".to_owned());
+        }
+        if source_digest != source_user_text_sha256
+            || source_observed_at > observed_at
+            || source_observed_at < observed_at.saturating_sub(BROWSER_SOURCE_TURN_RETENTION_MS)
+        {
+            return Err("browser_current_turn_not_found".to_owned());
+        }
+
+        let caller_session_sha256 = sha256_text(caller_session_id);
+        tx.execute(
+            "INSERT INTO browser_caller_sessions(
+                principal_ref, provider, caller_session_sha256, session_ref,
+                first_bound_at, last_bound_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(principal_ref, provider, caller_session_sha256) DO UPDATE SET
+                session_ref = excluded.session_ref,
+                last_bound_at = MAX(browser_caller_sessions.last_bound_at, excluded.last_bound_at)",
+            params![
+                principal_ref,
+                provider,
+                caller_session_sha256,
+                session_ref,
+                observed_at
+            ],
+        )
+        .map_err(|error| format!("cannot rebind browser caller session: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser caller-session rebind: {error}"))?;
+        Ok(())
+    }
+
     pub fn resolve_browser_caller_session(
         &self,
         principal_ref: &str,
