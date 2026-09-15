@@ -3647,6 +3647,10 @@ impl StateStore {
     /// triggered the current operation. ChatGPT may reuse one opaque Connector
     /// session across multiple conversations, so an older durable correlation
     /// cannot override a newer exact user-turn identity.
+    // Keep each identity/freshness fence explicit at this transaction boundary;
+    // collapsing them into an opaque options bag would make the security checks
+    // easier to omit at the single caller without reducing state ownership.
+    #[allow(clippy::too_many_arguments)]
     pub fn rebind_browser_caller_session_from_source_turn(
         &mut self,
         principal_ref: &str,
