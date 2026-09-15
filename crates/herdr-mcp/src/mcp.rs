@@ -3900,6 +3900,11 @@ fn browser_operation_call_with_controls(
             }
             Err(error) => return browser_store_error(error),
         }
+        match browser_operation_capability_preflight_error(&store_guard, operation, params) {
+            Ok(Some(error)) => return error,
+            Ok(None) => {}
+            Err(error) => return browser_store_error(error),
+        }
         match browser_operation_mutation_scope(&store_guard, operation, params) {
             Ok(scope) => Some(scope),
             Err(error) => return browser_store_error(error),
@@ -4586,9 +4591,6 @@ fn browser_resource_account_ref(
 fn browser_capability_snapshot_allows(capabilities_json: &str, operation: &str) -> Option<bool> {
     let parsed = serde_json::from_str::<Value>(capabilities_json).ok()?;
     let object = parsed.as_object()?;
-    if object.len() != 1 {
-        return None;
-    }
     let operations = object.get("operations")?.as_array()?;
     if operations.iter().any(|value| value.as_str().is_none()) {
         return None;
@@ -4608,10 +4610,35 @@ fn browser_public_capabilities(capabilities_json: &str) -> Value {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let adapter_schema_version = parsed.get("schema_version").and_then(Value::as_u64);
+    let capability_values = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(Value::as_array)
+            .filter(|values| values.iter().all(|value| value.as_str().is_some()))
+            .map(|values| json!({"status": "known", "values": values}))
+            .unwrap_or_else(|| json!({"status": "unknown"}))
+    };
+    let input_modalities = capability_values("input_modalities");
+    let output_modalities = capability_values("output_modalities");
+    let limits = parsed
+        .get("limits")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let capability_limit = |key: &str| {
+        limits
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| json!({"status": "unknown"}))
+    };
 
     json!({
         "schema_version": 1,
+        "adapter_schema_version": adapter_schema_version,
         "operations": operations,
+        "input_modalities": input_modalities,
+        "output_modalities": output_modalities.clone(),
         "input_contract": {
             "message": {
                 "accepted_modalities": ["text"],
@@ -4633,12 +4660,100 @@ fn browser_public_capabilities(capabilities_json: &str) -> Value {
         },
         "provider_dynamic_limits": {
             "message_bytes": {"status": "unknown"},
-            "attachment_count": {"status": "unknown"},
-            "turn_timeout_ms": {"status": "unknown"},
-            "output_modalities": {"status": "unknown"},
-            "model_effort_combinations": {"status": "unknown"}
+            "message_chars": capability_limit("provider_message_chars"),
+            "attachment_count": capability_limit("attachment_count"),
+            "turn_timeout_ms": capability_limit("provider_response_timeout_ms"),
+            "output_modalities": output_modalities,
+            "model_effort_combinations": capability_limit("provider_model_reasoning_combinations")
         }
     })
+}
+
+fn browser_operation_capability_preflight_error(
+    store: &StateStore,
+    operation: BrowserOperation,
+    params: &Value,
+) -> Result<Option<Value>, String> {
+    if !matches!(
+        operation,
+        BrowserOperation::SessionCreate
+            | BrowserOperation::MessageAppend
+            | BrowserOperation::DispatchSubmit
+    ) {
+        return Ok(None);
+    }
+    let target = if operation == BrowserOperation::SessionCreate {
+        browser_operation_resource(
+            store,
+            params.get("account_ref").and_then(Value::as_str).unwrap(),
+            "account",
+        )?
+    } else {
+        browser_operation_resource(
+            store,
+            params.get("session_ref").and_then(Value::as_str).unwrap(),
+            "session",
+        )?
+    };
+    let Some(provider_state) =
+        store.browser_provider_state(&target.endpoint_ref, &target.provider)?
+    else {
+        return Ok(None);
+    };
+    Ok(browser_capability_request_preflight_error(
+        &provider_state.capabilities_json,
+        params,
+    ))
+}
+
+fn browser_capability_request_preflight_error(
+    capabilities_json: &str,
+    params: &Value,
+) -> Option<Value> {
+    let parsed = serde_json::from_str::<Value>(capabilities_json).ok()?;
+    if let Some(modalities) = parsed.get("input_modalities").and_then(Value::as_array)
+        && modalities
+            .iter()
+            .all(|value| value.as_str() != Some("text"))
+    {
+        return Some(json!({
+            "ok": false,
+            "code": "capability_not_allowed",
+            "capability": "input_modalities.text",
+            "actuation_available": false,
+        }));
+    }
+    let message = params.get("message").and_then(Value::as_str)?;
+    let limit = parsed
+        .get("limits")
+        .and_then(Value::as_object)
+        .and_then(|limits| limits.get("provider_message_chars"))
+        .and_then(Value::as_object)?;
+    if limit.get("status").and_then(Value::as_str) != Some("known") {
+        return None;
+    }
+    let max = limit.get("max").and_then(Value::as_u64)?;
+    let actual = u64::try_from(message.chars().count()).ok()?;
+    if actual <= max {
+        return None;
+    }
+    Some(json!({
+        "ok": false,
+        "code": "browser_limit_exceeded",
+        "actuation_available": false,
+        "limit": {
+            "name": "provider_message_chars",
+            "status": "known",
+            "max": max,
+            "actual": actual,
+            "unit": "characters",
+            "authority": limit.get("authority").and_then(Value::as_str),
+        },
+        "supported_alternative": {
+            "kind": "shorter_text",
+            "max_characters": max,
+        }
+    }))
 }
 
 fn browser_required_generation(params: &Value) -> Result<i64, Value> {
@@ -5237,6 +5352,10 @@ fn browser_required_message(params: &Value, max_bytes: usize) -> Result<&str, Va
                 "kind": "max_bytes",
                 "max_bytes": max_bytes,
                 "actual_bytes": value.len(),
+            },
+            "supported_alternative": {
+                "kind": "shorter_text",
+                "max_bytes": max_bytes,
             }
         }));
     }
@@ -10028,7 +10147,7 @@ mod tests {
                     provider: "chatgpt",
                     adapter_protocol_version: 1,
                     observation_generation: 7,
-                    capabilities_json: r#"{"operations":["identity.inspect","session.inspect","composer.submit"]}"#,
+                    capabilities_json: r#"{"schema_version":1,"operations":["identity.inspect","session.inspect","composer.submit"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"},"provider_message_chars":{"status":"known","max":16,"authority":"provider"},"provider_response_timeout_ms":{"status":"unknown","authority":"provider"},"provider_model_reasoning_combinations":{"status":"unknown","authority":"provider"}}}"#,
                     observed_at: 11,
                 })
                 .unwrap();
@@ -10161,6 +10280,19 @@ mod tests {
             "browser_registry_observation"
         );
         assert_eq!(inspect["capabilities"]["schema_version"], 1);
+        assert_eq!(inspect["capabilities"]["adapter_schema_version"], 1);
+        assert_eq!(
+            inspect["capabilities"]["input_modalities"],
+            json!({"status": "known", "values": ["text"]})
+        );
+        assert_eq!(
+            inspect["capabilities"]["provider_dynamic_limits"]["attachment_count"]["max"],
+            0
+        );
+        assert_eq!(
+            inspect["capabilities"]["provider_dynamic_limits"]["message_chars"]["max"],
+            16
+        );
         assert_eq!(
             inspect["capabilities"]["input_contract"]["message"]["max_bytes"],
             262_144
@@ -10202,6 +10334,26 @@ mod tests {
                 panic!("explicit unsupported mutations must not reach browser actuation")
             }
         }
+        let provider_oversize = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "12345678901234567",
+                "expected_generation": 7,
+                "idempotency_key": "actuation-provider-limit-1"
+            }),
+            true,
+            Some(&PanicActuator),
+        );
+        assert_eq!(provider_oversize["code"], "browser_limit_exceeded");
+        assert_eq!(provider_oversize["limit"]["name"], "provider_message_chars");
+        assert_eq!(provider_oversize["limit"]["max"], 16);
+        assert_eq!(provider_oversize["limit"]["actual"], 17);
+        assert_eq!(
+            provider_oversize["supported_alternative"]["max_characters"],
+            16
+        );
         let admission = BrowserMutationAdmission::default();
         let same_account_scope = BrowserMutationScope {
             endpoint_ref: endpoint_ref.clone(),
@@ -10349,7 +10501,7 @@ mod tests {
                 provider: "chatgpt",
                 adapter_protocol_version: 1,
                 observation_generation: 8,
-                capabilities_json: r#"{"operations":["identity.inspect","session.inspect","composer.submit"]}"#,
+                capabilities_json: r#"{"schema_version":1,"operations":["identity.inspect","session.inspect","composer.submit"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"},"provider_message_chars":{"status":"unknown","authority":"provider"}}}"#,
                 observed_at: 16,
             })
             .unwrap();
@@ -10373,6 +10525,10 @@ mod tests {
         );
         assert_eq!(stale_inspect["route"]["resource_observation_generation"], 7);
         assert_eq!(stale_inspect["route"]["provider_observation_generation"], 8);
+        assert_eq!(
+            stale_inspect["capabilities"]["provider_dynamic_limits"]["message_chars"]["status"],
+            "unknown"
+        );
         let stale = browser_operation_call_with_grant(
             &store,
             "herdr_mcp.browser_dispatch.submit",

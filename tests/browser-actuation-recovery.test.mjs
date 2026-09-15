@@ -238,7 +238,8 @@ test("A to B to A registration cannot resurrect an older A response", async () =
 });
 
 test("ChatGPT session.open is the only supported existing-view open", () => {
-  assert.match(backgroundSource, /capabilities:\s*browserProviderCapabilities\(provider\)/);
+  assert.match(backgroundSource, /const capabilities = browserProviderCapabilities\(provider\)/);
+  assert.match(backgroundSource, /capabilities,\s*observed_at:/);
   assert.match(backgroundSource, /input_modalities:\s*\["text"\]/);
   assert.match(backgroundSource, /attachment_count:\s*\{\s*status:\s*"known",\s*max:\s*0/);
   assert.match(backgroundSource, /provider_message_chars:\s*\{\s*status:\s*"unknown"/);
@@ -247,6 +248,18 @@ test("ChatGPT session.open is the only supported existing-view open", () => {
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
   // No provider except chatgpt should ever reach the open postcondition.
   assert.match(wakeSource, /if \(ADAPTER\.name !== "chatgpt"\)\s*\{\s*return \{[^}]*resource_available:\s*false/);
+});
+
+test("adapter capability reprobe advances observation generation on snapshot change", () => {
+  assert.match(backgroundSource, /const browserCapabilitySnapshots = new Map\(\)/);
+  assert.match(backgroundSource, /getBrowserObservationGeneration\(provider, capabilities\)/);
+  assert.match(backgroundSource, /const previous = browserCapabilitySnapshots\.get\(provider\)/);
+  assert.match(backgroundSource, /previous !== undefined && previous !== snapshot/);
+  assert.match(
+    backgroundSource,
+    /browserObservationGeneration = Math\.max\(browserObservationGeneration \+ 1, Date\.now\(\)\)/,
+  );
+  assert.match(backgroundSource, /browserCapabilitySnapshots\.set\(provider, snapshot\)/);
 });
 
 test("background session.open recovers unique target via recoverBrowserSessionTarget and activates without message insert", () => {

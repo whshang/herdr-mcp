@@ -5137,12 +5137,11 @@ const ALLOWED_BROWSER_CAPABILITY_OPERATIONS: &[&str] = &[
 
 /// Normalize the provider capability snapshot reported by a browser adapter.
 ///
-/// The registry stores exactly one shape — the allowed `operations` list — while an
-/// adapter may report a richer object (`schema_version`, `input_modalities`,
-/// `limits`, ...). Only `operations` is authoritative: every reported operation must
-/// be in the allowlist, and sibling keys are dropped rather than persisted or treated
-/// as a hard failure. Anything without a usable `operations` array is still rejected,
-/// so a payload that only carries unrelated (possibly secret-like) fields fails closed.
+/// Only the bounded capability fields defined here are persisted. Unknown sibling
+/// fields are dropped, so an adapter cannot smuggle arbitrary page/account data into
+/// durable state. Legacy operation-only snapshots remain valid. Capability schema 1
+/// additionally preserves modality and hard/dynamic limit metadata so preflight can
+/// use the adapter's exact observation instead of reconstructing provider facts.
 fn normalize_browser_capabilities(value: &str) -> Result<String, String> {
     if value.is_empty() || value.len() > 16 * 1024 {
         return Err("browser_capabilities_invalid".to_owned());
@@ -5173,8 +5172,124 @@ fn normalize_browser_capabilities(value: &str) -> Result<String, String> {
     }
     normalized_ops.sort();
     normalized_ops.dedup();
-    serde_json::to_string(&serde_json::json!({ "operations": normalized_ops }))
+
+    let schema_version = match object.get("schema_version") {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(value @ 1..=4_294_967_295) => Some(value),
+            _ => return Err("browser_capabilities_invalid".to_owned()),
+        },
+    };
+    let mut normalized = serde_json::Map::new();
+    normalized.insert("operations".to_owned(), serde_json::json!(normalized_ops));
+    if let Some(schema_version) = schema_version {
+        normalized.insert(
+            "schema_version".to_owned(),
+            serde_json::json!(schema_version),
+        );
+    }
+    if schema_version == Some(1) {
+        for field in ["input_modalities", "output_modalities"] {
+            if let Some(value) = object.get(field) {
+                normalized.insert(
+                    field.to_owned(),
+                    normalize_browser_capability_tokens(value, 16, 32)?,
+                );
+            }
+        }
+        if let Some(value) = object.get("limits") {
+            normalized.insert(
+                "limits".to_owned(),
+                normalize_browser_capability_limits(value)?,
+            );
+        }
+    }
+    serde_json::to_string(&serde_json::Value::Object(normalized))
         .map_err(|_| "browser_capabilities_invalid".to_owned())
+}
+
+fn normalize_browser_capability_tokens(
+    value: &serde_json::Value,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<serde_json::Value, String> {
+    let Some(items) = value.as_array() else {
+        return Err("browser_capabilities_invalid".to_owned());
+    };
+    if items.len() > max_items {
+        return Err("browser_capabilities_invalid".to_owned());
+    }
+    let mut normalized = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(token) = item.as_str() else {
+            return Err("browser_capabilities_invalid".to_owned());
+        };
+        if !valid_work_memory_token(token, max_bytes) {
+            return Err("browser_capabilities_invalid".to_owned());
+        }
+        normalized.push(token.to_owned());
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(serde_json::json!(normalized))
+}
+
+fn normalize_browser_capability_limits(
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    const ALLOWED_LIMITS: &[&str] = &[
+        "attachment_count",
+        "provider_message_chars",
+        "provider_response_timeout_ms",
+        "provider_model_reasoning_combinations",
+    ];
+    const NUMERIC_LIMITS: &[&str] = &[
+        "attachment_count",
+        "provider_message_chars",
+        "provider_response_timeout_ms",
+    ];
+
+    let Some(limits) = value.as_object() else {
+        return Err("browser_capabilities_invalid".to_owned());
+    };
+    if limits.len() > 16 {
+        return Err("browser_capabilities_invalid".to_owned());
+    }
+    let mut normalized = serde_json::Map::new();
+    for name in ALLOWED_LIMITS {
+        let Some(raw) = limits.get(*name) else {
+            continue;
+        };
+        let Some(entry) = raw.as_object() else {
+            return Err("browser_capabilities_invalid".to_owned());
+        };
+        let Some(status) = entry.get("status").and_then(serde_json::Value::as_str) else {
+            return Err("browser_capabilities_invalid".to_owned());
+        };
+        if !matches!(status, "known" | "unknown") {
+            return Err("browser_capabilities_invalid".to_owned());
+        }
+        let authority = entry
+            .get("authority")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| valid_work_memory_token(value, 64))
+            .ok_or_else(|| "browser_capabilities_invalid".to_owned())?;
+        let mut canonical = serde_json::Map::new();
+        canonical.insert("status".to_owned(), serde_json::json!(status));
+        canonical.insert("authority".to_owned(), serde_json::json!(authority));
+        if NUMERIC_LIMITS.contains(name) && status == "known" {
+            let max = entry
+                .get("max")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|value| *value <= i64::MAX as u64)
+                .ok_or_else(|| "browser_capabilities_invalid".to_owned())?;
+            canonical.insert("max".to_owned(), serde_json::json!(max));
+        } else if status == "known" {
+            return Err("browser_capabilities_invalid".to_owned());
+        }
+        normalized.insert(name.to_string(), serde_json::Value::Object(canonical));
+    }
+    Ok(serde_json::Value::Object(normalized))
 }
 
 fn normalize_browser_required_apps(required_apps: &[&str]) -> Result<String, String> {
@@ -10881,22 +10996,34 @@ mod tests {
     }
 
     #[test]
-    fn browser_provider_capabilities_accept_the_adapter_shape_and_store_only_operations() {
-        // The adapter may report a richer capability object; only `operations` is
-        // authoritative and everything else is dropped, never persisted.
+    fn browser_provider_capabilities_store_only_allowlisted_adapter_metadata() {
         let adapter_shape = r#"{"schema_version":1,"operations":["composer.submit","session.create","generation.status","generation.stop","session.archive","session.inspect","session.open","composer.select_tool"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"},"provider_message_chars":{"status":"unknown","authority":"provider"},"provider_response_timeout_ms":{"status":"unknown","authority":"provider"},"provider_model_reasoning_combinations":{"status":"unknown","authority":"provider"}},"apiKey":"must-not-be-persisted"}"#;
         let normalized = normalize_browser_capabilities(adapter_shape).unwrap();
+        let normalized_value: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(normalized_value["schema_version"], 1);
         assert_eq!(
-            normalized,
-            r#"{"operations":["composer.select_tool","composer.submit","generation.status","generation.stop","session.archive","session.create","session.inspect","session.open"]}"#
+            normalized_value["input_modalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            normalized_value["output_modalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            normalized_value["limits"]["attachment_count"]["status"],
+            "known"
+        );
+        assert_eq!(normalized_value["limits"]["attachment_count"]["max"], 0);
+        assert_eq!(
+            normalized_value["limits"]["provider_message_chars"]["status"],
+            "unknown"
         );
         assert!(!normalized.contains("apiKey"));
-        assert!(!normalized.contains("schema_version"));
         assert_eq!(
             normalize_browser_capabilities(r#"{"operations":[]}"#).unwrap(),
             r#"{"operations":[]}"#
         );
-        // Duplicates collapse and the stored value is ordered deterministically.
+        // Duplicates collapse and legacy operation-only snapshots remain stable.
         assert_eq!(
             normalize_browser_capabilities(
                 r#"{"operations":["session.create","session.create","space.list"]}"#
@@ -10910,6 +11037,9 @@ mod tests {
             r#"{"operations":"session.create"}"#,
             r#"{"operations":[1]}"#,
             r#"{"operations":["unknown.operation"]}"#,
+            r#"{"schema_version":1,"operations":["session.create"],"input_modalities":"text"}"#,
+            r#"{"schema_version":1,"operations":["session.create"],"limits":{"attachment_count":{"status":"known","authority":"browser_control_v1"}}}"#,
+            r#"{"schema_version":1,"operations":["session.create"],"limits":{"provider_model_reasoning_combinations":{"status":"known","authority":"provider"}}}"#,
             r#""not-an-object""#,
             r#"[]"#,
             r#"null"#,
@@ -11079,9 +11209,34 @@ mod tests {
                 observed_at: 11,
             })
             .unwrap();
+        let observed_capabilities: serde_json::Value =
+            serde_json::from_str(&observed.capabilities_json).unwrap();
+        assert_eq!(observed_capabilities["schema_version"], 1);
         assert_eq!(
-            observed.capabilities_json,
-            r#"{"operations":["composer.select_tool","composer.submit","generation.status","generation.stop","session.archive","session.create","session.inspect","session.open"]}"#
+            observed_capabilities["input_modalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            observed_capabilities["limits"]["attachment_count"]["max"],
+            0
+        );
+
+        let reprobed = store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 1_789_378_392_883,
+                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","session.inspect"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"},"provider_message_chars":{"status":"known","max":16,"authority":"provider"}}}"#,
+                observed_at: 12,
+            })
+            .unwrap();
+        let reprobed_capabilities: serde_json::Value =
+            serde_json::from_str(&reprobed.capabilities_json).unwrap();
+        assert_eq!(reprobed.observation_generation, 1_789_378_392_883);
+        assert_eq!(
+            reprobed_capabilities["limits"]["provider_message_chars"]["max"],
+            16
         );
     }
 }
