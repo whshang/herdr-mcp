@@ -5605,18 +5605,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       let browserObservation = null;
       if (browserPageInfo && sender.tab?.id && String(msg.accountNativeIdentity || "").trim()) {
+        const observationInput = {
+          provider: browserPageInfo.site,
+          tabId: sender.tab.id,
+          convKey: String(msg.convKey || ""),
+          pageInfo: browserPageInfo,
+          accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
+          projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
+          reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
+        };
         try {
-          browserObservation = await observeBrowserConversation({
-            provider: browserPageInfo.site,
-            tabId: sender.tab.id,
-            convKey: String(msg.convKey || ""),
-            pageInfo: browserPageInfo,
-            accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
-            projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
-            reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
-          });
+          browserObservation = await observeBrowserConversation(observationInput);
         } catch (error) {
-          callLog("browser observation failed:", error?.message || String(error));
+          const code = error?.message || String(error);
+          const terminalReservationError = observationInput.reservationRef && [
+            "browser_session_reservation_not_found",
+            "browser_session_reservation_not_pending",
+            "browser_session_reservation_expired",
+            "stale_capability_generation",
+          ].includes(code);
+          if (terminalReservationError) {
+            try {
+              browserObservation = await observeBrowserConversation({
+                ...observationInput,
+                reservationRef: null,
+              });
+            } catch (retryError) {
+              callLog("browser observation failed:", retryError?.message || String(retryError));
+            }
+          } else {
+            callLog("browser observation failed:", code);
+          }
         }
       }
       let matched = bindingsForConv(bindings, msg.convKey);

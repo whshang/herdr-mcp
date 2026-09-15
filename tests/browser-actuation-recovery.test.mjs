@@ -170,15 +170,34 @@ test("service-worker recovery reports a newer generation instead of reusing a st
   assert.equal(browserSessionTargets.has(sessionRef), false);
 });
 
-test("page identity handshake exposes only opaque Browser Registry recovery identity", () => {
-  assert.match(wakeSource, /const identityMatchesRoute = Boolean\(convKey && registeredConvKey === convKey\)/);
-  assert.match(wakeSource, /browserSessionRef:\s*identityMatchesRoute \? registeredBrowserSessionRef : null/);
-  assert.match(wakeSource, /browserGeneration:\s*identityMatchesRoute \? registeredBrowserGeneration : null/);
-  assert.match(wakeSource, /registeredBrowserSessionRef\s*=\s*null;\s*\n\s*registeredBrowserGeneration\s*=\s*null;/);
-  assert.doesNotMatch(
-    wakeSource.slice(wakeSource.indexOf('if \(msg?.type === "h2w_get_convkey"\)'), wakeSource.indexOf('if \(msg?.type === "h2w_snapshot_turn"\)')),
-    /accountNativeIdentity|email|userId/i,
+test("page identity handshake lazily recovers only opaque Browser Registry identity", () => {
+  const identitySegment = wakeSource.slice(
+    wakeSource.indexOf('if (msg?.type === "h2w_get_convkey")'),
+    wakeSource.indexOf('if (msg?.type === "h2w_snapshot_turn")'),
   );
+  assert.match(identitySegment, /registerCurrentConversation\("identity-recovery"\)/);
+  assert.match(identitySegment, /return true;/);
+  assert.match(identitySegment, /const identityMatchesRoute = Boolean\(convKey && registeredConvKey === convKey\)/);
+  assert.match(identitySegment, /browserSessionRef:\s*identityMatchesRoute \? registeredBrowserSessionRef : null/);
+  assert.match(identitySegment, /browserGeneration:\s*identityMatchesRoute \? registeredBrowserGeneration : null/);
+  assert.match(wakeSource, /registeredBrowserSessionRef\s*=\s*null;\s*\n\s*registeredBrowserGeneration\s*=\s*null;/);
+  assert.doesNotMatch(identitySegment, /accountNativeIdentity|email|userId/i);
+});
+
+test("terminal stale session reservations do not block ordinary browser identity recovery", () => {
+  const registerStart = backgroundSource.indexOf('if (msg?.type === "h2w_register")');
+  const registerEnd = backgroundSource.indexOf('if (msg?.type === "h2w_insert_main")', registerStart);
+  const segment = backgroundSource.slice(registerStart, registerEnd);
+  for (const code of [
+    "browser_session_reservation_not_found",
+    "browser_session_reservation_not_pending",
+    "browser_session_reservation_expired",
+    "stale_capability_generation",
+  ]) {
+    assert.match(segment, new RegExp(code));
+  }
+  assert.match(segment, /reservationRef:\s*null/);
+  assert.doesNotMatch(segment, /browser_session_materialization_conflict[\s\S]*reservationRef:\s*null/);
 });
 
 test("conversation registration fences route changes before and after async background registration", () => {

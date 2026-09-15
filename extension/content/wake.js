@@ -2174,19 +2174,26 @@ const H2W_CONTENT_VERSION = "0.1.92";
         return true;
       }
       if (msg?.type === "h2w_get_convkey") {
-        const convKey = ADAPTER.getConversationKey();
-        const identityMatchesRoute = Boolean(convKey && registeredConvKey === convKey);
-        const project = currentChatGptProjectFromCatalog(chatGptProjectCatalogCache.projects);
-        sendResponse({
-          convKey,
-          url: location.href,
-          site: ADAPTER.name,
-          browserProjectId: project?.id || null,
-          browserProjectName: project?.name || null,
-          browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
-          browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
-        });
-        return;
+        void (async () => {
+          let convKey = ADAPTER.getConversationKey();
+          if (convKey && (registeredConvKey !== convKey
+              || !registeredBrowserSessionRef || !registeredBrowserGeneration)) {
+            await registerCurrentConversation("identity-recovery").catch(() => null);
+            convKey = ADAPTER.getConversationKey();
+          }
+          const identityMatchesRoute = Boolean(convKey && registeredConvKey === convKey);
+          const project = currentChatGptProjectFromCatalog(chatGptProjectCatalogCache.projects);
+          sendResponse({
+            convKey,
+            url: location.href,
+            site: ADAPTER.name,
+            browserProjectId: project?.id || null,
+            browserProjectName: project?.name || null,
+            browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,
+            browserGeneration: identityMatchesRoute ? registeredBrowserGeneration : null,
+          });
+        })();
+        return true;
       }
       if (msg?.type === "h2w_snapshot_turn") {
         void (async () => {
