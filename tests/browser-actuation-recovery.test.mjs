@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { chatGptConversationInfo } from "../extension/continuity-core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
@@ -13,6 +14,11 @@ const recoveryStart = backgroundSource.indexOf("async function recoverBrowserSes
 const recoveryEnd = backgroundSource.indexOf("\nasync function handleBrowserActuation", recoveryStart);
 assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart, "recovery helper must remain extractable");
 const recoverySource = backgroundSource.slice(recoveryStart, recoveryEnd);
+
+const archiveCleanupStart = backgroundSource.indexOf("function shouldCloseArchivedChatGptTab(");
+const archiveCleanupEnd = backgroundSource.indexOf("\nasync function recoverBrowserSessionTarget", archiveCleanupStart);
+assert.ok(archiveCleanupStart >= 0 && archiveCleanupEnd > archiveCleanupStart, "archive tab cleanup helpers must remain extractable");
+const archiveCleanupSource = backgroundSource.slice(archiveCleanupStart, archiveCleanupEnd);
 
 const registrationStart = wakeSource.indexOf('async function registerCurrentConversation(reason = "startup")');
 const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch()", registrationStart);
@@ -53,6 +59,66 @@ function recoveryHarness(tabRecords) {
     `${recoverySource}; return recoverBrowserSessionTarget;`,
   )(chrome, activeH2WTabUrls, browserConversationInfoFromSupportedUrl, browserSessionTargets);
   return { recover, browserSessionTargets };
+}
+
+function archiveCleanupHarness({
+  tabUrl,
+  sessionRef = "br_archive_cleanup",
+  generation = 7,
+  projectId = "g-p-6a89c078669481918c8eb70fdfd3d978",
+  target = null,
+  scope = null,
+} = {}) {
+  const tabId = 41;
+  const tabs = new Map([[tabId, { id: tabId, url: tabUrl }]]);
+  const removeCalls = [];
+  const chrome = {
+    tabs: {
+      async get(id) {
+        const tab = tabs.get(id);
+        if (!tab) throw new Error(`tab ${id} missing`);
+        return { ...tab };
+      },
+      async remove(id) {
+        removeCalls.push(id);
+        tabs.delete(id);
+      },
+    },
+  };
+  const browserSessionTargets = new Map([[sessionRef, target || {
+    provider: "chatgpt",
+    tabId,
+    projectId,
+    observationGeneration: generation,
+  }]]);
+  const browserTabScopes = new Map([[tabId, scope || {
+    provider: "chatgpt",
+    projectId,
+    observationGeneration: generation,
+  }]]);
+  const archiveTabCloseInFlight = new Set();
+  const browserConversationInfo = (provider, url) => provider === "chatgpt"
+    ? chatGptConversationInfo(url)
+    : null;
+  const api = new Function(
+    "chrome",
+    "browserConversationInfo",
+    "browserSessionTargets",
+    "browserTabScopes",
+    "archiveTabCloseInFlight",
+    `${archiveCleanupSource}; return { shouldCloseArchivedChatGptTab, closeArchivedChatGptTabAfterProjectHome };`,
+  )(chrome, browserConversationInfo, browserSessionTargets, browserTabScopes, archiveTabCloseInFlight);
+  return {
+    ...api,
+    tabId,
+    sessionRef,
+    generation,
+    projectId,
+    tabs,
+    removeCalls,
+    browserSessionTargets,
+    browserTabScopes,
+  };
 }
 
 function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") {
@@ -104,6 +170,121 @@ async function flushRegistrationToSend(harness) {
   for (let i = 0; i < 4; i += 1) await Promise.resolve();
   assert.ok(harness.pending.length > 0, "registration must reach background send");
 }
+
+test("archive cleanup closes only the exact ChatGPT tab after proven archive reaches the same Project home", async () => {
+  const harness = archiveCleanupHarness({
+    tabUrl: "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978-herdr-mcp/project",
+  });
+  const appliedEvidence = {
+    command_accepted: true,
+    resource_available: true,
+    rejected: false,
+    stable_resource_ref_observed: true,
+    lifecycle_observed: true,
+  };
+  assert.equal(harness.shouldCloseArchivedChatGptTab(
+    "herdr_mcp.browser_session.archive",
+    appliedEvidence,
+    "chatgpt",
+    harness.projectId,
+  ), true);
+  const result = await harness.closeArchivedChatGptTabAfterProjectHome({
+    tabId: harness.tabId,
+    sessionRef: harness.sessionRef,
+    expectedGeneration: harness.generation,
+    projectId: harness.projectId,
+    timeoutMs: 0,
+  });
+  assert.deepEqual(result, { closed: true, reason: "archived_project_home" });
+  assert.deepEqual(harness.removeCalls, [harness.tabId]);
+  assert.equal(harness.tabs.has(harness.tabId), false);
+  assert.equal(harness.browserSessionTargets.has(harness.sessionRef), false);
+  assert.equal(harness.browserTabScopes.has(harness.tabId), false);
+});
+
+test("archive cleanup keeps the tab when archive is uncertain or the exact Project home is not proven", async () => {
+  const conversationHarness = archiveCleanupHarness({
+    tabUrl: "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/still-open",
+  });
+  const uncertainEvidence = {
+    command_accepted: true,
+    resource_available: true,
+    rejected: false,
+    stable_resource_ref_observed: true,
+    lifecycle_observed: false,
+  };
+  assert.equal(conversationHarness.shouldCloseArchivedChatGptTab(
+    "herdr_mcp.browser_session.archive",
+    uncertainEvidence,
+    "chatgpt",
+    conversationHarness.projectId,
+  ), false);
+  const stillConversation = await conversationHarness.closeArchivedChatGptTabAfterProjectHome({
+    tabId: conversationHarness.tabId,
+    sessionRef: conversationHarness.sessionRef,
+    expectedGeneration: conversationHarness.generation,
+    projectId: conversationHarness.projectId,
+    timeoutMs: 0,
+  });
+  assert.deepEqual(stillConversation, { closed: false, reason: "project_home_not_observed" });
+  assert.deepEqual(conversationHarness.removeCalls, []);
+
+  const wrongProjectHarness = archiveCleanupHarness({
+    tabUrl: "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-other/project",
+  });
+  const wrongProject = await wrongProjectHarness.closeArchivedChatGptTabAfterProjectHome({
+    tabId: wrongProjectHarness.tabId,
+    sessionRef: wrongProjectHarness.sessionRef,
+    expectedGeneration: wrongProjectHarness.generation,
+    projectId: wrongProjectHarness.projectId,
+    timeoutMs: 0,
+  });
+  assert.deepEqual(wrongProject, { closed: false, reason: "wrong_project" });
+  assert.deepEqual(wrongProjectHarness.removeCalls, []);
+});
+
+test("archive cleanup is exact-generation fenced and duplicate close attempts are idempotent", async () => {
+  const mismatched = archiveCleanupHarness({
+    tabUrl: "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/project",
+    target: {
+      provider: "chatgpt",
+      tabId: 41,
+      projectId: "g-p-6a89c078669481918c8eb70fdfd3d978",
+      observationGeneration: 8,
+    },
+  });
+  const fenced = await mismatched.closeArchivedChatGptTabAfterProjectHome({
+    tabId: mismatched.tabId,
+    sessionRef: mismatched.sessionRef,
+    expectedGeneration: mismatched.generation,
+    projectId: mismatched.projectId,
+    timeoutMs: 0,
+  });
+  assert.deepEqual(fenced, { closed: false, reason: "session_identity_changed" });
+  assert.deepEqual(mismatched.removeCalls, []);
+
+  const duplicate = archiveCleanupHarness({
+    tabUrl: "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/project",
+  });
+  const [first, second] = await Promise.all([
+    duplicate.closeArchivedChatGptTabAfterProjectHome({
+      tabId: duplicate.tabId,
+      sessionRef: duplicate.sessionRef,
+      expectedGeneration: duplicate.generation,
+      projectId: duplicate.projectId,
+      timeoutMs: 0,
+    }),
+    duplicate.closeArchivedChatGptTabAfterProjectHome({
+      tabId: duplicate.tabId,
+      sessionRef: duplicate.sessionRef,
+      expectedGeneration: duplicate.generation,
+      projectId: duplicate.projectId,
+      timeoutMs: 0,
+    }),
+  ]);
+  assert.equal(first.closed || second.closed, true);
+  assert.deepEqual(duplicate.removeCalls, [duplicate.tabId]);
+});
 
 test("service-worker recovery rebuilds exactly one stable session target without page mutation", async () => {
   const sessionRef = "br_session_recovery";

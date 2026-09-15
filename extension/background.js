@@ -139,6 +139,7 @@ const BROWSER_PROFILE_SEED_STORAGE_KEY = "herdrBrowserProfileSeedV1";
 const BROWSER_OBSERVATION_GENERATION_STORAGE_KEY = "herdrBrowserObservationGenerationV1";
 const browserSessionTargets = new Map();
 const browserTabScopes = new Map();
+const archiveTabCloseInFlight = new Set();
 let browserEndpoint = null;
 let browserObservationGeneration = null;
 const browserCapabilitySnapshots = new Map();
@@ -2760,6 +2761,92 @@ function unavailableBrowserActuationEvidence(expectedGeneration, observedGenerat
   };
 }
 
+function shouldCloseArchivedChatGptTab(operation, evidence, provider, projectId) {
+  return operation === "herdr_mcp.browser_session.archive"
+    && provider === "chatgpt"
+    && typeof projectId === "string"
+    && projectId.length > 0
+    && evidence?.command_accepted === true
+    && evidence?.resource_available === true
+    && evidence?.rejected !== true
+    && evidence?.stable_resource_ref_observed === true
+    && evidence?.lifecycle_observed === true;
+}
+
+async function closeArchivedChatGptTabAfterProjectHome({
+  tabId,
+  sessionRef,
+  expectedGeneration,
+  projectId,
+  timeoutMs = 8000,
+  pollMs = 200,
+} = {}) {
+  if (!Number.isSafeInteger(tabId)
+      || tabId < 0
+      || typeof sessionRef !== "string"
+      || !sessionRef
+      || !Number.isSafeInteger(expectedGeneration)
+      || expectedGeneration < 1
+      || typeof projectId !== "string"
+      || !projectId) {
+    return { closed: false, reason: "invalid_identity" };
+  }
+  const closeKey = `${tabId}:${sessionRef}:${expectedGeneration}`;
+  if (archiveTabCloseInFlight.has(closeKey)) {
+    return { closed: false, reason: "already_in_flight" };
+  }
+  archiveTabCloseInFlight.add(closeKey);
+  try {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    do {
+      let tab = null;
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch (_) {
+        return { closed: true, reason: "already_closed" };
+      }
+      const live = browserConversationInfo("chatgpt", tab?.url || "");
+      if (live?.project_id && live.project_id !== projectId) {
+        return { closed: false, reason: "wrong_project" };
+      }
+      const mapped = browserSessionTargets.get(sessionRef) || null;
+      if (mapped && (mapped.tabId !== tabId
+          || mapped.observationGeneration !== expectedGeneration
+          || (mapped.projectId && mapped.projectId !== projectId))) {
+        return { closed: false, reason: "session_identity_changed" };
+      }
+      const scope = browserTabScopes.get(tabId) || null;
+      if (scope && (scope.provider !== "chatgpt"
+          || scope.observationGeneration !== expectedGeneration
+          || (scope.projectId && scope.projectId !== projectId))) {
+        return { closed: false, reason: "tab_scope_changed" };
+      }
+      if (live?.is_project_home === true && live.project_id === projectId) {
+        try {
+          await chrome.tabs.remove(tabId);
+        } catch (_) {
+          try {
+            await chrome.tabs.get(tabId);
+            return { closed: false, reason: "tab_close_failed" };
+          } catch (_) {
+            return { closed: true, reason: "already_closed" };
+          }
+        }
+        if (browserSessionTargets.get(sessionRef)?.tabId === tabId) {
+          browserSessionTargets.delete(sessionRef);
+        }
+        browserTabScopes.delete(tabId);
+        return { closed: true, reason: "archived_project_home" };
+      }
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.max(1, Number(pollMs) || 1)));
+    } while (true);
+    return { closed: false, reason: "project_home_not_observed" };
+  } finally {
+    archiveTabCloseInFlight.delete(closeKey);
+  }
+}
+
 async function recoverBrowserSessionTarget(sessionRef, expectedGeneration) {
   let observedGeneration = expectedGeneration;
   let exactTarget = null;
@@ -3113,6 +3200,21 @@ async function handleBrowserActuation(command) {
       ? response.evidence
       : { ...unavailableBrowserActuationEvidence(expectedGeneration), command_accepted: true, resource_available: true };
     await postBrowserActuationEvidence(actuationId, evidence);
+    const archiveProjectId = live?.project_id || target.projectId || null;
+    if (shouldCloseArchivedChatGptTab(operation, evidence, targetProvider, archiveProjectId)) {
+      try {
+        await closeArchivedChatGptTabAfterProjectHome({
+          tabId: target.tabId,
+          sessionRef,
+          expectedGeneration,
+          projectId: archiveProjectId,
+        });
+      } catch (error) {
+        // Archive authority has already been persisted above. Cleanup must not
+        // downgrade a proven provider archive into an uncertain mutation.
+        callLog("archived ChatGPT tab cleanup failed:", error?.message || String(error));
+      }
+    }
   } catch (_) {
     // The command may already have crossed into the content script. Report an
     // uncertain attempt rather than a retryable not-applied result.
