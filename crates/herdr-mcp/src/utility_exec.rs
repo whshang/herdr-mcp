@@ -132,7 +132,7 @@ pub fn run_durable(
                 "workspace": workspace.id,
                 "candidates": [],
                 "current_projects": detailed_project_views(snapshot, &workspace.id),
-                "hint": "workspace has no current project root — create or attach a project, then re-call with project_root set to the returned root",
+                "hint": "This workspace has no current project root; project_root requires a current attached project.",
             });
         }
         Ok(None) => {
@@ -142,7 +142,7 @@ pub fn run_durable(
                 "workspace": workspace.id,
                 "candidates": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
                 "current_projects": detailed_project_views(snapshot, &workspace.id),
-                "hint": "workspace has multiple project roots — re-call with project_root set to one of candidates",
+                "hint": "This workspace has multiple project roots; project_root must match one of the returned candidates.",
             });
         }
         Err(wanted) => {
@@ -153,7 +153,7 @@ pub fn run_durable(
                 "project_root": wanted.to_string_lossy(),
                 "candidates": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
                 "current_projects": detailed_project_views(snapshot, &workspace.id),
-                "hint": "project_root must be one of this workspace's current project roots — re-call with project_root set to one of candidates",
+                "hint": "project_root must match one of this workspace's returned project-root candidates.",
             });
         }
     };
@@ -169,7 +169,7 @@ pub fn run_durable(
     // where the rotating runtime must not become the TCC responsible client.
     // Both backends share one session registry, so a timed-out command stays
     // readable through `herdr_exec_read` and is never re-sent.
-    if crate::macos_permissions::is_protected_user_path(&effective_root) {
+    if crate::macos_permissions::project_path_needs_protected_transport(&effective_root) {
         #[cfg(unix)]
         {
             let _ = cleanup_stale_scripts();
@@ -314,7 +314,7 @@ pub(crate) fn start_reusable_pane_session(
                     "pane_id": pane_id,
                     "command": command,
                     "delivery_state": "unknown",
-                    "hint": "utility command start did not complete cleanly; inspect pane/process state before retrying",
+                    "hint": "Command start outcome is uncertain; existing pane/process state determines whether another start is safe.",
                 });
             }
         };
@@ -379,7 +379,7 @@ fn run_unix_durable(
                 "pane_id": pane_id,
                 "command": command,
                 "delivery_state": "unknown",
-                "hint": "utility command start did not complete cleanly; inspect pane/process state before retrying",
+                "hint": "Command start outcome is uncertain; existing pane/process state determines whether another start is safe.",
             });
         }
     };
@@ -499,7 +499,7 @@ fn run_native_durable(
                 "workspace": workspace_id,
                 "command": command,
                 "delivery_state": "unknown",
-                "hint": "native command start did not complete cleanly; inspect session/process state before retrying",
+                "hint": "Native command start outcome is uncertain; existing session/process state determines whether another start is safe.",
             });
         }
     };
@@ -650,7 +650,7 @@ fn utility_pane_contention_result(
         "retry_after_ms": 500,
         "delivery_state": "not_delivered",
         "safe_retry_mode": "retry_after_resource_release",
-        "hint": "utility pane is owned by an interactive program (for example less/git/gh); retry after the resource is released",
+        "hint": "The utility pane is occupied by an interactive program (for example less/git/gh) and becomes available when that program releases it.",
     })
 }
 

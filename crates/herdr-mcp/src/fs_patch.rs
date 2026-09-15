@@ -228,7 +228,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
                     "ok": false,
                     "reason": "file_dirty_confirmation_required",
                     "path": display.to_string_lossy(),
-                    "hint": "re-send with confirm_dirty:true",
+                    "hint": "A target file has uncommitted changes; confirm_dirty=true acknowledges applying the patch.",
                 });
             }
             Ok(None) => {}

@@ -156,7 +156,7 @@ fn check_with_policy_and_topology(
             "reason": "agent_working",
             "root": root.to_string_lossy(),
             "working": working,
-            "hint": "an agent in this project is working — pass confirm_busy:true to force, or wait for idle/done",
+            "hint": "A project agent is active; confirm_busy=true acknowledges concurrent modification risk, or the operation can run after the agent settles.",
         }));
     }
     Ok(working)

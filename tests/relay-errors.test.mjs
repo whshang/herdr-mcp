@@ -68,7 +68,7 @@ test("timeoutError: retryability follows operation safety", () => {
   assert.equal(timeoutError({ safety: "idempotent" }).retryable, true);
   assert.equal(timeoutError({ safety: "read" }).delivery_state, "delivery_unknown");
   assert.equal(timeoutError({ safety: "unsafe" }).retryable, false);
-  assert.match(timeoutError({ safety: "unsafe" }).message, /do not blindly retry/);
+  assert.match(timeoutError({ safety: "unsafe" }).message, /outcome is unknown/);
   assert.equal(timeoutError().retryable, false); // conservative default
 });
 

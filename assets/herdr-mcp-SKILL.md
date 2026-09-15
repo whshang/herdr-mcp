@@ -18,7 +18,7 @@ For task-specific reusable skills, support the frozen project and user `.agents`
 
 Discover candidate entrypoints only when the current task could benefit from a reusable skill. Read the matching `SKILL.md` on demand, then follow it for that task. Prefer project-scoped skills over same-name user-scoped skills. If two same-scope copies with the same skill name differ materially, read both and treat the conflict explicitly instead of silently choosing one. Do not recursively ingest every skill directory into context.
 
-Use `herdr_fs_list` / `herdr_fs_read` for project-scoped skill files inside managed roots. User-scoped skill directories are outside managed roots, so use `herdr_exec` only for bounded read-only discovery/reads of that known user skill root; do not broaden that exception into arbitrary home-directory scanning. System/developer safety constraints still outrank any local instruction or skill.
+Use `herdr_fs_list` / `herdr_fs_read` for project-scoped skill files inside managed roots. User-scoped skill directories are outside managed roots, so use `herdr_exec` only for bounded read-only discovery/reads of that known user skill root; do not broaden that exception into arbitrary home-directory scanning. When `herdr_exec.steps` is available, use one structured executable/argv step for a known file read (for example `cat` with the literal absolute path as its argv) instead of shell expansion, pipelines, redirects, command substitution, or command concatenation that the read does not require. On older contracts without `steps`, keep the freeform command to one single-purpose read. System/developer safety constraints still outrank any local instruction or skill.
 
 ## 0A. Conversation continuity recovery
 

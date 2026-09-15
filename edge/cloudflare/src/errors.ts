@@ -163,7 +163,7 @@ export function timeoutResult(opts: { requestId?: string; workstationId?: string
   const message = opts.opClass === "read"
     ? "request exceeded its deadline; retrying a read is safe"
     : opts.opClass === "mutating"
-      ? "request exceeded its deadline; outcome unknown — do not blindly retry a mutating operation"
+      ? "request exceeded its deadline; mutation outcome is unknown and may already have been applied"
       : "request exceeded its deadline; outcome unknown — verify live state before replay";
   return errorResult("request_timeout", {
     retryable,
@@ -180,7 +180,7 @@ export function timeoutResult(opts: { requestId?: string; workstationId?: string
 export function uncertainResult(opts: { requestId?: string; workstationId?: string; atMs?: number } = {}) {
   return errorResult("delivery_uncertain", {
     retryable: false,
-    message: "delivery outcome unknown after connection loss; inspect workstation state before retrying a mutating op",
+    message: "delivery outcome is unknown after connection loss; workstation state is authoritative before any repeated mutation",
     ...opts,
   });
 }

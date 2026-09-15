@@ -282,7 +282,7 @@ export class PendingRequestRegistry {
         retryable: c.retryable,
         message: c.retryable
           ? "connection lost before a confirmed result; safe to retry"
-          : "connection lost; mutation outcome unknown — do not blindly retry",
+          : "connection lost; mutation outcome is unknown and may already have been applied",
         requestId: p.requestId,
         workstationId: p.workstationId,
         atMs: now,

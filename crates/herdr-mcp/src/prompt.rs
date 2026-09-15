@@ -102,7 +102,7 @@ impl PromptRegistry {
                     "message": "a prompt with this idempotency_key is already in flight",
                     "submitted": "unknown",
                     "retryable": false,
-                    "hint": "wait for the first call result or inspect agent state; do not submit the same prompt again",
+                    "hint": "A matching submission is already in progress; repeating it can duplicate work. The existing result or live agent state identifies the outcome.",
                 })),
                 RecordState::Complete(result) => {
                     let mut replay = result.clone();
@@ -185,7 +185,7 @@ fn begin_persisted(
                 "code": "idempotency_store_unavailable",
                 "message": format!("durable idempotency reservation failed: {error}"),
                 "retryable": false,
-                "hint": "prompt was not submitted; repair the local state store before retrying",
+                "hint": "The prompt was not submitted because durable state could not be recorded. A new submission requires a healthy local state store.",
             })
         })?;
 
@@ -209,7 +209,7 @@ fn begin_persisted(
                     "submitted": "unknown",
                     "retryable": false,
                     "op_id": record.op_id,
-                    "hint": "inspect agent/live state before any retry; a runtime restart does not clear this reservation",
+                    "hint": "A durable submission reservation exists without a settled outcome. Live agent state is required before another submission; a runtime restart does not clear the reservation.",
                 })),
                 Some("complete") => {
                     let result_json = record.result_json.ok_or_else(|| {
@@ -276,7 +276,7 @@ fn complete_persisted(
             "code": "idempotency_completion_persist_failed",
             "message": format!("prompt replay payload exceeds {} bytes", MAX_REPLAY_JSON_BYTES),
             "retryable": false,
-            "hint": "the prompt may already have been submitted; inspect live state and do not blindly retry",
+            "hint": "The prompt may already have been submitted. Repeating it can duplicate work; live agent state distinguishes the outcome.",
         }));
     }
     let now = now_ms();
@@ -288,7 +288,7 @@ fn complete_persisted(
             "code": "idempotency_completion_persist_failed",
             "message": "durable idempotency store lock is unavailable after prompt execution",
             "retryable": false,
-            "hint": "the prompt may already have been submitted; inspect live state and do not blindly retry",
+            "hint": "The prompt may already have been submitted. Repeating it can duplicate work; live agent state distinguishes the outcome.",
         })
     })?;
     store
@@ -306,7 +306,7 @@ fn complete_persisted(
                 "code": "idempotency_completion_persist_failed",
                 "message": format!("durable idempotency completion failed: {error}"),
                 "retryable": false,
-                "hint": "the prompt may already have been submitted; inspect live state and do not blindly retry",
+                "hint": "The prompt may already have been submitted. Repeating it can duplicate work; live agent state distinguishes the outcome.",
             })
         })
 }
@@ -317,7 +317,7 @@ fn annotate_idempotency_persistence(mut result: Value, persistence_error: Value)
         object.insert("idempotency_persisted".to_owned(), json!(false));
         object.insert(
             "idempotency_hint".to_owned(),
-            json!("prompt outcome may already be committed while durable replay metadata is incomplete; inspect live state before retrying"),
+            json!("The prompt outcome may already be committed while durable replay metadata is incomplete; live agent state determines whether another submission is safe."),
         );
     }
     result

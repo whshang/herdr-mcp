@@ -46,7 +46,8 @@ pub fn start(
         Err(error) => return error,
     };
     let topology = projects::derive_routing(snapshot);
-    let protected_root = crate::macos_permissions::is_protected_user_path(Path::new(root));
+    let protected_root =
+        crate::macos_permissions::project_path_needs_protected_transport(Path::new(root));
     let managed = match if protected_root {
         fs_security::validate_exact_project_root_with_topology(&topology, root)
     } else {

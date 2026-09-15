@@ -63,7 +63,7 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
                     "ok": false,
                     "reason": "file_dirty_confirmation_required",
                     "path": target.resolved.to_string_lossy(),
-                    "hint": "file has uncommitted changes — re-send with confirm_dirty:true to proceed",
+                    "hint": "Uncommitted changes are present; confirm_dirty=true acknowledges editing this file.",
                 });
             }
             Ok(false) => {}
@@ -152,7 +152,7 @@ pub(crate) fn write_bytes(
             "ok": false,
             "reason": "overwrite_confirmation_required",
             "path": target.resolved.to_string_lossy(),
-            "hint": "file exists — re-send with overwrite:true (and confirm_dirty:true if dirty)",
+            "hint": "The file already exists; overwrite=true acknowledges replacement, and confirm_dirty=true is also required when it has uncommitted changes.",
         });
     }
     if existed && !confirm_dirty {
@@ -162,7 +162,7 @@ pub(crate) fn write_bytes(
                     "ok": false,
                     "reason": "file_dirty_confirmation_required",
                     "path": target.resolved.to_string_lossy(),
-                    "hint": "existing file has uncommitted changes — re-send with confirm_dirty:true to overwrite",
+                    "hint": "The existing file has uncommitted changes; confirm_dirty=true acknowledges replacement.",
                 });
             }
             Ok(false) => {}
