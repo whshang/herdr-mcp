@@ -272,6 +272,42 @@ test("ChatGPT model-visible sampler serializes Connector pills as @mentions with
   });
   const multi = element([herdrPill, text("  "), githubPill, text("   inspect this")]);
   assert.equal(perf.sampleChatGptModelMessageText(multi).text, "@herdr @github inspect this");
+
+  const toggleText = text("展开收起");
+  const toggle = {
+    nodeType: 1,
+    childNodes: [toggleText],
+    parentElement: null,
+    getAttribute(name) {
+      return name === "data-testid" ? "collapsible-user-message-toggle" : null;
+    },
+    closest(selector) {
+      if (selector === perf.DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR) return this;
+      return this.parentElement?.closest?.(selector) || null;
+    },
+    querySelector() { return null; },
+  };
+  toggleText.parentElement = toggle;
+  const longWithPill = element([
+    element([text("herdr")], {
+      "data-inline-selection-pill": "",
+      "data-keyword": "herdr",
+    }),
+    text("  Long user message body."),
+    toggle,
+  ]);
+  assert.equal(perf.sampleChatGptModelMessageText(longWithPill).text, "@herdr Long user message body.");
+  assert.doesNotMatch(perf.sampleChatGptModelMessageText(longWithPill).text, /展开|收起/);
+
+  const plainToggleText = text("展开收起");
+  const plainToggle = {
+    ...toggle,
+    childNodes: [plainToggleText],
+    parentElement: null,
+  };
+  plainToggleText.parentElement = plainToggle;
+  const longPlain = element([text("Long plain message body."), plainToggle]);
+  assert.equal(perf.sampleBoundedMessageText(longPlain).text, "Long plain message body.");
 });
 
 test("ui pressure classifier bands healthy, warning, high from bounded inputs", () => {

@@ -28,6 +28,7 @@
   const DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR = [
     '[class~="group/tool-message"]',
     '#h2w-page-hud',
+    '[data-testid="collapsible-user-message-toggle"]',
     'script',
     'style',
     'noscript',
