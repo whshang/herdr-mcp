@@ -68,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux musl build prerequisites
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: contains(matrix.target, 'linux-musl')
         shell: bash
         run: |
           set -euo pipefail
@@ -85,10 +85,16 @@ jobs:
           HERDR_MCP_BUILD_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            export CC_x86_64_unknown_linux_musl=musl-gcc
-            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-          fi
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              export CC_x86_64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+              ;;
+            aarch64-unknown-linux-musl)
+              export CC_aarch64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+              ;;
+          esac
           cargo build --locked --release -p herdr-mcp --target "${{ matrix.target }}"
       - name: Stage raw release asset
         shell: bash
@@ -103,7 +109,7 @@ jobs:
             chmod 755 "release-assets/herdr-mcp-${VERSION}-${{ matrix.target }}"
           fi
       - name: Smoke Linux release portability
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: contains(matrix.target, 'linux-musl')
         shell: bash
         run: |
           set -euo pipefail

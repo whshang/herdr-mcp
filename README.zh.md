@@ -25,6 +25,19 @@ Cloudflare Edge
 
 **[文档站](https://whshang.github.io/herdr-mcp/zh-CN/)**
 
+### 平台状态
+
+| 平台 / 架构 | 状态 | 验证情况 |
+| --- | --- | --- |
+| macOS Apple Silicon | 生产支持 | 已做实体机 runtime、TCC、Link、Connector 与浏览器插件 UAT |
+| Linux x86_64 | 生产支持 | 已做 Debian 实体机安装/lifecycle + 静态 Release qualification |
+| Linux ARM64 / aarch64 | 生产支持 | 已在 NanoPi R5C / Debian 11 做安装/Link 实体机 UAT，并通过原生 ARM64 静态 Release qualification |
+| Windows x86_64 | Candidate | 已做 hosted Windows CI/release build；尚未完成实体机 UAT |
+| Windows ARM64 / aarch64 | Candidate | 已做原生 `windows-11-arm` CI/release build；尚未完成实体机 UAT |
+| WSL | 不支持 | 尚未定义并验证 host/guest 文件系统与 lifecycle 边界 |
+
+精确的“已测试 / 尚未测试”边界见[平台支持矩阵](docs/i18n/zh-CN/platform-support-matrix.md)。
+
 ## 安装
 
 ### 推荐：给 Agent 一句话

@@ -1847,8 +1847,9 @@ fn target_for_platform(os: &str, arch: &str) -> Result<&'static str, String> {
     match (os, arch) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
         ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         (os, arch) => Err(format!("unsupported update target {os}/{arch}")),
     }
@@ -2431,7 +2432,11 @@ mod tests {
     }
 
     #[test]
-    fn release_target_mapping_uses_portable_musl_for_linux_x86_64() {
+    fn release_target_mapping_uses_portable_musl_for_linux() {
+        assert_eq!(
+            target_for_platform("linux", "aarch64").unwrap(),
+            "aarch64-unknown-linux-musl"
+        );
         assert_eq!(
             target_for_platform("linux", "x86_64").unwrap(),
             "x86_64-unknown-linux-musl"
@@ -2443,6 +2448,10 @@ mod tests {
         assert_eq!(
             target_for_platform("windows", "x86_64").unwrap(),
             "x86_64-pc-windows-msvc"
+        );
+        assert_eq!(
+            target_for_platform("windows", "aarch64").unwrap(),
+            "aarch64-pc-windows-msvc"
         );
     }
 

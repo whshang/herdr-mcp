@@ -25,6 +25,19 @@ The model keeps planning. Your computers keep the real state. Small tasks can ru
 
 **[Documentation](https://whshang.github.io/herdr-mcp/)**
 
+### Platform status
+
+| Platform / architecture | Status | Qualification |
+| --- | --- | --- |
+| macOS Apple Silicon | Production | Physical-machine runtime, TCC, Link, Connector and browser-extension UAT |
+| Linux x86_64 | Production | Physical Debian installation/lifecycle + static release qualification |
+| Linux ARM64 / aarch64 | Production | Physical NanoPi R5C Debian 11 install/Link UAT + native ARM64 static release qualification |
+| Windows x86_64 | Candidate | Hosted Windows CI/release build; physical UAT not completed |
+| Windows ARM64 / aarch64 | Candidate | Native `windows-11-arm` CI/release build; physical UAT not completed |
+| WSL | Unsupported | No qualified host/guest filesystem or lifecycle boundary |
+
+See the [platform support matrix](docs/i18n/en/platform-support-matrix.md) for the exact tested/not-yet-tested boundary.
+
 ## Install
 
 ### Recommended: paste one sentence to your Agent

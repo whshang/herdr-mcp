@@ -90,18 +90,22 @@ test("matrix publishes explicit production, candidate, and unsupported platform 
   const en = read("docs/i18n/en/platform-support-matrix.md");
   const zh = read("docs/i18n/zh-CN/platform-support-matrix.md");
 
-  assert.match(en, /\| macOS \| \*\*Production\*\*/);
-  assert.match(en, /\| Linux \(native Debian-class host\) \| \*\*Production\*\*/);
+  assert.match(en, /\| macOS \(Apple Silicon\) \| \*\*Production\*\*/);
+  assert.match(en, /\| Linux x86_64 \(native Debian-class host\) \| \*\*Production\*\*/);
+  assert.match(en, /\| Linux ARM64 \/ aarch64 \(native Debian-class host\) \| \*\*Production\*\*/);
   assert.match(en, /\| Windows x86_64 \| \*\*Candidate — not production\*\*/);
+  assert.match(en, /\| Windows ARM64 \/ aarch64 \| \*\*Candidate — not production\*\*/);
   assert.match(en, /\| WSL \| \*\*Unsupported\*\*/);
   assert.match(en, /pull\/364/);
   assert.match(en, /issues\/394/);
   assert.match(en, /Source merge and hosted CI are qualification evidence, not a production guarantee/);
   assert.match(en, /UNC\/path behavior must be covered/i);
 
-  assert.match(zh, /\| macOS \| \*\*生产支持\*\*/);
-  assert.match(zh, /\| Linux（原生 Debian 类主机） \| \*\*生产支持\*\*/);
+  assert.match(zh, /\| macOS（Apple Silicon） \| \*\*生产支持\*\*/);
+  assert.match(zh, /\| Linux x86_64（原生 Debian 类主机） \| \*\*生产支持\*\*/);
+  assert.match(zh, /\| Linux ARM64 \/ aarch64（原生 Debian 类主机） \| \*\*生产支持\*\*/);
   assert.match(zh, /\| Windows x86_64 \| \*\*候选——非生产支持\*\*/);
+  assert.match(zh, /\| Windows ARM64 \/ aarch64 \| \*\*候选——非生产支持\*\*/);
   assert.match(zh, /\| WSL \| \*\*不支持\*\*/);
   assert.match(zh, /pull\/364/);
   assert.match(zh, /issues\/394/);

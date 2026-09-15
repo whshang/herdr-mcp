@@ -237,7 +237,7 @@ test("CI Rust gate uses a trusted-main-only shared compiler cache", async () => 
   );
 });
 
-test("Rust release publishes authoritative macOS ARM64 + Debian-compatible Linux x64 + Windows x64 targets", async () => {
+test("Rust release publishes authoritative macOS ARM64 + Debian-compatible Linux ARM64/x64 + Windows ARM64/x64 targets", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const targetContract = JSON.parse(await readFile(join(ROOT, ".github/rust-release-targets.json"), "utf8"));
   assert.deepEqual(targetContract, {
@@ -245,7 +245,9 @@ test("Rust release publishes authoritative macOS ARM64 + Debian-compatible Linux
     targets: [
       { runner: "macos-15", target: "aarch64-apple-darwin" },
       { runner: "ubuntu-24.04", target: "x86_64-unknown-linux-musl" },
+      { runner: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-musl" },
       { runner: "windows-2025", target: "x86_64-pc-windows-msvc" },
+      { runner: "windows-11-arm", target: "aarch64-pc-windows-msvc" },
     ],
   });
   assert.match(release, /Load authoritative Rust release targets/);
@@ -255,6 +257,8 @@ test("Rust release publishes authoritative macOS ARM64 + Debian-compatible Linux
   assert.doesNotMatch(release, /x86_64-apple-darwin/);
   assert.match(release, /Install Linux musl build prerequisites/);
   assert.match(release, /Smoke Linux release portability/);
+  assert.match(release, /CC_aarch64_unknown_linux_musl=musl-gcc/);
+  assert.match(release, /CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc/);
   assert.match(release, /Requesting program interpreter/);
 });
 

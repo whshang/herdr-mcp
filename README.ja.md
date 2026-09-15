@@ -25,6 +25,19 @@ Cloudflare Edge
 
 **[Documentation](https://whshang.github.io/herdr-mcp/)**
 
+### Platform status
+
+| Platform / architecture | Status | Qualification |
+| --- | --- | --- |
+| macOS Apple Silicon | Production | 実機で runtime / TCC / Link / Connector / browser extension を検証済み |
+| Linux x86_64 | Production | Debian 実機 install/lifecycle + static release qualification 済み |
+| Linux ARM64 / aarch64 | Production | NanoPi R5C / Debian 11 実機 install/Link UAT + native ARM64 static release qualification 済み |
+| Windows x86_64 | Candidate | Hosted Windows CI/release build 済み、実機 UAT は未完了 |
+| Windows ARM64 / aarch64 | Candidate | Native `windows-11-arm` CI/release build 済み、実機 UAT は未完了 |
+| WSL | Unsupported | host/guest filesystem と lifecycle boundary は未検証 |
+
+詳細な tested / not-yet-tested boundary は [platform support matrix](docs/i18n/en/platform-support-matrix.md) を参照してください。
+
 ## インストール
 
 ### 推奨：Agent に一文だけ渡す
