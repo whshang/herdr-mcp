@@ -13,11 +13,12 @@ use crate::state_cache::EventCache;
 use crate::state_store::{
     BrowserDeliveryState, BrowserDispatchAuthorizationInput, BrowserDispatchReservation,
     BrowserDispatchReserveInput, BrowserDispatchUpdateInput, BrowserResourceResolveInput,
-    BrowserSessionReservation, BrowserSessionReservationInput, BrowserSessionReservationRecord,
-    ContinuitySearchInput, OperationReservation, StateStore, WorkMemoryBindingInput,
-    WorkMemoryCheckpointInput, WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput,
-    WorkMemorySearchBoundary, WorkMemorySearchPage, WorkMemorySearchPageOptions,
-    WorkMemoryTurnInput, validate_browser_lane_id, validate_browser_work_chain_id,
+    BrowserSessionArchiveIntentReservation, BrowserSessionReservation,
+    BrowserSessionReservationInput, BrowserSessionReservationRecord, ContinuitySearchInput,
+    OperationReservation, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
+    WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemorySearchBoundary,
+    WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
+    validate_browser_lane_id, validate_browser_work_chain_id,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
@@ -3226,6 +3227,77 @@ fn browser_session_archive_params_from_current_turn(
     })))
 }
 
+fn browser_session_archive_defer(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    source_user_text_sha256: &str,
+) -> Value {
+    let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+    let expected_generation = params
+        .get("expected_generation")
+        .and_then(Value::as_i64)
+        .unwrap();
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .unwrap();
+    let request_digest = browser_sha256(
+        &json!({
+            "operation": BrowserOperation::SessionArchive.method(),
+            "session_ref": session_ref,
+            "source_user_text_sha256": source_user_text_sha256,
+        })
+        .to_string(),
+    );
+    let idempotency_key_digest = browser_sha256(idempotency_key);
+    let now = browser_epoch_ms();
+    let Ok(mut store) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let reservation = match store.reserve_browser_session_archive_intent(
+        session_ref,
+        source_user_text_sha256,
+        &request_digest,
+        &idempotency_key_digest,
+        expected_generation,
+        now,
+    ) {
+        Ok(value) => value,
+        Err(error) => return browser_store_error(error),
+    };
+    let (intent, replayed) = match reservation {
+        BrowserSessionArchiveIntentReservation::Reserved(intent) => (intent, false),
+        BrowserSessionArchiveIntentReservation::Existing(intent) => (intent, true),
+    };
+    match intent.state.as_str() {
+        "applied" => json!({
+            "ok": true,
+            "code": Value::Null,
+            "operation": BrowserOperation::SessionArchive.method(),
+            "delivery_state": "applied",
+            "archive_ref": intent.archive_ref,
+            "replayed": replayed,
+        }),
+        "uncertain" => json!({
+            "ok": false,
+            "code": "uncertain",
+            "operation": BrowserOperation::SessionArchive.method(),
+            "delivery_state": "uncertain",
+            "archive_ref": intent.archive_ref,
+            "replayed": replayed,
+        }),
+        _ => json!({
+            "ok": true,
+            "code": Value::Null,
+            "operation": BrowserOperation::SessionArchive.method(),
+            "delivery_state": "deferred",
+            "archive_ref": intent.archive_ref,
+            "archive_state": intent.state,
+            "replayed": replayed,
+        }),
+    }
+}
+
 fn browser_session_create(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -3781,6 +3853,18 @@ fn browser_operation_call_with_controls(
     if let Some(error) = browser_reject_forbidden_input(object) {
         return error;
     }
+    let self_archive_source_digest = if operation == BrowserOperation::SessionArchive
+        && object.contains_key("current_user_message")
+    {
+        object
+            .get("current_user_message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(browser_sha256)
+    } else {
+        None
+    };
     let normalized_params;
     let params = if operation == BrowserOperation::SessionCreate
         && object.contains_key("source_url")
@@ -3973,6 +4057,9 @@ fn browser_operation_call_with_controls(
             controls.caller_authorization,
         ),
         BrowserOperation::SessionArchive => {
+            if let Some(source_user_text_sha256) = self_archive_source_digest.as_deref() {
+                return browser_session_archive_defer(store, params, source_user_text_sha256);
+            }
             let expected_generation = params
                 .get("expected_generation")
                 .and_then(Value::as_i64)
@@ -8959,6 +9046,131 @@ mod tests {
         );
         assert_eq!(archived["ok"], true);
         assert_eq!(archived["delivery_state"], "applied");
+    }
+
+    #[test]
+    fn browser_self_archive_reserves_durable_intent_without_mid_turn_actuation() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let session_ref = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "self-archive-durable-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.93",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["session.archive","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "self-archive-account",
+                    display_label: None,
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "self-archive-session",
+                    display_label: Some("Self archive"),
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            guard
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    "https://chatgpt.com/c/self-archive-durable",
+                    7,
+                    13,
+                )
+                .unwrap();
+            guard
+                .observe_browser_source_turn(
+                    &session.resource_ref,
+                    7,
+                    &browser_sha256("archive this conversation"),
+                    browser_epoch_ms(),
+                )
+                .unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 15,
+                })
+                .unwrap();
+            session.resource_ref
+        };
+
+        struct PanicActuator;
+        impl BrowserActuator for PanicActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("self-archive must not actuate before its source turn ends")
+            }
+        }
+
+        let deferred = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.archive",
+            &json!({
+                "current_user_message": "archive this conversation",
+                "idempotency_key": "self-archive-durable-1"
+            }),
+            true,
+            Some(&PanicActuator),
+        );
+        assert_eq!(deferred["ok"], true);
+        assert_eq!(deferred["delivery_state"], "deferred");
+        assert!(
+            deferred["archive_ref"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("bar_"))
+        );
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            guard
+                .scalar_i64(&format!(
+                    "SELECT COUNT(*) FROM browser_session_archive_intents WHERE session_ref = '{}' AND state = 'pending'",
+                    session_ref
+                ))
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[test]

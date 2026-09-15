@@ -1575,9 +1575,9 @@ const H2W_CONTENT_VERSION = "0.1.93";
     }, PENDING_SELF_ARCHIVE_POLL_MS);
   }
 
-  async function actuateChatGptArchive(conversationId, identity) {
+  async function actuateChatGptArchive(conversationId, identity, { durableAuthority = false } = {}) {
     const idempotencyKey = typeof identity?.idempotencyKey === "string" ? identity.idempotencyKey : "";
-    if (pendingSelfArchiveAlreadyClicked(idempotencyKey)) {
+    if (!durableAuthority && pendingSelfArchiveAlreadyClicked(idempotencyKey)) {
       // This exact key already dispatched an archive click whose readback was
       // inconclusive. Never click a second time; stay honest about uncertainty.
       return { outcome: "uncertain", delivered: true };
@@ -1588,7 +1588,8 @@ const H2W_CONTENT_VERSION = "0.1.93";
     // the delivery claim first, so a reload or same-key re-entry inside the
     // click/poll window cannot replay it and an unpersistable claim never
     // mutates the provider.
-    if (!markPendingSelfArchiveClicked(idempotencyKey, identity?.sessionRef, identity?.generation, conversationId)) {
+    if (!durableAuthority
+        && !markPendingSelfArchiveClicked(idempotencyKey, identity?.sessionRef, identity?.generation, conversationId)) {
       // Synchronous re-check after the menu await: a concurrent same-key call
       // may have claimed the delivery while this call waited. An already-claimed
       // key stays uncertain/delivered; otherwise the claim could not be
@@ -1670,7 +1671,20 @@ const H2W_CONTENT_VERSION = "0.1.93";
       return { ...evidence, resource_available: false };
     }
     const idempotencyKey = typeof params.idempotency_key === "string" ? params.idempotency_key : "";
+    const durableAuthority = command?.durable_archive === true;
     if (isTurnInProgress()) {
+      if (durableAuthority) {
+        // Runtime SQLite already owns this intent. Never copy a durable claim
+        // into page-local sessionStorage: tell the runtime no provider actuation
+        // occurred so it can return the intent to pending and re-arm after idle.
+        return {
+          ...evidence,
+          command_accepted: false,
+          rejected: true,
+          stable_resource_ref_observed: true,
+          lifecycle_observed: false,
+        };
+      }
       // The authoritative self-archive request is accepted and persisted now;
       // it executes once the source turn is no longer in progress.
       if (!enqueuePendingSelfArchive(params, sessionRef, registeredBrowserGeneration, conversationId)) {
@@ -1686,7 +1700,7 @@ const H2W_CONTENT_VERSION = "0.1.93";
       idempotencyKey,
       sessionRef,
       generation: registeredBrowserGeneration,
-    });
+    }, { durableAuthority });
     if (attempt.outcome === "rejected") return { ...evidence, rejected: true };
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
@@ -2142,10 +2156,35 @@ const H2W_CONTENT_VERSION = "0.1.93";
   // browser_dispatch.submit. Used as the settlement fallback only when a live
   // provider snapshot omits the user message id; it never invents an identity.
   const acceptedDispatchAssignments = new Map();
+  let durableArchiveRetryTimer = null;
+
+  function scheduleDurableArchiveRetryWake(convKey, delayMs) {
+    const targetConvKey = String(convKey || "").trim();
+    if (!targetConvKey) return false;
+    if (durableArchiveRetryTimer) clearTimeout(durableArchiveRetryTimer);
+    durableArchiveRetryTimer = setTimeout(() => {
+      durableArchiveRetryTimer = null;
+      if (!runtimeAlive() || isTurnInProgress()) return;
+      const currentConvKey = ADAPTER.getConversationKey();
+      if (!currentConvKey || currentConvKey !== targetConvKey) return;
+      try {
+        chrome.runtime.sendMessage({
+          type: "h2w_durable_archive_ready",
+          convKey: currentConvKey,
+          trigger: "bounded-retry",
+        });
+      } catch (_) {}
+    }, Math.max(0, Math.min(60000, Number(delayMs) || 0)));
+    return true;
+  }
 
   // ---- Message listener ----
   try {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (msg?.type === "h2w_schedule_durable_archive_retry") {
+        sendResponse({ ok: scheduleDurableArchiveRetryWake(msg?.convKey, msg?.delay_ms) });
+        return;
+      }
       if (msg?.type === "h2w_sync_project_instructions") {
         void performChatGptProjectInstructionsSync(msg)
           .then((result) => sendResponse(result))
@@ -4053,6 +4092,15 @@ const H2W_CONTENT_VERSION = "0.1.93";
     if (ADAPTER.name === "chatgpt") {
       startIdleNudgeWatch();
       startConversationHealthWatch();
+      if (!isTurnInProgress()) {
+        try {
+          chrome.runtime.sendMessage({
+            type: "h2w_durable_archive_ready",
+            convKey: ADAPTER.getConversationKey(),
+            trigger: "startup-idle",
+          });
+        } catch (_) {}
+      }
       // Resume a self-archive persisted before a page reload.
       if (readPendingSelfArchives().length > 0) schedulePendingSelfArchiveDrain();
     }

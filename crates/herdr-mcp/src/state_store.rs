@@ -34,6 +34,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// observation older than this is no longer resolvable and is pruned on the
 /// next observe/resolve.
 pub const BROWSER_SOURCE_TURN_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+const BROWSER_ARCHIVE_CLAIM_LEASE_MS: i64 = 30_000;
 
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
@@ -539,6 +540,45 @@ CREATE INDEX IF NOT EXISTS idx_browser_caller_sessions_resource
     ON browser_caller_sessions(session_ref);
 "#;
 
+/// Forward-additive durable deferred ChatGPT self-archive lifecycle.
+///
+/// This table is intentionally *not* a numbered schema migration. It is an
+/// additive auxiliary table that references existing schema-15 tables without
+/// altering them, so a pinned schema-15 PROD binary can still open the same DB
+/// after DEV has exercised this feature. That rollback property is required by
+/// `herdr-mcp dev rollback`; the older binary safely ignores this table.
+const BROWSER_ARCHIVE_AUXILIARY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS browser_session_archive_intents (
+    archive_ref              TEXT PRIMARY KEY NOT NULL,
+    endpoint_ref             TEXT NOT NULL,
+    provider                 TEXT NOT NULL,
+    session_ref              TEXT NOT NULL,
+    source_user_text_sha256  TEXT NOT NULL,
+    request_digest           TEXT NOT NULL,
+    idempotency_key_digest   TEXT NOT NULL,
+    state                    TEXT NOT NULL,
+    requested_generation     INTEGER NOT NULL,
+    execution_generation     INTEGER,
+    claim_attempt            INTEGER NOT NULL DEFAULT 0,
+    created_at               INTEGER NOT NULL,
+    updated_at               INTEGER NOT NULL,
+    claimed_at               INTEGER,
+    completed_at             INTEGER,
+    FOREIGN KEY (endpoint_ref) REFERENCES browser_endpoints(endpoint_ref) ON DELETE CASCADE,
+    FOREIGN KEY (session_ref) REFERENCES browser_resources(resource_ref) ON DELETE CASCADE,
+    CHECK (requested_generation > 0),
+    CHECK (execution_generation IS NULL OR execution_generation > 0),
+    CHECK (claim_attempt >= 0),
+    CHECK (state IN ('pending', 'claimed', 'applied', 'uncertain'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_session_archive_intents_idempotency
+    ON browser_session_archive_intents(endpoint_ref, provider, idempotency_key_digest);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_session_archive_intents_turn
+    ON browser_session_archive_intents(session_ref, source_user_text_sha256);
+CREATE INDEX IF NOT EXISTS idx_browser_session_archive_intents_pending
+    ON browser_session_archive_intents(session_ref, state, updated_at DESC);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -901,6 +941,31 @@ pub struct BrowserResourceLocatorRecord {
     pub observed_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSessionArchiveIntentRecord {
+    pub archive_ref: String,
+    pub endpoint_ref: String,
+    pub provider: String,
+    pub session_ref: String,
+    pub source_user_text_sha256: String,
+    pub request_digest: String,
+    pub idempotency_key_digest: String,
+    pub state: String,
+    pub requested_generation: i64,
+    pub execution_generation: Option<i64>,
+    pub claim_attempt: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub claimed_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserSessionArchiveIntentReservation {
+    Reserved(BrowserSessionArchiveIntentRecord),
+    Existing(BrowserSessionArchiveIntentRecord),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BrowserSessionReservationInput<'a> {
     pub endpoint_ref: &'a str,
@@ -1111,6 +1176,7 @@ impl StateStore {
         if path.as_os_str() == ":memory:" {
             let mut conn = open_connection(None)?;
             migrate(&mut conn)?;
+            ensure_browser_archive_auxiliary_schema(&conn)?;
             return Ok(Self { path: None, conn });
         }
 
@@ -1120,6 +1186,7 @@ impl StateStore {
         #[cfg(unix)]
         set_mode(path, 0o600)?;
         migrate(&mut conn)?;
+        ensure_browser_archive_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path.to_path_buf()),
             conn,
@@ -1143,6 +1210,7 @@ impl StateStore {
         #[cfg(unix)]
         set_mode(&path, 0o600)?;
         migrate(&mut conn)?;
+        ensure_browser_archive_auxiliary_schema(&conn)?;
         Ok(Self {
             path: Some(path),
             conn,
@@ -3673,6 +3741,483 @@ impl StateStore {
         }
     }
 
+    pub fn reserve_browser_session_archive_intent(
+        &mut self,
+        session_ref: &str,
+        source_user_text_sha256: &str,
+        request_digest: &str,
+        idempotency_key_digest: &str,
+        requested_generation: i64,
+        created_at: i64,
+    ) -> Result<BrowserSessionArchiveIntentReservation, String> {
+        validate_browser_resource_ref(session_ref)?;
+        validate_browser_digest(source_user_text_sha256, "source_user_text_sha256")?;
+        validate_browser_digest(request_digest, "request_digest")?;
+        validate_browser_digest(idempotency_key_digest, "idempotency_key_digest")?;
+        if requested_generation < 1 || created_at < 0 {
+            return Err("browser_archive_intent_invalid".to_owned());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser archive intent reservation: {error}"))?;
+        let (endpoint_ref, provider, kind, resource_generation) = tx
+            .query_row(
+                "SELECT endpoint_ref, provider, kind, observation_generation
+                 FROM browser_resources WHERE resource_ref = ?1",
+                params![session_ref],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read browser archive session: {error}"))?
+            .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+        if kind != "session" || provider != "chatgpt" {
+            return Err("browser_resource_kind_mismatch".to_owned());
+        }
+        if resource_generation != requested_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        require_current_browser_generation(&tx, &endpoint_ref, &provider, requested_generation)?;
+        let source_digest = tx
+            .query_row(
+                "SELECT user_text_sha256 FROM browser_source_turns WHERE session_ref = ?1",
+                params![session_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read browser archive source turn: {error}"))?;
+        if source_digest.as_deref() != Some(source_user_text_sha256) {
+            return Err("browser_current_turn_not_found".to_owned());
+        }
+
+        let by_idempotency = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents
+                 WHERE endpoint_ref = ?1 AND provider = ?2 AND idempotency_key_digest = ?3",
+                params![endpoint_ref, provider, idempotency_key_digest],
+                decode_browser_session_archive_intent_row,
+            )
+            .optional()
+            .map_err(|error| format!("cannot read existing browser archive intent: {error}"))?;
+        if let Some(existing) = by_idempotency {
+            if existing.session_ref != session_ref
+                || existing.source_user_text_sha256 != source_user_text_sha256
+                || existing.request_digest != request_digest
+            {
+                return Err("browser_archive_intent_idempotency_conflict".to_owned());
+            }
+            tx.commit().map_err(|error| {
+                format!("cannot commit existing browser archive intent lookup: {error}")
+            })?;
+            return Ok(BrowserSessionArchiveIntentReservation::Existing(existing));
+        }
+
+        let by_turn = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents
+                 WHERE session_ref = ?1 AND source_user_text_sha256 = ?2",
+                params![session_ref, source_user_text_sha256],
+                decode_browser_session_archive_intent_row,
+            )
+            .optional()
+            .map_err(|error| format!("cannot read browser archive intent by turn: {error}"))?;
+        if let Some(existing) = by_turn {
+            if existing.request_digest != request_digest {
+                return Err("browser_archive_intent_turn_conflict".to_owned());
+            }
+            tx.commit()
+                .map_err(|error| format!("cannot commit browser archive turn dedupe: {error}"))?;
+            return Ok(BrowserSessionArchiveIntentReservation::Existing(existing));
+        }
+
+        let archive_ref = browser_opaque_ref(
+            "bar_",
+            &[
+                "browser-session-archive-v1",
+                session_ref,
+                source_user_text_sha256,
+            ],
+        );
+        tx.execute(
+            "INSERT INTO browser_session_archive_intents(
+                 archive_ref, endpoint_ref, provider, session_ref,
+                 source_user_text_sha256, request_digest, idempotency_key_digest,
+                 state, requested_generation, execution_generation, claim_attempt,
+                 created_at, updated_at, claimed_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, 0, ?9, ?9, NULL, NULL)",
+            params![
+                archive_ref,
+                endpoint_ref,
+                provider,
+                session_ref,
+                source_user_text_sha256,
+                request_digest,
+                idempotency_key_digest,
+                requested_generation,
+                created_at,
+            ],
+        )
+        .map_err(|error| format!("cannot reserve browser archive intent: {error}"))?;
+        let record = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents WHERE archive_ref = ?1",
+                params![archive_ref],
+                decode_browser_session_archive_intent_row,
+            )
+            .map_err(|error| format!("cannot read reserved browser archive intent: {error}"))?;
+        tx.commit().map_err(|error| {
+            format!("cannot commit browser archive intent reservation: {error}")
+        })?;
+        Ok(BrowserSessionArchiveIntentReservation::Reserved(record))
+    }
+
+    pub fn claim_browser_session_archive_intent(
+        &mut self,
+        session_ref: &str,
+        claimed_at: i64,
+    ) -> Result<Option<BrowserSessionArchiveIntentRecord>, String> {
+        validate_browser_resource_ref(session_ref)?;
+        if claimed_at < 0 {
+            return Err("browser_archive_intent_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser archive intent claim: {error}"))?;
+        // `claimed` is strictly pre-actuation. The extension must durably arm
+        // the attempt (claimed -> uncertain) before it may send the browser
+        // command. A worker that disappears before that arm point therefore
+        // leaves a safely reclaimable lease; an armed/uncertain attempt is
+        // never reclaimed or replayed.
+        let stale_before = claimed_at.saturating_sub(BROWSER_ARCHIVE_CLAIM_LEASE_MS);
+        tx.execute(
+            "UPDATE browser_session_archive_intents
+             SET state = 'pending', execution_generation = NULL,
+                 claimed_at = NULL, updated_at = ?1
+             WHERE session_ref = ?2 AND state = 'claimed'
+               AND claimed_at IS NOT NULL AND claimed_at <= ?3",
+            params![claimed_at, session_ref, stale_before],
+        )
+        .map_err(|error| format!("cannot reclaim stale browser archive claim: {error}"))?;
+        let source_digest = tx
+            .query_row(
+                "SELECT user_text_sha256 FROM browser_source_turns WHERE session_ref = ?1",
+                params![session_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read browser archive claim source turn: {error}"))?;
+        let Some(source_digest) = source_digest else {
+            tx.commit().map_err(|error| {
+                format!("cannot commit empty browser archive intent claim: {error}")
+            })?;
+            return Ok(None);
+        };
+        let pending = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents
+                 WHERE session_ref = ?1 AND source_user_text_sha256 = ?2 AND state = 'pending'",
+                params![session_ref, source_digest],
+                decode_browser_session_archive_intent_row,
+            )
+            .optional()
+            .map_err(|error| format!("cannot read pending browser archive intent: {error}"))?;
+        let Some(pending) = pending else {
+            tx.commit().map_err(|error| {
+                format!("cannot commit no-op browser archive intent claim: {error}")
+            })?;
+            return Ok(None);
+        };
+        let (kind, resource_generation, webchat_control_allowed) = tx
+            .query_row(
+                "SELECT r.kind, r.observation_generation, e.webchat_control_allowed
+                 FROM browser_resources r
+                 JOIN browser_endpoints e ON e.endpoint_ref = r.endpoint_ref
+                 WHERE r.resource_ref = ?1 AND r.endpoint_ref = ?2 AND r.provider = ?3",
+                params![session_ref, pending.endpoint_ref, pending.provider],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read browser archive claim resource: {error}"))?
+            .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+        if kind != "session" {
+            return Err("browser_resource_kind_mismatch".to_owned());
+        }
+        if !webchat_control_allowed {
+            return Err("browser_control_not_allowed".to_owned());
+        }
+        require_current_browser_generation(
+            &tx,
+            &pending.endpoint_ref,
+            &pending.provider,
+            resource_generation,
+        )?;
+        let locator_generation = tx
+            .query_row(
+                "SELECT observation_generation FROM browser_resource_locators WHERE resource_ref = ?1",
+                params![session_ref],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read browser archive claim locator: {error}"))?
+            .ok_or_else(|| "browser_resource_locator_not_found".to_owned())?;
+        if locator_generation != resource_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE browser_session_archive_intents
+                 SET state = 'claimed', execution_generation = ?1,
+                     claim_attempt = claim_attempt + 1,
+                     claimed_at = ?2, updated_at = ?2
+                 WHERE archive_ref = ?3 AND state = 'pending'",
+                params![resource_generation, claimed_at, pending.archive_ref],
+            )
+            .map_err(|error| format!("cannot claim browser archive intent: {error}"))?;
+        if changed != 1 {
+            return Err("browser_archive_intent_claim_raced".to_owned());
+        }
+        let claimed = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents WHERE archive_ref = ?1",
+                params![pending.archive_ref],
+                decode_browser_session_archive_intent_row,
+            )
+            .map_err(|error| format!("cannot read claimed browser archive intent: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser archive intent claim: {error}"))?;
+        Ok(Some(claimed))
+    }
+
+    /// Durably fence an archive attempt immediately before browser actuation.
+    ///
+    /// Once this transition commits the attempt is deliberately no-replay: a
+    /// crash after this point cannot prove whether the provider click happened,
+    /// so recovery leaves it `uncertain`. Positive completion may still promote
+    /// the exact attempt to `applied`; an explicit no-delivery response may put
+    /// it back to `pending` for a later bounded trigger.
+    pub fn begin_browser_session_archive_intent(
+        &mut self,
+        archive_ref: &str,
+        execution_generation: i64,
+        claim_attempt: i64,
+        begun_at: i64,
+    ) -> Result<BrowserSessionArchiveIntentRecord, String> {
+        validate_browser_archive_ref(archive_ref)?;
+        if execution_generation < 1 || claim_attempt < 1 || begun_at < 0 {
+            return Err("browser_archive_intent_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser archive actuation fence: {error}"))?;
+        let current = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents WHERE archive_ref = ?1",
+                params![archive_ref],
+                decode_browser_session_archive_intent_row,
+            )
+            .optional()
+            .map_err(|error| format!("cannot read browser archive actuation fence: {error}"))?
+            .ok_or_else(|| "browser_archive_intent_not_found".to_owned())?;
+        if current.execution_generation != Some(execution_generation)
+            || current.claim_attempt != claim_attempt
+        {
+            return Err("browser_archive_intent_claim_conflict".to_owned());
+        }
+        if matches!(current.state.as_str(), "uncertain" | "applied") {
+            return Err("browser_archive_intent_already_begun".to_owned());
+        }
+        if current.state != "claimed" {
+            return Err("browser_archive_intent_not_claimed".to_owned());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE browser_session_archive_intents
+                 SET state = 'uncertain', updated_at = ?1
+                 WHERE archive_ref = ?2 AND state = 'claimed'
+                   AND execution_generation = ?3 AND claim_attempt = ?4",
+                params![begun_at, archive_ref, execution_generation, claim_attempt],
+            )
+            .map_err(|error| format!("cannot fence browser archive actuation: {error}"))?;
+        if changed != 1 {
+            return Err("browser_archive_intent_begin_raced".to_owned());
+        }
+        let begun = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents WHERE archive_ref = ?1",
+                params![archive_ref],
+                decode_browser_session_archive_intent_row,
+            )
+            .map_err(|error| format!("cannot read begun browser archive intent: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser archive actuation fence: {error}"))?;
+        Ok(begun)
+    }
+
+    pub fn complete_browser_session_archive_intent(
+        &mut self,
+        archive_ref: &str,
+        execution_generation: i64,
+        claim_attempt: i64,
+        delivery_state: BrowserDeliveryState,
+        completed_at: i64,
+    ) -> Result<BrowserSessionArchiveIntentRecord, String> {
+        validate_browser_archive_ref(archive_ref)?;
+        if execution_generation < 1 || claim_attempt < 1 || completed_at < 0 {
+            return Err("browser_archive_intent_invalid".to_owned());
+        }
+        let (next_state, retryable) = match delivery_state {
+            BrowserDeliveryState::Applied => ("applied", false),
+            BrowserDeliveryState::Uncertain => ("uncertain", false),
+            BrowserDeliveryState::NotApplied
+            | BrowserDeliveryState::Rejected
+            | BrowserDeliveryState::BrowserOffline
+            | BrowserDeliveryState::ResourceUnavailable => ("pending", true),
+            BrowserDeliveryState::Stopped => {
+                return Err("browser_archive_intent_delivery_state_invalid".to_owned());
+            }
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser archive intent completion: {error}"))?;
+        let current = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents WHERE archive_ref = ?1",
+                params![archive_ref],
+                decode_browser_session_archive_intent_row,
+            )
+            .optional()
+            .map_err(|error| format!("cannot read browser archive intent completion: {error}"))?
+            .ok_or_else(|| "browser_archive_intent_not_found".to_owned())?;
+        if current.execution_generation != Some(execution_generation)
+            || current.claim_attempt != claim_attempt
+        {
+            return Err("browser_archive_intent_claim_conflict".to_owned());
+        }
+        if current.state == "applied" {
+            tx.commit().map_err(|error| {
+                format!("cannot commit replayed browser archive completion: {error}")
+            })?;
+            return Ok(current);
+        }
+        if !matches!(current.state.as_str(), "claimed" | "uncertain") {
+            return Err("browser_archive_intent_not_claimed".to_owned());
+        }
+        // `claimed` is pre-actuation and may only return to pending. Any
+        // terminal result must first pass through begin_* so a crash at the
+        // browser boundary is durably no-replay.
+        if current.state == "claimed" && !retryable {
+            return Err("browser_archive_intent_not_begun".to_owned());
+        }
+        let changed = if retryable {
+            tx.execute(
+                "UPDATE browser_session_archive_intents
+                 SET state = 'pending', execution_generation = NULL,
+                     claimed_at = NULL, completed_at = NULL, updated_at = ?1
+                 WHERE archive_ref = ?2 AND state IN ('claimed', 'uncertain')
+                   AND execution_generation = ?3 AND claim_attempt = ?4",
+                params![
+                    completed_at,
+                    archive_ref,
+                    execution_generation,
+                    claim_attempt
+                ],
+            )
+        } else if next_state == "applied" {
+            tx.execute(
+                "UPDATE browser_session_archive_intents
+                 SET state = 'applied', completed_at = ?1, updated_at = ?1
+                 WHERE archive_ref = ?2 AND state = 'uncertain'
+                   AND execution_generation = ?3 AND claim_attempt = ?4",
+                params![
+                    completed_at,
+                    archive_ref,
+                    execution_generation,
+                    claim_attempt
+                ],
+            )
+        } else {
+            tx.execute(
+                "UPDATE browser_session_archive_intents
+                 SET completed_at = ?1, updated_at = ?1
+                 WHERE archive_ref = ?2 AND state = 'uncertain'
+                   AND execution_generation = ?3 AND claim_attempt = ?4",
+                params![
+                    completed_at,
+                    archive_ref,
+                    execution_generation,
+                    claim_attempt
+                ],
+            )
+        }
+        .map_err(|error| format!("cannot complete browser archive intent: {error}"))?;
+        if changed != 1 {
+            return Err("browser_archive_intent_completion_raced".to_owned());
+        }
+        let completed = tx
+            .query_row(
+                "SELECT archive_ref, endpoint_ref, provider, session_ref,
+                        source_user_text_sha256, request_digest, idempotency_key_digest,
+                        state, requested_generation, execution_generation, claim_attempt,
+                        created_at, updated_at, claimed_at, completed_at
+                 FROM browser_session_archive_intents WHERE archive_ref = ?1",
+                params![archive_ref],
+                decode_browser_session_archive_intent_row,
+            )
+            .map_err(|error| format!("cannot read completed browser archive intent: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser archive intent completion: {error}"))?;
+        Ok(completed)
+    }
+
     fn prune_browser_source_turns(&mut self, reference_at: i64) -> Result<(), String> {
         self.conn
             .execute(
@@ -4781,6 +5326,28 @@ fn decode_stored_browser_dispatch(
     })
 }
 
+fn decode_browser_session_archive_intent_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BrowserSessionArchiveIntentRecord> {
+    Ok(BrowserSessionArchiveIntentRecord {
+        archive_ref: row.get(0)?,
+        endpoint_ref: row.get(1)?,
+        provider: row.get(2)?,
+        session_ref: row.get(3)?,
+        source_user_text_sha256: row.get(4)?,
+        request_digest: row.get(5)?,
+        idempotency_key_digest: row.get(6)?,
+        state: row.get(7)?,
+        requested_generation: row.get(8)?,
+        execution_generation: row.get(9)?,
+        claim_attempt: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        claimed_at: row.get(13)?,
+        completed_at: row.get(14)?,
+    })
+}
+
 fn read_browser_dispatch_by_ref(
     conn: &Connection,
     dispatch_id: &str,
@@ -5055,6 +5622,19 @@ fn validate_browser_session_reservation_ref(value: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("browser_session_reservation_ref_invalid".to_owned())
+    }
+}
+
+fn validate_browser_archive_ref(value: &str) -> Result<(), String> {
+    if value.len() == 68
+        && value.starts_with("bar_")
+        && value[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err("browser_archive_ref_invalid".to_owned())
     }
 }
 
@@ -6758,6 +7338,26 @@ fn migrate(conn: &mut Connection) -> Result<(), String> {
     migrate_to(conn, SCHEMA_VERSION, MIGRATIONS)
 }
 
+fn ensure_browser_archive_auxiliary_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(BROWSER_ARCHIVE_AUXILIARY_SCHEMA)
+        .map_err(|error| format!("cannot ensure browser archive auxiliary schema: {error}"))?;
+    let has_claim_attempt = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('browser_session_archive_intents') WHERE name = 'claim_attempt'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("cannot inspect browser archive auxiliary schema: {error}"))?;
+    if has_claim_attempt == 0 {
+        conn.execute(
+            "ALTER TABLE browser_session_archive_intents ADD COLUMN claim_attempt INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|error| format!("cannot extend browser archive auxiliary schema: {error}"))?;
+    }
+    Ok(())
+}
+
 fn migrate_to(conn: &mut Connection, target: i64, migrations: &[&str]) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -7022,6 +7622,7 @@ mod tests {
             "service_rollbacks",
             "browser_dispatches",
             "browser_source_turns",
+            "browser_session_archive_intents",
         ] {
             assert!(tables.contains(&table.to_owned()), "missing table {table}");
         }
@@ -7038,6 +7639,9 @@ mod tests {
             "idx_service_rollbacks_created",
             "idx_browser_dispatches_idempotency",
             "idx_browser_source_turns_hash",
+            "idx_browser_session_archive_intents_idempotency",
+            "idx_browser_session_archive_intents_turn",
+            "idx_browser_session_archive_intents_pending",
         ] {
             assert!(indexes.contains(&index.to_owned()), "missing index {index}");
         }
@@ -7062,6 +7666,17 @@ mod tests {
         assert_eq!(
             source_turn_columns, 0,
             "durable source turns must store only the user-text digest"
+        );
+        let archive_plaintext_columns = store
+            .scalar_i64(
+                "SELECT COUNT(*) FROM pragma_table_info('browser_session_archive_intents') \
+                 WHERE name IN ('current_user_message', 'user_text', 'message', 'text')",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            archive_plaintext_columns, 0,
+            "durable archive intents must never persist source-message plaintext"
         );
         std::fs::remove_file(&path).ok();
     }
@@ -8830,6 +9445,53 @@ mod tests {
     }
 
     #[test]
+    fn schema_v15_adds_durable_archive_intents_without_breaking_old_binary_reopen() {
+        let path = temp_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(15) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '15')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            assert!(
+                !list_names(
+                    &conn,
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                )
+                .unwrap()
+                .contains(&"browser_session_archive_intents".to_owned())
+            );
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 15);
+        assert!(
+            store
+                .table_names()
+                .unwrap()
+                .contains(&"browser_session_archive_intents".to_owned())
+        );
+        drop(store);
+
+        // Simulate the pinned pre-feature PROD binary: it understands the same
+        // numbered schema 15, sees the additive table, and must still open the
+        // database without a downgrade or backup restore.
+        let mut old_binary_conn = open_connection(Some(&path)).unwrap();
+        migrate_to(&mut old_binary_conn, 15, MIGRATIONS).unwrap();
+        assert_eq!(i64_schema_version(&old_binary_conn).unwrap(), 15);
+        drop(old_binary_conn);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn schema_v7_upgrades_through_v11_and_preserves_browser_registry() {
         let path = temp_db_path();
         let endpoint_ref;
@@ -8908,6 +9570,7 @@ mod tests {
                 "browser_caller_sessions",
                 "browser_dispatches",
                 "browser_resource_locators",
+                "browser_session_archive_intents",
                 "browser_session_reservations",
                 "browser_source_turns"
             ]
@@ -9405,6 +10068,314 @@ mod tests {
                 "browser_current_turn_ambiguous"
             );
         }
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn browser_session_archive_intents_are_durable_rebind_and_never_replay_uncertain() {
+        let path = temp_db_path();
+        let source_digest = sha256_text("archive this conversation");
+        let request_digest = sha256_text("archive-request");
+        let idempotency_digest = sha256_text("archive-idempotency");
+        let second_source_digest = sha256_text("archive another conversation");
+        let second_request_digest = sha256_text("archive-request-2");
+        let second_idempotency_digest = sha256_text("archive-idempotency-2");
+        let session_a;
+        let session_b;
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            let (endpoint_ref, first, second) = browser_dispatch_fixture(&mut store, 7, "archive");
+            session_a = first;
+            session_b = second;
+            store
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 6,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(
+                    &session_a,
+                    "https://chatgpt.com/c/archive-a",
+                    7,
+                    10,
+                )
+                .unwrap();
+            store
+                .observe_browser_source_turn(&session_a, 7, &source_digest, 11)
+                .unwrap();
+            let reserved = store
+                .reserve_browser_session_archive_intent(
+                    &session_a,
+                    &source_digest,
+                    &request_digest,
+                    &idempotency_digest,
+                    7,
+                    12,
+                )
+                .unwrap();
+            let archive_ref = match reserved {
+                BrowserSessionArchiveIntentReservation::Reserved(record) => {
+                    assert_eq!(record.state, "pending");
+                    record.archive_ref
+                }
+                BrowserSessionArchiveIntentReservation::Existing(_) => {
+                    panic!("first reserve replayed")
+                }
+            };
+            match store
+                .reserve_browser_session_archive_intent(
+                    &session_a,
+                    &source_digest,
+                    &request_digest,
+                    &idempotency_digest,
+                    7,
+                    13,
+                )
+                .unwrap()
+            {
+                BrowserSessionArchiveIntentReservation::Existing(record) => {
+                    assert_eq!(record.archive_ref, archive_ref)
+                }
+                BrowserSessionArchiveIntentReservation::Reserved(_) => panic!("duplicate reserve"),
+            }
+            assert_eq!(
+                store
+                    .reserve_browser_session_archive_intent(
+                        &session_a,
+                        &source_digest,
+                        &sha256_text("conflicting request"),
+                        &idempotency_digest,
+                        7,
+                        14,
+                    )
+                    .unwrap_err(),
+                "browser_archive_intent_idempotency_conflict"
+            );
+
+            // Simulate a safe Extension/provider rebind after the self-archive
+            // request but before the assistant turn ends. The stable session ref
+            // remains authoritative and claim must use generation 8.
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 8,
+                    capabilities_json: r#"{"operations":["session.archive"]}"#,
+                    observed_at: 20,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "archive-account",
+                    display_label: None,
+                    observation_generation: 8,
+                    observed_at: 21,
+                })
+                .unwrap();
+            let rebound_a = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "archive-session-a",
+                    display_label: None,
+                    observation_generation: 8,
+                    observed_at: 22,
+                })
+                .unwrap();
+            let rebound_b = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "archive-session-b",
+                    display_label: None,
+                    observation_generation: 8,
+                    observed_at: 23,
+                })
+                .unwrap();
+            assert_eq!(rebound_a.resource_ref, session_a);
+            assert_eq!(rebound_b.resource_ref, session_b);
+            store
+                .upsert_browser_resource_locator(
+                    &session_a,
+                    "https://chatgpt.com/c/archive-a",
+                    8,
+                    24,
+                )
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(
+                    &session_b,
+                    "https://chatgpt.com/c/archive-b",
+                    8,
+                    25,
+                )
+                .unwrap();
+        }
+
+        let mut reopened = StateStore::open(&path).unwrap();
+        let claimed = reopened
+            .claim_browser_session_archive_intent(&session_a, 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.state, "claimed");
+        assert_eq!(claimed.requested_generation, 7);
+        assert_eq!(claimed.execution_generation, Some(8));
+        assert_eq!(claimed.claim_attempt, 1);
+        assert!(
+            reopened
+                .claim_browser_session_archive_intent(&session_a, 31)
+                .unwrap()
+                .is_none()
+        );
+
+        // Explicit not-delivered evidence is the only completion allowed to
+        // become retryable again.
+        let retryable = reopened
+            .complete_browser_session_archive_intent(
+                &claimed.archive_ref,
+                8,
+                claimed.claim_attempt,
+                BrowserDeliveryState::NotApplied,
+                32,
+            )
+            .unwrap();
+        assert_eq!(retryable.state, "pending");
+        let claimed_again = reopened
+            .claim_browser_session_archive_intent(&session_a, 33)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed_again.claim_attempt, 2);
+        let begun = reopened
+            .begin_browser_session_archive_intent(
+                &claimed_again.archive_ref,
+                8,
+                claimed_again.claim_attempt,
+                34,
+            )
+            .unwrap();
+        assert_eq!(begun.state, "uncertain");
+        assert_eq!(
+            reopened
+                .begin_browser_session_archive_intent(
+                    &claimed_again.archive_ref,
+                    8,
+                    claimed_again.claim_attempt,
+                    34,
+                )
+                .unwrap_err(),
+            "browser_archive_intent_already_begun"
+        );
+        let uncertain = reopened
+            .complete_browser_session_archive_intent(
+                &claimed_again.archive_ref,
+                8,
+                claimed_again.claim_attempt,
+                BrowserDeliveryState::Uncertain,
+                35,
+            )
+            .unwrap();
+        assert_eq!(uncertain.state, "uncertain");
+        assert!(
+            reopened
+                .claim_browser_session_archive_intent(&session_a, 36)
+                .unwrap()
+                .is_none()
+        );
+
+        // A different exact source turn can independently settle applied.
+        reopened
+            .observe_browser_source_turn(&session_b, 8, &second_source_digest, 40)
+            .unwrap();
+        let second = match reopened
+            .reserve_browser_session_archive_intent(
+                &session_b,
+                &second_source_digest,
+                &second_request_digest,
+                &second_idempotency_digest,
+                8,
+                41,
+            )
+            .unwrap()
+        {
+            BrowserSessionArchiveIntentReservation::Reserved(record) => record,
+            BrowserSessionArchiveIntentReservation::Existing(_) => panic!("unexpected replay"),
+        };
+        let second_claim = reopened
+            .claim_browser_session_archive_intent(&session_b, 42)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_claim.archive_ref, second.archive_ref);
+        assert_eq!(second_claim.claim_attempt, 1);
+        assert!(
+            reopened
+                .claim_browser_session_archive_intent(
+                    &session_b,
+                    42 + BROWSER_ARCHIVE_CLAIM_LEASE_MS - 1,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let reclaimed = reopened
+            .claim_browser_session_archive_intent(
+                &session_b,
+                42 + BROWSER_ARCHIVE_CLAIM_LEASE_MS + 1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed.claim_attempt, 2);
+        assert_eq!(
+            reopened
+                .begin_browser_session_archive_intent(
+                    &second_claim.archive_ref,
+                    8,
+                    second_claim.claim_attempt,
+                    42 + BROWSER_ARCHIVE_CLAIM_LEASE_MS + 2,
+                )
+                .unwrap_err(),
+            "browser_archive_intent_claim_conflict"
+        );
+        let begun = reopened
+            .begin_browser_session_archive_intent(
+                &reclaimed.archive_ref,
+                8,
+                reclaimed.claim_attempt,
+                42 + BROWSER_ARCHIVE_CLAIM_LEASE_MS + 3,
+            )
+            .unwrap();
+        assert_eq!(begun.state, "uncertain");
+        let applied = reopened
+            .complete_browser_session_archive_intent(
+                &reclaimed.archive_ref,
+                8,
+                reclaimed.claim_attempt,
+                BrowserDeliveryState::Applied,
+                42 + BROWSER_ARCHIVE_CLAIM_LEASE_MS + 4,
+            )
+            .unwrap();
+        assert_eq!(applied.state, "applied");
+        assert!(
+            reopened
+                .claim_browser_session_archive_intent(&session_b, 44)
+                .unwrap()
+                .is_none()
+        );
+        drop(reopened);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
