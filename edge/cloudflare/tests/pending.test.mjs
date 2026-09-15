@@ -197,6 +197,33 @@ test("registry: snapshot/restore + restoreIdem round trip", () => {
   assert.equal(again.status, "idem_hit");
 });
 
+
+test("registry: completion and idempotency retention stays bounded under multi-principal churn", () => {
+  const limits = makeLimits();
+  limits.maxCompletedRecords = 4;
+  const r = new PendingRequestRegistry({ limits });
+
+  for (let i = 0; i < 40; i += 1) {
+    const requestId = `stress-${i}`;
+    const added = r.add(pendingReq({
+      requestId,
+      resourcePrincipalRef: `principal:${i % 3}`,
+      idempotencyKey: `idem-${i}`,
+    }));
+    assert.equal(added.status, "added");
+    r.markSent(requestId, i + 1);
+    r.settle(requestId, { status: "ok", result: { i }, servedAtMs: i + 1 });
+  }
+
+  assert.equal(r.totalPendingSize(), 0);
+  assert.equal(r.completedEntries().length, 4);
+  assert.equal(r.completedFor("stress-0"), undefined);
+  assert.equal(r.completedFor("stress-39").status, "ok");
+  assert.equal(r.idempotencyKeyFor("stress-0"), undefined,
+    "evicted completion must not leave an unbounded idempotency index entry");
+  assert.equal(r.idempotencyKeyFor("stress-39"), "idem-39");
+});
+
 test("registry: completed TTL expiry + drop", () => {
   const limits = makeLimits();
   limits.completedRecordTtlMs = 100;
@@ -224,6 +251,7 @@ test("registry: liveCount excludes expired durable backlog", () => {
 test("limits: defaults + request timeout clamp", () => {
   const l = makeLimits();
   assert.equal(l.maxPendingRequests, 256);
+  assert.equal(l.maxPendingPerPrincipal, 8);
   assert.equal(l.maxFrameBytes, 1_048_576);
   assert.equal(l.requestTimeoutMs, 30_000);
   assert.equal(l.linkReconnectGraceMs, 15_000);

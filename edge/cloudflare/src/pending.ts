@@ -17,6 +17,8 @@ export type PendingState = "queued" | "sent" | "settled";
 export interface PendingRequest {
   requestId: string;
   workstationId: string;
+  /** Trusted Edge-only ownership key used for per-principal admission. */
+  resourcePrincipalRef?: string;
   op: string;
   opClass: OpClass;
   /** Diagnostic summary only — NO argument values, ever. */
@@ -38,6 +40,11 @@ export interface IdempotencyRecord {
   requestId: string;
   op: string;
   settledAtMs: number;
+}
+
+export interface PrunedCompletion {
+  requestId: string;
+  idempotencyKey?: string;
 }
 
 /** Decode a pending request persisted in Durable Object storage. */
@@ -139,6 +146,12 @@ export class PendingRequestRegistry {
     return undefined;
   }
 
+  idempotentCompletion(op: string, idempotencyKey: string): Completion | undefined {
+    const rec = this.idemByKey.get(idempotencyKey);
+    if (!rec || rec.op !== op) return undefined;
+    return this.completed.get(rec.requestId);
+  }
+
   add(req: Omit<PendingRequest, "state" | "createdAtMs">): AddOutcome {
     const now = this.now();
     // Idempotency-key replay is a pure dedup decision; mutating ops should
@@ -191,7 +204,10 @@ export class PendingRequestRegistry {
     return p;
   }
 
-  settle(requestId: string, completion: Completion): PendingRequest | undefined {
+  settle(
+    requestId: string,
+    completion: Completion,
+  ): { entry: PendingRequest; pruned: PrunedCompletion[] } | undefined {
     const p = this.pending.get(requestId);
     if (!p) return undefined;
     p.state = "settled";
@@ -201,8 +217,8 @@ export class PendingRequestRegistry {
     // Keeping settled entries here leaks one capacity slot per tools/call and
     // eventually makes every new request fail with edge_capacity_exceeded.
     this.pending.delete(requestId);
-    this.recordSettlement(p, completion);
-    return p;
+    const pruned = this.recordSettlement(p, completion);
+    return { entry: p, pruned };
   }
 
   /**
@@ -213,7 +229,7 @@ export class PendingRequestRegistry {
    * still settle correctly and the evicted request never resurrects on
    * rehydrate. Normal `settle()` reuses this after deleting the active slot.
    */
-  recordSettlement(entry: PendingRequest, completion: Completion): void {
+  recordSettlement(entry: PendingRequest, completion: Completion): PrunedCompletion[] {
     this.completed.set(entry.requestId, completion);
     if (entry.idempotencyKey !== undefined) {
       this.idemByKey.set(entry.idempotencyKey, {
@@ -223,6 +239,7 @@ export class PendingRequestRegistry {
         settledAtMs: this.now(),
       });
     }
+    return this.pruneCompletedCache();
   }
 
   /** Completion for a request the caller has a requestId for (replay after settle). */
@@ -332,10 +349,17 @@ export class PendingRequestRegistry {
     return this.pending.size;
   }
 
-  private pruneCompletedCache(): void {
-    if (this.completed.size <= this.limits.maxCompletedRecords) return;
+  private pruneCompletedCache(): PrunedCompletion[] {
+    if (this.completed.size <= this.limits.maxCompletedRecords) return [];
     const sorted = [...this.completed.entries()].sort((a, b) => a[1].servedAtMs - b[1].servedAtMs);
     const drop = sorted.slice(0, sorted.length - this.limits.maxCompletedRecords);
-    for (const [requestId] of drop) this.completed.delete(requestId);
+    const pruned: PrunedCompletion[] = [];
+    for (const [requestId] of drop) {
+      const idempotencyKey = this.idempotencyKeyFor(requestId);
+      this.completed.delete(requestId);
+      if (idempotencyKey !== undefined) this.idemByKey.delete(idempotencyKey);
+      pruned.push({ requestId, ...(idempotencyKey !== undefined ? { idempotencyKey } : {}) });
+    }
+    return pruned;
   }
 }

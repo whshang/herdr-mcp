@@ -100,6 +100,7 @@ export function errorResult(
     delivery_state?: string;
     retry_after_ms?: number;
     recovery?: RecoveryPolicy;
+    details?: unknown;
   } = {},
 ): RelayErrorResult {
   const requiresHuman = opts.requires_human ?? relayErrorRequiresHuman(code);
@@ -115,6 +116,7 @@ export function errorResult(
     ...(opts.delivery_state !== undefined ? { delivery_state: opts.delivery_state } : {}),
     ...(opts.retry_after_ms !== undefined ? { retry_after_ms: opts.retry_after_ms } : {}),
     ...(opts.recovery !== undefined ? { recovery: opts.recovery } : {}),
+    ...(opts.details !== undefined ? { details: opts.details } : {}),
   };
 }
 
@@ -184,13 +186,29 @@ export function uncertainResult(opts: { requestId?: string; workstationId?: stri
 }
 
 /** Edge capacity (pending registry full). Retryable after backpressure. */
-export function capacityResult(opts: { requestId?: string; workstationId?: string; atMs?: number } = {}) {
+export function capacityResult(opts: {
+  requestId?: string;
+  workstationId?: string;
+  atMs?: number;
+  resourceKey?: string;
+  limit?: number;
+  active?: number;
+} = {}) {
+  const { resourceKey, limit, active, ...base } = opts;
   return errorResult("edge_capacity_exceeded", {
     retryable: true,
     delivery_state: "not_delivered",
     retry_after_ms: EDGE_CAPACITY_RETRY_AFTER_MS,
     message: "edge pending-request capacity exceeded; request was not delivered, retry after backpressure",
-    ...opts,
+    ...(resourceKey !== undefined && limit !== undefined ? {
+      details: {
+        quota_scope: "principal",
+        resource_key: resourceKey,
+        limit,
+        ...(active !== undefined ? { active } : {}),
+      },
+    } : {}),
+    ...base,
   });
 }
 

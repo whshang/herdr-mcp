@@ -538,3 +538,191 @@ test("a read that settles after a mutation cannot repopulate stale dedupe state"
   });
   assert.equal((await freshRead).status, 200);
 });
+
+test("one noisy principal cannot consume all downstream request capacity", async () => {
+  const { subject, events } = makeSubject();
+  await init(subject, events);
+
+  const noisy = "principal:noisy";
+  const quiet = "principal:quiet";
+  const noisyPending = [];
+  for (let i = 0; i < 8; i += 1) {
+    noisyPending.push(subject.forwardInternal({
+      kind: "request",
+      requestId: `noisy-${i}`,
+      resourcePrincipalRef: noisy,
+      op: "herdr_inspect",
+      deadlineMs: Date.now() + 30_000,
+    }));
+  }
+  assert.equal(events.filter((event) => event[0] === "send").length, 8);
+
+  const rejected = await subject.forwardInternal({
+    kind: "request",
+    requestId: "noisy-over-limit",
+    resourcePrincipalRef: noisy,
+    op: "herdr_inspect",
+    deadlineMs: Date.now() + 30_000,
+  });
+  assert.equal(rejected.status, 429);
+  const rejection = await rejected.json();
+  assert.equal(rejection.error.code, "edge_capacity_exceeded");
+  assert.equal(rejection.error.retryable, true);
+  assert.equal(rejection.error.delivery_state, "not_delivered");
+  assert.equal(rejection.error.retry_after_ms, 1_000);
+  assert.deepEqual(rejection.error.details, {
+    quota_scope: "principal",
+    resource_key: noisy,
+    limit: 8,
+    active: 8,
+  });
+
+  const quietPending = subject.forwardInternal({
+    kind: "request",
+    requestId: "quiet-0",
+    resourcePrincipalRef: quiet,
+    op: "herdr_inspect",
+    deadlineMs: Date.now() + 30_000,
+  });
+  assert.equal(events.filter((event) => event[0] === "send").length, 9,
+    "an unrelated principal must retain downstream progress capacity");
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "quiet-0",
+    result: { ok: true },
+    served_at_ms: Date.now(),
+  });
+  assert.equal((await quietPending).status, 200);
+
+  for (let i = 0; i < 8; i += 1) {
+    await subject.handleToolResult({
+      protocol_version: 1,
+      kind: "tool_result",
+      workstation_id: "prod-real-runtime",
+      request_id: `noisy-${i}`,
+      result: { ok: true },
+      served_at_ms: Date.now(),
+    });
+  }
+  const settled = await Promise.all(noisyPending);
+  assert.ok(settled.every((response) => response.status === 200));
+});
+
+test("principal admission counts current Link occupancy past its deadline and idempotency replay bypasses saturation", async () => {
+  const { subject, events } = makeSubject();
+  await init(subject, events);
+  const principal = "principal:saturated";
+
+  subject.registry.add({
+    requestId: "replay-source",
+    workstationId: "prod-real-runtime",
+    resourcePrincipalRef: principal,
+    op: "herdr_prompt",
+    opClass: "mutating",
+    argsSummary: { argKeys: [] },
+    deadlineMs: Date.now() + 30_000,
+    idempotencyKey: "replay-key",
+  });
+  subject.registry.markSent("replay-source", Date.now());
+  subject.registry.settle("replay-source", {
+    status: "ok",
+    result: { replayed: true },
+    servedAtMs: Date.now(),
+  });
+
+  const active = [];
+  for (let i = 0; i < 8; i += 1) {
+    const requestId = `occupied-${i}`;
+    active.push(subject.forwardInternal({
+      kind: "request",
+      requestId,
+      resourcePrincipalRef: principal,
+      op: "herdr_prompt",
+      args: { target: "worker", text: `occupy-${i}` },
+      idempotencyKey: `occupied-idem-${i}`,
+      deadlineMs: Date.now() + 30_000,
+    }));
+  }
+  for (let i = 0; i < 8; i += 1) {
+    const entry = subject.registry.get(`occupied-${i}`);
+    assert.ok(entry);
+    entry.deadlineMs = Date.now() - 1;
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const blockedRead = await subject.forwardInternal({
+    kind: "request",
+    requestId: "expired-principal-read",
+    resourcePrincipalRef: principal,
+    op: "herdr_inspect",
+    deadlineMs: Date.now() + 30_000,
+  });
+  assert.equal(blockedRead.status, 429,
+    "current Link work must keep consuming principal capacity even if its stored deadline has passed");
+
+  const sendsBeforeReplay = events.filter((event) => event[0] === "send").length;
+  const replay = await subject.forwardInternal({
+    kind: "request",
+    requestId: "replay-at-limit",
+    resourcePrincipalRef: principal,
+    op: "herdr_prompt",
+    args: { target: "worker", text: "must not resend" },
+    idempotencyKey: "replay-key",
+    deadlineMs: Date.now() + 30_000,
+  });
+  assert.equal(replay.status, 200);
+  const replayBody = await replay.json();
+  assert.equal(replayBody.completion.result.replayed, true);
+  assert.equal(events.filter((event) => event[0] === "send").length, sendsBeforeReplay,
+    "an idempotent replay must return the stored completion without consuming capacity or resending");
+
+  for (let i = 0; i < 8; i += 1) {
+    await subject.handleToolResult({
+      protocol_version: 1,
+      kind: "tool_result",
+      workstation_id: "prod-real-runtime",
+      request_id: `occupied-${i}`,
+      result: { ok: true },
+      served_at_ms: Date.now(),
+    });
+  }
+  assert.ok((await Promise.all(active)).every((response) => response.status === 200));
+});
+
+test("ordinary mutation settlement bounds durable completed and idempotency rows", async () => {
+  const { subject, storage, events } = makeSubject();
+  await init(subject, events);
+  subject.limits.maxCompletedRecords = 2;
+
+  for (let i = 0; i < 4; i += 1) {
+    const requestId = `retained-${i}`;
+    const pending = subject.forwardInternal({
+      kind: "request",
+      requestId,
+      resourcePrincipalRef: "principal:retention",
+      op: "herdr_prompt",
+      args: { target: "worker", text: `turn-${i}` },
+      idempotencyKey: `retained-idem-${i}`,
+      deadlineMs: Date.now() + 30_000,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await subject.handleToolResult({
+      protocol_version: 1,
+      kind: "tool_result",
+      workstation_id: "prod-real-runtime",
+      request_id: requestId,
+      result: { ok: true, i },
+      served_at_ms: Date.now() + i,
+    });
+    assert.equal((await pending).status, 200);
+  }
+
+  const completedKeys = [...storage.map.keys()].filter((key) => String(key).startsWith("completed:"));
+  const idemKeys = [...storage.map.keys()].filter((key) => String(key).startsWith("idem:"));
+  assert.equal(completedKeys.length, 2);
+  assert.equal(idemKeys.length, 2);
+  assert.deepEqual(completedKeys.sort(), ["completed:retained-2", "completed:retained-3"]);
+  assert.deepEqual(idemKeys.sort(), ["idem:retained-idem-2", "idem:retained-idem-3"]);
+});

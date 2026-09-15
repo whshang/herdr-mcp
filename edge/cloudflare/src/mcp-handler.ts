@@ -44,6 +44,17 @@ function stableDedupeValue(value: unknown): unknown {
   return out;
 }
 
+async function resourcePrincipalRef(client?: McpClientContext): Promise<string> {
+  const identity = client?.connectorId
+    ? `connector:${client.connectorId}`
+    : client?.oauthClientId
+      ? `oauth_client:${client.oauthClientId}`
+      : client?.authSource
+        ? `auth:${client.authSource}`
+        : "anonymous";
+  return `principal:${await sha256Hex(identity)}`;
+}
+
 export type JsonRpcId = string | number | null;
 
 export interface McpRequest {
@@ -1211,6 +1222,7 @@ export async function handleMcp(
     const internal: InternalForwardRequest = {
       kind: "request",
       requestId,
+      resourcePrincipalRef: await resourcePrincipalRef(deps.client),
       op: name,
       opClass,
       args: runtimeArgs,
