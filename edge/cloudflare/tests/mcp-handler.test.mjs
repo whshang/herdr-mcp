@@ -1162,7 +1162,12 @@ test("browser and Page Assist private methods require explicit enrolled device s
   });
 
   // Missing device selector fails before forward
-  for (const method of ["herdr_mcp.browser_endpoint.list", "herdr_mcp.browser_resource.resolve", "herdr_mcp.page_assist"]) {
+  for (const method of [
+    "herdr_mcp.browser_endpoint.list",
+    "herdr_mcp.browser_resource.resolve",
+    "browser_session.archive",
+    "herdr_mcp.page_assist",
+  ]) {
     const missing = await handleMcp(
       req(1, "tools/call", { name: "herdr_call", arguments: { method, params: JSON.stringify({ limit: 10 }) } }),
       "w1",
@@ -1223,8 +1228,30 @@ test("browser and Page Assist private methods require explicit enrolled device s
     },
   }, "routed browser private methods carry only the selected device grants plus exact Connector authorization provenance");
 
-  const pageAssist = await handleMcp(
+  const shortArchive = await handleMcp(
     req(4, "tools/call", {
+      name: "herdr_call",
+      _meta: { "openai/session": "openai-session-anon-123" },
+      arguments: {
+        method: "browser_session.archive",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          current_user_message: "@herdr archive this conversation",
+          idempotency_key: "archive-short-alias-uat",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(shortArchive.body.result.isError, undefined);
+  assert.equal(d.calls.length, 2, "allowlisted short browser method forwards once");
+  assert.equal(d.calls[1].op, "herdr_call");
+  assert.equal(d.calls[1].args.method, "herdr_mcp.browser_session.archive");
+  assert.equal(d.calls[1].args.device, undefined, "device selector is consumed at the Edge before forwarding");
+
+  const pageAssist = await handleMcp(
+    req(5, "tools/call", {
       name: "herdr_call",
       arguments: {
         method: "herdr_mcp.page_assist",
@@ -1240,9 +1267,9 @@ test("browser and Page Assist private methods require explicit enrolled device s
     d.value,
   );
   assert.equal(pageAssist.body.result.isError, undefined);
-  assert.equal(d.calls.length, 2, "Page Assist request forwards to the selected workstation");
-  assert.equal(d.calls[1].args.method, "herdr_mcp.page_assist");
-  assert.deepEqual(d.calls[1].trace, {
+  assert.equal(d.calls.length, 3, "Page Assist request forwards to the selected workstation");
+  assert.equal(d.calls[2].args.method, "herdr_mcp.page_assist");
+  assert.deepEqual(d.calls[2].trace, {
     page_assist_grants: [{
       endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     }],
