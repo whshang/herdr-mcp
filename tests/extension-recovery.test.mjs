@@ -211,6 +211,69 @@ test("bounded message sampler preserves growth length while skipping tool subtre
   assert.equal(poisonSample.skipped_subtrees, 1);
 });
 
+test("ChatGPT model-visible sampler serializes Connector pills as @mentions without changing ordinary text", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  const text = (value) => ({ nodeType: 3, nodeValue: value, parentElement: null });
+  const element = (children = [], attrs = {}) => {
+    const node = {
+      nodeType: 1,
+      childNodes: children,
+      parentElement: null,
+      getAttribute(name) {
+        return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+      },
+      closest() { return null; },
+      querySelector(selector) {
+        const stack = [...children];
+        while (stack.length > 0) {
+          const child = stack.shift();
+          if (child?.nodeType === 1) {
+            const pill = child.getAttribute?.("data-inline-selection-pill") !== null
+              && child.getAttribute?.("data-keyword") !== null;
+            if (pill && selector === '[data-inline-selection-pill][data-keyword]') return child;
+            stack.push(...Array.from(child.childNodes || []));
+          }
+        }
+        return null;
+      },
+    };
+    for (const child of children) child.parentElement = node;
+    return node;
+  };
+
+  const ordinary = element([text("alpha  beta\ngamma")]);
+  assert.deepEqual(
+    perf.sampleChatGptModelMessageText(ordinary),
+    perf.sampleBoundedMessageText(ordinary),
+  );
+
+  const cursor = element([text("\ufeff")], { "data-inline-selection-pill-cursor-target": "" });
+  const pill = element([text("herdr")], {
+    "data-inline-selection-pill": "",
+    "data-keyword": "herdr",
+  });
+  const root = element([
+    cursor,
+    pill,
+    text("  Herdr durable self-archive UAT.\nKeep this newline."),
+  ]);
+  const sample = perf.sampleChatGptModelMessageText(root);
+  assert.equal(sample.text, "@herdr Herdr durable self-archive UAT.\nKeep this newline.");
+  assert.doesNotMatch(sample.text, /^herdr\b/);
+  assert.doesNotMatch(sample.text, /@herdr  /);
+
+  const herdrPill = element([text("herdr")], {
+    "data-inline-selection-pill": "",
+    "data-keyword": "herdr",
+  });
+  const githubPill = element([text("github")], {
+    "data-inline-selection-pill": "",
+    "data-keyword": "github",
+  });
+  const multi = element([herdrPill, text("  "), githubPill, text("   inspect this")]);
+  assert.equal(perf.sampleChatGptModelMessageText(multi).text, "@herdr @github inspect this");
+});
+
 test("ui pressure classifier bands healthy, warning, high from bounded inputs", () => {
   const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
   const classify = perf.classifyUiPressure;
@@ -628,7 +691,7 @@ test("ChatGPT turn watcher caches latest turns and reuses settled turns for pres
   assert.match(wake, /uiPressure\?\.recordTick\(\)/);
   assert.match(wake, /recordTimerDrift\(driftMs\)/);
   assert.match(wake, /rehydrate the latest-turn cache/);
-  assert.match(wake, /sampleLatestMessageText\(el\)/);
+  assert.match(wake, /sampleLatestMessageText\(el, \{ modelVisibleUser: role === "user" \}\)/);
   assert.match(wake, /let lastAsstLen = initialAssistant\.totalChars/);
   assert.match(wake, /const curLen = currentAssistant\.totalChars/);
   assert.match(wake, /function conversationHasPendingReply\(\)/);
