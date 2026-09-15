@@ -48,7 +48,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.92";
+const H2W_SCRIPT_VERSION = "0.1.93";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -5970,7 +5970,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Current extension builds never persist or consume HERDR_MCP_TOKEN.
       delete incoming.token;
       delete incoming.idleNudgeCooldownSec;
-      // Permission-card auto-allow is part of effective Project automation.
+      // Permission-card handling is an always-on, fail-closed Herdr tool path;
+      // it has no independent user preference and does not follow Project Auto.
       // Ignore the 0.1.43-and-earlier independent preference.
       delete incoming.autoAllow;
       if (Object.prototype.hasOwnProperty.call(incoming, "uiLocale")) {
