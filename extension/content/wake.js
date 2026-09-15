@@ -447,6 +447,14 @@ const H2W_CONTENT_VERSION = "0.1.94";
     if (el.value != null && el.tagName !== "DIV") return String(el.value);
     return String(el.innerText || el.textContent || "");
   }
+  function composerModelVisibleText() {
+    const el = ADAPTER.getInputEl();
+    if (!el) return "";
+    if (ADAPTER.name === "chatgpt" && BROWSER_PERFORMANCE?.sampleChatGptModelMessageText) {
+      return String(BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el).text || "").trim();
+    }
+    return composerTextRaw().trim();
+  }
   function composerNorm() { return normText(composerTextRaw()); }
   function composerHasSameWake(text) {
     const n = normText(text);
@@ -1176,8 +1184,11 @@ const H2W_CONTENT_VERSION = "0.1.94";
     return role === "user" ? latestTurns.user : latestTurns.assistant;
   }
 
-  function sampleLatestMessageText(el) {
+  function sampleLatestMessageText(el, { modelVisibleUser = false } = {}) {
     if (!el) return { text: "", total_chars: 0, truncated: false };
+    if (modelVisibleUser && BROWSER_PERFORMANCE?.sampleChatGptModelMessageText) {
+      return BROWSER_PERFORMANCE.sampleChatGptModelMessageText(el);
+    }
     if (BROWSER_PERFORMANCE?.sampleBoundedMessageText) {
       return BROWSER_PERFORMANCE.sampleBoundedMessageText(el);
     }
@@ -1193,7 +1204,7 @@ const H2W_CONTENT_VERSION = "0.1.94";
       }
     } catch (_) {}
     const el = latestTurnForRole(role);
-    return sampleLatestMessageText(el).text;
+    return sampleLatestMessageText(el, { modelVisibleUser: role === "user" }).text;
   }
 
   async function waitForStableAssistantReply(beforeText = "", beforeCount = 0, timeoutMs = 120000) {
@@ -4116,7 +4127,7 @@ const H2W_CONTENT_VERSION = "0.1.94";
     latestTurnCacheActive = true;
     const roleSnapshot = (role) => {
       const el = latestTurnForRole(role);
-      const sample = sampleLatestMessageText(el);
+      const sample = sampleLatestMessageText(el, { modelVisibleUser: role === "user" });
       return {
         count: role === "user" ? latestTurns.userCount : latestTurns.assistantCount,
         text: sample.text,
@@ -4187,7 +4198,7 @@ const H2W_CONTENT_VERSION = "0.1.94";
     };
 
     const noteTrustedManualSubmit = () => {
-      const text = composerNorm();
+      const text = composerModelVisibleText();
       if (!text || !CONVERSATION_HEALTH || !conversationHealth) return;
       const at = Date.now();
       markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth, at));
@@ -4342,12 +4353,13 @@ const H2W_CONTENT_VERSION = "0.1.94";
         // as an accepted conversation turn.
         const submitAt = syncPendingSubmitAnchor();
         const expectedUser = pendingUserTextHint();
+        const comparableCurrentUser = normText(currentUserText);
         const confirmedPendingUser = hasPendingReply()
           && submitAt > 0
           && Date.now() - submitAt <= 30000
           && expectedUser
-          && (currentUserText.includes(expectedUser.slice(0, 160))
-            || expectedUser.includes(currentUserText.slice(0, 160)));
+          && (comparableCurrentUser.includes(expectedUser.slice(0, 160))
+            || expectedUser.includes(comparableCurrentUser.slice(0, 160)));
         const journalKey = `${submitAt}:${currentUserSignature}`;
         if (confirmedPendingUser && journalKey !== lastStartedJournalKey) {
           lastStartedJournalKey = journalKey;

@@ -86,6 +86,7 @@ ok(manifest.version === "0.1.94", "manifest version stays aligned with the brows
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
 ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.94"'), "background version matches manifest");
 ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.94"'), "content version matches manifest");
+ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
     && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY')

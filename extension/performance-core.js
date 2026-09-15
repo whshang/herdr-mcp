@@ -255,6 +255,134 @@
   }
 
   /**
+   * ChatGPT renders Connector mentions as inline pills whose visible DOM text
+   * omits the leading "@" that the model receives. Serialize those pills into
+   * the model-visible form while preserving ordinary message whitespace. Only
+   * whitespace immediately adjacent to a pill is normalized to one separator.
+   * Messages without a pill stay on the existing sampler path byte-for-byte.
+   */
+  function sampleChatGptModelMessageText(root, {
+    maxChars = DEFAULT_MESSAGE_SAMPLE_CHARS,
+    tailChars = DEFAULT_MESSAGE_TAIL_CHARS,
+    ignoredSelector = DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR,
+  } = {}) {
+    if (!root) return sampleBoundedMessageText(root, { maxChars, tailChars, ignoredSelector });
+
+    const inlinePillKeyword = (element) => {
+      if (!element || typeof element.getAttribute !== "function") return null;
+      if (element.getAttribute("data-inline-selection-pill") === null) return null;
+      return String(element.getAttribute("data-keyword") || "").trim();
+    };
+    let hasInlinePill = Boolean(inlinePillKeyword(root));
+    if (!hasInlinePill && typeof root.querySelector === "function") {
+      try { hasInlinePill = Boolean(root.querySelector('[data-inline-selection-pill][data-keyword]')); } catch (_) {}
+    }
+    if (!hasInlinePill) {
+      return sampleBoundedMessageText(root, { maxChars, tailChars, ignoredSelector });
+    }
+
+    const limit = Math.max(1024, Math.floor(Number(maxChars) || DEFAULT_MESSAGE_SAMPLE_CHARS));
+    const tailLimit = Math.min(
+      Math.floor(limit / 2),
+      Math.max(0, Math.floor(Number(tailChars) || DEFAULT_MESSAGE_TAIL_CHARS)),
+    );
+    const marker = "\n…\n";
+    const stack = [root];
+    let prefix = "";
+    let tail = "";
+    let totalChars = 0;
+    let textNodes = 0;
+    let skippedSubtrees = 0;
+    let pendingWhitespace = "";
+    let afterInlinePill = false;
+
+    const emit = (value) => {
+      const text = String(value || "");
+      if (!text) return;
+      totalChars += text.length;
+      if (prefix.length < limit) prefix += text.slice(0, limit - prefix.length);
+      if (tailLimit > 0) {
+        tail += text;
+        if (tail.length > tailLimit * 2) tail = tail.slice(-tailLimit);
+      }
+    };
+    const flushBeforeContent = () => {
+      if (pendingWhitespace) emit(afterInlinePill ? " " : pendingWhitespace);
+      else if (afterInlinePill && totalChars > 0) emit(" ");
+      pendingWhitespace = "";
+      afterInlinePill = false;
+    };
+    const emitTextNode = (value) => {
+      const parts = String(value || "").split(/(\s+)/).filter(Boolean);
+      for (const part of parts) {
+        if (/^\s+$/.test(part)) {
+          pendingWhitespace += part;
+          continue;
+        }
+        flushBeforeContent();
+        emit(part);
+      }
+    };
+    const emitInlinePill = (keyword) => {
+      if (pendingWhitespace) emit(" ");
+      else if (afterInlinePill && totalChars > 0) emit(" ");
+      pendingWhitespace = "";
+      emit(`@${keyword}`);
+      afterInlinePill = true;
+    };
+
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (!node) continue;
+      if (node.nodeType === 3) {
+        const value = String(node.nodeValue || "");
+        if (!value) continue;
+        textNodes += 1;
+        emitTextNode(value);
+        continue;
+      }
+      if (node.nodeType !== 1 && node !== root) continue;
+      const element = node.nodeType === 1 ? node : null;
+      if (element && insideSelector(element, ignoredSelector)) {
+        skippedSubtrees += 1;
+        continue;
+      }
+      if (element && typeof element.getAttribute === "function"
+        && element.getAttribute("data-inline-selection-pill-cursor-target") !== null) {
+        skippedSubtrees += 1;
+        continue;
+      }
+      const keyword = inlinePillKeyword(element);
+      if (keyword) {
+        emitInlinePill(keyword);
+        continue;
+      }
+      const children = node.childNodes;
+      if (!children) continue;
+      for (let index = children.length - 1; index >= 0; index -= 1) stack.push(children[index]);
+    }
+
+    const truncated = totalChars > limit;
+    if (!truncated) {
+      return {
+        text: prefix.trim(),
+        total_chars: totalChars,
+        truncated: false,
+        text_nodes: textNodes,
+        skipped_subtrees: skippedSubtrees,
+      };
+    }
+    const headLimit = Math.max(0, limit - tailLimit - marker.length);
+    return {
+      text: `${prefix.slice(0, headLimit)}${marker}${tail.slice(-tailLimit)}`.trim(),
+      total_chars: totalChars,
+      truncated: true,
+      text_nodes: textNodes,
+      skipped_subtrees: skippedSubtrees,
+    };
+  }
+
+  /**
    * Pure three-band UI pressure classifier. Input carries per-minute rates and
    * max timer drift; any "high" signal raises the level to "high", otherwise
    * any "warning". Echoes the measured inputs and the contributing reasons.
@@ -512,6 +640,7 @@
     mutationRecordsAreIgnoredChurn,
     mutationTouchesConversationTurns,
     sampleBoundedMessageText,
+    sampleChatGptModelMessageText,
     createUiPressureMeter,
     classifyUiPressure,
     classifyMemoryPressure,
