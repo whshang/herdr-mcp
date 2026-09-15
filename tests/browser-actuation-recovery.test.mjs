@@ -10,9 +10,12 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+const canonicalRecoveryStart = backgroundSource.indexOf("async function findBrowserSessionTargetByCanonicalIdentity(");
 const recoveryStart = backgroundSource.indexOf("async function recoverBrowserSessionTarget(");
 const recoveryEnd = backgroundSource.indexOf("\nasync function handleBrowserActuation", recoveryStart);
+assert.ok(canonicalRecoveryStart >= 0 && recoveryStart > canonicalRecoveryStart, "canonical identity recovery helper must remain extractable");
 assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart, "recovery helper must remain extractable");
+const canonicalRecoverySource = backgroundSource.slice(canonicalRecoveryStart, recoveryStart);
 const recoverySource = backgroundSource.slice(recoveryStart, recoveryEnd);
 
 const archiveCleanupStart = backgroundSource.indexOf("function shouldCloseArchivedChatGptTab(");
@@ -24,6 +27,29 @@ const registrationStart = wakeSource.indexOf('async function registerCurrentConv
 const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch()", registrationStart);
 assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "registration helper must remain extractable");
 const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
+
+function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) {
+  const chrome = {
+    tabs: {
+      async query() {
+        return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
+      },
+    },
+  };
+  const activeH2WTabUrls = () => ["https://chatgpt.com/*"];
+  const browserTabScopes = scopeRecords;
+  const browserConversationInfo = (provider, rawUrl) => provider === "chatgpt"
+    ? chatGptConversationInfo(rawUrl)
+    : null;
+  const find = new Function(
+    "chrome",
+    "activeH2WTabUrls",
+    "browserConversationInfo",
+    "browserTabScopes",
+    `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
+  )(chrome, activeH2WTabUrls, browserConversationInfo, browserTabScopes);
+  return { find };
+}
 
 function recoveryHarness(tabRecords) {
   const browserSessionTargets = new Map();
@@ -170,6 +196,60 @@ async function flushRegistrationToSend(harness) {
   for (let i = 0; i < 4; i += 1) await Promise.resolve();
   assert.ok(harness.pending.length > 0, "registration must reach background send");
 }
+
+test("canonical ChatGPT session recovery reuses one slugged Project alias instead of opening a duplicate tab", async () => {
+  const conversationId = "6aa8f808-4a18-83e9-8919-ef5ed2acdfeb";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const canonical = `https://chatgpt.com/g/${projectId}/c/${conversationId}`;
+  const slugged = `https://chatgpt.com/g/${projectId}-herdr-mcp/c/${conversationId}`;
+  const scopes = new Map([[71, {
+    provider: "chatgpt",
+    projectId,
+    observationGeneration: 17,
+    accountRef: "br_account",
+    spaceRef: "br_space",
+  }]]);
+  const harness = canonicalIdentityRecoveryHarness([{ id: 71, url: slugged }], scopes);
+  const result = await harness.find("chatgpt", canonical, 17);
+  assert.equal(result.ambiguous, false);
+  assert.equal(result.target?.tabId, 71);
+  assert.equal(result.target?.conversationId, conversationId);
+  assert.equal(result.target?.projectId, projectId);
+  assert.equal(result.target?.convKey, canonical);
+  assert.equal(result.target?.observationGeneration, 17);
+});
+
+test("canonical ChatGPT session recovery fails closed when slugged and unslugged aliases are both open", async () => {
+  const conversationId = "6aa8f808-4a18-83e9-8919-ef5ed2acdfeb";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const canonical = `https://chatgpt.com/g/${projectId}/c/${conversationId}`;
+  const slugged = `https://chatgpt.com/g/${projectId}-herdr-mcp/c/${conversationId}`;
+  const scopes = new Map([
+    [71, { provider: "chatgpt", projectId, observationGeneration: 17 }],
+    [72, { provider: "chatgpt", projectId, observationGeneration: 17 }],
+  ]);
+  const harness = canonicalIdentityRecoveryHarness([
+    { id: 71, url: slugged },
+    { id: 72, url: canonical },
+  ], scopes);
+  const result = await harness.find("chatgpt", canonical, 17);
+  assert.deepEqual(result, { target: null, ambiguous: true });
+});
+
+test("canonical ChatGPT session recovery rejects a stale browser scope generation", async () => {
+  const conversationId = "6aa8f808-4a18-83e9-8919-ef5ed2acdfeb";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const canonical = `https://chatgpt.com/g/${projectId}/c/${conversationId}`;
+  const slugged = `https://chatgpt.com/g/${projectId}-herdr-mcp/c/${conversationId}`;
+  const scopes = new Map([[71, {
+    provider: "chatgpt",
+    projectId,
+    observationGeneration: 16,
+  }]]);
+  const harness = canonicalIdentityRecoveryHarness([{ id: 71, url: slugged }], scopes);
+  const result = await harness.find("chatgpt", canonical, 17);
+  assert.deepEqual(result, { target: null, ambiguous: false });
+});
 
 test("archive cleanup closes only the exact ChatGPT tab after proven archive reaches the same Project home", async () => {
   const harness = archiveCleanupHarness({
@@ -467,12 +547,31 @@ test("background session.open recovers unique target via recoverBrowserSessionTa
   assert.ok(start >= 0, "session.open branch must exist in handleBrowserActuation");
   const segment = backgroundSource.slice(start, backgroundSource.indexOf("\n  const sessionRef = String(params.session_ref", start));
   assert.match(segment, /recoverBrowserSessionTarget/);
+  assert.match(segment, /findBrowserSessionTargetByCanonicalIdentity/);
+  assert.match(segment, /recovered\.ambiguous/);
+  assert.ok(
+    segment.indexOf("findBrowserSessionTargetByCanonicalIdentity") < segment.indexOf("chrome.tabs.create"),
+    "session.open must try canonical-identity tab reuse before creating a new view",
+  );
   assert.match(segment, /chrome\.tabs\.update.*active:\s*true.*autoDiscardable:\s*false/);
   assert.match(segment, /protectBoundTab/);
   assert.doesNotMatch(segment, /insertMainWorld|performWake|tabs\.reload|executeScript/);
   // Must fail closed on missing/duplicate/stale/provider mismatch.
   assert.match(segment, /observedGeneration/);
   assert.match(segment, /providerOpen !== "chatgpt"/);
+});
+
+test("ChatGPT archive recovery also reuses canonical aliases before creating a disposable view", () => {
+  const openStart = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
+  const archiveStart = backgroundSource.indexOf('if (!target && operation === "herdr_mcp.browser_session.archive")', openStart);
+  assert.ok(archiveStart > openStart, "archive fallback must exist after session.open");
+  const segment = backgroundSource.slice(archiveStart, archiveStart + 3500);
+  assert.match(segment, /findBrowserSessionTargetByCanonicalIdentity/);
+  assert.match(segment, /existing\.ambiguous/);
+  assert.ok(
+    segment.indexOf("findBrowserSessionTargetByCanonicalIdentity") < segment.indexOf("chrome.tabs.create"),
+    "archive recovery must reuse one logical alias before creating a new view",
+  );
 });
 
 test("content script session.open verifies identity, generation, route, canonical readiness and never submits", () => {

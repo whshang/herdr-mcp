@@ -48,7 +48,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.93";
+const H2W_SCRIPT_VERSION = "0.1.94";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -3000,6 +3000,45 @@ async function closeArchivedChatGptTabAfterProjectHome({
   }
 }
 
+async function findBrowserSessionTargetByCanonicalIdentity(provider, canonicalUrl, expectedGeneration) {
+  const canonicalInfo = browserConversationInfo(provider, canonicalUrl);
+  if (!canonicalInfo?.conversation_id) return { target: null, ambiguous: false };
+  let exactTarget = null;
+  try {
+    const candidates = await chrome.tabs.query({ url: activeH2WTabUrls() });
+    for (const tab of candidates) {
+      if (!tab?.id || tab.status !== "complete") continue;
+      const live = browserConversationInfo(provider, tab.url || "");
+      // ChatGPT Project URLs can carry a cosmetic slug. Compare the normalized
+      // conversation key, not the raw URL, so `/g/g-p-<id>/c/<id>` and
+      // `/g/g-p-<id>-<slug>/c/<id>` are the same logical view.
+      if (!live?.conversation_id || live.convKey !== canonicalInfo.convKey) continue;
+      const scope = browserTabScopes.get(tab.id) || null;
+      if (scope && (scope.provider !== provider
+          || scope.observationGeneration !== expectedGeneration
+          || (canonicalInfo.project_id && scope.projectId && scope.projectId !== canonicalInfo.project_id))) {
+        continue;
+      }
+      const target = {
+        provider,
+        tabId: tab.id,
+        convKey: live.convKey,
+        conversationId: live.conversation_id,
+        projectId: live.project_id || null,
+        observationGeneration: expectedGeneration,
+        accountRef: scope?.accountRef || null,
+        spaceRef: scope?.spaceRef || null,
+        lastSeenAt: Date.now(),
+      };
+      // Reusing one already-open view is safe. Two aliases are still ambiguous:
+      // never create a third tab or guess a physical actuation owner.
+      if (exactTarget) return { target: null, ambiguous: true };
+      exactTarget = target;
+    }
+  } catch (_) {}
+  return { target: exactTarget, ambiguous: false };
+}
+
 async function recoverBrowserSessionTarget(sessionRef, expectedGeneration) {
   let observedGeneration = expectedGeneration;
   let exactTarget = null;
@@ -3183,6 +3222,13 @@ async function handleBrowserActuation(command) {
     if (!targetOpen) {
       const recovered = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration);
       targetOpen = recovered.target;
+      if (!targetOpen && recovered.ambiguous) {
+        await postBrowserActuationEvidence(
+          actuationId,
+          unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+        );
+        return;
+      }
       if (!targetOpen && canonicalUrl) {
         const canonicalInfo = browserConversationInfo(providerOpen, canonicalUrl);
         if (!canonicalInfo?.conversation_id) {
@@ -3192,31 +3238,44 @@ async function handleBrowserActuation(command) {
           );
           return;
         }
-        let createdTab = null;
-        try {
-          createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
-        } catch (_) {}
-        if (!createdTab?.id) {
+        const existing = await findBrowserSessionTargetByCanonicalIdentity(
+          providerOpen, canonicalUrl, expectedGeneration,
+        );
+        if (existing.ambiguous) {
           await postBrowserActuationEvidence(
             actuationId,
             unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
           );
           return;
         }
-        const deadline = Date.now() + 8000;
-        do {
-          targetOpen = browserSessionTargets.get(sessionRefOpen);
-          if (targetOpen?.tabId === createdTab.id) break;
-          targetOpen = null;
-          await new Promise((resolve) => setTimeout(resolve, 200));
-        } while (Date.now() < deadline);
+        targetOpen = existing.target;
         if (!targetOpen) {
-          await postBrowserActuationEvidence(actuationId, {
-            ...unavailableBrowserActuationEvidence(expectedGeneration),
-            command_accepted: true,
-            resource_available: true,
-          }).catch(() => {});
-          return;
+          let createdTab = null;
+          try {
+            createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
+          } catch (_) {}
+          if (!createdTab?.id) {
+            await postBrowserActuationEvidence(
+              actuationId,
+              unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+            );
+            return;
+          }
+          const deadline = Date.now() + 8000;
+          do {
+            targetOpen = browserSessionTargets.get(sessionRefOpen);
+            if (targetOpen?.tabId === createdTab.id) break;
+            targetOpen = null;
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          } while (Date.now() < deadline);
+          if (!targetOpen) {
+            await postBrowserActuationEvidence(actuationId, {
+              ...unavailableBrowserActuationEvidence(expectedGeneration),
+              command_accepted: true,
+              resource_available: true,
+            }).catch(() => {});
+            return;
+          }
         }
       }
       if (!targetOpen) {
@@ -3291,23 +3350,43 @@ async function handleBrowserActuation(command) {
   if (!target) {
     const recovered = await recoverBrowserSessionTarget(sessionRef, expectedGeneration);
     target = recovered.target;
+    if (!target && recovered.ambiguous) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+      );
+      return;
+    }
     if (!target && operation === "herdr_mcp.browser_session.archive") {
       const providerArchive = String(params.provider || "");
       const canonicalUrl = String(params.canonical_url || "");
       const canonicalInfo = browserConversationInfo(providerArchive, canonicalUrl);
       if (providerArchive === "chatgpt" && canonicalInfo?.conversation_id) {
-        let createdTab = null;
-        try {
-          createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
-        } catch (_) {}
-        if (createdTab?.id) {
-          const deadline = Date.now() + 8000;
-          do {
-            target = browserSessionTargets.get(sessionRef) || null;
-            if (target?.tabId === createdTab.id) break;
-            target = null;
-            await new Promise((resolve) => setTimeout(resolve, 200));
-          } while (Date.now() < deadline);
+        const existing = await findBrowserSessionTargetByCanonicalIdentity(
+          providerArchive, canonicalUrl, expectedGeneration,
+        );
+        if (existing.ambiguous) {
+          await postBrowserActuationEvidence(
+            actuationId,
+            unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+          );
+          return;
+        }
+        target = existing.target;
+        if (!target) {
+          let createdTab = null;
+          try {
+            createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
+          } catch (_) {}
+          if (createdTab?.id) {
+            const deadline = Date.now() + 8000;
+            do {
+              target = browserSessionTargets.get(sessionRef) || null;
+              if (target?.tabId === createdTab.id) break;
+              target = null;
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            } while (Date.now() < deadline);
+          }
         }
       }
     }
