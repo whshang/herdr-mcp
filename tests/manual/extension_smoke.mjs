@@ -66,6 +66,7 @@ const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const bindingCoreSource = readFileSync(path.join(EXT, "binding-core.js"), "utf8");
 const pushSource = readFileSync(path.join(EXT, "..", "src", "push.ts"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
+const baseSource = readFileSync(path.join(EXT, "content", "base.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(EXT, "content", "injector", "chatgpt.js"), "utf8");
 const queuedInsertCoreSource = readFileSync(path.join(EXT, "queued-insert-core.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
@@ -81,10 +82,10 @@ const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-mod
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
-ok(manifest.version === "0.1.91", "manifest version stays aligned with the browser product build");
+ok(manifest.version === "0.1.92", "manifest version stays aligned with the browser product build");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.91"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.91"'), "content version matches manifest");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.92"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.92"'), "content version matches manifest");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
     && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY')
@@ -1605,17 +1606,69 @@ console.log("\n[tool-action permission-card auto-allow]");
     ok(r.handled === true && r.button === mainAllow, "nested outer deny still selects exact primary action");
     ok(mainAllow.clickCount === 1 && externalAllow.clickCount === 0 && outerDeny.clickCount === 0, "only the primary Allow is clicked");
   }
-  // 12) Semantic fallback uses the nearest deny ancestor without a data-testid.
+  // 13) An Auto-OFF wake keeps manual intent: no permission auto-click.
+  //     (wake.js gates the watcher on permissionAutoAllowSuppressed, verified by source
+  //     assertions below; base.js itself stays automation-independent.)
+  // 14) wake.js keeps the permission watcher decoupled from Project Auto:
+  //     - permissionTryClick must not require automationEnabled/automationAutoAllow;
+  //     - syncAutomationPermissionWatch must always (re)start the persistent watcher;
+  //     - the fail-closed clicker from base.js is still the only click surface.
+  ok(
+    wakeSource.includes("if (permissionAutoAllowSuppressed) return;")
+      && !wakeSource.includes("if (!automationEnabled || !automationAutoAllow) return;"),
+    "permission clicks are gated only by an explicit wake-level suppression, not by Auto state",
+  );
+  ok(
+    /function syncAutomationPermissionWatch\(\) \{[\s\S]*?startPermissionWatch\(Number\.POSITIVE_INFINITY\);/.test(wakeSource),
+    "syncAutomationPermissionWatch keeps the persistent watcher alive regardless of Auto state",
+  );
+  ok(
+    !/syncAutomationPermissionWatch[\s\S]{0,200}else permissionStop\(\);/.test(wakeSource)
+      && !wakeSource.includes("if (automationEnabled && automationAutoAllow) startPermissionWatch"),
+    "Auto off no longer stops the permission watcher",
+  );
+  ok(
+    wakeSource.includes("else startPermissionWatch(Number.POSITIVE_INFINITY, { suppressAutoAllow: true });")
+      && wakeSource.includes("if (data.autoAllow !== false) startPermissionWatch();"),
+    "wake that explicitly disables auto-allow suppresses clicks; the default wake keeps them",
+  );
+  ok(
+    wakeSource.includes("Herdr Connector cards are watched continuously and independently of the Auto"),
+    "wake.js header states the decoupled permission-card contract",
+  );
+  // 15) The fail-closed card detector itself stays automation-free: no Auto state is
+  //     consulted anywhere in base.js, so card acceptance depends only on the DOM.
+  ok(
+    !baseSource.includes("automationEnabled") && !baseSource.includes("autoAllow"),
+    "base.js permission detector remains automation-state independent",
+  );
+  // 16) A generic confirm dialog without permission wording is never clicked, even
+  //     though it has an explicit deny action (guards the widened watcher).
   {
-    const allow = btn("允许");
-    const deny = btn("拒绝");
-    const card = el("div", { class: "tool-action-card" },
-      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "此工具需要权限"),
-      el("div", { class: "btn" }, deny, allow)); // No data-testid.
+    const okBtn = btn("OK");
+    const cancel = btn("Cancel");
+    const card = el("div", { role: "dialog" },
+      el("h3", {}, "Delete file?"),
+      el("p", {}, "This action cannot be undone"),
+      el("div", { class: "btn" }, cancel, okBtn));
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(document);
-    ok(r.handled === true && r.button === allow && allow.clickCount === 1, "semantic fallback clicks primary Allow once");
+    ok(r.handled === false && okBtn.clickCount === 0, "generic confirm dialog without permission text is not clicked");
+  }
+  // 17) A permission card whose Allow is aria-disabled stays untouched across
+  //     repeated observer passes (no hidden/disabled/ambiguous clicks).
+  {
+    const allowArDis = btn("允许", { "aria-disabled": "true" });
+    const deny = btn("拒绝");
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "需要权限"),
+      el("div", { class: "btn" }, deny, allowArDis));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r1 = clicker.tryClick(document);
+    const r2 = clicker.tryClick(document);
+    ok(r1.handled === false && r2.handled === false && allowArDis.clickCount === 0, "aria-disabled Allow is never clicked across retries");
   }
 }
 

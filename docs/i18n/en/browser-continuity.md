@@ -274,6 +274,8 @@ Project automation requires both:
 
 The preference is keyed by stable `project_id`, so a handoff conversation in the same Project can inherit the Project automation setting.
 
+Herdr tool permission cards are the one exception that does not follow Auto: a supported, explicitly labeled Herdr tool permission card is accepted automatically even when Auto is off, because it only unblocks a tool invocation the Herdr connector itself requested and reuses the fail-closed card detector. Auto continues to govern wake/progress/rollover behavior; turning it off never leaves a tool call stuck behind a card.
+
 ### Normal ChatGPT / z.ai / DeepSeek
 
 Where supported, these use conversation-scoped Auto.
