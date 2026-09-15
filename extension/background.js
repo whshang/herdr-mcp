@@ -141,6 +141,7 @@ const browserSessionTargets = new Map();
 const browserTabScopes = new Map();
 let browserEndpoint = null;
 let browserObservationGeneration = null;
+const browserCapabilitySnapshots = new Map();
 const AUTOMATION_MODE_MANUAL = "manual";
 const AUTOMATION_MODE_PROJECT = "project_auto";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
@@ -1792,18 +1793,28 @@ function browserConversationInfo(provider, rawUrl) {
   return null;
 }
 
-async function getBrowserObservationGeneration() {
-  if (Number.isSafeInteger(browserObservationGeneration) && browserObservationGeneration > 0) {
-    return browserObservationGeneration;
+async function getBrowserObservationGeneration(provider = null, capabilities = null) {
+  if (!Number.isSafeInteger(browserObservationGeneration) || browserObservationGeneration <= 0) {
+    const stored = (await chrome.storage.local.get(BROWSER_OBSERVATION_GENERATION_STORAGE_KEY))[
+      BROWSER_OBSERVATION_GENERATION_STORAGE_KEY
+    ];
+    const prior = Number.isSafeInteger(stored) && stored > 0 ? stored : 0;
+    browserObservationGeneration = Math.max(prior + 1, Date.now());
+    await chrome.storage.local.set({
+      [BROWSER_OBSERVATION_GENERATION_STORAGE_KEY]: browserObservationGeneration,
+    });
   }
-  const stored = (await chrome.storage.local.get(BROWSER_OBSERVATION_GENERATION_STORAGE_KEY))[
-    BROWSER_OBSERVATION_GENERATION_STORAGE_KEY
-  ];
-  const prior = Number.isSafeInteger(stored) && stored > 0 ? stored : 0;
-  browserObservationGeneration = Math.max(prior + 1, Date.now());
-  await chrome.storage.local.set({
-    [BROWSER_OBSERVATION_GENERATION_STORAGE_KEY]: browserObservationGeneration,
-  });
+  if (provider && capabilities) {
+    const snapshot = JSON.stringify(capabilities);
+    const previous = browserCapabilitySnapshots.get(provider);
+    if (previous !== undefined && previous !== snapshot) {
+      browserObservationGeneration = Math.max(browserObservationGeneration + 1, Date.now());
+      await chrome.storage.local.set({
+        [BROWSER_OBSERVATION_GENERATION_STORAGE_KEY]: browserObservationGeneration,
+      });
+    }
+    browserCapabilitySnapshots.set(provider, snapshot);
+  }
   return browserObservationGeneration;
 }
 
@@ -1870,7 +1881,8 @@ async function observeBrowserConversation({
   const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
   if (!endpoint?.endpoint_ref) return null;
   const profileSeed = await getOrCreateBrowserProfileSeed();
-  const observationGeneration = await getBrowserObservationGeneration();
+  const capabilities = browserProviderCapabilities(provider);
+  const observationGeneration = await getBrowserObservationGeneration(provider, capabilities);
   await postBrowserRegistry({
     operation: "provider.observe",
     profile_seed: profileSeed,
@@ -1878,7 +1890,7 @@ async function observeBrowserConversation({
     provider,
     adapter_protocol_version: 1,
     observation_generation: observationGeneration,
-    capabilities: browserProviderCapabilities(provider),
+    capabilities,
     observed_at: Date.now(),
   });
   let accountLaunchUrl = null;
