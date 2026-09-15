@@ -66,6 +66,7 @@ const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const bindingCoreSource = readFileSync(path.join(EXT, "binding-core.js"), "utf8");
 const pushSource = readFileSync(path.join(EXT, "..", "src", "push.ts"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
+const performanceCoreSource = readFileSync(path.join(EXT, "performance-core.js"), "utf8");
 const baseSource = readFileSync(path.join(EXT, "content", "base.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(EXT, "content", "injector", "chatgpt.js"), "utf8");
 const queuedInsertCoreSource = readFileSync(path.join(EXT, "queued-insert-core.js"), "utf8");
@@ -82,11 +83,12 @@ const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-mod
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
-ok(manifest.version === "0.1.94", "manifest version stays aligned with the browser product build");
+ok(manifest.version === "0.1.95", "manifest version stays aligned with the browser product build");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.94"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.94"'), "content version matches manifest");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.95"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.95"'), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
+ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
     && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY')
