@@ -1849,6 +1849,7 @@ fn target_for_platform(os: &str, arch: &str) -> Result<&'static str, String> {
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
         ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
         ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         (os, arch) => Err(format!("unsupported update target {os}/{arch}")),
     }
@@ -2447,6 +2448,10 @@ mod tests {
         assert_eq!(
             target_for_platform("windows", "x86_64").unwrap(),
             "x86_64-pc-windows-msvc"
+        );
+        assert_eq!(
+            target_for_platform("windows", "aarch64").unwrap(),
+            "aarch64-pc-windows-msvc"
         );
     }
 

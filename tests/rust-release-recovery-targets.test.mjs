@@ -52,6 +52,7 @@ test("modern recovery resolves the authoritative tagged target contract", () => 
       { runner: "ubuntu-24.04", target: "x86_64-unknown-linux-musl" },
       { runner: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-musl" },
       { runner: "windows-2025", target: "x86_64-pc-windows-msvc" },
+      { runner: "windows-11-arm", target: "aarch64-pc-windows-msvc" },
     ],
   });
   assert.deepEqual(resolveModernRecoveryTargets(contract), {
@@ -62,6 +63,7 @@ test("modern recovery resolves the authoritative tagged target contract", () => 
       { runner: "ubuntu-24.04", target: "x86_64-unknown-linux-musl" },
       { runner: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-musl" },
       { runner: "windows-2025", target: "x86_64-pc-windows-msvc" },
+      { runner: "windows-11-arm", target: "aarch64-pc-windows-msvc" },
     ],
   });
 });

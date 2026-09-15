@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 已支持 macOS 与 Linux。1.0 Windows x86_64 candidate 正在加入同一条核心接入路径，使用 Herdr named pipe、Windows Credential Manager、当前用户 Startup 文件夹快捷方式登录自启动和独立用户进程；在 Windows 原生 UAT gate 通过前仍按 candidate 支持。受管 Windows runtime 启动时会探测配置的 Herdr API；如果 Herdr 已安装但 server 尚未运行，会以当前用户权限尽力启动 `herdr server`，但 herdr-mcp 不负责安装或删除 Herdr 本体。Browser Native Messaging、self-update、产品级 reinstall/uninstall 不属于本轮 Windows 核心 UAT。
+当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 已在 Apple Silicon macOS、原生 Debian x86_64 与 ARM64 上完成生产级验证。Windows x86_64 与 Windows ARM64 都会发布 1.0 candidate：两者都在 GitHub 原生 Windows runner 上做构建/运行验证，但在实体机 UAT 通过前都不晋级为生产支持。Windows 使用 Herdr named pipe、Windows Credential Manager、当前用户 Startup 文件夹快捷方式登录自启动和独立用户进程；受管 Windows runtime 启动时会探测配置的 Herdr API，如果 Herdr 已安装但 server 尚未运行，会以当前用户权限尽力启动 `herdr server`，但 herdr-mcp 不负责安装或删除 Herdr 本体。Browser Native Messaging 与产品级 reinstall/uninstall 仍不属于 Windows 实体机支持声明。精确的“已测试/尚未测试”边界见[平台支持矩阵](platform-support-matrix.md)。
 
 旧版本安装按[Runtime 自升级](runtime-self-upgrade.md)原地升级。已有 Worker、设备关系和健康的 ChatGPT Connector 不需要为了升级当前 runtime 重新创建。
 
@@ -54,7 +54,7 @@ herdr-mcp status
 
 `install` 会把不可变 generation 放到 `~/.config/herdr-mcp/runtime/` 并让用户 PATH 入口指向 `runtime/current/herdr-mcp`。普通用户不要用 git clone、`npm` 或 `cargo` 安装本机 runtime。
 
-Debian 使用与机器架构匹配的静态 musl Release 产物：x86_64 使用 `x86_64-unknown-linux-musl`，ARM64 使用 `aarch64-unknown-linux-musl`。安装器优先使用 `systemd --user`，没有 user systemd manager 时使用托管用户进程 backend。macOS 使用用户级 LaunchAgent，完全磁盘访问只授予稳定的 macOS 专用 broker：`~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`；Linux 与 Windows 不使用这套 TCC/FDA 路径，`sudo` 也不能替代 macOS 隐私权限。
+Debian 使用与机器架构匹配的静态 musl Release 产物：x86_64 使用 `x86_64-unknown-linux-musl`，ARM64 使用 `aarch64-unknown-linux-musl`。Windows 按机器架构使用 `x86_64-pc-windows-msvc` 或 `aarch64-pc-windows-msvc`。Linux 安装器优先使用 `systemd --user`，没有 user systemd manager 时使用托管用户进程 backend。macOS 使用用户级 LaunchAgent，完全磁盘访问只授予稳定的 macOS 专用 broker：`~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`；Linux 与 Windows 不使用这套 TCC/FDA 路径，`sudo` 也不能替代 macOS 隐私权限。
 
 macOS 先执行 `herdr-mcp permissions status`。只有返回 `needs_setup` 时才执行 `herdr-mcp permissions setup`，在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中为稳定 broker 授权一次，再执行 `herdr-mcp permissions verify`。setup 前不要为了触发弹窗而主动访问 `~/Documents`。host-capable broker 是 MCP 受保护目录文件/Git 工具的稳定 TCC 客户端：它的请求面只是固定的受保护文件/Git 操作白名单（`fs_read`、`fs_list`、`fs_grep`、`fs_image`、`fs_edit`、`fs_write`、`fs_patch`、`git`），不是任意 shell/exec 执行面。native Herdr pane/Agent 的 TCC 取决于其执行宿主：托管的 `herdr server` 通过这个 host-capable broker 启动，因此其下的 pane/Agent 复用 broker 身份；不在这条托管路径上的 Herdr 宿主仍受自身 TCC 边界约束。正常首次安装因此只需要这一处 Full Disk Access 授权，避免每个进程分别弹窗。普通 runtime 更新保留这个 broker；只有明确的 compatibility migration 才执行 `permissions setup --upgrade-broker`。macOS 还可能单独要求稳定的 `herdr-mcp-credential-helper` 访问钥匙串；这属于独立安全边界，首次批准一次，后续更新继续复用。平台细节见 [CLI 参考](cli-reference.md)和[故障排查](troubleshooting.md)。本地 doctor 不健康时先解决 runtime / Herdr 问题，再部署公网 Edge。
 

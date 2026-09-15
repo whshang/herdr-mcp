@@ -68,14 +68,16 @@ test("Rust release manifest is target-complete, hashed, and contract-pinned", as
       { runner: "ubuntu-24.04", target: "x86_64-unknown-linux-musl" },
       { runner: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-musl" },
       { runner: "windows-2025", target: "x86_64-pc-windows-msvc" },
+      { runner: "windows-11-arm", target: "aarch64-pc-windows-msvc" },
     ]);
     assert.deepEqual(RUST_RELEASE_TARGETS, [
       "aarch64-apple-darwin",
       "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-musl",
       "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc",
     ]);
-    assert.equal(manifest.assets.length, 4);
+    assert.equal(manifest.assets.length, 5);
     assert.deepEqual(manifest.assets.map((asset) => asset.target), RUST_RELEASE_TARGETS);
     assert.ok(manifest.assets.every((asset) => /^[a-f0-9]{64}$/.test(asset.sha256)));
     assert.ok(manifest.assets.every((asset) => asset.size > 0));
