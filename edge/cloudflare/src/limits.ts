@@ -21,6 +21,12 @@ export const MAX_CAPABILITY_LEN = 128;
 
 /** Bounded pending-request registry. */
 export const DEFAULT_MAX_PENDING_REQUESTS = 256;
+/**
+ * One authenticated Edge principal may consume at most half of the default
+ * workstation Link's 16 pending slots. This preserves capacity for an
+ * unrelated principal before the downstream runtime queue can be saturated.
+ */
+export const DEFAULT_MAX_PENDING_PER_PRINCIPAL = 8;
 /** Bounded completed-request history (idempotent replay window). */
 export const DEFAULT_MAX_COMPLETED_RECORDS = 512;
 /** How long a completion remains replayable after settle. */
@@ -134,6 +140,7 @@ export const MAX_ARGS_SUMMARY_KEYS = 32;
 
 export interface EdgeLimits {
   maxPendingRequests: number;
+  maxPendingPerPrincipal: number;
   maxCompletedRecords: number;
   completedRecordTtlMs: number;
   requestTimeoutMs: number;
@@ -168,6 +175,7 @@ export function makeLimits(env?: {
   );
   return {
     maxPendingRequests: DEFAULT_MAX_PENDING_REQUESTS,
+    maxPendingPerPrincipal: DEFAULT_MAX_PENDING_PER_PRINCIPAL,
     maxCompletedRecords: DEFAULT_MAX_COMPLETED_RECORDS,
     completedRecordTtlMs: DEFAULT_COMPLETED_RECORD_TTL_MS,
     requestTimeoutMs,

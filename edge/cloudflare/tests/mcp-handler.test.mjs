@@ -1432,3 +1432,20 @@ test("read tools receive stable short-window dedupe keys while mutations do not"
   assert.equal(mutation.body.result.isError, undefined);
   assert.equal(d.calls[3].readDedupeKey, undefined);
 });
+
+test("forwarded requests carry a bounded principal ownership key derived from authenticated identity", async () => {
+  const a = deps({ client: { connectorId: "conn_principal_a", authSource: "oauth_edge" } });
+  const b = deps({ client: { connectorId: "conn_principal_b", authSource: "oauth_edge" } });
+
+  const call = req(9901, "tools/call", { name: "herdr_inspect", arguments: {} });
+  await handleMcp(call, "legacy", a.value);
+  await handleMcp({ ...call, id: 9902 }, "legacy", b.value);
+
+  const aRef = a.calls[0].resourcePrincipalRef;
+  const bRef = b.calls[0].resourcePrincipalRef;
+  assert.match(aRef, /^principal:[0-9a-f]{64}$/);
+  assert.match(bRef, /^principal:[0-9a-f]{64}$/);
+  assert.notEqual(aRef, bRef);
+  assert.equal(JSON.stringify(a.calls[0]).includes("conn_principal_a"), false,
+    "raw Connector identity must not enter pending ownership metadata");
+});

@@ -178,6 +178,8 @@ function decodeCompletedRow(value: unknown): CompletedRow | null {
 export interface InternalForwardRequest {
   kind: "request";
   requestId?: string;
+  /** Trusted Edge-only ownership key. Never forwarded to the workstation Link. */
+  resourcePrincipalRef?: string;
   op: string;
   opClass?: "read" | "mutating" | "unknown";
   args?: unknown;
@@ -207,6 +209,7 @@ interface LinkAttachment {
 interface EphemeralReadRequest {
   requestId: string;
   workstationId: string;
+  resourcePrincipalRef: string;
   op: string;
   state: "queued" | "sent";
   createdAtMs: number;
@@ -246,6 +249,12 @@ export class WorkstationDO {
   private readonly recentReadDedupe = new Map<string, { completion: Completion; settledAtMs: number }>();
   /** In-memory resolver cache only; storage remains authoritative. */
   private readonly resolvers = new Map<string, (completion: Completion) => void>();
+  /**
+   * Durable requests admitted by this isolate and still occupying downstream
+   * capacity. Rehydrated pending rows are deliberately absent because they are
+   * never replayed onto the current Link.
+   */
+  private readonly activeDurableAdmissions = new Set<string>();
   /** Brief reconnect grace waiters. Process-local only: zero DO storage/alarm writes. */
   private readonly linkWaiters = new Set<() => void>();
   /**
@@ -301,9 +310,17 @@ export class WorkstationDO {
       // before the pending delete) therefore still recovers the full
       // completion + binding: a same-key retry returns the prior completion and
       // never re-executes a mutation that may already have run.
+      const restoredCompletionIds = new Set(
+        this.registry.completedEntries().map(({ requestId }) => requestId),
+      );
       const idemByKey = new Map<string, IdempotencyRecord>();
-      for (const idemRecord of idem) idemByKey.set(idemRecord.idempotencyKey, idemRecord);
+      for (const idemRecord of idem) {
+        if (restoredCompletionIds.has(idemRecord.requestId)) {
+          idemByKey.set(idemRecord.idempotencyKey, idemRecord);
+        }
+      }
       for (const row of completed) {
+        if (!restoredCompletionIds.has(row.requestId)) continue;
         if (row.idempotencyKey === undefined) continue;
         const existing = idemByKey.get(row.idempotencyKey);
         // Prefer the durable idem:<key> row when present (it is the freshest
@@ -674,6 +691,8 @@ export class WorkstationDO {
     const now = Date.now();
     const workstationId = this.workstationId();
     const requestId = req.requestId ?? newRequestId();
+    const resourcePrincipalRef = req.resourcePrincipalRef ?? "principal:legacy";
+    const principalLimit = Math.min(this.limits.maxPendingPerPrincipal, this.limits.maxPendingRequests);
     if (req.routeDeviceId) {
       const fenceError = await this.enforceExecutionFence(req, requestId, workstationId);
       if (fenceError) return fenceError;
@@ -761,6 +780,8 @@ export class WorkstationDO {
       return this.forwardEphemeralRead({
         requestId,
         workstationId,
+        resourcePrincipalRef,
+        principalLimit,
         op: req.op,
         deadlineMs,
         wire,
@@ -774,6 +795,13 @@ export class WorkstationDO {
     this.inFlightReadDedupe.clear();
     this.recentReadDedupe.clear();
 
+    if (req.idempotencyKey !== undefined) {
+      const replay = this.registry.idempotentCompletion(req.op, req.idempotencyKey);
+      if (replay !== undefined) {
+        return this.successfulForwardResponse(replay, req.routeDeviceId);
+      }
+    }
+
     // Reconcile any durable mutation left past deadline by a previous isolate
     // before admitting a new mutation. If storage is over quota this fails
     // before the new mutation is sent, preserving fail-closed semantics.
@@ -785,6 +813,18 @@ export class WorkstationDO {
         opClass: expired.opClass,
       });
       await this.persistSettlement(expired.requestId, { status: "error", error: err, servedAtMs: now });
+    }
+
+    const principalActive = this.activeCountForPrincipal(resourcePrincipalRef);
+    if (principalActive >= principalLimit) {
+      return this.json({ status: "error", error: capacityResult({
+        requestId,
+        workstationId,
+        atMs: now,
+        resourceKey: resourcePrincipalRef,
+        limit: principalLimit,
+        active: principalActive,
+      }) }, 429);
     }
 
     // Preserve the original global in-flight bound when ephemeral reads are
@@ -800,6 +840,7 @@ export class WorkstationDO {
     const add = this.registry.add({
       requestId,
       workstationId,
+      resourcePrincipalRef,
       op: req.op,
       opClass,
       argsSummary: { argKeys: Object.keys((req.args ?? {}) as Record<string, unknown>).slice(0, 32) },
@@ -828,9 +869,11 @@ export class WorkstationDO {
       });
     }
     const entry = add.entry;
+    this.activeDurableAdmissions.add(entry.requestId);
 
     const encoded = encodeWire(wire, this.limits.maxFrameBytes);
     if (!encoded.ok) {
+      this.activeDurableAdmissions.delete(entry.requestId);
       this.registry.removeActive(entry.requestId);
       return this.json(
         { status: "error", error: errorResult("payload_too_large", { requestId: entry.requestId, workstationId, atMs: now }) },
@@ -843,8 +886,13 @@ export class WorkstationDO {
     // Storage is at quota, the mutation fails closed here and is never sent.
     // This also removes the former second pending-row write after socket send.
     this.registry.markSent(entry.requestId, now);
-    await this.state.storage.put(PREFIX_PENDING + entry.requestId, entry);
-    await this.armAlarm();
+    try {
+      await this.state.storage.put(PREFIX_PENDING + entry.requestId, entry);
+      await this.armAlarm();
+    } catch (persistErr) {
+      this.activeDurableAdmissions.delete(entry.requestId);
+      throw persistErr;
+    }
 
     // Test seam: deterministic pre-send interleave point. A test can pause a
     // durable mutation here (after the pre-send durability fence, before the
@@ -864,6 +912,7 @@ export class WorkstationDO {
       if (settledCompletion) {
         return this.successfulForwardResponse(settledCompletion, req.routeDeviceId);
       }
+      this.activeDurableAdmissions.delete(entry.requestId);
       return this.json(
         { status: "error", error: reconnectingResult({ requestId: entry.requestId, workstationId, atMs: now }) },
         503,
@@ -959,9 +1008,23 @@ export class WorkstationDO {
     for (const waiter of [...this.linkWaiters]) waiter();
   }
 
+  private activeCountForPrincipal(resourcePrincipalRef: string): number {
+    let active = 0;
+    for (const requestId of this.activeDurableAdmissions) {
+      const entry = this.registry.get(requestId);
+      if (entry?.resourcePrincipalRef === resourcePrincipalRef) active += 1;
+    }
+    for (const read of this.ephemeralReads.values()) {
+      if (read.resourcePrincipalRef === resourcePrincipalRef) active += 1;
+    }
+    return active;
+  }
+
   private async forwardEphemeralRead(opts: {
     requestId: string;
     workstationId: string;
+    resourcePrincipalRef: string;
+    principalLimit: number;
     op: string;
     deadlineMs: number;
     wire: ToolRequestMessage;
@@ -969,7 +1032,7 @@ export class WorkstationDO {
     routeDeviceId?: string;
     readDedupeKey?: string;
   }): Promise<Response> {
-    const { requestId, workstationId, op, deadlineMs, wire, now, readDedupeKey } = opts;
+    const { requestId, workstationId, resourcePrincipalRef, principalLimit, op, deadlineMs, wire, now, readDedupeKey } = opts;
     this.pruneRecentReadDedupe(now);
     if (readDedupeKey) {
       const inFlight = this.inFlightReadDedupe.get(readDedupeKey);
@@ -978,6 +1041,17 @@ export class WorkstationDO {
       if (recent && now - recent.settledAtMs <= READ_DUPLICATE_COALESCE_WINDOW_MS) {
         return this.successfulForwardResponse(recent.completion, opts.routeDeviceId);
       }
+    }
+    const principalActive = this.activeCountForPrincipal(resourcePrincipalRef);
+    if (principalActive >= principalLimit) {
+      return this.json({ status: "error", error: capacityResult({
+        requestId,
+        workstationId,
+        atMs: now,
+        resourceKey: resourcePrincipalRef,
+        limit: principalLimit,
+        active: principalActive,
+      }) }, 429);
     }
     // Preserve one coherent live-request capacity bound, but exclude expired
     // durable rows so historical mutation backlog cannot starve fresh reads.
@@ -994,6 +1068,7 @@ export class WorkstationDO {
     const entry: EphemeralReadRequest = {
       requestId,
       workstationId,
+      resourcePrincipalRef,
       op,
       state: "queued",
       createdAtMs: now,
@@ -1162,10 +1237,29 @@ export class WorkstationDO {
    * (revoke retry, alarm sweep, or a later forward's expired reconciliation)
    * can converge and no waiter hangs.
    */
+  private async deletePrunedSettlements(
+    pruned: Array<{ requestId: string; idempotencyKey?: string }>,
+  ): Promise<void> {
+    for (const row of pruned) {
+      try {
+        await this.state.storage.delete(PREFIX_COMPLETED + row.requestId);
+        if (row.idempotencyKey !== undefined) {
+          await this.state.storage.delete(PREFIX_IDEM + row.idempotencyKey);
+        }
+      } catch (persistErr) {
+        this.logger.warn("completed.retention_prune_failed", {
+          requestId: row.requestId,
+          reason: persistErr instanceof Error ? persistErr.message : "storage_write_failed",
+        });
+      }
+    }
+  }
+
   private async persistSettlement(requestId: string, completion: Completion): Promise<boolean> {
     const candidate = this.registry.get(requestId);
     if (candidate && candidate.opClass === "read") {
       this.logger.warn("pending.read_rejected_from_durable_settlement", { requestId, op: candidate.op });
+      this.activeDurableAdmissions.delete(requestId);
       this.registry.removeActive(requestId);
       const resolve = this.resolvers.get(requestId);
       if (resolve) {
@@ -1211,7 +1305,9 @@ export class WorkstationDO {
     }
 
     if (releaseIdempotency) entry.idempotencyKey = undefined;
-    this.registry.settle(requestId, completion);
+    const settled = this.registry.settle(requestId, completion);
+    this.activeDurableAdmissions.delete(requestId);
+    if (settled) await this.deletePrunedSettlements(settled.pruned);
     const resolve = this.resolvers.get(requestId);
     if (resolve) {
       this.resolvers.delete(requestId);
@@ -1265,7 +1361,9 @@ export class WorkstationDO {
       });
       return false;
     }
-    this.registry.recordSettlement(entry, completion);
+    const pruned = this.registry.recordSettlement(entry, completion);
+    this.activeDurableAdmissions.delete(requestId);
+    await this.deletePrunedSettlements(pruned);
     const resolve = this.resolvers.get(requestId);
     if (resolve) {
       this.resolvers.delete(requestId);

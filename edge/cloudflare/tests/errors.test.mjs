@@ -97,9 +97,20 @@ test("errors: structured results carry requestId", () => {
   const uncertain = uncertainResult({ requestId: "r1" });
   assert.equal(uncertain.retryable, false);
   assert.equal(uncertain.requires_human, false);
-  const capacity = capacityResult({ requestId: "r1" });
+  const capacity = capacityResult({
+    requestId: "r1",
+    resourceKey: "principal:test",
+    limit: 8,
+    active: 8,
+  });
   assert.equal(capacity.retryable, true);
   assert.equal(capacity.requires_human, false);
   assert.equal(capacity.delivery_state, "not_delivered");
   assert.equal(capacity.retry_after_ms, 1_000);
+  assert.deepEqual(capacity.details, {
+    quota_scope: "principal",
+    resource_key: "principal:test",
+    limit: 8,
+    active: 8,
+  });
 });
