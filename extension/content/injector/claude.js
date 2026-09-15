@@ -138,6 +138,18 @@ class ClaudeAdapter extends BaseAdapter {
   }
 
   async getAccountNativeIdentity() {
+    const sha256Identity = async (value) => {
+      if (!value || !globalThis.crypto?.subtle) return null;
+      const digest = await globalThis.crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(value),
+      );
+      const hex = [...new Uint8Array(digest)]
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+      return `claude-account-sha256:${hex}`;
+    };
+
     try {
       const response = await fetch("/api/auth/current_account", {
         method: "GET",
@@ -145,19 +157,26 @@ class ClaudeAdapter extends BaseAdapter {
         cache: "no-store",
         headers: { accept: "application/json" },
       });
-      if (!response.ok) return null;
-      const payload = await response.json();
-      const rawEmail = payload?.account?.email_address || payload?.email_address || null;
-      const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
-      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !globalThis.crypto?.subtle) return null;
-      const digest = await globalThis.crypto.subtle.digest(
-        "SHA-256",
-        new TextEncoder().encode(email),
-      );
-      const hex = [...new Uint8Array(digest)]
-        .map((value) => value.toString(16).padStart(2, "0"))
-        .join("");
-      return `claude-account-sha256:${hex}`;
+      if (response.ok) {
+        const payload = await response.json();
+        const rawEmail = payload?.account?.email_address || payload?.email_address || null;
+        const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
+        if (email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+          return await sha256Identity(email);
+        }
+      }
+    } catch (_) {}
+
+    // Claude's current web app no longer exposes /api/auth/current_account.
+    // It does publish the active account UUID through two independent local
+    // cache hints. Require both validated hints to agree before using them so
+    // stale/single-key page state cannot silently retarget Browser Registry.
+    try {
+      const hint = String(localStorage.getItem("__qk_hint_account_uuid") || "").trim().toLowerCase();
+      const confirmed = String(localStorage.getItem("rq-cache-confirmed-account") || "").trim().toLowerCase();
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+      if (!uuid.test(hint) || !uuid.test(confirmed) || hint !== confirmed) return null;
+      return await sha256Identity(confirmed);
     } catch (_) {
       return null;
     }

@@ -30,6 +30,8 @@ function harness(url = "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174
   const location = new URL(url);
   const window = {};
   let accountPayload = { account: { email_address: "User.Name+Claude@example.com" } };
+  let accountEndpointOk = true;
+  const localStorageValues = new Map();
   class BaseAdapter {
     elementVisible(candidate) { return Boolean(candidate?.visible); }
   }
@@ -42,11 +44,14 @@ function harness(url = "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174
     globalThis: null,
     document,
     location,
+    localStorage: {
+      getItem(key) { return localStorageValues.get(String(key)) ?? null; },
+    },
     window,
     fetch: async (input) => {
       assert.equal(String(input), "/api/auth/current_account");
       return {
-        ok: true,
+        ok: accountEndpointOk,
         async json() { return accountPayload; },
       };
     },
@@ -60,6 +65,11 @@ function harness(url = "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174
       selectors.set(selector, Array.isArray(values) ? values : [values]);
     },
     setAccountPayload(value) { accountPayload = value; },
+    setAccountEndpointOk(value) { accountEndpointOk = value === true; },
+    setLocalStorage(key, value) {
+      if (value == null) localStorageValues.delete(String(key));
+      else localStorageValues.set(String(key), String(value));
+    },
   };
 }
 
@@ -126,6 +136,25 @@ test("Claude adapter hashes current-account email before returning native identi
   );
 
   h.setAccountPayload({ account: {} });
+  assert.equal(await h.adapter.getAccountNativeIdentity(), null);
+});
+
+test("Claude adapter falls back to two matching validated account UUID hints", async () => {
+  const h = harness();
+  const accountUuid = "123e4567-e89b-42d3-a456-426614174000";
+  const expected = createHash("sha256").update(accountUuid).digest("hex");
+  h.setAccountEndpointOk(false);
+  h.setLocalStorage("__qk_hint_account_uuid", accountUuid.toUpperCase());
+  h.setLocalStorage("rq-cache-confirmed-account", accountUuid);
+  assert.equal(
+    await h.adapter.getAccountNativeIdentity(),
+    `claude-account-sha256:${expected}`,
+  );
+
+  h.setLocalStorage("rq-cache-confirmed-account", "223e4567-e89b-42d3-a456-426614174000");
+  assert.equal(await h.adapter.getAccountNativeIdentity(), null);
+
+  h.setLocalStorage("rq-cache-confirmed-account", "not-a-uuid");
   assert.equal(await h.adapter.getAccountNativeIdentity(), null);
 });
 
