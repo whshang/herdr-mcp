@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.92";
+const H2W_CONTENT_VERSION = "0.1.93";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -91,12 +91,10 @@ const H2W_CONTENT_VERSION = "0.1.92";
   // Fail closed until background confirms the master automation state. The
   // read-only HUD/workspace observers do not depend on these flags.
   let automationEnabled = false;
-  let automationAutoAllow = false;
   // Herdr tool permission cards are decoupled from the Auto continue/handoff
   // switches: whenever the page-side controller is owned and the fail-closed card
-  // detector can run, a supported, explicit Herdr tool permission card is allowed
-  // to be accepted automatically. This flag only silences that always-on watcher.
-  let permissionAutoAllowSuppressed = false;
+  // detector can run, a supported, explicit Herdr tool permission card is accepted
+  // automatically. Manual wake/continuation policy must not suppress tool consent.
   let automationRuntimeAvailable = false;
   let hudLabels = {};
   let queuedInsertCount = 0;
@@ -179,15 +177,11 @@ const H2W_CONTENT_VERSION = "0.1.92";
     const state = await sendBg({ type: "h2w_automation_state", convKey: ADAPTER.getConversationKey() });
     if (!state?.ok) {
       automationEnabled = false;
-      automationAutoAllow = false;
       automationRuntimeAvailable = false;
-      permissionAutoAllowSuppressed = false;
       return false;
     }
     automationRuntimeAvailable = state.runtime_available !== false;
     automationEnabled = state.enabled === true;
-    automationAutoAllow = state.autoAllow !== false;
-    permissionAutoAllowSuppressed = false;
     hudLabels = state.labels || hudLabels;
     updateQueuedInsertButton();
     return automationEnabled;
@@ -967,10 +961,6 @@ const H2W_CONTENT_VERSION = "0.1.92";
   let lastPermClickAt = 0;
   function permissionTryClick() {
     if (!runtimeAlive() || Date.now() > permDeadline) { permissionStop(); return; }
-    // Herdr tool permission cards are accepted independently of the Auto
-    // continue/handoff switches (Project Auto off must still allow its tools),
-    // but a wake that explicitly disabled auto-allow keeps its manual intent.
-    if (permissionAutoAllowSuppressed) return;
     const r = permClicker.tryClick(document);
     if (r.handled) {
       lastPermClickAt = Date.now();
@@ -981,9 +971,8 @@ const H2W_CONTENT_VERSION = "0.1.92";
     if (permObs) { try { permObs.disconnect(); } catch (e) {} permObs = null; }
     if (permScheduler) { try { permScheduler.cancel(); } catch (_) {} permScheduler = null; }
   }
-  function startPermissionWatch(durationMs = 90000, { suppressAutoAllow = false } = {}) {
+  function startPermissionWatch(durationMs = 90000) {
     const persistent = !Number.isFinite(durationMs);
-    permissionAutoAllowSuppressed = suppressAutoAllow;
     // A persistent observer already covers later finite watch requests.
     if (permObs && (persistent || permDeadline === Number.POSITIVE_INFINITY)) {
       if (persistent) permDeadline = Number.POSITIVE_INFINITY;
@@ -1065,8 +1054,10 @@ const H2W_CONTENT_VERSION = "0.1.92";
     }
     wakeInFlight = true;
     try {
-      if (data.autoAllow !== false) startPermissionWatch();
-      else startPermissionWatch(Number.POSITIVE_INFINITY, { suppressAutoAllow: true });
+      // Permission-card acceptance is an independent safety-bounded capability.
+      // `autoAllow:false` controls wake/continuation automation only; it must never
+      // leave a Herdr tool invocation waiting for a manual Allow click.
+      startPermissionWatch();
 
       // z.ai/DeepSeek JSON bridge intentionally intercepts normal user submits
       // so it can add the Herdr tool protocol. Handoff prompts and seeds are
@@ -5082,7 +5073,6 @@ const H2W_CONTENT_VERSION = "0.1.92";
     const preferenceEnabled = hud?.enabled === true;
     const effectiveEnabled = hud?.effective_enabled === true;
     automationEnabled = effectiveEnabled;
-    automationAutoAllow = hud?.autoAllow !== false;
     syncAutomationPermissionWatch();
     syncDocumentTitle(hud, state);
     ui.webStatus.textContent = hudWebActivityLabel();

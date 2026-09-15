@@ -82,10 +82,10 @@ const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-mod
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
-ok(manifest.version === "0.1.92", "manifest version stays aligned with the browser product build");
+ok(manifest.version === "0.1.93", "manifest version stays aligned with the browser product build");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.92"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.92"'), "content version matches manifest");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.93"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.93"'), "content version matches manifest");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
     && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY')
@@ -853,6 +853,7 @@ ok(
     && zhLocale.hud_automation_on_hint.includes("恢复")
     && zhLocale.hud_automation_on_hint.includes("自动接力")
     && zhLocale.hud_automation_on_hint.includes("权限卡")
+    && zhLocale.hud_automation_on_hint.includes("独立于 Auto")
     && zhLocale.hud_automation_on_hint.includes("接力"),
   "zh Auto-on tooltip enumerates automatic behavior and keeps manual handoff available in the HUD",
 );
@@ -860,8 +861,9 @@ ok(
   zhLocale.hud_automation_off_hint.includes("当前 ChatGPT Project")
     && zhLocale.hud_automation_off_hint.includes("继续")
     && zhLocale.hud_automation_off_hint.includes("接力")
+    && zhLocale.hud_automation_off_hint.includes("权限卡")
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
-  "zh Auto-off tooltip keeps all safe current-conversation HUD actions available",
+  "zh Auto-off tooltip keeps safe HUD actions available and states permission-card independence",
 );
 ok(zhLocale.label_automation_mode === "允许 ChatGPT 项目使用共享 Auto"
     && zhLocale.label_automation_mode.includes("共享 Auto")
@@ -929,7 +931,7 @@ ok(backgroundSource.includes('experimentalZAiEnabled: false')
   "experimental site integrations fail closed in background/content while Gemini and Grok stay outside JSON bridge");
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
-  "permission-card automation is folded into effective Project automation");
+  "permission-card automation has no separate legacy user preference");
 ok(wakeDocEn.includes("The HUD exposes Continue / Check Herdr / LLM decide plus Handoff")
     && wakeDocZh.includes("HUD 提供 `继续 / 查 Herdr / LLM 判断` 三个页面级推进动作和“接力”")
     && wakeDocEn.includes("herdr_mcp.browser_handoff.prepare")
@@ -1606,17 +1608,16 @@ console.log("\n[tool-action permission-card auto-allow]");
     ok(r.handled === true && r.button === mainAllow, "nested outer deny still selects exact primary action");
     ok(mainAllow.clickCount === 1 && externalAllow.clickCount === 0 && outerDeny.clickCount === 0, "only the primary Allow is clicked");
   }
-  // 13) An Auto-OFF wake keeps manual intent: no permission auto-click.
-  //     (wake.js gates the watcher on permissionAutoAllowSuppressed, verified by source
-  //     assertions below; base.js itself stays automation-independent.)
-  // 14) wake.js keeps the permission watcher decoupled from Project Auto:
+  // 13) wake.js keeps the permission watcher decoupled from every Auto/manual switch:
   //     - permissionTryClick must not require automationEnabled/automationAutoAllow;
+  //     - an explicit wake-level autoAllow:false must not suppress tool consent;
   //     - syncAutomationPermissionWatch must always (re)start the persistent watcher;
   //     - the fail-closed clicker from base.js is still the only click surface.
   ok(
-    wakeSource.includes("if (permissionAutoAllowSuppressed) return;")
+    !wakeSource.includes("permissionAutoAllowSuppressed")
+      && !wakeSource.includes("suppressAutoAllow")
       && !wakeSource.includes("if (!automationEnabled || !automationAutoAllow) return;"),
-    "permission clicks are gated only by an explicit wake-level suppression, not by Auto state",
+    "permission clicks cannot be suppressed by Project Auto or per-wake manual mode",
   );
   ok(
     /function syncAutomationPermissionWatch\(\) \{[\s\S]*?startPermissionWatch\(Number\.POSITIVE_INFINITY\);/.test(wakeSource),
@@ -1628,9 +1629,9 @@ console.log("\n[tool-action permission-card auto-allow]");
     "Auto off no longer stops the permission watcher",
   );
   ok(
-    wakeSource.includes("else startPermissionWatch(Number.POSITIVE_INFINITY, { suppressAutoAllow: true });")
-      && wakeSource.includes("if (data.autoAllow !== false) startPermissionWatch();"),
-    "wake that explicitly disables auto-allow suppresses clicks; the default wake keeps them",
+    /async function performWake\(data\)[\s\S]*?startPermissionWatch\(\);/.test(wakeSource)
+      && !wakeSource.includes("data.autoAllow !== false"),
+    "manual wake policy cannot disable Herdr permission-card acceptance",
   );
   ok(
     wakeSource.includes("Herdr Connector cards are watched continuously and independently of the Auto"),
