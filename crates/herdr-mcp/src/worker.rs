@@ -312,6 +312,11 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     match command {
         WorkerCommand::List => list_devices(&paths),
         WorkerCommand::Bootstrap => crate::worker_bootstrap::run(&paths),
+        WorkerCommand::Update => {
+            let result = crate::worker_bootstrap::update_current_worker(&paths)?;
+            print_json(&result)?;
+            Ok(ExitCode::SUCCESS)
+        }
         WorkerCommand::Pair {
             ttl_seconds,
             name,

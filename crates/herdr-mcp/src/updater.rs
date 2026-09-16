@@ -213,13 +213,27 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         .map_err(|error| update_check_indeterminate_error(&error))?;
     let current = current_version()?;
     let available = plan.version > current;
+    let paths = RuntimePaths::discover()?;
+    let release_version = plan.version.to_string();
+    let worker_update = worker_update_status_view(&paths, &release_version);
+    let worker_update_required = worker_update
+        .get("update_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let next_action = if available {
+        Some("herdr-mcp update apply")
+    } else if worker_update_required {
+        Some("herdr-mcp worker update")
+    } else {
+        None
+    };
     print_json(&json!({
         "ok": true,
         "code": "update_check",
         "update_channel": channel.as_str(),
         "current_version": current.to_string(),
         "available": available,
-        "release_version": plan.version.to_string(),
+        "release_version": release_version,
         "tag": plan.tag,
         "source_commit": plan.identity.source_commit,
         "repository": plan.identity.repository,
@@ -228,11 +242,8 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         "asset": plan.asset.name,
         "sha256": plan.asset.sha256,
         "size": plan.asset.size,
-        "next_action": if available {
-            Some("herdr-mcp update apply")
-        } else {
-            None
-        },
+        "worker_update": worker_update,
+        "next_action": next_action,
     }))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -241,6 +252,130 @@ fn update_check_indeterminate_error(error: &str) -> String {
     format!(
         "could not determine whether an update is available ({error}); run `herdr-mcp update apply` to retry"
     )
+}
+
+fn worker_update_status_view(paths: &RuntimePaths, target_version: &str) -> Value {
+    match crate::worker_bootstrap::existing_worker_status(paths, target_version) {
+        Ok(Some(status)) => status.public_view(),
+        Ok(None) => json!({
+            "configured": false,
+            "update_required": false,
+            "reason": "edge_not_configured",
+        }),
+        Err(error) => json!({
+            "configured": true,
+            "update_required": null,
+            "status": "unknown",
+            "error": error,
+            "next_action": "herdr-mcp worker update",
+        }),
+    }
+}
+
+fn reconcile_worker_for_release(
+    paths: &RuntimePaths,
+    source_commit: &str,
+    target_version: &str,
+) -> Value {
+    match crate::worker_bootstrap::existing_worker_status(paths, target_version) {
+        Ok(None) => json!({
+            "ok": true,
+            "code": "worker_update_skipped",
+            "changed": false,
+            "reason": "edge_not_configured",
+        }),
+        Ok(Some(status)) if !status.update_required() => json!({
+            "ok": true,
+            "code": "worker_update_current",
+            "changed": false,
+            "worker": status.worker_name,
+            "edge_origin": status.edge_origin,
+            "version": target_version,
+        }),
+        Ok(Some(_)) => match crate::worker_bootstrap::update_existing_worker_for_release(
+            paths,
+            source_commit,
+            target_version,
+        ) {
+            Ok(result) => result,
+            Err(error) => json!({
+                "ok": false,
+                "code": "worker_update_required",
+                "error": error,
+                "next_action": "herdr-mcp worker update",
+            }),
+        },
+        Err(error) => json!({
+            "ok": false,
+            "code": "worker_update_status_unknown",
+            "error": error,
+            "next_action": "herdr-mcp worker update",
+        }),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn reconcile_worker_with_active_runtime(paths: &RuntimePaths) -> Value {
+    let binary = match active_runtime_binary(paths) {
+        Ok(binary) => binary,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "code": "worker_update_active_runtime_unavailable",
+                "error": error,
+                "next_action": "herdr-mcp worker update",
+            });
+        }
+    };
+    let output = match Command::new(&binary)
+        .arg("worker")
+        .arg("update")
+        .env_remove("HERDR_MCP_EXEC_ID")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "code": "worker_update_launch_failed",
+                "error": format!("cannot launch active Runtime Worker reconciliation: {error}"),
+                "next_action": "herdr-mcp worker update",
+            });
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = serde_json::from_str::<Value>(stdout.trim()).ok();
+    if output.status.success() {
+        return parsed.unwrap_or_else(|| {
+            json!({
+                "ok": false,
+                "code": "worker_update_invalid_result",
+                "error": "active Runtime Worker reconciliation returned no valid JSON result",
+                "next_action": "herdr-mcp worker update",
+            })
+        });
+    }
+    match parsed {
+        Some(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("ok".to_owned(), json!(false));
+                object
+                    .entry("next_action".to_owned())
+                    .or_insert_with(|| json!("herdr-mcp worker update"));
+            }
+            value
+        }
+        None => json!({
+            "ok": false,
+            "code": "worker_update_failed",
+            "exit_code": output.status.code(),
+            "error": "active Runtime Worker reconciliation did not complete; diagnostics were written to stderr",
+            "next_action": "herdr-mcp worker update",
+        }),
+    }
 }
 
 fn apply(manifest_override: Option<&str>) -> Result<ExitCode, String> {
@@ -324,27 +459,72 @@ fn apply_inner(
             "Release {} verified; current version is {}.",
             plan.version, current
         ));
-        if plan.version <= current {
+        let paths = RuntimePaths::discover()?;
+        if plan.version < current {
+            return Err(format!(
+                "release {} is older than current {}; refusing downgrade",
+                plan.version, current
+            ));
+        }
+        if plan.version == current {
+            let target_version = plan.version.to_string();
             if allow_current {
+                let worker_update = worker_update_status_view(&paths, &target_version);
+                let worker_update_required = worker_update
+                    .get("update_required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 print_json(&json!({
                     "ok": true,
                     "code": "auto_update_current",
                     "update_channel": channel.as_str(),
                     "current_version": current.to_string(),
-                    "release_version": plan.version.to_string(),
+                    "release_version": target_version,
                     "tag": plan.tag,
                     "provenance_verified": true,
                     "network_checked": true,
                     "update_queued": false,
+                    "worker_update": worker_update,
+                    "next_action": if worker_update_required {
+                        Some("herdr-mcp worker update")
+                    } else {
+                        None
+                    },
                 }))?;
                 return Ok(ExitCode::SUCCESS);
             }
-            return Err(format!(
-                "release {} is not newer than current {}; refusing downgrade/reinstall",
-                plan.version, current
-            ));
+            // Runtime is already on the target release. This is the recovery
+            // path for users who upgraded with an older updater that did not
+            // yet reconcile their user-owned Edge Worker.
+            let worker_update =
+                reconcile_worker_for_release(&paths, &plan.identity.source_commit, &target_version);
+            let worker_ok = worker_update.get("ok").and_then(Value::as_bool) != Some(false);
+            print_json(&json!({
+                "ok": worker_ok,
+                "code": if worker_ok {
+                    "update_current"
+                } else {
+                    "update_current_worker_update_required"
+                },
+                "update_channel": channel.as_str(),
+                "current_version": current.to_string(),
+                "release_version": target_version,
+                "tag": plan.tag,
+                "provenance_verified": true,
+                "runtime_changed": false,
+                "worker_update": worker_update,
+                "next_action": if worker_ok {
+                    None
+                } else {
+                    Some("herdr-mcp worker update")
+                },
+            }))?;
+            return Ok(if worker_ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
         }
-        let paths = RuntimePaths::discover()?;
         let store = UpdateStore::open(&paths)?;
         recover_or_reject_active_update(&store, &paths)?;
         progress.phase("Preparing a rollback-safe update job...");
@@ -396,9 +576,20 @@ fn apply_inner(
 
         if progress.enabled {
             if let Some(job) = watch_update_job(&store, &job_id, &mut child, &mut progress)? {
+                progress.phase("Runtime update succeeded. Checking the fleet Worker release...");
+                // The foreground updater may be the old release. Delegate Edge
+                // reconciliation to the just-activated runtime/current binary
+                // so future same-contract releases can evolve their Worker
+                // metadata rules without an older updater guessing them.
+                let worker_update = reconcile_worker_with_active_runtime(&paths);
+                let worker_ok = worker_update.get("ok").and_then(Value::as_bool) != Some(false);
                 print_json(&json!({
-                    "ok": true,
-                    "code": "update_succeeded",
+                    "ok": worker_ok,
+                    "code": if worker_ok {
+                        "update_succeeded"
+                    } else {
+                        "update_succeeded_worker_update_required"
+                    },
                     "job_id": job_id,
                     "version": plan.version.to_string(),
                     "target": plan.asset.target,
@@ -406,8 +597,18 @@ fn apply_inner(
                     "worker_pid": child.id(),
                     "worker_pid_persisted": worker_pid_persisted,
                     "job": public_job_view(&job),
+                    "worker_update": worker_update,
+                    "next_action": if worker_ok {
+                        None
+                    } else {
+                        Some("herdr-mcp worker update")
+                    },
                 }))?;
-                return Ok(ExitCode::SUCCESS);
+                return Ok(if worker_ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                });
             }
             progress.phase(
                 "Installer is still running in the background; use `herdr-mcp update status` for the final state.",
@@ -423,6 +624,10 @@ fn apply_inner(
             "asset": plan.asset.name,
             "worker_pid": child.id(),
             "worker_pid_persisted": worker_pid_persisted,
+            "worker_update": {
+                "state": "deferred_until_runtime_update_finishes",
+                "next_action": "herdr-mcp update status",
+            },
             "next_action": "herdr-mcp update status",
         }))?;
         Ok(ExitCode::SUCCESS)
@@ -1051,16 +1256,36 @@ fn status() -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     let store = UpdateStore::open(&paths)?;
     let latest = store.latest_update_job()?;
+    let current_version = current_version()?.to_string();
+    let worker_update = worker_update_status_view(&paths, &current_version);
+    let worker_update_required = worker_update
+        .get("update_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let payload = match latest {
         Some(job) => json!({
             "ok": true,
             "code": "update_status",
             "job": public_job_view(&job),
+            "current_version": current_version,
+            "worker_update": worker_update,
+            "next_action": if worker_update_required {
+                Some("herdr-mcp worker update")
+            } else {
+                None
+            },
         }),
         None => json!({
             "ok": true,
             "code": "update_status",
             "job": null,
+            "current_version": current_version,
+            "worker_update": worker_update,
+            "next_action": if worker_update_required {
+                Some("herdr-mcp worker update")
+            } else {
+                None
+            },
         }),
     };
     print_json(&payload)?;

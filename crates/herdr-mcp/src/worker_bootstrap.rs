@@ -1,8 +1,10 @@
 use crate::paths::RuntimePaths;
 use crate::release_trust;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
@@ -147,6 +149,31 @@ struct Account {
 #[derive(Debug, Clone)]
 struct Script {
     name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExistingWorkerStatus {
+    pub edge_origin: String,
+    pub worker_name: String,
+    pub edge_version: String,
+    pub target_version: String,
+}
+
+impl ExistingWorkerStatus {
+    pub(crate) fn update_required(&self) -> bool {
+        self.edge_version != self.target_version
+    }
+
+    pub(crate) fn public_view(&self) -> Value {
+        json!({
+            "configured": true,
+            "edge_origin": self.edge_origin,
+            "worker": self.worker_name,
+            "edge_version": self.edge_version,
+            "target_version": self.target_version,
+            "update_required": self.update_required(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,6 +413,14 @@ impl<'a> Cloudflare<'a> {
         Ok(scripts)
     }
 
+    fn script_settings(&self, account_id: &str, worker_name: &str) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::GET,
+            &format!("accounts/{account_id}/workers/scripts/{worker_name}/settings"),
+            None,
+        )
+    }
+
     fn workers_subdomain(&self, account_id: &str) -> Result<Option<String>, String> {
         let (status, payload) = self.send(
             reqwest::Method::GET,
@@ -428,6 +463,7 @@ impl<'a> Cloudflare<'a> {
         worker_name: &str,
         bundle: &[u8],
         metadata: &Value,
+        strict_binding_inherit: bool,
     ) -> Result<(), String> {
         gate.require("deploy Worker")?;
         let module = reqwest::blocking::multipart::Part::bytes(bundle.to_vec())
@@ -437,7 +473,7 @@ impl<'a> Cloudflare<'a> {
         let form = reqwest::blocking::multipart::Form::new()
             .text("metadata", metadata.to_string())
             .part(EDGE_MAIN_MODULE.to_owned(), module);
-        let url = format!("{CLOUDFLARE_API}/accounts/{account_id}/workers/scripts/{worker_name}");
+        let url = worker_upload_url(account_id, worker_name, strict_binding_inherit);
         let response = self
             .client
             .put(url)
@@ -566,6 +602,14 @@ impl<'a> Cloudflare<'a> {
     }
 }
 
+fn worker_upload_url(account_id: &str, worker_name: &str, strict_binding_inherit: bool) -> String {
+    let mut url = format!("{CLOUDFLARE_API}/accounts/{account_id}/workers/scripts/{worker_name}");
+    if strict_binding_inherit {
+        url.push_str("?bindings_inherit=strict");
+    }
+    url
+}
+
 pub fn run(paths: &RuntimePaths) -> Result<ExitCode, String> {
     if !bootstrap_platform_supported(std::env::consts::OS) {
         return Err("worker bootstrap is unsupported on this platform".to_owned());
@@ -578,6 +622,176 @@ pub fn run(paths: &RuntimePaths) -> Result<ExitCode, String> {
 
 fn bootstrap_platform_supported(os: &str) -> bool {
     matches!(os, "macos" | "linux" | "windows")
+}
+
+pub(crate) fn existing_worker_status(
+    paths: &RuntimePaths,
+    target_version: &str,
+) -> Result<Option<ExistingWorkerStatus>, String> {
+    let config = crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let Some(edge_origin) = config.edge_public_origin else {
+        return Ok(None);
+    };
+    let client = client_for_edge_origin(&edge_origin)?;
+    let response = client
+        .get(format!("{edge_origin}/health"))
+        .send()
+        .map_err(|error| format!("cannot read current Worker health: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "current Worker health returned HTTP {}",
+            status.as_u16()
+        ));
+    }
+    let payload: Value = response
+        .json()
+        .map_err(|_| "current Worker health returned invalid JSON".to_owned())?;
+    validate_edge_transport_payload(&payload, &edge_origin)?;
+    let worker_name = payload
+        .get("service")
+        .and_then(Value::as_str)
+        .filter(|value| valid_worker_name(value))
+        .ok_or_else(|| "current Worker health returned no valid service identity".to_owned())?
+        .to_owned();
+    let edge_version = payload
+        .get("edgeVersion")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 128)
+        .ok_or_else(|| "current Worker health returned no Edge release version".to_owned())?
+        .to_owned();
+    Ok(Some(ExistingWorkerStatus {
+        edge_origin,
+        worker_name,
+        edge_version,
+        target_version: target_version.to_owned(),
+    }))
+}
+
+pub(crate) fn update_current_worker(paths: &RuntimePaths) -> Result<Value, String> {
+    if crate::runtime_meta::runtime_channel() != "prod" {
+        return Err(
+            "worker update requires an installed PROD release runtime; DEV source runtimes must not mutate a user's production Worker"
+                .to_owned(),
+        );
+    }
+    let source_commit = crate::runtime_meta::compiled_source_commit()
+        .filter(|value| valid_source_commit(value))
+        .ok_or_else(|| "worker update requires an exact release source commit".to_owned())?;
+    update_existing_worker_for_release(paths, source_commit, crate::runtime_meta::runtime_version())
+}
+
+pub(crate) fn update_existing_worker_for_release(
+    paths: &RuntimePaths,
+    source_commit: &str,
+    target_version: &str,
+) -> Result<Value, String> {
+    if paths.instance.is_named() {
+        return Err("worker update is available only on the default Herdr instance".to_owned());
+    }
+    if !valid_source_commit(source_commit) {
+        return Err("worker update requires an exact release source commit".to_owned());
+    }
+    let config = crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    if config.edge_device_id.is_none() {
+        return Err(
+            "worker update requires this computer to be enrolled in the existing fleet".to_owned(),
+        );
+    }
+    let Some(current) = existing_worker_status(paths, target_version)? else {
+        return Ok(json!({
+            "ok": true,
+            "code": "worker_update_skipped",
+            "changed": false,
+            "reason": "edge_not_configured",
+        }));
+    };
+    if !current.update_required() {
+        return Ok(json!({
+            "ok": true,
+            "code": "worker_update_current",
+            "changed": false,
+            "worker": current.worker_name,
+            "edge_origin": current.edge_origin,
+            "version": target_version,
+        }));
+    }
+    ensure_worker_version_can_advance(&current.edge_version, target_version)?;
+
+    // Download and attest before asking for Cloudflare authority. A bad release
+    // artifact therefore cannot turn into a control-plane mutation attempt.
+    let bundle = prepare_edge_bundle(source_commit, target_version)?;
+    let (token, refresh_token) = acquire_cloudflare_credential()?;
+    let cloudflare = Cloudflare::new(&token)?;
+    let account = select_account(&cloudflare)?;
+    let scripts = cloudflare.scripts(&account.id)?;
+    if !scripts
+        .iter()
+        .any(|script| script.name == current.worker_name)
+    {
+        return Err(format!(
+            "the selected Cloudflare account does not contain the health-proven Herdr Worker '{}'; no mutation was attempted",
+            current.worker_name
+        ));
+    }
+    let settings = cloudflare.script_settings(&account.id, &current.worker_name)?;
+    validate_existing_worker_settings(
+        &settings,
+        &current.worker_name,
+        &current.edge_origin,
+        &current.edge_version,
+    )?;
+    let secret_names = cloudflare.list_secret_names(&account.id, &current.worker_name)?;
+    let metadata = worker_update_metadata(
+        &current.worker_name,
+        &current.edge_origin,
+        target_version,
+        &settings,
+        &secret_names,
+    )?;
+    let mut gate = MutationGate::default();
+    gate.mark_classified();
+    cloudflare.upload_worker(
+        &gate,
+        &account.id,
+        &current.worker_name,
+        &bundle.bytes,
+        &metadata,
+        true,
+    )?;
+    drop(refresh_token);
+    drop(token);
+
+    // The public origin may be a Custom Domain. Verify through the same origin
+    // used by Connector/OAuth rather than assuming workers.dev routing.
+    verify_health(
+        &current.edge_origin,
+        &current.worker_name,
+        Some(target_version),
+    )?;
+    Ok(json!({
+        "ok": true,
+        "code": "worker_update_succeeded",
+        "changed": true,
+        "worker": current.worker_name,
+        "edge_origin": current.edge_origin,
+        "previous_version": current.edge_version,
+        "version": target_version,
+        "connector_readd_required": false,
+    }))
+}
+
+fn ensure_worker_version_can_advance(current: &str, target: &str) -> Result<(), String> {
+    let current = Version::parse(current)
+        .map_err(|_| "current Worker edgeVersion is not valid semver; refusing an unproven in-place replacement".to_owned())?;
+    let target = Version::parse(target)
+        .map_err(|_| "target Worker release version is not valid semver".to_owned())?;
+    if current > target {
+        return Err(format!(
+            "current Worker version {current} is newer than target {target}; refusing Edge downgrade"
+        ));
+    }
+    Ok(())
 }
 
 fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
@@ -688,7 +902,14 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
         let bundle = prepare_edge_bundle(&source_commit, &runtime_version)?;
         let metadata =
             worker_upload_metadata(&worker_name, &edge_origin, &runtime_version, !script_exists)?;
-        cloudflare.upload_worker(&gate, &account.id, &worker_name, &bundle.bytes, &metadata)?;
+        cloudflare.upload_worker(
+            &gate,
+            &account.id,
+            &worker_name,
+            &bundle.bytes,
+            &metadata,
+            false,
+        )?;
         cloudflare.enable_worker_subdomain(&gate, &account.id, &worker_name)?;
         cloudflare.set_worker_schedule(&gate, &account.id, &worker_name)?;
         let edge_http = verify_health(&edge_origin, &worker_name, Some(&runtime_version))?;
@@ -939,12 +1160,15 @@ fn acquire_device_flow() -> Result<(SecretBytes, Option<SecretBytes>), String> {
         .verification_uri_complete
         .unwrap_or_else(|| verification_uri.clone());
 
-    println!(
+    // This flow can run as the Worker-update subprocess launched by the
+    // updater with stdout piped and parsed as machine-readable JSON. Keep
+    // this human device-flow progress on stderr so stdout stays pure JSON.
+    eprintln!(
         "Cloudflare Workers Free is sufficient for Herdr. If you do not have a Cloudflare account, create one on the page that opens; signing in with Google is the simplest option."
     );
-    println!("Open this Cloudflare page and approve Herdr: {verification_uri}");
-    println!("Verification code: {user_code}");
-    println!("Code expires in at most {expires} seconds.");
+    eprintln!("Open this Cloudflare page and approve Herdr: {verification_uri}");
+    eprintln!("Verification code: {user_code}");
+    eprintln!("Code expires in at most {expires} seconds.");
     open_browser(&verification_uri_complete);
 
     let started = std::time::Instant::now();
@@ -1184,6 +1408,7 @@ fn parse_edge_release_manifest(
     if identity.source_commit != source_commit {
         return Err("release manifest source commit does not match this runtime".to_owned());
     }
+    require_current_release_contract(manifest)?;
     let edge = manifest
         .get("edge")
         .and_then(Value::as_object)
@@ -1231,6 +1456,25 @@ fn parse_edge_release_manifest(
         url,
         identity,
     })
+}
+
+fn require_current_release_contract(manifest: &Value) -> Result<(), String> {
+    let expected_contract = crate::contract::identity()?;
+    let contract = manifest
+        .get("contract")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "release manifest is missing contract identity".to_owned())?;
+    if contract.get("epoch").and_then(Value::as_u64) != Some(u64::from(expected_contract.epoch))
+        || contract.get("hash").and_then(Value::as_str) != Some(expected_contract.hash.as_str())
+        || contract.get("tool_count").and_then(Value::as_u64)
+            != Some(u64::from(expected_contract.tool_count))
+    {
+        return Err(
+            "release manifest contract identity requires an explicit contract migration; ordinary Worker update refused"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn read_http_bounded(
@@ -1304,6 +1548,166 @@ fn worker_upload_metadata(
         });
     }
     Ok(metadata)
+}
+
+fn worker_update_metadata(
+    worker_name: &str,
+    edge_origin: &str,
+    runtime_version: &str,
+    current_settings: &Value,
+    secret_names: &[String],
+) -> Result<Value, String> {
+    let mut metadata = worker_upload_metadata(worker_name, edge_origin, runtime_version, false)?;
+    let Some(bindings) = current_settings.get("bindings") else {
+        return Err(
+            "Cloudflare Worker settings are missing bindings; refusing an in-place update"
+                .to_owned(),
+        );
+    };
+    let bindings = bindings.as_array().ok_or_else(|| {
+        "Cloudflare Worker settings returned invalid bindings; refusing an in-place update"
+            .to_owned()
+    })?;
+    let desired = metadata
+        .get_mut("bindings")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "cannot construct Worker update bindings".to_owned())?;
+    let mut inherited_names = BTreeSet::new();
+    for binding in bindings {
+        let binding_type = binding
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Cloudflare Worker binding is missing its type".to_owned())?;
+        let name = binding
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Cloudflare Worker binding is missing its name".to_owned())?;
+        match (binding_type, name) {
+            (
+                "durable_object_namespace",
+                "WORKSTATION_DO" | "OAUTH_STORE_DO" | "DEVICE_REGISTRY_DO",
+            )
+            | ("plain_text", "EDGE_ENV" | "EDGE_PROJECT" | "EDGE_VERSION" | "OAUTH_ISSUER") => {}
+            // Cloudflare's upload API can inherit an existing binding by name.
+            // Use the strict inheritance query on the update call so a missing
+            // prior secret is a hard failure rather than a silently dropped
+            // binding. Secret values never enter this process.
+            ("secret_text", _) => {
+                if inherited_names.insert(name.to_owned()) {
+                    desired.push(json!({
+                        "type": "inherit",
+                        "name": name,
+                    }));
+                }
+            }
+            ("r2_bucket", "ARTIFACT_BUCKET") => {
+                binding
+                    .get("bucket_name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        "ARTIFACT_BUCKET binding has no bucket_name; refusing to drop it".to_owned()
+                    })?;
+                desired.push(json!({
+                    "type": "inherit",
+                    "name": "ARTIFACT_BUCKET",
+                }));
+                inherited_names.insert("ARTIFACT_BUCKET".to_owned());
+            }
+            _ => {
+                return Err(format!(
+                    "Worker binding {name} ({binding_type}) is not managed by the release updater; refusing an update that could drop custom configuration"
+                ));
+            }
+        }
+    }
+    // The settings endpoint is authoritative for non-secret bindings, while
+    // the dedicated secret inventory is authoritative for secret binding
+    // names. Include both sources so a Cloudflare response that redacts or
+    // omits `secret_text` settings cannot silently drop a secret on upload.
+    for name in secret_names {
+        if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+            return Err(
+                "Cloudflare Worker secret inventory returned an invalid binding name; refusing in-place update"
+                    .to_owned(),
+            );
+        }
+        if inherited_names.insert(name.clone()) {
+            desired.push(json!({
+                "type": "inherit",
+                "name": name,
+            }));
+        }
+    }
+    if let Some(flags) = current_settings.get("compatibility_flags") {
+        let flags = flags.as_array().ok_or_else(|| {
+            "Cloudflare Worker compatibility_flags are invalid; refusing in-place update".to_owned()
+        })?;
+        if !flags.is_empty() {
+            if !flags.iter().all(|flag| flag.as_str().is_some()) {
+                return Err(
+                    "Cloudflare Worker compatibility_flags contain invalid values; refusing in-place update"
+                        .to_owned(),
+                );
+            }
+            metadata["compatibility_flags"] = Value::Array(flags.clone());
+        }
+    }
+    Ok(metadata)
+}
+
+fn validate_existing_worker_settings(
+    settings: &Value,
+    worker_name: &str,
+    edge_origin: &str,
+    edge_version: &str,
+) -> Result<(), String> {
+    let bindings = settings
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Cloudflare Worker settings are missing bindings".to_owned())?;
+
+    let require_plain = |name: &str, expected: &str| -> Result<(), String> {
+        let matches = bindings
+            .iter()
+            .filter(|binding| {
+                binding.get("type").and_then(Value::as_str) == Some("plain_text")
+                    && binding.get("name").and_then(Value::as_str) == Some(name)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 || matches[0].get("text").and_then(Value::as_str) != Some(expected) {
+            return Err(format!(
+                "Cloudflare Worker setting {name} does not match the health/config identity; no mutation was attempted"
+            ));
+        }
+        Ok(())
+    };
+    require_plain("EDGE_ENV", "prod")?;
+    require_plain("EDGE_PROJECT", worker_name)?;
+    require_plain("EDGE_VERSION", edge_version)?;
+    require_plain("OAUTH_ISSUER", edge_origin)?;
+
+    for (name, class_name) in [
+        ("WORKSTATION_DO", "WorkstationDO"),
+        ("OAUTH_STORE_DO", "OAuthStoreDO"),
+        ("DEVICE_REGISTRY_DO", "DeviceRegistryDO"),
+    ] {
+        let matches = bindings
+            .iter()
+            .filter(|binding| {
+                binding.get("type").and_then(Value::as_str) == Some("durable_object_namespace")
+                    && binding.get("name").and_then(Value::as_str) == Some(name)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1
+            || matches[0].get("class_name").and_then(Value::as_str) != Some(class_name)
+        {
+            return Err(format!(
+                "Cloudflare Worker binding {name} does not match Herdr ownership; no mutation was attempted"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn create_and_consume_first_pairing(
@@ -3002,6 +3406,151 @@ mod tests {
         )
         .unwrap();
         assert!(metadata.get("migrations").is_none());
+    }
+
+    #[test]
+    fn worker_update_preserves_optional_r2_and_custom_oauth_origin_without_migrations() {
+        let settings = json!({
+            "bindings": [
+                {"type": "durable_object_namespace", "name": "WORKSTATION_DO", "class_name": "WorkstationDO"},
+                {"type": "durable_object_namespace", "name": "OAUTH_STORE_DO", "class_name": "OAuthStoreDO"},
+                {"type": "durable_object_namespace", "name": "DEVICE_REGISTRY_DO", "class_name": "DeviceRegistryDO"},
+                {"type": "plain_text", "name": "EDGE_ENV", "text": "prod"},
+                {"type": "plain_text", "name": "EDGE_PROJECT", "text": "herdr-edge-mac"},
+                {"type": "plain_text", "name": "EDGE_VERSION", "text": "0.4.8"},
+                {"type": "plain_text", "name": "OAUTH_ISSUER", "text": "https://mcp.example.com"},
+                {"type": "secret_text", "name": "LINK_SHARED_SECRET"},
+                {"type": "r2_bucket", "name": "ARTIFACT_BUCKET", "bucket_name": "herdr-user-artifacts", "jurisdiction": "eu"}
+            ],
+            "compatibility_flags": ["nodejs_compat"]
+        });
+        validate_existing_worker_settings(
+            &settings,
+            "herdr-edge-mac",
+            "https://mcp.example.com",
+            "0.4.8",
+        )
+        .unwrap();
+        let metadata = worker_update_metadata(
+            "herdr-edge-mac",
+            "https://mcp.example.com",
+            "1.0.0",
+            &settings,
+            &["LINK_SHARED_SECRET".to_owned()],
+        )
+        .unwrap();
+        assert!(metadata.get("migrations").is_none());
+        assert_eq!(
+            metadata
+                .get("compatibility_flags")
+                .and_then(Value::as_array)
+                .unwrap(),
+            &vec![json!("nodejs_compat")]
+        );
+        let bindings = metadata.get("bindings").and_then(Value::as_array).unwrap();
+        assert!(bindings.iter().any(|binding| {
+            binding.get("name").and_then(Value::as_str) == Some("ARTIFACT_BUCKET")
+                && binding.get("type").and_then(Value::as_str) == Some("inherit")
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.get("name").and_then(Value::as_str) == Some("OAUTH_ISSUER")
+                && binding.get("text").and_then(Value::as_str) == Some("https://mcp.example.com")
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.get("name").and_then(Value::as_str) == Some("LINK_SHARED_SECRET")
+                && binding.get("type").and_then(Value::as_str) == Some("inherit")
+                && binding.get("text").is_none()
+        }));
+    }
+
+    #[test]
+    fn worker_update_requires_selected_script_settings_to_match_public_identity() {
+        let settings = json!({
+            "bindings": [
+                {"type": "durable_object_namespace", "name": "WORKSTATION_DO", "class_name": "WorkstationDO"},
+                {"type": "durable_object_namespace", "name": "OAUTH_STORE_DO", "class_name": "OAuthStoreDO"},
+                {"type": "durable_object_namespace", "name": "DEVICE_REGISTRY_DO", "class_name": "DeviceRegistryDO"},
+                {"type": "plain_text", "name": "EDGE_ENV", "text": "prod"},
+                {"type": "plain_text", "name": "EDGE_PROJECT", "text": "herdr-edge-mac"},
+                {"type": "plain_text", "name": "EDGE_VERSION", "text": "0.4.8"},
+                {"type": "plain_text", "name": "OAUTH_ISSUER", "text": "https://other.example.com"}
+            ]
+        });
+        let error = validate_existing_worker_settings(
+            &settings,
+            "herdr-edge-mac",
+            "https://mcp.example.com",
+            "0.4.8",
+        )
+        .unwrap_err();
+        assert!(error.contains("OAUTH_ISSUER"));
+        assert!(error.contains("no mutation"));
+    }
+
+    #[test]
+    fn worker_update_refuses_unknown_non_secret_binding() {
+        let settings = json!({
+            "bindings": [
+                {"type": "plain_text", "name": "EDGE_ENV", "text": "prod"},
+                {"type": "kv_namespace", "name": "USER_CUSTOM_BINDING", "namespace_id": "abc"}
+            ]
+        });
+        let error = worker_update_metadata(
+            "herdr-edge-mac",
+            "https://mcp.example.com",
+            "1.0.0",
+            &settings,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("USER_CUSTOM_BINDING"));
+        assert!(error.contains("refusing"));
+    }
+
+    #[test]
+    fn ordinary_worker_update_refuses_contract_migration() {
+        let identity = crate::contract::identity().unwrap();
+        let current = json!({
+            "contract": {
+                "epoch": identity.epoch,
+                "hash": identity.hash,
+                "tool_count": identity.tool_count,
+            }
+        });
+        assert!(require_current_release_contract(&current).is_ok());
+        let changed = json!({
+            "contract": {
+                "epoch": u64::from(identity.epoch) + 1,
+                "hash": "sha256:other",
+                "tool_count": identity.tool_count,
+            }
+        });
+        let error = require_current_release_contract(&changed).unwrap_err();
+        assert!(error.contains("explicit contract migration"));
+    }
+
+    #[test]
+    fn worker_update_never_downgrades_or_guesses_legacy_versions() {
+        assert!(ensure_worker_version_can_advance("0.4.8", "1.0.0").is_ok());
+        assert!(ensure_worker_version_can_advance("1.0.0", "1.0.0").is_ok());
+        assert!(
+            ensure_worker_version_can_advance("1.1.0", "1.0.0")
+                .unwrap_err()
+                .contains("refusing Edge downgrade")
+        );
+        assert!(
+            ensure_worker_version_can_advance("legacy", "1.0.0")
+                .unwrap_err()
+                .contains("not valid semver")
+        );
+    }
+
+    #[test]
+    fn existing_worker_upload_uses_strict_binding_inheritance() {
+        let plain = worker_upload_url("1234567890abcdef", "herdr-edge-mac", false);
+        assert!(!plain.contains("bindings_inherit"));
+        let update = worker_upload_url("1234567890abcdef", "herdr-edge-mac", true);
+        assert!(update.ends_with("?bindings_inherit=strict"));
     }
 
     #[test]
