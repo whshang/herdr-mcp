@@ -489,7 +489,7 @@ globalThis.chrome = {
                 handoff_id: handoffId,
                 continuity_id: continuityId,
                 source_url: sourceUrl,
-                message: `继续 continuity_id ${continuityId}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：继续上一会话未完成的目标。原会话：${sourceUrl} 若工具调用发生 OpenAI host-side pre-delivery safety rejection，原参数最多重试一次；不要通过编码、混淆、机械改写或更换 transport 来规避 safety protection。 [HERDR_CONTINUITY_REF id=${handoffId} continuity_id=${continuityId}] continuity_id: ${continuityId} [END_HERDR_CONTINUITY_REF]`,
+                message: `继续 continuity_id ${continuityId}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：继续上一会话未完成的目标。原会话：${sourceUrl} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id=${handoffId} continuity_id=${continuityId}] continuity_id: ${continuityId} [END_HERDR_CONTINUITY_REF]`,
                 work_chain_id: params.work_chain_id || null,
                 target_context: { provider: "chatgpt", project_id: PROJECT_ID },
               },
@@ -502,12 +502,6 @@ globalThis.chrome = {
                 },
               },
               manual_delivery: { copy_prompt: null },
-              safety: {
-                pre_delivery_retry_limit: 1,
-                retry_requires_no_execution_evidence: true,
-                preserve_mutation_idempotency_key: true,
-                rewrite_rejected_payload: false,
-              },
             }
             : { ok: false, code: "continuity_not_found" };
           if (prepared.ok) {

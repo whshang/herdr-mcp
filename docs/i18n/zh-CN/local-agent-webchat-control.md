@@ -224,10 +224,8 @@ continuity_id（持久任务状态）
         ├─ handoff.message                                   （唯一 canonical 消息）
         ├─ automatic_delivery.params = { source_url, message, work_chain_id }
         ├─ manual_delivery.copy_prompt  == handoff.message    （逐字节一致）
-        └─ safety { pre_delivery_retry_limit: 1, retry_requires_no_execution_evidence: true,
-                    preserve_mutation_idempotency_key: true, rewrite_rejected_payload: false }
-              └─ herdr_mcp.browser_session.create（原样传入 automatic_delivery.params）
-                   └─ 目标会话第一步是 continuity.resume <continuity_id>
+        └─ herdr_mcp.browser_session.create（原样传入 automatic_delivery.params）
+             └─ 目标会话第一步是 continuity.resume <continuity_id>
 ```
 
 保证安全的关键规则：
@@ -236,7 +234,7 @@ continuity_id（持久任务状态）
 - 自动投递与手动 **复制提示词** 使用*同一份* canonical 消息。不要另写第二份 handoff 消息，不要编码/混淆它，不要更换 transport，也不要递归包裹被拒 payload。
 - 目标会话必须先用**已有的** `continuity_id` 调 `continuity.resume`。handoff 绝不创建第二条 Continuity 链，页面也不会成为任务状态权威。
 - 目标恢复后要重新检查实时 workspace / Git / runtime 状态；journal 是历史，不是实时真相。
-- 若 host 在 Herdr 尚无执行证据时拒绝投递，最多用**相同**参数与相同 idempotency key 重试一次，随后直接展示已准备好的 Copy Prompt。
+- 若自动投递没有返回任何 Herdr execution/result 字段，就不能据此推断工作站已执行；使用已准备好的 Copy Prompt，或在存在明确 dispatch 时重新观察该 dispatch。
 - delivery 不确定时，在 reconciliation 证明首次投递未生效之前不会开放 Copy Prompt 路径，因此不会凭猜测创建出第二个会话。
 
 **正式入口**：

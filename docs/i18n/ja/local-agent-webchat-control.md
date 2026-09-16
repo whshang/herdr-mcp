@@ -224,10 +224,8 @@ continuity_id（永続タスク状態）
         ├─ handoff.message                                   （唯一の canonical メッセージ）
         ├─ automatic_delivery.params = { source_url, message, work_chain_id }
         ├─ manual_delivery.copy_prompt  == handoff.message    （バイト単位で同一）
-        └─ safety { pre_delivery_retry_limit: 1, retry_requires_no_execution_evidence: true,
-                    preserve_mutation_idempotency_key: true, rewrite_rejected_payload: false }
-              └─ herdr_mcp.browser_session.create（automatic_delivery.params をそのまま渡す）
-                   └─ 対象会話の最初の手順は continuity.resume <continuity_id>
+        └─ herdr_mcp.browser_session.create（automatic_delivery.params をそのまま渡す）
+             └─ 対象会話の最初の手順は continuity.resume <continuity_id>
 ```
 
 安全を担保する規則：
@@ -236,7 +234,7 @@ continuity_id（永続タスク状態）
 - 自動配送と手動の **Copy Prompt** は*同じ* canonical メッセージを使います。二つ目の handoff メッセージを書いたり、エンコード・難読化したり、transport を変えたり、拒否された payload を再帰的に包んだりしてはいけません。
 - 対象会話は**既存の** `continuity_id` を `continuity.resume` で再開することから始めます。handoff は二つ目の Continuity チェーンを作らず、ページはタスク状態権威になりません。
 - 再開後、対象は live な workspace / Git / runtime を再確認します。journal は履歴であり、live な真実ではありません。
-- host が Herdr の実行証拠なしに事前拒否した場合、**同じ**引数と同じ idempotency key で最大 1 回だけ再試行し、その後は準備済みの Copy Prompt を提示します。
+- 自動配送が Herdr の execution/result フィールドを一切返さない場合、その結果だけからワークステーション実行を推測してはいけません。準備済みの Copy Prompt を使うか、明示的な dispatch が存在する場合はその dispatch を再観測します。
 - delivery が不確実な間は、reconciliation で最初の試行が適用されていないと証明されるまで Copy Prompt 経路を開きません。したがって推測で二つ目の会話を作ることはできません。
 
 **正式な入口**：

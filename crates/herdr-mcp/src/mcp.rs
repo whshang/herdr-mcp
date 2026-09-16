@@ -43,7 +43,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, call the read-only herdr_mcp.browser_handoff.prepare once, then pass its automatic_delivery message unchanged to browser_session.create with one idempotency key. The prepared manual_delivery.copy_prompt is the same canonical message: if browser control is unavailable, or a host-side pre-delivery safety rejection occurs with no Herdr execution evidence, retry the original create arguments at most once and then expose that already-prepared copy prompt instead of rewriting, encoding, changing transport, or recursively wrapping the rejected payload. Preserve the mutation idempotency key across the retry. Do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic same-boundary process steps, prefer transparent herdr_exec.steps when the current public schema advertises it; otherwise keep each freeform shell command narrow and single-purpose. Do not concatenate independent process invocations with shell operators solely to reduce remote calls. Use herdr_exec.command only when actual shell syntax is required. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, call the read-only herdr_mcp.browser_handoff.prepare once, then pass its automatic_delivery message unchanged to browser_session.create with one idempotency key. The prepared manual_delivery.copy_prompt is the same canonical message. If browser control is unavailable or automatic delivery returns no Herdr execution/result evidence, do not infer workstation execution; use the prepared Copy Prompt or re-observe the exact dispatch when one exists. Herdr-reported uncertain delivery is reconciliation-only and must not be replayed automatically. Do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic same-boundary process steps, prefer transparent herdr_exec.steps when the current public schema advertises it; otherwise keep each freeform shell command narrow and single-purpose. Do not concatenate independent process invocations with shell operators solely to reduce remote calls. Use herdr_exec.command only when actual shell syntax is required. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -3097,7 +3097,7 @@ fn browser_handoff_prepare(
         format!("hh_{}", &digest[..32])
     });
     let message = format!(
-        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_url} 若工具调用发生 OpenAI host-side pre-delivery safety rejection，原参数最多重试一次；不要通过编码、混淆、机械改写或更换 transport 来规避 safety protection。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
+        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_url} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
     );
 
     json!({
@@ -3125,12 +3125,6 @@ fn browser_handoff_prepare(
         },
         "manual_delivery": {
             "copy_prompt": message,
-        },
-        "safety": {
-            "pre_delivery_retry_limit": 1,
-            "retry_requires_no_execution_evidence": true,
-            "preserve_mutation_idempotency_key": true,
-            "rewrite_rejected_payload": false,
         }
     })
 }
@@ -6084,7 +6078,9 @@ mod tests {
         assert!(instructions.contains("search durable Continuity before asking"));
         assert!(instructions.contains("never select a chain by recency or text similarity alone"));
         assert!(instructions.contains("browser_handoff.prepare"));
-        assert!(instructions.contains("pre-delivery safety rejection"));
+        assert!(instructions.contains("execution/result evidence"));
+        assert!(!instructions.contains("pre-delivery safety rejection"));
+        assert!(!instructions.contains("retry the original create arguments"));
     }
 
     #[test]
@@ -9574,12 +9570,12 @@ mod tests {
         let message = first["handoff"]["message"].as_str().unwrap();
         assert!(message.contains("continuity.resume"));
         assert!(message.contains("workspace / Git / runtime"));
-        assert!(message.contains("host-side pre-delivery safety rejection"));
+        assert!(message.contains("delivery/execution"));
+        assert!(!message.contains("host-side pre-delivery safety rejection"));
         assert!(message.contains(source_url));
         assert!(message.len() < 2048);
         assert!(!message.contains("Keep the durable journal authoritative"));
-        assert_eq!(first["safety"]["pre_delivery_retry_limit"], 1);
-        assert_eq!(first["safety"]["rewrite_rejected_payload"], false);
+        assert!(first.get("safety").is_none());
 
         let mismatched_source = browser_handoff_prepare(
             &store,

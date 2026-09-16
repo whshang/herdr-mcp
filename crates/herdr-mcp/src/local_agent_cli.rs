@@ -735,12 +735,6 @@ mod tests {
                 },
             },
             "manual_delivery": {"copy_prompt": message},
-            "safety": {
-                "pre_delivery_retry_limit": 1,
-                "retry_requires_no_execution_evidence": true,
-                "preserve_mutation_idempotency_key": true,
-                "rewrite_rejected_payload": false,
-            },
         })
     }
 

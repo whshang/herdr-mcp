@@ -91,7 +91,7 @@ continuity_id
 | `stopped` | Deliberate outcome, not a failure |
 
 - One intended mutation = one idempotency key. A replay returns the recorded dispatch (`replayed: true`) instead of acting twice.
-- Pre-delivery rejection with no execution evidence: retry the original arguments at most once with the same key, then expose the Copy Prompt.
+- If automatic delivery returns no Herdr execution or result fields, no workstation execution can be inferred from that outcome; use the prepared Copy Prompt or re-observe the exact dispatch when one exists. If Herdr reports uncertain delivery, reconcile it before any later mutation.
 - Report the exact `session_ref` and `delivery_state`; never present "no error" or scrollback as delivery evidence.
 
 ## Current boundaries (do not document or emulate past these)

@@ -224,10 +224,8 @@ continuity_id  (durable task state)
         ├─ handoff.message                                   (one canonical message)
         ├─ automatic_delivery.params = { source_url, message, work_chain_id }
         ├─ manual_delivery.copy_prompt  == handoff.message    (byte-for-byte identical)
-        └─ safety { pre_delivery_retry_limit: 1, retry_requires_no_execution_evidence: true,
-                    preserve_mutation_idempotency_key: true, rewrite_rejected_payload: false }
-              └─ herdr_mcp.browser_session.create (pass automatic_delivery.params unchanged)
-                   └─ the target conversation's first step is continuity.resume <continuity_id>
+        └─ herdr_mcp.browser_session.create (pass automatic_delivery.params unchanged)
+             └─ the target conversation's first step is continuity.resume <continuity_id>
 ```
 
 Rules that make this safe:
@@ -236,7 +234,7 @@ Rules that make this safe:
 - Automatic delivery and the manual **Copy Prompt** use the *same* canonical message. Never compose a second handoff message, encode/obfuscate it, switch transport, or recursively wrap a rejected payload.
 - The target conversation must begin by resuming the **existing** `continuity_id`. Handoff never creates a second Continuity chain, and the page never becomes the task-state authority.
 - After the target resumes, it re-checks live workspace / Git / runtime state; the journal is history, not live truth.
-- If the host reports a pre-delivery safety rejection with no Herdr execution evidence, retry the original create arguments at most once with the **same** idempotency key, then expose the already-prepared Copy Prompt.
+- If automatic delivery returns no Herdr execution or result fields, no workstation execution can be inferred from that outcome; use the already-prepared Copy Prompt or re-observe the exact dispatch when one exists.
 - An uncertain delivery does not expose the Copy Prompt path until reconciliation proves the first attempt did not apply, so a second conversation cannot be created by guessing.
 
 **The supported way to run it:**
