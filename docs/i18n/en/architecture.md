@@ -126,7 +126,7 @@ Static or semi-static evidence is stored separately from the reliability state d
 
 Unknown means **unverified**, not false and not “probably supported.” Probe subprocesses are non-interactive, bounded, receive no inherited credentials, and only promote traits explicitly reported by a trusted self-description adapter. Full probe evidence is diagnostic data; the model-visible progressive bootstrap receives only compact counts and verified worker traits.
 
-Modular Progressive Skills is the default `herdr_skill` runtime shape. The first response contains only the global policy, compact catalog/capability summaries, and the on-demand load contract instead of the full policy bundle. `HERDR_MCP_PROGRESSIVE_SKILLS=0|false|off|legacy` remains an explicit compatibility opt-out for the legacy full response while downstream consumers finish migrating.
+The Modular Progressive Skills implementation ships in the Rust runtime behind `HERDR_MCP_PROGRESSIVE_SKILLS`. The compatibility/default path remains legacy until capability-aware multi-agent UAT provides evidence for a default-on migration.
 
 ## Why files, Git and shell are first-class
 

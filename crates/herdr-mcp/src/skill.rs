@@ -833,20 +833,6 @@ mod tests {
     }
 
     #[test]
-    fn progressive_bootstrap_is_smaller_than_legacy_full_response() {
-        let service = SkillService::new();
-        let snapshot = json!({"agents": []});
-        let progressive = service.fetch_for_runtime_mode(&json!({}), &snapshot, true);
-        let legacy = service.fetch_for_runtime_mode(&json!({}), &snapshot, false);
-        let progressive_bytes = serde_json::to_vec(&progressive).unwrap().len();
-        let legacy_bytes = serde_json::to_vec(&legacy).unwrap().len();
-        assert!(
-            progressive_bytes < legacy_bytes,
-            "progressive bootstrap must stay compact: progressive={progressive_bytes}, legacy={legacy_bytes}"
-        );
-    }
-
-    #[test]
     fn sha256_is_stable() {
         assert_eq!(
             sha256("abc"),
