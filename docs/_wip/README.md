@@ -16,8 +16,8 @@ Current active WIP includes the v0.4.5 follow-up maintenance plan (planner effic
 - Frozen planning baseline (read-only SSOT for D1–D5, canonical WebChat resource model, typed operations, and §17 compatibility gates): [`../history/architecture/v1.0-architecture-plan.md`](../history/architecture/v1.0-architecture-plan.md), restored verbatim from `47a6f80:docs/_wip/v1.0-architecture-plan.md`.
 - Milestone sequence authority: [`../herdr-architecture-roadmap.md`](../herdr-architecture-roadmap.md) (alpha.1 → alpha.2 → alpha.3 → alpha.4 → alpha.5 → beta.1 → beta.2 → rc.1).
 - alpha.1 spec: [`v1.0-phase1-fleet-control-kernel.md`](v1.0-phase1-fleet-control-kernel.md)
-- alpha.2 spec: [`v1.0-alpha2-work-memory.md`](v1.0-alpha2-work-memory.md)
-- alpha.3 spec: [`v1.0-alpha3-browser-registry.md`](v1.0-alpha3-browser-registry.md) — merged in PR #315.
+- alpha.2 historical spec: [`../history/architecture/v1.0-alpha2-work-memory.md`](../history/architecture/v1.0-alpha2-work-memory.md) — merged in PR #312.
+- alpha.3 historical spec: [`../history/architecture/v1.0-alpha3-browser-registry.md`](../history/architecture/v1.0-alpha3-browser-registry.md) — merged in PR #315.
 - alpha.4 spec: [`v1.0-alpha4-chatgpt-adapter.md`](v1.0-alpha4-chatgpt-adapter.md)
 - alpha.5 spec: [`v1.0-alpha5-gemini-adapter.md`](v1.0-alpha5-gemini-adapter.md)
 - alpha.6 spec: [`v1.0-alpha6-claude-adapter.md`](v1.0-alpha6-claude-adapter.md)

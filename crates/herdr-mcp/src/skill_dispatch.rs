@@ -141,53 +141,6 @@ pub fn advise_dispatch(task: &TaskProfile, snapshot: &CapabilitySnapshot) -> Dis
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum DispatchAction {
-    DirectTool(String),
-    Worker(String),
-    NoDispatch,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DispatchDecision {
-    pub action: DispatchAction,
-    pub reason: String,
-    pub rejected: Vec<String>,
-}
-
-/// Compatibility helper for internal callers that still expect a decision.
-/// Unrequested workers are no longer auto-selected; only an explicit compatible
-/// target can resolve to `Worker`.
-pub fn decide_dispatch(task: &TaskProfile, snapshot: &CapabilitySnapshot) -> DispatchDecision {
-    let advice = advise_dispatch(task, snapshot);
-    let action = if let Some(tool) = advice.direct_tool.clone() {
-        DispatchAction::DirectTool(tool)
-    } else if advice.delegation_allowed {
-        match advice.explicit_target.as_deref() {
-            Some(target) => snapshot
-                .workers
-                .iter()
-                .find(|worker| {
-                    matches_target(worker, target) && reject_reason(worker, task).is_none()
-                })
-                .map(|worker| DispatchAction::Worker(worker.agent_id.clone()))
-                .unwrap_or(DispatchAction::NoDispatch),
-            None => DispatchAction::NoDispatch,
-        }
-    } else {
-        DispatchAction::NoDispatch
-    };
-    DispatchDecision {
-        action,
-        reason: advice.reason,
-        rejected: advice
-            .rejected
-            .into_iter()
-            .map(|item| format!("{}:{}", item.agent_id, item.reason))
-            .collect(),
-    }
-}
-
 fn candidate(worker: &WorkerCapability) -> WorkerCandidate {
     WorkerCandidate {
         agent_id: worker.agent_id.clone(),
@@ -381,15 +334,14 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_task_chooses_direct_tool() {
+    fn deterministic_task_advises_direct_tool() {
         let task = TaskProfile {
             deterministic_tool: Some("herdr_git".to_owned()),
             ..TaskProfile::default()
         };
-        assert_eq!(
-            decide_dispatch(&task, &snapshot(vec![worker("a", "idle")])).action,
-            DispatchAction::DirectTool("herdr_git".to_owned())
-        );
+        let advice = advise_dispatch(&task, &snapshot(vec![worker("a", "idle")]));
+        assert_eq!(advice.direct_tool.as_deref(), Some("herdr_git"));
+        assert!(!advice.delegation_allowed);
     }
 
     #[test]
@@ -405,8 +357,8 @@ mod tests {
         assert_eq!(advice.candidates[0].agent_id, "a");
         assert_eq!(advice.candidates[0].control_target, "pane-a");
         assert_eq!(
-            decide_dispatch(&task, &snapshot).action,
-            DispatchAction::NoDispatch
+            advice.reason,
+            "compatible_workers_available_planner_decides"
         );
     }
 
@@ -438,8 +390,8 @@ mod tests {
         assert!(advice.delegation_allowed);
         assert_eq!(advice.candidates[0].agent_id, "reviewer");
         assert_eq!(
-            decide_dispatch(&task, &live).action,
-            DispatchAction::NoDispatch
+            advice.reason,
+            "compatible_workers_available_planner_decides"
         );
     }
 
@@ -468,10 +420,9 @@ mod tests {
             requires_code_edit: true,
             ..TaskProfile::default()
         };
-        assert_eq!(
-            decide_dispatch(&task, &snapshot).action,
-            DispatchAction::NoDispatch
-        );
+        let busy_advice = advise_dispatch(&task, &snapshot);
+        assert!(!busy_advice.delegation_allowed);
+        assert!(busy_advice.candidates.is_empty());
 
         let mut idle_live = live.clone();
         idle_live["agents"][0]["agent_status"] = serde_json::Value::String("idle".to_owned());
@@ -482,10 +433,6 @@ mod tests {
         let advice = advise_dispatch(&task, &idle_snapshot);
         assert!(advice.delegation_allowed);
         assert_eq!(advice.candidates[0].agent_id, "worker");
-        assert_eq!(
-            decide_dispatch(&task, &idle_snapshot).action,
-            DispatchAction::NoDispatch
-        );
     }
 
     #[test]
@@ -495,11 +442,13 @@ mod tests {
             explicit_target: Some("b".to_owned()),
             ..TaskProfile::default()
         };
-        let decision = decide_dispatch(
+        let advice = advise_dispatch(
             &task,
             &snapshot(vec![worker("a", "idle"), worker("b", "idle")]),
         );
-        assert_eq!(decision.action, DispatchAction::Worker("b".to_owned()));
+        assert_eq!(advice.explicit_target.as_deref(), Some("b"));
+        assert!(advice.delegation_allowed);
+        assert_eq!(advice.reason, "explicit_user_target_available");
     }
 
     #[test]
@@ -508,12 +457,12 @@ mod tests {
             project_root: Some("/repo".to_owned()),
             ..TaskProfile::default()
         };
-        let decision = decide_dispatch(
+        let advice = advise_dispatch(
             &task,
             &snapshot(vec![worker("a", "working"), worker("b", "blocked")]),
         );
-        assert_eq!(decision.action, DispatchAction::NoDispatch);
-        assert_eq!(decision.rejected.len(), 2);
+        assert!(!advice.delegation_allowed);
+        assert_eq!(advice.rejected.len(), 2);
     }
 
     #[test]
@@ -523,8 +472,9 @@ mod tests {
             requires_vision: true,
             ..TaskProfile::default()
         };
-        let decision = decide_dispatch(&task, &snapshot(vec![worker("a", "idle")]));
-        assert_eq!(decision.action, DispatchAction::NoDispatch);
+        let advice = advise_dispatch(&task, &snapshot(vec![worker("a", "idle")]));
+        assert!(!advice.delegation_allowed);
+        assert!(advice.candidates.is_empty());
     }
 
     #[test]
@@ -539,10 +489,6 @@ mod tests {
         assert!(advice.delegation_allowed);
         assert_eq!(advice.candidates[0].agent_id, "b");
         assert_eq!(advice.rejected[0].agent_id, "a");
-        assert_eq!(
-            decide_dispatch(&task, &snapshot).action,
-            DispatchAction::NoDispatch
-        );
     }
 
     #[test]
@@ -556,8 +502,9 @@ mod tests {
             minimum_reasoning_tier: Some(3),
             ..TaskProfile::default()
         };
-        let decision = decide_dispatch(&task, &snapshot(vec![strong, weak]));
-        assert_eq!(decision.action, DispatchAction::NoDispatch);
+        let advice = advise_dispatch(&task, &snapshot(vec![strong, weak]));
+        assert!(!advice.delegation_allowed);
+        assert!(advice.candidates.is_empty());
     }
 
     #[test]
@@ -566,18 +513,19 @@ mod tests {
             destructive_production_mutation: true,
             ..TaskProfile::default()
         };
+        let production_advice = advise_dispatch(&production, &snapshot(vec![worker("a", "idle")]));
+        assert!(!production_advice.delegation_allowed);
         assert_eq!(
-            decide_dispatch(&production, &snapshot(vec![worker("a", "idle")])).action,
-            DispatchAction::NoDispatch
+            production_advice.reason,
+            "destructive_production_mutation_not_auto_delegated"
         );
         let manager = TaskProfile {
             delegates_other_workers: true,
             ..TaskProfile::default()
         };
-        assert_eq!(
-            decide_dispatch(&manager, &snapshot(vec![worker("a", "idle")])).action,
-            DispatchAction::NoDispatch
-        );
+        let manager_advice = advise_dispatch(&manager, &snapshot(vec![worker("a", "idle")]));
+        assert!(!manager_advice.delegation_allowed);
+        assert_eq!(manager_advice.reason, "middle_manager_delegation_forbidden");
     }
 
     #[test]

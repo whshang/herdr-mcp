@@ -693,21 +693,19 @@ WorkerCapability {
 - dispatch outcome uncertain 时重复 prompt；
 - 仅因为“有空闲 Agent”就制造没有收益的并行任务。
 
-如果首选 worker busy，可自动选择**能力等价且 policy 允许**的 worker；如果只能明显降级质量/能力，则不静默降级，应由 Web planner自己完成或明确说明没有安全等价 worker。
+如果显式指定的 worker busy 或不兼容，runtime 只返回候选/拒绝证据，不静默换人；是否选择另一个能力等价 worker 由 Web planner 基于当前证据决定。如果只能明显降级质量/能力，则不静默降级。
 
-每次自动派工保留结构化 `DispatchDecision` evidence：
+planning 层返回结构化 `DispatchAdvice` evidence；实际 prompt/dispatch 的提交与 delivery evidence 由执行边界单独记录：
 
 ```text
-DispatchDecision {
-  task_profile
-  selected_agent
-  selected_model/profile?
-  selected_pane
-  matched_capabilities[]
-  rejected_candidates[]?   # bounded
+DispatchAdvice {
+  direct_tool?
+  explicit_target?
+  delegation_allowed
+  candidates[]             # bounded, evidence-backed
+  rejected[]               # bounded
   reason
-  ownership_scope
-  validation_boundary
+  parallelism
 }
 ```
 
@@ -1094,13 +1092,7 @@ Modular Progressive Skills
 
 要求 old `herdr_skill` compatibility output 在语义上仍能工作。
 
-可选择过渡模式：
-
-```text
-legacy_full=true (internal compatibility/testing only)
-```
-
-但默认 Web planner 应开始走 progressive path。
+兼容输出只由 progressive feature gate 控制；不再保留第二个内部请求参数来切换同一运行时的返回形态。
 
 ### Phase C — Native Skill Methods
 
