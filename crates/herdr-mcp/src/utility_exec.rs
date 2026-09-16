@@ -25,7 +25,7 @@ const UTILITY_OWNED_POLL: Duration = Duration::from_millis(100);
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_STRUCTURED_STEPS: usize = 16;
 const MAX_STRUCTURED_ARGS: usize = 128;
-static UTILITY_PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static UTILITY_SUBMISSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static UTILITY_PANE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -275,6 +275,14 @@ pub(crate) fn start_reusable_pane_session(
 
     #[cfg(unix)]
     {
+        // Keep selection, owned-busy waiting, and pane.send_text in one local
+        // critical section. Otherwise two callers can both wait on the same
+        // Herdr-owned session, observe the shell becoming ready, and then send
+        // two launch lines into the canonical pane concurrently.
+        let _submission_guard = UTILITY_SUBMISSION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (pane_id, created) =
             match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
                 Ok(value) => value,
@@ -338,6 +346,10 @@ fn run_unix_durable(
 ) -> Value {
     let (workspace_id, effective_root) = target;
     let started = Instant::now();
+    let submission_guard = UTILITY_SUBMISSION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (pane_id, created) =
         match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
             Ok(value) => value,
@@ -382,6 +394,9 @@ fn run_unix_durable(
     let Some(session_id) = start.get("session_id").and_then(Value::as_str) else {
         return json!({"ok": false, "code": "exec_start_failed", "message": "durable exec start returned no session_id"});
     };
+    // Submission ownership has transferred to the durable session. The
+    // synchronous wait below must not serialize unrelated later submissions.
+    drop(submission_guard);
     let deadline = Duration::from_millis(timeout_ms);
     loop {
         let read = registry.read(session_id, "both", 0, 65_536);
@@ -923,10 +938,6 @@ fn prepare_utility_pane(
     workspace_id: &str,
     cwd: &Path,
 ) -> Result<(String, bool), PrepareError> {
-    let _guard = UTILITY_PREPARE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cached = panes_from_snapshot(snapshot, workspace_id);
     let remembered = utility_pane_id(workspace_id);
     if let Some(pane) = choose_utility_pane(&cached, remembered.as_deref()) {
