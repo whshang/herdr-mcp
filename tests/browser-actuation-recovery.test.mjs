@@ -455,14 +455,16 @@ test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and
   const submitSegment = wakeSource.slice(submitStart, submitEnd);
   assert.match(submitSegment, /await submitMainWorld\(selector\)/);
   const mainFallbackStart = submitSegment.indexOf("const mainSubmit = selector ? await submitMainWorld(selector) : null;");
-  const mainFallbackEnd = submitSegment.indexOf("const baseline = captureSubmitAckBaseline(btn);", mainFallbackStart);
+  const buttonWaitStart = submitSegment.indexOf("for (let i = 0; i < 40; i++)", mainFallbackStart);
+  const mainFallbackEnd = buttonWaitStart;
   assert.ok(mainFallbackStart >= 0 && mainFallbackEnd > mainFallbackStart, "MAIN submit fallback must remain bounded");
-  assert.doesNotMatch(submitSegment.slice(0, mainFallbackStart), /attempt === 0 && ADAPTER\.inputHasContent\(\)/);
+  assert.match(submitSegment.slice(0, mainFallbackStart), /ADAPTER\.name === "chatgpt" && attempt === 0/);
+  assert.doesNotMatch(submitSegment.slice(0, mainFallbackEnd), /isSendButton\(btn\)[\s\S]*submitMainWorld/);
   assert.doesNotMatch(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /return false;/);
   assert.match(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /waitForSubmitAck\(mainBaseline, 4000\)/);
-  const clickIndex = submitSegment.indexOf("btn.click();", mainFallbackEnd);
+  const clickIndex = submitSegment.indexOf("btn.click();", buttonWaitStart);
   const enterIndex = submitSegment.indexOf("dispatchEnterSubmit(el)", clickIndex);
-  assert.ok(clickIndex > mainFallbackEnd && enterIndex > clickIndex, "DOM click and Enter remain ordered fallbacks");
+  assert.ok(clickIndex > buttonWaitStart && enterIndex > clickIndex, "DOM click and Enter remain ordered fallbacks");
 });
 
 test("terminal stale session reservations do not block ordinary browser identity recovery", () => {
