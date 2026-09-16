@@ -3080,6 +3080,60 @@ async function recoverBrowserSessionTarget(sessionRef, expectedGeneration) {
   return { target: exactTarget, observedGeneration, ambiguous: false };
 }
 
+async function resolveBrowserCreateAnchorWindow({
+  provider,
+  accountRef,
+  spaceRef,
+  expectedGeneration,
+  sourceSessionRef = null,
+} = {}) {
+  if (sourceSessionRef) {
+    let target = browserSessionTargets.get(sourceSessionRef) || null;
+    if (!target
+        || target.provider !== provider
+        || target.observationGeneration !== expectedGeneration) {
+      const recovered = await recoverBrowserSessionTarget(sourceSessionRef, expectedGeneration);
+      if (recovered.ambiguous || !recovered.target) {
+        return { windowId: null, unavailable: true, reason: "source_session_unavailable" };
+      }
+      target = recovered.target;
+    }
+    if (target.provider !== provider || target.observationGeneration !== expectedGeneration) {
+      return { windowId: null, unavailable: true, reason: "source_session_scope_mismatch" };
+    }
+    try {
+      const sourceTab = await chrome.tabs.get(target.tabId);
+      if (Number.isInteger(sourceTab?.windowId)) {
+        return { windowId: sourceTab.windowId, unavailable: false, reason: "source_session" };
+      }
+    } catch (_) {}
+    return { windowId: null, unavailable: true, reason: "source_session_tab_unavailable" };
+  }
+
+  const matchingWindowIds = new Set();
+  for (const [tabId, scope] of browserTabScopes.entries()) {
+    if (!scope
+        || scope.provider !== provider
+        || scope.accountRef !== accountRef
+        || (spaceRef ? scope.spaceRef !== spaceRef : Boolean(scope.spaceRef))
+        || scope.observationGeneration !== expectedGeneration) {
+      continue;
+    }
+    try {
+      const anchorTab = await chrome.tabs.get(tabId);
+      if (Number.isInteger(anchorTab?.windowId)) matchingWindowIds.add(anchorTab.windowId);
+    } catch (_) {}
+  }
+  if (matchingWindowIds.size > 1) {
+    return { windowId: null, unavailable: true, reason: "ambiguous_scope_windows" };
+  }
+  return {
+    windowId: matchingWindowIds.size === 1 ? [...matchingWindowIds][0] : null,
+    unavailable: false,
+    reason: matchingWindowIds.size === 1 ? "unique_scope_window" : "no_scope_window",
+  };
+}
+
 async function handleBrowserActuation(command) {
   const actuationId = String(command?.actuation_id || "");
   const operation = String(command?.operation || "");
@@ -3136,10 +3190,12 @@ async function handleBrowserActuation(command) {
     const providerCreate = String(params.provider || "");
     const accountRefCreate = String(params.account_ref || "");
     const spaceRefCreate = String(params.space_ref || "");
+    const sourceSessionRefCreate = String(params.source_session_ref || "");
     const reservationRef = String(params.reservation_ref || "");
     const launchUrl = String(params.launch_url || "");
     if (providerCreate !== "chatgpt"
         || !accountRefCreate
+        || (sourceSessionRefCreate && !/^br_[0-9a-f]{64}$/.test(sourceSessionRefCreate))
         || !/^bsr_[0-9a-f]{64}$/.test(reservationRef)
         || !launchUrl.startsWith("https://")) {
       await postBrowserActuationEvidence(
@@ -3148,23 +3204,21 @@ async function handleBrowserActuation(command) {
       );
       return;
     }
-    let anchorWindowId = null;
-    const anchorScopes = [...browserTabScopes.entries()]
-      .filter(([, scope]) => scope
-        && scope.provider === providerCreate
-        && scope.accountRef === accountRefCreate
-        && (spaceRefCreate ? scope.spaceRef === spaceRefCreate : !scope.spaceRef)
-        && scope.observationGeneration === expectedGeneration)
-      .sort((a, b) => Number(b[1]?.lastSeenAt || 0) - Number(a[1]?.lastSeenAt || 0));
-    for (const [tabId] of anchorScopes) {
-      try {
-        const anchorTab = await chrome.tabs.get(tabId);
-        if (Number.isInteger(anchorTab?.windowId)) {
-          anchorWindowId = anchorTab.windowId;
-          break;
-        }
-      } catch (_) {}
+    const anchor = await resolveBrowserCreateAnchorWindow({
+      provider: providerCreate,
+      accountRef: accountRefCreate,
+      spaceRef: spaceRefCreate || null,
+      expectedGeneration,
+      sourceSessionRef: sourceSessionRefCreate || null,
+    });
+    if (anchor.unavailable) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(expectedGeneration),
+      );
+      return;
     }
+    const anchorWindowId = anchor.windowId;
     let createdTab = null;
     try {
       createdTab = anchorWindowId == null

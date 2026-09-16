@@ -2898,7 +2898,7 @@ fn browser_session_create_reconcile_uncertain(
 fn browser_session_create_params_from_source(
     store: &StateStore,
     params: &Value,
-) -> Result<Option<Value>, Value> {
+) -> Result<Option<(Value, String)>, Value> {
     let Some(source_url) = params.get("source_url") else {
         return Ok(None);
     };
@@ -2948,18 +2948,71 @@ fn browser_session_create_params_from_source(
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
     let route = browser_source_route(store, source_url).map_err(browser_store_error)?;
-    Ok(Some(json!({
-        "endpoint_ref": route.endpoint_ref,
-        "provider": route.provider,
-        "account_ref": route.account_ref,
-        "space_ref": route.space_ref,
-        "display_label": route.display_label,
-        "message": message,
-        "expected_generation": route.expected_generation,
-        "idempotency_key": idempotency_key,
-        "work_chain_id": work_chain_id,
-        "lane_id": lane_id,
-    })))
+    let source_session_ref = route.session_ref.clone();
+    Ok(Some((
+        json!({
+            "endpoint_ref": route.endpoint_ref,
+            "provider": route.provider,
+            "account_ref": route.account_ref,
+            "space_ref": route.space_ref,
+            "display_label": route.display_label,
+            "message": message,
+            "expected_generation": route.expected_generation,
+            "idempotency_key": idempotency_key,
+            "work_chain_id": work_chain_id,
+            "lane_id": lane_id,
+        }),
+        source_session_ref,
+    )))
+}
+
+fn browser_create_caller_source_session_ref(
+    store: &StateStore,
+    params: &Value,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
+    caller_browser_session: Option<&BrowserCallerSessionIdentity>,
+) -> Result<Option<String>, String> {
+    let (Some(authorization), Some(caller_session)) =
+        (caller_authorization, caller_browser_session)
+    else {
+        return Ok(None);
+    };
+    if caller_session.provider != "chatgpt" {
+        return Ok(None);
+    }
+    let Some(session_ref) = store.resolve_browser_caller_session(
+        &authorization.principal_ref,
+        &caller_session.provider,
+        &caller_session.opaque_session_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(session) = store.browser_resource(&session_ref)? else {
+        return Ok(None);
+    };
+    let expected_endpoint = params.get("endpoint_ref").and_then(Value::as_str);
+    let expected_provider = params.get("provider").and_then(Value::as_str);
+    let expected_account = params.get("account_ref").and_then(Value::as_str);
+    let expected_space = params.get("space_ref").and_then(Value::as_str);
+    let expected_generation = params.get("expected_generation").and_then(Value::as_i64);
+    if session.kind != "session"
+        || expected_endpoint != Some(session.endpoint_ref.as_str())
+        || expected_provider != Some(session.provider.as_str())
+        || expected_generation != Some(session.observation_generation)
+    {
+        return Ok(None);
+    }
+    let actual_account = browser_resource_account_ref(store, &session)?;
+    if expected_account != Some(actual_account.as_str()) {
+        return Ok(None);
+    }
+    match expected_space {
+        Some(space_ref) if session.parent_ref.as_deref() != Some(space_ref) => return Ok(None),
+        None if session.parent_ref.as_deref() != Some(actual_account.as_str()) => return Ok(None),
+        _ => {}
+    }
+    Ok(Some(session_ref))
 }
 
 /// The registered ChatGPT conversation that an exact canonical source URL resolves to,
@@ -3366,6 +3419,7 @@ fn browser_session_create(
     params: &Value,
     actuator: Option<&dyn BrowserActuator>,
     caller_authorization: Option<&BrowserCallerAuthorization>,
+    source_session_ref: Option<&str>,
 ) -> Value {
     let endpoint_ref = params.get("endpoint_ref").and_then(Value::as_str).unwrap();
     let provider = params.get("provider").and_then(Value::as_str).unwrap();
@@ -3516,6 +3570,9 @@ fn browser_session_create(
             json!(reservation.reservation_ref),
         );
         object.insert("launch_url".to_owned(), json!(launch_url));
+        if let Some(source_session_ref) = source_session_ref {
+            object.insert("source_session_ref".to_owned(), json!(source_session_ref));
+        }
     }
     let evidence = match actuator {
         Some(actuator) => match actuator.actuate(
@@ -3929,41 +3986,58 @@ fn browser_operation_call_with_controls(
         None
     };
     let normalized_params;
-    let params = if operation == BrowserOperation::SessionCreate
-        && object.contains_key("source_url")
-    {
+    let mut create_source_session_ref = None;
+    let params =
+        if operation == BrowserOperation::SessionCreate && object.contains_key("source_url") {
+            let Ok(store_guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            let (value, source_session_ref) =
+                match browser_session_create_params_from_source(&store_guard, params) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => unreachable!(),
+                    Err(error) => return error,
+                };
+            normalized_params = value;
+            create_source_session_ref = Some(source_session_ref);
+            &normalized_params
+        } else if operation == BrowserOperation::SessionArchive
+            && object.contains_key("current_user_message")
+        {
+            let Ok(mut store_guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            normalized_params = match browser_session_archive_params_from_current_turn(
+                &mut store_guard,
+                params,
+                caller_webchat_control_grants,
+                controls.caller_authorization,
+                controls.caller_browser_session,
+            ) {
+                Ok(Some(value)) => value,
+                Ok(None) => unreachable!(),
+                Err(error) => return error,
+            };
+            &normalized_params
+        } else {
+            params
+        };
+    if let Err(error) = validate_browser_operation_params(operation, params) {
+        return error;
+    }
+    if operation == BrowserOperation::SessionCreate && create_source_session_ref.is_none() {
         let Ok(store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
-        normalized_params = match browser_session_create_params_from_source(&store_guard, params) {
-            Ok(Some(value)) => value,
-            Ok(None) => unreachable!(),
-            Err(error) => return error,
-        };
-        &normalized_params
-    } else if operation == BrowserOperation::SessionArchive
-        && object.contains_key("current_user_message")
-    {
-        let Ok(mut store_guard) = store.lock() else {
-            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
-        };
-        normalized_params = match browser_session_archive_params_from_current_turn(
-            &mut store_guard,
+        create_source_session_ref = match browser_create_caller_source_session_ref(
+            &store_guard,
             params,
-            caller_webchat_control_grants,
             controls.caller_authorization,
             controls.caller_browser_session,
         ) {
-            Ok(Some(value)) => value,
-            Ok(None) => unreachable!(),
-            Err(error) => return error,
+            Ok(value) => value,
+            Err(error) => return browser_store_error(error),
         };
-        &normalized_params
-    } else {
-        params
-    };
-    if let Err(error) = validate_browser_operation_params(operation, params) {
-        return error;
     }
 
     // Serialize the authorization decision through browser actuation against
@@ -4101,6 +4175,7 @@ fn browser_operation_call_with_controls(
             params,
             browser_actuator,
             controls.caller_authorization,
+            create_source_session_ref.as_deref(),
         ),
         BrowserOperation::SessionOpen => browser_session_open(store, params, browser_actuator),
         BrowserOperation::DispatchSubmit => browser_dispatch_submit(
@@ -6363,6 +6438,39 @@ mod tests {
                 .as_deref(),
             Some(session_ref.as_str())
         );
+
+        let create_affinity = browser_create_caller_source_session_ref(
+            &reopened,
+            &json!({
+                "endpoint_ref": initial_session.endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": initial_account_ref,
+                "display_label": "Continuation",
+                "message": "continue",
+                "expected_generation": 7,
+                "idempotency_key": "create-from-current-chat"
+            }),
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap();
+        assert_eq!(create_affinity.as_deref(), Some(session_ref.as_str()));
+        let stale_create_affinity = browser_create_caller_source_session_ref(
+            &reopened,
+            &json!({
+                "endpoint_ref": initial_session.endpoint_ref,
+                "provider": "chatgpt",
+                "account_ref": initial_account_ref,
+                "display_label": "Continuation",
+                "message": "continue",
+                "expected_generation": 8,
+                "idempotency_key": "create-from-stale-current-chat"
+            }),
+            Some(&authorization),
+            Some(&caller_session),
+        )
+        .unwrap();
+        assert_eq!(stale_create_affinity, None);
 
         // OpenAI may reuse the same opaque Connector caller session across
         // multiple ChatGPT conversations. A newer exact source-turn identity
@@ -9882,7 +9990,7 @@ mod tests {
         );
         // The source-anchored create must derive exactly the same scope from the same URL,
         // because both callers share one route resolution.
-        let create_params = browser_session_create_params_from_source(
+        let (create_params, create_source_session_ref) = browser_session_create_params_from_source(
             &store.lock().unwrap(),
             &json!({
                 "source_url": source_url,
@@ -9892,6 +10000,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(create_source_session_ref, session_ref);
         assert_eq!(create_params["endpoint_ref"], endpoint_ref);
         assert_eq!(create_params["account_ref"], account_ref);
         assert_eq!(create_params["space_ref"], space_ref);
@@ -10491,12 +10600,13 @@ mod tests {
             "message": prepared_message,
             "idempotency_key": "session-create-source-url-1"
         });
-        let normalized = {
+        let (normalized, normalized_source_session_ref) = {
             let guard = store.lock().unwrap();
             browser_session_create_params_from_source(&guard, &shortcut_params)
                 .unwrap()
                 .unwrap()
         };
+        assert_eq!(normalized_source_session_ref, source_session_ref);
         assert_eq!(
             normalized["message"],
             prepared["automatic_delivery"]["params"]["message"]
