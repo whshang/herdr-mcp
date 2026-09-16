@@ -532,11 +532,20 @@ fn continuity_call(
                 });
             }
             let resolve_identity = |conversation_id: &str,
-                                    project_id: Option<&str>|
+                                    project_id: Option<&str>,
+                                    conversation_url: Option<&str>|
              -> Result<Option<String>, String> {
                 match store.continuity_for_conversation(conversation_id) {
                     Ok(Some(value)) => Ok(Some(value)),
                     Ok(None) => {
+                        if let Some(conversation_url) = conversation_url
+                            && let Some(session_ref) =
+                                store.browser_session_ref_for_canonical_url(conversation_url)?
+                            && let Some(value) =
+                                store.continuity_for_provider_session("chatgpt", &session_ref)?
+                        {
+                            return Ok(Some(value));
+                        }
                         let Some(project_id) = project_id else {
                             return Ok(None);
                         };
@@ -564,7 +573,7 @@ fn continuity_call(
                 else {
                     return json!({"ok": false, "code": "continuity_resume_params_invalid", "message": "conversation_url must be a ChatGPT conversation URL"});
                 };
-                match resolve_identity(&conversation_id, project_id.as_deref()) {
+                match resolve_identity(&conversation_id, project_id.as_deref(), Some(raw_url)) {
                     Ok(Some(value)) => value,
                     Ok(None) => {
                         return json!({"ok": false, "code": "continuity_not_found", "conversation_url": raw_url});
@@ -577,7 +586,7 @@ fn continuity_call(
                     }
                 }
             } else if let Some(conversation_id) = conversation_id {
-                match resolve_identity(conversation_id, project_id) {
+                match resolve_identity(conversation_id, project_id, None) {
                     Ok(Some(value)) => value,
                     Ok(None) => {
                         return json!({"ok": false, "code": "continuity_not_found", "conversation_id": conversation_id});
@@ -760,13 +769,39 @@ fn continuity_call(
                 query,
                 limit,
             }) {
-                Ok(records) => {
+                Ok(mut records) => {
+                    let mut project_fallback = false;
+                    if records.is_empty()
+                        && conversation_url.is_some()
+                        && conversation_id.is_some()
+                        && project_id.is_some()
+                        && workspace_id.is_none()
+                    {
+                        records = match store.continuity_search(ContinuitySearchInput {
+                            project_id,
+                            repo_id,
+                            workspace_id: None,
+                            conversation_id: None,
+                            query,
+                            limit,
+                        }) {
+                            Ok(records) => records,
+                            Err(error) => {
+                                return json!({"ok": false, "code": "continuity_search_failed", "message": error});
+                            }
+                        };
+                        project_fallback = !records.is_empty();
+                    }
                     let identity_match = if exact_identity_hint {
                         store.continuity_search(ContinuitySearchInput {
                             project_id,
                             repo_id,
                             workspace_id,
-                            conversation_id,
+                            conversation_id: if project_fallback {
+                                None
+                            } else {
+                                conversation_id
+                            },
                             query: None,
                             limit: 2,
                         })
@@ -793,6 +828,10 @@ fn continuity_call(
                         .into_iter()
                         .map(|record| {
                             let mut match_reasons = common_match_reasons.clone();
+                            if project_fallback {
+                                match_reasons.retain(|reason| *reason != "conversation_id");
+                                match_reasons.push("project_id_fallback");
+                            }
                             let repo_scope = match repo_id {
                                 Some(expected_repo_id)
                                     if record.repo_id.as_deref() == Some(expected_repo_id) =>
@@ -846,7 +885,9 @@ fn continuity_call(
                         "auto_resume_safe": auto_resume_safe,
                         "confirmation_required": !auto_resume_safe && !candidates.is_empty(),
                         "candidates": candidates,
-                        "instruction": if auto_resume_safe {
+                        "instruction": if project_fallback && !auto_resume_safe {
+                            "The exact conversation has no durable Continuity binding. These candidates share the stable ChatGPT Project identity; use the bounded evidence for confirmation and never choose by recency or title similarity alone."
+                        } else if auto_resume_safe {
                             "Exactly one active chain matched a stable identity hint. Resume that continuity_id, then re-check live Herdr/runtime/Git state before mutation."
                         } else if has_legacy_repo_unbound {
                             "A legacy repo-unbound candidate matched the query, but the requested repository is not verified identity. Show the bounded evidence to the planner/user for confirmation; do not auto-resume or invent a Work Memory locator."
@@ -6794,6 +6835,31 @@ mod tests {
         );
         assert_eq!(ambiguous_identity_resume["ok"], false);
         assert_eq!(ambiguous_identity_resume["code"], "continuity_ambiguous");
+
+        let ambiguous_url_search = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({
+                "conversation_url": "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project/c/missing-conv"
+            }),
+        );
+        assert_eq!(ambiguous_url_search["resolution"], "confirmation_required");
+        assert_eq!(ambiguous_url_search["auto_resume_safe"], false);
+        assert_eq!(
+            ambiguous_url_search["candidates"].as_array().unwrap().len(),
+            2
+        );
+        assert!(
+            ambiguous_url_search["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate["match_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason == "project_id_fallback"))
+        );
 
         let identity_plus_text = continuity_call(
             &store,

@@ -1982,6 +1982,44 @@ impl StateStore {
         Ok(segments.last().map(|segment| segment.0.clone()))
     }
 
+    pub fn continuity_for_provider_session(
+        &self,
+        provider: &str,
+        session_ref: &str,
+    ) -> Result<Option<String>, String> {
+        validate_work_memory_ref(provider, 64, "provider")?;
+        validate_work_memory_ref(session_ref, 512, "session_ref")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT b.continuity_id
+                 FROM continuity_provider_bindings b
+                 JOIN continuity_chains c ON c.continuity_id = b.continuity_id
+                 WHERE b.provider = ?1 AND b.session_ref = ?2 AND c.status = 'active'
+                 ORDER BY c.updated_at DESC
+                 LIMIT 2",
+            )
+            .map_err(|error| {
+                format!("cannot prepare continuity provider session lookup: {error}")
+            })?;
+        let rows = stmt
+            .query_map(params![provider, session_ref], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("cannot query continuity provider session: {error}"))?;
+        let mut owner_ids = Vec::new();
+        for row in rows {
+            owner_ids.push(
+                row.map_err(|error| format!("cannot decode continuity provider session: {error}"))?,
+            );
+        }
+        match owner_ids.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some(only.clone())),
+            _ => Err("continuity_binding_ambiguous".to_owned()),
+        }
+    }
+
     pub fn bind_work_memory(&mut self, input: WorkMemoryBindingInput<'_>) -> Result<(), String> {
         validate_work_memory_partition(
             input.continuity_id,
