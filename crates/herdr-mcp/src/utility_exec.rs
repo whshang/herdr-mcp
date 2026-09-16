@@ -86,6 +86,16 @@ impl ExecInvocation {
     }
 }
 
+fn pre_start_rejection(mut result: Value) -> Value {
+    if let Some(object) = result.as_object_mut() {
+        object
+            .entry("delivery_state".to_owned())
+            .or_insert_with(|| json!("not_delivered"));
+        exec_evidence::insert_control_plane_rejection(object);
+    }
+    result
+}
+
 pub fn run_durable(
     client: &HerdrClient,
     snapshot: &Value,
@@ -114,11 +124,11 @@ pub fn run_durable(
         Err(error) => return error,
     };
     let Some(workspace) = resolve_workspace(snapshot, workspace_target) else {
-        return json!({
+        return pre_start_rejection(json!({
             "ok": false,
             "reason": "workspace_not_found",
             "workspace": workspace_target,
-        });
+        }));
     };
     let topology = projects::derive_routing(snapshot);
     let current_projects = projects::projects_for_workspace(&topology, &workspace.id);
@@ -129,27 +139,27 @@ pub fn run_durable(
     let effective_root = match select_project_root(project_root, &roots) {
         Ok(Some(root)) => root,
         Ok(None) if roots.is_empty() => {
-            return json!({
+            return pre_start_rejection(json!({
                 "ok": false,
                 "reason": "project_root_required",
                 "workspace": workspace.id,
                 "candidates": [],
                 "current_projects": detailed_project_views(snapshot, &workspace.id),
                 "hint": "This workspace has no current project root; project_root requires a current attached project.",
-            });
+            }));
         }
         Ok(None) => {
-            return json!({
+            return pre_start_rejection(json!({
                 "ok": false,
                 "reason": "project_root_required",
                 "workspace": workspace.id,
                 "candidates": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
                 "current_projects": detailed_project_views(snapshot, &workspace.id),
                 "hint": "This workspace has multiple project roots; project_root must match one of the returned candidates.",
-            });
+            }));
         }
         Err(wanted) => {
-            return json!({
+            return pre_start_rejection(json!({
                 "ok": false,
                 "reason": "project_root_not_in_workspace",
                 "workspace": workspace.id,
@@ -157,13 +167,13 @@ pub fn run_durable(
                 "candidates": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
                 "current_projects": detailed_project_views(snapshot, &workspace.id),
                 "hint": "project_root must match one of this workspace's returned project-root candidates.",
-            });
+            }));
         }
     };
     let working =
         match mutation::check_with_topology(snapshot, &topology, &effective_root, confirm_busy) {
             Ok(working) => working,
-            Err(error) => return error,
+            Err(error) => return pre_start_rejection(error),
         };
 
     // Ordinary, non-interactive execution reuses the durable native
@@ -188,7 +198,7 @@ pub fn run_durable(
         }
         #[cfg(not(unix))]
         {
-            return json!({
+            return pre_start_rejection(json!({
                 "ok": false,
                 "code": "unsupported_platform",
                 "message": "protected-path execution requires the macOS utility-pane transport",
@@ -196,7 +206,7 @@ pub fn run_durable(
                 "command": command,
                 "effective_cwd": effective_root.to_string_lossy(),
                 "project_root": effective_root.to_string_lossy(),
-            });
+            }));
         }
     }
 
@@ -1883,6 +1893,40 @@ mod tests {
                 "cwd": root.to_string_lossy(),
             }],
         })
+    }
+
+    #[test]
+    fn project_root_mismatch_reports_pre_start_control_plane_evidence() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+        let outside = base.join("outside");
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({
+                "workspace": "w1",
+                "project_root": outside.to_string_lossy(),
+                "steps": [{"program": "printf", "args": ["must-not-run"]}],
+            }),
+        );
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["reason"], "project_root_not_in_workspace");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["execution"]["started"], false);
+        assert_eq!(result["execution"]["completed"], false);
+        assert!(result["execution"]["exit_code"].is_null());
+        assert_eq!(result["failure_origin"], "herdr_control_plane");
+        assert!(registry.list_views().is_empty());
+
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
