@@ -899,6 +899,30 @@ impl ExecRegistry {
         views
     }
 
+    /// Return the newest live exec session that this runtime owns on `pane_id`.
+    ///
+    /// Utility-pane scheduling uses this as an ownership proof before waiting
+    /// for a busy canonical pane. A busy pane with no matching live registry
+    /// session is treated as foreign/interactive contention and is never waited
+    /// on or interrupted automatically.
+    pub fn running_pane_session_id(&self, pane_id: &str) -> Option<String> {
+        self.prune();
+        let sessions = self.inner.sessions.lock().ok()?;
+        sessions
+            .values()
+            .filter(|session| {
+                matches!(
+                    &session.backend,
+                    SessionBackend::Pane {
+                        pane_id: owned_pane,
+                        ..
+                    } if owned_pane == pane_id
+                ) && !session_status(session).closed
+            })
+            .max_by_key(|session| session.started_at_ms)
+            .map(|session| session.id.clone())
+    }
+
     pub fn diagnostics(&self) -> Value {
         let views = self.list_views();
         let running = views

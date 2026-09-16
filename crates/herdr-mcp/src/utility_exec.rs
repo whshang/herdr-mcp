@@ -20,6 +20,8 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 60_000;
 const PRE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
+const UTILITY_OWNED_WAIT: Duration = Duration::from_secs(2);
+const UTILITY_OWNED_POLL: Duration = Duration::from_millis(100);
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_STRUCTURED_STEPS: usize = 16;
 const MAX_STRUCTURED_ARGS: usize = 128;
@@ -299,15 +301,15 @@ pub(crate) fn start_reusable_pane_session(
                 }
             };
 
-        if let Ok(info) = client.call_with_timeout(
-            "pane.process_info",
-            json!({"pane_id": pane_id}),
-            PRE_SEND_TIMEOUT,
+        if let Err(result) = ensure_utility_pane_ready(
+            client,
+            registry,
+            workspace_id,
+            &pane_id,
+            command,
+            UTILITY_OWNED_WAIT,
         ) {
-            let readiness = utility_pane_readiness(&info);
-            if !readiness.ready {
-                return utility_pane_contention_result(workspace_id, &pane_id, command, &readiness);
-            }
+            return result;
         }
 
         let mut result = match registry.start_in_existing_pane(effective_root, command, &pane_id) {
@@ -360,15 +362,15 @@ fn run_unix_durable(
             }
         };
 
-    if let Ok(info) = client.call_with_timeout(
-        "pane.process_info",
-        json!({"pane_id": pane_id}),
-        PRE_SEND_TIMEOUT,
+    if let Err(result) = ensure_utility_pane_ready(
+        client,
+        registry,
+        workspace_id,
+        &pane_id,
+        command,
+        UTILITY_OWNED_WAIT,
     ) {
-        let readiness = utility_pane_readiness(&info);
-        if !readiness.ready {
-            return utility_pane_contention_result(workspace_id, &pane_id, command, &readiness);
-        }
+        return result;
     }
 
     let start = match registry.start_in_existing_pane(effective_root, command, &pane_id) {
@@ -750,6 +752,92 @@ fn utility_pane_contention_result(
         exec_evidence::insert_control_plane_rejection(object);
     }
     result
+}
+
+#[cfg(unix)]
+fn ensure_utility_pane_ready(
+    client: &HerdrClient,
+    registry: &ExecRegistry,
+    workspace_id: &str,
+    pane_id: &str,
+    command: &str,
+    wait_budget: Duration,
+) -> Result<(), Value> {
+    let info = client
+        .call_with_timeout(
+            "pane.process_info",
+            json!({"pane_id": pane_id}),
+            PRE_SEND_TIMEOUT,
+        )
+        .map_err(|error| utility_pane_control_plane_error(workspace_id, command, error.message))?;
+    let readiness = utility_pane_readiness(&info);
+    let owner_session_id = registry.running_pane_session_id(pane_id);
+    wait_for_owned_utility_pane(
+        client,
+        workspace_id,
+        pane_id,
+        command,
+        readiness,
+        owner_session_id.as_deref(),
+        wait_budget,
+    )
+}
+
+#[cfg(unix)]
+fn wait_for_owned_utility_pane(
+    client: &HerdrClient,
+    workspace_id: &str,
+    pane_id: &str,
+    command: &str,
+    mut readiness: PaneReadiness,
+    owner_session_id: Option<&str>,
+    wait_budget: Duration,
+) -> Result<(), Value> {
+    if readiness.ready {
+        return Ok(());
+    }
+    let Some(owner_session_id) = owner_session_id else {
+        return Err(utility_pane_contention_result(
+            workspace_id,
+            pane_id,
+            command,
+            &readiness,
+        ));
+    };
+
+    let started = Instant::now();
+    while started.elapsed() < wait_budget {
+        let remaining = wait_budget.saturating_sub(started.elapsed());
+        thread::sleep(UTILITY_OWNED_POLL.min(remaining));
+        let info = client
+            .call_with_timeout(
+                "pane.process_info",
+                json!({"pane_id": pane_id}),
+                PRE_SEND_TIMEOUT,
+            )
+            .map_err(|error| {
+                utility_pane_control_plane_error(workspace_id, command, error.message)
+            })?;
+        readiness = utility_pane_readiness(&info);
+        if readiness.ready {
+            return Ok(());
+        }
+    }
+
+    let mut result = utility_pane_contention_result(workspace_id, pane_id, command, &readiness);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("owner".to_owned(), json!("herdr_exec_session"));
+        object.insert("owner_session_id".to_owned(), json!(owner_session_id));
+        object.insert(
+            "waited_ms".to_owned(),
+            json!(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        );
+        object.insert(
+            "hint".to_owned(),
+            json!("The canonical utility pane is still occupied by a Herdr-owned exec session after the bounded wait; observe that session before retrying."),
+        );
+    }
+    Err(result)
 }
 
 fn resolve_workspace(snapshot: &Value, target: &str) -> Option<WorkspaceRecord> {
@@ -1337,6 +1425,87 @@ mod tests {
             }
         }));
         assert!(!blocked.ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn herdr_owned_busy_utility_pane_waits_for_shell_before_send() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "pane.process_info");
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "id": request["id"].clone(),
+                    "result": {
+                        "process_info": {
+                            "shell_pid": 42,
+                            "foreground_process_group_id": 42,
+                            "foreground_processes": [{"pid": 42, "name": "zsh"}],
+                        }
+                    }
+                })
+            )
+            .unwrap();
+        });
+        let client = HerdrClient::new(&socket);
+        let busy = PaneReadiness {
+            ready: false,
+            shell_pid: Some(42),
+            foreground_process_group_id: Some(77),
+            foreground: vec![json!({"pid": 77, "name": "sleep"})],
+        };
+
+        let result = wait_for_owned_utility_pane(
+            &client,
+            "w1",
+            "w1:p2",
+            "git status",
+            busy,
+            Some("es_owned"),
+            Duration::from_millis(250),
+        );
+        assert!(result.is_ok(), "owned pane should become ready: {result:?}");
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_busy_utility_pane_never_enters_owned_wait() {
+        let client = HerdrClient::new(Path::new("/definitely/not/a/socket"));
+        let busy = PaneReadiness {
+            ready: false,
+            shell_pid: Some(42),
+            foreground_process_group_id: Some(77),
+            foreground: vec![json!({"pid": 77, "name": "less"})],
+        };
+        let started = Instant::now();
+        let result = wait_for_owned_utility_pane(
+            &client,
+            "w1",
+            "w1:p2",
+            "git status",
+            busy,
+            None,
+            Duration::from_millis(250),
+        )
+        .unwrap_err();
+        assert_eq!(result["code"], "utility_pane_not_ready");
+        assert!(result.get("owner_session_id").is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
