@@ -951,7 +951,6 @@ const H2W_CONTENT_VERSION = "0.1.97";
               const mainSubmit = selector ? await submitMainWorld(selector) : null;
               if (mainSubmit?.ok) {
                 if (await waitForSubmitAck(mainBaseline, 8000)) return true;
-                return false;
               }
             }
             console.warn("[h2w] composer still has content after Send click; retrying");
