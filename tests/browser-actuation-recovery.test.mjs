@@ -445,6 +445,25 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
   assert.doesNotMatch(identitySegment, /accountNativeIdentity|email|userId/i);
 });
 
+test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and Enter fallbacks", () => {
+  assert.match(wakeSource, /function submitMainWorld\(selector\)/);
+  assert.match(wakeSource, /type:\s*"h2w_submit_main"/);
+  assert.match(backgroundSource, /msg\?\.type === "h2w_submit_main"/);
+  assert.match(backgroundSource, /form\.requestSubmit\(sendButton\)/);
+  const submitStart = wakeSource.indexOf("async function submit() {");
+  const submitEnd = wakeSource.indexOf("// ---- Auto-allow", submitStart);
+  const submitSegment = wakeSource.slice(submitStart, submitEnd);
+  assert.match(submitSegment, /await submitMainWorld\(selector\)/);
+  const mainFallbackStart = submitSegment.indexOf("const mainSubmit = selector ? await submitMainWorld(selector) : null;");
+  const mainFallbackEnd = submitSegment.indexOf("const baseline = captureSubmitAckBaseline(btn);", mainFallbackStart);
+  assert.ok(mainFallbackStart >= 0 && mainFallbackEnd > mainFallbackStart, "MAIN submit fallback must remain bounded");
+  assert.doesNotMatch(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /return false;/);
+  assert.match(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /waitForSubmitAck\(mainBaseline, 4000\)/);
+  const clickIndex = submitSegment.indexOf("btn.click();", mainFallbackEnd);
+  const enterIndex = submitSegment.indexOf("dispatchEnterSubmit(el)", clickIndex);
+  assert.ok(clickIndex > mainFallbackEnd && enterIndex > clickIndex, "DOM click and Enter remain ordered fallbacks");
+});
+
 test("terminal stale session reservations do not block ordinary browser identity recovery", () => {
   const registerStart = backgroundSource.indexOf('if (msg?.type === "h2w_register")');
   const registerEnd = backgroundSource.indexOf('if (msg?.type === "h2w_insert_main")', registerStart);
@@ -1112,6 +1131,10 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(segment, /browserTabScopes\.get\(createdTab\.id\)/);
   assert.match(segment, /scope\.accountRef === accountRefCreate/);
   assert.match(segment, /scope\.spaceRef === spaceRefCreate/);
+  assert.match(segment, /browserTabScopes\.entries\(\)/);
+  assert.match(segment, /scope\.observationGeneration === expectedGeneration/);
+  assert.match(segment, /chrome\.tabs\.get\(tabId\)/);
+  assert.match(segment, /windowId: anchorWindowId/);
   assert.match(segment, /chrome\.tabs\.create\(\{ url: launchUrl, active: true \}\)/);
   assert.match(segment, /reservationRef/);
 
@@ -1119,7 +1142,7 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);
   const createSegment = wakeSource.slice(createStart, createEnd);
   assert.match(createSegment, /sessionStorage\.setItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef\)/);
-  assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 8000/);
+  assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 20000/);
   assert.match(createSegment, /while \(!ADAPTER\.getInputEl\(\) && Date\.now\(\) < composerReadyDeadline\)/);
   assert.match(createSegment, /await wait\(200\)/);
   assert.ok(
@@ -1141,6 +1164,8 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
 
   const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
   const registrationSegment = wakeSource.slice(registrationStart, registrationStart + 3500);
+  assert.match(registrationSegment, /chatGptProjectRoute/);
+  assert.match(registrationSegment, /chatGptProjectRoute\s*\?\s*\[\]\s*:\s*await chatGptProjectCatalog\(accountNativeIdentity\)/);
   assert.match(registrationSegment, /browserSessionReservationRef/);
   assert.match(registrationSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
 });
