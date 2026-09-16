@@ -570,7 +570,7 @@ test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and
   const ackEnd = wakeSource.indexOf("async function waitForSubmitAck", ackStart);
   const ackSegment = wakeSource.slice(ackStart, ackEnd);
   assert.match(ackSegment, /location\.href !== baseline\.href/);
-  assert.match(ackSegment, /baseline\?\.generating === false && isComposerGenerating\(\)/);
+  assert.doesNotMatch(ackSegment, /baseline\?\.generating|isComposerGenerating\(\)/);
   assert.doesNotMatch(ackSegment, /sendButton\.isConnected|isSendButton\(baseline\.sendButton\)/);
 });
 

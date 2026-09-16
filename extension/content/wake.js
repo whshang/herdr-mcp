@@ -857,7 +857,6 @@ const H2W_CONTENT_VERSION = "0.1.97";
       composer: composerNorm(),
       sendButton,
       href: location.href,
-      generating: isComposerGenerating(),
       userTurn: ADAPTER.name === "chatgpt" ? latestTurnForRole("user") : null,
     };
   }
@@ -868,9 +867,9 @@ const H2W_CONTENT_VERSION = "0.1.97";
     // React may replace the Send button while the composer is merely rerendering;
     // that node transition alone is not provider acceptance. Require a stronger
     // post-submit signal before stopping retries: navigation to the new ChatGPT
-    // conversation, a transition from idle to generation, or a matching user turn.
+    // conversation or a matching user turn. A transient busy/generating control
+    // is not sufficient because ChatGPT can show it before provider acceptance.
     if (baseline?.href && location.href !== baseline.href) return true;
-    if (baseline?.generating === false && isComposerGenerating()) return true;
     const latestUser = latestTurnForRole("user");
     if (latestUser && latestUser !== baseline?.userTurn) {
       const latestText = normText(latestUser.innerText || latestUser.textContent || "");

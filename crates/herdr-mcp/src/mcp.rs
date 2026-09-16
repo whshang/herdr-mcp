@@ -2710,7 +2710,9 @@ fn browser_session_create_success(
     })
 }
 
-const BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS: usize = 81;
+// Keep the whole create call inside the upstream request budget even after the
+// browser broker's bounded actuation wait. Forty intervals add at most 10s.
+const BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS: usize = 41;
 #[cfg(not(test))]
 const BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS: u64 = 250;
 #[cfg(test)]
