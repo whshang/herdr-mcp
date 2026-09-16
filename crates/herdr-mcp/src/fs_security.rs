@@ -924,7 +924,7 @@ mod tests {
         fs::remove_dir_all(worktrees_root).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn delegated_protected_root_uses_metadata_when_canonicalize_is_unavailable() {
         use std::os::unix::fs::PermissionsExt;
