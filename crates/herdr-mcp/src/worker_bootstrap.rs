@@ -774,7 +774,7 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
 
     verify_public_oauth(&edge_http, &edge_origin)?;
     verify_current_device_inventory(paths, journal.canonical_device_id.as_deref(), &edge_http)?;
-    let link = crate::link::ownership::status_report()?;
+    let link = crate::link::status_report()?;
     if link.get("operational_ready").and_then(Value::as_bool) != Some(true) {
         let safe = crate::status::sanitize_probe_token(&link.to_string());
         return Err(format!(

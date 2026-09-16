@@ -231,11 +231,11 @@ pub fn doctor_runtime_token() -> Result<Option<String>, String> {
 }
 
 pub fn print_link_status() -> Result<ExitCode, String> {
-    print_json(&link_status_value()?)?;
+    print_json(&link_status_report()?)?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn link_status_value() -> Result<Value, String> {
+pub(crate) fn link_status_report() -> Result<Value, String> {
     if wsl_environment_detected() {
         return Ok(unsupported_wsl_status_value());
     }
@@ -332,7 +332,7 @@ fn linux_link_status_from_evidence(
         "production_ready_eligible": operational_ready,
         "operational_ready": operational_ready,
         "cutover_applicable": false,
-        "cutover_sealed": operational_ready,
+        "cutover_sealed": false,
         "cutover_pending": false,
         "runtime_current": paths.current_binary,
         "link_unit": if backend == LinuxBackend::SystemdUser { Some(paths.link_unit.clone()) } else { None },
@@ -1694,6 +1694,10 @@ mod tests {
         );
         assert_eq!(
             status.get("cutover_applicable").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            status.get("cutover_sealed").and_then(Value::as_bool),
             Some(false)
         );
         let gates = status.get("gates").and_then(Value::as_array).unwrap();
