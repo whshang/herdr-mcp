@@ -121,10 +121,10 @@ Old/frozen action set  → may remain on an older action set
 
 After runtime upgrades:
 
-1. verify Edge/runtime version;
-2. do **not** disconnect/delete/re-add the Connector merely because the workstation runtime was upgraded;
+1. verify Edge/runtime version. Current releases expose Worker drift through `herdr-mcp update check|status`; interactive `herdr-mcp update` reconciles a safe same-contract existing Worker after Runtime activation, and `herdr-mcp worker update` is the direct repair path;
+2. do **not** disconnect/delete/re-add the Connector merely because either Runtime or the existing Worker was upgraded in place; Worker reconciliation preserves the public OAuth origin and Connector credentials;
 3. when the Herdr public action catalog changed, refresh/review/publish the app actions through the workspace controls available on the account, and explicitly enable new actions when required;
-4. use a fresh conversation after the action snapshot changes.
+4. use a fresh conversation after the action snapshot changes. Updating Worker code is necessary for new Edge-provided descriptions, but an already-reviewed ChatGPT action snapshot can still remain frozen until the app actions are refreshed.
 
 Do not reinstall the workstation for a stale tool snapshot. Existing v0.4.2 runtimes continue to execute the epoch-2 18-tool workstation contract; they simply do not gain the v0.4.3 multi-device runtime features until upgraded.
 

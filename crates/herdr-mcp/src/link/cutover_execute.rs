@@ -351,11 +351,7 @@ fn prepare_cutover(
     }
     let original = fs::read(prod_plist)
         .map_err(|error| format!("cannot read {}: {error}", prod_plist.display()))?;
-    refuse_if_not_prod_label(&original, prod_plist)?;
-    require_node_program_arguments(
-        &original,
-        &format!("current prod plist {}", prod_plist.display()),
-    )?;
+    validate_node_rollback_bytes(&original, prod_plist)?;
 
     if let Some(parent) = backup_path.parent() {
         fs::create_dir_all(parent)
@@ -370,11 +366,7 @@ fn prepare_cutover(
                 backup_path.display()
             )
         })?;
-        refuse_if_not_prod_label(&existing, backup_path)?;
-        require_node_program_arguments(
-            &existing,
-            &format!("existing Node rollback backup {}", backup_path.display()),
-        )?;
+        validate_node_rollback_bytes(&existing, backup_path)?;
     } else {
         atomic_write(backup_path, &original, 0o600)?;
     }
@@ -439,13 +431,20 @@ pub fn rollback_cutover<L: LaunchdOps>(
 ) -> Value {
     let mut steps = Vec::new();
     match fs::read(backup_path) {
-        Ok(bytes) => match atomic_write(prod_plist, &bytes, 0o600) {
-            Ok(()) => steps.push(json!({"step": "restore_plist", "ok": true})),
-            Err(error) => {
-                steps.push(json!({"step": "restore_plist", "ok": false, "error": error}));
+        Ok(bytes) => {
+            if let Err(error) = validate_node_rollback_bytes(&bytes, backup_path) {
+                steps.push(json!({"step": "validate_backup", "ok": false, "error": error}));
                 return json!({"ok": false, "steps": steps});
             }
-        },
+            steps.push(json!({"step": "validate_backup", "ok": true}));
+            match atomic_write(prod_plist, &bytes, 0o600) {
+                Ok(()) => steps.push(json!({"step": "restore_plist", "ok": true})),
+                Err(error) => {
+                    steps.push(json!({"step": "restore_plist", "ok": false, "error": error}));
+                    return json!({"ok": false, "steps": steps});
+                }
+            }
+        }
         Err(error) => {
             steps.push(json!({
                 "step": "restore_plist",
@@ -675,6 +674,49 @@ fn require_node_program_arguments(bytes: &[u8], context: &str) -> Result<Vec<Str
     }
 }
 
+pub(crate) fn validate_node_rollback_source(path: &Path) -> Result<Vec<String>, String> {
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "cannot read Node rollback source {}: {error}",
+            path.display()
+        )
+    })?;
+    validate_node_rollback_bytes(&bytes, path)
+}
+
+fn validate_node_rollback_bytes(bytes: &[u8], path: &Path) -> Result<Vec<String>, String> {
+    refuse_if_not_prod_label(bytes, path)?;
+    let context = format!("Node rollback source {}", path.display());
+    let program = require_node_program_arguments(bytes, &context)?;
+    validate_node_program_targets(&program, &context)?;
+    Ok(program)
+}
+
+fn validate_node_program_targets(program: &[String], context: &str) -> Result<(), String> {
+    let node = program
+        .first()
+        .ok_or_else(|| format!("{context}: Node executable missing from ProgramArguments"))?;
+    if !Path::new(node).is_file() {
+        return Err(format!("{context}: Node executable does not exist: {node}"));
+    }
+    let daemon = program
+        .iter()
+        .skip(1)
+        .find(|arg| {
+            let lower = arg.replace('\\', "/").to_ascii_lowercase();
+            lower.contains("macos-daemon")
+                || lower.ends_with("/dist/link/macos-daemon.js")
+                || (lower.contains("/link/") && lower.ends_with(".js"))
+        })
+        .ok_or_else(|| format!("{context}: Node Link daemon missing from ProgramArguments"))?;
+    if !Path::new(daemon).is_file() {
+        return Err(format!(
+            "{context}: Node Link daemon does not exist: {daemon}"
+        ));
+    }
+    Ok(())
+}
+
 fn refuse_if_not_prod_label(bytes: &[u8], path: &Path) -> Result<(), String> {
     let value = PlistValue::from_reader(std::io::Cursor::new(bytes))
         .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
@@ -888,6 +930,12 @@ mod tests {
     }
 
     fn node_prod_plist_xml(home: &Path) -> Vec<u8> {
+        let node = home.join("node/bin/node");
+        let daemon = home.join("Documents/herdr-mcp/dist/link/macos-daemon.js");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::create_dir_all(daemon.parent().unwrap()).unwrap();
+        fs::write(&node, b"#!/bin/sh\n").unwrap();
+        fs::write(&daemon, b"// test node link daemon\n").unwrap();
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -897,8 +945,8 @@ mod tests {
   <string>{LINK_PROD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/node</string>
-    <string>/Users/qingxian/Documents/herdr-mcp/dist/link/macos-daemon.js</string>
+    <string>{}</string>
+    <string>{}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -916,6 +964,8 @@ mod tests {
 </dict>
 </plist>
 "#,
+            node.display(),
+            daemon.display(),
             home.join(".config/herdr-mcp").display()
         );
         xml.into_bytes()
@@ -1050,6 +1100,59 @@ mod tests {
         );
         // bootout for activate + bootout for rollback; bootstrap only for rollback success path
         assert!(launchd.bootouts().len() >= 2);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rollback_refuses_invalid_backup_sources_before_any_mutation() {
+        let home = test_home();
+        setup_managed_runtime(&home);
+        let agents = home.join("Library/LaunchAgents");
+        fs::create_dir_all(&agents).unwrap();
+        let prod_plist = agents.join(format!("{LINK_PROD_LABEL}.plist"));
+        let backup = prod_plist_backup_path(&home);
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        let sentinel = b"current-rust-prod-must-stay-untouched".to_vec();
+        fs::write(&prod_plist, &sentinel).unwrap();
+
+        let runtime = candidate_program_arguments(&home).unwrap()[0].clone();
+        let rust_backup = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>{LINK_PROD_LABEL}</string>
+<key>ProgramArguments</key><array>
+<string>{}</string><string>link</string><string>run</string>
+</array></dict></plist>"#,
+            runtime
+        );
+        let launchd = FakeLaunchd::new();
+        fs::write(&backup, rust_backup).unwrap();
+        let rust_report = rollback_cutover(&launchd, &prod_plist, &backup);
+        assert_eq!(rust_report["ok"], false);
+        assert_eq!(rust_report["steps"][0]["step"], "validate_backup");
+        assert_eq!(fs::read(&prod_plist).unwrap(), sentinel);
+        assert!(launchd.bootouts().is_empty());
+
+        fs::write(&backup, b"not a plist").unwrap();
+        let corrupt_report = rollback_cutover(&launchd, &prod_plist, &backup);
+        assert_eq!(corrupt_report["ok"], false);
+        assert_eq!(fs::read(&prod_plist).unwrap(), sentinel);
+        assert!(launchd.bootouts().is_empty());
+
+        let node_backup = node_prod_plist_xml(&home);
+        let daemon = home.join("Documents/herdr-mcp/dist/link/macos-daemon.js");
+        fs::remove_file(&daemon).unwrap();
+        fs::write(&backup, node_backup).unwrap();
+        let missing_target_report = rollback_cutover(&launchd, &prod_plist, &backup);
+        assert_eq!(missing_target_report["ok"], false);
+        assert!(
+            missing_target_report["steps"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("Node Link daemon does not exist")
+        );
+        assert_eq!(fs::read(&prod_plist).unwrap(), sentinel);
+        assert!(launchd.bootouts().is_empty());
         let _ = fs::remove_dir_all(&home);
     }
 
