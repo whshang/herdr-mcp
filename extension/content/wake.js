@@ -942,18 +942,15 @@ const H2W_CONTENT_VERSION = "0.1.97";
         for (let i = 0; i < 40; i++) {
           const btn = findSendButton();
           if (isSendButton(btn)) {
-            const baseline = captureSubmitAckBaseline(btn);
-            btn.click();
-            if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
             if (ADAPTER.name === "chatgpt" && attempt === 0 && ADAPTER.inputHasContent()) {
               const selector = ADAPTER.getWatchMainWorldSelector();
-              const mainBaseline = captureSubmitAckBaseline(findSendButton());
+              const mainBaseline = captureSubmitAckBaseline(btn);
               const mainSubmit = selector ? await submitMainWorld(selector) : null;
-              if (mainSubmit?.ok) {
-                if (await waitForSubmitAck(mainBaseline, 8000)) return true;
-                return false;
-              }
+              if (mainSubmit?.ok && await waitForSubmitAck(mainBaseline, 4000)) return true;
             }
+            const baseline = captureSubmitAckBaseline(btn);
+            btn.click();
+            if (await waitForSubmitAck(baseline, 4000)) return true;
             console.warn("[h2w] composer still has content after Send click; retrying");
             break;
           }
