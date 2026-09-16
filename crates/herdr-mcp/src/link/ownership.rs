@@ -548,6 +548,13 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     let loaded_prod_generation =
         launchd_loaded_environment_value(LINK_PROD_LABEL, "HERDR_RUNTIME_GENERATION");
     let current_generation = current_managed_runtime_generation(home);
+    let control_path = prefer_existing(&[
+        config_dir.join("runtime-control-prod.json"),
+        config_dir.join("runtime-control.json"),
+    ]);
+    let desired_generation = control_path
+        .as_ref()
+        .and_then(|path| read_control_desired_active(path));
     let status_path = prefer_existing(&[
         config_dir.join("runtime-status-prod.json"),
         config_dir.join("runtime-status.json"),
@@ -562,6 +569,10 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     let loaded_matches_current = matches!(
         (loaded_prod_generation.as_deref(), current_generation.as_deref()),
         (Some(loaded), Some(current)) if loaded == current
+    );
+    let desired_matches_current = matches!(
+        (desired_generation.as_deref(), current_generation.as_deref()),
+        (Some(desired), Some(current)) if desired == current
     );
     let runtime_control_active_matches_current = matches!(
         (active_generation.as_deref(), current_generation.as_deref()),
@@ -657,14 +668,18 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         ],
         "production_runtime_alignment": {
             "current_generation": current_generation,
+            "desired_generation": desired_generation,
             "active_generation": active_generation,
             "configured_launchd_generation": configured_prod_generation,
             "loaded_launchd_generation": loaded_prod_generation,
             "configured_matches_current": configured_matches_current,
             "loaded_matches_current": loaded_matches_current,
+            "desired_matches_current": desired_matches_current,
             "runtime_control_active_matches_current": runtime_control_active_matches_current,
             "loaded_environment_stale": loaded_environment_stale,
-            "detail": if loaded_environment_stale && runtime_control_active_matches_current {
+            "detail": if !desired_matches_current {
+                "runtime-control desired generation is not aligned with runtime/current"
+            } else if loaded_environment_stale && runtime_control_active_matches_current {
                 "runtime-control reports active=current, but the loaded launchd environment still carries a stale startup generation"
             } else if loaded_environment_stale {
                 "loaded launchd generation is stale relative to runtime/current and runtime-control has not reported active=current"

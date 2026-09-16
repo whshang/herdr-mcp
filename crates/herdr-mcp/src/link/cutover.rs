@@ -128,21 +128,7 @@ fn run_rollback(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
             }
         };
         let rollback = rollback_cutover(&RealLaunchd, &prod_plist, &backup);
-        let seal_clear = super::seal::clear_active_seal(config_dir)?;
-        let report = json!({
-            "ok": rollback.get("ok").and_then(Value::as_bool).unwrap_or(false),
-            "mode": "rollback",
-            "backup_plist": backup.display().to_string(),
-            "rollback": rollback,
-            "seal_cleared": seal_clear,
-            "production_ready": false,
-            "protected_labels_untouched": [LINK_LABEL, LINK_RUST_CANDIDATE_LABEL],
-            "notes": [
-                "Restored Node link-prod from backup via bootout/bootstrap (never the forbidden launchd submission path).",
-                "Active production_ready seal cleared if present.",
-                "Re-cut to Rust with HERDR_LINK_CUTOVER_I_UNDERSTAND=1 link cutover --execute after Node verify.",
-            ],
-        });
+        let report = finalize_rollback_report(config_dir, &backup, rollback)?;
         println!(
             "{}",
             serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
@@ -153,6 +139,45 @@ fn run_rollback(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
             Ok(ExitCode::from(2))
         }
     }
+}
+
+fn finalize_rollback_report(
+    config_dir: &Path,
+    backup: &Path,
+    rollback: Value,
+) -> Result<Value, String> {
+    let ok = rollback.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let seal_cleared = if ok {
+        super::seal::clear_active_seal(config_dir)?
+    } else {
+        json!({
+            "ok": true,
+            "cleared": false,
+            "detail": "rollback did not complete; active seal preserved",
+        })
+    };
+    let production_ready = super::seal::production_ready_from_seal(config_dir);
+    Ok(json!({
+        "ok": ok,
+        "mode": "rollback",
+        "backup_plist": backup.display().to_string(),
+        "rollback": rollback,
+        "seal_cleared": seal_cleared,
+        "production_ready": production_ready,
+        "protected_labels_untouched": [LINK_LABEL, LINK_RUST_CANDIDATE_LABEL],
+        "notes": if ok {
+            vec![
+                "Restored Node link-prod from backup via bootout/bootstrap (never the forbidden launchd submission path).",
+                "Active production_ready seal cleared if present.",
+                "Re-cut to Rust with HERDR_LINK_CUTOVER_I_UNDERSTAND=1 link cutover --execute after Node verify.",
+            ]
+        } else {
+            vec![
+                "Rollback did not complete; the active production_ready seal was preserved.",
+                "Inspect rollback.steps for the exact failure before any new mutation.",
+            ]
+        },
+    }))
 }
 
 fn run_execute(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
@@ -444,7 +469,7 @@ fn evaluate_cutover_preconditions(
 
     out.push(Precondition {
         id: "prod_plist_present_for_backup".to_owned(),
-        ok: prod.present,
+        ok: prod.present && prod.implementation == LinkImplementation::Node,
         detail: format!(
             "label={} present={} implementation={} plist={}",
             prod.label,
@@ -519,6 +544,28 @@ fn build_planned_cutover_steps(
 ) -> Vec<String> {
     let binary = managed_runtime_binary(home);
     let backup = prod_plist_backup_path(home);
+    if prod.implementation != LinkImplementation::Node {
+        let recovery = if prod.implementation == LinkImplementation::Rust {
+            format!(
+                "2. Production is already Rust. Do not create a Node backup from current prod bytes. If the authentic Node rollback backup at {} is unavailable, use `herdr-mcp link seal adopt-existing-rust --ack --reason <operator-reason>` after verifying the healthy aligned Rust owner.",
+                backup.display()
+            )
+        } else {
+            format!(
+                "2. Current prod is not a verified Node source. Repair or restore an authentic Node prod plist/backup at {} before cutover; do not synthesize rollback history.",
+                backup.display()
+            )
+        };
+        return vec![
+            "0. Independent Shell only (never managed herdr_exec); no cutover mutation is eligible from this ownership state.".to_owned(),
+            format!(
+                "1. Current {} implementation is {}; it cannot be used as the pre-Rust Node backup source.",
+                prod.plist_path.display(),
+                prod.implementation.as_str()
+            ),
+            recovery,
+        ];
+    }
     let argv = planned
         .map(|args| args.join(" "))
         .unwrap_or_else(|| format!("{} link run", binary.display()));
@@ -793,6 +840,78 @@ mod tests {
                 .as_bool()
                 .unwrap_or(false),
             "planned argv should still validate even when current prod is Node"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn failed_rollback_preserves_active_production_ready_seal() {
+        let home = test_home();
+        let config_dir = home.join(".config/herdr-mcp");
+        let seal_path = super::super::seal::active_seal_path(&config_dir);
+        fs::create_dir_all(seal_path.parent().unwrap()).unwrap();
+        fs::write(
+            &seal_path,
+            br#"{"schema_version":1,"production_ready":true}"#,
+        )
+        .unwrap();
+        let backup = prod_plist_backup_path(&home);
+        let report = finalize_rollback_report(
+            &config_dir,
+            &backup,
+            json!({
+                "ok": false,
+                "steps": [{"step": "validate_backup", "ok": false}]
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["seal_cleared"]["cleared"], false);
+        assert_eq!(report["production_ready"], true);
+        assert!(seal_path.is_file());
+        assert!(super::super::seal::production_ready_from_seal(&config_dir));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rust_prod_dry_run_is_not_presented_as_node_backup_source() {
+        let home = test_home();
+        setup_managed_runtime(&home);
+        let config_dir = home.join(".config/herdr-mcp");
+        fs::create_dir_all(&config_dir).unwrap();
+        let binary = managed_runtime_binary(&home);
+        let agents = home.join("Library/LaunchAgents");
+        write_plist(
+            &agents.join("dev.herdr-mcp.link-prod.plist"),
+            LINK_PROD_LABEL,
+            &[binary.to_str().unwrap(), "link", "run"],
+        );
+
+        let report = plan_dry_run_with_agents(
+            &home,
+            &config_dir,
+            assess_agent(&home, LINK_PROD_LABEL, true),
+            assess_agent(&home, LINK_LABEL, false),
+            assess_agent(&home, LINK_RUST_CANDIDATE_LABEL, false),
+        );
+        let backup_gate = report["preconditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "prod_plist_present_for_backup")
+            .unwrap();
+        assert_eq!(backup_gate["ok"], false);
+        let steps = report["planned_cutover_steps"].as_array().unwrap();
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.as_str().unwrap().contains("adopt-existing-rust"))
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step.as_str().unwrap().contains("Backup Node prod plist"))
         );
         let _ = fs::remove_dir_all(&home);
     }

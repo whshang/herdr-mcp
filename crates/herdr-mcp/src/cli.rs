@@ -1125,6 +1125,35 @@ fn parse_link_seal(args: &[String]) -> Result<Command, String> {
             mode: SealMode::Status,
         }));
     }
+    if args.first().map(String::as_str) == Some("adopt-existing-rust") {
+        let mut acknowledged = false;
+        let mut reason = None;
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--ack" => acknowledged = true,
+                "--reason" => {
+                    index += 1;
+                    let value = args.get(index).ok_or_else(|| {
+                        "link seal adopt-existing-rust --reason requires a value".to_owned()
+                    })?;
+                    reason = Some(value.clone());
+                }
+                other => {
+                    return Err(format!(
+                        "unknown link seal adopt-existing-rust argument: {other}"
+                    ));
+                }
+            }
+            index += 1;
+        }
+        return Ok(Command::Link(LinkCommand::Seal {
+            mode: SealMode::AdoptExistingRust {
+                acknowledged,
+                reason: reason.unwrap_or_default(),
+            },
+        }));
+    }
     match args
         .iter()
         .map(String::as_str)
@@ -1147,7 +1176,7 @@ fn parse_link_seal(args: &[String]) -> Result<Command, String> {
             mode: SealMode::Execute,
         })),
         _ => Err(
-            "link seal accepts status | record --dual-uat | record --rollback-uat | --dry-run | --execute"
+            "link seal accepts status | record --dual-uat | record --rollback-uat | adopt-existing-rust --ack --reason <reason> | --dry-run | --execute"
                 .to_owned(),
         ),
     }
@@ -2159,7 +2188,7 @@ Advanced / internal:\n\
   herdr-mcp link install\n\
   herdr-mcp link uninstall\n\
   herdr-mcp link cutover [--dry-run|--execute|--rollback]\n\
-  herdr-mcp link seal [status|record --dual-uat|record --rollback-uat|--dry-run|--execute]\n\
+  herdr-mcp link seal [status|record --dual-uat|record --rollback-uat|adopt-existing-rust --ack --reason REASON|--dry-run|--execute]\n\
   herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n\
   herdr-mcp tcc-broker <install [--force]|status|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
@@ -2187,7 +2216,8 @@ require HERDR_LINK_CUTOVER_I_UNDERSTAND=1, mutate only link-prod via\n\
 bootout/bootstrap (never the forbidden launchd submission path), and --rollback clears any active\n\
 production_ready seal. link seal writes an auditable evidence artifact; it never\n\
 auto-flips from LaunchAgent ownership alone (HERDR_LINK_SEAL_I_UNDERSTAND=1 for\n\
---execute). link migrate-runtime-control prepares a\n\
+--execute). adopt-existing-rust is an explicit irreversible migration record for a healthy,\n\
+aligned Rust prod owner only when no valid Node rollback backup remains. link migrate-runtime-control prepares a\n\
 Rust-compatible runtime-control-prod generation (default dry-run; --write-staging\n\
 writes a pending sibling; --apply rewrites the live control file only with\n\
 HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"
