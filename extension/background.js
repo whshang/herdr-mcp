@@ -3148,9 +3148,28 @@ async function handleBrowserActuation(command) {
       );
       return;
     }
+    let anchorWindowId = null;
+    const anchorScopes = [...browserTabScopes.entries()]
+      .filter(([, scope]) => scope
+        && scope.provider === providerCreate
+        && scope.accountRef === accountRefCreate
+        && (spaceRefCreate ? scope.spaceRef === spaceRefCreate : !scope.spaceRef)
+        && scope.observationGeneration === expectedGeneration)
+      .sort((a, b) => Number(b[1]?.lastSeenAt || 0) - Number(a[1]?.lastSeenAt || 0));
+    for (const [tabId] of anchorScopes) {
+      try {
+        const anchorTab = await chrome.tabs.get(tabId);
+        if (Number.isInteger(anchorTab?.windowId)) {
+          anchorWindowId = anchorTab.windowId;
+          break;
+        }
+      } catch (_) {}
+    }
     let createdTab = null;
     try {
-      createdTab = await chrome.tabs.create({ url: launchUrl, active: true });
+      createdTab = anchorWindowId == null
+        ? await chrome.tabs.create({ url: launchUrl, active: true })
+        : await chrome.tabs.create({ windowId: anchorWindowId, url: launchUrl, active: true });
     } catch (_) {}
     if (!createdTab?.id) {
       await postBrowserActuationEvidence(
@@ -6075,6 +6094,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } catch (e) { return { ok: false, error: String(e) }; }
       },
       args: [msg.text, msg.selector],
+    }).then((res) => {
+      const r = res && res[0] && res[0].result;
+      sendResponse(r || { ok: false, error: "no-result" });
+    }).catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+  if (msg?.type === "h2w_submit_main") {
+    if (!sender.tab?.id) { sendResponse({ ok: false, error: "no-tab" }); return; }
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id },
+      world: "MAIN",
+      func: (selector) => {
+        try {
+          const all = [...document.querySelectorAll(selector)];
+          const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
+          if (!el) return { ok: false, error: "no-input" };
+          const text = String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+          if (!text) return { ok: false, error: "empty-input" };
+          const form = el.closest("form");
+          if (!form || typeof form.requestSubmit !== "function") {
+            return { ok: false, error: "no-submit-form" };
+          }
+          const sendButton = form.querySelector(
+            'button[data-testid="send-button"], button[data-testid="composer-send-button"], #composer-submit-button',
+          );
+          if (!sendButton
+              || sendButton.disabled
+              || sendButton.getAttribute("aria-disabled") === "true"
+              || String(sendButton.getAttribute("type") || "").toLowerCase() !== "submit") {
+            return { ok: false, error: "no-submit-button" };
+          }
+          form.requestSubmit(sendButton);
+          return { ok: true, submitted: true };
+        } catch (e) { return { ok: false, error: String(e) }; }
+      },
+      args: [msg.selector],
     }).then((res) => {
       const r = res && res[0] && res[0].result;
       sendResponse(r || { ok: false, error: "no-result" });

@@ -415,6 +415,16 @@ const H2W_CONTENT_VERSION = "0.1.97";
       } catch (e) { resolve({ ok: false, error: String(e) }); }
     });
   }
+  function submitMainWorld(selector) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: "h2w_submit_main", selector }, (resp) => {
+          if (chrome.runtime.lastError || !resp) resolve({ ok: false, error: "no-response" });
+          else resolve(resp);
+        });
+      } catch (e) { resolve({ ok: false, error: String(e) }); }
+    });
+  }
   function mainWorldCommitted(text) {
     const el = ADAPTER.getInputEl();
     if (!el) return false;
@@ -935,6 +945,15 @@ const H2W_CONTENT_VERSION = "0.1.97";
             const baseline = captureSubmitAckBaseline(btn);
             btn.click();
             if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
+            if (ADAPTER.name === "chatgpt" && attempt === 0 && ADAPTER.inputHasContent()) {
+              const selector = ADAPTER.getWatchMainWorldSelector();
+              const mainBaseline = captureSubmitAckBaseline(findSendButton());
+              const mainSubmit = selector ? await submitMainWorld(selector) : null;
+              if (mainSubmit?.ok) {
+                if (await waitForSubmitAck(mainBaseline, 8000)) return true;
+                return false;
+              }
+            }
             console.warn("[h2w] composer still has content after Send click; retrying");
             break;
           }
@@ -1829,7 +1848,7 @@ const H2W_CONTENT_VERSION = "0.1.97";
       // composer mount. Existing-session dispatches must still fail closed on
       // the current page state, but a freshly created tab gets one bounded
       // readiness window before we decide that insertion is unavailable.
-      const composerReadyDeadline = Date.now() + 8000;
+      const composerReadyDeadline = Date.now() + 20000;
       while (!ADAPTER.getInputEl() && Date.now() < composerReadyDeadline) {
         if (!runtimeAlive()) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
@@ -2640,8 +2659,15 @@ const H2W_CONTENT_VERSION = "0.1.97";
       registeredBrowserGeneration = null;
     }
     const accountNativeIdentity = await browserAccountNativeIdentity();
-    const browserProjects = await chatGptProjectCatalog(accountNativeIdentity);
-    const browserCurrentProject = currentChatGptProjectFromCatalog(browserProjects);
+    let chatGptProjectRoute = false;
+    if (ADAPTER.name === "chatgpt") {
+      try {
+        const route = new URL(convKey, location.origin);
+        chatGptProjectRoute = /^\/g\/g-p-[^/]+(?:\/c\/[^/]+)?$/i.test(route.pathname);
+      } catch (_) {}
+    }
+    const browserProjects = chatGptProjectRoute ? [] : await chatGptProjectCatalog(accountNativeIdentity);
+    const browserCurrentProject = chatGptProjectRoute ? null : currentChatGptProjectFromCatalog(browserProjects);
     if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
       if (registeredConvKey === convKey) {
         if (ADAPTER.getConversationKey() !== convKey) {
