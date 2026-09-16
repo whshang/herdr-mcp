@@ -112,18 +112,18 @@ OAuth 成功以后 workstation 仍可能离线，所以不要把 OAuth 当作完
 
 ChatGPT 使用经过审核的 MCP action 冻结快照。只升级本地 runtime 或部署 Edge，并不会自动把新增 action 启用到已经批准的 Workspace App 中。
 
-Herdr 0.4.3 明确区分两层 contract：
+Herdr 从 0.4.3 起明确区分两层 contract：
 
-**ChatGPT public contract：epoch 3 / 19 tools；workstation runtime execution contract：epoch 2 / 18 tools。** 新增的第 19 个 action 是 Edge-local `herdr_devices`，不会转发到 workstation。
+**ChatGPT public contract（first-party DEV/PROD）：epoch 7 / 19 actions；workstation runtime execution contract：epoch 4 / 18 tools。** 第 19 个 action 是 Edge-local `herdr_devices`，不会转发到 workstation。Runtime epoch 2/3 与公共 Edge epoch 3 仅作为有界的 rollback/compatibility 基线保留。
 
 典型现象：
 
 ```text
-服务器已经 public epoch 3 / 19 tools
+服务器已经 public epoch 7 / 19 actions
         │
-        ├─ 已刷新 action 集：可以看到 19 tools ✓
+        ├─ 已刷新 action 集：可以看到 19 actions ✓
         │
-        └─ 旧/冻结 action 集：可能仍只有 18 tools
+        └─ 旧/冻结 action 集：可能仍是更旧的 action 集
 ```
 
 升级 runtime 后：

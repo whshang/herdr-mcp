@@ -11,7 +11,7 @@ Herdr-MCP 有多层彼此独立的协议，它们不会共用一个版本号。
 | 层 | 当前生产身份 | 有界兼容范围 | 失败关闭规则 |
 | --- | --- | --- | --- |
 | 公共 MCP 客户端协议 | `initialize` 协商接受 `2025-11-25`、`2025-06-18`、`2025-03-26`、`2024-11-05`、`2024-10-07` | ChatGPT/OpenAI discovery 可公布探测版本 `2026-07-28`；该值不是额外的 `initialize` 协议版本 | 缺失或无法识别的 `initialize` 协议值会明确降到 legacy baseline `2025-11-25`，不会把未列出的协议对外声明为支持 |
-| 公共 Edge 工具契约 | epoch **3**，**19** 个 action | 旧对话可能保留历史工具快照，但 Edge 只发布当前公共 catalog | 不在当前公共契约内的工具会被拒绝 |
+| 公共 Edge 工具契约 | epoch **7**，**19** 个 action | 旧对话可能保留历史工具快照，但 Edge 只发布当前 DEV/PROD 公共 catalog；epoch 3 身份仅作为非 DEV/PROD 的保守回退与 rollback 基线 | 不在当前公共契约内的工具会被拒绝 |
 | Workstation Runtime Execution Contract | epoch **4**，**18** 个工具 | 紧邻上一代冻结的 epoch **3**、**18** 个工具作为有界 rollback 基线，同时保留仍在现场的冻结 epoch **2**、**18** 个工具 catalog | 其他 epoch/hash 组合在 workstation 执行前直接拒绝 |
 | Relay wire protocol | 数字 `protocol_version = 1` | 无 | 缺失、字符串形式或未知版本会在写入 Relay 状态前被拒绝 |
 | 持久运行时状态 | 当前二进制 schema；自动激活的 Release 必须声明相同且可 rollback 的 state schema | 旧 store 通过追加式迁移事务性升级 | 旧二进制拒绝比自己更新的 store；自动 updater 对 state schema 或 runtime contract identity 不精确匹配的 Release 拒绝激活 |

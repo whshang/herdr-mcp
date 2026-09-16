@@ -147,7 +147,7 @@ Candidate 只有在真实 loopback endpoint 上通过验证后才允许切流。
 5. 如果声明 expected runtime version，则版本一致；
 6. 必要时连续多个 observation window 保持健康。
 
-当前 production 的公共 Edge contract 是 **epoch 3 / 19 actions**，workstation Runtime Execution Contract 仍是 **epoch 2 / 18 tools**。具体 canonical hash 属于构建/发布事实，不应该作为一篇长期教程里的常量；实际激活以当前运行配置和冻结 contract 定义为准。
+当前 first-party DEV/PROD 的公共 Edge contract 是 **epoch 7 / 19 actions**，workstation Runtime Execution Contract 是 **epoch 4 / 18 tools**。Runtime epoch 2/3 与公共 Edge epoch 3 仅作为有界的 rollback/compatibility 基线保留。具体 canonical hash 属于构建/发布事实，不应该作为一篇长期教程里的常量；实际激活以当前运行配置和冻结 contract 定义为准。
 
 ## 为什么 contract epoch 和 Runtime A/B 必须分开
 
