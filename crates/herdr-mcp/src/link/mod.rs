@@ -66,3 +66,15 @@ pub use ownership::production_ready_gate_catalog;
 pub use ownership::run_status as run_link_status;
 pub use run::{LINK_RUN_WIRED, run as run_link};
 pub use seal::{SealMode, run as run_link_seal};
+
+pub(crate) fn status_report() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_service_manager::link_status_report()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        ownership::status_report()
+    }
+}
