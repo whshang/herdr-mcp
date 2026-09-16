@@ -61,8 +61,8 @@ pub const BROKER_COMPAT_REVISION: u32 = 4;
 #[cfg(target_os = "macos")]
 pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
 /// First broker revision that can serve vcs-less operational roots through the
-/// shared validated-root boundary.
-#[cfg(any(target_os = "macos", test))]
+/// shared validated-root boundary. This value is also used by the portable
+/// denial annotation path, so it must remain available on every target.
 pub(crate) const OPERATIONAL_ROOT_MIN_COMPAT_REVISION: u32 = 4;
 /// First broker revision that can be a stable TCC parent for `herdr server`.
 #[cfg(any(target_os = "macos", test))]
