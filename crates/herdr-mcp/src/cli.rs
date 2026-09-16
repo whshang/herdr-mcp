@@ -107,6 +107,7 @@ pub enum ConfigCommand {
 pub enum WorkerCommand {
     List,
     Bootstrap,
+    Update,
     Pair {
         ttl_seconds: u64,
         name: Option<String>,
@@ -1197,16 +1198,17 @@ fn parse_worker(args: &[String]) -> Result<Command, String> {
         }),
         Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::List)),
         Some("bootstrap") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::Bootstrap)),
+        Some("update") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::Update)),
         Some("pair") => parse_worker_pair(&args[1..]),
         Some("connect") => parse_worker_connect(&args[1..]),
         Some("rename") => parse_worker_rename(&args[1..]),
         Some("revoke") => parse_worker_revoke(&args[1..]),
         Some("credential-repair") => parse_worker_credential_repair(&args[1..]),
         Some(value) => Err(format!(
-            "unknown worker command '{value}' (expected list, bootstrap, pair, connect, rename, revoke, or credential-repair)"
+            "unknown worker command '{value}' (expected list, bootstrap, update, pair, connect, rename, revoke, or credential-repair)"
         )),
         None => Err(
-            "worker requires list, bootstrap, pair, connect, rename, revoke, or credential-repair"
+            "worker requires list, bootstrap, update, pair, connect, rename, revoke, or credential-repair"
                 .to_owned(),
         ),
     }
@@ -2124,6 +2126,7 @@ User path:\n\
   herdr-mcp worker bootstrap  (macOS/Linux first device; guided Cloudflare Worker + enrollment bootstrap)\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]  (macOS/Linux/Windows enrolled device; creates pairing or exact-device credential recovery)\n  herdr-mcp worker credential-repair prepare|apply|finalize  (advanced headless repair; device secret never leaves the target machine)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS/Linux/Windows; uses the platform credential store and reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
+  herdr-mcp worker update  (existing fleet; release-matched in-place Edge reconcile)\n\
   herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
   herdr-mcp connector list  (enrolled-device credential; non-secret connector inventory)\n\
   herdr-mcp connector approve <approval-request-id>  (macOS/Linux/Windows enrolled device; reads the 6-digit code interactively, never argv)\n\
@@ -2262,6 +2265,12 @@ commands require an enrolled-device credential.\n\n\
       safely resumes one release-matched Worker, enrolls the canonical device,\n\
       removes the temporary operator credential, starts the production Link,\n\
       and succeeds only when link status reports operational_ready=true.\n\n\
+  herdr-mcp worker update\n\
+      Updates an existing fleet Worker to the exact installed PROD release after\n\
+      temporary Cloudflare authorization. It preserves Worker identity, Durable\n\
+      Objects, secrets, optional artifact R2, public OAuth origin, devices and\n\
+      Connectors; it never changes DNS.\n\
+\n\
   herdr-mcp device list\n      Lists the non-secret enrolled-device inventory and local Link/runtime\n      alignment. herdr-mcp worker list is a compatibility alias.\n\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]\n      Creates a pairing address for another computer to enroll. --recover-device\n      binds a one-time recovery pairing to an existing active device and preserves\n      its immutable device_id.\n\n  herdr-mcp worker credential-repair prepare\n      Advanced headless recovery on the broken device: generates/stages a new\n      local device secret and prints only its SHA-256 verifier, never the secret.\n\n  herdr-mcp worker credential-repair apply <device-id> <sha256-verifier> --confirm\n      Run from another enrolled fleet-admin device. Rebinds only the target\n      device verifier; the target device secret never crosses machines.\n\n  herdr-mcp worker credential-repair finalize --confirm\n      Run back on the repaired device. Commits the staged local secret, explicitly\n      switches the owned production Link to the device-specific credential service,\n      verifies launchd convergence, then deletes staging.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine on macOS, Linux, or Windows; uses the platform credential store and reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
 }
@@ -2680,6 +2689,10 @@ mod tests {
             Command::Config(ConfigCommand::SetEdgeOrigin {
                 edge_origin: "https://herdr.example.com".to_owned(),
             })
+        );
+        assert_eq!(
+            parse(args(&["worker", "update"])).unwrap().command,
+            Command::Worker(WorkerCommand::Update)
         );
         assert_eq!(
             parse(args(&[
