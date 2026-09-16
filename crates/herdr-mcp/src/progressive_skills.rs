@@ -15,8 +15,7 @@ use time::format_description::well_known::Rfc3339;
 // Canonical wire names for herdr-mcp private/local methods; this block is the
 // single owner of each name. The MCP router (`crate::mcp`), the local-agent CLI
 // (`crate::local_agent_cli`) and the discoverability schema below reference
-// these constants instead of retyping the wire name, so a method can never be
-// routed under a name the discovery surface does not publish.
+// these constants instead of maintaining independent copies of the wire names.
 pub const LOCAL_LIST_METHOD: &str = "herdr_mcp.skill.list";
 pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
