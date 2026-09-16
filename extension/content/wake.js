@@ -856,6 +856,8 @@ const H2W_CONTENT_VERSION = "0.1.97";
     return {
       composer: composerNorm(),
       sendButton,
+      href: location.href,
+      generating: isComposerGenerating(),
       userTurn: ADAPTER.name === "chatgpt" ? latestTurnForRole("user") : null,
     };
   }
@@ -863,13 +865,12 @@ const H2W_CONTENT_VERSION = "0.1.97";
   function submitWasAccepted(baseline) {
     if (!ADAPTER.inputHasContent()) return true;
     if (ADAPTER.name !== "chatgpt") return false;
-    // An accepted ChatGPT send normally replaces or repurposes the exact Send
-    // button before ProseMirror clears. Checking that captured node is O(1) and
-    // avoids repeatedly scanning a long conversation while the page is hot.
-    if (baseline?.sendButton
-      && (!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton))) {
-      return true;
-    }
+    // React may replace the Send button while the composer is merely rerendering;
+    // that node transition alone is not provider acceptance. Require a stronger
+    // post-submit signal before stopping retries: navigation to the new ChatGPT
+    // conversation, a transition from idle to generation, or a matching user turn.
+    if (baseline?.href && location.href !== baseline.href) return true;
+    if (baseline?.generating === false && isComposerGenerating()) return true;
     const latestUser = latestTurnForRole("user");
     if (latestUser && latestUser !== baseline?.userTurn) {
       const latestText = normText(latestUser.innerText || latestUser.textContent || "");

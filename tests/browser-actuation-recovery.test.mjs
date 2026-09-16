@@ -565,6 +565,13 @@ test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and
   const clickIndex = submitSegment.indexOf("btn.click();", mainFallbackEnd);
   const enterIndex = submitSegment.indexOf("dispatchEnterSubmit(el)", clickIndex);
   assert.ok(clickIndex > mainFallbackEnd && enterIndex > clickIndex, "DOM click and Enter remain ordered fallbacks");
+
+  const ackStart = wakeSource.indexOf("function submitWasAccepted(baseline) {");
+  const ackEnd = wakeSource.indexOf("async function waitForSubmitAck", ackStart);
+  const ackSegment = wakeSource.slice(ackStart, ackEnd);
+  assert.match(ackSegment, /location\.href !== baseline\.href/);
+  assert.match(ackSegment, /baseline\?\.generating === false && isComposerGenerating\(\)/);
+  assert.doesNotMatch(ackSegment, /sendButton\.isConnected|isSendButton\(baseline\.sendButton\)/);
 });
 
 test("terminal stale session reservations do not block ordinary browser identity recovery", () => {

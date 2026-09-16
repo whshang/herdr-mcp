@@ -2710,20 +2710,40 @@ fn browser_session_create_success(
     })
 }
 
+const BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS: usize = 81;
+#[cfg(not(test))]
+const BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS: u64 = 250;
+#[cfg(test)]
+const BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS: u64 = 5;
+
 fn browser_session_create_reconcile_evidence(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     actuator: &dyn BrowserActuator,
     reservation_ref: &str,
     expected_generation: i64,
 ) -> Result<Option<BrowserPostconditionEvidence>, String> {
-    const ATTEMPTS: usize = 6;
-    const INTERVAL_MS: u64 = 50;
-
-    for attempt in 0..ATTEMPTS {
+    for attempt in 0..BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS {
         if let Some(evidence) = actuator.reconcile_dispatch(reservation_ref, expected_generation)? {
             return Ok(Some(evidence));
         }
-        if attempt + 1 < ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_millis(INTERVAL_MS));
+        let reservation_settled = {
+            let guard = store
+                .lock()
+                .map_err(|_| "browser_operation_store_unavailable".to_owned())?;
+            let reservation = guard
+                .browser_session_reservation(reservation_ref)?
+                .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+            reservation.delivery_state != BrowserDeliveryState::Uncertain.as_str()
+                || (reservation.state == "materialized"
+                    && reservation.accepted_user_message_ref.is_some())
+        };
+        if reservation_settled {
+            return Ok(None);
+        }
+        if attempt + 1 < BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(
+                BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS,
+            ));
         }
     }
     Ok(None)
@@ -2790,13 +2810,14 @@ fn browser_session_create_reconcile_uncertain(
         });
     };
     let evidence = match browser_session_create_reconcile_evidence(
+        store,
         actuator,
         &reservation.reservation_ref,
         expected_generation,
     ) {
         Ok(Some(evidence)) => evidence,
         Ok(None) => {
-            let Ok(guard) = store.lock() else {
+            let Ok(mut guard) = store.lock() else {
                 return json!({"ok": false, "code": "browser_operation_store_unavailable"});
             };
             let latest = match guard.browser_session_reservation(&reservation.reservation_ref) {
@@ -2806,6 +2827,24 @@ fn browser_session_create_reconcile_uncertain(
                 }
                 Err(error) => return browser_store_error(error),
             };
+            match promote_materialized_browser_session_delivery(
+                &mut guard,
+                &latest,
+                expected_generation,
+            ) {
+                Ok(Some(promoted)) => {
+                    return browser_session_create_success(
+                        &mut guard,
+                        &promoted.reservation_ref,
+                        params,
+                        replayed,
+                        true,
+                        caller_authorization,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => return browser_store_error(error),
+            }
             match browser_session_materialized_uncertain(&guard, &latest, replayed) {
                 Ok(Some(result)) => return result,
                 Ok(None) => {}
@@ -10023,6 +10062,7 @@ mod tests {
             calls: AtomicUsize,
             reconcile_calls: AtomicUsize,
             materialize_on_actuate: bool,
+            materialize_on_reconcile_poll: Option<usize>,
             delayed: bool,
             materialized_but_partial: bool,
             // Number of leading reconcile polls that observe no evidence yet,
@@ -10054,9 +10094,7 @@ mod tests {
                 }
             }
 
-            fn materialize(&self, params: &Value, expected_generation: i64) {
-                let reservation_ref = params["reservation_ref"].as_str().unwrap();
-                let account_ref = params["account_ref"].as_str().unwrap();
+            fn materialize_reservation(&self, reservation_ref: &str, expected_generation: i64) {
                 let native_identity = format!("created-{reservation_ref}");
                 let canonical_url = format!("https://chatgpt.com/c/{reservation_ref}");
                 let mut guard = self.store.lock().unwrap();
@@ -10069,7 +10107,10 @@ mod tests {
                         endpoint_ref: &reservation.endpoint_ref,
                         provider: &reservation.provider,
                         kind: "session",
-                        parent_ref: reservation.space_ref.as_deref().or(Some(account_ref)),
+                        parent_ref: reservation
+                            .space_ref
+                            .as_deref()
+                            .or(Some(&reservation.account_ref)),
                         native_identity: &native_identity,
                         display_label: None,
                         observation_generation: expected_generation,
@@ -10089,6 +10130,32 @@ mod tests {
                         reservation_ref,
                         &session.resource_ref,
                         20,
+                    )
+                    .unwrap();
+            }
+
+            fn materialize(&self, params: &Value, expected_generation: i64) {
+                self.materialize_reservation(
+                    params["reservation_ref"].as_str().unwrap(),
+                    expected_generation,
+                );
+            }
+
+            fn materialize_with_accepted_user_ref(
+                &self,
+                reservation_ref: &str,
+                expected_generation: i64,
+            ) {
+                self.materialize_reservation(reservation_ref, expected_generation);
+                self.store
+                    .lock()
+                    .unwrap()
+                    .update_browser_session_reservation_delivery(
+                        reservation_ref,
+                        expected_generation,
+                        BrowserDeliveryState::Uncertain,
+                        Some("provider-created-session-user"),
+                        21,
                     )
                     .unwrap();
             }
@@ -10145,6 +10212,10 @@ mod tests {
             ) -> Result<Option<BrowserPostconditionEvidence>, String> {
                 assert!(dispatch_id.starts_with("bsr_"));
                 let poll = self.reconcile_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.materialize_on_reconcile_poll == Some(poll) {
+                    self.materialize_with_accepted_user_ref(dispatch_id, expected_generation);
+                    return Ok(None);
+                }
                 if poll <= self.reconcile_pending_polls {
                     return Ok(None);
                 }
@@ -10289,6 +10360,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
             materialize_on_actuate: true,
+            materialize_on_reconcile_poll: None,
             delayed: false,
             materialized_but_partial: false,
             reconcile_pending_polls: 0,
@@ -10424,6 +10496,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
             materialize_on_actuate: true,
+            materialize_on_reconcile_poll: None,
             delayed: false,
             materialized_but_partial: true,
             reconcile_pending_polls: 0,
@@ -10464,6 +10537,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
             materialize_on_actuate: true,
+            materialize_on_reconcile_poll: None,
             delayed: true,
             materialized_but_partial: false,
             reconcile_pending_polls: usize::MAX,
@@ -10518,7 +10592,7 @@ mod tests {
             materialized_without_completion
                 .reconcile_calls
                 .load(Ordering::SeqCst),
-            6
+            BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS
         );
         let response_lost_replay = browser_operation_call_with_grant(
             &store,
@@ -10539,6 +10613,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
             materialize_on_actuate: false,
+            materialize_on_reconcile_poll: None,
             delayed: true,
             materialized_but_partial: false,
             reconcile_pending_polls: usize::MAX,
@@ -10565,7 +10640,46 @@ mod tests {
         assert_eq!(not_reconciled["reconciled"], false);
         assert_eq!(not_reconciled["session_ref"], Value::Null);
         assert_eq!(no_observation.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(no_observation.reconcile_calls.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            no_observation.reconcile_calls.load(Ordering::SeqCst),
+            BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS
+        );
+
+        let late_materialization = SessionCreateActuator {
+            store: store.clone(),
+            calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
+            materialize_on_actuate: false,
+            materialize_on_reconcile_poll: Some(3),
+            delayed: true,
+            materialized_but_partial: false,
+            reconcile_pending_polls: usize::MAX,
+        };
+        let late_materialization_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker late materialization",
+            "message": "do bounded task with late registry materialization",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-late-materialization-1"
+        });
+        let late_materialized = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &late_materialization_params,
+            true,
+            Some(&late_materialization),
+        );
+        assert_eq!(late_materialized["ok"], true);
+        assert_eq!(late_materialized["delivery_state"], "applied");
+        assert_eq!(late_materialized["replayed"], false);
+        assert_eq!(late_materialized["reconciled"], true);
+        assert_eq!(late_materialization.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            late_materialization.reconcile_calls.load(Ordering::SeqCst),
+            3
+        );
 
         {
             let mut guard = store.lock().unwrap();
@@ -10641,6 +10755,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
             materialize_on_actuate: true,
+            materialize_on_reconcile_poll: None,
             delayed: true,
             materialized_but_partial: false,
             // Provider readback is late: the first reconcile poll is empty and
