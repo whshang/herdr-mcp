@@ -1946,6 +1946,9 @@ const H2W_CONTENT_VERSION = "0.1.97";
           generation: expectedGeneration,
           acceptedUserMessageRef,
           reportedAssistantRef,
+          unmatchedGraceUntil: creatingSession
+            ? Date.now() + BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS
+            : null,
         });
       }
       const assistantAdvanced = Boolean(
@@ -2089,8 +2092,9 @@ const H2W_CONTENT_VERSION = "0.1.97";
 
   // Browser workers need no native pane binding, automation, or tab focus.
   // The existing route timer probes only a proven assignment. Transient errors
-  // back off without dropping it; three explicit identity rejections stop it
-  // after a grace window for dispatch persistence, until a new assignment.
+  // back off without dropping it. A newly-created session gets a bounded grace
+  // period while its synthesized dispatch is persisted; after that, three
+  // explicit identity rejections stop probes until a new assignment.
   let browserResultProbeState = null;
   async function observeBrowserResultSettlement() {
     const convKey = ADAPTER.getConversationKey();
@@ -2144,7 +2148,12 @@ const H2W_CONTENT_VERSION = "0.1.97";
         return false;
       }
       const settled = await reportBrowserResultSettlement(settledSnapshot, (error) => {
-        if (["browser_dispatch_result_unmatched", "browser_dispatch_result_conflict"].includes(error)) probe.rejected += 1;
+        if (error === "browser_dispatch_result_conflict"
+            || (error === "browser_dispatch_result_unmatched"
+              && (!Number.isFinite(pending.unmatchedGraceUntil)
+                || Date.now() >= pending.unmatchedGraceUntil))) {
+          probe.rejected += 1;
+        }
       });
       probe.retryMs = settled ? 5000 : Math.min(probe.retryMs * 2, 60000);
       return settled;
@@ -2163,6 +2172,7 @@ const H2W_CONTENT_VERSION = "0.1.97";
   let browserRegistrationAttempt = 0;
   let chatGptProjectCatalogCache = { accountNativeIdentity: null, fetchedAt: 0, projects: [] };
   const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+  const BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS = 5 * 60 * 1000;
   // Exact accepted provider user-message identity reported by the last proven
   // browser_dispatch.submit. Used as the settlement fallback only when a live
   // provider snapshot omits the user message id; it never invents an identity.
