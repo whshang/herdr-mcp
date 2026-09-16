@@ -1982,6 +1982,44 @@ impl StateStore {
         Ok(segments.last().map(|segment| segment.0.clone()))
     }
 
+    pub fn continuity_for_provider_session(
+        &self,
+        provider: &str,
+        session_ref: &str,
+    ) -> Result<Option<String>, String> {
+        validate_work_memory_ref(provider, 64, "provider")?;
+        validate_work_memory_ref(session_ref, 512, "session_ref")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT b.continuity_id
+                 FROM continuity_provider_bindings b
+                 JOIN continuity_chains c ON c.continuity_id = b.continuity_id
+                 WHERE b.provider = ?1 AND b.session_ref = ?2 AND c.status = 'active'
+                 ORDER BY c.updated_at DESC
+                 LIMIT 2",
+            )
+            .map_err(|error| {
+                format!("cannot prepare continuity provider session lookup: {error}")
+            })?;
+        let rows = stmt
+            .query_map(params![provider, session_ref], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("cannot query continuity provider session: {error}"))?;
+        let mut owner_ids = Vec::new();
+        for row in rows {
+            owner_ids.push(
+                row.map_err(|error| format!("cannot decode continuity provider session: {error}"))?,
+            );
+        }
+        match owner_ids.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some(only.clone())),
+            _ => Err("continuity_binding_ambiguous".to_owned()),
+        }
+    }
+
     pub fn bind_work_memory(&mut self, input: WorkMemoryBindingInput<'_>) -> Result<(), String> {
         validate_work_memory_partition(
             input.continuity_id,
@@ -3540,42 +3578,34 @@ impl StateStore {
             return Err("browser_canonical_url_invalid".to_owned());
         }
         // One canonical conversation URL may be observed by more than one browser
-        // endpoint on this device (for example after a browser profile or DEV
-        // identity switch). The newest observation is the authoritative one; an
-        // exact tie between two distinct sessions stays fail-closed because the
-        // runtime must not pick by an arbitrary order.
+        // session on this device (for example after a browser profile or DEV
+        // identity switch). A single exact canonical URL must map to exactly one
+        // session resource_ref; if any second distinct session shares the URL it is
+        // ambiguous regardless of how recent each observation is. The runtime must
+        // never pick by recency or arbitrary order, so any count above one is
+        // fail-closed rather than a newest-wins choice.
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT r.resource_ref, MAX(l.observed_at) AS observed_at
+                "SELECT r.resource_ref
                  FROM browser_resource_locators l
                  JOIN browser_resources r ON r.resource_ref = l.resource_ref
                  WHERE l.canonical_url = ?1
                    AND r.kind = 'session'
                    AND r.provider = 'chatgpt'
                  GROUP BY r.resource_ref
-                 ORDER BY observed_at DESC, r.resource_ref
                  LIMIT 2",
             )
             .map_err(|error| format!("cannot prepare browser session URL lookup: {error}"))?;
         let mut refs = stmt
-            .query_map([canonical_url], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
+            .query_map([canonical_url], |row| row.get::<_, String>(0))
             .map_err(|error| format!("cannot query browser session URL lookup: {error}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot read browser session URL lookup: {error}"))?;
         match refs.len() {
             0 => Ok(None),
-            1 => Ok(Some(refs.remove(0).0)),
-            _ => {
-                let (newest_ref, newest_at) = refs.remove(0);
-                let (_, runner_up_at) = refs.remove(0);
-                if runner_up_at == newest_at {
-                    return Err("browser_canonical_url_ambiguous".to_owned());
-                }
-                Ok(Some(newest_ref))
-            }
+            1 => Ok(Some(refs.remove(0))),
+            _ => Err("browser_canonical_url_ambiguous".to_owned()),
         }
     }
 
@@ -12143,7 +12173,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_canonical_url_lookup_prefers_the_newest_observation() {
+    fn browser_canonical_url_lookup_is_fail_closed_on_multiple_sessions() {
         const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
         const URL: &str =
             "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/conversation-1";
@@ -12218,30 +12248,34 @@ mod tests {
                 .as_deref(),
             Some(older.as_str())
         );
-        // The same conversation observed by a newer browser endpoint on this device
-        // (for example after a DEV identity or profile switch) becomes the answer.
+        // A second distinct session observing the same canonical URL is ambiguous at
+        // once, regardless of how much newer its observation is. Recency must never
+        // break the tie, so a stricter timestamp here must still fail closed.
         let newer = observe_session(&mut store, "seed-new-endpoint", "conversation-new", 200);
+        assert!(!newer.is_empty());
         assert_eq!(
             store
                 .browser_session_ref_for_canonical_url(URL)
-                .unwrap()
-                .as_deref(),
-            Some(newer.as_str())
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
         );
-        // Re-observing the same session under the same URL is not an ambiguity, and a
-        // late lower-timestamp locator must not move the answer backwards.
+        // Re-observing the same single session under the same URL is not an ambiguity,
+        // and a late lower-timestamp locator must not change the single-session answer.
+        let mut store = StateStore::open(":memory:").unwrap();
+        let singleton =
+            observe_session(&mut store, "seed-only-endpoint", "conversation-single", 300);
         store
-            .upsert_browser_resource_locator(&newer, URL, 200, 150)
+            .upsert_browser_resource_locator(&singleton, URL, 300, 150)
             .unwrap();
         assert_eq!(
             store
                 .browser_session_ref_for_canonical_url(URL)
                 .unwrap()
                 .as_deref(),
-            Some(newer.as_str())
+            Some(singleton.as_str())
         );
         // Two distinct sessions sharing the newest observation stay fail-closed.
-        observe_session(&mut store, "seed-tied-endpoint", "conversation-tied", 200);
+        observe_session(&mut store, "seed-tied-endpoint", "conversation-tied", 300);
         assert_eq!(
             store
                 .browser_session_ref_for_canonical_url(URL)

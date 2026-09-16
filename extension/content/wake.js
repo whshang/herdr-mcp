@@ -1962,6 +1962,9 @@ const H2W_CONTENT_VERSION = "0.1.97";
           generation: expectedGeneration,
           acceptedUserMessageRef,
           reportedAssistantRef,
+          unmatchedGraceUntil: creatingSession
+            ? Date.now() + BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS
+            : null,
         });
       }
       const assistantAdvanced = Boolean(
@@ -2105,8 +2108,9 @@ const H2W_CONTENT_VERSION = "0.1.97";
 
   // Browser workers need no native pane binding, automation, or tab focus.
   // The existing route timer probes only a proven assignment. Transient errors
-  // back off without dropping it; three explicit identity rejections stop it
-  // after a grace window for dispatch persistence, until a new assignment.
+  // back off without dropping it. A newly-created session gets a bounded grace
+  // period while its synthesized dispatch is persisted; after that, three
+  // explicit identity rejections stop probes until a new assignment.
   let browserResultProbeState = null;
   async function observeBrowserResultSettlement() {
     const convKey = ADAPTER.getConversationKey();
@@ -2160,7 +2164,12 @@ const H2W_CONTENT_VERSION = "0.1.97";
         return false;
       }
       const settled = await reportBrowserResultSettlement(settledSnapshot, (error) => {
-        if (["browser_dispatch_result_unmatched", "browser_dispatch_result_conflict"].includes(error)) probe.rejected += 1;
+        if (error === "browser_dispatch_result_conflict"
+            || (error === "browser_dispatch_result_unmatched"
+              && (!Number.isFinite(pending.unmatchedGraceUntil)
+                || Date.now() >= pending.unmatchedGraceUntil))) {
+          probe.rejected += 1;
+        }
       });
       probe.retryMs = settled ? 5000 : Math.min(probe.retryMs * 2, 60000);
       return settled;
@@ -2179,11 +2188,53 @@ const H2W_CONTENT_VERSION = "0.1.97";
   let browserRegistrationAttempt = 0;
   let chatGptProjectCatalogCache = { accountNativeIdentity: null, fetchedAt: 0, projects: [] };
   const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+  const BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS = 5 * 60 * 1000;
+  let browserPendingDispatchRefresh = null;
   // Exact accepted provider user-message identity reported by the last proven
   // browser_dispatch.submit. Used as the settlement fallback only when a live
   // provider snapshot omits the user message id; it never invents an identity.
   const acceptedDispatchAssignments = new Map();
   let durableArchiveRetryTimer = null;
+
+  function clearBrowserPendingDispatchRefresh(removeStoredReservation = false) {
+    browserPendingDispatchRefresh = null;
+    if (removeStoredReservation) {
+      try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+    }
+  }
+
+  function armBrowserPendingDispatchRefresh(reservationRef) {
+    if (!/^bsr_[0-9a-f]{64}$/.test(String(reservationRef || ""))) return;
+    if (browserPendingDispatchRefresh?.reservationRef === reservationRef) return;
+    browserPendingDispatchRefresh = {
+      reservationRef,
+      until: Date.now() + BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS,
+      nextAt: Date.now() + 1000,
+      retryMs: 1000,
+      inFlight: false,
+    };
+  }
+
+  function maybeRefreshBrowserPendingDispatchAssignment() {
+    const refresh = browserPendingDispatchRefresh;
+    if (!refresh) return;
+    if (registeredBrowserSessionRef && acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+      clearBrowserPendingDispatchRefresh(true);
+      return;
+    }
+    if (Date.now() >= refresh.until) {
+      clearBrowserPendingDispatchRefresh(true);
+      return;
+    }
+    if (document.hidden || refresh.inFlight || Date.now() < refresh.nextAt) return;
+    refresh.inFlight = true;
+    refresh.nextAt = Date.now() + refresh.retryMs;
+    refresh.retryMs = Math.min(refresh.retryMs * 2, 30000);
+    void registerCurrentConversation("session-create-pending-dispatch")
+      .finally(() => {
+        if (browserPendingDispatchRefresh === refresh) refresh.inFlight = false;
+      });
+  }
 
   function scheduleDurableArchiveRetryWake(convKey, delayMs) {
     const targetConvKey = String(convKey || "").trim();
@@ -2710,10 +2761,15 @@ const H2W_CONTENT_VERSION = "0.1.97";
         && response.browser_generation > 0
         ? response.browser_generation
         : null;
-      if (browserSessionReservationRef && registeredBrowserSessionRef) {
-        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
-      }
       restoreBrowserResultAssignment(response?.browser_pending_dispatch);
+      if (browserSessionReservationRef && registeredBrowserSessionRef) {
+        if (response?.browser_pending_dispatch
+            || acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+          clearBrowserPendingDispatchRefresh(true);
+        } else {
+          armBrowserPendingDispatchRefresh(browserSessionReservationRef);
+        }
+      }
       const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
       if (concreteChat) {
         await ensureConversationHealth(convKey);
@@ -2749,6 +2805,7 @@ const H2W_CONTENT_VERSION = "0.1.97";
     setInterval(() => {
       void observeBrowserResultSettlement().catch(() => {});
       if (document.hidden) return;
+      maybeRefreshBrowserPendingDispatchAssignment();
       const convKey = ADAPTER.getConversationKey();
       if (convKey && convKey !== registeredConvKey) void registerCurrentConversation("poll");
       if (ADAPTER.name === "chatgpt") ensureQueuedInsertButton();
