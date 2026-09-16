@@ -789,8 +789,8 @@ fn ensure_utility_pane_ready(
     let owner_session_id = registry.running_pane_session_id(pane_id);
     wait_for_owned_utility_pane(
         client,
-        workspace_id,
-        pane_id,
+        registry,
+        (workspace_id, pane_id),
         command,
         readiness,
         owner_session_id.as_deref(),
@@ -801,17 +801,18 @@ fn ensure_utility_pane_ready(
 #[cfg(unix)]
 fn wait_for_owned_utility_pane(
     client: &HerdrClient,
-    workspace_id: &str,
-    pane_id: &str,
+    registry: &ExecRegistry,
+    target: (&str, &str),
     command: &str,
     mut readiness: PaneReadiness,
     owner_session_id: Option<&str>,
     wait_budget: Duration,
 ) -> Result<(), Value> {
-    if readiness.ready {
-        return Ok(());
-    }
+    let (workspace_id, pane_id) = target;
     let Some(owner_session_id) = owner_session_id else {
+        if readiness.ready {
+            return Ok(());
+        }
         return Err(utility_pane_contention_result(
             workspace_id,
             pane_id,
@@ -821,7 +822,17 @@ fn wait_for_owned_utility_pane(
     };
 
     let started = Instant::now();
-    while started.elapsed() < wait_budget {
+    loop {
+        // Pane readiness alone is not enough while this registry still owns a
+        // live session. pane.send_text can acknowledge before the shell has
+        // visibly handed foreground to the launched command; allowing another
+        // send in that window would duplicate delivery into the same pane.
+        if registry.running_pane_session_id(pane_id).is_none() && readiness.ready {
+            return Ok(());
+        }
+        if started.elapsed() >= wait_budget {
+            break;
+        }
         let remaining = wait_budget.saturating_sub(started.elapsed());
         thread::sleep(UTILITY_OWNED_POLL.min(remaining));
         let info = client
@@ -834,9 +845,6 @@ fn wait_for_owned_utility_pane(
                 utility_pane_control_plane_error(workspace_id, command, error.message)
             })?;
         readiness = utility_pane_readiness(&info);
-        if readiness.ready {
-            return Ok(());
-        }
     }
 
     let mut result = utility_pane_contention_result(workspace_id, pane_id, command, &readiness);
@@ -1472,6 +1480,7 @@ mod tests {
             .unwrap();
         });
         let client = HerdrClient::new(&socket);
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
         let busy = PaneReadiness {
             ready: false,
             shell_pid: Some(42),
@@ -1481,8 +1490,8 @@ mod tests {
 
         let result = wait_for_owned_utility_pane(
             &client,
-            "w1",
-            "w1:p2",
+            &registry,
+            ("w1", "w1:p2"),
             "git status",
             busy,
             Some("es_owned"),
@@ -1490,12 +1499,97 @@ mod tests {
         );
         assert!(result.is_ok(), "owned pane should become ready: {result:?}");
         server.join().unwrap();
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_owner_blocks_second_send_even_when_shell_still_looks_ready() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_methods = Arc::clone(&methods);
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Value = serde_json::from_str(
+                    &BufReader::new(stream.try_clone().unwrap())
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                server_methods.lock().unwrap().push(method.clone());
+                let result = match method.as_str() {
+                    "pane.send_text" | "pane.send_keys" => json!({"ok": true}),
+                    "pane.process_info" => json!({
+                        "process_info": {
+                            "shell_pid": 42,
+                            "foreground_process_group_id": 42,
+                            "foreground_processes": [{"pid": 42, "name": "zsh"}],
+                        }
+                    }),
+                    other => panic!("unexpected Herdr method: {other}"),
+                };
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"id": request["id"].clone(), "result": result}),
+                )
+                .unwrap();
+            }
+        });
+
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+        let started = registry
+            .start_in_existing_pane(Path::new("/tmp"), "sleep 30", "w1:p2")
+            .unwrap();
+        let owner = started["session_id"].as_str().unwrap().to_owned();
+        let shell_ready = PaneReadiness {
+            ready: true,
+            shell_pid: Some(42),
+            foreground_process_group_id: Some(42),
+            foreground: vec![json!({"pid": 42, "name": "zsh"})],
+        };
+
+        let blocked = wait_for_owned_utility_pane(
+            &client,
+            &registry,
+            ("w1", "w1:p2"),
+            "git status",
+            shell_ready,
+            Some(&owner),
+            Duration::from_millis(60),
+        )
+        .unwrap_err();
+        assert_eq!(blocked["code"], "utility_pane_not_ready");
+        assert_eq!(blocked["delivery_state"], "not_delivered");
+        assert_eq!(blocked["owner_session_id"], owner);
+
+        assert_eq!(registry.kill(&owner)["ok"], true);
+        server.join().unwrap();
+        assert_eq!(
+            *methods.lock().unwrap(),
+            vec!["pane.send_text", "pane.process_info", "pane.send_keys"],
+        );
+        drop(registry);
         let _ = fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
     #[test]
     fn foreign_busy_utility_pane_never_enters_owned_wait() {
+        let base = native_test_dir();
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
         let client = HerdrClient::new(Path::new("/definitely/not/a/socket"));
         let busy = PaneReadiness {
             ready: false,
@@ -1506,8 +1600,8 @@ mod tests {
         let started = Instant::now();
         let result = wait_for_owned_utility_pane(
             &client,
-            "w1",
-            "w1:p2",
+            &registry,
+            ("w1", "w1:p2"),
             "git status",
             busy,
             None,
@@ -1517,6 +1611,8 @@ mod tests {
         assert_eq!(result["code"], "utility_pane_not_ready");
         assert!(result.get("owner_session_id").is_none());
         assert!(started.elapsed() < Duration::from_millis(100));
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
