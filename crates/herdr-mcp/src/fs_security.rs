@@ -122,8 +122,9 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
         // vcs-less root fails closed instead of guessing.
         return false;
     };
+    let guard = HomeGuard::new(home);
     let root = &project.root;
-    if !root.is_absolute() || rejects_home_ancestry(home, root) || denied_secret_path(root) {
+    if !root.is_absolute() || guard.rejects(root) || denied_secret_path(root) {
         return false;
     }
     // "canonical existing directory": the live cwd must resolve to a real
@@ -131,7 +132,7 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     // and secret-path guards, so a symlinked cwd cannot escape them.
     let root_real = match std::fs::canonicalize(root) {
         Ok(real) => {
-            if !real.is_dir() || rejects_home_ancestry(home, &real) || denied_secret_path(&real) {
+            if !real.is_dir() || guard.rejects(&real) || denied_secret_path(&real) {
                 return false;
             }
             Some(real)
@@ -167,11 +168,103 @@ fn tcc_delegated_root(home: &Path, candidate: &Path) -> bool {
             .any(|name| candidate.starts_with(home.join(name)))
 }
 
-/// HOME itself, or any ancestor of HOME (for example `/`, `/Users`), is never
-/// an operational root. This also covers a symlinked cwd whose real target is
-/// HOME or above it.
-fn rejects_home_ancestry(home: &Path, candidate: &Path) -> bool {
-    home == candidate || home.starts_with(candidate)
+/// Stable filesystem identity of an existing path: `(device, inode)` on Unix.
+///
+/// This is deliberately not a string comparison. On macOS the Data-volume
+/// firmlink makes `/Users/<u>` and `/System/Volumes/Data/Users/<u>` the same
+/// directory while `realpath(3)`/`canonicalize` happily returns the spelling it
+/// was given, so only device+inode identifies them as one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Identity of `path`, following symlinks. `None` when the path cannot be
+/// stat'ed at all (missing, or TCC-blocked for the rotating runtime).
+fn path_identity(path: &Path) -> Option<FileIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    file_identity(&metadata)
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    // No portable device+inode pair here; every caller also runs the lexical
+    // and canonical-path guards, and a non-Unix path that cannot be resolved
+    // is refused rather than allowed.
+    None
+}
+
+/// Rejects HOME itself, any ancestor of HOME, and any alternate spelling of
+/// either, before a vcs-less cwd may become an operational root.
+///
+/// Three independent layers, because each one alone is bypassable:
+///
+/// 1. lexical ancestry against both the given and firmlink-normalized spelling
+///    (`/System/Volumes/Data/Users` is an ancestor of HOME even though no
+///    lexical prefix check on `$HOME` sees it);
+/// 2. stable identity (`device`+`inode`) against HOME and each of its
+///    ancestors, which catches symlinked and firmlink aliases regardless of
+///    spelling, and keeps working when `canonicalize` cannot run;
+/// 3. the caller additionally re-runs this guard on the canonical real path.
+struct HomeGuard {
+    spellings: Vec<PathBuf>,
+    identities: std::collections::BTreeSet<FileIdentity>,
+}
+
+impl HomeGuard {
+    fn new(home: &Path) -> Self {
+        let mut spellings = vec![home.to_path_buf()];
+        if let Some(primary) = firmlink_primary_spelling(home) {
+            spellings.push(primary);
+        }
+        let identities = home
+            .ancestors()
+            .filter_map(path_identity)
+            .collect::<std::collections::BTreeSet<_>>();
+        Self {
+            spellings,
+            identities,
+        }
+    }
+
+    fn rejects(&self, candidate: &Path) -> bool {
+        let mut candidates = vec![candidate.to_path_buf()];
+        if let Some(primary) = firmlink_primary_spelling(candidate) {
+            candidates.push(primary);
+        }
+        for candidate in &candidates {
+            if self
+                .spellings
+                .iter()
+                .any(|home| home == candidate || home.starts_with(candidate))
+            {
+                return true;
+            }
+        }
+        path_identity(candidate).is_some_and(|identity| self.identities.contains(&identity))
+    }
+}
+
+/// macOS firmlink alias for the Data volume. `/System/Volumes/Data/<rest>` is
+/// the same object as `/<rest>` for firmlinked subtrees such as `/Users`.
+const FIRMLINK_DATA_PREFIX: &str = "/System/Volumes/Data";
+
+/// Map an alternate Data-volume spelling onto its primary spelling so the
+/// lexical ancestor checks see through the firmlink. Returns `None` when the
+/// path does not use that prefix.
+fn firmlink_primary_spelling(candidate: &Path) -> Option<PathBuf> {
+    let rest = candidate.strip_prefix(FIRMLINK_DATA_PREFIX).ok()?;
+    Some(Path::new("/").join(rest))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -185,18 +278,38 @@ fn home_dir() -> Option<PathBuf> {
 /// Git-oriented consumers (for example `herdr_git`) keep this pre-existing
 /// Git-only boundary so Git semantics do not change.
 pub fn validate_existing(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
+    validate_existing_scoped(
+        snapshot,
+        input,
+        &managed_roots(snapshot),
+        default_worktrees_root().as_deref(),
+    )
+}
+
+/// Shared entry point behind both the Git-only and the validated fs surface.
+///
+/// The target-scoped Herdr worktree special case (`~/.herdr/worktrees/<repo>
+/// /<branch>` without a declared managed root) is part of both, so linked
+/// worktree fs reads keep the pre-existing behavior.
+fn validate_existing_scoped(
+    snapshot: &Value,
+    input: &str,
+    roots: &[PathBuf],
+    worktrees_root: Option<&Path>,
+) -> Result<ManagedPath, Value> {
     if let Ok(resolved) = resolve_input(input)
-        && let Some(root) = target_scoped_herdr_worktree_root(snapshot, &resolved)
+        && let Some(root) = worktrees_root.and_then(|worktrees_root| {
+            target_scoped_worktree_root_under(snapshot, &resolved, worktrees_root)
+        })
     {
         return validate_existing_with_roots(&[root], input);
     }
-    let roots = managed_roots(snapshot);
-    validate_existing_with_roots(&roots, input)
+    validate_existing_with_roots(roots, input)
 }
 
-fn target_scoped_herdr_worktree_root(snapshot: &Value, resolved: &Path) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    target_scoped_worktree_root_under(snapshot, resolved, &home.join(".herdr/worktrees"))
+fn default_worktrees_root() -> Option<PathBuf> {
+    let home = home_dir()?;
+    Some(home.join(".herdr/worktrees"))
 }
 
 fn target_scoped_worktree_root_under(
@@ -256,7 +369,20 @@ fn target_scoped_worktree_root_under(
 /// Validate an existing path against the unified validated-root surface
 /// (managed Git roots plus operational roots proven by the live topology).
 pub fn validate_existing_validated(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
-    validate_existing_validated_with_topology(&projects::derive_routing(snapshot), input)
+    validate_existing_validated_with_worktrees_root(snapshot, input, default_worktrees_root())
+}
+
+fn validate_existing_validated_with_worktrees_root(
+    snapshot: &Value,
+    input: &str,
+    worktrees_root: Option<PathBuf>,
+) -> Result<ManagedPath, Value> {
+    validate_existing_scoped(
+        snapshot,
+        input,
+        &validated_roots_from(&projects::derive_routing(snapshot)),
+        worktrees_root.as_deref(),
+    )
 }
 
 /// See [`validate_existing_validated`]. Reuses one routing topology per
@@ -711,6 +837,242 @@ mod tests {
         // HOME itself under the same hierarchical prefix is still refused.
         assert_eq!(
             validate_existing_validated(&snapshot(&home), home.to_str().unwrap()).unwrap_err()["reason"],
+            "outside_managed_roots"
+        );
+    }
+
+    /// A `ProjectInfo` for a vcs-less cwd, for guard-level unit tests that need
+    /// an injected HOME instead of the host's real one.
+    fn vcs_less_project(root: &Path) -> crate::projects::ProjectInfo {
+        crate::projects::ProjectInfo {
+            root: root.to_path_buf(),
+            vcs: None,
+            managed: false,
+            dirty: false,
+            changed_files: 0,
+            git_status_observed: false,
+            git_status_source: None,
+            pane_ids: vec!["w1:p1".to_owned()],
+            cwds: vec![root.to_path_buf()],
+        }
+    }
+
+    #[test]
+    fn fs_validated_path_keeps_the_herdr_worktree_special_case() {
+        let worktrees_root = plain_parent("worktree-special", &[]);
+        let root = worktrees_root.join("repo").join("feature");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join(".git"),
+            "gitdir: /elsewhere/repo/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        let file = root.join("src/lib.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+
+        // A linked worktree with no declared managed root is proven only by
+        // the live cwd / checked-out workspace.
+        let idle = json!({"panes": [], "agents": []});
+        let live = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": []
+        });
+        let declared = json!({
+            "workspaces": [{"workspace_id": "w1", "worktree": {"checkout_path": root}}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/tmp/elsewhere"}],
+            "agents": []
+        });
+        let path = file.to_str().unwrap();
+
+        for snapshot in [&idle, &live, &declared] {
+            let expected = if snapshot == &idle {
+                "outside_managed_roots"
+            } else {
+                ""
+            };
+            if expected.is_empty() {
+                let validated = validate_existing_validated_with_worktrees_root(
+                    snapshot,
+                    path,
+                    Some(worktrees_root.clone()),
+                )
+                .expect("live-proven worktree stays readable through the fs path");
+                assert_eq!(validated.root, root);
+                // The Git-only entry point keeps the same special case.
+                let git_only =
+                    validate_existing_scoped(snapshot, path, &[], Some(worktrees_root.as_path()))
+                        .expect("git-only entry keeps the worktree special case");
+                assert_eq!(git_only.root, root);
+            } else {
+                assert_eq!(
+                    validate_existing_validated_with_worktrees_root(
+                        snapshot,
+                        path,
+                        Some(worktrees_root.clone())
+                    )
+                    .unwrap_err()["reason"],
+                    expected
+                );
+            }
+        }
+        // Without the worktree special case the declared-only root really is
+        // unmanaged (no pane cwd inside it), so the positive assertion above is
+        // not vacuous for that snapshot.
+        let declared_topology = projects::derive_routing(&declared);
+        assert!(!validated_roots_from(&declared_topology).contains(&root));
+        assert!(!managed_roots_from(&declared_topology).contains(&root));
+        fs::remove_dir_all(worktrees_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegated_protected_root_uses_metadata_when_canonicalize_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = plain_parent("delegated", &["elsewhere"]);
+        let home = parent.join("home");
+        let documents = home.join("Documents");
+        let project = documents.join("feishu");
+        let outside = parent.join("elsewhere/project");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(project.join("notes.md"), "artifact\n").unwrap();
+
+        // Real canonicalization failure for a directory that exists: the
+        // process cannot traverse the protected parent.
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(outside.parent().unwrap(), fs::Permissions::from_mode(0o000)).unwrap();
+        let privileged_runner = std::fs::canonicalize(&project).is_ok();
+        if !privileged_runner {
+            assert!(std::fs::canonicalize(&project).is_err());
+            assert!(std::fs::metadata(&project).is_err());
+            assert!(
+                operational_root_eligible(&vcs_less_project(&project), Some(&home)),
+                "an exact protected operational cwd is proven from live metadata alone"
+            );
+            // The delegation is scoped to the protected folders: the identical
+            // canonicalize failure outside them is still refused instead of
+            // being treated as an allow.
+            assert!(!operational_root_eligible(
+                &vcs_less_project(&outside),
+                Some(&home)
+            ));
+            // The guard layers still apply while canonicalization is down:
+            // HOME itself is refused from metadata alone.
+            assert!(!operational_root_eligible(
+                &vcs_less_project(&home),
+                Some(&home)
+            ));
+        }
+
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(outside.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !privileged_runner,
+            "a privileged runner cannot express permission-denied; skipping"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn firmlink_and_alternate_home_spellings_are_rejected() {
+        // Pure lexical layer: deterministic on every platform. On macOS the
+        // Data-volume firmlink makes these the same directory as `/Users/...`
+        // while canonicalize does not collapse the spelling.
+        for candidate in [
+            "/Users/example",
+            "/Users",
+            "/",
+            "/System/Volumes/Data/Users/example",
+            "/System/Volumes/Data/Users",
+            "/System/Volumes/Data",
+        ] {
+            let guard = HomeGuard::new(Path::new("/Users/example"));
+            assert!(
+                guard.rejects(Path::new(candidate)),
+                "{candidate} must never be an operational root"
+            );
+        }
+        // A descendant of HOME keeps working under either spelling.
+        for candidate in [
+            "/Users/example/Documents/feishu",
+            "/System/Volumes/Data/Users/example/Documents/feishu",
+        ] {
+            let guard = HomeGuard::new(Path::new("/Users/example"));
+            assert!(!guard.rejects(Path::new(candidate)), "{candidate}");
+        }
+        assert_eq!(
+            firmlink_primary_spelling(Path::new("/System/Volumes/Data/Users")),
+            Some(PathBuf::from("/Users"))
+        );
+        assert_eq!(firmlink_primary_spelling(Path::new("/Users")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alternate_home_spelling_by_identity_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let parent = plain_parent("identity", &["home", "other"]);
+        let home = parent.join("home");
+        let alias = parent.join("home-alias");
+        symlink(&home, &alias).unwrap();
+
+        // Same object, different spelling: only device+inode sees it.
+        assert_eq!(path_identity(&home), path_identity(&alias));
+        assert_ne!(path_identity(&home), path_identity(&parent));
+        let guard = HomeGuard::new(&home);
+        assert!(guard.rejects(&alias));
+        // The lexical layer still catches the ancestor, and an unrelated
+        // sibling stays available.
+        assert!(guard.rejects(&parent));
+        assert!(!guard.rejects(&parent.join("other")));
+
+        // A guarded cwd never becomes an operational root, while a real
+        // descendant and an unrelated sibling still do.
+        assert!(!operational_root_eligible(
+            &vcs_less_project(&alias),
+            Some(&home)
+        ));
+        let child = home.join("child");
+        fs::create_dir_all(&child).unwrap();
+        assert!(operational_root_eligible(
+            &vcs_less_project(&child),
+            Some(&home)
+        ));
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_firmlink_home_ancestors_are_rejected() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on this host"));
+        let Some(name) = home.file_name() else {
+            return;
+        };
+        let firmlink_home = PathBuf::from("/System/Volumes/Data/Users").join(name);
+        if path_identity(&firmlink_home).is_none() {
+            // This host has no Data-volume spelling for HOME; the portable
+            // identity and lexical regressions still cover the guard.
+            return;
+        }
+        assert_eq!(
+            path_identity(&home),
+            path_identity(&firmlink_home),
+            "the Data-volume spelling must be the same object as HOME"
+        );
+        let guard = HomeGuard::new(&home);
+        for candidate in [
+            firmlink_home.clone(),
+            PathBuf::from("/System/Volumes/Data/Users"),
+            PathBuf::from("/System/Volumes/Data"),
+        ] {
+            assert!(guard.rejects(&candidate), "{}", candidate.display());
+        }
+        // The same spelling never becomes an operational root through the
+        // snapshot either.
+        let snap = snapshot(&firmlink_home);
+        assert_eq!(
+            validate_existing_validated(&snap, firmlink_home.to_str().unwrap()).unwrap_err()["reason"],
             "outside_managed_roots"
         );
     }

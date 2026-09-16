@@ -60,6 +60,10 @@ pub const BROKER_COMPAT_REVISION: u32 = 4;
 /// First broker revision that implements the read-only `git` identity action.
 #[cfg(target_os = "macos")]
 pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
+/// First broker revision that can serve vcs-less operational roots through the
+/// shared validated-root boundary.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const OPERATIONAL_ROOT_MIN_COMPAT_REVISION: u32 = 4;
 /// First broker revision that can be a stable TCC parent for `herdr server`.
 #[cfg(any(target_os = "macos", test))]
 pub const HERDR_HOST_MIN_COMPAT_REVISION: u32 = 2;
@@ -972,7 +976,43 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
     if std::env::var("HERDR_MCP_TCC_BROKER").ok().as_deref() != Some("1") {
         return None;
     }
-    Some(run_stable_broker(op, snapshot, args))
+    Some(run_stable_broker(op, snapshot, args).map(annotate_operational_root_upgrade))
+}
+
+/// Explain an `outside_managed_roots` denial when the installed stable broker
+/// predates operational-root support.
+///
+/// This is strictly additive on an already-failing result: an outdated broker
+/// keeps denying, and the caller learns that a non-Git operational root cannot
+/// be served until the broker is upgraded. It never turns a denial into a
+/// success, and it does not need the topology (which the rotating runtime
+/// cannot resolve for TCC-protected paths anyway).
+fn annotate_operational_root_upgrade(value: Value) -> Value {
+    let Ok(paths) = crate::paths::RuntimePaths::discover() else {
+        return value;
+    };
+    annotate_operational_root_upgrade_with(value, &paths.config_dir)
+}
+
+fn annotate_operational_root_upgrade_with(value: Value, config_dir: &Path) -> Value {
+    if value.get("reason").and_then(Value::as_str) != Some("outside_managed_roots") {
+        return value;
+    }
+    let installed = installed_compat_revision(config_dir);
+    if installed.is_some_and(|revision| revision >= OPERATIONAL_ROOT_MIN_COMPAT_REVISION) {
+        return value;
+    }
+    let mut value = value;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("broker_compat_revision".to_owned(), json!(installed));
+        object.insert(
+            "broker_upgrade_reason".to_owned(),
+            json!(
+                "the installed stable TCC broker predates operational-root support (compat revision 4); if this path is a non-Git directory exactly proven by a live workspace/pane cwd, this broker cannot serve it yet — run `herdr-mcp permissions setup --upgrade-broker`"
+            ),
+        );
+    }
+    value
 }
 
 /// Whether the installed stable broker can answer the read-only `git` identity
@@ -1808,6 +1848,58 @@ mod tests {
         assert!(!text.contains("runtime"));
         assert!(!text.contains("generations"));
         assert!(!text.contains("rust-"));
+    }
+
+    #[test]
+    fn outdated_broker_denial_carries_the_operational_root_upgrade_reason() {
+        let dir = temp_dir("operational-upgrade-reason");
+        let config = dir.join("config");
+        let target = broker_path(&config);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"stable-broker").unwrap();
+        let denial = json!({"ok": false, "reason": "outside_managed_roots", "path": "/tmp/x"});
+
+        // Revision 3 predates operational-root support: the denial explains why.
+        fs::write(
+            broker_metadata_path(&config),
+            format!(
+                "{{\"schema_version\":1,\"compat_revision\":3,\"preferred_signing_identifier\":\"{BROKER_SIGNING_IDENTIFIER}\"}}"
+            ),
+        )
+        .unwrap();
+        assert_eq!(installed_compat_revision(&config), Some(3));
+        assert_eq!(
+            OPERATIONAL_ROOT_MIN_COMPAT_REVISION, 4,
+            "revision 4 is the first broker that serves operational roots"
+        );
+        let annotated = annotate_operational_root_upgrade_with(denial.clone(), &config);
+        assert_eq!(annotated["reason"], "outside_managed_roots");
+        assert_eq!(annotated["broker_compat_revision"], 3);
+        assert!(
+            annotated["broker_upgrade_reason"]
+                .as_str()
+                .unwrap()
+                .contains("upgrade-broker")
+        );
+
+        // A current broker adds nothing, and non-denials are untouched.
+        fs::write(
+            broker_metadata_path(&config),
+            format!(
+                "{{\"schema_version\":1,\"compat_revision\":{BROKER_COMPAT_REVISION},\"preferred_signing_identifier\":\"{BROKER_SIGNING_IDENTIFIER}\"}}"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            annotate_operational_root_upgrade_with(denial.clone(), &config),
+            denial
+        );
+        let success = json!({"ok": true, "content": "x"});
+        assert_eq!(
+            annotate_operational_root_upgrade_with(success.clone(), &config),
+            success
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

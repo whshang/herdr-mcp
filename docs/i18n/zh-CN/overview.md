@@ -37,7 +37,7 @@ herdr-mcp + Herdr workstation
 
 - 面向 ChatGPT / Web AI 的 MCP 工具契约；
 - Cloudflare Edge、OAuth 与 workstation link；
-- managed Git root 内的文件、Git、Shell 和图片能力；
+- managed Git root 内的文件、Git、Shell 和图片能力，以及对被 live workspace/pane cwd 精确证明的 non-Git operational root 的读/执行能力；
 - 面向 Web planner 的状态摘要、mutation 语义和 Agent 调度；
 - 可选的浏览器 Continuity、Control Center 与实验性 JSON → MCP bridge。
 

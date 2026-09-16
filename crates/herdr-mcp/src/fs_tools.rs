@@ -1278,6 +1278,16 @@ mod tests {
         assert_eq!(grepped["ok"], true, "{grepped}");
         assert!(grepped["matches"].as_array().unwrap().len() >= 2);
 
+        // `herdr_fs_image` shares the same validated-root entry point: the
+        // operational root is accepted and the content gate is what rejects a
+        // non-image, never the root gate.
+        let imaged = image(&snap, &json!({"path": file}));
+        assert_eq!(
+            imaged.unwrap_err()["reason"],
+            "unsupported_image",
+            "image must reach the content gate on an operational root"
+        );
+
         // A sibling outside the proven root stays refused.
         let sibling = std::env::temp_dir().join(format!(
             "herdr-mcp-fs-operational-sibling-{}",
@@ -1287,6 +1297,11 @@ mod tests {
         fs::write(sibling.join("other.md"), "other\n").unwrap();
         let refused = read(&snap, &json!({"path": sibling.join("other.md")}));
         assert_eq!(refused["reason"], "outside_managed_roots");
+        let image_outside = image(&snap, &json!({"path": sibling.join("other.md")}));
+        assert_eq!(
+            image_outside.unwrap_err()["reason"],
+            "outside_managed_roots"
+        );
         fs::remove_dir_all(&sibling).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
