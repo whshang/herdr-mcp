@@ -2586,9 +2586,9 @@ mod tests {
             "ok": true,
             "service": "herdr-edge-mac",
             "edgeVersion": "0.4.6-dev",
-            "contractEpoch": 4,
-            "contractHash": "sha256:public-v4",
-            "runtimeContractEpoch": 3,
+            "contractEpoch": 7,
+            "contractHash": "sha256:public-v7",
+            "runtimeContractEpoch": 4,
             "runtimeContractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
         });
         assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_ok());
@@ -2600,11 +2600,11 @@ mod tests {
             "ok": true,
             "service": "herdr-edge-mac",
             "edgeVersion": "0.4.6-dev",
-            "contractEpoch": 5,
-            "contractHash": "sha256:public-v5",
+            "contractEpoch": 7,
+            "contractHash": "sha256:public-v7",
             "runtimeContractEpoch": 2,
-            "runtimeContractHash": crate::link::daemon::PREVIOUS_PUBLIC_CONTRACT_HASH,
-            "currentRuntimeContractEpoch": 3,
+            "runtimeContractHash": crate::link::daemon::LEGACY_EPOCH2_CONTRACT_HASH,
+            "currentRuntimeContractEpoch": 4,
             "currentRuntimeContractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
         });
         assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_ok());
@@ -2616,11 +2616,13 @@ mod tests {
             "ok": true,
             "service": "herdr-edge-mac",
             "edgeVersion": "0.4.6-dev",
-            "contractEpoch": 4,
-            "contractHash": "sha256:public-v4",
-            "runtimeContractEpoch": 2,
+            "contractEpoch": 6,
+            "contractHash": "sha256:public-v6",
+            "runtimeContractEpoch": 3,
             "runtimeContractHash": crate::link::daemon::PREVIOUS_PUBLIC_CONTRACT_HASH,
         });
+        // The previous runtime identity is a rollback baseline for the Edge
+        // hello, never a substitute for the current link-side requirement.
         assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_err());
     }
 
@@ -2652,7 +2654,7 @@ mod tests {
         let payload = json!({
             "ok": true,
             "service": "herdr-edge-mac",
-            "contractEpoch": 3,
+            "contractEpoch": 4,
             "contractHash": crate::link::daemon::PUBLIC_CONTRACT_HASH,
         });
         assert!(

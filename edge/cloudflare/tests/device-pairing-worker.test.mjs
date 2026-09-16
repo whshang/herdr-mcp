@@ -170,10 +170,12 @@ test("health and info expose the same explicit first-party public contract ident
     assert.equal(health.contractEpoch, expectedEpoch);
     assert.equal(info.publicContract.epoch, expectedEpoch);
     assert.equal(health.contractHash, info.publicContract.hash);
+    // /health keeps the frozen epoch-2 rollback view for old Links and adds the
+    // current runtime execution identity; /info reports current + previous.
     assert.equal(health.runtimeContractEpoch, 2);
-    assert.equal(health.currentRuntimeContractEpoch, 3);
-    assert.equal(info.runtimeContract.epoch, 3);
-    assert.equal(info.previousRuntimeContract.epoch, 2);
+    assert.equal(health.currentRuntimeContractEpoch, 4);
+    assert.equal(info.runtimeContract.epoch, 4);
+    assert.equal(info.previousRuntimeContract.epoch, 3);
   }
 });
 

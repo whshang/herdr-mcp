@@ -5,11 +5,13 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
-export const CONTRACT_HASH = "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
-export const CONTRACT_EPOCH = 3;
-/** Previous runtime baseline accepted while an Edge rollout is in flight. */
-export const PREVIOUS_CONTRACT_HASH = "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
-export const PREVIOUS_CONTRACT_EPOCH = 2;
+export const CONTRACT_HASH =
+  "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135";
+export const CONTRACT_EPOCH = 4;
+/// Previous runtime baselines accepted while an Edge rollout is in flight.
+export const PREVIOUS_CONTRACT_HASH =
+  "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
+export const PREVIOUS_CONTRACT_EPOCH = 3;
 export const REQUIRED_TOOL_COUNT = 18;
 export const RUNTIME_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 

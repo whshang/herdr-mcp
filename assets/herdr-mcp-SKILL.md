@@ -149,7 +149,7 @@ While `herdr-mcp` is still under active development, every task about developing
 - Prefer direct edits over prompting an agent to make trivial deterministic changes.
 - Respect managed-root, readonly, dirty and busy gates. `confirm_dirty`/`confirm_busy` acknowledge a known condition; they are not permission to overwrite unrelated work.
 - Do not overwrite unrelated dirty changes. Read the exact target or diff first.
-- `herdr_exec` is a high-capability shell boundary and does not have the secret-path filtering of `herdr_fs_*`; use file tools for ordinary file IO.
+- `herdr_exec` runs one command in the selected project root. Its result reports `execution.started` / `execution.completed` / `execution.exit_code` plus `failure_origin`, so a non-zero child exit (`failure_origin=child_process`) is distinguishable from a pre-start control-plane refusal (`started=false`, `failure_origin=herdr_control_plane`, `delivery_state=not_delivered`) and from an uncertain start (`started=null`). When the complete bounded stdout (or, failing that, stderr) is exactly one JSON object, the result also carries `structured_output` with `structured_output_stream` next to the unchanged `output`. Command output is returned as the child process produced it; the `herdr_fs_*` tools additionally exclude secret-like paths, so use file tools for ordinary file IO.
 - Mutating agent prompts should carry an `idempotency_key`. If delivery is uncertain, inspect/since before retrying.
 - If `herdr_exec` may already have been delivered, never blindly rerun it after a transport/control-plane error.
 - Treat TaskGroup/ExceptionGroup snapshot failures as a control-plane transient until file/Git/direct exec evidence says otherwise.

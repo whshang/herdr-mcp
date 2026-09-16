@@ -41,7 +41,7 @@ pub const LOCAL_MCP_DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const LOCAL_MCP_DEFAULT_TIMEOUT_MS: u64 = 10_000;
 pub const LOCAL_MCP_MAX_TIMEOUT_MS: u64 = 120_000;
 /// Runtime execution contract epoch implemented by the local managed runtime.
-pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 3;
+pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 4;
 
 const LOCAL_MCP_RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";

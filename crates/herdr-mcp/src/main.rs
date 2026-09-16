@@ -17,6 +17,7 @@ pub mod development_orchestration;
 mod device_name;
 mod events;
 mod exec_compact;
+mod exec_evidence;
 mod exec_sessions;
 mod exec_tools;
 mod extension_ipc;

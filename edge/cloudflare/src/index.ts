@@ -30,6 +30,7 @@ import type { Env } from "./env.js";
 import { errorResult } from "./errors.js";
 import { edgeIdentity, MCP_SERVER_VERSION } from "./version.js";
 import { EPOCH2_CONTRACT } from "./contracts/epoch2.js";
+import { PREVIOUS_RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 import { handleMcp } from "./mcp-handler.js";
 import {
   createSessionlessMcpProbeResponse,
@@ -133,6 +134,8 @@ export default {
         edgeEnv: identity.edgeEnv,
         contractEpoch: identity.contractEpoch,
         contractHash: identity.contractHash,
+        // Legacy rollback view: the frozen epoch-2 catalog identity that Links
+        // predating the current runtime execution contract consume.
         runtimeContractEpoch: EPOCH2_CONTRACT.contract_epoch,
         runtimeContractHash: EPOCH2_CONTRACT.contract_hash,
         currentRuntimeContractEpoch: identity.runtimeContractEpoch,
@@ -150,7 +153,10 @@ export default {
         edgeVersion: identity.edgeVersion,
         publicContract: { epoch: identity.contractEpoch, hash: identity.contractHash },
         runtimeContract: { epoch: identity.runtimeContractEpoch, hash: identity.runtimeContractHash },
-        previousRuntimeContract: { epoch: EPOCH2_CONTRACT.contract_epoch, hash: EPOCH2_CONTRACT.contract_hash },
+        previousRuntimeContract: {
+          epoch: PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+          hash: PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash,
+        },
         routes: [
           { path: "/health", stage: "stable" },
           { path: "/info", stage: "dev" },

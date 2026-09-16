@@ -106,7 +106,16 @@ pub fn start(
         match started {
             Ok(value) => value,
             Err(message) => {
-                return json!({"ok": false, "reason": "exec_start_failed", "message": message});
+                let mut result = serde_json::Map::new();
+                result.insert("ok".to_owned(), json!(false));
+                result.insert("reason".to_owned(), json!("exec_start_failed"));
+                result.insert("message".to_owned(), json!(message));
+                result.insert("backend".to_owned(), json!("native"));
+                result.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
+                result.insert("command".to_owned(), json!(rendered));
+                result.insert("delivery_state".to_owned(), json!("unknown"));
+                crate::exec_evidence::insert_uncertain_start(&mut result);
+                return Value::Object(result);
             }
         }
     };

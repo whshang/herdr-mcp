@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "base_contract": "contracts/epoch2.json",
+  "contract_epoch": 4,
+  "contract_hash": "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
+  "tool_count": 18,
+  "shape": {
+    "tool": "herdr_exec",
+    "set": {
+      "description": "Run a non-interactive command on the workstation inside a selected project root of the target workspace (explicit project_root, or the workspace's single current project root) and return its bounded result synchronously: a durable native exec session is started, the call waits up to timeout_ms, then returns exit_code, effective_cwd/project_root, output, and execution evidence (execution.started, execution.completed, execution.exit_code, plus failure_origin when the call fails). Ordinary roots use the native session backend, independent of a pane's foreground cwd. When the workspace has multiple project roots and project_root is omitted, the result reports project_root_required together with the candidate roots. Authorization and allowed write roots follow HERDR_MCP_READONLY / HERDR_MCP_WRITE_ROOTS, and a working agent in the project produces an agent_working result unless confirm_busy=true is passed, which sets warnings.working. Command output is returned as the child process produced it; the herdr_fs_read, herdr_fs_list and herdr_fs_grep tools additionally exclude secret-like paths. On timeout the command keeps running as the returned session_id, partial output is returned with ok:false and code:exec_timeout, and the same session continues through herdr_exec_read. macOS user-protected roots (Documents/Desktop/Downloads) use the persistent visible utility pane (label 'herdr-mcp:utility') so execution stays under the TCC-authorized Herdr terminal host."
+    }
+  }
+}

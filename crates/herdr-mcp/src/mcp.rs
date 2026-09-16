@@ -6078,7 +6078,7 @@ mod tests {
         }));
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "herdr-mcp");
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 3);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("continue/resume intent"));
         assert!(instructions.contains("search durable Continuity before asking"));
@@ -6504,7 +6504,7 @@ mod tests {
         let result = discover_result();
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], SDK_WIRE_PROTOCOL);
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 3);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
     }
 
     #[test]
@@ -7248,7 +7248,7 @@ mod tests {
         assert_eq!(remote_consent["code"], "unknown_local_method");
 
         let identity = contract::identity().unwrap();
-        assert_eq!(identity.epoch, 3);
+        assert_eq!(identity.epoch, 4);
         assert_eq!(identity.tool_count, 18);
     }
 

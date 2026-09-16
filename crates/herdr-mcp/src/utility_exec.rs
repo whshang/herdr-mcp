@@ -1,3 +1,4 @@
+use crate::exec_evidence;
 use crate::exec_sessions::ExecRegistry;
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
@@ -305,17 +306,7 @@ pub(crate) fn start_reusable_pane_session(
         let mut result = match registry.start_in_existing_pane(effective_root, command, &pane_id) {
             Ok(value) => value,
             Err(message) => {
-                return json!({
-                    "ok": false,
-                    "code": "exec_start_failed",
-                    "message": message,
-                    "backend": "utility_pane",
-                    "workspace": workspace_id,
-                    "pane_id": pane_id,
-                    "command": command,
-                    "delivery_state": "unknown",
-                    "hint": "Command start outcome is uncertain; existing pane/process state determines whether another start is safe.",
-                });
+                return utility_pane_start_failure(workspace_id, &pane_id, command, message);
             }
         };
         if let Some(object) = result.as_object_mut() {
@@ -370,17 +361,7 @@ fn run_unix_durable(
     let start = match registry.start_in_existing_pane(effective_root, command, &pane_id) {
         Ok(value) => value,
         Err(message) => {
-            return json!({
-                "ok": false,
-                "code": "exec_start_failed",
-                "message": message,
-                "backend": "utility_pane",
-                "workspace": workspace_id,
-                "pane_id": pane_id,
-                "command": command,
-                "delivery_state": "unknown",
-                "hint": "Command start outcome is uncertain; existing pane/process state determines whether another start is safe.",
-            });
+            return utility_pane_start_failure(workspace_id, &pane_id, command, message);
         }
     };
     let Some(session_id) = start.get("session_id").and_then(Value::as_str) else {
@@ -426,6 +407,9 @@ fn run_unix_durable(
             if let Some(counts) = read.get("counts") {
                 result.insert("counts".to_owned(), counts.clone());
             }
+            let observed_exit_code = result.get("exit_code").and_then(Value::as_i64);
+            exec_evidence::insert_completed_evidence(&mut result, observed_exit_code);
+            project_structured_output(&mut result, registry, session_id);
             add_working_warning(&mut result, working);
             return Value::Object(result);
         }
@@ -454,6 +438,7 @@ fn run_unix_durable(
             if let Some(progress) = read.get("progress") {
                 result.insert("progress".to_owned(), progress.clone());
             }
+            exec_evidence::insert_timeout_evidence(&mut result);
             add_working_warning(&mut result, working);
             result.insert(
                 "hint".to_owned(),
@@ -491,25 +476,36 @@ fn run_native_durable(
     let start = match started_result {
         Ok(value) => value,
         Err(message) => {
-            return json!({
-                "ok": false,
-                "code": "exec_start_failed",
-                "message": message,
-                "backend": "native",
-                "workspace": workspace_id,
-                "command": command,
-                "delivery_state": "unknown",
-                "hint": "Native command start outcome is uncertain; existing session/process state determines whether another start is safe.",
-            });
+            let mut result = Map::new();
+            result.insert("ok".to_owned(), json!(false));
+            result.insert("code".to_owned(), json!("exec_start_failed"));
+            result.insert("message".to_owned(), json!(message));
+            result.insert("backend".to_owned(), json!("native"));
+            result.insert("workspace".to_owned(), json!(workspace_id));
+            result.insert("command".to_owned(), json!(command));
+            result.insert("delivery_state".to_owned(), json!("unknown"));
+            exec_evidence::insert_uncertain_start(&mut result);
+            result.insert(
+                "hint".to_owned(),
+                json!("Native command start outcome is uncertain; existing session/process state determines whether another start is safe."),
+            );
+            return Value::Object(result);
         }
     };
     let Some(session_id) = start.get("session_id").and_then(Value::as_str) else {
-        return json!({
-            "ok": false,
-            "code": "exec_start_failed",
-            "message": "native exec start returned no session_id",
-            "backend": "native",
-        });
+        let mut result = Map::new();
+        result.insert("ok".to_owned(), json!(false));
+        result.insert("code".to_owned(), json!("exec_start_failed"));
+        result.insert(
+            "message".to_owned(),
+            json!("native exec start returned no session_id"),
+        );
+        result.insert("backend".to_owned(), json!("native"));
+        result.insert("workspace".to_owned(), json!(workspace_id));
+        result.insert("command".to_owned(), json!(command));
+        result.insert("delivery_state".to_owned(), json!("unknown"));
+        exec_evidence::insert_uncertain_start(&mut result);
+        return Value::Object(result);
     };
     let session_id = session_id.to_owned();
     let deadline = Duration::from_millis(timeout_ms);
@@ -517,6 +513,7 @@ fn run_native_durable(
         let read = registry.read(&session_id, "both", 0, 65_536);
         if read.get("phase").and_then(Value::as_str) == Some("completed") {
             return native_completed_result(
+                registry,
                 workspace_id,
                 effective_root,
                 command,
@@ -540,6 +537,7 @@ fn run_native_durable(
 }
 
 fn native_completed_result(
+    registry: &ExecRegistry,
     workspace_id: &str,
     effective_root: &Path,
     command: &str,
@@ -573,6 +571,9 @@ fn native_completed_result(
             result.insert(key.to_owned(), value.clone());
         }
     }
+    let observed_exit_code = result.get("exit_code").and_then(Value::as_i64);
+    exec_evidence::insert_completed_evidence(&mut result, observed_exit_code);
+    project_structured_output(&mut result, registry, session_id);
     add_working_warning(&mut result, working);
     Value::Object(result)
 }
@@ -607,6 +608,7 @@ fn native_timeout_result(
     if let Some(progress) = read.get("progress") {
         result.insert("progress".to_owned(), progress.clone());
     }
+    exec_evidence::insert_timeout_evidence(&mut result);
     add_working_warning(&mut result, working);
     result.insert(
         "hint".to_owned(),
@@ -615,18 +617,84 @@ fn native_timeout_result(
     Value::Object(result)
 }
 
+/// Complete bounded content of one stream, or `None` when completeness cannot
+/// be proven (missing session, dropped bytes, read-window truncation, or an
+/// already compacted view). `structured_output` is only projected from proven-
+/// complete content.
+fn complete_stream_text(registry: &ExecRegistry, session_id: &str, stream: &str) -> Option<String> {
+    let view = registry.read(
+        session_id,
+        stream,
+        0,
+        exec_evidence::STRUCTURED_OUTPUT_MAX_BYTES,
+    );
+    if view.get("ok").and_then(Value::as_bool) != Some(true)
+        || view.get("truncated").and_then(Value::as_bool) == Some(true)
+        || view.get("compacted").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let text = view.get("text").and_then(Value::as_str)?;
+    let bytes_total = view.get("bytes_total").and_then(Value::as_u64)?;
+    (bytes_total == text.len() as u64).then(|| text.to_owned())
+}
+
+/// Project a conservative `structured_output` from the stdout/stderr streams
+/// (stdout preferred) while leaving the original `output` untouched.
+fn project_structured_output(
+    result: &mut Map<String, Value>,
+    registry: &ExecRegistry,
+    session_id: &str,
+) {
+    let stdout = complete_stream_text(registry, session_id, "stdout").unwrap_or_default();
+    let stderr = complete_stream_text(registry, session_id, "stderr").unwrap_or_default();
+    exec_evidence::insert_structured_output(result, &stdout, &stderr);
+}
+
+fn utility_pane_start_failure(
+    workspace_id: &str,
+    pane_id: &str,
+    command: &str,
+    message: String,
+) -> Value {
+    let mut result = Map::new();
+    result.insert("ok".to_owned(), json!(false));
+    result.insert("code".to_owned(), json!("exec_start_failed"));
+    result.insert("message".to_owned(), json!(message));
+    result.insert("backend".to_owned(), json!("utility_pane"));
+    result.insert("workspace".to_owned(), json!(workspace_id));
+    result.insert("pane_id".to_owned(), json!(pane_id));
+    result.insert("command".to_owned(), json!(command));
+    result.insert("delivery_state".to_owned(), json!("unknown"));
+    result.insert(
+        "hint".to_owned(),
+        json!("Command start outcome is uncertain; existing pane/process state determines whether another start is safe."),
+    );
+    // `send_text` may already have reached the pane, so this must never claim
+    // `execution.started=false`.
+    exec_evidence::insert_uncertain_start(&mut result);
+    Value::Object(result)
+}
+
 fn utility_pane_control_plane_error(workspace_id: &str, command: &str, message: String) -> Value {
-    json!({
-        "ok": false,
-        "code": "utility_pane_unavailable",
-        "message": message,
-        "backend": "utility_pane",
-        "workspace": workspace_id,
-        "command": command,
-        "delivery_state": "not_delivered",
-        "safe_retry_mode": "retry_after_control_plane_recovery",
-        "hint": "failed to prepare canonical utility pane before command delivery",
-    })
+    let mut result = Map::new();
+    result.insert("ok".to_owned(), json!(false));
+    result.insert("code".to_owned(), json!("utility_pane_unavailable"));
+    result.insert("message".to_owned(), json!(message));
+    result.insert("backend".to_owned(), json!("utility_pane"));
+    result.insert("workspace".to_owned(), json!(workspace_id));
+    result.insert("command".to_owned(), json!(command));
+    result.insert("delivery_state".to_owned(), json!("not_delivered"));
+    result.insert(
+        "safe_retry_mode".to_owned(),
+        json!("retry_after_control_plane_recovery"),
+    );
+    result.insert(
+        "hint".to_owned(),
+        json!("failed to prepare canonical utility pane before command delivery"),
+    );
+    exec_evidence::insert_control_plane_rejection(&mut result);
+    Value::Object(result)
 }
 
 fn utility_pane_contention_result(
@@ -635,7 +703,7 @@ fn utility_pane_contention_result(
     command: &str,
     readiness: &PaneReadiness,
 ) -> Value {
-    json!({
+    let mut result = json!({
         "ok": false,
         "code": "utility_pane_not_ready",
         "backend": "utility_pane",
@@ -651,7 +719,11 @@ fn utility_pane_contention_result(
         "delivery_state": "not_delivered",
         "safe_retry_mode": "retry_after_resource_release",
         "hint": "The utility pane is occupied by an interactive program (for example less/git/gh) and becomes available when that program releases it.",
-    })
+    });
+    if let Some(object) = result.as_object_mut() {
+        exec_evidence::insert_control_plane_rejection(object);
+    }
+    result
 }
 
 fn resolve_workspace(snapshot: &Value, target: &str) -> Option<WorkspaceRecord> {
@@ -1256,6 +1328,11 @@ mod tests {
             result["safe_retry_mode"],
             "retry_after_control_plane_recovery"
         );
+        assert_eq!(
+            result["execution"],
+            json!({"started": false, "completed": false, "exit_code": null})
+        );
+        assert_eq!(result["failure_origin"], "herdr_control_plane");
     }
 
     #[cfg(target_os = "macos")]
@@ -1309,6 +1386,8 @@ mod tests {
         assert_eq!(result["code"], "utility_pane_unavailable");
         assert_eq!(result["backend"], "utility_pane");
         assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["execution"]["started"], false);
+        assert_eq!(result["failure_origin"], "herdr_control_plane");
         assert!(registry.list_views().is_empty());
 
         server.join().unwrap();
@@ -1331,6 +1410,29 @@ mod tests {
         assert_eq!(result["retry_after_ms"], 500);
         assert_eq!(result["delivery_state"], "not_delivered");
         assert_eq!(result["safe_retry_mode"], "retry_after_resource_release");
+        // Machine-decidable pre-start semantics: nothing ran, and the failure
+        // belongs to the Herdr control plane rather than to a child process.
+        assert_eq!(
+            result["execution"],
+            json!({"started": false, "completed": false, "exit_code": null})
+        );
+        assert_eq!(result["failure_origin"], "herdr_control_plane");
+        assert!(result.get("structured_output").is_none());
+    }
+
+    #[test]
+    fn utility_pane_start_failure_never_claims_nothing_ran() {
+        let result = utility_pane_start_failure(
+            "w1",
+            "w1:p2",
+            "lark-cli --json",
+            "cannot start utility pane command".to_owned(),
+        );
+        assert_eq!(result["code"], "exec_start_failed");
+        assert_eq!(result["delivery_state"], "unknown");
+        assert_eq!(result["execution"]["started"], Value::Null);
+        assert_ne!(result["execution"]["started"], json!(false));
+        assert_eq!(result["failure_origin"], "unknown");
     }
 
     #[test]
@@ -1451,6 +1553,147 @@ mod tests {
         let read = registry.read(session_id, "both", 0, 65_536);
         assert_eq!(read["ok"], true);
         assert_eq!(read["phase"], "running");
+        assert_eq!(registry.kill(session_id)["killed"], true);
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Regression for the real 1.0 failure: a child CLI exits 2 while printing
+    /// exactly one JSON object. The result must prove the child process ran and
+    /// ended, attribute the failure to it instead of to the Herdr control
+    /// plane, and project the payload without dropping the raw output.
+    #[cfg(unix)]
+    #[test]
+    fn native_child_cli_json_error_exit_two_is_child_process_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const PAYLOAD: &str = r#"{"ok":false,"error":{"type":"validation","subtype":"invalid_argument","message":"flag needs an argument: --json"}}"#;
+
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let cli = base.join("fake-lark-cli.sh");
+        fs::write(
+            &cli,
+            format!("#!/bin/sh\nprintf '%s\\n' '{PAYLOAD}'\nexit 2\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({
+                "workspace": "w1",
+                "steps": [{"program": cli.to_string_lossy(), "args": ["--json"]}]
+            }),
+        );
+
+        assert_eq!(result["ok"], false, "unexpected result: {result}");
+        assert_eq!(result["backend"], "native");
+        assert_eq!(result["phase"], "completed");
+        assert_eq!(result["exit_code"], 2);
+        assert_eq!(
+            result["execution"],
+            json!({"started": true, "completed": true, "exit_code": 2})
+        );
+        assert_eq!(result["failure_origin"], "child_process");
+        // No pre-delivery claim may leak into an executed child result.
+        assert!(result.get("delivery_state").is_none());
+        // The original output is preserved verbatim…
+        let output = result["output"].as_str().expect("raw output kept");
+        assert!(
+            output.contains("flag needs an argument: --json"),
+            "{output}"
+        );
+        // …and the payload is also projected conservatively.
+        assert_eq!(
+            result["structured_output"],
+            serde_json::from_str::<serde_json::Value>(PAYLOAD).unwrap()
+        );
+        assert_eq!(result["structured_output"]["ok"], false);
+        assert_eq!(
+            result["structured_output"]["error"]["subtype"],
+            "invalid_argument"
+        );
+        assert_eq!(result["structured_output_stream"], "stdout");
+
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_successful_json_object_is_projected_without_failure_origin() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"workspace": "w1", "command": "printf '{\"task\":\"ok\"}'"}),
+        );
+
+        assert_eq!(result["ok"], true, "unexpected result: {result}");
+        assert_eq!(
+            result["execution"],
+            json!({"started": true, "completed": true, "exit_code": 0})
+        );
+        assert!(result.get("failure_origin").is_none());
+        assert_eq!(result["structured_output"], json!({"task": "ok"}));
+
+        // Non-object stdout stays unprojected.
+        let array = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"workspace": "w1", "command": "printf '[1,2,3]'"}),
+        );
+        assert_eq!(array["ok"], true, "unexpected result: {array}");
+        assert!(array.get("structured_output").is_none());
+
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_timeout_is_not_reported_as_a_child_failure() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"workspace": "w1", "command": "sleep 30", "timeout_ms": 250}),
+        );
+
+        assert_eq!(result["code"], "exec_timeout");
+        assert_eq!(
+            result["execution"],
+            json!({"started": true, "completed": false, "exit_code": null})
+        );
+        assert_eq!(result["failure_origin"], "timeout");
+        assert_ne!(result["failure_origin"], "child_process");
+        assert_ne!(result["failure_origin"], "herdr_control_plane");
+        assert!(result.get("structured_output").is_none());
+
+        let session_id = result["session_id"].as_str().unwrap();
         assert_eq!(registry.kill(session_id)["killed"], true);
         drop(registry);
         let _ = fs::remove_dir_all(base);

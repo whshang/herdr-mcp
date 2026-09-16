@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn parses_prod_shaped_health() {
-        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":3,"contractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":4,"contractHash":"sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
         assert!(rust_link_accepts_edge_contract(&contract));
         assert_eq!(contract.service.as_deref(), Some("herdr-edge-prod"));
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn prefers_current_runtime_contract_over_legacy_rollback_fields() {
-        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":5,"contractHash":"sha256:public-v5","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8","currentRuntimeContractEpoch":3,"currentRuntimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":7,"contractHash":"sha256:public-v7","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8","currentRuntimeContractEpoch":4,"currentRuntimeContractHash":"sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
         assert!(rust_link_accepts_edge_contract(&contract));
         assert_eq!(contract.contract_epoch, PUBLIC_CONTRACT_EPOCH);
@@ -222,17 +222,17 @@ mod tests {
 
     #[test]
     fn refuses_legacy_only_previous_runtime_edge_for_current_link() {
-        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":4,"contractHash":"sha256:public-v4","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"}"#;
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":6,"contractHash":"sha256:public-v6","runtimeContractEpoch":3,"runtimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
         assert!(!rust_link_accepts_edge_contract(&contract));
     }
 
     #[test]
     fn prefers_runtime_contract_when_public_contract_has_advanced() {
-        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":4,"contractHash":"sha256:public-v4","runtimeContractEpoch":3,"runtimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":7,"contractHash":"sha256:public-v7","runtimeContractEpoch":4,"runtimeContractHash":"sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
         assert!(rust_link_accepts_edge_contract(&contract));
-        assert_eq!(contract.contract_epoch, 3);
+        assert_eq!(contract.contract_epoch, 4);
         assert_eq!(contract.contract_hash, PUBLIC_CONTRACT_HASH);
     }
 
@@ -243,7 +243,7 @@ mod tests {
         assert!(!rust_link_accepts_edge_contract(&contract));
         let err = refuse_edge_for_rust_link(&contract).to_string();
         assert!(err.contains("epoch 1"));
-        assert!(err.contains("runtime epoch 3"));
+        assert!(err.contains("runtime epoch 4"));
         assert!(err.contains("compatible Edge"));
     }
 

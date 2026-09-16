@@ -22,7 +22,7 @@ test("Rust release manifest is target-complete, hashed, and contract-pinned", as
   await mkdir(assetsDir, { recursive: true });
   await writeFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), '[package]\nname = "herdr-mcp"\nversion = "1.2.3-alpha.4"\n');
   await writeFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), 'pub const SCHEMA_VERSION: i64 = 4;\n');
-  await writeFile(join(root, "contracts", "runtime-exec-v3.json"), JSON.stringify({
+  await writeFile(join(root, "contracts", "runtime-exec-v4.json"), JSON.stringify({
     contract_epoch: 3,
     contract_hash: "sha256:test",
     tool_count: 18,
@@ -113,7 +113,7 @@ test("Rust release manifest refuses incomplete assets and tag/version drift", as
   await mkdir(assetsDir, { recursive: true });
   await writeFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), '[package]\nversion = "1.0.0"\n');
   await writeFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), 'pub const SCHEMA_VERSION: i64 = 4;\n');
-  await writeFile(join(root, "contracts", "runtime-exec-v3.json"), JSON.stringify({ contract_epoch: 3, contract_hash: "h", tool_count: 18 }));
+  await writeFile(join(root, "contracts", "runtime-exec-v4.json"), JSON.stringify({ contract_epoch: 3, contract_hash: "h", tool_count: 18 }));
   try {
     await assert.rejects(
       buildRustReleaseManifest({
