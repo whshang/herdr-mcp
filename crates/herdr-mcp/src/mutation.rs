@@ -469,9 +469,11 @@ mod tests {
 
         crate::projects::reset_derive_routing_call_count();
         let topology = crate::projects::derive_routing(&snap);
-        let validated =
-            fs_security::validate_existing_with_topology(&topology, file.to_str().unwrap())
-                .unwrap();
+        let validated = fs_security::validate_existing_validated_with_topology(
+            &topology,
+            file.to_str().unwrap(),
+        )
+        .unwrap();
         let working = check_with_topology(&snap, &topology, &validated.root, false).unwrap();
         assert!(working.is_empty());
         assert_eq!(

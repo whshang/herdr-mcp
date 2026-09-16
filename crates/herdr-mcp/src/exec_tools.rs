@@ -49,9 +49,9 @@ pub fn start(
     let protected_root =
         crate::macos_permissions::project_path_needs_protected_transport(Path::new(root));
     let managed = match if protected_root {
-        fs_security::validate_exact_project_root_with_topology(&topology, root)
+        fs_security::validate_exact_validated_root_with_topology(&topology, root)
     } else {
-        fs_security::validate_existing_with_topology(&topology, root)
+        fs_security::validate_existing_validated_with_topology(&topology, root)
     } {
         Ok(value) => value,
         Err(error) => return error,
@@ -344,8 +344,89 @@ fn invalid(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartInvocation, resolve_start_invocation, wait_view_ready};
+    use super::{StartInvocation, resolve_start_invocation, start, wait, wait_view_ready};
+    use crate::exec_sessions::ExecRegistry;
+    use crate::herdr::HerdrClient;
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_suffix() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    fn registry(name: &str) -> ExecRegistry {
+        ExecRegistry::new(std::env::temp_dir().join(format!(
+            "herdr-mcp-exec-{name}-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        )))
+        .unwrap()
+    }
+
+    /// `herdr_exec` must run in the exact live vcs-less cwd instead of
+    /// borrowing an unrelated managed Git root.
+    #[test]
+    fn exec_start_accepts_an_exact_vcs_less_operational_root() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-exec-operational-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": []
+        });
+        let registry = registry("operational");
+        // The client is only used by the macOS protected-path branch; a
+        // vcs-less temp root takes the native branch.
+        let client = HerdrClient::new(PathBuf::from("/nonexistent-herdr.sock"));
+
+        let started = start(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"root": root, "program": "pwd"}),
+        );
+        assert_eq!(started["ok"], true, "{started}");
+        assert_eq!(started["root"], json!(root.to_string_lossy()));
+
+        let session_id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait(
+            &registry,
+            &json!({"session_id": session_id, "stream": "stdout", "timeout_ms": 10_000}),
+        );
+        let stdout = view["text"]
+            .as_str()
+            .or_else(|| view["stdout"].as_str())
+            .unwrap_or_default();
+        assert!(
+            stdout.contains(root.file_name().unwrap().to_str().unwrap()),
+            "exec must run in the operational root, saw: {view}"
+        );
+
+        // A sibling directory is still refused.
+        let sibling = std::env::temp_dir().join(format!(
+            "herdr-mcp-exec-sibling-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&sibling).unwrap();
+        let refused = start(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"root": sibling, "program": "pwd"}),
+        );
+        assert_eq!(refused["reason"], "outside_managed_roots");
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&sibling).unwrap();
+    }
 
     #[test]
     fn exec_start_keeps_legacy_command_and_defaults_typed_args() {

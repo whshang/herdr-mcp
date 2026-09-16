@@ -166,7 +166,7 @@ Then confirm workstation identity, active runtime generation health, and Edge's 
 
 Common gates:
 
-- path is outside a managed Git root;
+- path is outside a managed Git root and outside a non-Git operational root proven by an exact live workspace/pane cwd (a directory borrowed from another project, or a sibling the live topology does not prove, is refused);
 - filename matches a secret-ish path rule;
 - read-only mode is enabled;
 - target root is not in the write allowlist;

@@ -39,10 +39,14 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
     };
 
     let topology = projects::derive_routing(snapshot);
-    let root_path = match fs_security::validate_existing_with_topology(&topology, root_input) {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
+    let root_path =
+        match fs_security::validate_existing_validated_with_topology(&topology, root_input) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+    if let Some(error) = fs_security::reject_operational_root_mutation(&topology, &root_path.root) {
+        return error;
+    }
     if !root_path.real.is_dir() {
         return fail(
             "not_a_directory",

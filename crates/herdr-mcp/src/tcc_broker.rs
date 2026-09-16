@@ -48,7 +48,15 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Revision 3 adds the read-only `git` identity action, so a runtime that
 /// needs exact source provenance must ask the operator to upgrade the stable
 /// broker instead of falling back to a direct Git read.
-pub const BROKER_COMPAT_REVISION: u32 = 3;
+///
+/// Revision 4 serves vcs-less operational roots (a directory exactly proven by
+/// a live workspace/pane cwd) through the same validated-root boundary, so a
+/// protected non-Git project like `~/Documents/<project>` is readable without
+/// the rotating runtime ever becoming the TCC client. A revision-3 broker
+/// still applies the Git-only boundary and reports `outside_managed_roots`, so
+/// the operator must upgrade the broker with
+/// `herdr-mcp permissions setup --upgrade-broker` for that case.
+pub const BROKER_COMPAT_REVISION: u32 = 4;
 /// First broker revision that implements the read-only `git` identity action.
 #[cfg(target_os = "macos")]
 pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;

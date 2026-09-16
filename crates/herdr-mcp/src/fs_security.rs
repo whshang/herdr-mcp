@@ -13,17 +13,43 @@ pub fn managed_roots(snapshot: &Value) -> Vec<PathBuf> {
     managed_roots_from(&projects::derive_routing(snapshot))
 }
 
+/// Unified validated-root access surface: managed Git roots plus vcs-less
+/// Operational roots proven by the live topology.
+///
+/// `validated_roots_from` is the single root set for the read/exec surface
+/// (`herdr_fs_read` / `herdr_fs_list` / `herdr_fs_grep` / `herdr_exec`).
+/// [`managed_roots_from`] keeps the pre-existing Git-only meaning for every
+/// Git-oriented consumer, so Git semantics are unchanged.
+pub fn validated_roots_from(topology: &ProjectTopology) -> Vec<PathBuf> {
+    sorted_deepest_first(
+        topology
+            .projects
+            .values()
+            .filter_map(root_kind_of)
+            .map(|(root, _)| root)
+            .collect(),
+    )
+}
+
 /// Extract managed Git roots from an already-derived routing topology.
+///
+/// Git roots are exactly the `managed && vcs == Some("git")` projects; this
+/// stays Git-only so no Git-oriented consumer widens silently.
 ///
 /// Prefer this when the same request also needs busy-agent checks so the
 /// cwd→git-root identity is resolved once for the snapshot.
 pub fn managed_roots_from(topology: &ProjectTopology) -> Vec<PathBuf> {
-    let mut roots = topology
-        .projects
-        .values()
-        .filter(|project| project.managed && project.vcs == Some("git"))
-        .map(|project| project.root.clone())
-        .collect::<Vec<_>>();
+    sorted_deepest_first(
+        topology
+            .projects
+            .values()
+            .filter(|project| project.managed && project.vcs == Some("git"))
+            .map(|project| project.root.clone())
+            .collect(),
+    )
+}
+
+fn sorted_deepest_first(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
     roots.sort_by(|left, right| {
         right
             .components()
@@ -35,6 +61,129 @@ pub fn managed_roots_from(topology: &ProjectTopology) -> Vec<PathBuf> {
     roots
 }
 
+/// Whether a root validated by the unified surface is vcs-less Operational.
+///
+/// Operational roots are read/exec-only: mutations that rely on Git-dirty
+/// confirmation must fail closed for them instead of fabricating Git state.
+pub fn is_operational_root(topology: &ProjectTopology, root: &Path) -> bool {
+    topology.projects.get(root).is_some_and(|project| {
+        root_kind_of(project).is_some_and(|(_, kind)| kind == RootKind::Operational)
+    })
+}
+
+/// Deterministic fail-closed guard for mutations whose safety depends on
+/// Git-dirty confirmation. Returns the error value when `root` is an
+/// operational root, otherwise `None`.
+pub fn reject_operational_root_mutation(topology: &ProjectTopology, root: &Path) -> Option<Value> {
+    is_operational_root(topology, root).then(|| {
+        json!({
+            "ok": false,
+            "reason": "operational_root_mutation_unsupported",
+            "root": root.to_string_lossy(),
+            "hint": "this vcs-less operational root has no Git dirty state to confirm against; write inside a Git-backed project root, or restrict this change to reading it",
+        })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootKind {
+    /// A Git-backed managed root (pre-existing behavior, unchanged).
+    Git,
+    /// A vcs-less canonical existing directory exactly proven by live
+    /// workspace/pane cwd.
+    Operational,
+}
+
+fn root_kind_of(project: &projects::ProjectInfo) -> Option<(PathBuf, RootKind)> {
+    let home = home_dir();
+    match project.vcs {
+        Some("git") => project
+            .managed
+            .then_some((project.root.clone(), RootKind::Git)),
+        None if operational_root_eligible(project, home.as_deref()) => {
+            Some((project.root.clone(), RootKind::Operational))
+        }
+        _ => None,
+    }
+}
+
+/// An Operational root must be a vcs-less canonical existing directory that
+/// the live workspace/pane cwds prove exactly.
+///
+/// Rejected: HOME itself or any ancestor of HOME, any unproven sibling, a
+/// secret-like path, and a symlink escape (the canonical real path must still
+/// be a directory that is not HOME or an ancestor of HOME).
+fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path>) -> bool {
+    if project.vcs.is_some() || project.cwds.is_empty() {
+        return false;
+    }
+    let Some(home) = home else {
+        // Without a known HOME the ancestry guard cannot be evaluated, so a
+        // vcs-less root fails closed instead of guessing.
+        return false;
+    };
+    let root = &project.root;
+    if !root.is_absolute() || rejects_home_ancestry(home, root) || denied_secret_path(root) {
+        return false;
+    }
+    // "canonical existing directory": the live cwd must resolve to a real
+    // directory, and that real directory must itself survive the HOME-ancestry
+    // and secret-path guards, so a symlinked cwd cannot escape them.
+    let root_real = match std::fs::canonicalize(root) {
+        Ok(real) => {
+            if !real.is_dir() || rejects_home_ancestry(home, &real) || denied_secret_path(&real) {
+                return false;
+            }
+            Some(real)
+        }
+        // The rotating runtime is deliberately not the macOS TCC client, so
+        // Documents/Desktop/Downloads existence, symlink resolution, and real
+        // paths are verified by the stable broker (`herdr_fs_*`) or the
+        // delegated utility pane (`herdr_exec`) instead — the same route the
+        // pre-existing protected-root command preflight already uses. Every
+        // other unresolvable path is refused.
+        Err(_) if tcc_delegated_root(home, root) => None,
+        Err(_) => return false,
+    };
+    // Exactly proven by live cwd: every cwd attached to this project resolves
+    // to this root's real directory (or, when the real path is delegated to
+    // TCC, must be this exact cwd). A sibling outside the group therefore
+    // cannot borrow this root's authority.
+    project
+        .cwds
+        .iter()
+        .all(|cwd| match (&root_real, std::fs::canonicalize(cwd)) {
+            (Some(root_real), Ok(cwd_real)) => &cwd_real == root_real,
+            _ => cwd == root,
+        })
+}
+
+/// macOS Documents/Desktop/Downloads roots are executed/read through the TCC
+/// broker or utility pane, which can verify what this runtime cannot.
+fn tcc_delegated_root(home: &Path, candidate: &Path) -> bool {
+    cfg!(target_os = "macos")
+        && ["Documents", "Desktop", "Downloads"]
+            .iter()
+            .any(|name| candidate.starts_with(home.join(name)))
+}
+
+/// HOME itself, or any ancestor of HOME (for example `/`, `/Users`), is never
+/// an operational root. This also covers a symlinked cwd whose real target is
+/// HOME or above it.
+fn rejects_home_ancestry(home: &Path, candidate: &Path) -> bool {
+    home == candidate || home.starts_with(candidate)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Validate an existing path against managed Git roots only.
+///
+/// Git-oriented consumers (for example `herdr_git`) keep this pre-existing
+/// Git-only boundary so Git semantics do not change.
 pub fn validate_existing(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
     if let Ok(resolved) = resolve_input(input)
         && let Some(root) = target_scoped_herdr_worktree_root(snapshot, &resolved)
@@ -104,13 +253,32 @@ fn target_scoped_worktree_root_under(
     (live_cwd_declares_root || live_workspace_declares_root).then_some(root)
 }
 
-/// Validate an existing path using a routing topology already derived for
-/// this request.
-pub fn validate_existing_with_topology(
+/// Validate an existing path against the unified validated-root surface
+/// (managed Git roots plus operational roots proven by the live topology).
+pub fn validate_existing_validated(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
+    validate_existing_validated_with_topology(&projects::derive_routing(snapshot), input)
+}
+
+/// See [`validate_existing_validated`]. Reuses one routing topology per
+/// request so the root identity is resolved once.
+pub fn validate_existing_validated_with_topology(
     topology: &ProjectTopology,
     input: &str,
 ) -> Result<ManagedPath, Value> {
-    validate_existing_with_roots(&managed_roots_from(topology), input)
+    validate_existing_with_roots(&validated_roots_from(topology), input)
+}
+
+/// Validate that `input` is exactly one root on the unified validated-root
+/// surface, using only live topology metadata.
+///
+/// This is the protected-path (macOS Documents/Desktop/Downloads) preflight
+/// form: existence is delegated to the Herdr utility pane, exactly as the
+/// pre-existing Git-only variant does.
+pub fn validate_exact_validated_root_with_topology(
+    topology: &ProjectTopology,
+    input: &str,
+) -> Result<ManagedPath, Value> {
+    validate_exact_root_with_roots(&validated_roots_from(topology), input)
 }
 
 /// Validate that `input` is exactly one project root already declared by the
@@ -124,7 +292,10 @@ pub fn validate_exact_project_root_with_topology(
     topology: &ProjectTopology,
     input: &str,
 ) -> Result<ManagedPath, Value> {
-    let roots = managed_roots_from(topology);
+    validate_exact_root_with_roots(&managed_roots_from(topology), input)
+}
+
+fn validate_exact_root_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedPath, Value> {
     let resolved = resolve_input(input)?;
     let Some(root) = roots.iter().find(|root| **root == resolved).cloned() else {
         return Err(json!({
@@ -200,13 +371,16 @@ fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<Manage
     })
 }
 
-/// Validate a writable target using a routing topology already derived for
-/// this request.
-pub fn validate_target_with_topology(
+/// Validate a writable target against the unified validated-root surface.
+///
+/// Callers must still fail closed for operational roots when their safety
+/// depends on Git-dirty confirmation; see
+/// [`reject_operational_root_mutation`].
+pub fn validate_target_validated_with_topology(
     topology: &ProjectTopology,
     input: &str,
 ) -> Result<ManagedPath, Value> {
-    validate_target_with_roots(&managed_roots_from(topology), input)
+    validate_target_with_roots(&validated_roots_from(topology), input)
 }
 
 /// Validate a writable target against one project root that was already
@@ -286,13 +460,14 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
 
 /// Shared actionable hint for `outside_managed_roots` failures.
 ///
-/// A path is rejected because it is not inside a git-backed project root
-/// visible in the live Herdr snapshot. When the snapshot exposes no managed
-/// roots, the hint must tell the user to open/create a Herdr workspace or pane
-/// whose cwd is inside the intended Git repository, keep it available, then
-/// retry. A coding agent is not required for this step.
+/// A path is rejected because it is neither inside a Git-backed project root
+/// nor inside a vcs-less operational root proven by the live Herdr snapshot.
+/// When the snapshot exposes no validated roots, the hint must tell the user
+/// to open/create a Herdr workspace or pane whose cwd is exactly the intended
+/// directory, keep it available, then retry. A coding agent is not required
+/// for this step.
 pub fn outside_managed_roots_hint() -> &'static str {
-    "only paths inside git-backed project roots visible in the live snapshot are accessible; open or create a Herdr workspace/pane whose cwd is inside the intended Git repository and keep it available, then retry (no coding agent required)"
+    "only paths inside project roots visible in the live snapshot are accessible: a Git-backed project root, or a non-Git operational root exactly proven by a live Herdr workspace/pane cwd; open or create a Herdr workspace/pane whose cwd is exactly the intended directory (or is inside the intended Git repository) and keep it available, then retry (no coding agent required)"
 }
 
 pub fn denied_secret_path(path: &Path) -> bool {
@@ -409,6 +584,253 @@ mod tests {
         })
     }
 
+    /// A vcs-less scratch parent plus the named child directories under it.
+    fn plain_parent(name: &str, children: &[&str]) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sequence = NEXT_REPO_ID.fetch_add(1, Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "herdr-mcp-operational-{name}-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&parent).unwrap();
+        for child in children {
+            fs::create_dir_all(parent.join(child)).unwrap();
+        }
+        parent
+    }
+
+    #[test]
+    fn exact_live_non_git_cwd_is_an_operational_root() {
+        let parent = plain_parent("exact", &["project"]);
+        let root = parent.join("project");
+        let file = root.join("artifact.md");
+        fs::write(&file, "lark-cli output\n").unwrap();
+        let snap = snapshot(&root);
+
+        let topology = projects::derive_routing(&snap);
+        let project = topology.projects.get(&root).unwrap();
+        assert_eq!(project.vcs, None);
+        // Operational roots never claim managed-Git or fabricate Git state.
+        assert!(!project.managed);
+        assert!(!project.dirty);
+        assert_eq!(project.changed_files, 0);
+        assert!(!project.git_status_observed);
+        assert_eq!(project.git_status_source, None);
+        assert!(is_operational_root(&topology, &root));
+
+        let validated = validate_existing_validated(&snap, file.to_str().unwrap()).unwrap();
+        assert_eq!(validated.root, root);
+        assert_eq!(validated.real, fs::canonicalize(&file).unwrap());
+        assert_eq!(
+            validated_roots_from(&topology),
+            vec![root.clone()],
+            "the proven live cwd is the operational root identity"
+        );
+
+        // Git semantics are unchanged: the Git-only surface still refuses it.
+        assert_eq!(managed_roots(&snap), Vec::<PathBuf>::new());
+        assert_eq!(
+            validate_existing(&snap, file.to_str().unwrap()).unwrap_err()["reason"],
+            "outside_managed_roots"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn unproven_siblings_and_parent_directories_are_rejected() {
+        let parent = plain_parent("sibling", &["project", "other", "elsewhere"]);
+        let root = parent.join("project");
+        let sibling_file = parent.join("other/artifact.md");
+        fs::write(&sibling_file, "not mine\n").unwrap();
+        let snap = snapshot(&root);
+
+        // A sibling directory is never covered by the proven root.
+        assert_eq!(
+            validate_existing_validated(&snap, sibling_file.to_str().unwrap()).unwrap_err()["reason"],
+            "outside_managed_roots"
+        );
+        // Neither is the shared parent that only contains the proven root.
+        assert_eq!(
+            validate_existing_validated(&snap, parent.to_str().unwrap()).unwrap_err()["reason"],
+            "outside_managed_roots"
+        );
+        // A declared workspace root without an exact live cwd is not proof.
+        let declared = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": root.to_string_lossy()}
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": parent.join("elsewhere").to_string_lossy()
+            }],
+            "agents": []
+        });
+        assert_eq!(
+            validate_existing_validated(&declared, root.join("artifact.md").to_str().unwrap())
+                .unwrap_err()["reason"],
+            "outside_managed_roots"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tcc_delegated_documents_root_is_proven_by_metadata_and_still_fails_closed() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on this host"));
+        // Never touch user data: the directory deliberately does not exist, so
+        // this exercises exactly the runtime's TCC-delegated case (the
+        // rotating runtime cannot resolve Documents paths by design).
+        let root = home
+            .join("Documents")
+            .join("herdr-mcp-operational-root-not-present");
+        let snap = snapshot(&root);
+        let topology = projects::derive_routing(&snap);
+        assert!(is_operational_root(&topology, &root));
+        assert!(
+            validate_exact_validated_root_with_topology(&topology, root.to_str().unwrap()).is_ok(),
+            "the protected exec preflight is metadata-only"
+        );
+
+        // Reads still fail closed: existence/symlink verification belongs to
+        // the TCC broker, never to an inferred directory.
+        let refused = validate_existing_validated(&snap, root.to_str().unwrap()).unwrap_err();
+        assert_ne!(refused["ok"], true, "{refused}");
+        assert!(
+            matches!(
+                refused["reason"].as_str(),
+                Some("not_found") | Some("macos_tcc_access_blocked")
+            ),
+            "{refused}"
+        );
+
+        // HOME itself under the same hierarchical prefix is still refused.
+        assert_eq!(
+            validate_existing_validated(&snapshot(&home), home.to_str().unwrap()).unwrap_err()["reason"],
+            "outside_managed_roots"
+        );
+    }
+
+    #[test]
+    fn home_and_its_ancestors_are_never_operational_roots() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on this host"));
+        let mut candidates = vec![home.clone()];
+        let mut ancestor = home.as_path();
+        while let Some(parent) = ancestor.parent() {
+            candidates.push(parent.to_path_buf());
+            ancestor = parent;
+        }
+        for candidate in candidates {
+            let snap = snapshot(&candidate);
+            assert_eq!(
+                validate_existing_validated(&snap, candidate.to_str().unwrap()).unwrap_err()["reason"],
+                "outside_managed_roots",
+                "{} must never be an operational root",
+                candidate.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_home_is_not_an_operational_root() {
+        use std::os::unix::fs::symlink;
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on this host"));
+        let parent = plain_parent("symlink-home", &[]);
+        let link = parent.join("innocent");
+        symlink(&home, &link).unwrap();
+        let snap = snapshot(&link);
+        assert_eq!(
+            validate_existing_validated(&snap, link.to_str().unwrap()).unwrap_err()["reason"],
+            "outside_managed_roots"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn secret_like_roots_and_targets_are_rejected() {
+        let parent = plain_parent("denied", &["work", "api-secrets", "credentials-store"]);
+        for child in ["api-secrets", "credentials-store"] {
+            let root = parent.join(child);
+            let snap = snapshot(&root);
+            assert_eq!(
+                validate_existing_validated(&snap, root.to_str().unwrap()).unwrap_err()["reason"],
+                "outside_managed_roots",
+                "{child} must not become an operational root"
+            );
+        }
+
+        let root = parent.join("work");
+        let env_file = root.join(".env");
+        fs::write(&env_file, "TOKEN=1\n").unwrap();
+        let snap = snapshot(&root);
+        assert_eq!(
+            validate_existing_validated(&snap, env_file.to_str().unwrap()).unwrap_err()["reason"],
+            "secret_path_denied"
+        );
+        assert!(validate_existing_validated(&snap, root.to_str().unwrap()).is_ok());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_inside_an_operational_root_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let parent = plain_parent("escape", &["project"]);
+        let root = parent.join("project");
+        let outside = parent.join("outside.txt");
+        fs::write(&outside, "outside\n").unwrap();
+        let link = root.join("escape.txt");
+        symlink(&outside, &link).unwrap();
+        let snap = snapshot(&root);
+        assert_eq!(
+            validate_existing_validated(&snap, link.to_str().unwrap()).unwrap_err()["reason"],
+            "symlink_escape"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn git_root_behavior_is_unchanged_by_the_operational_surface() {
+        let root = repo();
+        let file = root.join("src.txt");
+        fs::write(&file, "hello").unwrap();
+        let snap = snapshot(&root);
+        let topology = projects::derive_routing(&snap);
+
+        assert!(managed_roots_from(&topology).contains(&root));
+        assert!(!is_operational_root(&topology, &root));
+        assert!(reject_operational_root_mutation(&topology, &root).is_none());
+        let git_only = validate_existing(&snap, file.to_str().unwrap()).unwrap();
+        let validated = validate_existing_validated(&snap, file.to_str().unwrap()).unwrap();
+        assert_eq!(git_only.root, validated.root);
+        assert_eq!(git_only.real, validated.real);
+        assert_eq!(
+            validate_exact_project_root_with_topology(&topology, root.to_str().unwrap())
+                .unwrap()
+                .root,
+            root
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operational_roots_fail_closed_for_git_dirty_confirmation() {
+        let parent = plain_parent("mutation", &["project"]);
+        let root = parent.join("project");
+        let snap = snapshot(&root);
+        let topology = projects::derive_routing(&snap);
+        let denied = reject_operational_root_mutation(&topology, &root)
+            .expect("operational roots must fail closed for Git-dirty gates");
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["reason"], "operational_root_mutation_unsupported");
+        fs::remove_dir_all(parent).unwrap();
+    }
+
     #[test]
     fn managed_roots_from_matches_snapshot_derive() {
         let root = repo();
@@ -418,7 +840,7 @@ mod tests {
         let file = root.join("src.txt");
         fs::write(&file, "hello").unwrap();
         let via_topology =
-            validate_existing_with_topology(&topology, file.to_str().unwrap()).unwrap();
+            validate_existing_validated_with_topology(&topology, file.to_str().unwrap()).unwrap();
         let via_snapshot = validate_existing(&snap, file.to_str().unwrap()).unwrap();
         assert_eq!(via_topology.root, via_snapshot.root);
         assert_eq!(via_topology.real, via_snapshot.real);
@@ -538,7 +960,8 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         let target = src.join("new.rs");
         let topology = projects::derive_routing(&snapshot(&root));
-        let validated = validate_target_with_topology(&topology, target.to_str().unwrap()).unwrap();
+        let validated =
+            validate_target_validated_with_topology(&topology, target.to_str().unwrap()).unwrap();
         assert_eq!(validated.root, root);
         assert_eq!(
             validated.real,
@@ -547,7 +970,8 @@ mod tests {
 
         let missing_parent = root.join("missing/new.rs");
         let error =
-            validate_target_with_topology(&topology, missing_parent.to_str().unwrap()).unwrap_err();
+            validate_target_validated_with_topology(&topology, missing_parent.to_str().unwrap())
+                .unwrap_err();
         assert_eq!(error["reason"], "parent_not_found");
         fs::remove_dir_all(validated.root).unwrap();
     }

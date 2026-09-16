@@ -40,7 +40,7 @@ pub fn read(snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let managed = match fs_security::validate_existing(snapshot, path) {
+    let managed = match fs_security::validate_existing_validated(snapshot, path) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -148,7 +148,7 @@ struct PreparedImage {
 
 pub fn image(snapshot: &Value, args: &Value) -> Result<ImageData, Value> {
     let path = required_str(args, "path")?;
-    let managed = fs_security::validate_existing(snapshot, path)?;
+    let managed = fs_security::validate_existing_validated(snapshot, path)?;
     let max_bytes = optional_usize(args, "max_bytes", 1, 8_000_000)?.unwrap_or(2_097_152);
     let metadata = fs::metadata(&managed.real).map_err(|error| {
         crate::macos_permissions::io_error_to_fs_value("stat_failed", &managed.resolved, error)
@@ -324,7 +324,7 @@ pub fn list(snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let managed = match fs_security::validate_existing(snapshot, path) {
+    let managed = match fs_security::validate_existing_validated(snapshot, path) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -412,7 +412,7 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
         Ok(value) => value,
         Err(error) => return error,
     };
-    let managed = match fs_security::validate_existing(snapshot, root) {
+    let managed = match fs_security::validate_existing_validated(snapshot, root) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -1229,6 +1229,67 @@ fn fail(reason: &str, path: &Path, message: Option<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vcs-less directory whose cwd is proven exactly by the live snapshot.
+    fn operational_root() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-fs-operational-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        root
+    }
+
+    fn operational_snapshot(root: &Path) -> Value {
+        json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": []
+        })
+    }
+
+    #[test]
+    fn read_list_and_grep_accept_a_vcs_less_operational_root() {
+        let root = operational_root();
+        let file = root.join("notes.md");
+        fs::write(&file, "alpha line\nbeta line\n").unwrap();
+        fs::write(root.join("nested/inner.md"), "gamma line\n").unwrap();
+        let snap = operational_snapshot(&root);
+
+        let read_result = read(&snap, &json!({"path": file}));
+        assert_eq!(read_result["ok"], true, "{read_result}");
+        assert_eq!(read_result["root"], json!(root.to_string_lossy()));
+        assert!(
+            read_result["content"]
+                .as_str()
+                .unwrap()
+                .contains("alpha line")
+        );
+
+        let listed = list(&snap, &json!({"path": root, "recursive": true}));
+        assert_eq!(listed["ok"], true, "{listed}");
+        assert_eq!(listed["root"], json!(root.to_string_lossy()));
+        assert!(listed["count"].as_u64().unwrap() >= 2);
+
+        let grepped = grep(&snap, &json!({"root": root, "pattern": "line"}));
+        assert_eq!(grepped["ok"], true, "{grepped}");
+        assert!(grepped["matches"].as_array().unwrap().len() >= 2);
+
+        // A sibling outside the proven root stays refused.
+        let sibling = std::env::temp_dir().join(format!(
+            "herdr-mcp-fs-operational-sibling-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("other.md"), "other\n").unwrap();
+        let refused = read(&snap, &json!({"path": sibling.join("other.md")}));
+        assert_eq!(refused["reason"], "outside_managed_roots");
+        fs::remove_dir_all(&sibling).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn byte_budget_never_returns_partial_line() {
