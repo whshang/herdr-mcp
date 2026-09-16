@@ -942,7 +942,7 @@ const H2W_CONTENT_VERSION = "0.1.97";
         for (let i = 0; i < 40; i++) {
           const btn = findSendButton();
           if (isSendButton(btn)) {
-            if (ADAPTER.name === "chatgpt" && attempt === 0 && ADAPTER.inputHasContent()) {
+            if (ADAPTER.name === "chatgpt" && attempt === 0) {
               const selector = ADAPTER.getWatchMainWorldSelector();
               const mainBaseline = captureSubmitAckBaseline(btn);
               const mainSubmit = selector ? await submitMainWorld(selector) : null;
