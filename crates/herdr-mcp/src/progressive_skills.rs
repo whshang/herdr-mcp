@@ -887,20 +887,21 @@ pub struct ProgressiveSkillService {
     cache: Mutex<HashMap<SkillIdentity, CachedSkill>>,
 }
 
+fn progressive_enabled_from_env_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "off" | "legacy")
+    )
+}
+
 impl ProgressiveSkillService {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn enabled_from_env() -> bool {
-        std::env::var("HERDR_MCP_PROGRESSIVE_SKILLS")
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "on" | "progressive"
-                )
-            })
+        let value = std::env::var("HERDR_MCP_PROGRESSIVE_SKILLS").ok();
+        progressive_enabled_from_env_value(value.as_deref())
     }
 
     pub fn catalog(&self) -> Vec<SkillDescriptor> {
@@ -1905,6 +1906,23 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progressive_skills_are_default_on_with_explicit_legacy_opt_out() {
+        assert!(progressive_enabled_from_env_value(None));
+        for enabled in ["1", "true", "on", "progressive", "unexpected"] {
+            assert!(
+                progressive_enabled_from_env_value(Some(enabled)),
+                "{enabled}"
+            );
+        }
+        for disabled in ["0", "false", "off", "legacy", " OFF "] {
+            assert!(
+                !progressive_enabled_from_env_value(Some(disabled)),
+                "{disabled}"
+            );
+        }
+    }
 
     fn snapshot() -> Value {
         json!({

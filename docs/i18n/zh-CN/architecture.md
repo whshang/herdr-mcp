@@ -144,7 +144,7 @@ safe dispatch decision
 
 unknown 的语义是**未验证**，不是 false，也不是“按经验应该支持”。probe 必须非交互、有超时、有输出上限、不继承凭据，只允许明确的 Agent 自描述 adapter 把字段升级为 verified。完整 probe evidence 留给诊断，模型可见的 Progressive bootstrap 只得到紧凑计数和已验证 worker trait。
 
-Modular Progressive Skills 已进入 Rust runtime，但通过 `HERDR_MCP_PROGRESSIVE_SKILLS` 保留兼容开关。在 capability-aware 多 Agent UAT 足以支持默认迁移之前，默认行为仍保持 legacy。
+Modular Progressive Skills 现在是 `herdr_skill` 的默认 runtime 形态：首次响应只返回全局 policy、紧凑 catalog/capability 摘要和按需 load contract，不再默认灌入完整 policy bundle。兼容期仍可显式设置 `HERDR_MCP_PROGRESSIVE_SKILLS=0|false|off|legacy` 回到 legacy full response，供尚未迁移的下游 consumer 使用。
 
 ## 两条数据路径
 

@@ -92,14 +92,14 @@ Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint
 
 ### Modular Progressive Skills / Capability Scan
 
-状态：Progressive implementation 已进入 production binary；根据 `v0.4.2` Wave B 的 contract/consumer 审计，当前继续 opt-in、默认 OFF。Capability Scan / Resolver 已补齐。
+状态：Progressive implementation 已进入 production binary；Capability Scan / Resolver 已补齐，`herdr_skill` 默认返回紧凑 Progressive bootstrap。legacy full response 暂时保留为显式兼容 opt-out。
 
 冻结边界：
 
-- workstation Runtime Execution Contract 当前为 epoch 3 / 18 tools；公共 Edge 的第 19 个 action `herdr_devices` 独立于这套 runtime tool catalog；Progressive Skills 本身不增加 runtime tool；
+- workstation Runtime Execution Contract 当前为 epoch 4 / 18 tools；公共 Edge 的第 19 个 action `herdr_devices` 独立于这套 runtime tool catalog；Progressive Skills 本身不增加 runtime tool；
 - `herdr_mcp.skill.list/describe/load` 只走现有 `herdr_call` local namespace；
 - giant policy 拆为 global `AGENTS.md` + 8 个 on-demand Skill；其中 `engineering-robustness` 把 regression-first、silent-wrongness、AI self-verification 与多 state-plane 验收作为按需 reference 内化；
-- `HERDR_MCP_PROGRESSIVE_SKILLS` 在真实多 Agent UAT 前保持兼容默认；
+- `HERDR_MCP_PROGRESSIVE_SKILLS=0|false|off|legacy` 作为 legacy full response 的显式兼容 opt-out；默认不设置时走 Progressive；
 - unknown capability 永远不按 Agent 名称猜测。
 
 Capability truth：
