@@ -2173,11 +2173,52 @@ const H2W_CONTENT_VERSION = "0.1.97";
   let chatGptProjectCatalogCache = { accountNativeIdentity: null, fetchedAt: 0, projects: [] };
   const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
   const BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS = 5 * 60 * 1000;
+  let browserPendingDispatchRefresh = null;
   // Exact accepted provider user-message identity reported by the last proven
   // browser_dispatch.submit. Used as the settlement fallback only when a live
   // provider snapshot omits the user message id; it never invents an identity.
   const acceptedDispatchAssignments = new Map();
   let durableArchiveRetryTimer = null;
+
+  function clearBrowserPendingDispatchRefresh(removeStoredReservation = false) {
+    browserPendingDispatchRefresh = null;
+    if (removeStoredReservation) {
+      try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+    }
+  }
+
+  function armBrowserPendingDispatchRefresh(reservationRef) {
+    if (!/^bsr_[0-9a-f]{64}$/.test(String(reservationRef || ""))) return;
+    if (browserPendingDispatchRefresh?.reservationRef === reservationRef) return;
+    browserPendingDispatchRefresh = {
+      reservationRef,
+      until: Date.now() + BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS,
+      nextAt: Date.now() + 1000,
+      retryMs: 1000,
+      inFlight: false,
+    };
+  }
+
+  function maybeRefreshBrowserPendingDispatchAssignment() {
+    const refresh = browserPendingDispatchRefresh;
+    if (!refresh) return;
+    if (registeredBrowserSessionRef && acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+      clearBrowserPendingDispatchRefresh(true);
+      return;
+    }
+    if (Date.now() >= refresh.until) {
+      clearBrowserPendingDispatchRefresh(true);
+      return;
+    }
+    if (document.hidden || refresh.inFlight || Date.now() < refresh.nextAt) return;
+    refresh.inFlight = true;
+    refresh.nextAt = Date.now() + refresh.retryMs;
+    refresh.retryMs = Math.min(refresh.retryMs * 2, 30000);
+    void registerCurrentConversation("session-create-pending-dispatch")
+      .finally(() => {
+        if (browserPendingDispatchRefresh === refresh) refresh.inFlight = false;
+      });
+  }
 
   function scheduleDurableArchiveRetryWake(convKey, delayMs) {
     const targetConvKey = String(convKey || "").trim();
@@ -2697,10 +2738,15 @@ const H2W_CONTENT_VERSION = "0.1.97";
         && response.browser_generation > 0
         ? response.browser_generation
         : null;
-      if (browserSessionReservationRef && registeredBrowserSessionRef) {
-        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
-      }
       restoreBrowserResultAssignment(response?.browser_pending_dispatch);
+      if (browserSessionReservationRef && registeredBrowserSessionRef) {
+        if (response?.browser_pending_dispatch
+            || acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+          clearBrowserPendingDispatchRefresh(true);
+        } else {
+          armBrowserPendingDispatchRefresh(browserSessionReservationRef);
+        }
+      }
       const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
       if (concreteChat) {
         await ensureConversationHealth(convKey);
@@ -2736,6 +2782,7 @@ const H2W_CONTENT_VERSION = "0.1.97";
     setInterval(() => {
       void observeBrowserResultSettlement().catch(() => {});
       if (document.hidden) return;
+      maybeRefreshBrowserPendingDispatchAssignment();
       const convKey = ADAPTER.getConversationKey();
       if (convKey && convKey !== registeredConvKey) void registerCurrentConversation("poll");
       if (ADAPTER.name === "chatgpt") ensureQueuedInsertButton();

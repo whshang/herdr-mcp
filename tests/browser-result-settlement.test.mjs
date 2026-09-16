@@ -483,6 +483,15 @@ test("session.create settlement survives unmatched results while dispatch persis
   assert.equal(h.sent.length, 5);
 });
 
+test("session.create re-registers boundedly until its synthesized pending dispatch is discoverable", () => {
+  assert.match(wakeSource, /function armBrowserPendingDispatchRefresh\(reservationRef\)/);
+  assert.match(wakeSource, /until:\s*Date\.now\(\) \+ BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS/);
+  assert.match(wakeSource, /refresh\.retryMs = Math\.min\(refresh\.retryMs \* 2, 30000\)/);
+  assert.match(wakeSource, /registerCurrentConversation\("session-create-pending-dispatch"\)/);
+  assert.match(wakeSource, /response\?\.browser_pending_dispatch\s*\|\|\s*acceptedDispatchAssignments\.has\(registeredBrowserSessionRef\)/);
+  assert.match(wakeSource, /maybeRefreshBrowserPendingDispatchAssignment\(\);/);
+});
+
 test("persistent identity rejection stops retries but a new assignment can proceed", async () => {
   const h = observationHarness({ snapshots: [...Array(3).fill(completedWorkerSnapshot), { ...completedWorkerSnapshot, userMessageId: "user-2", messageId: "assistant-2" }], sends: [...Array(3).fill({ ok: false, error: "browser_dispatch_result_unmatched" }), { ok: true }] });
   for (let i = 0; i < 10; i += 1) { await h.observe(); h.advance(60000); }
