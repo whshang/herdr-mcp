@@ -99,11 +99,11 @@ native Herdr method
 
 This preserves native reachability without turning every Herdr method into a permanent public MCP ABI.
 
-The workstation Runtime Execution Contract remains **epoch 2 / 18 tools**. The current public Edge contract remains **epoch 3 / 19 actions**, introduced in v0.4.3 by adding Edge-local `herdr_devices`; workstation tool-catalog changes remain explicit contract migrations, not incidental runtime changes.
+The workstation Runtime Execution Contract is **epoch 4 / 18 tools**. The current first-party DEV/PROD public Edge contract is **epoch 7 / 19 actions**; workstation tool-catalog changes remain explicit contract migrations, not incidental runtime changes. Runtime epochs 2/3 and the public Edge epoch-3 identity are kept only as bounded rollback/compatibility baselines.
 
 ## Progressive skills and capability truth
 
-The epoch-2 tool catalog stays fixed, but the planner policy no longer has to be one giant always-loaded document. The Rust runtime contains a compact global `AGENTS.md` plus eight on-demand modules: workstation control, file search, file mutation, Git, execution, agent dispatch, development orchestration, and engineering robustness/self-verification. Internal `herdr_mcp.skill.list/describe/load` methods are reached through the existing `herdr_call`; they do not add a nineteenth public MCP tool.
+The frozen 18-tool catalog stays fixed, but the planner policy no longer has to be one giant always-loaded document. The Rust runtime contains a compact global `AGENTS.md` plus eight on-demand modules: workstation control, file search, file mutation, Git, execution, agent dispatch, development orchestration, and engineering robustness/self-verification. Internal `herdr_mcp.skill.list/describe/load` methods are reached through the existing `herdr_call`; they do not add a nineteenth public MCP tool.
 
 The progressive path is deliberately separated from capability truth. A worker is not treated as code-edit capable, vision capable, high-reasoning, or tied to a provider/model merely because of its product name. `herdr-mcp scan` builds evidence instead:
 

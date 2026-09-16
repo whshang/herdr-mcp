@@ -93,7 +93,7 @@ Herdr 本身拥有大量 Socket API 方法。herdr-mcp 没有把它们逐个包�
 
 ## 18 个工具为什么够用
 
-workstation Runtime Execution Contract 当前固定为 **epoch 2 / 18 tools**；当前公共 Edge contract 仍是 **epoch 3 / 19 actions**，该 contract 自 v0.4.3 引入，新增项仅为 Edge-local `herdr_devices`。设计目标是让模型容易选对工具，而不是让工具列表看起来壮观。
+workstation Runtime Execution Contract 当前为 **epoch 4 / 18 tools**；first-party DEV/PROD 公共 Edge contract 当前为 **epoch 7 / 19 actions**，其 action 集包含 Edge-local `herdr_devices`。设计目标是让模型容易选对工具，而不是让工具列表看起来壮观。
 
 ### 1. 观察：我现在在哪
 
@@ -121,7 +121,7 @@ workstation Runtime Execution Contract 当前固定为 **epoch 2 / 18 tools**；
 
 ## Progressive Skills 与 Capability Truth
 
-epoch 2 的 18-tool catalog 保持不变，但 planner policy 不必永远加载成一份巨大的 Skill 文本。Rust runtime 已内置 compact global `AGENTS.md` 和 8 个按需模块：workstation control、files search、files mutation、Git、execution、agent dispatch、development orchestration，以及 engineering robustness/self-verification。内部 `herdr_mcp.skill.list/describe/load` 仍通过现有 `herdr_call` 进入，不增加第 19 个公共 MCP tool。
+冻结的 18-tool catalog 保持不变，但 planner policy 不必永远加载成一份巨大的 Skill 文本。Rust runtime 已内置 compact global `AGENTS.md` 和 8 个按需模块：workstation control、files search、files mutation、Git、execution、agent dispatch、development orchestration，以及 engineering robustness/self-verification。内部 `herdr_mcp.skill.list/describe/load` 仍通过现有 `herdr_call` 进入，不增加第 19 个公共 MCP tool。
 
 模块化 Skill 和“Agent 到底会什么”是两个独立问题。系统不会因为一个进程叫 Pi、Claude、Codex 或 Grok，就直接认定它一定支持 code edit、vision、某个 provider/model 或某档 reasoning。能力事实由 `herdr-mcp scan` 建立：
 
@@ -256,7 +256,7 @@ Herdr daemon 的 snapshot / event 聚合偶尔可能出现 TaskGroup / Exception
 
 Runtime A/B 把“ChatGPT 连哪里”和“当前跑哪个本地版本”分开。新 runtime 先构建、验证 contract、健康检查，再切换 active generation；旧 generation 可以排空或回滚。详见 [Runtime A/B 自升级](runtime-self-upgrade.md)。
 
-工具契约发生不兼容变化时使用 contract epoch 管理。当前 workstation Runtime Execution Contract 为 epoch 2 / 18 tools，公共 Edge contract 为 epoch 3 / 19 actions；旧 epoch 仅用于明确的兼容和回滚场景。
+工具契约发生不兼容变化时使用 contract epoch 管理。当前 workstation Runtime Execution Contract 为 epoch 4 / 18 tools，first-party DEV/PROD 公共 Edge contract 为 epoch 7 / 19 actions；Runtime epoch 2/3 与公共 Edge epoch 3 仅用于有界的兼容和回滚场景。
 
 ## 进程与职责
 

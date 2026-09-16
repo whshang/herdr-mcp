@@ -63,7 +63,7 @@ Herdr 原生 Socket API 很丰富，而且会持续演进。
   → herdr_methods + herdr_call
 ```
 
-当前 workstation Runtime Execution Contract 是 **epoch 2 / 18 tools**；当前公共 Edge contract 仍是 **epoch 3 / 19 actions**，该 contract 自 v0.4.3 引入，新增项为 Edge-local `herdr_devices`。以后 catalog 变化也必须显式进入新的 contract epoch，不能由一次 runtime 重构顺手改变。
+当前 workstation Runtime Execution Contract 是 **epoch 4 / 18 tools**；first-party DEV/PROD 公共 Edge contract 是 **epoch 7 / 19 actions**，其 action 集包含 Edge-local `herdr_devices`。Runtime epoch 2/3 与公共 Edge epoch 3 仅作为有界的 rollback/compatibility 基线保留。以后 catalog 变化也必须显式进入新的 contract epoch，不能由一次 runtime 重构顺手改变。
 
 ## 取舍二：文件 / Git / Shell 必须是一等能力
 

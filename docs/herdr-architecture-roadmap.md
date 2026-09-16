@@ -12,7 +12,7 @@
 
 - **Rust runtime 拥有生产 MCP / service / updater / Link / Native Messaging 路径**；`bin/herdr-extension-host` 只是委托 Rust 的兼容入口，不是第二套 installer/broker。
 - **生产 Link 是 Rust**，执行 `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`。
-- **公共 Edge contract 为 epoch 3 / 19 actions，workstation Runtime Execution Contract 为 epoch 3 / 18 tools**；第 19 个 `herdr_devices` 由 Edge 本地执行，不转发到 workstation。
+- **first-party DEV/PROD 公共 Edge contract 为 epoch 7 / 19 actions，workstation Runtime Execution Contract 为 epoch 4 / 18 tools**；第 19 个 `herdr_devices` 由 Edge 本地执行，不转发到 workstation；Runtime epoch 2/3 与公共 Edge epoch 3 仅作为有界的 rollback/compatibility 身份保留。
 - **浏览器控制面是有界的**：不宣称 browser true-steer；普通终端只开放有 target fencing 的窄化 `Run command -> pane.send_input + Enter`，任意 Herdr method 仍保持 preview-only。
 - **`v0.4.8` 是当前稳定 0.4.x 产品基线**；1.0 未发布能力仍必须描述为 development/upcoming，不能提前写成当前产品能力。
 
@@ -22,7 +22,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 - 用户只看到稳定、高速、低等待的工具体验；
 - Rust runtime 负责确定性、安全边界和可靠状态；
-- 工具性能优化不得原地修改已冻结的 Runtime Execution contract；当前为 epoch 3 / 18 tools，model-visible 变化必须显式演进新 epoch；
+- 工具性能优化不得原地修改已冻结的 Runtime Execution contract；当前为 epoch 4 / 18 tools，model-visible 变化必须显式演进新 epoch；
 - 新能力优先进入内部 runtime/state，不增加模型每轮 schema 负担。
 
 核心原则：
@@ -96,7 +96,7 @@ Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint
 
 冻结边界：
 
-- workstation Runtime Execution Contract 当前为 epoch 3 / 18 tools；公共 Edge 的第 19 个 action `herdr_devices` 独立于这套 runtime tool catalog；Progressive Skills 本身不增加 runtime tool；
+- workstation Runtime Execution Contract 当前为 epoch 4 / 18 tools；first-party DEV/PROD 公共 Edge contract 当前为 epoch 7 / 19 actions，其第 19 个 action `herdr_devices` 独立于这套 runtime tool catalog；Progressive Skills 本身不增加 runtime tool；
 - `herdr_mcp.skill.list/describe/load` 只走现有 `herdr_call` local namespace；
 - giant policy 拆为 global `AGENTS.md` + 8 个 on-demand Skill；其中 `engineering-robustness` 把 regression-first、silent-wrongness、AI self-verification 与多 state-plane 验收作为按需 reference 内化；
 - `HERDR_MCP_PROGRESSIVE_SKILLS` 在真实多 Agent UAT 前保持兼容默认；
@@ -327,7 +327,7 @@ Continuity 2.0 是 `v0.4.2` 之后的正式未来版本目标之一，但**当�
 
 工具性能作为独立 lane 演进，详细历史与基准见 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)。Batch A/B 的普通优化不得原地改变当前 Runtime Execution visible contract；历史 Batch A/B 在 epoch 2 / 18-tool 下完成，后续 model-visible 变化必须走独立 contract epoch；生产 Rust Link 已是稳定基线，不再作为性能 lane 的并行 cutover 任务。只有测量证明固定 MCP/model round-trip 仍是主要瓶颈后，才在未来明确评估 multi-operation tool schema / JSON-RPC batch 与 contract epoch 演进，禁止把 model-visible schema 变化混入普通 Rust 重构。
 
-长任务可观察性作为性能与可靠性并行 lane 纳入 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)。该 lane 通过 Task Journal、phase event 和 checkpoint 提供长 release/CI/deploy/self-upgrade 过程的阶段反馈，不替代 Git/runtime live state，也不原地改变当前 epoch 3 / 18 tools Runtime Execution contract。
+长任务可观察性作为性能与可靠性并行 lane 纳入 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)。该 lane 通过 Task Journal、phase event 和 checkpoint 提供长 release/CI/deploy/self-upgrade 过程的阶段反馈，不替代 Git/runtime live state，也不原地改变当前 epoch 4 / 18 tools Runtime Execution contract。
 
 ## 暂不进入主线
 

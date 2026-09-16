@@ -106,17 +106,17 @@ OAuth success does not prove that the workstation is online.
 
 ChatGPT uses a reviewed/frozen snapshot of MCP action definitions. A runtime or Edge deployment does not automatically enable newly added actions in an already approved workspace app.
 
-Herdr 0.4.3 separates the two contracts intentionally:
+Herdr 0.4.3 introduced the intentional separation of the two contracts:
 
-**public ChatGPT contract: epoch 3 / 19 tools; workstation runtime execution contract: epoch 2 / 18 tools.** The extra public action is Edge-local `herdr_devices`; it is never forwarded to a workstation.
+**public ChatGPT contract (first-party DEV/PROD): epoch 7 / 19 actions; workstation runtime execution contract: epoch 4 / 18 tools.** The extra public action is Edge-local `herdr_devices`; it is never forwarded to a workstation. Runtime epochs 2/3 and the public Edge epoch-3 identity are retained only as bounded rollback/compatibility baselines.
 
 Example:
 
 ```text
-Server: public epoch 3 / 19 tools
+Server: public epoch 7 / 19 actions
 
-Refreshed action set   ✓ can expose epoch 3
-Old/frozen action set  → may remain on 18 tools
+Refreshed action set   ✓ can expose epoch 7
+Old/frozen action set  → may remain on an older action set
 ```
 
 After runtime upgrades:

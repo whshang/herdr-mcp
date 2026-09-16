@@ -82,7 +82,7 @@ HERDR_LINK_PROXY > HTTPS_PROXY/https_proxy > HTTP_PROXY/http_proxy > ALL_PROXY/a
 
 ### 4. 新 ChatGPT 会话有当前工具吗
 
-当前 ChatGPT 公共 contract 是 **epoch 3 / 19 actions**。workstation execution 仍是 **epoch 2 / 18 tools**，其中包含 `herdr_skill`；额外的公共 action 是只在 Edge 执行的 `herdr_devices`。
+当前 first-party DEV/PROD 的 ChatGPT 公共 contract 是 **epoch 7 / 19 actions**。workstation execution 是 **epoch 4 / 18 tools**，其中包含 `herdr_skill`；额外的公共 action 是只在 Edge 执行的 `herdr_devices`。Runtime epoch 2/3 与公共 Edge epoch 3 仅作为有界的 rollback/compatibility 基线保留。
 
 旧聊天可能保留旧 `tools/list` 快照。确认服务端版本后，优先刷新 App/Connector actions（如果当前 ChatGPT UI 提供）并**新开会话**，不要先重装本机 runtime。
 
