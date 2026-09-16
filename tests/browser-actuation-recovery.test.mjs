@@ -445,7 +445,7 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
   assert.doesNotMatch(identitySegment, /accountNativeIdentity|email|userId/i);
 });
 
-test("ChatGPT submit keeps bounded fallbacks after MAIN-world requestSubmit has no ack", () => {
+test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and Enter fallbacks", () => {
   assert.match(wakeSource, /function submitMainWorld\(selector\)/);
   assert.match(wakeSource, /type:\s*"h2w_submit_main"/);
   assert.match(backgroundSource, /msg\?\.type === "h2w_submit_main"/);
@@ -454,11 +454,14 @@ test("ChatGPT submit keeps bounded fallbacks after MAIN-world requestSubmit has 
   const submitEnd = wakeSource.indexOf("// ---- Auto-allow", submitStart);
   const submitSegment = wakeSource.slice(submitStart, submitEnd);
   assert.match(submitSegment, /await submitMainWorld\(selector\)/);
-  const mainFallbackStart = submitSegment.indexOf("if (mainSubmit?.ok) {");
-  const mainFallbackEnd = submitSegment.indexOf('console.warn("[h2w] composer still has content after Send click; retrying")', mainFallbackStart);
+  const mainFallbackStart = submitSegment.indexOf("const mainSubmit = selector ? await submitMainWorld(selector) : null;");
+  const mainFallbackEnd = submitSegment.indexOf("const baseline = captureSubmitAckBaseline(btn);", mainFallbackStart);
   assert.ok(mainFallbackStart >= 0 && mainFallbackEnd > mainFallbackStart, "MAIN submit fallback must remain bounded");
   assert.doesNotMatch(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /return false;/);
-  assert.match(submitSegment.slice(mainFallbackEnd), /dispatchEnterSubmit\(el\)/);
+  assert.match(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /waitForSubmitAck\(mainBaseline, 4000\)/);
+  const clickIndex = submitSegment.indexOf("btn.click();", mainFallbackEnd);
+  const enterIndex = submitSegment.indexOf("dispatchEnterSubmit(el)", clickIndex);
+  assert.ok(clickIndex > mainFallbackEnd && enterIndex > clickIndex, "DOM click and Enter remain ordered fallbacks");
 });
 
 test("terminal stale session reservations do not block ordinary browser identity recovery", () => {
