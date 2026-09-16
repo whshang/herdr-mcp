@@ -1,6 +1,6 @@
 //! Provider-neutral Link transport ladder and route selection.
 //!
-//! Implements the Link transport policy specified in `docs/_wip/v0.4.5-release-plan.md`:
+//! Implements the Link transport policy recorded in `docs/history/architecture/v0.4.5-release-plan.md`:
 //! 1. direct Custom Domain when configured/healthy
 //! 2. direct workers.dev
 //! 3. validated explicit/system local proxy (existing HTTP/SOCKS implementation)
