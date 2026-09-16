@@ -939,7 +939,7 @@ const H2W_CONTENT_VERSION = "0.1.97";
       const postInsertMs = Math.min(1200, 350 + Math.floor((ADAPTER.getInputEl()?.innerText?.length || 0) / 40) * 50);
       await wait(postInsertMs);
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (ADAPTER.name === "chatgpt" && attempt === 0) {
+        if (ADAPTER.name === "chatgpt") {
           const selector = ADAPTER.getWatchMainWorldSelector();
           const mainBaseline = captureSubmitAckBaseline(findSendButton());
           const mainSubmit = selector ? await submitMainWorld(selector) : null;

@@ -458,7 +458,8 @@ test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and
   const buttonWaitStart = submitSegment.indexOf("for (let i = 0; i < 40; i++)", mainFallbackStart);
   const mainFallbackEnd = buttonWaitStart;
   assert.ok(mainFallbackStart >= 0 && mainFallbackEnd > mainFallbackStart, "MAIN submit fallback must remain bounded");
-  assert.match(submitSegment.slice(0, mainFallbackStart), /ADAPTER\.name === "chatgpt" && attempt === 0/);
+  assert.match(submitSegment.slice(0, mainFallbackStart), /if \(ADAPTER\.name === "chatgpt"\)/);
+  assert.doesNotMatch(submitSegment.slice(0, mainFallbackStart), /attempt === 0/);
   assert.doesNotMatch(submitSegment.slice(0, mainFallbackEnd), /isSendButton\(btn\)[\s\S]*submitMainWorld/);
   assert.doesNotMatch(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /return false;/);
   assert.match(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /waitForSubmitAck\(mainBaseline, 4000\)/);
