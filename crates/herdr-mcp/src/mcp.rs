@@ -558,8 +558,12 @@ fn continuity_call(
                             limit: 2,
                         })?;
                         match records.as_slice() {
-                            [record] => Ok(Some(record.continuity_id.clone())),
+                            // Project-only evidence is confirmation/search context,
+                            // not a stable exact conversation or browser identity, so it
+                            // must never auto-select a chain even when only one active
+                            // chain exists. Leave the caller to confirm via search.
                             [] => Ok(None),
+                            [_] => Ok(None),
                             _ => Err("continuity_binding_ambiguous".to_owned()),
                         }
                     }
@@ -577,6 +581,9 @@ fn continuity_call(
                     Ok(Some(value)) => value,
                     Ok(None) => {
                         return json!({"ok": false, "code": "continuity_not_found", "conversation_url": raw_url});
+                    }
+                    Err(error) if error == "browser_canonical_url_ambiguous" => {
+                        return json!({"ok": false, "code": "continuity_ambiguous", "conversation_url": raw_url});
                     }
                     Err(error) if error == "continuity_binding_ambiguous" => {
                         return json!({"ok": false, "code": "continuity_ambiguous", "conversation_url": raw_url});
@@ -6581,7 +6588,10 @@ mod tests {
     }
     #[test]
     fn continuity_search_requires_confirmation_without_stable_identity() {
-        use crate::state_store::{ContinuityTurnInput, WorkMemoryBindingInput};
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput, ContinuityTurnInput, WorkMemoryBindingInput,
+        };
         use std::sync::{Arc, Mutex};
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
@@ -6706,8 +6716,8 @@ mod tests {
                 "project_id": "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }),
         );
-        assert_eq!(resumed_identity_project["ok"], true);
-        assert_eq!(resumed_identity_project["continuity_id"], "hc:alpha");
+        assert_eq!(resumed_identity_project["ok"], false);
+        assert_eq!(resumed_identity_project["code"], "continuity_not_found");
 
         let mixed_resume = continuity_call(
             &store,
@@ -6726,8 +6736,8 @@ mod tests {
             "continuity.resume",
             &json!({"conversation_url": "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-project/c/unseen-conv"}),
         );
-        assert_eq!(resumed_project["ok"], true);
-        assert_eq!(resumed_project["continuity_id"], "hc:alpha");
+        assert_eq!(resumed_project["ok"], false);
+        assert_eq!(resumed_project["code"], "continuity_not_found");
 
         let text_only = continuity_call(&store, "continuity.search", &json!({"query": "v0.4.2"}));
         assert_eq!(text_only["candidates"].as_array().unwrap().len(), 1);
@@ -6884,6 +6894,78 @@ mod tests {
         );
         assert_eq!(invalid["ok"], false);
         assert_eq!(invalid["code"], "continuity_search_params_invalid");
+
+        // A single canonical URL observed by two distinct browser sessions is
+        // ambiguous even when one observation is newer. Resuming from the URL must
+        // surface continuity_ambiguous, never a generic read failure or a recency pick.
+        {
+            let mut guard = store.lock().unwrap();
+            for (seed, identity, observed_at) in [
+                ("url-ambig-endpoint-a", "conversation-ambig-a", 100),
+                ("url-ambig-endpoint-b", "conversation-ambig-b", 900),
+            ] {
+                let endpoint = guard
+                    .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                        device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                        profile_seed: seed,
+                        browser_family: "ego",
+                        extension_version: "0.1.91",
+                        observed_at,
+                    })
+                    .unwrap();
+                let generation = if observed_at < 500 { 7 } else { 8 };
+                guard
+                    .observe_browser_provider(BrowserProviderObservationInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        provider: "chatgpt",
+                        adapter_protocol_version: 1,
+                        observation_generation: generation,
+                        capabilities_json: r#"{"operations":["session.inspect"]}"#,
+                        observed_at,
+                    })
+                    .unwrap();
+                let account_identity = format!("{identity}-account");
+                let account = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "account",
+                        parent_ref: None,
+                        native_identity: &account_identity,
+                        display_label: None,
+                        observation_generation: generation,
+                        observed_at,
+                    })
+                    .unwrap();
+                let session = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "session",
+                        parent_ref: Some(&account.resource_ref),
+                        native_identity: identity,
+                        display_label: None,
+                        observation_generation: generation,
+                        observed_at,
+                    })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &session.resource_ref,
+                        "https://chatgpt.com/c/ambiguous-distinct-url",
+                        generation,
+                        observed_at,
+                    )
+                    .unwrap();
+            }
+        }
+        let ambiguous_url_resume = continuity_call(
+            &store,
+            "continuity.resume",
+            &json!({"conversation_url": "https://chatgpt.com/c/ambiguous-distinct-url"}),
+        );
+        assert_eq!(ambiguous_url_resume["ok"], false);
+        assert_eq!(ambiguous_url_resume["code"], "continuity_ambiguous");
     }
 
     #[test]
