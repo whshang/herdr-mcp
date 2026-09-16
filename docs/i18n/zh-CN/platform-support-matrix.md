@@ -12,7 +12,7 @@ Herdr-MCP 有多层彼此独立的协议，它们不会共用一个版本号。
 | --- | --- | --- | --- |
 | 公共 MCP 客户端协议 | `initialize` 协商接受 `2025-11-25`、`2025-06-18`、`2025-03-26`、`2024-11-05`、`2024-10-07` | ChatGPT/OpenAI discovery 可公布探测版本 `2026-07-28`；该值不是额外的 `initialize` 协议版本 | 缺失或无法识别的 `initialize` 协议值会明确降到 legacy baseline `2025-11-25`，不会把未列出的协议对外声明为支持 |
 | 公共 Edge 工具契约 | epoch **3**，**19** 个 action | 旧对话可能保留历史工具快照，但 Edge 只发布当前公共 catalog | 不在当前公共契约内的工具会被拒绝 |
-| Workstation Runtime Execution Contract | epoch **3**，**18** 个工具 | 仅紧邻上一代冻结的 epoch **2**、**18** 个工具作为有界 rollback 基线 | 其他 epoch/hash 组合在 workstation 执行前直接拒绝 |
+| Workstation Runtime Execution Contract | epoch **4**，**18** 个工具 | 紧邻上一代冻结的 epoch **3**、**18** 个工具作为有界 rollback 基线，同时保留仍在现场的冻结 epoch **2**、**18** 个工具 catalog | 其他 epoch/hash 组合在 workstation 执行前直接拒绝 |
 | Relay wire protocol | 数字 `protocol_version = 1` | 无 | 缺失、字符串形式或未知版本会在写入 Relay 状态前被拒绝 |
 | 持久运行时状态 | 当前二进制 schema；自动激活的 Release 必须声明相同且可 rollback 的 state schema | 旧 store 通过追加式迁移事务性升级 | 旧二进制拒绝比自己更新的 store；自动 updater 对 state schema 或 runtime contract identity 不精确匹配的 Release 拒绝激活 |
 
@@ -23,7 +23,7 @@ Herdr-MCP 有多层彼此独立的协议，它们不会共用一个版本号。
 `N` 表示当前部署的 Edge 契约和当前已验证的 runtime generation。
 
 - **N → N** 是常规生产路径。候选 runtime 只有在健康检查和精确 runtime execution contract 验证通过后才能切换流量；Release 更新还要求 manifest 与本地 durable-state schema 匹配。
-- **N-1 runtime execution** 只是有界 rollback，不是任意历史版本兼容承诺。当前仅紧邻上一代冻结的 epoch-2 runtime contract 与当前 epoch 3 同时接受，并且按 epoch + hash 校验；更老的任意 catalog 不会被接收。
+- **N-1 runtime execution** 只是有界 rollback，不是任意历史版本兼容承诺。当前同时接受紧邻上一代冻结的 epoch-3 runtime contract、仍在现场的冻结 epoch-2 catalog 与当前 epoch 4，并且按 epoch + hash 校验；更老的任意 catalog 不会被接收。
 - **N+1 runtime 或 control plane** 不做猜测兼容。未来 epoch、Relay protocol 或 durable-state schema 必须经过显式迁移和验证后才能使用；当前实现会拒绝未知 contract pair 和未来 schema，而不是尝试“尽量降级运行”。
 - **durable state 升级是单向迁移。** SQLite migration 采用追加式、事务性执行。只有旧 binary 仍能读取迁移后的状态时 rollback 才安全，因此自动 Release 激活要求声明的 state schema 保持 rollback-compatible。Runtime rollback 只切回执行所有权，不会撤销已经发生的 Git、文件、远程服务或 Agent 副作用。
 

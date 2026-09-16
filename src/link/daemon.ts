@@ -4,16 +4,16 @@ import { HerdrLink } from "./client.js";
 import { RuntimeControlLoop } from "./runtime-control.js";
 import { RuntimeGenerationManager } from "./runtime-generation.js";
 
-/// Current runtime execution contract epoch 3, shaped from the frozen epoch-2
-/// catalog by `contracts/runtime-exec-v3.json`.
-export const PUBLIC_CONTRACT_EPOCH = 3;
+/// Current runtime execution contract epoch 4, shaped from the frozen epoch-2
+/// catalog by `contracts/runtime-exec-v4.json`.
+export const PUBLIC_CONTRACT_EPOCH = 4;
 export const PUBLIC_CONTRACT_HASH =
-  "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
-/// Immediately previous runtime execution contract (frozen epoch 2). Only the
-/// Edge/Relay acceptance window uses it; the current daemon stays strict.
-export const PREVIOUS_PUBLIC_CONTRACT_EPOCH = 2;
+  "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135";
+/// Previous runtime execution contract epoch 3 (native-default metadata). Only
+/// the Edge/Relay acceptance window uses it; the current daemon stays strict.
+export const PREVIOUS_PUBLIC_CONTRACT_EPOCH = 3;
 export const PREVIOUS_PUBLIC_CONTRACT_HASH =
-  "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
+  "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
 export const LEGACY_EPOCH1_CONTRACT_HASH =
   "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
 

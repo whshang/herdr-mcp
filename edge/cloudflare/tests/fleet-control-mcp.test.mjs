@@ -197,7 +197,7 @@ test("owner-approved possession capability controls fleet without authorizing si
   assert.equal((await h.call("pane.list", { ...cap })).result.code, "invalid_params");
   const tools = await worker.fetch(mcpRequest("planner", 2, "tools/list", {}), h.env);
   assert.deepEqual((await tools.json()).result.tools, EPOCH3_CONTRACT.tools);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 3);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 4);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
   assert.equal(tools.headers.get("mcp-session-id"), null);
   const records = JSON.stringify([...h.oauthStorage.map]);
@@ -274,7 +274,7 @@ test("fleet private method schemas are discoverable without changing the base pu
   assert.deepEqual(listed.body.result.tools, EPOCH3_CONTRACT.tools);
   assert.equal(EPOCH3_CONTRACT.contract_epoch, 3);
   assert.equal(listed.body.result.tools.length, 19);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 3);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 4);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
 });
 

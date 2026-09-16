@@ -224,10 +224,8 @@ continuity_id（永続タスク状態）
         ├─ handoff.message                                   （唯一の canonical メッセージ）
         ├─ automatic_delivery.params = { source_url, message, work_chain_id }
         ├─ manual_delivery.copy_prompt  == handoff.message    （バイト単位で同一）
-        └─ safety { pre_delivery_retry_limit: 1, retry_requires_no_execution_evidence: true,
-                    preserve_mutation_idempotency_key: true, rewrite_rejected_payload: false }
-              └─ herdr_mcp.browser_session.create（automatic_delivery.params をそのまま渡す）
-                   └─ 対象会話の最初の手順は continuity.resume <continuity_id>
+        └─ herdr_mcp.browser_session.create（automatic_delivery.params をそのまま渡す）
+             └─ 対象会話の最初の手順は continuity.resume <continuity_id>
 ```
 
 安全を担保する規則：
@@ -236,7 +234,7 @@ continuity_id（永続タスク状態）
 - 自動配送と手動の **Copy Prompt** は*同じ* canonical メッセージを使います。二つ目の handoff メッセージを書いたり、エンコード・難読化したり、transport を変えたり、拒否された payload を再帰的に包んだりしてはいけません。
 - 対象会話は**既存の** `continuity_id` を `continuity.resume` で再開することから始めます。handoff は二つ目の Continuity チェーンを作らず、ページはタスク状態権威になりません。
 - 再開後、対象は live な workspace / Git / runtime を再確認します。journal は履歴であり、live な真実ではありません。
-- host が Herdr の実行証拠なしに事前拒否した場合、**同じ**引数と同じ idempotency key で最大 1 回だけ再試行し、その後は準備済みの Copy Prompt を提示します。
+- 自動配送が Herdr の execution/result フィールドを一切返さない場合、その結果だけからワークステーション実行を推測してはいけません。準備済みの Copy Prompt を使うか、明示的な dispatch が存在する場合はその dispatch を再観測します。
 - delivery が不確実な間は、reconciliation で最初の試行が適用されていないと証明されるまで Copy Prompt 経路を開きません。したがって推測で二つ目の会話を作ることはできません。
 
 **正式な入口**：
@@ -268,7 +266,7 @@ herdr-mcp webchat handoff \
 | `manual_delivery.copy_prompt` | 同じ canonical メッセージ（手動継続用） |
 | `instruction` | 実際に何が起きたかの平易な説明 |
 
-冪等性：一つの logical handoff は一つの key を使います。`--idempotency-key` を渡さない場合、CLI は canonical な `handoff_id` を再利用するため、「同じコマンドをそのまま再実行する」ことが同じ logical handoff になります。これが canonical の「同じ key で 1 回だけ再試行」ルールを満たします。再試行で新しい key を渡さず、CLI が uncertain な配送を自動再試行することも期待しないでください。
+冪等性：一つの logical handoff は一つの key を使います。`--idempotency-key` を渡さない場合、CLI は canonical な `handoff_id` を再利用します。配送状態を探るために key を変えず、`automatic_delivery` と、dispatch がある場合は `dispatch-status` を確認してください。CLI は uncertain な配送を自動再試行しません。
 
 `--prepare-only` は配送をスキップし、packet のみを返します（`automatic_delivery.attempted=false`、`reason="prepare_only"`）。
 
@@ -293,16 +291,16 @@ Agent は次の順で進めます。
 
 実際のアカウント id、トークン、本番 secret を計画・メッセージ・報告に含めないでください。CLI が返す ref は不透明な識別子で、CLI に戻したりユーザーに報告してよいものですが、資格情報ではありません。
 
-## 8. 安全性と再試行のセマンティクス
+## 8. 配送と再試行のセマンティクス
 
 | 状況 | 正しい対応 |
 | --- | --- |
-| 配送前拒否（例：OpenAI host-side safety rejection）で実行証拠がない | 同じ引数・同じ idempotency key で最大 1 回だけ再試行し、その後 canonical Copy Prompt を渡す |
+| Herdr の実行/結果証拠がない | ローカル実行を推測しない。canonical な手動経路を使うか、dispatch がある場合はその exact dispatch を再観測する |
 | `applied` | 変更は永続化済み。続行し、後続は dispatch/evidence identity を使う |
 | `not_applied` | 何も配送されていない。再試行は自動ループではなく意図的な判断 |
 | `uncertain` | まず再観測（`webchat inspect`、`dispatch-status`）。変更を盲目的に再送しない |
 | `browser_offline` / `resource_unavailable` | 対象に到達できない。待って再観測し、元の意図で再試行する。生存確認のために idempotency key を回さない |
-| `rejected` | host が拒否した。payload を書き換えたり再エンコードして回避しない |
+| `rejected` | その試行は拒否された結果として扱い、報告して自動再試行を止める |
 | `stopped` | 意図的に停止された結果であり、再試行すべき失敗ではない |
 
 追加規則：

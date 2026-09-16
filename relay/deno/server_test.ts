@@ -437,9 +437,9 @@ Deno.test("relay socket lifetime hook resolves on error", async () => {
   await held;
 });
 
-Deno.test("relay expected runtime contract matches authoritative contracts/runtime-exec-v3.json", async () => {
+Deno.test("relay expected runtime contract matches authoritative contracts/runtime-exec-v4.json", async () => {
   const text = await Deno.readTextFile(
-    new URL("../../contracts/runtime-exec-v3.json", import.meta.url),
+    new URL("../../contracts/runtime-exec-v4.json", import.meta.url),
   );
   const fixture = JSON.parse(text);
   assertEquals(EXPECTED_RUNTIME_CONTRACT_EPOCH, fixture.contract_epoch);

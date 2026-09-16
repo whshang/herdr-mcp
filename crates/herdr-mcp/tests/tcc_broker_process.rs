@@ -106,9 +106,20 @@ fn binary_under_test() -> PathBuf {
 /// Run the real `herdr-mcp __tcc-broker` binary with a JSON request on stdin,
 /// returning the parsed JSON response.
 fn run_broker_binary(request_bytes: &[u8]) -> Value {
+    run_broker_binary_with_env(request_bytes, None)
+}
+
+/// Same, with an explicit child `HOME`. A scratch HOME lets the test exercise
+/// the macOS Documents/Desktop/Downloads operational-root route without
+/// touching real user data or depending on host TCC state.
+fn run_broker_binary_with_env(request_bytes: &[u8], home: Option<&Path>) -> Value {
     let binary = binary_under_test();
-    let mut child = Command::new(&binary)
-        .arg("__tcc-broker")
+    let mut command = Command::new(&binary);
+    command.arg("__tcc-broker");
+    if let Some(home) = home {
+        command.env("HOME", home);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -191,6 +202,117 @@ fn real_binary_broker_round_trip_dispatch_and_rejection() {
     let out = run_broker_binary(&serde_json::to_vec(&bad_op).unwrap());
     assert_eq!(out["ok"].as_bool(), Some(false));
     assert_eq!(out["code"].as_str(), Some("dispatch_failed"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn real_binary_broker_serves_an_exact_vcs_less_operational_root() {
+    let root = test_root("operational");
+    let work = root.join("work");
+    let sibling = root.join("sibling");
+    fs::create_dir_all(&work).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(work.join("artifact.md"), "lark-cli output\n").unwrap();
+    fs::write(sibling.join("artifact.md"), "not mine\n").unwrap();
+    let snapshot = make_snapshot(&work);
+
+    // A vcs-less directory proven exactly by the live cwd is readable through
+    // the real binary instead of being refused as outside_managed_roots.
+    let read = request(
+        "fs_read",
+        &snapshot,
+        json!({"path": work.join("artifact.md")}),
+    );
+    let out = run_broker_binary(&serde_json::to_vec(&read).unwrap());
+    assert_eq!(out["ok"].as_bool(), Some(true), "{out}");
+    assert!(out["content"].as_str().unwrap().contains("lark-cli output"));
+
+    // An unproven sibling is still refused, so the root cannot be borrowed.
+    let outside = request(
+        "fs_read",
+        &snapshot,
+        json!({"path": sibling.join("artifact.md")}),
+    );
+    let out = run_broker_binary(&serde_json::to_vec(&outside).unwrap());
+    assert_eq!(out["ok"].as_bool(), Some(false));
+    assert_eq!(out["reason"].as_str(), Some("outside_managed_roots"));
+
+    // Git semantics are unchanged: the Git action still refuses the vcs-less
+    // root instead of running inside it.
+    let git = request("git", &snapshot, json!({"root": work, "action": "status"}));
+    let out = run_broker_binary(&serde_json::to_vec(&git).unwrap());
+    assert_eq!(out["ok"].as_bool(), Some(false));
+    assert_eq!(out["reason"].as_str(), Some("outside_managed_roots"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The P0 scenario: a non-Git directory under macOS Documents, proven exactly
+/// by a live pane cwd, must be readable/listed/greppable through the stable
+/// TCC broker — not merely recognized as a root and then failed closed.
+#[cfg(unix)]
+#[test]
+fn broker_serves_an_exact_documents_operational_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = test_root("documents-operational");
+    let home = root.join("home");
+    let feishu = home.join("Documents").join("feishu");
+    let sibling = home.join("Documents").join("other-project");
+    fs::create_dir_all(feishu.join("nested")).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(feishu.join("notes.md"), "lark-cli artifact\n").unwrap();
+    fs::write(feishu.join("nested/inner.md"), "nested line\n").unwrap();
+    fs::write(feishu.join(".env"), "TOKEN=1\n").unwrap();
+    fs::write(sibling.join("notes.md"), "not mine\n").unwrap();
+    let outside = root.join("outside.txt");
+    fs::write(&outside, "outside\n").unwrap();
+    symlink(&outside, feishu.join("escape.txt")).unwrap();
+    let snapshot = make_snapshot(&feishu);
+    let call = |op: &str, args: Value| {
+        let payload = serde_json::to_vec(&request(op, &snapshot, args)).unwrap();
+        run_broker_binary_with_env(&payload, Some(&home))
+    };
+
+    let read = call("fs_read", json!({"path": feishu.join("notes.md")}));
+    assert_eq!(read["ok"].as_bool(), Some(true), "{read}");
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap()
+            .contains("lark-cli artifact")
+    );
+
+    let listed = call("fs_list", json!({"path": feishu, "recursive": true}));
+    assert_eq!(listed["ok"].as_bool(), Some(true), "{listed}");
+    assert!(listed["count"].as_u64().unwrap() >= 2);
+
+    let grepped = call("fs_grep", json!({"root": feishu, "pattern": "line"}));
+    assert_eq!(grepped["ok"].as_bool(), Some(true), "{grepped}");
+    assert!(!grepped["matches"].as_array().unwrap().is_empty());
+
+    // Gates that must survive the new root kind.
+    let sibling_read = call("fs_read", json!({"path": sibling.join("notes.md")}));
+    assert_eq!(
+        sibling_read["reason"].as_str(),
+        Some("outside_managed_roots")
+    );
+    let home_read = call("fs_read", json!({"path": home.join("Documents")}));
+    assert_eq!(home_read["reason"].as_str(), Some("outside_managed_roots"));
+    let secret = call("fs_read", json!({"path": feishu.join(".env")}));
+    assert_eq!(secret["reason"].as_str(), Some("secret_path_denied"));
+    let escape = call("fs_read", json!({"path": feishu.join("escape.txt")}));
+    assert_eq!(escape["reason"].as_str(), Some("symlink_escape"));
+    let written = call(
+        "fs_write",
+        json!({"path": feishu.join("new.md"), "content": "new\n"}),
+    );
+    assert_eq!(
+        written["reason"].as_str(),
+        Some("operational_root_mutation_unsupported")
+    );
+    assert!(!feishu.join("new.md").exists());
 
     let _ = fs::remove_dir_all(&root);
 }

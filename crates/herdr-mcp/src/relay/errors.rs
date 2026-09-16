@@ -255,7 +255,7 @@ pub fn timeout_error(opts: &ErrorOpts, safety: RetrySafety) -> RelayError {
         if retryable {
             "request exceeded its deadline; operation is safe to repeat".to_owned()
         } else {
-            "request exceeded its deadline; outcome unknown — do not blindly retry a mutating op"
+            "request exceeded its deadline; mutation outcome is unknown and may already have been applied"
                 .to_owned()
         }
     }));
@@ -273,7 +273,7 @@ pub fn uncertain_error(opts: &ErrorOpts, safety: RetrySafety) -> RelayError {
         if retryable {
             "delivery outcome unknown; operation is safe to repeat".to_owned()
         } else {
-            "delivery outcome unknown; inspect workstation state before retrying a mutating op"
+            "delivery outcome is unknown; workstation state is authoritative before any repeated mutation"
                 .to_owned()
         }
     }));
@@ -437,7 +437,7 @@ mod tests {
                 .message
                 .as_deref()
                 .unwrap()
-                .contains("do not blindly retry")
+                .contains("mutation outcome is unknown")
         );
         assert!(!timeout_error(&opts, RetrySafety::Unsafe).retryable); // conservative default
     }

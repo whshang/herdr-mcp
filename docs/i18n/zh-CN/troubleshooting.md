@@ -147,7 +147,7 @@ tail -n 100 ~/.config/herdr-mcp/link-prod.launchd.err.log
 
 常见原因：
 
-- 路径不在当前 managed Git root；
+- 路径既不在 managed Git root 内，也不在被 live workspace/pane cwd 精确证明的 non-Git operational root 内（借用其它项目的目录，或 live topology 未证明的 sibling，都会被拒绝）；
 - 文件名被 secret-path gate 拦截；
 - `HERDR_MCP_READONLY=1`；
 - `HERDR_MCP_WRITE_ROOTS` 没包含目标仓库；

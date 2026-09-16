@@ -224,10 +224,8 @@ continuity_id  (durable task state)
         ├─ handoff.message                                   (one canonical message)
         ├─ automatic_delivery.params = { source_url, message, work_chain_id }
         ├─ manual_delivery.copy_prompt  == handoff.message    (byte-for-byte identical)
-        └─ safety { pre_delivery_retry_limit: 1, retry_requires_no_execution_evidence: true,
-                    preserve_mutation_idempotency_key: true, rewrite_rejected_payload: false }
-              └─ herdr_mcp.browser_session.create (pass automatic_delivery.params unchanged)
-                   └─ the target conversation's first step is continuity.resume <continuity_id>
+        └─ herdr_mcp.browser_session.create (pass automatic_delivery.params unchanged)
+             └─ the target conversation's first step is continuity.resume <continuity_id>
 ```
 
 Rules that make this safe:
@@ -236,7 +234,7 @@ Rules that make this safe:
 - Automatic delivery and the manual **Copy Prompt** use the *same* canonical message. Never compose a second handoff message, encode/obfuscate it, switch transport, or recursively wrap a rejected payload.
 - The target conversation must begin by resuming the **existing** `continuity_id`. Handoff never creates a second Continuity chain, and the page never becomes the task-state authority.
 - After the target resumes, it re-checks live workspace / Git / runtime state; the journal is history, not live truth.
-- If the host reports a pre-delivery safety rejection with no Herdr execution evidence, retry the original create arguments at most once with the **same** idempotency key, then expose the already-prepared Copy Prompt.
+- If automatic delivery returns no Herdr execution or result fields, no workstation execution can be inferred from that outcome; use the already-prepared Copy Prompt or re-observe the exact dispatch when one exists.
 - An uncertain delivery does not expose the Copy Prompt path until reconciliation proves the first attempt did not apply, so a second conversation cannot be created by guessing.
 
 **The supported way to run it:**
@@ -268,7 +266,7 @@ Output is the canonical packet plus the delivery evidence:
 | `manual_delivery.copy_prompt` | The same canonical message, for manual continuation |
 | `instruction` | Plain-language statement of what actually happened |
 
-Idempotency: one logical handoff keeps one key. Without `--idempotency-key` the CLI reuses the canonical `handoff_id`, so a plain re-run is the same logical handoff — that is what satisfies the canonical "retry once with the same key" rule. Never pass a new key to retry, and never expect the CLI to retry an uncertain delivery for you.
+Idempotency: one logical handoff keeps one key. Without `--idempotency-key` the CLI reuses the canonical `handoff_id`. Do not rotate the key to probe delivery state; use `automatic_delivery` and, when a dispatch exists, `dispatch-status`. The CLI never retries an uncertain delivery for you.
 
 `--prepare-only` skips delivery and returns the packet (with `automatic_delivery.attempted=false`, `reason="prepare_only"`).
 
@@ -293,16 +291,16 @@ The agent should proceed in this order:
 
 Never place real account ids, tokens, or production secrets in a plan, a message, or a report. Refs returned by the CLI are opaque identifiers; they are safe to pass back to the CLI and to report to the user, but they are not credentials.
 
-## 8. Safety and retry semantics
+## 8. Delivery and retry semantics
 
 | Situation | Correct behavior |
 | --- | --- |
-| Pre-delivery rejection (for example an OpenAI host-side safety rejection) with no execution evidence | At most one retry with the same arguments and the same idempotency key, then hand the user the canonical Copy Prompt |
+| No Herdr execution/result evidence | Do not infer local execution; use the canonical manual path, or re-observe the exact dispatch when one exists |
 | `applied` | The mutation is durable; continue, and use the dispatch/evidence identity for follow-ups |
 | `not_applied` | Nothing was delivered; a new attempt needs a deliberate decision, not an automatic loop |
 | `uncertain` | Re-observe (`webchat inspect`, `dispatch-status`); never blind-retry the mutation |
 | `browser_offline` / `resource_unavailable` | The target is not reachable now; wait, re-observe, then retry the original intent — do not rotate the idempotency key to probe |
-| `rejected` | The host refused the request; do not rewrite or re-encode the payload to work around it |
+| `rejected` | Treat the attempt as refused; report that result and stop automatic retries |
 | `stopped` | The turn was stopped deliberately; treat it as an outcome, not a failure to retry |
 
 Additional rules:

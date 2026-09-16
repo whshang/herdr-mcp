@@ -17,6 +17,7 @@ pub mod development_orchestration;
 mod device_name;
 mod events;
 mod exec_compact;
+mod exec_evidence;
 mod exec_sessions;
 mod exec_tools;
 mod extension_ipc;
@@ -311,7 +312,11 @@ fn run() -> Result<ExitCode, String> {
                 {
                     windows_service_manager::print_link_status()
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(target_os = "linux")]
+                {
+                    linux_service_manager::print_link_status()
+                }
+                #[cfg(target_os = "macos")]
                 {
                     link::run_link_status()
                 }

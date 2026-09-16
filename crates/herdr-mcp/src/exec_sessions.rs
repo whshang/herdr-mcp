@@ -30,6 +30,56 @@ const RECOVERY_MAX_ENTRIES: usize = 64;
 const PANE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
+/// Stage at which a utility-pane exec start failed.
+///
+/// The stage is owned here, next to the operation that produced it, so callers
+/// never have to infer "did anything run?" from an error string.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PaneStartStage {
+    /// Failed before `pane.send_text`: nothing was delivered.
+    BeforeSend,
+    /// Failed at or after `pane.send_text`: delivery cannot be ruled out.
+    AfterSend,
+}
+
+impl PaneStartStage {
+    /// True only when the failure proves no command was delivered.
+    pub fn proves_nothing_delivered(self) -> bool {
+        matches!(self, Self::BeforeSend)
+    }
+}
+
+/// Typed utility-pane start failure carrying the stage that produced it.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PaneStartError {
+    pub stage: PaneStartStage,
+    pub message: String,
+}
+
+impl PaneStartError {
+    pub fn before_send(message: impl Into<String>) -> Self {
+        Self {
+            stage: PaneStartStage::BeforeSend,
+            message: message.into(),
+        }
+    }
+
+    pub fn after_send(message: impl Into<String>) -> Self {
+        Self {
+            stage: PaneStartStage::AfterSend,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PaneStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PaneStartError {}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum StreamKind {
     Stdout,
@@ -602,25 +652,32 @@ impl ExecRegistry {
         }))
     }
 
+    /// Start one command in an existing utility pane.
+    ///
+    /// Failures are typed by the stage that produced them, because only the
+    /// stage decides what a caller may claim: a failure before `pane.send_text`
+    /// proves nothing was delivered, while a failure at or after that call
+    /// cannot prove either way.
     pub fn start_in_existing_pane(
         &self,
         cwd: &Path,
         command: &str,
         pane_id: &str,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, PaneStartError> {
         self.prune();
         if command.is_empty() {
-            return Err("command must not be empty".to_owned());
+            return Err(PaneStartError::before_send("command must not be empty"));
         }
         let client = self
             .inner
             .client
             .clone()
-            .ok_or_else(|| "Herdr pane backend is unavailable".to_owned())?;
+            .ok_or_else(|| PaneStartError::before_send("Herdr pane backend is unavailable"))?;
         let id = new_session_id();
         let script_path = pane_script_path(&id);
         let spool = pane_spool_paths(&id);
-        write_pane_script(&script_path, cwd, command, &spool)?;
+        write_pane_script(&script_path, cwd, command, &spool)
+            .map_err(PaneStartError::before_send)?;
         let launch_line = format!(
             "{} {}",
             shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
@@ -632,7 +689,9 @@ impl ExecRegistry {
             PANE_RPC_TIMEOUT,
         ) {
             cleanup_pane_files(&script_path, &spool);
-            return Err(format!("cannot start utility pane command: {error}"));
+            return Err(PaneStartError::after_send(format!(
+                "cannot start utility pane command: {error}"
+            )));
         }
         let started_at_ms = now_ms();
         let session = Arc::new(Session {
@@ -661,14 +720,20 @@ impl ExecRegistry {
             .and_then(|store| store.record_pane_exec_running(&id, started_at_ms))
         {
             terminate_session(&session, true, None);
-            return Err(format!(
+            // The launch line already reached the pane, so the caller must not
+            // be told that nothing ran.
+            return Err(PaneStartError::after_send(format!(
                 "cannot durably register utility exec session; utility pane was closed before return: {error}"
-            ));
+            )));
         }
         self.inner
             .sessions
             .lock()
-            .map_err(|_| "exec registry lock poisoned".to_owned())?
+            .map_err(|_| {
+                // The launch line was already delivered before this registry
+                // bookkeeping step.
+                PaneStartError::after_send("exec registry lock poisoned")
+            })?
             .insert(id.clone(), Arc::clone(&session));
         spawn_monitor(Arc::clone(&session), Arc::downgrade(&self.inner));
         Ok(json!({
@@ -832,6 +897,30 @@ impl ExecRegistry {
                 .cmp(&right.get("started_at").and_then(Value::as_str))
         });
         views
+    }
+
+    /// Return the newest live exec session that this runtime owns on `pane_id`.
+    ///
+    /// Utility-pane scheduling uses this as an ownership proof before waiting
+    /// for a busy canonical pane. A busy pane with no matching live registry
+    /// session is treated as foreign/interactive contention and is never waited
+    /// on or interrupted automatically.
+    pub fn running_pane_session_id(&self, pane_id: &str) -> Option<String> {
+        self.prune();
+        let sessions = self.inner.sessions.lock().ok()?;
+        sessions
+            .values()
+            .filter(|session| {
+                matches!(
+                    &session.backend,
+                    SessionBackend::Pane {
+                        pane_id: owned_pane,
+                        ..
+                    } if owned_pane == pane_id
+                ) && !session_status(session).closed
+            })
+            .max_by_key(|session| session.started_at_ms)
+            .map(|session| session.id.clone())
     }
 
     pub fn diagnostics(&self) -> Value {

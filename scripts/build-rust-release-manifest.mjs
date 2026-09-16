@@ -88,7 +88,7 @@ export async function buildRustReleaseManifest({
   }
   const cargo = await readFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), "utf8");
   const stateStore = await readFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), "utf8");
-  const contract = JSON.parse(await readFile(join(root, "contracts", "runtime-exec-v3.json"), "utf8"));
+  const contract = JSON.parse(await readFile(join(root, "contracts", "runtime-exec-v4.json"), "utf8"));
   const version = parseCargoPackageVersion(cargo);
   const stateSchema = parseRustStateSchema(stateStore);
   const tagVersion = tag.startsWith("v") ? tag.slice(1) : tag;

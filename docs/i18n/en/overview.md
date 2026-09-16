@@ -37,7 +37,7 @@ This is not another Coding Agent. Herdr is the persistent workplace; herdr-mcp i
 
 - the MCP contract for ChatGPT / Web AI;
 - Cloudflare Edge, OAuth, and the workstation link;
-- file, Git, shell, and image capabilities inside managed Git roots;
+- file, Git, shell, and image capabilities inside managed Git roots, plus read/exec access to non-Git operational roots exactly proven by a live workspace/pane cwd;
 - planner-facing state summaries, mutation semantics, and agent delegation;
 - optional Browser Continuity, Control Center, and the experimental JSON → MCP bridge.
 

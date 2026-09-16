@@ -159,8 +159,8 @@ async function pair(env, name) {
 
 test("health and info expose the same explicit first-party public contract identity", async () => {
   for (const [edgeEnv, expectedEpoch] of [
-    ["dev", 6],
-    ["prod", 6],
+    ["dev", 7],
+    ["prod", 7],
     [undefined, 3],
     ["unknown", 3],
   ]) {
@@ -170,10 +170,28 @@ test("health and info expose the same explicit first-party public contract ident
     assert.equal(health.contractEpoch, expectedEpoch);
     assert.equal(info.publicContract.epoch, expectedEpoch);
     assert.equal(health.contractHash, info.publicContract.hash);
+    // Rolling-rollback fence: /health must stay parseable by a Link built
+    // before the current epoch, so it publishes the frozen epoch-2 catalog view
+    // first and the rollback-compatible runtime identity (epoch 3) in the field
+    // that an older Link reads first. Whether this Edge accepts the current
+    // epoch is proven only by the authenticated hello_ack; /info reports the
+    // current + previous identities for humans and probes.
     assert.equal(health.runtimeContractEpoch, 2);
+    assert.equal(
+      health.runtimeContractHash,
+      "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
+    );
     assert.equal(health.currentRuntimeContractEpoch, 3);
-    assert.equal(info.runtimeContract.epoch, 3);
-    assert.equal(info.previousRuntimeContract.epoch, 2);
+    assert.equal(
+      health.currentRuntimeContractHash,
+      "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",
+    );
+    assert.equal(info.runtimeContract.epoch, 4);
+    assert.equal(info.previousRuntimeContract.epoch, 3);
+    assert.equal(
+      info.previousRuntimeContract.hash,
+      "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",
+    );
   }
 });
 

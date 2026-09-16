@@ -2,7 +2,7 @@
 
 状态：WIP / 架构讨论稿
 日期：2026-08-27
-目标：把当前单体 `herdr_skill` 演进为小型全局 `AGENTS.md` + 可发现、按需加载的模块化 Skill 系统，同时不阻塞当前 GA，不修改 epoch 2 / 18-tool 公共 MCP contract。
+目标：把当前单体 `herdr_skill` 演进为小型全局 `AGENTS.md` + 可发现、按需加载的模块化 Skill 系统，同时不阻塞当前 GA，不增加 workstation public tool，也不原地修改当前 epoch 3 / 18-tool Runtime Execution contract。本文最初写于 epoch 2；下文保留的 epoch-2 数字属于原始设计基线，当前验收以 epoch 3 / 18 tools 为准。
 
 ---
 
@@ -240,7 +240,7 @@ Web ChatGPT 即使暂时不支持 Skills over MCP，也可以先通过现有 `he
 当前 GA 期间不做以下变化：
 
 - 不增加第 19 个 public MCP tool；
-- 不改变 epoch 2 / 18 tools 集合；
+- 不改变当前 epoch 3 / 18 tools 集合；原始 epoch-2 / 18-tool 设计基线只作为 provenance；
 - 不把 SEP-2640 draft 直接硬编码成 production ABI；
 - 不要求 ChatGPT Host 支持 MCP Skills Extension；
 - 不把模块化 Skill 变成 GA blocker；
@@ -294,7 +294,7 @@ otherwise
 这使第一阶段可以实现真正的模块化/按需加载，同时保持：
 
 ```text
-epoch 2 public tools = 18
+current Runtime Execution public tools = 18 (epoch 3; original design baseline was epoch 2)
 ```
 
 未来 Host 支持 Skills Extension 时：
@@ -311,7 +311,7 @@ SkillService
 
 ## 5. 第一版 Skill Taxonomy：严格从当前 17 个非-Skill tools 出发
 
-当前 epoch 2 有 18 个 public tools，其中 `herdr_skill` 是现有兼容入口。模块化设计的第一版以其余 **17 个执行 tools** 为边界，不为了“看起来完整”额外制造过多 Skill。
+当前 Runtime Execution epoch 3 有 18 个 public tools，其中 `herdr_skill` 是现有兼容入口。模块化设计的第一版以其余 **17 个执行 tools** 为边界，不为了“看起来完整”额外制造过多 Skill。
 
 当前 17 tools 分组：
 
@@ -693,21 +693,19 @@ WorkerCapability {
 - dispatch outcome uncertain 时重复 prompt；
 - 仅因为“有空闲 Agent”就制造没有收益的并行任务。
 
-如果首选 worker busy，可自动选择**能力等价且 policy 允许**的 worker；如果只能明显降级质量/能力，则不静默降级，应由 Web planner自己完成或明确说明没有安全等价 worker。
+如果显式指定的 worker busy 或不兼容，runtime 只返回候选/拒绝证据，不静默换人；是否选择另一个能力等价 worker 由 Web planner 基于当前证据决定。如果只能明显降级质量/能力，则不静默降级。
 
-每次自动派工保留结构化 `DispatchDecision` evidence：
+planning 层返回结构化 `DispatchAdvice` evidence；实际 prompt/dispatch 的提交与 delivery evidence 由执行边界单独记录：
 
 ```text
-DispatchDecision {
-  task_profile
-  selected_agent
-  selected_model/profile?
-  selected_pane
-  matched_capabilities[]
-  rejected_candidates[]?   # bounded
+DispatchAdvice {
+  direct_tool?
+  explicit_target?
+  delegation_allowed
+  candidates[]             # bounded, evidence-backed
+  rejected[]               # bounded
   reason
-  ownership_scope
-  validation_boundary
+  parallelism
 }
 ```
 
@@ -1060,7 +1058,7 @@ Modular Progressive Skills
 
 第一阶段实现不得修改：
 
-- epoch 2 tool count；
+- 当前 Runtime Execution 18-tool count / contract identity；
 - public MCP tool names；
 - production Link cutover；
 - GA install/update/rollback semantics；
@@ -1094,13 +1092,7 @@ Modular Progressive Skills
 
 要求 old `herdr_skill` compatibility output 在语义上仍能工作。
 
-可选择过渡模式：
-
-```text
-legacy_full=true (internal compatibility/testing only)
-```
-
-但默认 Web planner 应开始走 progressive path。
+兼容输出只由 progressive feature gate 控制；不再保留第二个内部请求参数来切换同一运行时的返回形态。
 
 ### Phase C — Native Skill Methods
 
@@ -1212,7 +1204,7 @@ skill.read_resource (if needed)
 5. **Agent dispatch 第一版提供可解释建议，由 Web planner 决策。** runtime 自动发现候选与 capability/resource evidence，过滤 busy/dirty/ownership/安全冲突并给出 direct/delegation/parallelism advice；复杂任务可以考虑多 Agent 并行，但不会因为存在空闲 Agent 或任务较大就强制派工。用户明确 target 优先；Agent 名称不承载固定角色或质量等级；不允许静默质量降级或递归中间管理。
 6. **Skill 按 conversation/task-context sticky。** 不是每条命令 reload；首次命中新能力域时额外加载一次，一次可以 batch 多个 Skill；live state 单独通过 inspect/since 更新。
 7. **当前 Web ChatGPT 不要求支持 Skills over MCP。** 使用 `herdr_skill` bootstrap + `herdr_call(method="herdr_mcp.skill.load", ...)` 完成 progressive loading；同一个 bootstrap 还声明 `herdr_mcp.planning.advise`，通过现有 `herdr_call` 返回只读 planning advice，不新增 public tool。
-8. **不新增第 19 个 public MCP tool，不改变 epoch 2 / 18-tool contract。**
+8. **不新增第 19 个 workstation public MCP tool，不原地改变当前 epoch 3 / 18-tool Runtime Execution contract。**
 9. **MCP Skills Extension 仅作为未来 adapter。** 不冻结当前 draft 的具体协议细节。
 10. **模块化必须用 token/bytes/round-trip/task-success benchmark 证明真实收益。**
 
@@ -1259,7 +1251,7 @@ Global AGENTS.md
 7. busy/blocked/capability-mismatch worker 不被错误选择；
 8. 多线 mutation 的 worktree/lane ownership 不冲突；
 9. 旧 `herdr_skill` 客户端仍然工作；
-10. epoch 2 public tool set/hash 不改变；
+10. 当前 epoch 3 public tool set/hash 不因 Progressive Skills 改变；
 11. 非 `herdr_mcp.*` 的 `herdr_call` 仍保持 live Herdr schema validation + socket passthrough，行为无回归；
 12. `herdr_mcp.*` unknown local method fail closed，绝不误透传 Herdr；
 13. 相比当前 giant `herdr_skill`，典型 fs-only / exec-only / delegation task 的注入 bytes/tokens 明显下降；

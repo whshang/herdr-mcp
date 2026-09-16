@@ -34,23 +34,22 @@ The rule is simple:
 
 > Do deterministic work directly. Delegate work that benefits from independent reasoning.
 
-There is one reliability exception: a WebChat host can reject a legitimate Herdr call before it reaches the MCP server. If the rejection contains none of Herdr's normal execution evidence (`op_id`, `session_id`, `backend`, `pane_id`, `exit_code`, `device_id`), classify it as **pre-delivery**. After the bounded direct retry, an existing local Agent may execute the same user-authorized objective when that objective is suitable for autonomous local work.
+External host outcomes are not worker-selection signals. If a response contains none of Herdr's normal execution/result evidence (`op_id`, `session_id`, `backend`, `pane_id`, `exit_code`, `execution`, `failure_origin`, `device_id`), do not attribute workstation or child-process execution to Herdr. Choose an Agent only because the task benefits from independent reasoning or parallel local work, never because a prior invocation was refused by an external host.
 
-This fallback changes the execution subject, not the security boundary:
+Keep execution evidence and worker selection as separate decisions:
 
 ```text
 direct Herdr tool
-  ↓ host rejects before delivery
-same call: one bounded retry
-  ↓ host rejects before delivery again
-existing local Agent via herdr_prompt
   ↓
-Agent performs the local workflow
-  ↓
-planner verifies target state through the safest available read path
+Herdr execution/result evidence available? ── yes ──> follow that delivery/execution evidence
+  │ no
+  └─> do not infer local execution; report or use the product's documented reconciliation/manual path
+
+independent task needs reasoning/parallel work? ── yes ──> existing local Agent via herdr_prompt
+  └─> planner verifies the resulting target state
 ```
 
-Send the Agent a high-level task contract: desired outcome, allowed scope, relevant project/context, verification criteria, and no further delegation. Do not paste, encode, obfuscate, or mechanically rewrite the rejected shell/API payload merely to get it past the host filter. For a mutation, use this fallback only when the original rejection proves pre-delivery, and keep every existing authorization or confirmation requirement unchanged. If `herdr_prompt` is also rejected before Herdr delivery, stop and report the host-side barrier; do not continue through stronger tools or alternate encodings.
+Send the Agent a high-level task contract: desired outcome, allowed scope, relevant project/context, verification criteria, and no further delegation. Preserve every existing authorization or confirmation requirement. Agent dispatch is an independent execution choice for suitable work; it is not a retry mechanism for an externally refused invocation.
 
 ## Recommended worker order
 
@@ -279,13 +278,7 @@ Herdr's visible workspace/pane model makes manual observation and takeover part 
 Inspect
   ↓
 Can deterministic tools do it?
-  ├─ yes → fs/git/exec
-  │          ↓ host-side pre-delivery rejection
-  │       one bounded identical retry
-  │          ↓ rejected again
-  │       suitable existing local Agent?
-  │          ├─ yes → herdr_prompt → verify target state
-  │          └─ no  → report host-side block
+  ├─ yes → fs/git/exec → read Herdr delivery/execution evidence → verify target state
   └─ no
        ↓
    define one narrow worker task

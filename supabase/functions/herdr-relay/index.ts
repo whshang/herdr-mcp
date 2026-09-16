@@ -24,14 +24,20 @@ export const MAX_FRAME_BYTES = 1024 * 1024; // 1 MiB
 export const MAX_AUTH_HEX_LEN = 1024; // 512 bytes * 2 hex chars
 export const HEALTH_PROBE_TIMEOUT_MS = 3_000;
 export const MAX_HEALTH_RESPONSE_BYTES = 64 * 1024;
-export const EXPECTED_RUNTIME_CONTRACT_EPOCH = 3;
+export const EXPECTED_RUNTIME_CONTRACT_EPOCH = 4;
 export const EXPECTED_RUNTIME_CONTRACT_HASH =
-  "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
-/** Previous runtime baseline accepted during the Edge rollout window. */
+  "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135";
+/** Runtime baselines accepted during the Edge rollout window (current, the
+ *  immediately previous native-default epoch 3, and the frozen epoch 2). */
 export const COMPATIBLE_RUNTIME_CONTRACTS = [
   {
     epoch: EXPECTED_RUNTIME_CONTRACT_EPOCH,
     hash: EXPECTED_RUNTIME_CONTRACT_HASH,
+  },
+  {
+    epoch: 3,
+    hash:
+      "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",
   },
   {
     epoch: 2,

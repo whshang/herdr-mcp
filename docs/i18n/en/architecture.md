@@ -208,18 +208,25 @@ A candidate can start independently, pass health and contract gates, become acti
 
 Already-dispatched work must not be duplicated merely because the active pointer changed.
 
-## Managed Git roots are the file boundary
+## Git-backed roots and exact live non-Git operational roots are the file boundary
 
-Remote file operations are constrained to Git-backed project roots known to the live Herdr snapshot.
+Remote file operations are constrained to project roots known to the live Herdr snapshot. There are two kinds:
+
+- **Git-backed managed roots** — the pre-existing boundary: the `managed && vcs == git` projects derived from the snapshot.
+- **Non-Git operational roots** — a vcs-less directory that is an exact live workspace/pane cwd resolving to a canonical existing directory. `$HOME` itself and any ancestor of it (including the macOS Data-volume firmlink spelling `/System/Volumes/Data/Users/<user>` and symlink aliases, matched by device+inode) are never operational roots, and neither is any sibling the live topology does not prove.
 
 Important gates include:
 
-- managed-root validation;
+- validated-root (Git-backed or operational) validation;
 - read-only mode;
 - optional write-root allowlist;
 - dirty-file acknowledgement;
 - busy-project acknowledgement;
 - secret-ish path filtering for `herdr_fs_*`.
+
+An operational root never fabricates Git state: it is not `managed`, and it has no clean/dirty/status. Read/exec surface (`herdr_fs_read` / `herdr_fs_list` / `herdr_fs_grep` / `herdr_fs_image` / `herdr_exec`) accepts it; `herdr_git` keeps the Git-only boundary, and mutations (`herdr_fs_edit` / `herdr_fs_write` / `herdr_fs_patch`) currently fail closed with `operational_root_mutation_unsupported` because their safety depends on Git-dirty confirmation.
+
+On macOS, `Documents` / `Desktop` / `Downloads` roots keep the existing TCC route: the rotating runtime never reads them directly. `herdr_fs_*` is served by the installed stable TCC broker (compat revision 4 for operational roots) and `herdr_exec` by the delegated utility pane.
 
 `herdr_exec` is deliberately a stronger boundary: it runs a shell as the workstation user and is not equivalent to a secret-path-filtered file API.
 

@@ -67,24 +67,21 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /Live herdr-mcp runtime context/);
     assert.match(r.content, /Latency-aware tool scheduling/);
     assert.match(r.content, /dependency-aware \*\*wave\*\*/);
-    assert.match(r.content, /host-side safety rejection.*pre-delivery/s);
-    assert.match(r.content, /none of Herdr's normal execution identity\/evidence fields.*op_id.*session_id.*device_id/s);
-    assert.match(r.content, /One identical retry is allowed.*pre-delivery evidence/s);
-    assert.match(r.content, /For a mutation, retry only when the host rejection itself proves pre-delivery/s);
-    assert.match(r.content, /after a second host rejection, stop instead of changing transport.*tool power/s);
-    assert.match(r.content, /Do not build a tool\/command blacklist from a single rejection/);
-    assert.match(r.content, /one bounded single-purpose read\/probe per call/);
+    assert.match(r.content, /host-side rejection that contains none of Herdr's execution identity or result fields/s);
+    assert.match(r.content, /provides no workstation or child-process execution result/s);
+    assert.match(r.content, /When Herdr result fields are present, their execution and delivery evidence is authoritative/s);
+    assert.match(r.content, /Host-side policy remains external to Herdr and is not altered by this planner guide/);
+    assert.match(r.content, /If browser control is unavailable, use the already-prepared Copy Prompt/);
+    assert.match(r.content, /If automatic delivery produces no Herdr execution or result fields.*use the prepared manual path/s);
+    assert.match(r.content, /If Herdr reports uncertain delivery, do not replay the mutation automatically/);
+    assert.doesNotMatch(r.content, /One identical retry is allowed/);
+    assert.doesNotMatch(r.content, /existing local Agent.*execution fallback/s);
+    assert.doesNotMatch(r.content, /pre-delivery safety rejection.*retry the original create arguments/s);
     assert.match(r.content, /one logical intent, one authority boundary, and at most one mutation boundary/);
     assert.match(r.content, /internal Herdr\/Edge batching, caching and coalescing remain encouraged/i);
     assert.match(r.content, /concatenating unrelated host, file, database, network, or service actions into one freeform `herdr_exec`/);
     assert.match(r.content, /must stay separate public calls even when that costs an extra round trip/);
     assert.match(r.content, /does not by itself make any tool "absolutely safe".*not permission to weaken authorization/s);
-    assert.match(r.content, /existing local Agent.*execution fallback/s);
-    assert.match(r.content, /Use `herdr_prompt` with one high-level task contract/s);
-    assert.match(r.content, /Agent fallback is an alternate execution subject.*not a privilege or safety bypass/s);
-    assert.match(r.content, /If `herdr_prompt` is itself rejected.*stop the fallback chain/s);
-    assert.match(r.content, /not permission to bypass, disable, or evade host safety checks/);
-    assert.match(r.content, /never escalate to a more powerful tool solely to force a rejected request through/);
     assert.match(r.content, /herdr_git status.*diff.*log.*herdr_exec.*herdr_fs_grep.*compacted/s);
     assert.match(r.content, /counts.*compacted.*summarized `output`/s);
     assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start`, not the visible utility pane or a blocking `herdr_exec`/);
@@ -133,17 +130,17 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
   }
 });
 
-test("agent-dispatch skill keeps host pre-delivery fallback bounded", () => {
+test("agent-dispatch skill keeps host policy external to worker selection", () => {
   const content = readFileSync(
     new URL("../assets/herdr/skills/agent-dispatch/SKILL.md", import.meta.url),
     "utf8",
   );
-  assert.match(content, /host-side pre-delivery rejection/);
-  assert.match(content, /existing compatible local Agent.*alternate execution subject/s);
-  assert.match(content, /high-level task contract/);
-  assert.match(content, /authorization\/confirmation.*irreversible-action boundary/s);
-  assert.match(content, /If `herdr_prompt` is itself rejected before Herdr delivery.*fallback chain stops/s);
-  assert.match(content, /never bypass, disable, or evade host safety checks/);
+  assert.match(content, /External host outcome/);
+  assert.match(content, /no Herdr execution identity or result fields/);
+  assert.match(content, /Host policy is external to Agent Dispatch/);
+  assert.doesNotMatch(content, /one bounded, identical retry/);
+  assert.doesNotMatch(content, /existing compatible local Agent/);
+  assert.doesNotMatch(content, /fallback chain stops/);
 });
 
 test("fetchHerdrSkill appends release-matched native Herdr reference with remote-scope warning", async () => {

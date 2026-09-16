@@ -25,6 +25,8 @@ import {
 
 export const MCP_SERVER_NAME = "herdr-mcp";
 export const MCP_LEGACY_PROTOCOL = "2025-11-25";
+const HERDR_SERVER_INSTRUCTIONS =
+  "Herdr connects this conversation to the user's enrolled workstations and keeps each request scoped to the selected device and project.";
 /** ChatGPT/OpenAI connector probe version; advertised on discover only. */
 export const OPENAI_PROBE_PROTOCOL = "2026-07-28" as const;
 export const MCP_SUPPORTED_PROTOCOLS = [
@@ -504,7 +506,7 @@ export async function handleMcp(
       protocolVersion: negotiateProtocolVersion(params.protocolVersion),
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
-      instructions: `Herdr Edge public contract epoch ${publicContract.contract_epoch}; workstation execution uses a separate authenticated runtime contract.`,
+      instructions: HERDR_SERVER_INSTRUCTIONS,
       _meta: { herdr: publicContractIdentity(deps.edgeEnv) },
     });
   }
@@ -514,7 +516,7 @@ export async function handleMcp(
       resultType: "complete",
       supportedVersions: discoverSupportedVersions(deps.client),
       capabilities: { tools: { listChanged: false } },
-      instructions: `Herdr Edge public MCP contract epoch ${publicContract.contract_epoch}.`,
+      instructions: HERDR_SERVER_INSTRUCTIONS,
       ttlMs: 3_600_000,
       cacheScope: "private",
       _meta: {

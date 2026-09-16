@@ -77,7 +77,7 @@ continuity_id
 - Reuse the existing `continuity_id`; never create a second continuity chain and never treat the page as task-state authority.
 - Automatic delivery and Copy Prompt must stay byte-identical; never compose your own continuation prompt and call it canonical.
 - Without `--idempotency-key` the CLI reuses the canonical `handoff_id`, so re-running the same command is the same logical handoff. Never pass a new key to retry.
-- `automatic_delivery.completed=false` (including `uncertain`, `browser_offline`, `resource_unavailable`, or a missing source route) means nothing was created: report that, use `manual_delivery.copy_prompt`, and inspect any returned `dispatch_id` with `webchat dispatch-status` before acting again.
+- `automatic_delivery.completed=false` means automatic delivery is not confirmed complete; interpret `delivery_state` rather than collapsing states. `not_applied`, `browser_offline`, `resource_unavailable`, or a missing source route may use the prepared manual path only when the returned evidence proves no delivery occurred. `uncertain` requires `webchat dispatch-status` / resource re-observation and must not expose or submit the Copy Prompt until reconciliation proves the first delivery did not apply.
 
 ## Mutation safety
 
@@ -91,7 +91,7 @@ continuity_id
 | `stopped` | Deliberate outcome, not a failure |
 
 - One intended mutation = one idempotency key. A replay returns the recorded dispatch (`replayed: true`) instead of acting twice.
-- Pre-delivery rejection with no execution evidence: retry the original arguments at most once with the same key, then expose the Copy Prompt.
+- If automatic delivery returns no Herdr execution or result fields, no workstation execution can be inferred from that outcome; use the prepared Copy Prompt or re-observe the exact dispatch when one exists. If Herdr reports uncertain delivery, reconcile it before any later mutation.
 - Report the exact `session_ref` and `delivery_state`; never present "no error" or scrollback as delivery evidence.
 
 ## Current boundaries (do not document or emulate past these)

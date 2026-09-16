@@ -61,9 +61,17 @@ test("published support matrix tracks the live protocol compatibility identities
   assert.equal(numberField(epoch1, "contract_epoch"), 1);
   assert.equal(numberField(epoch1, "tool_count"), 17);
 
-  assert.match(runtime, /COMPATIBLE_RUNTIME_CONTRACTS\s*=\s*\[RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT\]/);
-  assert.match(en, /N-1 runtime execution[\s\S]*epoch-2/i);
-  assert.match(zh, /N-1 runtime execution[\s\S]*epoch-2/i);
+  // The accepted runtime window is the current execution contract plus the
+  // immediately previous frozen identity and the frozen epoch-2 catalog.
+  assert.match(
+    runtime,
+    /COMPATIBLE_RUNTIME_CONTRACTS\s*=\s*\[\s*RUNTIME_EXECUTION_CONTRACT,\s*PREVIOUS_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH2_CONTRACT,\s*\]/,
+  );
+  assert.match(runtime, /contract_epoch: 3,/);
+  assert.equal(numberField(epoch2, "contract_epoch"), 2);
+  assert.equal(numberField(epoch2, "tool_count"), 18);
+  assert.match(en, /N-1 runtime execution[\s\S]*epoch-3[\s\S]*epoch-2/i);
+  assert.match(zh, /N-1 runtime execution[\s\S]*epoch-3[\s\S]*epoch-2/i);
   assert.match(relay, /protocol_version` is the number `1` on every message/);
   assert.match(en, /protocol_version = 1/);
   assert.match(zh, /protocol_version = 1/);

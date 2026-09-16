@@ -230,6 +230,165 @@ pub fn doctor_runtime_token() -> Result<Option<String>, String> {
     }
 }
 
+pub fn print_link_status() -> Result<ExitCode, String> {
+    print_json(&link_status_report()?)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn link_status_report() -> Result<Value, String> {
+    if wsl_environment_detected() {
+        return Ok(unsupported_wsl_status_value());
+    }
+    let paths = LinuxPaths::discover()?;
+    let backend = backend_for_control(&paths)?;
+    let link_loaded = match backend {
+        LinuxBackend::SystemdUser => unit_active(LINK_UNIT),
+        LinuxBackend::DetachedProcess => managed_process_active(&paths.link_process, "link"),
+    };
+    let current_generation = current_generation(&paths);
+    let active_generation = crate::link::ownership::read_status_active_generation(
+        &paths.config_dir.join("runtime-status.json"),
+    );
+    let runtime_current_exists = paths.current_binary.is_file();
+
+    let runtime_paths = RuntimePaths::discover()?;
+    let config = Config::load(&runtime_paths.config_file)?;
+    let relay_pool = crate::link::relay_manifest::load_cached_pool_from_config_dir(
+        &paths.config_dir,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+            .unwrap_or(0),
+    );
+    let transport = crate::link::collect_transport_evidence_with_pool(
+        config.edge_public_origin.as_deref(),
+        config.edge_link_upstream_origin.as_deref(),
+        &relay_pool.relays,
+        relay_pool.source,
+    );
+
+    Ok(linux_link_status_from_evidence(
+        backend,
+        link_loaded,
+        runtime_current_exists,
+        current_generation,
+        active_generation,
+        transport,
+        &paths,
+    ))
+}
+
+fn linux_link_status_from_evidence(
+    backend: LinuxBackend,
+    link_loaded: bool,
+    runtime_current_exists: bool,
+    current_generation: Option<String>,
+    active_generation: Option<String>,
+    transport: crate::link::TransportEvidence,
+    paths: &LinuxPaths,
+) -> Value {
+    let runtime_generation_current = matches!(
+        (current_generation.as_deref(), active_generation.as_deref()),
+        (Some(current), Some(active)) if current == active
+    );
+    let operational_ready = link_loaded && runtime_current_exists && runtime_generation_current;
+    let owner = if link_loaded { "rust" } else { "absent" };
+    let link_owner_detail = if link_loaded {
+        format!("{LINK_UNIT} is active under {}", backend.implementation())
+    } else {
+        format!(
+            "{LINK_UNIT} is not active under {}",
+            backend.implementation()
+        )
+    };
+    let generation_detail = match (current_generation.as_deref(), active_generation.as_deref()) {
+        (Some(current), Some(active)) if current == active => {
+            format!("runtime/current and Link runtime status both report {current}")
+        }
+        (Some(current), Some(active)) => {
+            format!("runtime/current is {current}, but Link runtime status reports {active}")
+        }
+        (Some(current), None) => {
+            format!(
+                "runtime/current is {current}, but Link runtime status has no active generation"
+            )
+        }
+        (None, Some(active)) => {
+            format!(
+                "runtime/current generation is missing, but Link runtime status reports {active}"
+            )
+        }
+        (None, None) => {
+            "runtime/current and Link runtime status generations are missing".to_owned()
+        }
+    };
+
+    json!({
+        "ok": true,
+        "platform": "linux",
+        "supported": true,
+        "implementation": backend.implementation(),
+        "production_owner": owner,
+        "production_ready_eligible": operational_ready,
+        "operational_ready": operational_ready,
+        "cutover_applicable": false,
+        "cutover_sealed": false,
+        "cutover_pending": false,
+        "runtime_current": paths.current_binary,
+        "link_unit": if backend == LinuxBackend::SystemdUser { Some(paths.link_unit.clone()) } else { None },
+        "link_process": if backend == LinuxBackend::DetachedProcess { Some(paths.link_process.clone()) } else { None },
+        "link_loaded": link_loaded,
+        "gates": [
+            {
+                "id": "linux_link_owner_active",
+                "category": "data_plane",
+                "ok": link_loaded,
+                "detail": link_owner_detail,
+            },
+            {
+                "id": "runtime_current_exists",
+                "category": "data_plane",
+                "ok": runtime_current_exists,
+                "detail": if runtime_current_exists {
+                    "runtime/current resolves to an installed runtime binary"
+                } else {
+                    "runtime/current does not resolve to an installed runtime binary"
+                },
+            },
+            {
+                "id": "runtime_control_generation_current",
+                "category": "data_plane",
+                "ok": runtime_generation_current,
+                "detail": generation_detail.clone(),
+            },
+        ],
+        "production_runtime_alignment": {
+            "current_generation": current_generation,
+            "active_generation": active_generation,
+            "runtime_control_active_matches_current": runtime_generation_current,
+            "detail": generation_detail,
+        },
+        "transport": {
+            "mcp_origin": transport.mcp_origin,
+            "link_upstream": transport.link_upstream,
+            "live_transport": transport.live_transport,
+            "configured_preferred_transport": transport.configured_preferred_transport,
+            "proxy_source": transport.proxy_source,
+            "relay": transport.relay,
+            "relay_policy": transport.relay_policy,
+            "relay_selection": transport.relay_selection,
+            "pool_source": transport.pool_source,
+            "failover_ready": transport.failover_ready,
+            "candidate_count": transport.candidate_count,
+        },
+        "next_action": if operational_ready {
+            "Linux Link is operationally ready"
+        } else {
+            "Linux Link is not operationally ready; review the failing data-plane gates above"
+        },
+    })
+}
+
 pub fn ensure_link_installed() -> Result<(), String> {
     ensure_link_installed_with_restart(false)
 }
@@ -1473,6 +1632,110 @@ mod tests {
         assert!(require_link_enrollment(&config).is_err());
         config.edge_device_id = Some("dev_01M1XYJHD1EGGTN1M11R14ZAYF".to_owned());
         assert!(require_link_enrollment(&config).is_ok());
+    }
+
+    fn test_linux_paths() -> LinuxPaths {
+        let home = PathBuf::from("/home/tester");
+        LinuxPaths {
+            home: home.clone(),
+            config_dir: home.join(".config/herdr-mcp"),
+            runtime_root: home.join(".config/herdr-mcp/runtime"),
+            generations_dir: home.join(".config/herdr-mcp/runtime/generations"),
+            current_link: home.join(".config/herdr-mcp/runtime/current"),
+            current_binary: home.join(".config/herdr-mcp/runtime/current/herdr-mcp"),
+            runtime_env: home.join(".config/herdr-mcp/runtime.env"),
+            backend_file: home.join(".config/herdr-mcp/runtime/linux-service-backend"),
+            service_process: home.join(".config/herdr-mcp/runtime/service-process.json"),
+            link_process: home.join(".config/herdr-mcp/runtime/link-process.json"),
+            systemd_dir: home.join(".config/systemd/user"),
+            service_unit: home.join(".config/systemd/user/herdr-mcp.service"),
+            link_unit: home.join(".config/systemd/user/herdr-mcp-link.service"),
+            port: 8772,
+            herdr_socket: home.join(".config/herdr/herdr.sock"),
+        }
+    }
+
+    #[test]
+    fn linux_link_status_uses_native_linux_ownership_not_launchd_cutover_gates() {
+        let transport = crate::link::TransportEvidence {
+            mcp_origin: "custom-domain".to_owned(),
+            link_upstream: "example.workers.dev".to_owned(),
+            live_transport: "unknown".to_owned(),
+            configured_preferred_transport: "direct".to_owned(),
+            proxy_source: "none".to_owned(),
+            relay: "unknown".to_owned(),
+            relay_policy: "fallback-only-no-custom-domain".to_owned(),
+            relay_selection: "stable-weighted-per-device".to_owned(),
+            pool_source: "embedded".to_owned(),
+            failover_ready: false,
+            candidate_count: 1,
+        };
+        let status = linux_link_status_from_evidence(
+            LinuxBackend::SystemdUser,
+            true,
+            true,
+            Some("rust-deadbeef".to_owned()),
+            Some("rust-deadbeef".to_owned()),
+            transport,
+            &test_linux_paths(),
+        );
+
+        assert_eq!(
+            status.get("platform").and_then(Value::as_str),
+            Some("linux")
+        );
+        assert_eq!(
+            status.get("production_owner").and_then(Value::as_str),
+            Some("rust")
+        );
+        assert_eq!(
+            status.get("operational_ready").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            status.get("cutover_applicable").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            status.get("cutover_sealed").and_then(Value::as_bool),
+            Some(false)
+        );
+        let gates = status.get("gates").and_then(Value::as_array).unwrap();
+        assert!(gates.iter().all(|gate| {
+            !gate
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("launchd")
+        }));
+    }
+
+    #[test]
+    fn linux_link_status_fails_readiness_when_runtime_generation_is_stale() {
+        let status = linux_link_status_from_evidence(
+            LinuxBackend::DetachedProcess,
+            true,
+            true,
+            Some("rust-new".to_owned()),
+            Some("rust-old".to_owned()),
+            crate::link::collect_transport_evidence(None, None),
+            &test_linux_paths(),
+        );
+
+        assert_eq!(
+            status.get("production_owner").and_then(Value::as_str),
+            Some("rust")
+        );
+        assert_eq!(
+            status.get("operational_ready").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            status
+                .pointer("/production_runtime_alignment/runtime_control_active_matches_current")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

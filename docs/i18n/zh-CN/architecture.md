@@ -200,19 +200,26 @@ herdr-mcp runtime
 
 浏览器只和 Native Messaging host 说话；host 再通过仅本机用户可访问的 Unix socket 进入 runtime。静态 `HERDR_MCP_TOKEN` 继续服务本地 curl / Cursor 以及旧 runtime 兼容路径，不应复制到 ChatGPT Connector 或网页脚本。
 
-## managed Git root 是远程文件系统的边界
+## Git-backed project root 与 exact live non-Git operational root 是远程文件系统的边界
 
-远程模型不应该默认拥有 `$HOME` 的文件浏览器。`herdr_fs_*` 只接受 Herdr 当前识别的 managed Git project root，并过滤常见 secret-like 路径。
+远程模型不应该默认拥有 `$HOME` 的文件浏览器。`herdr_fs_*` 只接受 Herdr 当前识别的项目根，分为两类：
+
+- **Git-backed managed root**：沿用既有边界，即快照中 `managed && vcs == git` 的项目；
+- **non-Git operational root**：`vcs` 为空、但被 live workspace/pane cwd 精确证明、且能解析为已存在规范目录（canonical existing directory）的目录。`$HOME` 本身及其任何祖先目录（包括 macOS Data volume firmlink 拼写 `/System/Volumes/Data/Users/<user>` 与 symlink 别名，按 device+inode 识别）永远不能成为 operational root；live topology 未精确证明的 sibling 同样不行。
 
 写操作还有几层闸门：
 
 | 闸门 | 作用 |
 |---|---|
-| managed root | 限制可操作项目范围 |
+| validated root（Git-backed 或 operational） | 限制可操作项目范围 |
 | `HERDR_MCP_READONLY` | 全局禁止 mutation |
 | `HERDR_MCP_WRITE_ROOTS` | 进一步缩小允许写的仓库 |
 | dirty confirmation | 防止覆盖未知未提交修改 |
 | busy confirmation | 防止和正在工作的 Agent 同时修改同一项目 |
+
+operational root 不会伪造 Git 状态：它不是 managed，也没有 clean/dirty/status。读/执行面（`herdr_fs_read` / `herdr_fs_list` / `herdr_fs_grep` / `herdr_fs_image` / `herdr_exec`）接受它；`herdr_git` 仍保持 Git-only 边界；而 mutation（`herdr_fs_edit` / `herdr_fs_write` / `herdr_fs_patch`）目前对 operational root 一律 deterministic fail-closed，返回 `operational_root_mutation_unsupported`，因为它们的安全性依赖 Git dirty 确认。
+
+在 macOS 上，`Documents` / `Desktop` / `Downloads` 根继续走既有 TCC 路线：轮换的 runtime 永远不直接读取它们；`herdr_fs_*` 由已安装的 stable TCC broker 提供（operational root 需要 compat revision 4），`herdr_exec` 则由委派的 utility pane 执行。
 
 `herdr_exec` 是更强的能力。Shell 可以访问当前用户本来能访问的资源，因此它不具备 `fs_*` 的 secret-path 过滤。这是明确的信任边界：允许远程模型使用 shell，等价于允许它以该工作站用户权限执行命令。
 

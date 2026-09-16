@@ -503,7 +503,7 @@ function herdrErrorResult(error: unknown, context?: string, failurePhase?: strin
       ...detail,
       // Status-wait timeout after a mutation: never blind-retry
       retryable: false,
-      hint: "submission may have succeeded — verify with herdr_inspect / herdr_since before re-sending",
+      hint: "Submission outcome is uncertain; current agent state determines whether another submission is safe.",
       daemon,
     });
   }
@@ -526,7 +526,7 @@ function herdrErrorResult(error: unknown, context?: string, failurePhase?: strin
         message: rootMessage,
         raw: msg.slice(0, 2000),
       },
-      hint: "Shared herdr control-plane blip (snapshot/events/socket). Agent is usually still fine — retry the same read; do not blind-retry mutations.",
+      hint: "A shared Herdr control-plane read failed transiently. Read operations remain repeatable; mutation outcome must be established from current state before another mutation.",
       daemon,
     });
   }
@@ -1105,7 +1105,7 @@ function registerTools(server: McpServer): void {
         ok: false,
         reason: "task_not_found",
         session,
-        hint: "call herdr_task first to create the workspace",
+        hint: "This operation requires an existing task workspace.",
       });
     }
     sessionSave(session, sess);
@@ -1113,7 +1113,7 @@ function registerTools(server: McpServer): void {
       ok: true,
       session,
       saved: true,
-      hint: `new conversation: call herdr_task("${session}", resume=true)`,
+      hint: `The next conversation can resume the existing task session ${session}.`,
     });
   };
   registerToolCompat(
@@ -1164,7 +1164,7 @@ function registerTools(server: McpServer): void {
           ok: false,
           reason: "session_not_found",
           session,
-          hint: "call herdr_session first",
+          hint: "This operation requires an existing Herdr session.",
         });
       }
       // NOTE (fix over Python): server.py's herdr_parallel falls through its
@@ -1223,7 +1223,7 @@ function registerTools(server: McpServer): void {
       }
       const wsId = sess.workspace_id;
       if (!wsId) {
-        return toResult({ ok: false, reason: "no_workspace", session, hint: "call herdr_session first" });
+        return toResult({ ok: false, reason: "no_workspace", session, hint: "This operation requires an existing Herdr session workspace." });
       }
       const snap = await c.snapshot();
 
@@ -2089,7 +2089,7 @@ function registerTools(server: McpServer): void {
       const working = workingAgentsForRoot(snap, rootV.root);
       if (working.length > 0 && !confirm_busy && !dry_run) {
         return toResult({ ok: false, reason: "agent_working", root: rootV.root, working,
-          hint: "pass confirm_busy:true to force, or wait for idle" });
+          hint: "A project agent is active; confirm_busy=true acknowledges concurrent modification risk, or the operation can run after the agent settles." });
       }
       let ops;
       try { ops = parsePatch(patch); }
@@ -2160,12 +2160,12 @@ function registerTools(server: McpServer): void {
           if (s.content === null) {
             if (fileDirty(rootV.root, s.real) && !confirm_dirty) {
               return toResult({ ok: false, reason: "file_dirty_confirmation_required", path: s.display,
-                hint: "re-send with confirm_dirty:true" });
+                hint: "A target file has uncommitted changes; confirm_dirty=true acknowledges applying the patch." });
             }
           } else if (s.op !== "add") {
             if (fileDirty(rootV.root, s.real) && !confirm_dirty) {
               return toResult({ ok: false, reason: "file_dirty_confirmation_required", path: s.display,
-                hint: "re-send with confirm_dirty:true" });
+                hint: "A target file has uncommitted changes; confirm_dirty=true acknowledges applying the patch." });
             }
           }
         }
@@ -2362,7 +2362,7 @@ function registerTools(server: McpServer): void {
       const working = workingAgentsForRoot(live.snap, rootV.root);
       if (working.length > 0 && !confirm_busy) {
         return toResult({ ok: false, reason: "agent_working", root: rootV.root, working,
-          hint: "pass confirm_busy:true to force" });
+          hint: "A project agent is active; confirm_busy=true acknowledges concurrent modification risk." });
       }
       const s = startExecSession({ command, cwd: rootV.real });
       return toResult({
@@ -2460,7 +2460,7 @@ function registerTools(server: McpServer): void {
           workspace: wsId,
           candidates: [],
           current_projects: [],
-          hint: "workspace has no current project root — create or attach a project, then re-call with project_root set to the returned root",
+          hint: "This workspace has no current project root; project_root requires a current attached project.",
         });
       }
       if (project_root) {
@@ -2474,7 +2474,7 @@ function registerTools(server: McpServer): void {
             project_root: want,
             candidates: roots,
             current_projects: currentProjects,
-            hint: "project_root must be one of this workspace's current project roots — re-call with project_root set to one of candidates",
+            hint: "project_root must match one of this workspace's returned project-root candidates.",
           });
         }
         effectiveRoot = match.root;
@@ -2485,7 +2485,7 @@ function registerTools(server: McpServer): void {
           workspace: wsId,
           candidates: roots,
           current_projects: currentProjects,
-          hint: "workspace has multiple project roots — re-call with project_root set to one of candidates",
+          hint: "This workspace has multiple project roots; project_root must match one of the returned candidates.",
         });
       } else {
         effectiveRoot = roots[0];
@@ -2498,7 +2498,7 @@ function registerTools(server: McpServer): void {
       if (working.length > 0 && !confirm_busy) {
         return toResult({
           ok: false, reason: "agent_working", root: execCwd, working,
-          hint: "an agent in this project is working — pass confirm_busy:true to force, or wait for idle/done",
+          hint: "A project agent is active; confirm_busy=true acknowledges concurrent modification risk, or the operation can run after the agent settles.",
         });
       }
 
@@ -2698,7 +2698,7 @@ function registerTools(server: McpServer): void {
               ok: false, code: err2.code, message: err2.message,
               workspace: wsId, pane_id: paneId, command,
               delivery: "uncertain",
-              hint: "send may have reached the utility pane — check pane output; do not blind-retry",
+              hint: "The send may have reached the utility pane; current pane output determines whether another command start is safe.",
               ...busyWarn,
             });
           }
@@ -2710,7 +2710,7 @@ function registerTools(server: McpServer): void {
             failure: "herdr_internal",
             message: unwrapControlPlaneMessage(err.message),
             workspace: wsId, pane_id: paneId, command,
-            hint: "pane.send_text hit control-plane TaskGroup — command may or may not have run; inspect utility pane or herdr_since, do not re-send the same command",
+            hint: "Command delivery is uncertain after a control-plane failure; current utility-pane state determines whether another start is safe.",
             ...busyWarn,
           });
         } else {
@@ -2755,7 +2755,7 @@ function registerTools(server: McpServer): void {
           message: isHerdrControlPlaneTaskGroup(msg) ? unwrapControlPlaneMessage(msg) : msg,
           backend: "utility_pane",
           workspace: wsId, pane_id: paneId, command,
-          hint: "command was sent; retry herdr_call pane.read on this pane_id — do not re-run herdr_exec with the same command",
+          hint: "The command was sent and may still be running; pane output can be read from this pane_id without starting a second copy.",
           ...busyWarn,
         });
       }
@@ -2808,7 +2808,7 @@ function registerTools(server: McpServer): void {
       const working = workingAgentsForRoot(snap, v.root);
       if (working.length > 0 && !confirm_busy) {
         return toResult({ ok: false, reason: "agent_working", root: v.root, working,
-          hint: "an agent in this project is working — pass confirm_busy:true to force, or wait for idle/done" });
+          hint: "A project agent is active; confirm_busy=true acknowledges concurrent modification risk, or the operation can run after the agent settles." });
       }
       let old: string;
       try { old = await readFile(v.real, "utf-8"); } catch (e) {
@@ -2821,7 +2821,7 @@ function registerTools(server: McpServer): void {
       }
       if (fileDirty(v.root, v.real) && !confirm_dirty) {
         return toResult({ ok: false, reason: "file_dirty_confirmation_required", path: v.resolved,
-          hint: "file has uncommitted changes — re-send with confirm_dirty:true to proceed" });
+          hint: "Uncommitted changes are present; confirm_dirty=true acknowledges editing this file." });
       }
       const next = old.replace(old_string, new_string);
       try { await writeFile(v.real, next, "utf-8"); } catch (e) {
@@ -2862,17 +2862,17 @@ function registerTools(server: McpServer): void {
       const working = workingAgentsForRoot(snap, v.root);
       if (working.length > 0 && !confirm_busy) {
         return toResult({ ok: false, reason: "agent_working", root: v.root, working,
-          hint: "an agent in this project is working — pass confirm_busy:true to force, or wait for idle/done" });
+          hint: "A project agent is active; confirm_busy=true acknowledges concurrent modification risk, or the operation can run after the agent settles." });
       }
       let existed = false;
       try { await readFile(v.real); existed = true; } catch { existed = false; }
       if (existed && !overwrite) {
         return toResult({ ok: false, reason: "overwrite_confirmation_required", path: v.resolved,
-          hint: "file exists — re-send with overwrite:true (and confirm_dirty:true if dirty)" });
+          hint: "The file already exists; overwrite=true acknowledges replacement, and confirm_dirty=true is also required when it has uncommitted changes." });
       }
       if (existed && fileDirty(v.root, v.real) && !confirm_dirty) {
         return toResult({ ok: false, reason: "file_dirty_confirmation_required", path: v.resolved,
-          hint: "existing file has uncommitted changes — re-send with confirm_dirty:true to overwrite" });
+          hint: "The existing file has uncommitted changes; confirm_dirty=true acknowledges replacement." });
       }
       try { await writeFile(v.real, content, "utf-8"); } catch (e) {
         return toResult({ ok: false, reason: "write_failed", path: v.resolved, message: String(e) });
@@ -2964,7 +2964,7 @@ function registerTools(server: McpServer): void {
             code: err.code,
             message: err.message,
             retryable: false,
-            hint: "status wait timed out after accept — verify with herdr_inspect / herdr_since before re-sending",
+            hint: "Submission was accepted but status observation timed out; current agent state determines whether another submission is safe.",
             wait: { completed: false, reason: "agent_status_timeout" },
           };
           // Safe to remember when we believe submission landed (blocks blind re-prompt)
@@ -3004,7 +3004,7 @@ function registerTools(server: McpServer): void {
             },
             // Never blind-retry agent.prompt: delivery may have landed despite TaskGroup.
             retryable: false,
-            hint: "herdr daemon control-plane TaskGroup blip on agent.prompt — pane/agent usually still fine. Check herdr_since / herdr_inspect (status/seq) before any re-prompt; do not treat this as agent dead or as a novo/repo failure.",
+            hint: "Agent submission outcome is uncertain after a Herdr control-plane failure; current agent status and sequence identify whether work already started.",
           });
         }
         const result = {

@@ -28,10 +28,13 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
         Err(error) => return error,
     };
     let topology = projects::derive_routing(snapshot);
-    let target = match fs_security::validate_existing_with_topology(&topology, path) {
+    let target = match fs_security::validate_existing_validated_with_topology(&topology, path) {
         Ok(value) => value,
         Err(error) => return error,
     };
+    if let Some(error) = fs_security::reject_operational_root_mutation(&topology, &target.root) {
+        return error;
+    }
     let working =
         match mutation::check_with_topology(snapshot, &topology, &target.root, confirm_busy) {
             Ok(value) => value,
@@ -63,7 +66,7 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
                     "ok": false,
                     "reason": "file_dirty_confirmation_required",
                     "path": target.resolved.to_string_lossy(),
-                    "hint": "file has uncommitted changes — re-send with confirm_dirty:true to proceed",
+                    "hint": "Uncommitted changes are present; confirm_dirty=true acknowledges editing this file.",
                 });
             }
             Ok(false) => {}
@@ -137,10 +140,13 @@ pub(crate) fn write_bytes(
     confirm_busy: bool,
 ) -> Value {
     let topology = projects::derive_routing(snapshot);
-    let target = match fs_security::validate_target_with_topology(&topology, path) {
+    let target = match fs_security::validate_target_validated_with_topology(&topology, path) {
         Ok(value) => value,
         Err(error) => return error,
     };
+    if let Some(error) = fs_security::reject_operational_root_mutation(&topology, &target.root) {
+        return error;
+    }
     let working =
         match mutation::check_with_topology(snapshot, &topology, &target.root, confirm_busy) {
             Ok(value) => value,
@@ -152,7 +158,7 @@ pub(crate) fn write_bytes(
             "ok": false,
             "reason": "overwrite_confirmation_required",
             "path": target.resolved.to_string_lossy(),
-            "hint": "file exists — re-send with overwrite:true (and confirm_dirty:true if dirty)",
+            "hint": "The file already exists; overwrite=true acknowledges replacement, and confirm_dirty=true is also required when it has uncommitted changes.",
         });
     }
     if existed && !confirm_dirty {
@@ -162,7 +168,7 @@ pub(crate) fn write_bytes(
                     "ok": false,
                     "reason": "file_dirty_confirmation_required",
                     "path": target.resolved.to_string_lossy(),
-                    "hint": "existing file has uncommitted changes — re-send with confirm_dirty:true to overwrite",
+                    "hint": "The existing file has uncommitted changes; confirm_dirty=true acknowledges replacement.",
                 });
             }
             Ok(false) => {}
@@ -285,6 +291,57 @@ mod tests {
             "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
             "agents": []
         })
+    }
+
+    #[test]
+    fn operational_root_mutation_fails_closed_without_touching_git() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-fs-operational-mutation-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("artifact.md");
+        fs::write(&existing, "before\n").unwrap();
+        let snap = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": []
+        });
+
+        // Reads and listings still work on the operational root.
+        assert_eq!(
+            crate::fs_tools::read(&snap, &json!({"path": existing}))["ok"],
+            true
+        );
+
+        // Every mutation path fails closed deterministically instead of
+        // borrowing Git-dirty semantics the root does not have.
+        let edited = edit(
+            &snap,
+            &json!({"path": existing, "old_string": "before", "new_string": "after"}),
+        );
+        assert_eq!(edited["reason"], "operational_root_mutation_unsupported");
+        let written = write(
+            &snap,
+            &json!({"path": root.join("new.md"), "content": "new\n"}),
+        );
+        assert_eq!(written["reason"], "operational_root_mutation_unsupported");
+        let patched = crate::fs_patch::apply(
+            &snap,
+            &json!({
+                "root": root,
+                "patch": "*** Begin Patch\n*** Add File: added.md\n+added\n*** End Patch\n"
+            }),
+        );
+        assert_eq!(patched["reason"], "operational_root_mutation_unsupported");
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "before\n");
+        assert!(!root.join("new.md").exists());
+        assert!(!root.join("added.md").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -30,6 +30,7 @@ import type { Env } from "./env.js";
 import { errorResult } from "./errors.js";
 import { edgeIdentity, MCP_SERVER_VERSION } from "./version.js";
 import { EPOCH2_CONTRACT } from "./contracts/epoch2.js";
+import { PREVIOUS_RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 import { handleMcp } from "./mcp-handler.js";
 import {
   createSessionlessMcpProbeResponse,
@@ -133,10 +134,21 @@ export default {
         edgeEnv: identity.edgeEnv,
         contractEpoch: identity.contractEpoch,
         contractHash: identity.contractHash,
+        // Two-stage rollout fence. `/health` is an admission gate, not the
+        // final compatibility proof: it must stay parseable by a Link built
+        // before the current runtime epoch, so the oldest still-supported
+        // identity is published first (`runtimeContract*`, the frozen epoch-2
+        // catalog view) and `currentRuntimeContract*` carries the
+        // rollback-compatible runtime identity (the previous execution
+        // contract) that a pre-upgrade Link reads first. Whether this Edge
+        // actually accepts the current epoch is proven only by the
+        // authenticated `hello_ack`.
         runtimeContractEpoch: EPOCH2_CONTRACT.contract_epoch,
         runtimeContractHash: EPOCH2_CONTRACT.contract_hash,
-        currentRuntimeContractEpoch: identity.runtimeContractEpoch,
-        currentRuntimeContractHash: identity.runtimeContractHash,
+        currentRuntimeContractEpoch:
+          PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+        currentRuntimeContractHash:
+          PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash,
         timestampMs: Date.now(),
       });
     }
@@ -150,7 +162,10 @@ export default {
         edgeVersion: identity.edgeVersion,
         publicContract: { epoch: identity.contractEpoch, hash: identity.contractHash },
         runtimeContract: { epoch: identity.runtimeContractEpoch, hash: identity.runtimeContractHash },
-        previousRuntimeContract: { epoch: EPOCH2_CONTRACT.contract_epoch, hash: EPOCH2_CONTRACT.contract_hash },
+        previousRuntimeContract: {
+          epoch: PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+          hash: PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash,
+        },
         routes: [
           { path: "/health", stage: "stable" },
           { path: "/info", stage: "dev" },

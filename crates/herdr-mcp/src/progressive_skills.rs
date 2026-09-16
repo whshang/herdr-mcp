@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+// Canonical wire names for herdr-mcp private/local methods; this block is the
+// single owner of each name. The MCP router (`crate::mcp`), the local-agent CLI
+// (`crate::local_agent_cli`) and the discoverability schema below reference
+// these constants instead of maintaining independent copies of the wire names.
 pub const LOCAL_LIST_METHOD: &str = "herdr_mcp.skill.list";
 pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
@@ -798,7 +802,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
     },
     BuiltinSkillSpec {
         id: "agent-dispatch",
-        description: "Select and submit safe compatible local-agent work from live capability facts, including bounded fallback after a host-side pre-delivery rejection.",
+        description: "Select and submit compatible local-agent work from live capability facts with explicit ownership and verification.",
         content: AGENT_DISPATCH,
         triggers: &[
             "delegate",
@@ -806,9 +810,6 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
             "review",
             "parallel implementation",
             "audit",
-            "pre-delivery",
-            "host rejection",
-            "safety rejection",
         ],
         requires_capabilities: &["live agent state"],
         related_skills: &["workstation-control", "development-orchestration"],
@@ -2097,20 +2098,20 @@ mod tests {
     }
 
     #[test]
-    fn agent_dispatch_is_discoverable_for_host_pre_delivery_fallback() {
+    fn agent_dispatch_is_discoverable_without_host_policy_fallback() {
         let service = ProgressiveSkillService::new();
         let descriptor = service
             .catalog()
             .into_iter()
             .find(|item| item.id == "agent-dispatch")
             .expect("agent-dispatch must be in the builtin catalog");
-        assert!(descriptor.description.contains("pre-delivery rejection"));
-        for expected in ["pre-delivery", "host rejection", "safety rejection"] {
+        assert!(descriptor.description.contains("live capability facts"));
+        for forbidden in ["pre-delivery", "host rejection", "safety rejection"] {
             assert!(
-                descriptor
+                !descriptor
                     .triggers
                     .iter()
-                    .any(|trigger| trigger == expected)
+                    .any(|trigger| trigger == forbidden)
             );
         }
         let loaded = service
@@ -2122,9 +2123,16 @@ mod tests {
             .unwrap();
         assert_eq!(loaded["ok"], true);
         let content = loaded["skills"][0]["content"].as_str().unwrap();
-        assert!(content.contains("Host-side pre-delivery rejection"));
-        assert!(content.contains("existing compatible local Agent"));
-        assert!(content.contains("fallback chain stops"));
+        assert!(content.contains("External host outcome"));
+        assert!(content.contains("no Herdr execution identity or result fields"));
+        assert!(content.contains("Host policy is external to Agent Dispatch"));
+        for forbidden in [
+            "one bounded, identical retry",
+            "existing compatible local Agent",
+            "fallback chain stops",
+        ] {
+            assert!(!content.contains(forbidden));
+        }
     }
 
     #[test]

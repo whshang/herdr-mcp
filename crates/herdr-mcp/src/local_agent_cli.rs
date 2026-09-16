@@ -4,6 +4,13 @@ use crate::link::local_mcp::{
 };
 use crate::link::request_core::RuntimeRequest;
 use crate::paths::RuntimePaths;
+use crate::progressive_skills::{
+    BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD, BROWSER_ENDPOINT_LIST_METHOD,
+    BROWSER_HANDOFF_PREPARE_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
+    BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD, WORK_MEMORY_RESUME_METHOD,
+    WORK_MEMORY_SEARCH_METHOD,
+};
+use crate::state_store::BrowserDeliveryState;
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::Path;
@@ -53,7 +60,7 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<ExitCode, String> {
             work_chain_id,
             max_turns,
         } => (
-            "work_memory.resume",
+            WORK_MEMORY_RESUME_METHOD,
             json!({
                 "project_ref": project_ref,
                 "repo_id": repo_id,
@@ -68,7 +75,7 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<ExitCode, String> {
             query,
             limit,
         } => (
-            "work_memory.search",
+            WORK_MEMORY_SEARCH_METHOD,
             json!({
                 "project_ref": project_ref,
                 "repo_id": repo_id,
@@ -84,7 +91,7 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<ExitCode, String> {
 pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
     match command {
         WebChatCommand::Endpoints { limit } => print_private_result(call_private(
-            "herdr_mcp.browser_endpoint.list",
+            BROWSER_ENDPOINT_LIST_METHOD,
             json!({"limit": limit}),
             None,
         )?),
@@ -102,7 +109,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             insert_optional(&mut params, "parent_ref", parent_ref);
             params.insert("limit".to_owned(), json!(limit));
             print_private_result(call_private(
-                "herdr_mcp.browser_resource.list",
+                BROWSER_RESOURCE_LIST_METHOD,
                 Value::Object(params),
                 None,
             )?)
@@ -110,7 +117,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
         WebChatCommand::Inspect { resource_ref } => {
             let grant = grant_for_resource(&resource_ref)?;
             print_private_result(call_private(
-                "herdr_mcp.browser_resource.inspect",
+                BROWSER_RESOURCE_INSPECT_METHOD,
                 json!({"resource_ref": resource_ref}),
                 Some(&grant),
             )?)
@@ -142,7 +149,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             params.insert("idempotency_key".to_owned(), json!(idempotency_key));
             insert_optional(&mut params, "work_chain_id", work_chain_id);
             print_private_result(call_private(
-                "herdr_mcp.browser_session.create",
+                BROWSER_SESSION_CREATE_METHOD,
                 Value::Object(params),
                 Some(&grant),
             )?)
@@ -162,13 +169,13 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             params.insert("idempotency_key".to_owned(), json!(idempotency_key));
             insert_optional(&mut params, "work_chain_id", work_chain_id);
             print_private_result(call_private(
-                "herdr_mcp.browser_dispatch.submit",
+                BROWSER_DISPATCH_SUBMIT_METHOD,
                 Value::Object(params),
                 Some(&grant),
             )?)
         }
         WebChatCommand::DispatchStatus { dispatch_id } => print_private_result(call_private(
-            "herdr_mcp.browser_dispatch.status",
+            BROWSER_DISPATCH_STATUS_METHOD,
             json!({"dispatch_id": dispatch_id}),
             None,
         )?),
@@ -179,7 +186,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
         } => {
             let grant = grant_for_resource(&session_ref)?;
             print_private_result(call_private(
-                "herdr_mcp.browser_session.archive",
+                BROWSER_SESSION_ARCHIVE_METHOD,
                 json!({
                     "session_ref": session_ref,
                     "expected_generation": expected_generation,
@@ -210,20 +217,6 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
         )?),
     }
 }
-
-const BROWSER_HANDOFF_PREPARE_METHOD: &str = "herdr_mcp.browser_handoff.prepare";
-const BROWSER_SESSION_CREATE_METHOD: &str = "herdr_mcp.browser_session.create";
-
-/// The delivery states the browser runtime can report for a mutation.
-const BROWSER_DELIVERY_STATES: &[&str] = &[
-    "applied",
-    "not_applied",
-    "uncertain",
-    "rejected",
-    "browser_offline",
-    "resource_unavailable",
-    "stopped",
-];
 
 struct WebChatHandoffRequest {
     continuity_id: String,
@@ -378,8 +371,8 @@ fn handoff_delivery_result(result: &Value) -> Value {
     let delivery_state = result
         .get("delivery_state")
         .and_then(Value::as_str)
-        .or_else(|| code.filter(|code| BROWSER_DELIVERY_STATES.contains(code)));
-    let reason = code.filter(|code| !BROWSER_DELIVERY_STATES.contains(code));
+        .or_else(|| code.filter(|code| BrowserDeliveryState::parse(code).is_ok()));
+    let reason = code.filter(|code| BrowserDeliveryState::parse(code).is_err());
     json!({
         "attempted": true,
         "completed": delivery_state == Some("applied"),
@@ -426,7 +419,7 @@ fn grant_for_resource(resource_ref: &str) -> Result<BrowserGrant, String> {
     let mut expected_provider: Option<String> = None;
     for _ in 0..4 {
         let result = call_private(
-            "herdr_mcp.browser_resource.inspect",
+            BROWSER_RESOURCE_INSPECT_METHOD,
             json!({"resource_ref": current_ref}),
             None,
         )?;
@@ -742,12 +735,6 @@ mod tests {
                 },
             },
             "manual_delivery": {"copy_prompt": message},
-            "safety": {
-                "pre_delivery_retry_limit": 1,
-                "retry_requires_no_execution_evidence": true,
-                "preserve_mutation_idempotency_key": true,
-                "rewrite_rejected_payload": false,
-            },
         })
     }
 

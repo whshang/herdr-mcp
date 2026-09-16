@@ -224,10 +224,8 @@ continuity_id（持久任务状态）
         ├─ handoff.message                                   （唯一 canonical 消息）
         ├─ automatic_delivery.params = { source_url, message, work_chain_id }
         ├─ manual_delivery.copy_prompt  == handoff.message    （逐字节一致）
-        └─ safety { pre_delivery_retry_limit: 1, retry_requires_no_execution_evidence: true,
-                    preserve_mutation_idempotency_key: true, rewrite_rejected_payload: false }
-              └─ herdr_mcp.browser_session.create（原样传入 automatic_delivery.params）
-                   └─ 目标会话第一步是 continuity.resume <continuity_id>
+        └─ herdr_mcp.browser_session.create（原样传入 automatic_delivery.params）
+             └─ 目标会话第一步是 continuity.resume <continuity_id>
 ```
 
 保证安全的关键规则：
@@ -236,7 +234,7 @@ continuity_id（持久任务状态）
 - 自动投递与手动 **复制提示词** 使用*同一份* canonical 消息。不要另写第二份 handoff 消息，不要编码/混淆它，不要更换 transport，也不要递归包裹被拒 payload。
 - 目标会话必须先用**已有的** `continuity_id` 调 `continuity.resume`。handoff 绝不创建第二条 Continuity 链，页面也不会成为任务状态权威。
 - 目标恢复后要重新检查实时 workspace / Git / runtime 状态；journal 是历史，不是实时真相。
-- 若 host 在 Herdr 尚无执行证据时拒绝投递，最多用**相同**参数与相同 idempotency key 重试一次，随后直接展示已准备好的 Copy Prompt。
+- 若自动投递没有返回任何 Herdr execution/result 字段，就不能据此推断工作站已执行；使用已准备好的 Copy Prompt，或在存在明确 dispatch 时重新观察该 dispatch。
 - delivery 不确定时，在 reconciliation 证明首次投递未生效之前不会开放 Copy Prompt 路径，因此不会凭猜测创建出第二个会话。
 
 **正式入口**：
@@ -268,7 +266,7 @@ herdr-mcp webchat handoff \
 | `manual_delivery.copy_prompt` | 同一条 canonical 消息，用于手动继续 |
 | `instruction` | 用自然语言说明实际发生了什么 |
 
-Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-key` 时，CLI 复用 canonical `handoff_id`，因此“原样重跑同一条命令”就是同一次 logical handoff——这正是 canonical 的“用同一 key 最多重试一次”规则。重试绝不要换新 key，也不要期待 CLI 替你重试 uncertain 投递。
+Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-key` 时，CLI 复用 canonical `handoff_id`。不要通过更换 key 来探测投递状态；应读取 `automatic_delivery`，已有 dispatch 时再查 `dispatch-status`。CLI 不会替你自动重试 uncertain 投递。
 
 `--prepare-only` 跳过投递，只返回 packet（`automatic_delivery.attempted=false`、`reason="prepare_only"`）。
 
@@ -293,16 +291,16 @@ Agent 应按这个顺序做：
 
 永远不要把真实账号 id、token 或生产密钥写进计划、消息或汇报。CLI 返回的 ref 是不透明标识，可以传回 CLI 并向用户报告，但它们不是凭据。
 
-## 8. 安全与重试语义
+## 8. 投递与重试语义
 
 | 情况 | 正确处理 |
 | --- | --- |
-| 预投递被拒（例如 OpenAI host-side safety rejection）且没有任何执行证据 | 最多用相同参数、相同 idempotency key 重试一次，然后把 canonical Copy Prompt 交给用户 |
+| 没有 Herdr 执行/结果证据 | 不推断本地已经执行；使用 canonical 手动路径，或在已有 dispatch 时重新观测 exact dispatch |
 | `applied` | 修改已经持久生效，可以继续，并用 dispatch/evidence 身份做后续操作 |
 | `not_applied` | 什么都没送达；再次尝试需要明确决策，不能自动循环 |
 | `uncertain` | 先重新观测（`webchat inspect`、`dispatch-status`）；绝不盲目重试写操作 |
 | `browser_offline` / `resource_unavailable` | 目标当前不可达；等待、重新观测，再按原意图重试——不要用换 idempotency key 的方式探测 |
-| `rejected` | host 拒绝了请求；不要靠改写或重新编码 payload 绕过 |
+| `rejected` | 把本次尝试视为已被拒绝；如实报告并停止自动重试 |
 | `stopped` | 轮次是被有意停止的；把它当作结果，而不是需要重试的失败 |
 
 补充规则：

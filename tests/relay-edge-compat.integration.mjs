@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import {
   RELAY_PROTOCOL_VERSION as ROOT_VERSION,
@@ -20,8 +21,10 @@ import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch4.js";
 import { EPOCH5_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch5.js";
 import { EPOCH6_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch6.js";
+import { EPOCH7_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch7.js";
 import { PUBLIC_CONTRACT, resolvePublicContract } from "../edge/cloudflare/dist/contracts/public.js";
 import {
+  PREVIOUS_RUNTIME_EXECUTION_CONTRACT,
   RUNTIME_EXECUTION_CONTRACT,
   isCompatibleRuntimeContract,
 } from "../edge/cloudflare/dist/contracts/runtime.js";
@@ -105,11 +108,14 @@ test("tracked Cloudflare epoch-2 catalog stays frozen to the captured 18-tool co
   assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), expected);
 });
 
-test("public epoch 3 evolves independently while runtime execution advances to epoch 3", () => {
+test("public epoch 3 evolves independently while runtime execution advances to epoch 4", () => {
   assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 3);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5");
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 4);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135");
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
+  assert.equal(PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch, 3);
+  assert.equal(PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5");
+  assert.equal(PREVIOUS_RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
   assert.equal(PUBLIC_CONTRACT.contract_epoch, 3);
   assert.equal(PUBLIC_CONTRACT.tool_count, 19);
   assert.equal(PUBLIC_CONTRACT.tools.some((tool) => tool.name === "herdr_devices"), true);
@@ -118,18 +124,20 @@ test("public epoch 3 evolves independently while runtime execution advances to e
   const runtimeInspect = EPOCH2_CONTRACT.tools.find((tool) => tool.name === "herdr_inspect");
   assert.equal(publicInspect.inputSchema.properties.device.type, "string");
   assert.equal(Object.hasOwn(runtimeInspect.inputSchema.properties, "device"), false);
-  // Edge/Relay acceptance window: current runtime contract plus the immediately
-  // previous rollback baseline, and nothing older.
-  assert.equal(isCompatibleRuntimeContract(3, RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
+  // Edge/Relay acceptance window: current runtime contract plus the previous
+  // runtime execution identity and the frozen epoch-2 catalog, and nothing older.
+  assert.equal(isCompatibleRuntimeContract(4, RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
+  assert.equal(isCompatibleRuntimeContract(3, PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH2_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(1, EPOCH1_CONTRACT.contract_hash), false);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH1_CONTRACT.contract_hash), false);
   assert.equal(isCompatibleRuntimeContract(3, EPOCH2_CONTRACT.contract_hash), false);
+  assert.equal(isCompatibleRuntimeContract(4, PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash), false);
 });
 
-test("public contract resolver enables epoch 6 for explicit first-party dev and prod environments", () => {
-  assert.equal(resolvePublicContract("dev"), EPOCH6_CONTRACT);
-  assert.equal(resolvePublicContract("prod"), EPOCH6_CONTRACT);
+test("public contract resolver enables epoch 7 for explicit first-party dev and prod environments", () => {
+  assert.equal(resolvePublicContract("dev"), EPOCH7_CONTRACT);
+  assert.equal(resolvePublicContract("prod"), EPOCH7_CONTRACT);
   assert.equal(resolvePublicContract(), EPOCH3_CONTRACT);
   assert.equal(resolvePublicContract("unknown"), EPOCH3_CONTRACT);
 });
@@ -335,4 +343,160 @@ test("public epoch 6 removes planner workflow policy from model-visible descript
   );
   assert.equal(EPOCH5_CONTRACT.contract_hash, "sha256:560dc151053f2a54fc1271c299fb6ed4464d5b9651a6c172c5eb6c9d63396e39");
   assert.equal(EPOCH4_CONTRACT.contract_hash, "sha256:0c756a7479ff5d5c70891d7cf5c9810841a1e936327d91aa0770abe67faf83af");
+});
+
+test("public epoch 7 removes safety-sensitive wording without changing tool behavior", () => {
+  assert.equal(EPOCH7_CONTRACT.contract_epoch, 7);
+  assert.equal(EPOCH7_CONTRACT.tool_count, EPOCH6_CONTRACT.tool_count);
+  assert.equal(computeContractHash(EPOCH7_CONTRACT.tools), EPOCH7_CONTRACT.contract_hash);
+  assert.equal(
+    EPOCH7_CONTRACT.contract_hash,
+    "sha256:971ee73a86eef74b1f046b1097806e8d71a4e63b0b57d6f6d5ea35c4e54c44d3",
+  );
+  assert.notEqual(EPOCH7_CONTRACT.contract_hash, EPOCH6_CONTRACT.contract_hash);
+  assert.deepEqual(
+    EPOCH7_CONTRACT.tools.map((tool) => tool.name).sort(),
+    EPOCH6_CONTRACT.tools.map((tool) => tool.name).sort(),
+  );
+
+  const readOnly = new Set([
+    "herdr_methods", "herdr_inspect", "herdr_skill", "herdr_since", "herdr_fs_read",
+    "herdr_fs_list", "herdr_fs_grep", "herdr_fs_image", "herdr_git", "herdr_exec_read",
+    "herdr_devices",
+  ]);
+  const destructive = new Set([
+    "herdr_call", "herdr_fs_patch", "herdr_exec_start", "herdr_exec_kill", "herdr_exec",
+    "herdr_fs_edit", "herdr_fs_write", "herdr_prompt",
+  ]);
+  const openWorld = new Set([
+    "herdr_skill", "herdr_call", "herdr_exec_start", "herdr_exec", "herdr_prompt",
+  ]);
+  for (const tool of EPOCH7_CONTRACT.tools) {
+    assert.equal(typeof tool.title, "string", `${tool.name} title`);
+    assert.ok(tool.title.length >= 3, `${tool.name} title`);
+    assert.match(tool.description, /^Use this /, `${tool.name} description`);
+    assert.equal(tool.annotations.readOnlyHint, readOnly.has(tool.name), `${tool.name} readOnlyHint`);
+    assert.equal(tool.annotations.destructiveHint, destructive.has(tool.name), `${tool.name} destructiveHint`);
+    assert.equal(tool.annotations.openWorldHint, openWorld.has(tool.name), `${tool.name} openWorldHint`);
+  }
+
+  const risky = [
+    /before any agent operation/i,
+    /typical session start/i,
+    /you \(web\) are the planner/i,
+    /\bplanner\b/i,
+    /\bprefer\b/i,
+    /\bshould\b/i,
+    /\brecommended\b/i,
+    /\bdo not\b/i,
+    /\bnever\b/i,
+    /\bcall herdr_/i,
+    /verify with herdr_/i,
+    /\bhigh-capability\b/i,
+    /arbitrary commands/i,
+    /\bbypass\b/i,
+    /\bpolicy\b/i,
+    /local api burn/i,
+    /\bcheap\b/i,
+    /\bexpensive\b/i,
+  ];
+  const descriptionStrings = (value) => {
+    if (typeof value === "string") return [];
+    if (!value || typeof value !== "object") return [];
+    return Object.entries(value).flatMap(([key, child]) => [
+      ...(key === "description" && typeof child === "string" ? [child] : []),
+      ...descriptionStrings(child),
+    ]);
+  };
+  for (const tool of EPOCH7_CONTRACT.tools) {
+    for (const description of descriptionStrings(tool)) {
+      for (const pattern of risky) {
+        assert.doesNotMatch(description, pattern, `${tool.name}: ${description}`);
+      }
+    }
+  }
+
+  const stripDescriptions = (value) => {
+    if (Array.isArray(value)) return value.map(stripDescriptions);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => key !== "description")
+        .map(([key, child]) => [key, stripDescriptions(child)]),
+    );
+  };
+  assert.deepEqual(
+    stripDescriptions(EPOCH7_CONTRACT.tools.map((tool) => tool.inputSchema)),
+    stripDescriptions(EPOCH6_CONTRACT.tools.map((tool) => tool.inputSchema)),
+  );
+  assert.equal(EPOCH6_CONTRACT.contract_hash, "sha256:addcde324850f88cd2f87bf38de1edb7fc34e90e8cd178b37cc49694b56636cf");
+});
+
+test("runtime execution epoch 4 neutralizes herdr_exec metadata without changing the tool list", async () => {
+  const root = new URL("../", import.meta.url);
+  const descriptor = JSON.parse(
+    await readFile(new URL("contracts/runtime-exec-v4.json", root), "utf8"),
+  );
+  const previous = JSON.parse(
+    await readFile(new URL("contracts/runtime-exec-v3.json", root), "utf8"),
+  );
+  const base = JSON.parse(
+    await readFile(new URL("contracts/epoch2.json", root), "utf8"),
+  );
+
+  // Epoch 4 shapes only the herdr_exec description over the frozen catalog.
+  const shaped = base.tools.map((tool) =>
+    tool.name === descriptor.shape.tool
+      ? { ...tool, description: descriptor.shape.set.description }
+      : tool,
+  );
+  assert.equal(descriptor.contract_epoch, 4);
+  assert.equal(descriptor.tool_count, base.tool_count);
+  assert.equal(computeContractHash(shaped), descriptor.contract_hash);
+
+  // The previous epoch-3 descriptor stays byte-frozen with its pinned identity.
+  assert.equal(previous.contract_epoch, 3);
+  assert.equal(previous.contract_hash, "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5");
+  const previousShaped = base.tools.map((tool) =>
+    tool.name === previous.shape.tool
+      ? { ...tool, description: previous.shape.set.description }
+      : tool,
+  );
+  assert.equal(computeContractHash(previousShaped), previous.contract_hash);
+  // The frozen epoch-2 catalog hash is unchanged as well.
+  assert.equal(computeContractHash(base.tools), base.contract_hash);
+
+  // The current runtime herdr_exec metadata carries the same neutral wording
+  // gate as the ChatGPT-visible public contract.
+  const risky = [
+    /high-capability/i,
+    /arbitrary commands/i,
+    /secret-path gated/i,
+    /\bbypass\b/i,
+    /\bplanner\b/i,
+    /\bdo not\b/i,
+    /\bnever\b/i,
+    /\bprefer\b/i,
+    /\bshould\b/i,
+    /\bmust\b/i,
+    /\bpolicy\b/i,
+  ];
+  for (const pattern of risky) {
+    assert.doesNotMatch(descriptor.shape.set.description, pattern);
+  }
+  // The real constraints stay stated as facts.
+  assert.match(descriptor.shape.set.description, /HERDR_MCP_READONLY/);
+  assert.match(descriptor.shape.set.description, /HERDR_MCP_WRITE_ROOTS/);
+  assert.match(descriptor.shape.set.description, /execution\.started/);
+  assert.match(descriptor.shape.set.description, /execution\.exit_code/);
+
+  // Metadata-only change: the tool list itself is untouched.
+  assert.deepEqual(
+    shaped.map((tool) => tool.name),
+    base.tools.map((tool) => tool.name),
+  );
+  for (const [index, tool] of shaped.entries()) {
+    if (tool.name === descriptor.shape.tool) continue;
+    assert.deepEqual(tool, base.tools[index]);
+  }
 });

@@ -128,11 +128,10 @@ impl SkillService {
         progressive_enabled: bool,
     ) -> Value {
         if progressive_enabled {
-            match progressive_mode_requested(args) {
-                Ok(true) => return self.progressive.bootstrap(snapshot),
-                Ok(false) => return self.fetch(args),
-                Err(error) => return error,
+            if let Err(error) = validate_progressive_args(args) {
+                return error;
             }
+            return self.progressive.bootstrap(snapshot);
         }
         self.fetch(args)
     }
@@ -619,11 +618,10 @@ fn sha256(content: &str) -> String {
     format!("{digest:x}")
 }
 
-fn progressive_mode_requested(args: &Value) -> Result<bool, Value> {
+fn validate_progressive_args(args: &Value) -> Result<(), Value> {
     optional_bool(args, "refresh")?;
     optional_bool(args, "include_native_reference")?;
-    let legacy_full = optional_bool(args, "legacy_full")?.unwrap_or(false);
-    Ok(!legacy_full)
+    Ok(())
 }
 
 fn optional_bool(args: &Value, key: &str) -> Result<Option<bool>, Value> {
@@ -783,7 +781,7 @@ mod tests {
             "active_binary+runtime_generation_manager"
         );
         assert!(runtime.get("self_update").is_none());
-        assert_eq!(runtime["tool_execution"]["contract_epoch"], 3);
+        assert_eq!(runtime["tool_execution"]["contract_epoch"], 4);
         assert_eq!(runtime["tool_execution"]["tool_count"], 18);
         assert_eq!(
             runtime["tool_execution"]["server_concurrent_requests"],
@@ -809,38 +807,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_full_is_an_internal_progressive_compatibility_escape_hatch() {
-        assert!(progressive_mode_requested(&json!({})).unwrap());
-        assert!(!progressive_mode_requested(&json!({"legacy_full": true})).unwrap());
-        let error = progressive_mode_requested(&json!({"legacy_full": "yes"})).unwrap_err();
+    fn progressive_mode_validates_public_boolean_args() {
+        validate_progressive_args(&json!({})).unwrap();
+        let error = validate_progressive_args(&json!({"refresh": "yes"})).unwrap_err();
         assert_eq!(error["code"], "invalid_params");
     }
 
     #[test]
-    fn progressive_runtime_preserves_explicit_legacy_full_response_shape() {
+    fn progressive_runtime_uses_progressive_shape_when_enabled() {
         let service = SkillService::new();
         let snapshot = json!({"agents": []});
         let progressive = service.fetch_for_runtime_mode(&json!({}), &snapshot, true);
         assert_eq!(progressive["mode"], "progressive");
         assert!(progressive.get("catalog").is_some());
-
-        let legacy = service.fetch_for_runtime_mode(
-            &json!({
-                "legacy_full": true,
-                "include_native_reference": false
-            }),
-            &snapshot,
-            true,
-        );
-        assert_eq!(legacy["ok"], true);
-        assert!(legacy.get("mode").is_none());
-        assert!(legacy.get("project_skill").is_some());
-        assert!(legacy.get("runtime").is_some());
-        assert!(
-            legacy["content"]
-                .as_str()
-                .is_some_and(|content| content.contains("# herdr-mcp remote planner skill"))
-        );
     }
 
     #[test]

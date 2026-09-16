@@ -61,6 +61,39 @@ pub(crate) fn is_protected_user_path(path: &Path) -> bool {
     }
 }
 
+/// Whether commands started from a project root need a TCC-authorized
+/// transport because either the checkout itself or a linked worktree's Git
+/// metadata lives under Documents/Desktop/Downloads.
+pub(crate) fn project_path_needs_protected_transport(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if is_protected_user_path(path) {
+            return true;
+        }
+        let Ok(content) = std::fs::read_to_string(path.join(".git")) else {
+            return false;
+        };
+        let Some(raw) = content.trim().strip_prefix("gitdir:").map(str::trim) else {
+            return false;
+        };
+        if raw.is_empty() {
+            return false;
+        }
+        let git_dir = PathBuf::from(raw);
+        let git_dir = if git_dir.is_absolute() {
+            git_dir
+        } else {
+            path.join(git_dir)
+        };
+        is_protected_user_path(&git_dir)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn is_protected_user_path_for_home(path: &Path, home: &Path) -> bool {
     let protected_roots = ["Documents", "Desktop", "Downloads"]
@@ -892,6 +925,27 @@ mod tests {
             &base.join("missing-project"),
             &home
         ));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn linked_worktree_with_protected_git_metadata_uses_protected_transport() {
+        let base = temp_dir("protected-linked-worktree");
+        let checkout = base.join("checkout");
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(
+            checkout.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                home.join("Documents/repo/.git/worktrees/feature").display()
+            ),
+        )
+        .unwrap();
+
+        assert!(project_path_needs_protected_transport(&checkout));
 
         let _ = fs::remove_dir_all(&base);
     }

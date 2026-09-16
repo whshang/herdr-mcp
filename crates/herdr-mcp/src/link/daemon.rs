@@ -33,29 +33,34 @@ use super::transport::{
     TransportConfig,
 };
 
-/// Current runtime execution contract epoch 3, shaped from the frozen epoch-2
-/// catalog by the `contracts/runtime-exec-v3.json` descriptor.
-pub const PUBLIC_CONTRACT_EPOCH: u64 = 3;
+/// Current runtime execution contract epoch 4, shaped from the frozen epoch-2
+/// catalog by the `contracts/runtime-exec-v4.json` descriptor.
+pub const PUBLIC_CONTRACT_EPOCH: u64 = 4;
 pub const PUBLIC_CONTRACT_HASH: &str =
-    "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
-/// Immediately previous runtime execution contract (frozen epoch 2). The
-/// current Rust binary never *runs* it — rollback activates the old binary —
-/// but Edge/Relay must keep accepting an epoch-2 workstation hello during the
-/// rollout window, and a new Link may still probe an Edge that has not yet been
-/// redeployed.
-pub const PREVIOUS_PUBLIC_CONTRACT_EPOCH: u64 = 2;
+    "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135";
+/// Immediately previous runtime execution contract (frozen epoch 3,
+/// native-default metadata). The current Rust binary never *runs* it — rollback
+/// activates the old binary — but Edge/Relay must keep accepting an epoch-3
+/// workstation hello during the rollout window, and a new Link may still probe
+/// an Edge that has not yet been redeployed.
+pub const PREVIOUS_PUBLIC_CONTRACT_EPOCH: u64 = 3;
 pub const PREVIOUS_PUBLIC_CONTRACT_HASH: &str =
+    "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5";
+/// Frozen epoch-2 catalog identity, the second rollback baseline that Edge and
+/// Relay keep accepting while an epoch-4 rollout is in flight.
+pub const LEGACY_EPOCH2_CONTRACT_HASH: &str =
     "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
 pub const LEGACY_EPOCH1_CONTRACT_HASH: &str =
     "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
 
 /// Edge/Relay acceptance window for a workstation hello: the current runtime
-/// execution contract or its immediately previous rollback baseline. Purely an
-/// interoperability window; it never makes the current binary run the previous
+/// execution contract or an immediately previous rollback baseline. Purely an
+/// interoperability window; it never makes the current binary run an older
 /// contract locally.
 pub fn is_runtime_rollback_compatible(epoch: u64, hash: &str) -> bool {
     (epoch == PUBLIC_CONTRACT_EPOCH && hash == PUBLIC_CONTRACT_HASH)
         || (epoch == PREVIOUS_PUBLIC_CONTRACT_EPOCH && hash == PREVIOUS_PUBLIC_CONTRACT_HASH)
+        || (epoch == 2 && hash == LEGACY_EPOCH2_CONTRACT_HASH)
 }
 
 const DAEMON_TRANSPORT_PING_MS: i64 = 15_000;
@@ -233,9 +238,10 @@ pub const DEFAULT_RUNTIME_GENERATION: &str = "local-mcp-active";
 
 /// Assemble and run the staged candidate-only Link daemon.
 ///
-/// Requires epoch 2 because the staged Rust `RuntimeGenerationManager` only
-/// accepts `LOCAL_MCP_CONTRACT_EPOCH`. Epoch-1 config remains readable for
-/// Node parity, but this Rust run path fails closed instead of cutting over.
+/// Requires the current local MCP contract epoch because the staged Rust
+/// `RuntimeGenerationManager` only accepts `LOCAL_MCP_CONTRACT_EPOCH`. Epoch-1
+/// (and any older) config remains readable for Node parity, but this Rust run
+/// path fails closed instead of cutting over.
 pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     if config.contract_epoch != LOCAL_MCP_CONTRACT_EPOCH {
         return Err(format!(
@@ -687,6 +693,42 @@ mod tests {
     }
 
     #[test]
+    fn link_boundary_epoch_constants_agree_with_the_contract_owner() {
+        let current = crate::contract::identity().expect("current contract identity");
+        assert_eq!(PUBLIC_CONTRACT_EPOCH, u64::from(current.epoch));
+        assert_eq!(PUBLIC_CONTRACT_HASH, current.hash);
+
+        let previous = crate::contract::previous_identity().expect("previous contract identity");
+        assert_eq!(PREVIOUS_PUBLIC_CONTRACT_EPOCH, u64::from(previous.epoch));
+        assert_eq!(PREVIOUS_PUBLIC_CONTRACT_HASH, previous.hash);
+        assert_ne!(PUBLIC_CONTRACT_HASH, PREVIOUS_PUBLIC_CONTRACT_HASH);
+    }
+
+    #[test]
+    fn rollback_window_accepts_current_previous_and_frozen_epoch2_only() {
+        assert!(is_runtime_rollback_compatible(
+            PUBLIC_CONTRACT_EPOCH,
+            PUBLIC_CONTRACT_HASH
+        ));
+        assert!(is_runtime_rollback_compatible(
+            PREVIOUS_PUBLIC_CONTRACT_EPOCH,
+            PREVIOUS_PUBLIC_CONTRACT_HASH
+        ));
+        assert!(is_runtime_rollback_compatible(
+            2,
+            LEGACY_EPOCH2_CONTRACT_HASH
+        ));
+        assert!(!is_runtime_rollback_compatible(
+            PUBLIC_CONTRACT_EPOCH,
+            PREVIOUS_PUBLIC_CONTRACT_HASH
+        ));
+        assert!(!is_runtime_rollback_compatible(
+            PREVIOUS_PUBLIC_CONTRACT_EPOCH,
+            LEGACY_EPOCH2_CONTRACT_HASH
+        ));
+    }
+
+    #[test]
     fn staged_run_rejects_epoch1_without_cutting_production_link() {
         let cfg = read_link_daemon_config(&env(&[
             ("HERDR_CONTRACT_EPOCH", "1"),
@@ -699,7 +741,7 @@ mod tests {
             .unwrap()
             .block_on(run_link_daemon(cfg))
             .expect_err("epoch1 run");
-        assert!(error.contains("requires contract epoch 3"));
+        assert!(error.contains("requires contract epoch 4"));
     }
 
     #[tokio::test]

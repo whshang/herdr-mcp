@@ -91,7 +91,7 @@ workspace
 | pane 输出 compact / expand | Result Optimization | 是 | 默认摘要，用户按需展开 raw tail |
 | 长任务 started/progress/settled 展示 | Streaming First / Long Task Progress | 是，随 Streaming 落地 | 不需要等 Batch B |
 
-这些工作不会增加第 19 个 MCP tool，也不改变 epoch 2 / 18 tools 公共 contract。
+这些工作不会增加第 19 个 workstation MCP tool，也不原地改变当前 epoch 3 / 18 tools Runtime Execution contract；任何 model-visible 变化必须走独立 contract epoch。
 
 ### 3.2 应等当前 Rust production ownership 到位后再实现
 

@@ -882,23 +882,7 @@ fn source_identity(repo: &Path, runtime: &RuntimePaths) -> Result<SourceIdentity
 /// repository.
 #[cfg(target_os = "macos")]
 fn source_identity_needs_stable_broker(repo: &Path) -> bool {
-    if crate::macos_permissions::is_protected_user_path(repo) {
-        return true;
-    }
-    fs::read_to_string(repo.join(".git"))
-        .ok()
-        .and_then(|content| {
-            let raw = content.trim().strip_prefix("gitdir:")?.trim().to_owned();
-            (!raw.is_empty()).then(|| {
-                let path = PathBuf::from(raw);
-                if path.is_absolute() {
-                    path
-                } else {
-                    repo.join(path)
-                }
-            })
-        })
-        .is_some_and(|git_dir| crate::macos_permissions::is_protected_user_path(&git_dir))
+    crate::macos_permissions::project_path_needs_protected_transport(repo)
 }
 
 /// Protected source identity is broker-only: the runtime never shells `git`

@@ -204,7 +204,7 @@ export function timeoutError(opts: ErrorOpts & { safety?: RetrySafety } = {}): R
     delivery_state: "delivery_unknown",
     message: retryable
       ? "request exceeded its deadline; operation is safe to repeat"
-      : "request exceeded its deadline; outcome unknown — do not blindly retry a mutating op",
+      : "request exceeded its deadline; mutation outcome is unknown and may already have been applied",
   };
 }
 
@@ -222,7 +222,7 @@ export function uncertainError(opts: ErrorOpts & { safety?: RetrySafety } = {}):
     delivery_state: "delivery_unknown",
     message: retryable
       ? "delivery outcome unknown; operation is safe to repeat"
-      : "delivery outcome unknown; inspect workstation state before retrying a mutating op",
+      : "delivery outcome is unknown; workstation state is authoritative before any repeated mutation",
   };
 }
 

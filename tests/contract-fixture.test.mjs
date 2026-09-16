@@ -27,7 +27,7 @@ test("epoch2 JSON fixture is the language-independent public contract source", a
 
 test("runtime parity fixture pins the shared Node/Rust wire invariants", async () => {
   const parity = JSON.parse(await readFile(new URL("contracts/runtime-parity.json", root), "utf8"));
-  const contract = JSON.parse(await readFile(new URL("contracts/runtime-exec-v3.json", root), "utf8"));
+  const contract = JSON.parse(await readFile(new URL("contracts/runtime-exec-v4.json", root), "utf8"));
   assert.equal(parity.schema_version, 1);
   assert.equal(parity.server_name, "herdr-mcp");
   assert.equal(parity.sdk_wire_protocol, "2025-11-25");
@@ -39,9 +39,9 @@ test("runtime parity fixture pins the shared Node/Rust wire invariants", async (
   assert.deepEqual(parity.stateless_json_methods, ["server/discover", "tools/call"]);
 });
 
-test("relay adapters expected runtime contract constants match the runtime-exec-v3 descriptor", async () => {
+test("relay adapters expected runtime contract constants match the runtime-exec-v4 descriptor", async () => {
   const descriptor = JSON.parse(
-    await readFile(new URL("contracts/runtime-exec-v3.json", root), "utf8"),
+    await readFile(new URL("contracts/runtime-exec-v4.json", root), "utf8"),
   );
 
   for (const relativePath of [
@@ -54,26 +54,41 @@ test("relay adapters expected runtime contract constants match the runtime-exec-
 
     assert.ok(epochMatch, `EXPECTED_RUNTIME_CONTRACT_EPOCH constant found in ${relativePath}`);
     assert.ok(hashMatch, `EXPECTED_RUNTIME_CONTRACT_HASH constant found in ${relativePath}`);
-    assert.equal(Number(epochMatch[1]), descriptor.contract_epoch, `epoch in ${relativePath} matches runtime-exec-v3 descriptor`);
-    assert.equal(hashMatch[1], descriptor.contract_hash, `hash in ${relativePath} matches runtime-exec-v3 descriptor`);
+    assert.equal(Number(epochMatch[1]), descriptor.contract_epoch, `epoch in ${relativePath} matches runtime-exec-v4 descriptor`);
+    assert.equal(hashMatch[1], descriptor.contract_hash, `hash in ${relativePath} matches runtime-exec-v4 descriptor`);
   }
 });
 
-test("edge runtime identity mirrors the frozen epoch-2 shape and the runtime-exec-v3 identity", async () => {
+test("edge runtime identity mirrors the frozen epoch-2 shape and the runtime-exec-v4 identity", async () => {
   const descriptor = JSON.parse(
-    await readFile(new URL("contracts/runtime-exec-v3.json", root), "utf8"),
+    await readFile(new URL("contracts/runtime-exec-v4.json", root), "utf8"),
   );
   const source = await readFile(
     new URL("edge/cloudflare/src/contracts/runtime.ts", root),
     "utf8",
   );
-  const epochMatch = source.match(/contract_epoch: (\d+),/);
-  const hashMatch = source.match(/contract_hash: "([^"]+)"/);
-  const countMatch = source.match(/tool_count: (\d+),/);
+  // Anchor on the current identity export: the frozen predecessor identity is
+  // declared above it in the same module.
+  const current = source.match(
+    /export const RUNTIME_EXECUTION_CONTRACT = \{([\s\S]*?)\} as const;/,
+  );
+  assert.ok(current, "current runtime execution identity export present");
+  const epochMatch = current[1].match(/contract_epoch: (\d+),/);
+  const hashMatch = current[1].match(/contract_hash: "([^"]+)"/);
+  const countMatch = current[1].match(/tool_count: (\d+),/);
   assert.ok(epochMatch && hashMatch && countMatch, "edge runtime identity fields present");
   assert.equal(Number(epochMatch[1]), descriptor.contract_epoch);
   assert.equal(hashMatch[1], descriptor.contract_hash);
   assert.equal(Number(countMatch[1]), descriptor.tool_count);
-  // The previous rollback baseline is the frozen epoch-2 catalog.
-  assert.match(source, /COMPATIBLE_RUNTIME_CONTRACTS = \[RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT\]/);
+  // The acceptance window is the current identity plus the previous
+  // runtime execution identity and the frozen epoch-2 catalog.
+  assert.match(
+    source,
+    /COMPATIBLE_RUNTIME_CONTRACTS = \[\s*RUNTIME_EXECUTION_CONTRACT,\s*PREVIOUS_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH2_CONTRACT,\s*\]/,
+  );
+  assert.match(source, /contract_epoch: 3,/);
+  assert.match(
+    source,
+    /PREVIOUS_RUNTIME_EXECUTION_CONTRACT = \{\s*contract_epoch: 3,\s*contract_hash: "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",\s*tool_count: 18,\s*\}/,
+  );
 });

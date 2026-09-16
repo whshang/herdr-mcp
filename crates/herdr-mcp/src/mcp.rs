@@ -7,6 +7,17 @@ use crate::fs_tools;
 use crate::git_tools;
 use crate::herdr::HerdrClient;
 use crate::native_tools;
+use crate::progressive_skills::{
+    BROWSER_COMPOSER_SET_APPS_METHOD, BROWSER_COMPOSER_SET_REASONING_METHOD,
+    BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_STOP_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD,
+    BROWSER_ENDPOINT_INSPECT_METHOD, BROWSER_ENDPOINT_LIST_METHOD, BROWSER_HANDOFF_PREPARE_METHOD,
+    BROWSER_MESSAGE_APPEND_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
+    BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD,
+    BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SPACE_CREATE_METHOD,
+    BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD, EXEC_WAIT_METHOD,
+    WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD,
+    WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+};
 use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
@@ -32,7 +43,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, call the read-only herdr_mcp.browser_handoff.prepare once, then pass its automatic_delivery message unchanged to browser_session.create with one idempotency key. The prepared manual_delivery.copy_prompt is the same canonical message: if browser control is unavailable, or a host-side pre-delivery safety rejection occurs with no Herdr execution evidence, retry the original create arguments at most once and then expose that already-prepared copy prompt instead of rewriting, encoding, changing transport, or recursively wrapping the rejected payload. Preserve the mutation idempotency key across the retry. Do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic same-boundary process steps, prefer transparent herdr_exec.steps when the current public schema advertises it; otherwise keep each freeform shell command narrow and single-purpose. Do not concatenate independent process invocations with shell operators solely to reduce remote calls. Use herdr_exec.command only when actual shell syntax is required. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, call the read-only herdr_mcp.browser_handoff.prepare once, then pass its automatic_delivery message unchanged to browser_session.create with one idempotency key. The prepared manual_delivery.copy_prompt is the same canonical message. If browser control is unavailable or automatic delivery returns no Herdr execution/result evidence, do not infer workstation execution; use the prepared Copy Prompt or re-observe the exact dispatch when one exists. Herdr-reported uncertain delivery is reconciliation-only and must not be replayed automatically. Do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic same-boundary process steps, prefer transparent herdr_exec.steps when the current public schema advertises it; otherwise keep each freeform shell command narrow and single-purpose. Do not concatenate independent process invocations with shell operators solely to reduce remote calls. Use herdr_exec.command only when actual shell syntax is required. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -305,7 +316,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
-            } else if method == crate::progressive_skills::BROWSER_HANDOFF_PREPARE_METHOD {
+            } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
                 browser_handoff_prepare(context.state_store, &params)
             } else if method == "herdr_mcp.page_assist" {
                 page_assist_call(
@@ -336,7 +347,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &params,
                     context.caller_webchat_control_grants,
                 )
-            } else if method == crate::progressive_skills::EXEC_WAIT_METHOD {
+            } else if method == EXEC_WAIT_METHOD {
                 exec_tools::wait(context.exec, &params)
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
@@ -1062,7 +1073,7 @@ fn work_memory_call(
         return json!({"ok": false, "code": "work_memory_store_unavailable"});
     };
     match method {
-        "work_memory.bind" => {
+        WORK_MEMORY_BIND_METHOD => {
             if let Some(error) = work_memory_reject_unknown(
                 object,
                 &[
@@ -1139,7 +1150,7 @@ fn work_memory_call(
                 Err(error) => work_memory_store_error(error),
             }
         }
-        "work_memory.append_turn" => {
+        WORK_MEMORY_APPEND_TURN_METHOD => {
             if let Some(error) = work_memory_reject_unknown(
                 object,
                 &[
@@ -1218,7 +1229,7 @@ fn work_memory_call(
                 Err(error) => work_memory_store_error(error),
             }
         }
-        "work_memory.append_evidence" => {
+        WORK_MEMORY_APPEND_EVIDENCE_METHOD => {
             if let Some(error) = work_memory_reject_unknown(
                 object,
                 &[
@@ -1353,7 +1364,7 @@ fn work_memory_call(
                 Err(error) => work_memory_store_error(error),
             }
         }
-        "work_memory.checkpoint.put" => {
+        WORK_MEMORY_CHECKPOINT_PUT_METHOD => {
             if let Some(error) = work_memory_reject_unknown(
                 object,
                 &[
@@ -1433,7 +1444,7 @@ fn work_memory_call(
                 Err(error) => work_memory_store_error(error),
             }
         }
-        "work_memory.resume" => {
+        WORK_MEMORY_RESUME_METHOD => {
             if let Some(error) = work_memory_reject_unknown(
                 object,
                 &["project_ref", "repo_id", "work_chain_id", "max_turns"],
@@ -1540,7 +1551,7 @@ fn work_memory_call(
                 Err(error) => work_memory_store_error(error),
             }
         }
-        "work_memory.search" => {
+        WORK_MEMORY_SEARCH_METHOD => {
             if let Some(error) = work_memory_reject_unknown(
                 object,
                 &[
@@ -1668,38 +1679,38 @@ enum BrowserOperation {
 impl BrowserOperation {
     fn parse(method: &str) -> Option<Self> {
         match method {
-            "herdr_mcp.browser_space.create" => Some(Self::SpaceCreate),
-            "herdr_mcp.browser_space.open" => Some(Self::SpaceOpen),
-            "herdr_mcp.browser_space.inspect" => Some(Self::SpaceInspect),
-            "herdr_mcp.browser_session.create" => Some(Self::SessionCreate),
-            "herdr_mcp.browser_session.open" => Some(Self::SessionOpen),
-            "herdr_mcp.browser_session.archive" => Some(Self::SessionArchive),
-            "herdr_mcp.browser_session.inspect" => Some(Self::SessionInspect),
-            "herdr_mcp.browser_message.append" => Some(Self::MessageAppend),
-            "herdr_mcp.browser_composer.set_reasoning" => Some(Self::ComposerSetReasoning),
-            "herdr_mcp.browser_composer.set_apps" => Some(Self::ComposerSetApps),
-            "herdr_mcp.browser_dispatch.submit" => Some(Self::DispatchSubmit),
-            "herdr_mcp.browser_dispatch.status" => Some(Self::DispatchStatus),
-            "herdr_mcp.browser_dispatch.stop" => Some(Self::DispatchStop),
+            BROWSER_SPACE_CREATE_METHOD => Some(Self::SpaceCreate),
+            BROWSER_SPACE_OPEN_METHOD => Some(Self::SpaceOpen),
+            BROWSER_SPACE_INSPECT_METHOD => Some(Self::SpaceInspect),
+            BROWSER_SESSION_CREATE_METHOD => Some(Self::SessionCreate),
+            BROWSER_SESSION_OPEN_METHOD => Some(Self::SessionOpen),
+            BROWSER_SESSION_ARCHIVE_METHOD => Some(Self::SessionArchive),
+            BROWSER_SESSION_INSPECT_METHOD => Some(Self::SessionInspect),
+            BROWSER_MESSAGE_APPEND_METHOD => Some(Self::MessageAppend),
+            BROWSER_COMPOSER_SET_REASONING_METHOD => Some(Self::ComposerSetReasoning),
+            BROWSER_COMPOSER_SET_APPS_METHOD => Some(Self::ComposerSetApps),
+            BROWSER_DISPATCH_SUBMIT_METHOD => Some(Self::DispatchSubmit),
+            BROWSER_DISPATCH_STATUS_METHOD => Some(Self::DispatchStatus),
+            BROWSER_DISPATCH_STOP_METHOD => Some(Self::DispatchStop),
             _ => None,
         }
     }
 
     fn method(self) -> &'static str {
         match self {
-            Self::SpaceCreate => "herdr_mcp.browser_space.create",
-            Self::SpaceOpen => "herdr_mcp.browser_space.open",
-            Self::SpaceInspect => "herdr_mcp.browser_space.inspect",
-            Self::SessionCreate => "herdr_mcp.browser_session.create",
-            Self::SessionOpen => "herdr_mcp.browser_session.open",
-            Self::SessionArchive => "herdr_mcp.browser_session.archive",
-            Self::SessionInspect => "herdr_mcp.browser_session.inspect",
-            Self::MessageAppend => "herdr_mcp.browser_message.append",
-            Self::ComposerSetReasoning => "herdr_mcp.browser_composer.set_reasoning",
-            Self::ComposerSetApps => "herdr_mcp.browser_composer.set_apps",
-            Self::DispatchSubmit => "herdr_mcp.browser_dispatch.submit",
-            Self::DispatchStatus => "herdr_mcp.browser_dispatch.status",
-            Self::DispatchStop => "herdr_mcp.browser_dispatch.stop",
+            Self::SpaceCreate => BROWSER_SPACE_CREATE_METHOD,
+            Self::SpaceOpen => BROWSER_SPACE_OPEN_METHOD,
+            Self::SpaceInspect => BROWSER_SPACE_INSPECT_METHOD,
+            Self::SessionCreate => BROWSER_SESSION_CREATE_METHOD,
+            Self::SessionOpen => BROWSER_SESSION_OPEN_METHOD,
+            Self::SessionArchive => BROWSER_SESSION_ARCHIVE_METHOD,
+            Self::SessionInspect => BROWSER_SESSION_INSPECT_METHOD,
+            Self::MessageAppend => BROWSER_MESSAGE_APPEND_METHOD,
+            Self::ComposerSetReasoning => BROWSER_COMPOSER_SET_REASONING_METHOD,
+            Self::ComposerSetApps => BROWSER_COMPOSER_SET_APPS_METHOD,
+            Self::DispatchSubmit => BROWSER_DISPATCH_SUBMIT_METHOD,
+            Self::DispatchStatus => BROWSER_DISPATCH_STATUS_METHOD,
+            Self::DispatchStop => BROWSER_DISPATCH_STOP_METHOD,
         }
     }
 
@@ -3086,7 +3097,7 @@ fn browser_handoff_prepare(
         format!("hh_{}", &digest[..32])
     });
     let message = format!(
-        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_url} 若工具调用发生 OpenAI host-side pre-delivery safety rejection，原参数最多重试一次；不要通过编码、混淆、机械改写或更换 transport 来规避 safety protection。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
+        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_url} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
     );
 
     json!({
@@ -3105,7 +3116,7 @@ fn browser_handoff_prepare(
             }
         },
         "automatic_delivery": {
-            "method": "herdr_mcp.browser_session.create",
+            "method": BROWSER_SESSION_CREATE_METHOD,
             "params": {
                 "source_url": source_url,
                 "message": message,
@@ -3114,12 +3125,6 @@ fn browser_handoff_prepare(
         },
         "manual_delivery": {
             "copy_prompt": message,
-        },
-        "safety": {
-            "pre_delivery_retry_limit": 1,
-            "retry_requires_no_execution_evidence": true,
-            "preserve_mutation_idempotency_key": true,
-            "rewrite_rejected_payload": false,
         }
     })
 }
@@ -5138,7 +5143,7 @@ fn browser_registry_call_with_grants(
         return json!({"ok": false, "code": "browser_registry_store_unavailable"});
     };
     match method {
-        "herdr_mcp.browser_endpoint.list" => {
+        BROWSER_ENDPOINT_LIST_METHOD => {
             if let Some(error) = browser_reject_unknown(object, &["limit"]) {
                 return error;
             }
@@ -5154,7 +5159,7 @@ fn browser_registry_call_with_grants(
                 Err(error) => browser_store_error(error),
             }
         }
-        "herdr_mcp.browser_endpoint.inspect" => {
+        BROWSER_ENDPOINT_INSPECT_METHOD => {
             if let Some(error) = browser_reject_unknown(object, &["endpoint_ref"]) {
                 return error;
             }
@@ -5183,7 +5188,7 @@ fn browser_registry_call_with_grants(
                 Err(error) => browser_store_error(error),
             }
         }
-        "herdr_mcp.browser_resource.list" => {
+        BROWSER_RESOURCE_LIST_METHOD => {
             if let Some(error) = browser_reject_unknown(
                 object,
                 &["endpoint_ref", "provider", "kind", "parent_ref", "limit"],
@@ -5226,7 +5231,7 @@ fn browser_registry_call_with_grants(
                 Err(error) => browser_store_error(error),
             }
         }
-        "herdr_mcp.browser_resource.inspect" => {
+        BROWSER_RESOURCE_INSPECT_METHOD => {
             if let Some(error) = browser_reject_unknown(object, &["resource_ref"]) {
                 return error;
             }
@@ -5285,7 +5290,7 @@ fn browser_registry_call_with_grants(
                 Err(error) => browser_store_error(error),
             }
         }
-        "herdr_mcp.browser_resource.resolve" => {
+        BROWSER_RESOURCE_RESOLVE_METHOD => {
             if let Some(error) = browser_reject_unknown(
                 object,
                 &[
@@ -6067,13 +6072,15 @@ mod tests {
         }));
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "herdr-mcp");
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 3);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("continue/resume intent"));
         assert!(instructions.contains("search durable Continuity before asking"));
         assert!(instructions.contains("never select a chain by recency or text similarity alone"));
         assert!(instructions.contains("browser_handoff.prepare"));
-        assert!(instructions.contains("pre-delivery safety rejection"));
+        assert!(instructions.contains("execution/result evidence"));
+        assert!(!instructions.contains("pre-delivery safety rejection"));
+        assert!(!instructions.contains("retry the original create arguments"));
     }
 
     #[test]
@@ -6493,7 +6500,7 @@ mod tests {
         let result = discover_result();
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], SDK_WIRE_PROTOCOL);
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 3);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
     }
 
     #[test]
@@ -7237,7 +7244,7 @@ mod tests {
         assert_eq!(remote_consent["code"], "unknown_local_method");
 
         let identity = contract::identity().unwrap();
-        assert_eq!(identity.epoch, 3);
+        assert_eq!(identity.epoch, 4);
         assert_eq!(identity.tool_count, 18);
     }
 
@@ -9563,12 +9570,12 @@ mod tests {
         let message = first["handoff"]["message"].as_str().unwrap();
         assert!(message.contains("continuity.resume"));
         assert!(message.contains("workspace / Git / runtime"));
-        assert!(message.contains("host-side pre-delivery safety rejection"));
+        assert!(message.contains("delivery/execution"));
+        assert!(!message.contains("host-side pre-delivery safety rejection"));
         assert!(message.contains(source_url));
         assert!(message.len() < 2048);
         assert!(!message.contains("Keep the durable journal authoritative"));
-        assert_eq!(first["safety"]["pre_delivery_retry_limit"], 1);
-        assert_eq!(first["safety"]["rewrite_rejected_payload"], false);
+        assert!(first.get("safety").is_none());
 
         let mismatched_source = browser_handoff_prepare(
             &store,
