@@ -34,23 +34,22 @@ herdr-mcp 把 Web AI 视为高层 planner。本地 Agent 是可以被调用的�
 
 > 能确定性完成的工作直接做；需要独立思考的工作才委派。
 
-可靠性上有一个例外：WebChat host 可能在请求到达 MCP server 之前误拦一个合法 Herdr 调用。如果返回里没有 Herdr 正常的执行证据（`op_id`、`session_id`、`backend`、`pane_id`、`exit_code`、`device_id`），就把它判定为 **pre-delivery**。直接路径做过一次有界重试后，如果仍然明确是 pre-delivery，而且原目标适合本机自主执行，可以把同一个用户已授权目标交给**现有本地 Agent**完成。
+外部 host 的结果不是 worker 选择信号。如果返回里没有 Herdr 正常的执行/结果证据（`op_id`、`session_id`、`backend`、`pane_id`、`exit_code`、`execution`、`failure_origin`、`device_id`），不要据此声称 Herdr workstation 或 child process 已经执行。只有当任务本身确实需要独立推理或并行本地工作时才选择 Agent，不能因为前一次调用被外部 host 拒绝就把 Agent 当成重试通道。
 
-这条 fallback 只更换执行主体，不改变安全边界：
+执行证据与 worker 选择应当分开判断：
 
 ```text
 直接 Herdr tool
-  ↓ host 在投递前拦截
-同一调用有界重试一次
-  ↓ 再次在投递前拦截
-通过 herdr_prompt 交给现有本地 Agent
   ↓
-Agent 在本机完成工作流
-  ↓
-planner 用最安全的可用读取路径核验目标状态
+是否有 Herdr 执行/结果证据？ ── 有 ──> 按该 delivery/execution 证据继续
+  │ 无
+  └─> 不推断本地已执行；如实报告，或使用产品已定义的 reconciliation / 手动路径
+
+任务本身是否需要独立推理/并行工作？ ── 是 ──> 通过 herdr_prompt 使用现有本地 Agent
+  └─> planner 再核验最终目标状态
 ```
 
-发给 Agent 的应当是高层任务契约：目标结果、允许范围、相关项目/上下文、验收条件、禁止继续转派。不要把刚才被拒绝的 shell/API payload 原样复制、编码、混淆或机械改写后交给 Agent，只为了让 host 放行。mutation 只有在原调用已经被明确证明为 pre-delivery 时才走这条 fallback，并继续遵守原有授权与确认要求。如果 `herdr_prompt` 自己也在到达 Herdr 前被 host 拒绝，就停止 fallback 链并明确报告是 host-side barrier；不要继续换更强工具或其它编码形式包装同一意图。
+发给 Agent 的应当是高层任务契约：目标结果、允许范围、相关项目/上下文、验收条件、禁止继续转派，并继续遵守所有既有授权与确认要求。Agent dispatch 是适合任务本身时采用的独立执行选择，不是对外部 host 已拒绝调用的重试机制。
 
 ## 推荐 worker 顺序
 
@@ -287,13 +286,7 @@ Herdr 的 workspace/pane 可见性让人类可以随时观察并接管，而不�
 Inspect
   ↓
 能否 deterministic 完成？
-  ├─ yes → fs/git/exec
-  │          ↓ host-side pre-delivery rejection
-  │       同一调用有界重试一次
-  │          ↓ 再次拒绝
-  │       适合现有本地 Agent？
-  │          ├─ yes → herdr_prompt → 核验目标状态
-  │          └─ no  → 报告 host-side block
+  ├─ yes → fs/git/exec → 读取 Herdr delivery/execution 证据 → 核验目标状态
   └─ no
        ↓
    选择一个窄 worker 任务

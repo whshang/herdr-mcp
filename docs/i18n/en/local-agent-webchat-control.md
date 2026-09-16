@@ -266,7 +266,7 @@ Output is the canonical packet plus the delivery evidence:
 | `manual_delivery.copy_prompt` | The same canonical message, for manual continuation |
 | `instruction` | Plain-language statement of what actually happened |
 
-Idempotency: one logical handoff keeps one key. Without `--idempotency-key` the CLI reuses the canonical `handoff_id`, so a plain re-run is the same logical handoff — that is what satisfies the canonical "retry once with the same key" rule. Never pass a new key to retry, and never expect the CLI to retry an uncertain delivery for you.
+Idempotency: one logical handoff keeps one key. Without `--idempotency-key` the CLI reuses the canonical `handoff_id`. Do not rotate the key to probe delivery state; use `automatic_delivery` and, when a dispatch exists, `dispatch-status`. The CLI never retries an uncertain delivery for you.
 
 `--prepare-only` skips delivery and returns the packet (with `automatic_delivery.attempted=false`, `reason="prepare_only"`).
 

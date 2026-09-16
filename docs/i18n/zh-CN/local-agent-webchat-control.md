@@ -266,7 +266,7 @@ herdr-mcp webchat handoff \
 | `manual_delivery.copy_prompt` | 同一条 canonical 消息，用于手动继续 |
 | `instruction` | 用自然语言说明实际发生了什么 |
 
-Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-key` 时，CLI 复用 canonical `handoff_id`，因此“原样重跑同一条命令”就是同一次 logical handoff——这正是 canonical 的“用同一 key 最多重试一次”规则。重试绝不要换新 key，也不要期待 CLI 替你重试 uncertain 投递。
+Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-key` 时，CLI 复用 canonical `handoff_id`。不要通过更换 key 来探测投递状态；应读取 `automatic_delivery`，已有 dispatch 时再查 `dispatch-status`。CLI 不会替你自动重试 uncertain 投递。
 
 `--prepare-only` 跳过投递，只返回 packet（`automatic_delivery.attempted=false`、`reason="prepare_only"`）。
 

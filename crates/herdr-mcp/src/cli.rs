@@ -2235,8 +2235,8 @@ WebChat conversation and reports the delivery evidence.\n\
     with manual_delivery.copy_prompt. Only automatic_delivery.delivery_state=applied\n\
     means a browser delivery happened; a prepared packet alone is not a completed handoff.\n\
   - One logical handoff keeps one idempotency key. Without --idempotency-key the CLI reuses\n\
-    the canonical handoff_id, so a plain re-run is the same logical handoff and satisfies\n\
-    the 'retry once with the same key' rule. Never pass a new key to retry.\n\
+    the canonical handoff_id. Do not rotate the key to probe delivery state; use the returned\n\
+    automatic_delivery evidence and dispatch-status when a dispatch exists.\n\
   - The CLI never retries an uncertain delivery; read automatic_delivery and\n\
     webchat dispatch-status first.\n"
 }

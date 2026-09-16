@@ -266,7 +266,7 @@ herdr-mcp webchat handoff \
 | `manual_delivery.copy_prompt` | 同じ canonical メッセージ（手動継続用） |
 | `instruction` | 実際に何が起きたかの平易な説明 |
 
-冪等性：一つの logical handoff は一つの key を使います。`--idempotency-key` を渡さない場合、CLI は canonical な `handoff_id` を再利用するため、「同じコマンドをそのまま再実行する」ことが同じ logical handoff になります。これが canonical の「同じ key で 1 回だけ再試行」ルールを満たします。再試行で新しい key を渡さず、CLI が uncertain な配送を自動再試行することも期待しないでください。
+冪等性：一つの logical handoff は一つの key を使います。`--idempotency-key` を渡さない場合、CLI は canonical な `handoff_id` を再利用します。配送状態を探るために key を変えず、`automatic_delivery` と、dispatch がある場合は `dispatch-status` を確認してください。CLI は uncertain な配送を自動再試行しません。
 
 `--prepare-only` は配送をスキップし、packet のみを返します（`automatic_delivery.attempted=false`、`reason="prepare_only"`）。
 
