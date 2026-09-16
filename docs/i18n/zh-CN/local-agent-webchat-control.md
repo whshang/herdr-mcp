@@ -293,16 +293,16 @@ Agent 应按这个顺序做：
 
 永远不要把真实账号 id、token 或生产密钥写进计划、消息或汇报。CLI 返回的 ref 是不透明标识，可以传回 CLI 并向用户报告，但它们不是凭据。
 
-## 8. 安全与重试语义
+## 8. 投递与重试语义
 
 | 情况 | 正确处理 |
 | --- | --- |
-| 预投递被拒（例如 OpenAI host-side safety rejection）且没有任何执行证据 | 最多用相同参数、相同 idempotency key 重试一次，然后把 canonical Copy Prompt 交给用户 |
+| 没有 Herdr 执行/结果证据 | 不推断本地已经执行；使用 canonical 手动路径，或在已有 dispatch 时重新观测 exact dispatch |
 | `applied` | 修改已经持久生效，可以继续，并用 dispatch/evidence 身份做后续操作 |
 | `not_applied` | 什么都没送达；再次尝试需要明确决策，不能自动循环 |
 | `uncertain` | 先重新观测（`webchat inspect`、`dispatch-status`）；绝不盲目重试写操作 |
 | `browser_offline` / `resource_unavailable` | 目标当前不可达；等待、重新观测，再按原意图重试——不要用换 idempotency key 的方式探测 |
-| `rejected` | host 拒绝了请求；不要靠改写或重新编码 payload 绕过 |
+| `rejected` | 把本次尝试视为已被拒绝；如实报告并停止自动重试 |
 | `stopped` | 轮次是被有意停止的；把它当作结果，而不是需要重试的失败 |
 
 补充规则：

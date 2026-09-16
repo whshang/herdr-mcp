@@ -293,16 +293,16 @@ The agent should proceed in this order:
 
 Never place real account ids, tokens, or production secrets in a plan, a message, or a report. Refs returned by the CLI are opaque identifiers; they are safe to pass back to the CLI and to report to the user, but they are not credentials.
 
-## 8. Safety and retry semantics
+## 8. Delivery and retry semantics
 
 | Situation | Correct behavior |
 | --- | --- |
-| Pre-delivery rejection (for example an OpenAI host-side safety rejection) with no execution evidence | At most one retry with the same arguments and the same idempotency key, then hand the user the canonical Copy Prompt |
+| No Herdr execution/result evidence | Do not infer local execution; use the canonical manual path, or re-observe the exact dispatch when one exists |
 | `applied` | The mutation is durable; continue, and use the dispatch/evidence identity for follow-ups |
 | `not_applied` | Nothing was delivered; a new attempt needs a deliberate decision, not an automatic loop |
 | `uncertain` | Re-observe (`webchat inspect`, `dispatch-status`); never blind-retry the mutation |
 | `browser_offline` / `resource_unavailable` | The target is not reachable now; wait, re-observe, then retry the original intent — do not rotate the idempotency key to probe |
-| `rejected` | The host refused the request; do not rewrite or re-encode the payload to work around it |
+| `rejected` | Treat the attempt as refused; report that result and stop automatic retries |
 | `stopped` | The turn was stopped deliberately; treat it as an outcome, not a failure to retry |
 
 Additional rules:

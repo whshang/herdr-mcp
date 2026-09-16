@@ -293,16 +293,16 @@ Agent は次の順で進めます。
 
 実際のアカウント id、トークン、本番 secret を計画・メッセージ・報告に含めないでください。CLI が返す ref は不透明な識別子で、CLI に戻したりユーザーに報告してよいものですが、資格情報ではありません。
 
-## 8. 安全性と再試行のセマンティクス
+## 8. 配送と再試行のセマンティクス
 
 | 状況 | 正しい対応 |
 | --- | --- |
-| 配送前拒否（例：OpenAI host-side safety rejection）で実行証拠がない | 同じ引数・同じ idempotency key で最大 1 回だけ再試行し、その後 canonical Copy Prompt を渡す |
+| Herdr の実行/結果証拠がない | ローカル実行を推測しない。canonical な手動経路を使うか、dispatch がある場合はその exact dispatch を再観測する |
 | `applied` | 変更は永続化済み。続行し、後続は dispatch/evidence identity を使う |
 | `not_applied` | 何も配送されていない。再試行は自動ループではなく意図的な判断 |
 | `uncertain` | まず再観測（`webchat inspect`、`dispatch-status`）。変更を盲目的に再送しない |
 | `browser_offline` / `resource_unavailable` | 対象に到達できない。待って再観測し、元の意図で再試行する。生存確認のために idempotency key を回さない |
-| `rejected` | host が拒否した。payload を書き換えたり再エンコードして回避しない |
+| `rejected` | その試行は拒否された結果として扱い、報告して自動再試行を止める |
 | `stopped` | 意図的に停止された結果であり、再試行すべき失敗ではない |
 
 追加規則：
