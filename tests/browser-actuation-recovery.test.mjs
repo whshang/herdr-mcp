@@ -1241,6 +1241,10 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(segment, /chrome\.tabs\.create\(\{ url: launchUrl, active: true \}\)/);
   assert.doesNotMatch(segment, /lastSeenAt/);
   assert.match(segment, /reservationRef/);
+  assert.match(segment, /void sendBrowserActuationTabMessage\(createdTab\.id,/);
+  assert.doesNotMatch(segment, /const response = await sendBrowserActuationTabMessage\(createdTab\.id,/);
+  assert.match(segment, /\.then\(async \(response\) => \{/);
+  assert.match(segment, /postBrowserActuationEvidence\(actuationId, evidence\)/);
 
   const createStart = wakeSource.indexOf('const creatingSession = command?.operation === "herdr_mcp.browser_session.create"');
   const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);

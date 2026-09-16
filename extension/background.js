@@ -3255,22 +3255,36 @@ async function handleBrowserActuation(command) {
     }
     try {
       await protectBoundTab(createdTab.id);
-      const response = await sendBrowserActuationTabMessage(createdTab.id, {
+      // Do not keep the browser_actuation SSE handler waiting on the content
+      // script. ChatGPT submission itself needs one content -> service-worker
+      // MAIN-world request; holding this parent sendMessage open while that
+      // request is in flight can starve the nested extension message. The Rust
+      // broker already owns the bounded wait for postBrowserActuationEvidence,
+      // so complete this leg asynchronously without changing submit ownership
+      // or adding a second provider mutation attempt.
+      void sendBrowserActuationTabMessage(createdTab.id, {
         type: "h2w_browser_actuation",
         command: {
           operation,
           expected_generation: expectedGeneration,
           params,
         },
+      }).then(async (response) => {
+        const evidence = response?.evidence && typeof response.evidence === "object"
+          ? response.evidence
+          : {
+              ...unavailableBrowserActuationEvidence(expectedGeneration),
+              command_accepted: true,
+              resource_available: true,
+            };
+        await postBrowserActuationEvidence(actuationId, evidence);
+      }).catch(async () => {
+        await postBrowserActuationEvidence(actuationId, {
+          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          command_accepted: true,
+          resource_available: true,
+        }).catch(() => {});
       });
-      const evidence = response?.evidence && typeof response.evidence === "object"
-        ? response.evidence
-        : {
-            ...unavailableBrowserActuationEvidence(expectedGeneration),
-            command_accepted: true,
-            resource_available: true,
-          };
-      await postBrowserActuationEvidence(actuationId, evidence);
     } catch (_) {
       await postBrowserActuationEvidence(actuationId, {
         ...unavailableBrowserActuationEvidence(expectedGeneration),
