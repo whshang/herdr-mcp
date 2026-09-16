@@ -10,7 +10,8 @@
 //! identity before it connects.
 
 use crate::link::daemon::{
-    LEGACY_EPOCH1_CONTRACT_HASH, PUBLIC_CONTRACT_EPOCH, PUBLIC_CONTRACT_HASH,
+    LEGACY_EPOCH1_CONTRACT_HASH, PREVIOUS_PUBLIC_CONTRACT_EPOCH, PREVIOUS_PUBLIC_CONTRACT_HASH,
+    PUBLIC_CONTRACT_EPOCH, PUBLIC_CONTRACT_HASH,
 };
 
 /// Snapshot from Edge `GET /health` (non-secret fields only).
@@ -108,33 +109,47 @@ pub fn parse_edge_health_contract(body: &str) -> Result<EdgeHealthContract, Edge
     })
 }
 
-/// The current Rust Link requires proof that the Edge understands the current
-/// runtime execution contract. N-1 is supported in the opposite direction:
-/// the new Edge accepts an epoch-2 workstation hello so an old binary can be
-/// rolled back. A new binary must not treat a legacy-only Edge as compatible,
-/// because that Edge cannot accept the epoch-3 hello.
-pub fn rust_link_accepts_edge_contract(contract: &EdgeHealthContract) -> bool {
-    contract.contract_epoch == PUBLIC_CONTRACT_EPOCH
-        && contract.contract_hash == PUBLIC_CONTRACT_HASH
+/// Admission rule for the Edge `/health` preflight.
+///
+/// `/health` is only an admission gate and never the final compatibility proof.
+/// A Link proceeds to the authenticated hello when the advertised runtime
+/// identity is either its own current execution contract or the immediately
+/// previous rollback baseline — the same window the Edge uses to accept a
+/// workstation hello. This keeps a rolling Edge deployment from stranding Links
+/// built before the current epoch, because the Edge publishes the
+/// rollback-compatible identity in the field an older Link reads first.
+///
+/// A health result that only matches the previous baseline is deliberately NOT
+/// treated as final: whether the Edge accepts the current epoch is decided by
+/// the authenticated `hello_ack`, where `code=contract_mismatch` fails the Link
+/// closed. An older Edge therefore cannot be mistaken for a current one.
+pub fn rust_link_admits_edge_health_contract(contract: &EdgeHealthContract) -> bool {
+    (contract.contract_epoch == PUBLIC_CONTRACT_EPOCH
+        && contract.contract_hash == PUBLIC_CONTRACT_HASH)
+        || (contract.contract_epoch == PREVIOUS_PUBLIC_CONTRACT_EPOCH
+            && contract.contract_hash == PREVIOUS_PUBLIC_CONTRACT_HASH)
 }
 
-/// Human-readable refusal when Edge runtime compatibility is still epoch 1.
+/// Human-readable refusal when the Edge health preflight does not admit the Link.
 pub fn refuse_edge_for_rust_link(contract: &EdgeHealthContract) -> EdgeContractError {
     if contract.contract_epoch == 1 && contract.contract_hash == LEGACY_EPOCH1_CONTRACT_HASH {
         return EdgeContractError::Message(format!(
-            "Edge runtime contract is still epoch 1 ({}); Rust link run requires runtime epoch {} ({}). Point HERDR_EDGE_URL at a compatible Edge or deploy an Edge that accepts runtime epoch {}",
+            "Edge runtime contract is still epoch 1 ({}); Rust link run requires runtime epoch {} ({}) or the previous rollback baseline {}. Point HERDR_EDGE_URL at a compatible Edge or deploy an Edge that accepts runtime epoch {}",
             contract.contract_hash,
             PUBLIC_CONTRACT_EPOCH,
             PUBLIC_CONTRACT_HASH,
+            PREVIOUS_PUBLIC_CONTRACT_EPOCH,
             PUBLIC_CONTRACT_EPOCH
         ));
     }
     EdgeContractError::Message(format!(
-        "Edge runtime contract epoch {} hash {} is incompatible with Rust link run (requires current epoch {} hash {})",
+        "Edge /health runtime contract epoch {} hash {} is outside the admission window (current epoch {} hash {}, previous epoch {} hash {}); the authenticated hello remains the final runtime-contract fence",
         contract.contract_epoch,
         contract.contract_hash,
         PUBLIC_CONTRACT_EPOCH,
-        PUBLIC_CONTRACT_HASH
+        PUBLIC_CONTRACT_HASH,
+        PREVIOUS_PUBLIC_CONTRACT_EPOCH,
+        PREVIOUS_PUBLIC_CONTRACT_HASH
     ))
 }
 
@@ -145,7 +160,7 @@ pub fn probe_edge_contract_for_rust_link(
     let health_url = health_url_from_edge_ws(edge_ws_url)?;
     let body = fetch_health_body(&health_url)?;
     let contract = parse_edge_health_contract(&body)?;
-    if rust_link_accepts_edge_contract(&contract) {
+    if rust_link_admits_edge_health_contract(&contract) {
         Ok(contract)
     } else {
         Err(refuse_edge_for_rust_link(&contract))
@@ -205,33 +220,93 @@ mod tests {
 
     #[test]
     fn parses_prod_shaped_health() {
-        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":4,"contractHash":"sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"}"#;
-        let contract = parse_edge_health_contract(body).unwrap();
-        assert!(rust_link_accepts_edge_contract(&contract));
-        assert_eq!(contract.service.as_deref(), Some("herdr-edge-prod"));
+        // A current Edge is admitted whether it publishes the current identity
+        // or the rollback-compatible previous one in the field old Links read.
+        for body in [
+            r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":4,"contractHash":"sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"}"#,
+            r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":7,"contractHash":"sha256:public-v7","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8","currentRuntimeContractEpoch":3,"currentRuntimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#,
+        ] {
+            let contract = parse_edge_health_contract(body).unwrap();
+            assert!(
+                rust_link_admits_edge_health_contract(&contract),
+                "admitted: {body}"
+            );
+            assert_eq!(contract.service.as_deref(), Some("herdr-edge-prod"));
+        }
+    }
+
+    /// Rolling rollback, Link side: a Link built before the current epoch reads
+    /// `currentRuntimeContractEpoch` first, so the Edge must publish the
+    /// rollback-compatible identity there or the deployed fleet is stranded the
+    /// moment the Edge is deployed ahead of the runtime.
+    #[test]
+    fn rolling_rollback_edge_health_keeps_a_previous_epoch_link_admissible() {
+        // A Link that still requires epoch 3 parses this new-Edge `/health` view
+        // and finds exactly its own contract.
+        let new_edge = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":7,"contractHash":"sha256:public-v7","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8","currentRuntimeContractEpoch":3,"currentRuntimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
+        let contract = parse_edge_health_contract(new_edge).unwrap();
+        assert_eq!(contract.contract_epoch, PREVIOUS_PUBLIC_CONTRACT_EPOCH);
+        assert_eq!(contract.contract_hash, PREVIOUS_PUBLIC_CONTRACT_HASH);
+        // An epoch-3 Link's exact-match rule passes against this view.
+        assert!(
+            contract.contract_epoch == 3
+                && contract.contract_hash
+                    == "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"
+        );
+        // The current Link treats the same view as admission-only, never as
+        // proof that the Edge accepts the current epoch.
+        assert!(rust_link_admits_edge_health_contract(&contract));
+    }
+
+    /// Rolling rollback, Edge side: an epoch-3 Edge advertises the same
+    /// rollback-compatible view, so the current Link enters the hello; the
+    /// authenticated hello is then the final fence and rejects it.
+    #[test]
+    fn rolling_rollback_previous_epoch_edge_is_admitted_then_fails_the_hello_fence() {
+        let old_edge = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":6,"contractHash":"sha256:public-v6","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8","currentRuntimeContractEpoch":3,"currentRuntimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
+        let contract = parse_edge_health_contract(old_edge).unwrap();
+        assert!(
+            rust_link_admits_edge_health_contract(&contract),
+            "the previous baseline is admitted to the hello, not proven compatible"
+        );
+        assert_ne!(contract.contract_epoch, PUBLIC_CONTRACT_EPOCH);
+        assert_ne!(contract.contract_hash, PUBLIC_CONTRACT_HASH);
+        // Final fence: the Edge refuses the current-epoch hello, and the Link
+        // classifies that refusal as fatal instead of downgrading.
+        assert_eq!(
+            crate::link::policy::classify_hello_ack_refusal(Some("contract_mismatch")),
+            crate::link::policy::LinkDirective::Exit(
+                crate::link::policy::LinkExitKind::ContractRejected
+            )
+        );
     }
 
     #[test]
     fn prefers_current_runtime_contract_over_legacy_rollback_fields() {
         let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":7,"contractHash":"sha256:public-v7","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8","currentRuntimeContractEpoch":4,"currentRuntimeContractHash":"sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
-        assert!(rust_link_accepts_edge_contract(&contract));
+        assert!(rust_link_admits_edge_health_contract(&contract));
         assert_eq!(contract.contract_epoch, PUBLIC_CONTRACT_EPOCH);
         assert_eq!(contract.contract_hash, PUBLIC_CONTRACT_HASH);
     }
 
     #[test]
-    fn refuses_legacy_only_previous_runtime_edge_for_current_link() {
-        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":6,"contractHash":"sha256:public-v6","runtimeContractEpoch":3,"runtimeContractHash":"sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5"}"#;
+    fn refuses_edge_outside_the_admission_window() {
+        // An Edge two epochs behind cannot accept the current hello, so it is
+        // refused before any connection is attempted.
+        let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":6,"contractHash":"sha256:public-v6","runtimeContractEpoch":2,"runtimeContractHash":"sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
-        assert!(!rust_link_accepts_edge_contract(&contract));
+        assert!(!rust_link_admits_edge_health_contract(&contract));
+        let err = refuse_edge_for_rust_link(&contract).to_string();
+        assert!(err.contains("outside the admission window"));
+        assert!(err.contains("authenticated hello remains the final"));
     }
 
     #[test]
     fn prefers_runtime_contract_when_public_contract_has_advanced() {
         let body = r#"{"ok":true,"service":"herdr-edge-prod","contractEpoch":7,"contractHash":"sha256:public-v7","runtimeContractEpoch":4,"runtimeContractHash":"sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
-        assert!(rust_link_accepts_edge_contract(&contract));
+        assert!(rust_link_admits_edge_health_contract(&contract));
         assert_eq!(contract.contract_epoch, 4);
         assert_eq!(contract.contract_hash, PUBLIC_CONTRACT_HASH);
     }
@@ -240,7 +315,7 @@ mod tests {
     fn refuses_epoch1_dev_health() {
         let body = r#"{"ok":true,"service":"herdr-edge-dev","contractEpoch":1,"contractHash":"sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d"}"#;
         let contract = parse_edge_health_contract(body).unwrap();
-        assert!(!rust_link_accepts_edge_contract(&contract));
+        assert!(!rust_link_admits_edge_health_contract(&contract));
         let err = refuse_edge_for_rust_link(&contract).to_string();
         assert!(err.contains("epoch 1"));
         assert!(err.contains("runtime epoch 4"));

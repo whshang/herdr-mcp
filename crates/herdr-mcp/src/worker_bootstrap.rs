@@ -2124,7 +2124,7 @@ fn validate_health_payload(
     }
     let contract = crate::link::edge_contract::parse_edge_health_contract(&payload.to_string())
         .map_err(|error| format!("Worker health runtime contract is invalid: {error}"))?;
-    if !crate::link::edge_contract::rust_link_accepts_edge_contract(&contract) {
+    if !crate::link::edge_contract::rust_link_admits_edge_health_contract(&contract) {
         return Err(crate::link::edge_contract::refuse_edge_for_rust_link(&contract).to_string());
     }
     if let Some(expected) = expected_version
@@ -2610,20 +2610,40 @@ mod tests {
         assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_ok());
     }
 
+    /// Rolling rollback on the bootstrap path: a current Edge publishes the
+    /// rollback-compatible identity in the field an older Link reads first, so
+    /// the install preflight admits it and the authenticated hello decides
+    /// whether the current epoch is really accepted.
     #[test]
-    fn health_contract_rejects_legacy_only_previous_edge_for_current_install() {
+    fn health_contract_admits_previous_epoch_edge_for_the_hello_fence() {
+        let payload = json!({
+            "ok": true,
+            "service": "herdr-edge-mac",
+            "edgeVersion": "0.4.6-dev",
+            "contractEpoch": 7,
+            "contractHash": "sha256:public-v7",
+            "runtimeContractEpoch": 2,
+            "runtimeContractHash": crate::link::daemon::LEGACY_EPOCH2_CONTRACT_HASH,
+            "currentRuntimeContractEpoch": 3,
+            "currentRuntimeContractHash": crate::link::daemon::PREVIOUS_PUBLIC_CONTRACT_HASH,
+        });
+        assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_ok());
+    }
+
+    #[test]
+    fn health_contract_rejects_edge_outside_the_admission_window() {
         let payload = json!({
             "ok": true,
             "service": "herdr-edge-mac",
             "edgeVersion": "0.4.6-dev",
             "contractEpoch": 6,
             "contractHash": "sha256:public-v6",
-            "runtimeContractEpoch": 3,
-            "runtimeContractHash": crate::link::daemon::PREVIOUS_PUBLIC_CONTRACT_HASH,
+            "runtimeContractEpoch": 2,
+            "runtimeContractHash": crate::link::daemon::LEGACY_EPOCH2_CONTRACT_HASH,
         });
-        // The previous runtime identity is a rollback baseline for the Edge
-        // hello, never a substitute for the current link-side requirement.
-        assert!(validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev")).is_err());
+        let error = validate_health_payload(&payload, "herdr-edge-mac", Some("0.4.6-dev"))
+            .expect_err("two epochs behind");
+        assert!(error.contains("outside the admission window"), "{error}");
     }
 
     #[test]

@@ -280,15 +280,22 @@ pub(crate) fn start_reusable_pane_session(
                     return utility_pane_control_plane_error(workspace_id, command, message);
                 }
                 Err(PrepareError::Other { code, message }) => {
-                    return json!({
-                        "ok": false,
-                        "code": code,
-                        "message": message,
-                        "workspace": workspace_id,
-                        "command": command,
-                        "delivery_state": "not_delivered",
-                        "hint": "failed to prepare canonical utility pane before command delivery",
-                    });
+                    let mut result = Map::new();
+                    result.insert("ok".to_owned(), json!(false));
+                    result.insert("code".to_owned(), json!(code));
+                    result.insert("message".to_owned(), json!(message));
+                    result.insert("backend".to_owned(), json!("utility_pane"));
+                    result.insert("workspace".to_owned(), json!(workspace_id));
+                    result.insert("command".to_owned(), json!(command));
+                    result.insert("delivery_state".to_owned(), json!("not_delivered"));
+                    result.insert(
+                        "hint".to_owned(),
+                        json!("failed to prepare canonical utility pane before command delivery"),
+                    );
+                    // Preparation owns the pane, not the command: the command
+                    // was never delivered to a running child.
+                    exec_evidence::insert_control_plane_rejection(&mut result);
+                    return Value::Object(result);
                 }
             };
 
@@ -336,14 +343,20 @@ fn run_unix_durable(
                 return utility_pane_control_plane_error(workspace_id, command, message);
             }
             Err(PrepareError::Other { code, message }) => {
-                return json!({
-                    "ok": false,
-                    "code": code,
-                    "message": message,
-                    "workspace": workspace_id,
-                    "command": command,
-                    "hint": "failed to prepare utility pane before command delivery",
-                });
+                let mut result = Map::new();
+                result.insert("ok".to_owned(), json!(false));
+                result.insert("code".to_owned(), json!(code));
+                result.insert("message".to_owned(), json!(message));
+                result.insert("backend".to_owned(), json!("utility_pane"));
+                result.insert("workspace".to_owned(), json!(workspace_id));
+                result.insert("command".to_owned(), json!(command));
+                result.insert("delivery_state".to_owned(), json!("not_delivered"));
+                result.insert(
+                    "hint".to_owned(),
+                    json!("failed to prepare utility pane before command delivery"),
+                );
+                exec_evidence::insert_control_plane_rejection(&mut result);
+                return Value::Object(result);
             }
         };
 
@@ -651,28 +664,41 @@ fn project_structured_output(
     exec_evidence::insert_structured_output(result, &stdout, &stderr);
 }
 
+/// Utility-pane start failure. The stage is owned by `exec_sessions`, not
+/// guessed from the message: a before-send failure proves the command was never
+/// delivered, while an at/after-send failure must not claim that.
 fn utility_pane_start_failure(
     workspace_id: &str,
     pane_id: &str,
     command: &str,
-    message: String,
+    error: crate::exec_sessions::PaneStartError,
 ) -> Value {
     let mut result = Map::new();
     result.insert("ok".to_owned(), json!(false));
     result.insert("code".to_owned(), json!("exec_start_failed"));
-    result.insert("message".to_owned(), json!(message));
+    result.insert("message".to_owned(), json!(error.message));
     result.insert("backend".to_owned(), json!("utility_pane"));
     result.insert("workspace".to_owned(), json!(workspace_id));
     result.insert("pane_id".to_owned(), json!(pane_id));
     result.insert("command".to_owned(), json!(command));
-    result.insert("delivery_state".to_owned(), json!("unknown"));
-    result.insert(
-        "hint".to_owned(),
-        json!("Command start outcome is uncertain; existing pane/process state determines whether another start is safe."),
-    );
-    // `send_text` may already have reached the pane, so this must never claim
-    // `execution.started=false`.
-    exec_evidence::insert_uncertain_start(&mut result);
+    if error.stage.proves_nothing_delivered() {
+        // Preparation failed before the launch line was sent: nothing ran.
+        result.insert("delivery_state".to_owned(), json!("not_delivered"));
+        result.insert(
+            "hint".to_owned(),
+            json!("The utility-pane command was not delivered; the pane is unchanged."),
+        );
+        exec_evidence::insert_control_plane_rejection(&mut result);
+    } else {
+        // `send_text` may already have reached the pane, so this must never
+        // claim `execution.started=false`.
+        result.insert("delivery_state".to_owned(), json!("unknown"));
+        result.insert(
+            "hint".to_owned(),
+            json!("Command start outcome is uncertain; existing pane/process state determines whether another start is safe."),
+        );
+        exec_evidence::insert_uncertain_start(&mut result);
+    }
     Value::Object(result)
 }
 
@@ -1421,18 +1447,119 @@ mod tests {
     }
 
     #[test]
-    fn utility_pane_start_failure_never_claims_nothing_ran() {
-        let result = utility_pane_start_failure(
+    fn utility_pane_start_failure_stage_owns_the_delivery_claim() {
+        use crate::exec_sessions::PaneStartError;
+
+        // Before-send preparation failure: the command never reached the pane.
+        let before = utility_pane_start_failure(
             "w1",
             "w1:p2",
             "lark-cli --json",
-            "cannot start utility pane command".to_owned(),
+            PaneStartError::before_send("Herdr pane backend is unavailable"),
         );
-        assert_eq!(result["code"], "exec_start_failed");
-        assert_eq!(result["delivery_state"], "unknown");
-        assert_eq!(result["execution"]["started"], Value::Null);
-        assert_ne!(result["execution"]["started"], json!(false));
-        assert_eq!(result["failure_origin"], "unknown");
+        assert_eq!(before["code"], "exec_start_failed");
+        assert_eq!(before["delivery_state"], "not_delivered");
+        assert_eq!(
+            before["execution"],
+            json!({"started": false, "completed": false, "exit_code": null})
+        );
+        assert_eq!(before["failure_origin"], "herdr_control_plane");
+
+        // At/after-send failure: delivery cannot be ruled out.
+        let after = utility_pane_start_failure(
+            "w1",
+            "w1:p2",
+            "lark-cli --json",
+            PaneStartError::after_send("cannot start utility pane command: send failed"),
+        );
+        assert_eq!(after["code"], "exec_start_failed");
+        assert_eq!(after["delivery_state"], "unknown");
+        assert_eq!(after["execution"]["started"], Value::Null);
+        assert_ne!(after["execution"]["started"], json!(false));
+        assert_eq!(after["failure_origin"], "unknown");
+    }
+
+    #[test]
+    fn pane_start_stage_is_owned_by_the_exec_backend_not_guessed_from_text() {
+        use crate::exec_sessions::{PaneStartError, PaneStartStage};
+
+        assert!(
+            PaneStartError::before_send("cannot write pane script")
+                .stage
+                .proves_nothing_delivered()
+        );
+        assert!(
+            !PaneStartError::after_send("cannot write pane script")
+                .stage
+                .proves_nothing_delivered()
+        );
+        assert_eq!(
+            PaneStartStage::BeforeSend,
+            PaneStartError::before_send("x").stage
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_durable_protected_root_reports_pre_start_evidence_on_prepare_failure() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..1 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({
+                        "id": request["id"].clone(),
+                        "error": {
+                            "code": "pane_list_failed",
+                            "message": "cannot list panes in this workspace"
+                        }
+                    })
+                )
+                .unwrap();
+            }
+        });
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on macOS"));
+        let root = home.join("Documents").join(format!(
+            "herdr-protected-prepare-failure-test-{}",
+            std::process::id()
+        ));
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(&socket);
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"workspace": "w1", "command": "printf 'must-not-run-natively\n'"}),
+        );
+
+        assert_eq!(result["ok"], false, "unexpected result: {result}");
+        assert_eq!(result["code"], "pane_list_failed");
+        assert_eq!(result["backend"], "utility_pane");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(
+            result["execution"],
+            json!({"started": false, "completed": false, "exit_code": null})
+        );
+        assert_eq!(result["failure_origin"], "herdr_control_plane");
+        assert!(registry.list_views().is_empty());
+
+        server.join().unwrap();
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

@@ -134,12 +134,21 @@ export default {
         edgeEnv: identity.edgeEnv,
         contractEpoch: identity.contractEpoch,
         contractHash: identity.contractHash,
-        // Legacy rollback view: the frozen epoch-2 catalog identity that Links
-        // predating the current runtime execution contract consume.
+        // Two-stage rollout fence. `/health` is an admission gate, not the
+        // final compatibility proof: it must stay parseable by a Link built
+        // before the current runtime epoch, so the oldest still-supported
+        // identity is published first (`runtimeContract*`, the frozen epoch-2
+        // catalog view) and `currentRuntimeContract*` carries the
+        // rollback-compatible runtime identity (the previous execution
+        // contract) that a pre-upgrade Link reads first. Whether this Edge
+        // actually accepts the current epoch is proven only by the
+        // authenticated `hello_ack`.
         runtimeContractEpoch: EPOCH2_CONTRACT.contract_epoch,
         runtimeContractHash: EPOCH2_CONTRACT.contract_hash,
-        currentRuntimeContractEpoch: identity.runtimeContractEpoch,
-        currentRuntimeContractHash: identity.runtimeContractHash,
+        currentRuntimeContractEpoch:
+          PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+        currentRuntimeContractHash:
+          PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash,
         timestampMs: Date.now(),
       });
     }
