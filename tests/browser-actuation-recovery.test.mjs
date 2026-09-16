@@ -1167,7 +1167,10 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(registrationSegment, /chatGptProjectRoute/);
   assert.match(registrationSegment, /chatGptProjectRoute\s*\?\s*\[\]\s*:\s*await chatGptProjectCatalog\(accountNativeIdentity\)/);
   assert.match(registrationSegment, /browserSessionReservationRef/);
-  assert.match(registrationSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
+  assert.match(registrationSegment, /clearBrowserPendingDispatchRefresh\(true\)/);
+  const refreshClearStart = wakeSource.indexOf("function clearBrowserPendingDispatchRefresh");
+  const refreshClearSegment = wakeSource.slice(refreshClearStart, refreshClearStart + 500);
+  assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
 });
 
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {

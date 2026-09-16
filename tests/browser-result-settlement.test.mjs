@@ -179,6 +179,7 @@ function observationHarness({
   snapshots = [],
   sends = [],
   domCandidates = [],
+  unmatchedGraceMs = 0,
 } = {}) {
   let now = 10000;
   let route = "chatgpt:/c/worker";
@@ -187,7 +188,12 @@ function observationHarness({
   let currentDomCandidate = null;
   const sent = [];
   const assignments = new Map();
-  if (accepted) assignments.set("br_worker", { generation: 7, acceptedUserMessageRef: "user-1", reportedAssistantRef: null });
+  if (accepted) assignments.set("br_worker", {
+    generation: 7,
+    acceptedUserMessageRef: "user-1",
+    reportedAssistantRef: null,
+    unmatchedGraceUntil: unmatchedGraceMs > 0 ? now + unmatchedGraceMs : null,
+  });
   const routeStart = wakeSource.indexOf("  function startConversationRouteWatch() {");
   const routeEnd = wakeSource.indexOf("  function assistantSignature", routeStart);
   const observe = new Function(
@@ -401,6 +407,7 @@ test("late accepted-dispatch observation preserves an already reported assistant
     "registeredBrowserSessionRef",
     "expectedGeneration",
     "acceptedUserMessageRef",
+    "creatingSession",
     `${wakeSource.slice(start, end)}; return acceptedDispatchAssignments.get(registeredBrowserSessionRef);`,
   );
   const assignments = new Map([["br_worker", {
@@ -408,15 +415,17 @@ test("late accepted-dispatch observation preserves an already reported assistant
     acceptedUserMessageRef: "user-1",
     reportedAssistantRef: "assistant-1",
   }]]);
-  assert.deepEqual(apply(assignments, "br_worker", 7, "user-1"), {
+  assert.deepEqual(apply(assignments, "br_worker", 7, "user-1", false), {
     generation: 7,
     acceptedUserMessageRef: "user-1",
     reportedAssistantRef: "assistant-1",
+    unmatchedGraceUntil: null,
   });
-  assert.deepEqual(apply(assignments, "br_worker", 7, "user-2"), {
+  assert.deepEqual(apply(assignments, "br_worker", 7, "user-2", false), {
     generation: 7,
     acceptedUserMessageRef: "user-2",
     reportedAssistantRef: null,
+    unmatchedGraceUntil: null,
   });
 });
 
@@ -457,6 +466,30 @@ test("recovered assignment survives more than three transient result failures", 
   assert.equal(await h.observe(), true);
   assert.equal(h.sent.length, 5);
   assert.ok(h.sent.every((message) => message.generation === 6));
+});
+
+test("session.create settlement survives unmatched results while dispatch persistence is in grace", async () => {
+  assert.match(
+    wakeSource,
+    /unmatchedGraceUntil:\s*creatingSession\s*\?\s*Date\.now\(\) \+ BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS/,
+  );
+  const h = observationHarness({
+    unmatchedGraceMs: 5 * 60 * 1000,
+    snapshots: Array(5).fill(completedWorkerSnapshot),
+    sends: [...Array(4).fill({ ok: false, error: "browser_dispatch_result_unmatched" }), { ok: true }],
+  });
+  for (let i = 0; i < 4; i += 1) { assert.equal(await h.observe(), false); h.advance(60000); }
+  assert.equal(await h.observe(), true);
+  assert.equal(h.sent.length, 5);
+});
+
+test("session.create re-registers boundedly until its synthesized pending dispatch is discoverable", () => {
+  assert.match(wakeSource, /function armBrowserPendingDispatchRefresh\(reservationRef\)/);
+  assert.match(wakeSource, /until:\s*Date\.now\(\) \+ BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS/);
+  assert.match(wakeSource, /refresh\.retryMs = Math\.min\(refresh\.retryMs \* 2, 30000\)/);
+  assert.match(wakeSource, /registerCurrentConversation\("session-create-pending-dispatch"\)/);
+  assert.match(wakeSource, /response\?\.browser_pending_dispatch\s*\|\|\s*acceptedDispatchAssignments\.has\(registeredBrowserSessionRef\)/);
+  assert.match(wakeSource, /maybeRefreshBrowserPendingDispatchAssignment\(\);/);
 });
 
 test("persistent identity rejection stops retries but a new assignment can proceed", async () => {
