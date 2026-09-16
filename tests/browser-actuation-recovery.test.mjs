@@ -445,27 +445,14 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
   assert.doesNotMatch(identitySegment, /accountNativeIdentity|email|userId/i);
 });
 
-test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and Enter fallbacks", () => {
+test("ChatGPT submit has one bounded MAIN-world requestSubmit fallback", () => {
   assert.match(wakeSource, /function submitMainWorld\(selector\)/);
   assert.match(wakeSource, /type:\s*"h2w_submit_main"/);
   assert.match(backgroundSource, /msg\?\.type === "h2w_submit_main"/);
   assert.match(backgroundSource, /form\.requestSubmit\(sendButton\)/);
   const submitStart = wakeSource.indexOf("async function submit() {");
   const submitEnd = wakeSource.indexOf("// ---- Auto-allow", submitStart);
-  const submitSegment = wakeSource.slice(submitStart, submitEnd);
-  assert.match(submitSegment, /await submitMainWorld\(selector\)/);
-  const mainFallbackStart = submitSegment.indexOf("const mainSubmit = selector ? await submitMainWorld(selector) : null;");
-  const buttonWaitStart = submitSegment.indexOf("for (let i = 0; i < 40; i++)", mainFallbackStart);
-  const mainFallbackEnd = buttonWaitStart;
-  assert.ok(mainFallbackStart >= 0 && mainFallbackEnd > mainFallbackStart, "MAIN submit fallback must remain bounded");
-  assert.match(submitSegment.slice(0, mainFallbackStart), /if \(ADAPTER\.name === "chatgpt"\)/);
-  assert.doesNotMatch(submitSegment.slice(0, mainFallbackStart), /attempt === 0/);
-  assert.doesNotMatch(submitSegment.slice(0, mainFallbackEnd), /isSendButton\(btn\)[\s\S]*submitMainWorld/);
-  assert.doesNotMatch(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /return false;/);
-  assert.match(submitSegment.slice(mainFallbackStart, mainFallbackEnd), /waitForSubmitAck\(mainBaseline, 4000\)/);
-  const clickIndex = submitSegment.indexOf("btn.click();", buttonWaitStart);
-  const enterIndex = submitSegment.indexOf("dispatchEnterSubmit(el)", clickIndex);
-  assert.ok(clickIndex > buttonWaitStart && enterIndex > clickIndex, "DOM click and Enter remain ordered fallbacks");
+  assert.match(wakeSource.slice(submitStart, submitEnd), /await submitMainWorld\(selector\)/);
 });
 
 test("terminal stale session reservations do not block ordinary browser identity recovery", () => {

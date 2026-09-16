@@ -939,18 +939,21 @@ const H2W_CONTENT_VERSION = "0.1.97";
       const postInsertMs = Math.min(1200, 350 + Math.floor((ADAPTER.getInputEl()?.innerText?.length || 0) / 40) * 50);
       await wait(postInsertMs);
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (ADAPTER.name === "chatgpt") {
-          const selector = ADAPTER.getWatchMainWorldSelector();
-          const mainBaseline = captureSubmitAckBaseline(findSendButton());
-          const mainSubmit = selector ? await submitMainWorld(selector) : null;
-          if (mainSubmit?.ok && await waitForSubmitAck(mainBaseline, 4000)) return true;
-        }
         for (let i = 0; i < 40; i++) {
           const btn = findSendButton();
           if (isSendButton(btn)) {
             const baseline = captureSubmitAckBaseline(btn);
             btn.click();
-            if (await waitForSubmitAck(baseline, 4000)) return true;
+            if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
+            if (ADAPTER.name === "chatgpt" && attempt === 0 && ADAPTER.inputHasContent()) {
+              const selector = ADAPTER.getWatchMainWorldSelector();
+              const mainBaseline = captureSubmitAckBaseline(findSendButton());
+              const mainSubmit = selector ? await submitMainWorld(selector) : null;
+              if (mainSubmit?.ok) {
+                if (await waitForSubmitAck(mainBaseline, 8000)) return true;
+                return false;
+              }
+            }
             console.warn("[h2w] composer still has content after Send click; retrying");
             break;
           }
