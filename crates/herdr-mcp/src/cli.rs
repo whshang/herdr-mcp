@@ -20,8 +20,13 @@ pub enum Command {
         preference: Option<String>,
     },
     Version,
-    Status,
-    Doctor,
+    Status {
+        verbose: bool,
+    },
+    Doctor {
+        verbose: bool,
+        json: bool,
+    },
     Uninstall,
     Reinstall,
     DocumentsProbe,
@@ -436,8 +441,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             args,
             Command::Service(ServiceCommand::Install { adopt_node: false }),
         ),
-        "status" => no_extra(args, Command::Status),
-        "doctor" => no_extra(args, Command::Doctor),
+        "status" => parse_status(&args[1..]),
+        "doctor" => parse_doctor(&args[1..]),
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
         "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
         "__tcc-herdr-host" => no_extra(args, Command::TccHerdrHost),
@@ -471,6 +476,32 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "artifact" => parse_artifact(&args[1..]),
         "link" => parse_link(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
+    }
+}
+
+fn parse_status(args: &[String]) -> Result<Command, String> {
+    match args {
+        [] => Ok(Command::Status { verbose: false }),
+        [flag] if flag == "--verbose" => Ok(Command::Status { verbose: true }),
+        _ => Err("usage: herdr-mcp status [--verbose]".to_owned()),
+    }
+}
+
+fn parse_doctor(args: &[String]) -> Result<Command, String> {
+    match args {
+        [] => Ok(Command::Doctor {
+            verbose: false,
+            json: false,
+        }),
+        [flag] if flag == "--verbose" => Ok(Command::Doctor {
+            verbose: true,
+            json: false,
+        }),
+        [flag] if flag == "--json" => Ok(Command::Doctor {
+            verbose: false,
+            json: true,
+        }),
+        _ => Err("usage: herdr-mcp doctor [--verbose|--json]".to_owned()),
     }
 }
 
@@ -2159,8 +2190,8 @@ pub fn help() -> &'static str {
     "Herdr MCP native runtime\n\n\
 User path:\n\
   herdr-mcp install\n\
-  herdr-mcp status\n\
-  herdr-mcp doctor  (exit 0 = no known failure in probed layers; E2E readiness is DOCTOR_JSON.overall)\n\
+  herdr-mcp status [--verbose]\n\
+  herdr-mcp doctor [--verbose|--json]  (default is concise; exit 0 = no known failure in probed layers)\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
@@ -2359,11 +2390,11 @@ mod tests {
     fn parses_global_language_override_and_persistent_language_command() {
         let parsed = parse(args(&["--lang", "ja", "status"])).unwrap();
         assert_eq!(parsed.lang, Some(crate::locale::Locale::Ja));
-        assert_eq!(parsed.command, Command::Status);
+        assert_eq!(parsed.command, Command::Status { verbose: false });
 
         let parsed = parse(args(&["status", "--lang=zh-CN"])).unwrap();
         assert_eq!(parsed.lang, Some(crate::locale::Locale::ZhCn));
-        assert_eq!(parsed.command, Command::Status);
+        assert_eq!(parsed.command, Command::Status { verbose: false });
 
         assert_eq!(
             parse(args(&["lang", "ja"])).unwrap().command,
@@ -2597,8 +2628,36 @@ mod tests {
             parse(args(&["install"])).unwrap().command,
             Command::Service(ServiceCommand::Install { adopt_node: false })
         );
-        assert_eq!(parse(args(&["status"])).unwrap().command, Command::Status);
-        assert_eq!(parse(args(&["doctor"])).unwrap().command, Command::Doctor);
+        assert_eq!(
+            parse(args(&["status"])).unwrap().command,
+            Command::Status { verbose: false }
+        );
+        assert_eq!(
+            parse(args(&["status", "--verbose"])).unwrap().command,
+            Command::Status { verbose: true }
+        );
+        assert_eq!(
+            parse(args(&["doctor"])).unwrap().command,
+            Command::Doctor {
+                verbose: false,
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse(args(&["doctor", "--verbose"])).unwrap().command,
+            Command::Doctor {
+                verbose: true,
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse(args(&["doctor", "--json"])).unwrap().command,
+            Command::Doctor {
+                verbose: false,
+                json: true,
+            }
+        );
+        assert!(parse(args(&["doctor", "--json", "--verbose"])).is_err());
         assert_eq!(
             parse(args(&["permissions", "status"])).unwrap().command,
             Command::Permissions(crate::macos_permissions::PermissionsCommand::Status)
@@ -3682,10 +3741,16 @@ mod tests {
     fn parses_instance_flag_before_command() {
         let parsed = parse(args(&["--instance", "uat", "status"])).unwrap();
         assert_eq!(parsed.instance.as_deref(), Some("uat"));
-        assert_eq!(parsed.command, Command::Status);
+        assert_eq!(parsed.command, Command::Status { verbose: false });
         let parsed = parse(args(&["-i", "clean", "doctor"])).unwrap();
         assert_eq!(parsed.instance.as_deref(), Some("clean"));
-        assert_eq!(parsed.command, Command::Doctor);
+        assert_eq!(
+            parsed.command,
+            Command::Doctor {
+                verbose: false,
+                json: false,
+            }
+        );
         assert!(parse(args(&["--instance", "server", "status"])).is_err());
         assert!(
             parse(args(&[
@@ -3766,7 +3831,9 @@ mod tests {
                 "help missing user-path command: {needle}"
             );
         }
-        assert!(text.contains("E2E readiness is DOCTOR_JSON.overall"));
+        assert!(text.contains("herdr-mcp status [--verbose]"));
+        assert!(text.contains("herdr-mcp doctor [--verbose|--json]"));
+        assert!(text.contains("default is concise"));
         assert!(text.contains("worker bootstrap  (macOS/Linux first device"));
         assert!(
             text.contains("worker connect <pairing-address> [--name NAME]  (macOS/Linux/Windows")

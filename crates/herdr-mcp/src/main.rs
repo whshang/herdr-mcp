@@ -160,20 +160,22 @@ fn run() -> Result<ExitCode, String> {
             println!("state schema {}", state_store::SCHEMA_VERSION);
             Ok(ExitCode::SUCCESS)
         }
-        cli::Command::Status => {
+        cli::Command::Status { verbose } => {
             let paths = paths::RuntimePaths::discover()?;
             let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-            status::print_status(&paths, &config, language);
+            status::print_status(&paths, &config, language, verbose);
             Ok(ExitCode::SUCCESS)
         }
-        cli::Command::Doctor => {
+        cli::Command::Doctor { verbose, json } => {
             let paths = paths::RuntimePaths::discover()?;
             let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-            Ok(if status::print_doctor(&paths, &config, language) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(2)
-            })
+            Ok(
+                if status::print_doctor(&paths, &config, language, verbose, json) {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                },
+            )
         }
         cli::Command::Uninstall => product_lifecycle::uninstall(),
         cli::Command::Reinstall => product_lifecycle::reinstall(),

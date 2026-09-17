@@ -74,7 +74,7 @@ herdr-mcp permissions verify
 
 ## 能力検出: `scan`
 
-`doctor` が答えるのは **「このインストールは健全か？」** です。macOS で managed STANDALONE 拡張がインストールされている場合、`standalone-extension-load` evidence と `DOCTOR_JSON.standalone_extension` オブジェクトも出力します。`state=drift` は、Google Chrome が固定の standalone extension ID を `~/.config/herdr-mcp/extensions/standalone/current` 以外のパスから読み込んでいることを意味し、そのオブジェクトには `expected_path`、実際に読み込まれたパス/profile、Chromium の `location`、`drift_count` が含まれます。ブラウザ拡張は任意であるため、この advisory が、それ以外は健全なコア MCP/service readiness を失敗に変えることはありません。`scan` が答えるのは **「このワークステーション上で実際に証拠付けられているローカル agent 能力はどれか？」** です。
+`doctor` が答えるのは **「このインストールは健全か？」** です。デフォルト出力は、人向けの短い要約としてローカルの健全性、Edge 到達性、未実行のリモート Connector 認証、対応が必要な項目だけを表示します。完全なレイヤー診断は `herdr-mcp doctor --verbose`、機械可読出力は `herdr-mcp doctor --json` を使用します。macOS の JSON `standalone_extension` オブジェクトは managed STANDALONE 拡張の状態を報告します。`state=drift` は、Google Chrome が固定の standalone extension ID を `~/.config/herdr-mcp/extensions/standalone/current` 以外のパスから読み込んでいることを意味し、そのオブジェクトには `expected_path`、実際に読み込まれたパス/profile、Chromium の `location`、`drift_count` が含まれます。ブラウザ拡張は任意であるため、この advisory が、それ以外は健全なコア MCP/service readiness を失敗に変えることはありません。`scan` が答えるのは **「このワークステーション上で実際に証拠付けられているローカル agent 能力はどれか？」** です。
 
 ```bash
 herdr-mcp scan
