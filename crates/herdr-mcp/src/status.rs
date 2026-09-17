@@ -93,7 +93,108 @@ fn collect(paths: &RuntimePaths, config: &Config) -> StatusReport {
     }
 }
 
-pub fn print_status(paths: &RuntimePaths, config: &Config, language: crate::locale::Locale) {
+pub fn print_status(
+    paths: &RuntimePaths,
+    config: &Config,
+    language: crate::locale::Locale,
+    verbose: bool,
+) {
+    if verbose {
+        print_status_verbose(paths, config, language);
+        return;
+    }
+
+    let report = collect(paths, config);
+    let cli_probe = herdr_native::probe_cli();
+    let server_version = paths
+        .herdr_socket
+        .as_ref()
+        .and_then(|socket| HerdrClient::new(socket).ping().ok())
+        .and_then(|pong| {
+            pong.get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let native_runtime = herdr_native::project_runtime(&cli_probe, server_version.as_deref(), 0);
+    let tcc = crate::tcc_broker::upgrade_status(&paths.config_dir);
+    let tcc_summary =
+        if crate::tcc_broker::status_line(&paths.config_dir).starts_with("not installed") {
+            language
+                .text("not installed", "未安装", "未インストール")
+                .to_owned()
+        } else if tcc.metadata_invalid.is_some() {
+            language
+                .text("needs repair", "需要修复", "修復が必要")
+                .to_owned()
+        } else if tcc.update_available {
+            if tcc.update_requires_reauthorization {
+                language
+                    .text(
+                        "update available · macOS authorization required",
+                        "可更新 · 需要重新授权 macOS 权限",
+                        "更新あり · macOS の再認証が必要",
+                    )
+                    .to_owned()
+            } else {
+                language
+                    .text("update available", "可更新", "更新あり")
+                    .to_owned()
+            }
+        } else {
+            "OK".to_owned()
+        };
+    let scheduler = crate::update_scheduler::status_line();
+    let scheduler = if scheduler.starts_with("daily,") {
+        language.text("daily background", "每日后台", "毎日バックグラウンド")
+    } else {
+        scheduler.as_str()
+    };
+
+    println!(
+        "Herdr MCP {} · {}",
+        crate::runtime_meta::runtime_version(),
+        crate::runtime_meta::runtime_channel()
+    );
+    println!(
+        "{}: {} · 127.0.0.1:{}",
+        language.text("Runtime", "运行时", "ランタイム"),
+        if matches!(report.runtime, RuntimeHealth::Healthy(_)) {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        config.runtime_port
+    );
+    println!(
+        "Herdr: {} · CLI {} · server {}",
+        if report.herdr_transport_reachable {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        native_runtime["cli_version"].as_str().unwrap_or("unknown"),
+        native_runtime["server_version"]
+            .as_str()
+            .unwrap_or("unknown")
+    );
+    println!(
+        "{}: {} · {scheduler}",
+        language.text("Updates", "更新", "更新"),
+        if config.update_check {
+            config.update_channel.as_str()
+        } else {
+            language.text("disabled", "已关闭", "無効")
+        }
+    );
+    println!("TCC: {tcc_summary}");
+    println!();
+    println!(
+        "{}: herdr-mcp status --verbose",
+        language.text("Details", "详细信息", "詳細")
+    );
+}
+
+fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::locale::Locale) {
     let report = collect(paths, config);
     let cli_probe = herdr_native::probe_cli();
     let server_version = paths
@@ -219,7 +320,22 @@ pub fn print_doctor(
     paths: &RuntimePaths,
     config: &Config,
     language: crate::locale::Locale,
+    verbose: bool,
+    json_only: bool,
 ) -> bool {
+    macro_rules! println {
+        ($($arg:tt)*) => {
+            if verbose {
+                std::println!($($arg)*);
+            }
+        };
+    }
+    let print_check = |label: &str, pass: bool| {
+        if verbose {
+            std::println!("{} {label}", if pass { "PASS" } else { "FAIL" });
+        }
+    };
+
     let report = collect(paths, config);
     let runtime_healthy = matches!(report.runtime, RuntimeHealth::Healthy(_));
     let methods_result = native_tools::methods("");
@@ -379,7 +495,7 @@ pub fn print_doctor(
         local_agent_skill.0,
     );
     println!("LAYER local-agent-skill {}", local_agent_skill.1);
-    let remote = print_layer_ownership(paths, config, &report);
+    let remote = print_layer_ownership(paths, config, &report, verbose);
     println!(
         "LAYER authenticated-local-mcp {}",
         authenticated_local_mcp.detail
@@ -405,20 +521,18 @@ pub fn print_doctor(
         authenticated_local_mcp.state.as_str(),
         readiness.as_str()
     );
-    println!(
-        "DOCTOR_JSON {}",
-        json!({
-            "service_health": if service_health { "pass" } else { "fail" },
-            "authenticated_local_mcp": authenticated_local_mcp.state.as_str(),
-            "authenticated_remote_mcp": "not_probed",
-            "edge_reachable": remote.edge_state.as_str(),
-            "oauth_metadata": remote.oauth_state.as_str(),
-            "mcp_surface": remote.mcp_surface_state.as_str(),
-            "standalone_extension": standalone_browser.as_json(),
-            "herdr_native": native_runtime,
-            "overall": readiness.as_str(),
-        })
-    );
+    let doctor_json = json!({
+        "service_health": if service_health { "pass" } else { "fail" },
+        "authenticated_local_mcp": authenticated_local_mcp.state.as_str(),
+        "authenticated_remote_mcp": "not_probed",
+        "edge_reachable": remote.edge_state.as_str(),
+        "oauth_metadata": remote.oauth_state.as_str(),
+        "mcp_surface": remote.mcp_surface_state.as_str(),
+        "standalone_extension": standalone_browser.as_json(),
+        "herdr_native": native_runtime,
+        "overall": readiness.as_str(),
+    });
+    println!("DOCTOR_JSON {doctor_json}");
     println!("INFO config {}", paths.config_file.display());
     println!("INFO state {}", paths.config_dir.display());
     println!("INFO dev-state {}", paths.dev_state_dir.display());
@@ -456,6 +570,182 @@ pub fn print_doctor(
         println!("WARN event-cache {error}");
     }
 
+    if json_only {
+        std::println!("{doctor_json}");
+    } else if !verbose {
+        let remote_summary = if remote.edge_state == DiagnosticState::Fail
+            || remote.oauth_state == DiagnosticState::Fail
+            || remote.mcp_surface_state == DiagnosticState::Fail
+        {
+            DiagnosticState::Fail
+        } else if remote.edge_state == DiagnosticState::Pass
+            && remote.oauth_state == DiagnosticState::Pass
+            && remote.mcp_surface_state == DiagnosticState::Pass
+        {
+            DiagnosticState::Pass
+        } else {
+            DiagnosticState::NotProbed
+        };
+        let edge_host = resolve_edge_config(config)
+            .map(|edge| edge.host)
+            .unwrap_or_else(|| {
+                language
+                    .text("not configured", "未配置", "未設定")
+                    .to_owned()
+            });
+
+        std::println!("Herdr MCP {}", language.text("doctor", "诊断", "診断"));
+        std::println!(
+            "{}: {} · {}",
+            language.text("Local", "本机", "ローカル"),
+            diagnostic_label(if service_health {
+                DiagnosticState::Pass
+            } else {
+                DiagnosticState::Fail
+            }),
+            language.text(
+                "runtime, Herdr and local control checks",
+                "运行时、Herdr 与本地控制检查",
+                "runtime、Herdr、ローカル制御チェック"
+            )
+        );
+        std::println!(
+            "{}: {}",
+            language.text("Local MCP", "本地 MCP", "ローカル MCP"),
+            diagnostic_label(authenticated_local_mcp.state)
+        );
+        std::println!("Edge: {} · {edge_host}", diagnostic_label(remote_summary));
+        std::println!(
+            "{}: SKIP · {}",
+            language.text("Remote MCP auth", "远程 MCP 认证", "リモート MCP 認証"),
+            language.text(
+                "doctor does not use a Connector OAuth credential",
+                "doctor 不使用 Connector OAuth 凭据",
+                "doctor は Connector OAuth credential を使用しません"
+            )
+        );
+
+        let mut attention = Vec::new();
+        if !service_health {
+            attention.push(
+                language
+                    .text(
+                        "A local health check failed; use --verbose for the failing layer",
+                        "本机健康检查失败；使用 --verbose 查看失败层",
+                        "ローカルの健全性チェックに失敗しました。--verbose で失敗したレイヤーを確認してください",
+                    )
+                    .to_owned(),
+            );
+        }
+        if authenticated_local_mcp.state == DiagnosticState::Fail {
+            attention.push(
+                language
+                    .text(
+                        "Authenticated local MCP check failed",
+                        "本地 MCP 认证检查失败",
+                        "ローカル MCP 認証チェックに失敗しました",
+                    )
+                    .to_owned(),
+            );
+        }
+        if remote_summary == DiagnosticState::Fail {
+            attention.push(
+                language
+                    .text(
+                        "Edge or public MCP endpoint check failed",
+                        "Edge 或公开 MCP 端点检查失败",
+                        "Edge または公開 MCP endpoint のチェックに失敗しました",
+                    )
+                    .to_owned(),
+            );
+        }
+        if cfg!(target_os = "macos") {
+            let tcc = crate::tcc_broker::upgrade_status(&paths.config_dir);
+            if tcc.metadata_invalid.is_some() {
+                attention.push(
+                    language
+                        .text(
+                            "TCC broker metadata needs repair",
+                            "TCC broker 元数据需要修复",
+                            "TCC broker metadata の修復が必要です",
+                        )
+                        .to_owned(),
+                );
+            } else if tcc.update_available {
+                attention.push(
+                    language
+                        .text(
+                            "TCC broker update available",
+                            "TCC broker 有可用更新",
+                            "TCC broker の更新があります",
+                        )
+                        .to_owned(),
+                );
+            }
+        }
+        if doctor_json
+            .pointer("/standalone_extension/state")
+            .and_then(Value::as_str)
+            == Some("drift")
+        {
+            attention.push(
+                language
+                    .text(
+                        "Chrome standalone extension path has drifted",
+                        "Chrome standalone 扩展加载路径已漂移",
+                        "Chrome standalone 拡張の読み込みパスがずれています",
+                    )
+                    .to_owned(),
+            );
+        }
+        if !local_agent_skill.0 {
+            attention.push(format!(
+                "{}: {}",
+                language.text(
+                    "Local Agent Skill needs attention",
+                    "本地 Agent Skill 需要处理",
+                    "ローカル Agent Skill の確認が必要です",
+                ),
+                local_agent_skill.1
+            ));
+        }
+        if !attention.is_empty() {
+            std::println!();
+            std::println!("{}:", language.text("Attention", "需要处理", "要確認"));
+            for item in attention {
+                std::println!("  - {item}");
+            }
+        }
+        std::println!();
+        std::println!(
+            "{}: {} · {}",
+            language.text("Result", "结果", "結果"),
+            if readiness == OverallReadiness::Fail {
+                "FAIL"
+            } else {
+                "PASS"
+            },
+            if readiness == OverallReadiness::Fail {
+                language.text(
+                    "one or more checked layers failed",
+                    "至少一项已检查层失败",
+                    "チェック済みレイヤーの一部が失敗しました",
+                )
+            } else {
+                language.text(
+                    "all checked layers are healthy",
+                    "已检查层均健康",
+                    "チェック済みレイヤーはすべて正常です",
+                )
+            }
+        );
+        std::println!(
+            "{}: herdr-mcp doctor --verbose",
+            language.text("Details", "详细信息", "詳細")
+        );
+        std::println!("JSON: herdr-mcp doctor --json");
+    }
+
     service_health && readiness != OverallReadiness::Fail
 }
 
@@ -465,35 +755,42 @@ fn print_layer_ownership(
     paths: &RuntimePaths,
     config: &Config,
     report: &StatusReport,
+    verbose: bool,
 ) -> RemoteProbeReport {
-    println!("LAYER herdr {}", format_herdr_layer(paths, report));
-    println!(
-        "LAYER local-runtime {}",
-        format_local_runtime_layer(paths, config, report.runtime)
-    );
-    println!("LAYER service {}", format_service_layer());
-    println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
-    println!("LAYER native-messaging {}", format_native_messaging_layer());
-    println!("LAYER link {}", format_link_layer(paths));
-    println!(
-        "LAYER link-transport {}",
-        format_link_transport_layer(paths, config)
-    );
-    println!(
-        "LAYER relay-pool {}",
-        crate::link::relay_manifest::status_line(paths, unix_now_seconds())
-    );
+    if verbose {
+        println!("LAYER herdr {}", format_herdr_layer(paths, report));
+        println!(
+            "LAYER local-runtime {}",
+            format_local_runtime_layer(paths, config, report.runtime)
+        );
+        println!("LAYER service {}", format_service_layer());
+        println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
+        println!("LAYER native-messaging {}", format_native_messaging_layer());
+        println!("LAYER link {}", format_link_layer(paths));
+        println!(
+            "LAYER link-transport {}",
+            format_link_transport_layer(paths, config)
+        );
+        println!(
+            "LAYER relay-pool {}",
+            crate::link::relay_manifest::status_line(paths, unix_now_seconds())
+        );
+    }
     let edge = resolve_edge_config(config);
-    println!("LAYER edge {}", format_edge_configured_layer(&edge, config));
+    if verbose {
+        println!("LAYER edge {}", format_edge_configured_layer(&edge, config));
+    }
     let remote = edge
         .as_ref()
         .map(probe_edge_remote)
         .unwrap_or(RemoteProbeReport::absent());
-    println!("LAYER edge-reachable {}", remote.edge_reachable);
-    println!("LAYER oauth-metadata {}", remote.oauth_metadata);
-    println!("LAYER mcp-endpoint {}", remote.mcp_endpoint);
-    println!("LAYER update-state {}", format_update_state_layer(paths));
-    println!("{}", crate::residue::doctor_line());
+    if verbose {
+        println!("LAYER edge-reachable {}", remote.edge_reachable);
+        println!("LAYER oauth-metadata {}", remote.oauth_metadata);
+        println!("LAYER mcp-endpoint {}", remote.mcp_endpoint);
+        println!("LAYER update-state {}", format_update_state_layer(paths));
+        println!("{}", crate::residue::doctor_line());
+    }
     remote
 }
 
@@ -1509,8 +1806,12 @@ fn runtime_label(health: RuntimeHealth, port: u16) -> String {
     }
 }
 
-fn print_check(label: &str, pass: bool) {
-    println!("{} {label}", if pass { "PASS" } else { "FAIL" });
+fn diagnostic_label(state: DiagnosticState) -> &'static str {
+    match state {
+        DiagnosticState::Pass => "PASS",
+        DiagnosticState::Fail => "FAIL",
+        DiagnosticState::NotProbed => "SKIP",
+    }
 }
 
 #[cfg(test)]

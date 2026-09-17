@@ -147,7 +147,8 @@ test("standalone extension path drift diagnosis stays documented", () => {
 
   for (const rel of ["docs/i18n/en/troubleshooting.md", "docs/i18n/zh-CN/troubleshooting.md", "docs/i18n/ja/troubleshooting.md"]) {
     const doc = read(rel);
-    assert.match(doc, /DOCTOR_JSON\.standalone_extension/);
+    assert.match(doc, /herdr-mcp doctor --json/);
+    assert.match(doc, /standalone_extension/);
     assert.match(doc, /expected_path/);
     assert.match(doc, /drift_count/);
   }

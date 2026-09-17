@@ -243,7 +243,7 @@ This is a path-ownership drift. `herdr-mcp extension standalone status` proves w
 herdr-mcp doctor
 ```
 
-If the output contains `WARN standalone-extension-load state=drift`, compare its `expected` and `actual` paths. `DOCTOR_JSON.standalone_extension` provides the same evidence in machine-readable form, including the Chrome profile and `drift_count`. Open `chrome://extensions`, locate Herdr, and load/reload it from `expected_path` (normally `~/.config/herdr-mcp/extensions/standalone/current`). Then rerun `doctor`. Do not change Native Host ownership or delete extension data unless a separate identity problem is also proven. The doctor probe is read-only and inspects only the exact Herdr extension ID entry in Chrome preferences.
+If the default `doctor` summary reports standalone extension path drift, run `herdr-mcp doctor --verbose` to see the `expected` and `actual` paths, or `herdr-mcp doctor --json` and inspect `standalone_extension` for the same machine-readable evidence, including the Chrome profile and `drift_count`. Open `chrome://extensions`, locate Herdr, and load/reload it from `expected_path` (normally `~/.config/herdr-mcp/extensions/standalone/current`). Then rerun `doctor`. Do not change Native Host ownership or delete extension data unless a separate identity problem is also proven. The doctor probe is read-only and inspects only the exact Herdr extension ID entry in Chrome preferences.
 
 ## Symptom: Browser Control Center will not open, shows no workspaces, or stays on Runtime unavailable
 
