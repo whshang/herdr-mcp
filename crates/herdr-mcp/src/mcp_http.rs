@@ -4737,6 +4737,7 @@ mod tests {
 
         let mut extension_state = test_state_with_snapshot(&root.join("extension"), snapshot);
         extension_state.trusted_extension_ipc = true;
+        let browser_actuation = extension_state.browser_actuation.clone();
         let extension = candidate_router(extension_state);
         let state_request = Request::builder()
             .method(Method::GET)
@@ -4764,6 +4765,9 @@ mod tests {
         assert!(text.contains("retry: 2000"));
         assert!(text.contains("event: hello"));
         assert!(text.contains("herdr-mcp-push/v1"));
+        assert!(text.contains("\"boot_id\":"));
+        let state = browser_actuation.inner.0.lock().unwrap();
+        assert!(BrowserActuationBroker::extension_live(&state));
         std::fs::remove_dir_all(root).ok();
     }
 
