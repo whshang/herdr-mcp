@@ -1300,6 +1300,33 @@ test("shared native push stream self-heals when heartbeat bytes stall", () => {
   assert.match(segment, /finally \{[\s\S]*?if \(stallTimer\) clearTimeout\(stallTimer\)/);
 });
 
+test("shared native push stream fences retired runtime boots and reconnects", () => {
+  assert.match(backgroundSource, /let pushStream = null; \/\/ \{ ctrl, bootId \}/);
+  assert.match(backgroundSource, /function reconcilePushStreamRuntime\(state\)/);
+  assert.match(backgroundSource, /currentBootId === streamBootId/);
+  assert.match(backgroundSource, /push stream runtime changed .* forcing reconnect/);
+  assert.match(backgroundSource, /stopPushStream\(\);\s*return true;/);
+  const pushStart = backgroundSource.indexOf("async function runPushStream(ctrl)");
+  const pushEnd = backgroundSource.indexOf("\nasync function postBrowserActuationEvidence", pushStart);
+  const pushSegment = backgroundSource.slice(pushStart, pushEnd);
+  assert.match(pushSegment, /handlePushBlock\(block, ctrl\)/);
+  const blockStart = backgroundSource.indexOf("async function handlePushBlock(block, streamCtrl = null)");
+  const blockEnd = backgroundSource.indexOf("\nasync function onPushHello", blockStart);
+  const blockSegment = backgroundSource.slice(blockStart, blockEnd);
+  assert.match(blockSegment, /pushStream\?\.ctrl === streamCtrl/);
+  assert.match(blockSegment, /pushStream\.bootId = String\(data\.boot_id \|\| ""\)/);
+  const aliveStart = backgroundSource.indexOf("async function ensureAlive(preloaded, runtimeState = null)");
+  const aliveEnd = backgroundSource.indexOf("\n// ---- Install, browser startup", aliveStart);
+  const aliveSegment = backgroundSource.slice(aliveStart, aliveEnd);
+  assert.match(aliveSegment, /runtimeState\?\.ok === true \? runtimeState : await fetchStateFresh\(\)/);
+  assert.match(aliveSegment, /reconcilePushStreamRuntime\(currentState\)/);
+  const agentsStart = backgroundSource.indexOf('if (msg?.type === "h2w_agents")');
+  const agentsEnd = backgroundSource.indexOf('if (msg?.type === "h2w_bind")', agentsStart);
+  const agentsSegment = backgroundSource.slice(agentsStart, agentsEnd);
+  assert.match(agentsSegment, /const state = await fetchStateFresh\(\)/);
+  assert.match(agentsSegment, /await ensureAlive\(undefined, state\)/);
+});
+
 test("ChatGPT session.create carries one durable reservation across the new-conversation route", () => {
   const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
   const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);

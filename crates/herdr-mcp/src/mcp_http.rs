@@ -140,6 +140,14 @@ impl BrowserActuationBroker {
         state.queued.pop_front()
     }
 
+    fn note_extension_poll(&self) {
+        let Ok(mut state) = self.inner.0.lock() else {
+            return;
+        };
+        self.prune_expired(&mut state);
+        state.last_extension_poll = Some(Instant::now());
+    }
+
     fn complete(
         &self,
         actuation_id: &str,
@@ -1902,6 +1910,13 @@ fn push_events_response(
     let events = stream::unfold(state, |mut state| async move {
         if state.first {
             state.first = false;
+            if state.trusted_extension_ipc {
+                // The trusted Extension has already established the SSE stream.
+                // Treat that initial hello request as live immediately instead
+                // of forcing browser mutations to wait for the first 15s
+                // heartbeat before the broker records a poll.
+                state.browser_actuation.note_extension_poll();
+            }
             let digest = state.cache.digest_since(u64::MAX);
             let all_agents = push_agent_views(&digest.agents);
             let panes = state
@@ -1918,6 +1933,7 @@ fn push_events_response(
                 .collect::<Vec<_>>();
             let hello = json!({
                 "protocol": "herdr-mcp-push/v1",
+                "boot_id": state.cache.boot_id(),
                 "server_time": iso_now(),
                 "filters": push_filters_value(&state.filters),
                 "agents": agents,
