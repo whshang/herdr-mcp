@@ -122,7 +122,7 @@ jobs:
             $doctorText = ""
             for ($attempt = 0; $attempt -lt 12; $attempt++) {
               Start-Sleep -Milliseconds 250
-              $doctorText = (& $candidate doctor 2>&1 | Out-String)
+              $doctorText = (& $candidate doctor --verbose 2>&1 | Out-String)
               if (Test-HerdrDoctorPasses $doctorText) { $doctorReady = $true; break }
             }
             if (-not $doctorReady) {
@@ -157,7 +157,7 @@ jobs:
             $doctorText = ""
             for ($attempt = 0; $attempt -lt 12; $attempt++) {
               Start-Sleep -Milliseconds 250
-              $doctorText = (& $candidate doctor 2>&1 | Out-String)
+              $doctorText = (& $candidate doctor --verbose 2>&1 | Out-String)
               if (Test-HerdrDoctorPasses $doctorText) { $doctorReady = $true; break }
             }
             if (-not $doctorReady) {
