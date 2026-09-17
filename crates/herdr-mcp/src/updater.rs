@@ -1201,6 +1201,46 @@ fn restore_state_backup(record: &MajorUpgradeRecord, state_path: &Path) -> Resul
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_restored_source_install_after_error(
+    paths: &RuntimePaths,
+    record: &MajorUpgradeRecord,
+    install_error: &str,
+) -> Result<(), String> {
+    if !install_error.contains("production Link generation reconcile failed") {
+        return Err(format!(
+            "major rollback source install failed outside the recoverable production-Link reconciliation class: {install_error}"
+        ));
+    }
+    let active = active_runtime_binary(paths).map_err(|error| {
+        format!(
+            "major rollback source install failed and active runtime could not be resolved: {install_error}; {error}"
+        )
+    })?;
+    verify_file_sha256(
+        &active,
+        &record.source_binary_sha256,
+        BINARY_MAX_BYTES,
+        "restored major-upgrade source runtime",
+    )
+    .map_err(|error| {
+        format!(
+            "major rollback source install failed without restoring the recorded source runtime: {install_error}; {error}"
+        )
+    })?;
+    run_service_command(
+        Path::new(&record.source_binary),
+        paths,
+        &["service", "status"],
+    )
+    .map_err(|error| {
+        format!(
+            "major rollback source install failed and the restored source service is not healthy: {install_error}; {error}"
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn recover_major_upgrade(paths: &RuntimePaths, record: &MajorUpgradeRecord) -> Result<(), String> {
     validate_major_upgrade_record(paths, record)?;
     verify_file_sha256(
@@ -1215,11 +1255,33 @@ fn recover_major_upgrade(paths: &RuntimePaths, record: &MajorUpgradeRecord) -> R
         .map_err(|error| format!("cannot stop service before major state restore: {error}"))?;
     let state_path = paths.config_dir.join("state.db");
     restore_state_backup(record, &state_path)?;
-    run_service_command(
+    let source_install_error = run_service_command(
         Path::new(&record.source_binary),
         paths,
         &["service", "install"],
-    )?;
+    )
+    .err();
+    if let Some(error) = source_install_error.as_deref() {
+        // Older source installers can report a sidecar-generation failure after
+        // committing the exact source runtime and restarting a healthy service.
+        // Treat that as recoverable only after proving those postconditions.
+        validate_restored_source_install_after_error(paths, record, error)?;
+    }
+    #[cfg(target_os = "macos")]
+    if !paths.instance.is_named() {
+        crate::native_host_install::sync_owned_runtime_from_active().map_err(|error| {
+            format!(
+                "major rollback restored the source runtime but native-host reconciliation failed: {error}"
+            )
+        })?;
+    }
+    if let Some(error) = source_install_error.as_deref() {
+        crate::link::reconcile_after_service_generation_change(paths).map_err(|link_error| {
+            format!(
+                "major rollback source install reported an error after restoring the source runtime, and current Link reconciliation also failed: {error}; {link_error}"
+            )
+        })?;
+    }
     let schema = read_raw_state_schema(&state_path)?
         .ok_or_else(|| "restored runtime did not expose a state database".to_owned())?;
     if schema != record.source_state_schema {
@@ -2392,6 +2454,158 @@ mod tests {
             .unwrap();
         assert_eq!(value, "after-major-upgrade");
         drop(conn);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_rollback_accepts_source_install_error_only_after_restored_runtime_is_proven() {
+        let root = env::temp_dir().join(format!(
+            "herdr-major-source-install-postcondition-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        write_test_executable(
+            &source_binary,
+            "#!/bin/sh\nset -e\ncase \"$1 $2\" in\n  \"service install\")\n    cp \"$0\" \"$HERDR_MCP_CONFIG_DIR/runtime/current/herdr-mcp\"\n    chmod 700 \"$HERDR_MCP_CONFIG_DIR/runtime/current/herdr-mcp\"\n    echo 'production Link generation reconcile failed: simulated contract mismatch' >&2\n    exit 17\n    ;;\n  \"service status\") exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+        );
+        let state = root.join("state.db");
+        write_test_state(&state, SCHEMA_VERSION, "after-major-upgrade");
+        let backup = major_upgrade_backup_path(&paths);
+        write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: MAJOR_SOURCE_SCHEMA,
+            target_state_schema: SCHEMA_VERSION,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        recover_major_upgrade(&paths, &record).unwrap();
+        assert_eq!(
+            sha256_file(&active, BINARY_MAX_BYTES).unwrap(),
+            record.source_binary_sha256
+        );
+        assert_eq!(
+            read_raw_state_schema(&state).unwrap(),
+            Some(MAJOR_SOURCE_SCHEMA)
+        );
+        let conn = Connection::open(&state).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "before-major-upgrade");
+        drop(conn);
+        assert!(
+            !dir.exists(),
+            "successful postcondition recovery retires rollback material"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_rollback_keeps_failure_when_source_install_did_not_restore_recorded_runtime() {
+        let root = env::temp_dir().join(format!(
+            "herdr-major-source-install-unrestored-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        write_test_executable(
+            &source_binary,
+            "#!/bin/sh\nif [ \"$1 $2\" = \"service install\" ]; then echo 'production Link generation reconcile failed: simulated contract mismatch' >&2; exit 17; fi\nexit 0\n",
+        );
+        let state = root.join("state.db");
+        write_test_state(&state, SCHEMA_VERSION, "after-major-upgrade");
+        let backup = major_upgrade_backup_path(&paths);
+        write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: MAJOR_SOURCE_SCHEMA,
+            target_state_schema: SCHEMA_VERSION,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        let error = recover_major_upgrade(&paths, &record).unwrap_err();
+        assert!(error.contains("without restoring the recorded source runtime"));
+        assert!(dir.exists(), "failed recovery must keep rollback material");
+        assert_ne!(
+            sha256_file(&active, BINARY_MAX_BYTES).unwrap(),
+            record.source_binary_sha256
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_rollback_rejects_non_link_install_error_even_if_source_runtime_was_committed() {
+        let root = env::temp_dir().join(format!(
+            "herdr-major-source-install-wrong-class-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let paths = test_runtime_paths(&root);
+        let active = root.join("runtime/current/herdr-mcp");
+        write_test_executable(&active, "#!/bin/sh\nexit 0\n");
+
+        let dir = major_upgrade_dir(&paths);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let source_binary = major_upgrade_source_binary_path(&paths);
+        write_test_executable(
+            &source_binary,
+            "#!/bin/sh\nset -e\nif [ \"$1 $2\" = \"service install\" ]; then\n  cp \"$0\" \"$HERDR_MCP_CONFIG_DIR/runtime/current/herdr-mcp\"\n  chmod 700 \"$HERDR_MCP_CONFIG_DIR/runtime/current/herdr-mcp\"\n  echo 'service install committed but Herdr supervisor activation failed: simulated' >&2\n  exit 17\nfi\nexit 0\n",
+        );
+        let state = root.join("state.db");
+        write_test_state(&state, SCHEMA_VERSION, "after-major-upgrade");
+        let backup = major_upgrade_backup_path(&paths);
+        write_test_state(&backup, MAJOR_SOURCE_SCHEMA, "before-major-upgrade");
+        let record = MajorUpgradeRecord {
+            record_version: MAJOR_UPGRADE_RECORD_VERSION,
+            source_state_schema: MAJOR_SOURCE_SCHEMA,
+            target_state_schema: SCHEMA_VERSION,
+            source_binary: source_binary.to_string_lossy().into_owned(),
+            source_binary_sha256: sha256_file(&source_binary, BINARY_MAX_BYTES).unwrap(),
+            state_backup: backup.to_string_lossy().into_owned(),
+            state_backup_sha256: sha256_file(&backup, MAJOR_BACKUP_MAX_BYTES).unwrap(),
+            created_at_ms: now_ms_i64(),
+        };
+        write_major_upgrade_record(&paths, &record).unwrap();
+
+        let error = recover_major_upgrade(&paths, &record).unwrap_err();
+        assert!(error.contains("outside the recoverable production-Link reconciliation class"));
+        assert!(
+            dir.exists(),
+            "unclassified failure must keep rollback material"
+        );
         fs::remove_dir_all(root).ok();
     }
 

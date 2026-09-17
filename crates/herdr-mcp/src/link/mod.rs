@@ -59,6 +59,7 @@ pub use ladder::{
     default_embedded_relays,
 };
 pub use migrate_runtime_control::{MigrateMode, run as run_link_migrate_runtime_control};
+#[cfg(not(target_os = "linux"))]
 pub use ownership::doctor_layer_summary;
 #[cfg(target_os = "macos")]
 pub use ownership::production_ready_gate_catalog;
