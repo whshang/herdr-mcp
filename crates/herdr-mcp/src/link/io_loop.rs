@@ -33,6 +33,7 @@ use crate::relay::protocol::RelayMessage;
 
 pub(crate) const LINK_DEFAULT_DRAIN_MS: u64 = 5_000;
 pub(crate) const LINK_DEFAULT_OFFLINE_RECYCLE_MS: u64 = 300_000;
+const DIRECT_RECOVERY_PROBE_MS: u64 = 30_000;
 
 #[derive(Clone)]
 pub(crate) struct LinkIoConfig {
@@ -180,6 +181,10 @@ enum LoopEvent<H> {
     OfflineRecycleElapsed {
         generation: u64,
     },
+    DirectRecoveryCompleted {
+        generation: u64,
+        recovered: bool,
+    },
     HeartbeatTick {
         generation: u64,
     },
@@ -219,6 +224,8 @@ where
     reconnect_timer: Option<JoinHandle<()>>,
     offline_recycle_generation: u64,
     offline_recycle_timer: Option<JoinHandle<()>>,
+    direct_recovery_generation: u64,
+    direct_recovery_task: Option<JoinHandle<()>>,
     online_generation: u64,
     online_delays: Option<(Duration, Duration, Duration)>,
     heartbeat_timer: Option<JoinHandle<()>>,
@@ -283,6 +290,8 @@ where
             reconnect_timer: None,
             offline_recycle_generation: 0,
             offline_recycle_timer: None,
+            direct_recovery_generation: 0,
+            direct_recovery_task: None,
             online_generation: 0,
             online_delays: None,
             heartbeat_timer: None,
@@ -474,6 +483,45 @@ where
                     threshold_ms: self.config.offline_recycle_ms,
                 })
             }
+            LoopEvent::DirectRecoveryCompleted {
+                generation,
+                recovered,
+            } => {
+                if generation != self.direct_recovery_generation || self.stopping {
+                    return Ok(None);
+                }
+                self.direct_recovery_task.take();
+                if self.core.phase() != ConnectionPhase::Online {
+                    if recovered {
+                        self.ladder.arm_direct_workers_dev_recovery();
+                    }
+                    return Ok(None);
+                }
+                if self.ladder.current_route().kind != TransportRouteKind::SharedRelay {
+                    return Ok(None);
+                }
+                if !recovered || self.runner.active_requests() > 0 {
+                    self.arm_direct_recovery();
+                    return Ok(None);
+                }
+                if !self.ladder.arm_direct_workers_dev_recovery() {
+                    return Ok(None);
+                }
+                let Some(socket) = self.socket.take() else {
+                    self.arm_direct_recovery();
+                    return Ok(None);
+                };
+                let attempt_id = socket.attempt_id();
+                socket.abort();
+                let actions = self.core.socket_closed(
+                    attempt_id,
+                    ABNORMAL_CLOSE_CODE,
+                    "direct workers.dev route recovered",
+                    self.now_ms(),
+                    self.rng_sample(),
+                )?;
+                self.pump_actions(actions).await
+            }
             LoopEvent::HeartbeatTick { generation } => {
                 if generation != self.online_generation || self.online_delays.is_none() {
                     return Ok(None);
@@ -613,7 +661,11 @@ where
                 TransportAction::ScheduleReconnect(schedule) => {
                     if self.attempt_pre_online {
                         self.attempt_pre_online = false;
-                        self.ladder.record_failure();
+                        let failed_route = self.ladder.current_route().clone();
+                        let advanced = self.ladder.record_failure();
+                        if advanced && failed_route.kind == TransportRouteKind::DirectWorkersDev {
+                            self.spawn_direct_hosts_recovery(failed_route.endpoint_url);
+                        }
                     }
                     if !self.stopping {
                         self.arm_reconnect(schedule);
@@ -649,9 +701,15 @@ where
                     self.attempt_pre_online = false;
                     self.cancel_offline_recycle();
                     self.ladder.record_success();
+                    if self.ladder.current_route().kind == TransportRouteKind::SharedRelay {
+                        self.arm_direct_recovery();
+                    } else {
+                        self.cancel_direct_recovery();
+                    }
                 }
                 TransportAction::Disconnected { .. } => {
                     self.attempt_pre_online = false;
+                    self.cancel_direct_recovery();
                     self.arm_offline_recycle();
                 }
                 TransportAction::HeartbeatDue { .. } | TransportAction::Inbound { .. } => {
@@ -799,6 +857,58 @@ where
         abort_task(&mut self.offline_recycle_timer);
     }
 
+    fn spawn_direct_hosts_recovery(&mut self, endpoint: String) {
+        self.cancel_direct_recovery();
+        self.direct_recovery_generation = self.direct_recovery_generation.saturating_add(1);
+        let generation = self.direct_recovery_generation;
+        let event_tx = self.event_tx.clone();
+        self.direct_recovery_task = Some(tokio::spawn(async move {
+            let recovered = tokio::task::spawn_blocking(move || {
+                crate::worker_bootstrap::recover_workers_dev_direct_noninteractive(&endpoint)
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            let _ = event_tx.send(LoopEvent::DirectRecoveryCompleted {
+                generation,
+                recovered,
+            });
+        }));
+    }
+
+    fn arm_direct_recovery(&mut self) {
+        self.cancel_direct_recovery();
+        let Some(endpoint) = self
+            .ladder
+            .routes()
+            .iter()
+            .find(|route| route.kind == TransportRouteKind::DirectWorkersDev)
+            .map(|route| route.endpoint_url.clone())
+        else {
+            return;
+        };
+        self.direct_recovery_generation = self.direct_recovery_generation.saturating_add(1);
+        let generation = self.direct_recovery_generation;
+        let event_tx = self.event_tx.clone();
+        self.direct_recovery_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(DIRECT_RECOVERY_PROBE_MS)).await;
+            let recovered = tokio::task::spawn_blocking(move || {
+                crate::worker_bootstrap::probe_workers_dev_direct(&endpoint).unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            let _ = event_tx.send(LoopEvent::DirectRecoveryCompleted {
+                generation,
+                recovered,
+            });
+        }));
+    }
+
+    fn cancel_direct_recovery(&mut self) {
+        self.direct_recovery_generation = self.direct_recovery_generation.saturating_add(1);
+        abort_task(&mut self.direct_recovery_task);
+    }
+
     fn start_online_timers(
         &mut self,
         transport_ping_ms: i64,
@@ -886,6 +996,8 @@ where
         }
         abort_task(&mut self.handshake_timer);
         abort_task(&mut self.reconnect_timer);
+        abort_task(&mut self.offline_recycle_timer);
+        abort_task(&mut self.direct_recovery_task);
         abort_task(&mut self.heartbeat_timer);
         abort_task(&mut self.transport_ping_timer);
         abort_task(&mut self.silence_timer);
