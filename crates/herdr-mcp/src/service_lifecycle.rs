@@ -1,6 +1,7 @@
 #![cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
 
 use crate::cli::ServiceCommand;
+use crate::locale::Locale;
 #[cfg(target_os = "macos")]
 use crate::native_host_install;
 use crate::{herdr_supervisor, link, paths::RuntimePaths, service_manager};
@@ -40,14 +41,22 @@ where
 }
 
 pub(crate) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
+    run_with_locale(command, crate::locale::resolve(None))
+}
+
+pub(crate) fn run_with_locale(
+    command: ServiceCommand,
+    language: Locale,
+) -> Result<ExitCode, String> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
+        let _ = language;
         service_manager::run(command)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     match command {
-        ServiceCommand::Install { adopt_node } => run_install(adopt_node),
+        ServiceCommand::Install { adopt_node } => run_install(adopt_node, language),
         ServiceCommand::Rollback => run_rollback(),
         ServiceCommand::Uninstall => run_uninstall(),
         other => service_manager::run(other),
@@ -57,8 +66,8 @@ pub(crate) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
 /// Shared install lifecycle for the public `service install` path. The
 /// orchestrator is the executing binary; the installed payload is the same
 /// executable (`current_exe` inside `service_manager`).
-fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
-    let result = run_install_lifecycle(|mutation_lock| {
+fn run_install(adopt_node: bool, language: Locale) -> Result<ExitCode, String> {
+    let result = run_install_lifecycle(language, |mutation_lock| {
         service_manager::run_with_mutation_lock(
             ServiceCommand::Install { adopt_node },
             mutation_lock,
@@ -81,7 +90,7 @@ pub(crate) fn run_install_from_payload(
     payload_binary: &Path,
 ) -> Result<ExitCode, String> {
     refuse_sidecar_mutation_inside_managed_exec()?;
-    run_install_lifecycle(|mutation_lock| {
+    run_install_lifecycle(crate::locale::resolve(None), |mutation_lock| {
         service_manager::run_install_from_payload(adopt_node, payload_binary, mutation_lock)
     })
 }
@@ -92,7 +101,7 @@ pub(crate) fn run_install_from_payload(
 /// post-commit sidecar orchestration (Herdr supervisor, product identity/update
 /// fence, production Link generation reconcile, native-host sync, compensation)
 /// completes inside `finish_install_lifecycle`.
-fn run_install_lifecycle<Install>(install: Install) -> Result<ExitCode, String>
+fn run_install_lifecycle<Install>(language: Locale, install: Install) -> Result<ExitCode, String>
 where
     Install: FnOnce(&service_manager::ServiceMutationLease) -> Result<ExitCode, String>,
 {
@@ -114,7 +123,13 @@ where
     }
 
     let result = install(&mutation_lock)?;
-    finish_install_lifecycle(before_service, before_supervisor, &mutation_lock, result)
+    finish_install_lifecycle(
+        before_service,
+        before_supervisor,
+        &mutation_lock,
+        result,
+        language,
+    )
 }
 
 /// The lifecycle after the service commit itself, shared by the public install
@@ -126,7 +141,11 @@ fn finish_install_lifecycle(
     before_supervisor: herdr_supervisor::InstallState,
     mutation_lock: &service_manager::ServiceMutationLease,
     result: ExitCode,
+    language: Locale,
 ) -> Result<ExitCode, String> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = language;
+
     if result != ExitCode::SUCCESS {
         return Ok(result);
     }
@@ -309,7 +328,10 @@ fn finish_install_lifecycle(
             ));
         }
 
-        crate::macos_permissions::post_service_install_onboarding(paths.instance.is_named());
+        crate::macos_permissions::post_service_install_onboarding(
+            paths.instance.is_named(),
+            language,
+        );
     }
 
     Ok(result)

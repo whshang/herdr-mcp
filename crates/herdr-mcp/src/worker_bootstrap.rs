@@ -1,3 +1,4 @@
+use crate::locale::Locale;
 use crate::paths::RuntimePaths;
 use crate::release_trust;
 use semver::Version;
@@ -610,14 +611,14 @@ fn worker_upload_url(account_id: &str, worker_name: &str, strict_binding_inherit
     url
 }
 
-pub fn run(paths: &RuntimePaths) -> Result<ExitCode, String> {
+pub fn run(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
     if !bootstrap_platform_supported(std::env::consts::OS) {
         return Err("worker bootstrap is unsupported on this platform".to_owned());
     }
     if paths.instance.is_named() {
         return Err("worker bootstrap is available only on the default Herdr instance".to_owned());
     }
-    run_inner(paths)
+    run_inner(paths, language)
 }
 
 fn bootstrap_platform_supported(os: &str) -> bool {
@@ -794,7 +795,7 @@ fn ensure_worker_version_can_advance(current: &str, target: &str) -> Result<(), 
     Ok(())
 }
 
-fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
+fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
     let source_commit = crate::runtime_meta::compiled_source_commit()
         .filter(|value| valid_source_commit(value))
         .ok_or_else(|| {
@@ -823,15 +824,41 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
         }
     }
 
-    println!("Herdr first Worker bootstrap");
-    println!("[1/7] Check — local first-device state is eligible.");
-    let (token, refresh_token) = acquire_cloudflare_credential()?;
-    let cloudflare = Cloudflare::new(&token)?;
-    println!("[2/7] Cloudflare — temporary authorization acquired; it will not be persisted.");
-
-    let account = select_account(&cloudflare)?;
     println!(
-        "[3/7] Account — using {} ({}).",
+        "{}",
+        language.text(
+            "Herdr first Worker bootstrap",
+            "Herdr 首个 Worker 初始化",
+            "Herdr 最初の Worker セットアップ",
+        )
+    );
+    println!(
+        "{}",
+        language.text(
+            "[1/7] Check — local first-device state is eligible.",
+            "[1/7] 检查 — 本机符合首台设备初始化条件。",
+            "[1/7] 確認 — このコンピュータは最初のデバイスとして初期化できます。",
+        )
+    );
+    let (token, refresh_token) = acquire_cloudflare_credential_for_locale(language)?;
+    let cloudflare = Cloudflare::new(&token)?;
+    println!(
+        "{}",
+        language.text(
+            "[2/7] Cloudflare — temporary authorization acquired; it will not be persisted.",
+            "[2/7] Cloudflare — 已取得临时授权，不会持久保存。",
+            "[2/7] Cloudflare — 一時的な認可を取得しました。永続保存はしません。",
+        )
+    );
+
+    let account = select_account_for_locale(&cloudflare, language)?;
+    println!(
+        "{} {} ({}).",
+        language.text(
+            "[3/7] Account — using",
+            "[3/7] 账户 — 使用",
+            "[3/7] Account — 使用"
+        ),
         account.name,
         short_id(&account.id)
     );
@@ -886,7 +913,11 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
         None => {
             let candidate = subdomain_candidate(&account.id);
             let value = cloudflare.create_workers_subdomain(&gate, &account.id, &candidate)?;
-            println!("Cloudflare account workers.dev subdomain created and read back.");
+            println!("{}", language.text(
+                "Cloudflare account workers.dev subdomain created and read back.",
+                "Cloudflare 账户的 workers.dev 子域已创建并读回验证。",
+                "Cloudflare account の workers.dev サブドメインを作成し、読み戻して確認しました。",
+            ));
             value
         }
     };
@@ -918,10 +949,24 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
         edge_http
     } else {
         let edge_http = verify_health(&edge_origin, &worker_name, None)?;
-        println!("Existing Herdr Worker verified; resuming configuration.");
+        println!(
+            "{}",
+            language.text(
+                "Existing Herdr Worker verified; resuming configuration.",
+                "已验证现有 Herdr Worker，继续配置。",
+                "既存の Herdr Worker を確認しました。設定を続行します。",
+            )
+        );
         edge_http
     };
-    println!("[4/7] Worker — release-matched Worker is healthy at {edge_origin}.");
+    println!(
+        "{} {edge_origin}.",
+        language.text(
+            "[4/7] Worker — release-matched Worker is healthy at",
+            "[4/7] Worker — 与 Release 匹配的 Worker 已健康运行于",
+            "[4/7] Worker — Release と一致する Worker は正常です：",
+        )
+    );
 
     if journal.phase < Phase::DeviceEnrolled {
         let pepper = random_secret(32)?;
@@ -980,7 +1025,14 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
         journal.advance(Phase::DeviceEnrolled);
         write_journal(&journal_path, &journal)?;
     }
-    println!("[5/7] Computer — canonical device enrollment is active.");
+    println!(
+        "{}",
+        language.text(
+            "[5/7] Computer — canonical device enrollment is active.",
+            "[5/7] 电脑 — canonical device enrollment 已生效。",
+            "[5/7] コンピュータ — canonical device enrollment が有効です。",
+        )
+    );
 
     remove_temporary_operator(
         |name| cloudflare.delete_secret(&gate, &account.id, &worker_name, name),
@@ -1004,17 +1056,56 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
     }
     journal.advance(Phase::OperationalReady);
     write_journal(&journal_path, &journal)?;
-    println!("[6/7] Connection — `herdr-mcp link status` reports operational_ready=true.");
-    println!("[7/7] Done — MCP URL: {edge_origin}/mcp");
     println!(
-        "Next in ChatGPT: enable Developer mode for Plugins, then open Plugins → Browse plugins and add a custom plugin named `herdr`."
+        "{}",
+        language.text(
+            "[6/7] Connection — `herdr-mcp link status` reports operational_ready=true.",
+            "[6/7] 连接 — `herdr-mcp link status` 已报告 operational_ready=true。",
+            "[6/7] 接続 — `herdr-mcp link status` が operational_ready=true を返しました。",
+        )
     );
-    println!("Paste this complete MCP address, including `/mcp`: {edge_origin}/mcp");
     println!(
-        "After OAuth approval, create or open a ChatGPT Project. In the first message of each new chat, use the + button to reference `herdr` so the plugin is enabled for that conversation."
+        "{} {edge_origin}/mcp",
+        language.text(
+            "[7/7] Done — MCP URL:",
+            "[7/7] 完成 — MCP URL：",
+            "[7/7] 完了 — MCP URL:",
+        )
     );
-    println!("Cloudflare credential management: https://dash.cloudflare.com/profile/api-tokens");
-    println!("If a Cloudflare credential appeared in any conversation or terminal, revoke it now.");
+    println!("{}", language.text(
+        "Next in ChatGPT: enable Developer mode for Plugins, then open Plugins → Browse plugins and add a custom plugin named `herdr`.",
+        "下一步在 ChatGPT 中：开启插件 Developer mode，进入“插件 → 浏览插件”，添加名为 `herdr` 的自定义插件。",
+        "次に ChatGPT で Plugins の Developer mode を有効にし、Plugins → Browse plugins から `herdr` という名前のカスタムプラグインを追加してください。",
+    ));
+    println!(
+        "{} {edge_origin}/mcp",
+        language.text(
+            "Paste this complete MCP address, including `/mcp`:",
+            "粘贴这个完整 MCP 地址，必须包含 `/mcp`：",
+            "`/mcp` を含む完全な MCP アドレスを貼り付けてください：",
+        )
+    );
+    println!("{}", language.text(
+        "After OAuth approval, create or open a ChatGPT Project. In the first message of each new chat, use the + button to reference `herdr` so the plugin is enabled for that conversation.",
+        "OAuth 完成后，请创建或打开 ChatGPT Project。每个新会话的第一条消息都用 + 按钮引用 `herdr`，确保该会话启用插件。",
+        "OAuth 承認後、ChatGPT Project を作成または開いてください。各新規チャットの最初のメッセージで + ボタンから `herdr` を参照し、その会話でプラグインを有効にしてください。",
+    ));
+    println!(
+        "{} https://dash.cloudflare.com/profile/api-tokens",
+        language.text(
+            "Cloudflare credential management:",
+            "Cloudflare 凭据管理：",
+            "Cloudflare 資格情報の管理：",
+        )
+    );
+    println!(
+        "{}",
+        language.text(
+            "If a Cloudflare credential appeared in any conversation or terminal, revoke it now.",
+            "如果任何 Cloudflare 凭据曾出现在对话或终端中，请立即撤销。",
+            "Cloudflare 資格情報が会話やターミナルに表示された場合は、今すぐ revoke してください。",
+        )
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1078,6 +1169,12 @@ fn classify_fleet(
 }
 
 fn acquire_cloudflare_credential() -> Result<(SecretBytes, Option<SecretBytes>), String> {
+    acquire_cloudflare_credential_for_locale(Locale::En)
+}
+
+fn acquire_cloudflare_credential_for_locale(
+    language: Locale,
+) -> Result<(SecretBytes, Option<SecretBytes>), String> {
     if let Ok(value) = std::env::var("CLOUDFLARE_API_TOKEN") {
         if !verify_api_token_shape(&value) {
             return Err("CLOUDFLARE_API_TOKEN has an invalid shape".to_owned());
@@ -1086,7 +1183,7 @@ fn acquire_cloudflare_credential() -> Result<(SecretBytes, Option<SecretBytes>),
         verify_api_token(&token)?;
         return Ok((token, None));
     }
-    match acquire_device_flow() {
+    match acquire_device_flow(language) {
         Ok(tokens) => Ok(tokens),
         Err(device_error) => {
             if !stdin_is_tty() {
@@ -1094,11 +1191,24 @@ fn acquire_cloudflare_credential() -> Result<(SecretBytes, Option<SecretBytes>),
                     "Cloudflare device authorization failed: {device_error}. Set CLOUDFLARE_API_TOKEN in the current process to use the API-token fallback"
                 ));
             }
-            eprintln!("Cloudflare device authorization could not complete: {device_error}");
             eprintln!(
-                "API-token fallback permissions: Workers Scripts -> Edit; Account Settings -> Read."
+                "{}: {device_error}",
+                language.text(
+                    "Cloudflare device authorization could not complete",
+                    "Cloudflare 设备授权未能完成",
+                    "Cloudflare デバイス認可を完了できませんでした",
+                )
             );
-            let value = read_hidden_line("Paste temporary Cloudflare API token (input hidden): ")?;
+            eprintln!("{}", language.text(
+                "API-token fallback permissions: Workers Scripts -> Edit; Account Settings -> Read.",
+                "API Token 备用权限：Workers Scripts -> Edit；Account Settings -> Read。",
+                "API Token fallback の権限: Workers Scripts -> Edit; Account Settings -> Read。",
+            ));
+            let value = read_hidden_line(language.text(
+                "Paste temporary Cloudflare API token (input hidden): ",
+                "粘贴临时 Cloudflare API Token（输入内容隐藏）：",
+                "一時的な Cloudflare API Token を貼り付けてください（入力は非表示）：",
+            ))?;
             if !verify_api_token_shape(&value) {
                 return Err("Cloudflare API token has an invalid shape".to_owned());
             }
@@ -1119,7 +1229,7 @@ fn verify_api_token(token: &SecretBytes) -> Result<(), String> {
     Ok(())
 }
 
-fn acquire_device_flow() -> Result<(SecretBytes, Option<SecretBytes>), String> {
+fn acquire_device_flow(language: Locale) -> Result<(SecretBytes, Option<SecretBytes>), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(4))
@@ -1163,12 +1273,31 @@ fn acquire_device_flow() -> Result<(SecretBytes, Option<SecretBytes>), String> {
     // This flow can run as the Worker-update subprocess launched by the
     // updater with stdout piped and parsed as machine-readable JSON. Keep
     // this human device-flow progress on stderr so stdout stays pure JSON.
+    eprintln!("{}", language.text(
+        "Cloudflare Workers Free is sufficient for Herdr. If you do not have a Cloudflare account, create one on the page that opens; signing in with Google is the simplest option.",
+        "Herdr 使用 Cloudflare Workers Free 即可，不需要付费。如果没有 Cloudflare 账号，请在打开的页面免费注册；使用 Google 登录最方便。",
+        "Herdr には Cloudflare Workers Free で十分で、支払いは不要です。Cloudflare アカウントがない場合は、開いたページで無料登録してください。Google サインインが最も簡単です。",
+    ));
     eprintln!(
-        "Cloudflare Workers Free is sufficient for Herdr. If you do not have a Cloudflare account, create one on the page that opens; signing in with Google is the simplest option."
+        "{} {verification_uri}",
+        language.text(
+            "Open this Cloudflare page and approve Herdr:",
+            "打开这个 Cloudflare 页面并批准 Herdr：",
+            "この Cloudflare ページを開いて Herdr を承認してください：",
+        )
     );
-    eprintln!("Open this Cloudflare page and approve Herdr: {verification_uri}");
-    eprintln!("Verification code: {user_code}");
-    eprintln!("Code expires in at most {expires} seconds.");
+    eprintln!(
+        "{}: {user_code}",
+        language.text("Verification code", "验证码", "確認コード")
+    );
+    eprintln!(
+        "{}",
+        match language {
+            Locale::En => format!("Code expires in at most {expires} seconds."),
+            Locale::ZhCn => format!("验证码最多 {expires} 秒后过期。"),
+            Locale::Ja => format!("確認コードは最大 {expires} 秒で期限切れになります。"),
+        }
+    );
     open_browser(&verification_uri_complete);
 
     let started = std::time::Instant::now();
@@ -1264,6 +1393,13 @@ where
 }
 
 fn select_account(cloudflare: &Cloudflare<'_>) -> Result<Account, String> {
+    select_account_for_locale(cloudflare, Locale::En)
+}
+
+fn select_account_for_locale(
+    cloudflare: &Cloudflare<'_>,
+    language: Locale,
+) -> Result<Account, String> {
     let accounts = cloudflare.accounts()?;
     if accounts.is_empty() {
         return Err("Cloudflare authorization can access no accounts".to_owned());
@@ -1282,7 +1418,14 @@ fn select_account(cloudflare: &Cloudflare<'_>) -> Result<Account, String> {
     if !stdin_is_tty() {
         return Err("multiple Cloudflare accounts are accessible; set non-secret CLOUDFLARE_ACCOUNT_ID and rerun".to_owned());
     }
-    eprintln!("Choose Cloudflare account:");
+    eprintln!(
+        "{}",
+        language.text(
+            "Choose Cloudflare account:",
+            "选择 Cloudflare 账户：",
+            "Cloudflare account を選択してください：",
+        )
+    );
     for (index, account) in accounts.iter().enumerate() {
         eprintln!(
             "  {}. {} ({})",
@@ -1292,7 +1435,10 @@ fn select_account(cloudflare: &Cloudflare<'_>) -> Result<Account, String> {
         );
     }
     let mut line = String::new();
-    eprint!("Account number: ");
+    eprint!(
+        "{}",
+        language.text("Account number: ", "账户编号：", "Account 番号: ",)
+    );
     io::stderr().flush().map_err(|error| error.to_string())?;
     io::stdin()
         .read_line(&mut line)

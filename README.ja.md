@@ -36,33 +36,33 @@ Cloudflare Edge
 | Windows ARM64 / aarch64 | Candidate | Native `windows-11-arm` CI/release build 済み、実機 UAT は未完了 |
 | WSL | Unsupported | host/guest filesystem と lifecycle boundary は未検証 |
 
-詳細な tested / not-yet-tested boundary は [platform support matrix](docs/i18n/en/platform-support-matrix.md) を参照してください。
+詳細な tested / not-yet-tested boundary は [プラットフォームサポートマトリクス](docs/i18n/ja/platform-support-matrix.md) を参照してください。
 
 ## インストール
 
 ### 推奨：Agent に一文だけ渡す
 
 ```text
-Herdr と herdr-mcp を https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md に従ってインストールしてください。依存関係を先に整理し、自動化できる処理はできるだけまとめて実行し、現在の Stable GitHub Release を使ってください。私自身のログイン、認可、Cloudflare Account/domain の選択が必要な場面だけ停止してください。
+Herdr と herdr-mcp を https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/ja/agent-install.md に従ってインストールしてください。依存関係を先に整理し、自動化できる処理はできるだけまとめて実行し、現在の Stable GitHub Release を使ってください。私自身のログイン、認可、Cloudflare Account/domain の選択が必要な場面だけ停止してください。
 ```
 
 Agent は Herdr と herdr-mcp をインストールし、Worker と最終公開入口を設定し、workstation Link と ChatGPT 認可を進め、実際の MCP request で検証します。domain は必須ではありません。このコンピュータから `workers.dev` へ直接到達できない場合、Link は既存 local proxy と組み込み shared Relay を自動的に利用できます。
 
 ### 手動インストール
 
-各手順を自分で進める場合は [Manual install](docs/i18n/en/install.md) を参照してください。
+各手順を自分で進める場合は [手動インストール](docs/i18n/ja/install.md) を参照してください。
 
 ### ChatGPT の設定
 
 必要に応じて Developer Mode を有効にし、**Settings → Apps** から `herdr` App/Connector を追加して OAuth を完了します。
 
-[ChatGPT setup](docs/i18n/en/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
+[ChatGPT の設定](docs/i18n/ja/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
 
 ### Cloudflare の設定
 
 Cloudflare が安定した公開 MCP/OAuth 入口を提供し、各開発マシンは外向きに認証済み接続を張ります。各マシンへ公開 inbound port を開ける必要はありません。
 
-[Cloudflare setup](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
+[Cloudflare の設定](docs/i18n/ja/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 
 ### Link のネットワーク代替経路
 
@@ -97,12 +97,12 @@ Herdr は Worker control plane で pairing を作成するため、その操作�
 新しいコンピュータ上の Coding Agent に次の一文を渡します。
 
 ```text
-このコンピュータを既存の Herdr デバイス群へ接続してください。https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md に従い、pairing address は <pairing-address> を使い、CLI が要求した時だけ 6 桁 verification code を私に入力させ、完了後に同じ Worker 上でこのデバイスが online と表示されることを確認してください。
+このコンピュータを既存の Herdr デバイス群へ接続してください。https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/ja/existing-worker-connect.md に従い、pairing address は <pairing-address> を使い、CLI が要求した時だけ 6 桁 verification code を私に入力させ、完了後に同じ Worker 上でこのデバイスが online と表示されることを確認してください。
 ```
 
 新しいコンピュータは既存の Worker と ChatGPT 接続へ参加します。別の Worker を作成したり、長期共有 secret をコピーしたりしません。
 
-[Multi-device guide](docs/i18n/en/existing-worker-connect.md)
+[マルチデバイスの手引き](docs/i18n/ja/existing-worker-connect.md)
 
 ## 使い方の推奨
 
@@ -158,7 +158,7 @@ herdr-mcp webchat resources --kind session
 herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.com/g/g-p-.../c/...'
 ```
 
-[ローカル Agent による WebChat 操作](docs/i18n/ja/local-agent-webchat-control.md) · [Browser continuity](docs/i18n/en/browser-continuity.md) · [Browser extension](docs/i18n/en/extension.md)
+[ローカル Agent による WebChat 操作](docs/i18n/ja/local-agent-webchat-control.md) · [ブラウザ連続性](docs/i18n/ja/browser-continuity.md) · [ブラウザ拡張](docs/i18n/ja/extension.md)
 
 ## Chrome extension
 
@@ -166,7 +166,7 @@ ChatGPT → MCP → 開発マシンの基本接続には必須ではありませ
 
 macOS で STANDALONE channel を使う場合、`herdr-mcp doctor` は Google Chrome が固定 Herdr standalone ID を managed path `~/.config/herdr-mcp/extensions/standalone/current` から実際に読み込んでいるかも確認します。`standalone-extension-load state=drift` が出た場合、Chrome は別の Load-unpacked directory を使っているため、`doctor` が示す `expected` path から Herdr extension を再読み込みしてください。
 
-[Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [Extension guide](docs/i18n/en/extension.md) · [Browser continuity](docs/i18n/en/browser-continuity.md)
+[Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [拡張の手引き](docs/i18n/ja/extension.md) · [ブラウザ連続性](docs/i18n/ja/browser-continuity.md)
 
 ## よくある質問
 
@@ -191,7 +191,7 @@ herdr-mcp status
 herdr-mcp doctor
 ```
 
-mutation の場合は返された delivery/retry 情報に従い、delivery が不明な操作を無条件に繰り返さないでください。詳細は [Troubleshooting](docs/i18n/en/troubleshooting.md) を参照してください。
+mutation の場合は返された delivery/retry 情報に従い、delivery が不明な操作を無条件に繰り返さないでください。詳細は [トラブルシューティング](docs/i18n/ja/troubleshooting.md) を参照してください。
 
 ### アカウントの利用上限はどこで確認しますか？
 
@@ -219,7 +219,7 @@ Herdr-MCP は複数の open-source project から有用なアイデアを学ん�
 - [codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) — Codex harness + Web-model inference。
 - [OpenAI tunnel-client](https://github.com/openai/tunnel-client) — MCP-compatible service を ChatGPT に安全に公開する参考実装。
 
-詳しい比較は [Ecosystem comparison](docs/i18n/en/herdr-vs-ecosystem.md) を参照してください。
+詳しい比較は [エコシステム比較](docs/i18n/ja/herdr-vs-ecosystem.md) を参照してください。
 
 ## License
 
