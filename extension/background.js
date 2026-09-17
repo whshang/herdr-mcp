@@ -3291,6 +3291,7 @@ async function handleBrowserActuation(command) {
     }
     let scope = null;
     const scopeDeadline = Date.now() + 8000;
+    let probeStarted = false;
     do {
       scope = browserTabScopes.get(createdTab.id) || null;
       if (scope
@@ -3301,6 +3302,22 @@ async function handleBrowserActuation(command) {
         break;
       }
       scope = null;
+      // A freshly-created ChatGPT tab publishes its Browser Registry scope only
+      // after its content script registers the current conversation. After a
+      // worker reload or a slow project mount that registration can lag behind
+      // this gate, so a passive wait deadlocked on the absent scope would
+      // misreport a healthy create as resource_unavailable. The h2w_get_convkey
+      // handshake is non-mutating and lazily drives that exact-tab registration,
+      // closing the startup deadlock without weakening the account/space/
+      // generation equality checks above: the create command is still gated on
+      // a scope that matches the requested provider, account, project and
+      // observation generation, and the reservation-backed registration happens
+      // only when the command is later delivered to the content script.
+      if (!probeStarted) {
+        probeStarted = true;
+        void chrome.tabs.sendMessage(createdTab.id, { type: "h2w_get_convkey" })
+          .catch(() => {});
+      }
       await new Promise((resolve) => setTimeout(resolve, 200));
     } while (Date.now() < scopeDeadline);
     if (!scope) {

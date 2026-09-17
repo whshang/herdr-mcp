@@ -1395,3 +1395,215 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /required-app-not-found/);
   assert.match(wakeSource, /composerHasOnlyAppPills\(data\.requiredApps\)/);
 });
+
+// Regression: session.create must not passively deadlock on a Browser Registry
+// scope only a freshly-created ChatGPT tab's content script can publish. After
+// a worker reload or a slow Project mount the fresh tab's registration can lag
+// the create scope-gate, so the handler used to time out its passive wait and
+// misreport a healthy create as resource_unavailable — with a visible new tab
+// already open but no authoritative create command ever delivered. The fix
+// actively probes the exact tab with the non-mutating h2w_get_convkey identity
+// handshake (which drives lazy registerCurrentConversation registration) while
+// retaining the account/space/generation equality gate. Old code never probes,
+// so the scope never materializes and the create still fails closed.
+const createAnchorSource2 = (() => {
+  const start = backgroundSource.indexOf("async function resolveBrowserCreateAnchorWindow({");
+  const end = backgroundSource.indexOf("async function handleBrowserActuation", start);
+  assert.ok(start >= 0 && end > start, "create anchor helper must remain extractable");
+  return backgroundSource.slice(start, end);
+})();
+const createBranchSource = (() => {
+  const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.create")');
+  const end = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")', start);
+  assert.ok(start >= 0 && end > start, "create branch must remain extractable");
+  return backgroundSource.slice(start, end);
+})();
+
+function createActuationBranchHarness({ publishOnProbe = true } = {}) {
+  // Virtual clock: the old 8s scope-gate deadline must elapse immediately so a
+  // harness that models the no-probe failure returns fast.
+  const clock = { value: 1_000_000 };
+  const dateShim = { now: () => clock.value };
+  const setTimeoutShim = (fn) => { clock.value += 200; fn(); return 0; };
+
+  const tabs = new Map();
+  const browserTabScopes = new Map();
+  const browserSessionTargets = new Map();
+  const postCalls = [];
+  const actuationMessages = [];
+  let nextTabId = 100;
+  const liveScopesByTab = new Map();
+
+  const chrome = {
+    tabs: {
+      async get(tabId) {
+        const t = tabs.get(tabId);
+        if (!t) throw new Error(`tab ${tabId} missing`);
+        return { ...t };
+      },
+      async query() {
+        return [...tabs.values()].map((t) => ({ id: t.id, url: t.url, status: "complete" }));
+      },
+      async create(info) {
+        const id = nextTabId++;
+        const tab = { id, url: info.url, windowId: info.windowId ?? null };
+        tabs.set(id, tab);
+        return { ...tab };
+      },
+      async sendMessage(tabId, message) {
+        if (message?.type === "h2w_get_convkey" && publishOnProbe) {
+          // The content-script identity handshake drives lazy registration,
+          // which publishes the tab's Browser Registry scope on the next poll.
+          if (liveScopesByTab.has(tabId)) browserTabScopes.set(tabId, liveScopesByTab.get(tabId));
+        }
+        return {};
+      },
+    },
+  };
+  const activeH2WTabUrls = () => ["https://chatgpt.com/*"];
+  const browserConversationInfo = (provider, url) => provider === "chatgpt" ? chatGptConversationInfo(url) : null;
+  const browserConversationInfoFromSupportedUrl = (rawUrl) => {
+    const info = chatGptConversationInfo(rawUrl);
+    return info ? { ...info } : null;
+  };
+  const unavailable = (expectedGeneration, observedGeneration = expectedGeneration) => ({
+    observed_generation: Math.max(1, Number(observedGeneration) || Number(expectedGeneration) || 1),
+    command_accepted: false, browser_online: false, resource_available: false, rejected: false,
+    stable_resource_ref_observed: false, lifecycle_observed: false, canonical_url_observed: false,
+    accepted_message_observed: false, message_baseline_advanced: false,
+    reasoning_effort_readback: null, required_apps_readback: [],
+    generation_owner: null, generation_status_observed: false, generation_stopped: false, result: null,
+  });
+  const postBrowserActuationEvidence = async (id, evidence) => { postCalls.push({ id, evidence }); };
+  const protectBoundTab = async () => {};
+  const sendBrowserActuationTabMessage = async (tabId, message) => {
+    actuationMessages.push({ tabId, message });
+    return {
+      evidence: {
+        observed_generation: 17,
+        command_accepted: true,
+        browser_online: true,
+        resource_available: true,
+        rejected: false,
+        stable_resource_ref_observed: true,
+        lifecycle_observed: true,
+        canonical_url_observed: true,
+        accepted_message_observed: true,
+        message_baseline_advanced: false,
+        reasoning_effort_readback: null,
+        required_apps_readback: [],
+        generation_owner: 17,
+        generation_status_observed: true,
+        generation_stopped: false,
+        result: null,
+      },
+    };
+  };
+
+  const actuate = new Function(
+    "chrome", "browserTabScopes", "browserSessionTargets", "activeH2WTabUrls",
+    "browserConversationInfo", "browserConversationInfoFromSupportedUrl",
+    "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
+    "unavailableBrowserActuationEvidence", "Date", "setTimeout",
+    `async function __actuate(command) {\n` +
+    `const actuationId = String(command?.actuation_id || "");\n` +
+    `const operation = String(command?.operation || "");\n` +
+    `const expectedGeneration = Number(command?.expected_generation || 0);\n` +
+    `const params = command?.params && typeof command.params === "object" ? command.params : {};\n` +
+    `${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
+  )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrls,
+    browserConversationInfo, browserConversationInfoFromSupportedUrl,
+    postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
+    unavailable, dateShim, setTimeoutShim);
+
+  return {
+    actuate,
+    postCalls,
+    actuationMessages,
+    browserTabScopes,
+    browserSessionTargets,
+    tabs,
+    liveScopesByTab,
+    dateShim,
+  };
+}
+
+test("session.create closes the startup scope deadlock with a non-mutating identity probe", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness();
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  // The freshly-created tab (id 100) will only publish its scope on the
+  // non-mutating h2w_get_convkey probe, not on a passive poll.
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  const actuate = harness.actuate;
+  await actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "0".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "1".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+
+  // The gate must not deadlock: the authoritative create command is delivered
+  // to the exact freshly-created tab (window affinity preserved, new tab id 100).
+  assert.deepEqual(harness.actuationMessages.map((m) => m.tabId), [100]);
+  assert.equal(
+    harness.actuationMessages[0].message.command.operation,
+    "herdr_mcp.browser_session.create",
+  );
+  // On probe-driven scope success the create proceeds and reports resource_available.
+  assert.ok(harness.postCalls.length > 0, "create must post actuation evidence");
+  const success = harness.postCalls.find((c) => c.evidence?.resource_available === true);
+  assert.ok(success, "probe-driven create must complete with resource_available=true");
+  assert.equal(success.evidence.command_accepted, true);
+  assert.equal(harness.postCalls.some((c) => c.evidence?.resource_available === false), false);
+});
+
+test("session.create still fails closed when the fresh tab can never be identified", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ publishOnProbe: false });
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+
+  const actuate = harness.actuate;
+  await actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "0".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "1".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 60; i += 1) await Promise.resolve();
+
+  assert.equal(harness.actuationMessages.length, 0, "no create command may be delivered without a matching scope");
+  const failure = harness.postCalls.find((c) => c.evidence?.resource_available === false);
+  assert.ok(failure, "unidentifiable fresh tab must fail closed with resource_available=false");
+  assert.equal(failure.evidence.command_accepted, false);
+});
