@@ -27,6 +27,7 @@ pub enum Command {
         verbose: bool,
         json: bool,
     },
+    Network(NetworkCommand),
     Uninstall,
     Reinstall,
     DocumentsProbe,
@@ -65,6 +66,11 @@ pub enum Command {
     TccHerdrHost,
     CredentialHelperRun,
     Permissions(crate::macos_permissions::PermissionsCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NetworkCommand {
+    Repair,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -443,6 +449,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         ),
         "status" => parse_status(&args[1..]),
         "doctor" => parse_doctor(&args[1..]),
+        "network" => parse_network(&args[1..]),
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
         "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
         "__tcc-herdr-host" => no_extra(args, Command::TccHerdrHost),
@@ -476,6 +483,13 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "artifact" => parse_artifact(&args[1..]),
         "link" => parse_link(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
+    }
+}
+
+fn parse_network(args: &[String]) -> Result<Command, String> {
+    match args {
+        [command] if command == "repair" => Ok(Command::Network(NetworkCommand::Repair)),
+        _ => Err("usage: herdr-mcp network repair".to_owned()),
     }
 }
 
@@ -2658,6 +2672,12 @@ mod tests {
             }
         );
         assert!(parse(args(&["doctor", "--json", "--verbose"])).is_err());
+        assert_eq!(
+            parse(args(&["network", "repair"])).unwrap().command,
+            Command::Network(NetworkCommand::Repair)
+        );
+        assert!(parse(args(&["network"])).is_err());
+        assert!(parse(args(&["network", "repair", "--force"])).is_err());
         assert_eq!(
             parse(args(&["permissions", "status"])).unwrap().command,
             Command::Permissions(crate::macos_permissions::PermissionsCommand::Status)
