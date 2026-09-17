@@ -43,7 +43,11 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_BROWSER_RESULT_TEXT_BYTES: usize = 256 * 1024;
 const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
-const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(35);
+// Edge's default tool-request deadline is 30s. Keep one browser actuation wait
+// above the 15s extension heartbeat while leaving room for bounded create
+// reconciliation plus HTTP/serialization overhead before the outer request
+// can turn a durable reservation/dispatch into an ambiguous gateway timeout.
+const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(22);
 const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
 // The extension polls for browser actuation on the shared SSE heartbeat. Keep
 // the liveness window above that 15s cadence so an idle healthy stream is not
@@ -4148,6 +4152,13 @@ mod tests {
         assert_eq!(observed.generation_owner, Some(7));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn browser_actuation_timeout_leaves_edge_request_headroom() {
+        assert!(BROWSER_ACTUATION_TIMEOUT > SSE_HEARTBEAT);
+        assert!(BROWSER_ACTUATION_TIMEOUT <= Duration::from_secs(22));
+        assert!(BROWSER_ACTUATION_TIMEOUT < Duration::from_secs(30));
     }
 
     #[tokio::test]

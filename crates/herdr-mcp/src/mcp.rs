@@ -2710,11 +2710,15 @@ fn browser_session_create_success(
     })
 }
 
-// Keep the whole create call inside the upstream request budget even after the
-// browser broker's bounded actuation wait. Forty intervals add at most 10s.
-const BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS: usize = 41;
+// Keep the whole create call inside the upstream 30s request budget after the
+// browser broker's bounded actuation wait. Twenty intervals add at most 5s,
+// leaving the caller enough time to receive the durable reservation/session
+// identity instead of seeing an outer gateway timeout first.
+const BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS: usize = 21;
+const BROWSER_SESSION_CREATE_PRODUCTION_RECONCILE_INTERVAL_MS: u64 = 250;
 #[cfg(not(test))]
-const BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS: u64 = 250;
+const BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS: u64 =
+    BROWSER_SESSION_CREATE_PRODUCTION_RECONCILE_INTERVAL_MS;
 #[cfg(test)]
 const BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS: u64 = 5;
 
@@ -10048,6 +10052,12 @@ mod tests {
         assert_eq!(create_params["expected_generation"], 7);
         assert_eq!(create_params["display_label"], "herdr-mcp");
         assert_eq!(create_params["provider"], "chatgpt");
+    }
+
+    #[test]
+    fn browser_session_create_reconciliation_stays_within_request_headroom() {
+        let intervals = BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS.saturating_sub(1) as u64;
+        assert!(intervals * BROWSER_SESSION_CREATE_PRODUCTION_RECONCILE_INTERVAL_MS <= 5_000);
     }
 
     #[test]
