@@ -16,6 +16,9 @@ pub enum Command {
     Help {
         section: HelpSection,
     },
+    Lang {
+        preference: Option<String>,
+    },
     Version,
     Status,
     Doctor,
@@ -345,6 +348,8 @@ pub enum UpdateCommand {
 pub struct Parsed {
     /// Optional `--instance NAME` / `-i NAME` (sugar for `HERDR_MCP_INSTANCE`).
     pub instance: Option<String>,
+    /// Optional per-invocation human-language override. Machine fields stay English.
+    pub lang: Option<crate::locale::Locale>,
     pub command: Command,
 }
 
@@ -353,12 +358,17 @@ where
     I: IntoIterator<Item = String>,
 {
     let args = args.into_iter().collect::<Vec<_>>();
+    let (lang, args) = crate::locale::strip_lang_flag(&args)?;
     let (instance, args) = strip_instance_flag(&args)?;
     let command = parse_command(&args)?;
     if instance.is_some() && matches!(command, Command::Instance(_)) {
         return Err("--instance cannot be combined with instance list/reap".to_owned());
     }
-    Ok(Parsed { instance, command })
+    Ok(Parsed {
+        instance,
+        lang,
+        command,
+    })
 }
 
 fn strip_instance_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
@@ -406,6 +416,15 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
     };
 
     match command {
+        "lang" => match &args[1..] {
+            [] => Ok(Command::Lang { preference: None }),
+            [value] if value == "auto" || crate::locale::Locale::explicit(value).is_some() => {
+                Ok(Command::Lang {
+                    preference: Some(value.clone()),
+                })
+            }
+            _ => Err("usage: herdr-mcp lang [auto|en|zh|ja]".to_owned()),
+        },
         "help" | "-h" | "--help" => no_extra(
             args,
             Command::Help {
@@ -2334,6 +2353,43 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn parses_global_language_override_and_persistent_language_command() {
+        let parsed = parse(args(&["--lang", "ja", "status"])).unwrap();
+        assert_eq!(parsed.lang, Some(crate::locale::Locale::Ja));
+        assert_eq!(parsed.command, Command::Status);
+
+        let parsed = parse(args(&["status", "--lang=zh-CN"])).unwrap();
+        assert_eq!(parsed.lang, Some(crate::locale::Locale::ZhCn));
+        assert_eq!(parsed.command, Command::Status);
+
+        assert_eq!(
+            parse(args(&["lang", "ja"])).unwrap().command,
+            Command::Lang {
+                preference: Some("ja".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse(args(&["lang", "auto"])).unwrap().command,
+            Command::Lang {
+                preference: Some("auto".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse(args(&["lang"])).unwrap().command,
+            Command::Lang { preference: None }
+        );
+
+        for invalid in [
+            vec!["--lang"],
+            vec!["--lang=de", "status"],
+            vec!["--lang=en", "--lang=ja", "status"],
+            vec!["lang", "de"],
+        ] {
+            assert!(parse(args(&invalid)).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

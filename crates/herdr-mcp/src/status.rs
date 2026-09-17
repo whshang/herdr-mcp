@@ -92,15 +92,17 @@ fn collect(paths: &RuntimePaths, config: &Config) -> StatusReport {
     }
 }
 
-pub fn print_status(paths: &RuntimePaths, config: &Config) {
+pub fn print_status(paths: &RuntimePaths, config: &Config, language: crate::locale::Locale) {
     let report = collect(paths, config);
     println!("Herdr MCP {}", crate::runtime_meta::runtime_version());
     println!(
-        "runtime channel: {}",
+        "{}: {}",
+        language.text("runtime channel", "运行通道", "ランタイムチャネル"),
         crate::runtime_meta::runtime_channel()
     );
     println!(
-        "runtime source: {}{}",
+        "{}: {}{}",
+        language.text("runtime source", "运行源码", "ランタイムソース"),
         crate::runtime_meta::compiled_source_commit().unwrap_or("release"),
         if crate::runtime_meta::compiled_source_dirty() {
             " (dirty)"
@@ -108,49 +110,84 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
             ""
         }
     );
-    println!("config: {}", paths.config_file.display());
     println!(
-        "runtime: {}",
+        "{}: {}",
+        language.text("config", "配置", "設定"),
+        paths.config_file.display()
+    );
+    println!(
+        "{}: {}",
+        language.text("runtime", "运行时", "ランタイム"),
         runtime_label(report.runtime, config.runtime_port)
     );
     println!(
-        "herdr transport: {}",
+        "{}: {}",
+        language.text("herdr transport", "Herdr 本地传输", "Herdr ローカル通信"),
         if report.herdr_transport_reachable {
-            "reachable"
+            language.text("reachable", "可达", "到達可能")
         } else {
-            "unreachable"
+            language.text("unreachable", "不可达", "到達不可")
         }
     );
     println!(
-        "tcc broker: {}",
+        "{}: {}",
+        language.text("tcc broker", "TCC broker", "TCC broker"),
         crate::tcc_broker::status_line(&paths.config_dir)
     );
-    println!("update channel: {}", config.update_channel.as_str());
     println!(
-        "update checks: {}",
+        "{}: {}",
+        language.text("update channel", "更新通道", "更新チャネル"),
+        config.update_channel.as_str()
+    );
+    println!(
+        "{}: {}",
+        language.text("update checks", "更新检查", "更新チェック"),
         if config.update_check {
-            "enabled"
+            language.text("enabled", "已启用", "有効")
         } else {
-            "disabled"
+            language.text("disabled", "已关闭", "無効")
         }
     );
     println!(
-        "auto update scheduler: {}",
+        "{}: {}",
+        language.text(
+            "auto update scheduler",
+            "自动更新调度",
+            "自動更新スケジューラ"
+        ),
         crate::update_scheduler::status_line()
     );
-    println!("lifecycle residue: {}", crate::residue::status_line());
     println!(
-        "relay pool: {}",
+        "{}: {}",
+        language.text("lifecycle residue", "生命周期残留", "ライフサイクル残留"),
+        crate::residue::status_line()
+    );
+    println!(
+        "{}: {}",
+        language.text("relay pool", "Relay 池", "Relay プール"),
         crate::link::relay_manifest::status_line(paths, unix_now_seconds())
     );
-    println!("relay use: {}", crate::link::RELAY_POLICY_DESCRIPTION);
     println!(
-        "local agent skill: {}",
+        "{}: {}",
+        language.text("relay use", "Relay 用途", "Relay 用途"),
+        crate::link::RELAY_POLICY_DESCRIPTION
+    );
+    println!(
+        "{}: {}",
+        language.text(
+            "local agent skill",
+            "本地 Agent Skill",
+            "ローカル Agent Skill"
+        ),
         crate::local_agent_skill::status_line()
     );
 }
 
-pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
+pub fn print_doctor(
+    paths: &RuntimePaths,
+    config: &Config,
+    language: crate::locale::Locale,
+) -> bool {
     let report = collect(paths, config);
     let runtime_healthy = matches!(report.runtime, RuntimeHealth::Healthy(_));
     let methods_result = native_tools::methods("");
@@ -190,9 +227,10 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     } else {
         true
     };
-    println!("Herdr MCP doctor");
+    println!("Herdr MCP {}", language.text("doctor", "诊断", "診断"));
     println!(
-        "runtime provenance: channel={} version={} source={}{}",
+        "{}: channel={} version={} source={}{}",
+        language.text("runtime provenance", "运行来源", "ランタイム由来"),
         crate::runtime_meta::runtime_channel(),
         crate::runtime_meta::runtime_version(),
         crate::runtime_meta::compiled_source_commit().unwrap_or("release"),
@@ -202,13 +240,54 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
             ""
         }
     );
-    print_check("runtime endpoint", runtime_healthy);
-    print_check("Herdr local transport", report.herdr_transport_reachable);
-    print_check("Herdr API schema", schema_healthy);
-    print_check("validated Herdr RPC", native_call_healthy);
-    print_check("Herdr snapshot state", snapshot_healthy);
-    print_check("Herdr inspect projection", inspect_healthy);
-    print_check("Herdr event cache", event_cache.healthy);
+    print_check(
+        language.text("runtime endpoint", "运行端点", "ランタイムエンドポイント"),
+        runtime_healthy,
+    );
+    print_check(
+        language.text(
+            "Herdr local transport",
+            "Herdr 本地传输",
+            "Herdr ローカル通信",
+        ),
+        report.herdr_transport_reachable,
+    );
+    print_check(
+        language.text("Herdr API schema", "Herdr API schema", "Herdr API schema"),
+        schema_healthy,
+    );
+    print_check(
+        language.text(
+            "validated Herdr RPC",
+            "已验证 Herdr RPC",
+            "検証済み Herdr RPC",
+        ),
+        native_call_healthy,
+    );
+    print_check(
+        language.text(
+            "Herdr snapshot state",
+            "Herdr 快照状态",
+            "Herdr スナップショット状態",
+        ),
+        snapshot_healthy,
+    );
+    print_check(
+        language.text(
+            "Herdr inspect projection",
+            "Herdr inspect 投影",
+            "Herdr inspect 投影",
+        ),
+        inspect_healthy,
+    );
+    print_check(
+        language.text(
+            "Herdr event cache",
+            "Herdr 事件缓存",
+            "Herdr イベントキャッシュ",
+        ),
+        event_cache.healthy,
+    );
     let macos_permissions = crate::macos_permissions::collect_status();
     println!("{}", documents_permission.doctor_line());
     println!(
@@ -220,7 +299,14 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     println!("{}", herdr_supervisor::doctor_line());
     println!("{}", crate::child_process::doctor_line());
     println!("{}", standalone_browser.doctor_line());
-    print_check("local agent Skill", local_agent_skill.0);
+    print_check(
+        language.text(
+            "local agent Skill",
+            "本地 Agent Skill",
+            "ローカル Agent Skill",
+        ),
+        local_agent_skill.0,
+    );
     println!("LAYER local-agent-skill {}", local_agent_skill.1);
     let remote = print_layer_ownership(paths, config, &report);
     println!(
