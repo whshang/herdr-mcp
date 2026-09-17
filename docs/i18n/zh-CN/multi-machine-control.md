@@ -1,8 +1,8 @@
-# Herdr 0.9 多机器与双线控制
+# Herdr 0.9.1 多机器与双线控制
 
 *让 Herdr saved SSH machine 与 Herdr-MCP Edge device 同时工作，但不混淆两套身份。*
 
-Herdr 0.9 与 Herdr-MCP 解决的是多机器控制的不同层面：
+Herdr 0.9.1 与 Herdr-MCP 解决的是多机器控制的不同层面：
 
 | 控制面 | 身份 | 传输 | 主要用途 |
 | --- | --- | --- | --- |
@@ -33,30 +33,46 @@ Herdr 的 server id 只在对应 server/session 内有意义。两台机器完�
 
 走 Edge 时，把 `device_id` 或带 device affinity 的 `herdr_ref_*` 与 workspace/pane 引用一起保存。走 saved-machine 路径时，把 machine profile + Herdr session 与 workspace/pane id 一起解释。不要把裸 `w1:p1` 当作跨机器全局唯一 id。
 
-Herdr issue [#3732](https://github.com/herdrdev/herdr/issues/3732) 已经记录了 0.9.0 中真实存在的跨机器 workspace-id 歧义，因此即使 saved machine 与 Edge device 指向同一台 workstation，Herdr-MCP 仍保持显式 device affinity。
+Herdr 0.9.1 已修复 issue [#3732](https://github.com/herdrdev/herdr/issues/3732) 记录的客户端同 ID 过滤问题。workspace/pane id 仍只在对应 Herdr server/session 内有意义，因此即使 saved machine 与 Edge device 指向同一台 workstation，Herdr-MCP 仍保持显式 device affinity。
 
-## Herdr 0.9 当前的程序化接口限制
+## Herdr 0.9.1 原生 machine-scoped CLI
 
-Connecting Machines TUI 已经可以展示和切换 saved machines，但 Herdr 0.9 暂时还没有在普通 CLI/socket 接口中提供 machine-scoped pane/workspace addressing：
+Herdr 0.9.1 已提供 saved SSH machine 的原生 CLI forwarding：
 
-- TUI 中选择远端 machine，不会让另一个本地 `herdr pane ...` / `herdr workspace ...` 命令自动切换到该 machine；
-- `herdr --remote <target>` 当前用于附着远程 TUI，不能再与 pane/workspace 子命令组合；
-- 本地和远端 server 可以同时存在相同的 pane id。
+- `herdr --machine <label-or-id> <command>` 直接对该 saved machine 配置的 Herdr session 执行支持的 API 命令，不要求先打开远程 Herdr window；
+- workspace、worktree、tab、pane、agent 命令都可以通过这一入口寻址；
+- 依赖 CLI forwarding 前，要把本机和远端都升级到 Herdr 0.9.1；
+- 远端命令失败时保持失败，禁止回退到 Local；
+- `herdr --remote <target>` 继续承担交互式远程 TUI attach。
 
-在 upstream 提供原生 machine-scoped addressing 之前，程序化控制使用显式桥接：
+程序化控制以 saved profile 为路由身份，并在 mutation 前重新发现远端 id：
 
 ```bash
 # 读取 saved profile；始终把 id、target、session 一起保留。
 herdr machine list --json
 
-# 显式进入目标 server/session 后再执行 Herdr CLI。
-# <target> 通常是 SSH config alias，认证仍由 SSH 管理。
-ssh <target> '~/.local/bin/herdr --session <session> pane list'
+# 通过 saved machine profile 路由 API 命令。
+herdr --machine <label-or-id> workspace list
+herdr --machine <label-or-id> pane list --workspace <remote-workspace-id>
+herdr --machine <label-or-id> agent list
 ```
 
-进入远端 server 后，先重新读取该 server 的实时 workspace/pane id，再执行 mutation。不要假设本机取得的 id 在远端仍代表同一资源。
+不要假设本机取得的 id 在远端仍代表同一资源。对于仍停留在 0.9.1 之前、需要 bootstrap 或修复的 endpoint，显式 SSH 执行只作为兼容/恢复路径；远端升级完成后，日常程序化控制回到 `--machine`。
 
-upstream 多机器 Ideas 主线程是 [Discussion #515](https://github.com/herdrdev/herdr/discussions/515)。未来如果 Herdr 提供原生 machine-scoped API，并且 live schema/capabilities 能证明接口存在，Herdr-MCP 应优先使用原生路径；SSH bridge 只作为显式兼容路径，不成为第二套身份系统。
+upstream 多机器 Ideas 主线程是 [Discussion #515](https://github.com/herdrdev/herdr/discussions/515)。saved-machine profile 仍属于 SSH/Herdr 身份；原生 `--machine` forwarding 不会把它与 Herdr-MCP Edge `device_id` 身份合并。
+
+## 恢复前先区分 client/server 版本状态
+
+Herdr-MCP 1.0 在 `herdr_inspect` 中提供结构化 `herdr_native` 投影，不再把一个版本号当作整个 Herdr 依赖状态：
+
+- `cli_version`：Herdr-MCP 实际找到的本机 Herdr CLI 版本；
+- `server_version`：当前运行中的 Herdr server 通过 live ping 返回的版本；
+- `machine_forwarding`：已安装 CLI 是否真实暴露原生 `--machine` API forwarding；
+- `saved_machine_count` / `saved_machines`：有界的本机 saved profile 清单，不包含 SSH credential 或 target；
+- `version_state`：`current`、`server_restart_pending`、`version_mismatch` 或 `unknown`；
+- `handoff_blocked_reason=legacy_sender_pane_limit`：本机 CLI 已升级，但旧 server 仍拥有超过 64 个 pane，第一次 live handoff 不能安全完成。
+
+`server_restart_pending` 不是 service failure，也不授权自动停止 Herdr。兼容的旧 server 可以继续保留现有终端，而新 CLI 已经安装。必须保留用户和其他任务的 pane，只在安全的 handoff/restart 窗口完成收敛。
 
 ## ChatGPT 应该走哪条路径
 
@@ -66,6 +82,8 @@ saved-machine/SSH 路径用于明确的维护、首次 bootstrap、Debian/Linux 
 
 - `delivery_state=not_delivered`：在重新验证连接和实时状态后，可以通过明确选择的路径安全重发；
 - `delivery_unknown`、delivered/uncertain 或缺少 delivery evidence：先检查实时 pane/Git/runtime/resource 状态，禁止盲目重放 mutation。
+
+恢复时保持显式 transport 顺序：Edge 健康时继续使用 Edge → 只有在确认未投递或实时状态证明 mutation 未应用、且目标 Herdr server 可达时，才使用原生 `herdr --machine` → 只有目标 Herdr server 或 forwarding 路径本身需要 bootstrap/修复时才退到 raw SSH。禁止根据 label/hostname 推导 Edge `device_id`；两套身份之间的对应关系必须由独立的实时证据确认。
 
 Herdr TUI 当前选择哪台 machine，不会改变 Edge call 的目标。Edge call 始终绑定显式/默认的 Herdr-MCP device，以及返回的 `herdr_ref_*` affinity。
 

@@ -1,8 +1,8 @@
-# Herdr 0.9 multi-machine and dual-path control
+# Herdr 0.9.1 multi-machine and dual-path control
 
 *Use Herdr saved SSH machines and Herdr-MCP Edge devices together without confusing their identities.*
 
-Herdr 0.9 and Herdr-MCP solve different parts of multi-machine control:
+Herdr 0.9.1 and Herdr-MCP solve different parts of multi-machine control:
 
 | Control plane | Identity | Transport | Best use |
 | --- | --- | --- | --- |
@@ -33,30 +33,46 @@ Herdr server ids are server/session scoped. Two machines can both have `w1`, `w1
 
 For Edge work, keep the `device_id` or device-bound `herdr_ref_*` with the workspace/pane reference. For saved-machine work, keep the machine profile + Herdr session with the workspace/pane id. Do not cache or pass around a bare `w1:p1` as though it were globally unique.
 
-Herdr issue [#3732](https://github.com/herdrdev/herdr/issues/3732) tracks a real 0.9.0 cross-machine workspace-id ambiguity. Herdr-MCP therefore keeps device affinity explicit even when a saved machine and an Edge device reach the same workstation.
+Herdr 0.9.1 fixes the client-side same-id filtering tracked by issue [#3732](https://github.com/herdrdev/herdr/issues/3732). Workspace and pane ids are still scoped to one Herdr server/session, so Herdr-MCP keeps device affinity explicit even when a saved machine and an Edge device reach the same workstation.
 
-## Current Herdr 0.9 programmatic limitation
+## Native machine-scoped CLI in Herdr 0.9.1
 
-The Connecting Machines TUI can show and switch saved machines, but Herdr 0.9 does not yet expose machine-scoped pane/workspace commands through the ordinary CLI/socket surface:
+Herdr 0.9.1 adds native CLI forwarding to a saved SSH machine:
 
-- selecting a remote machine in the TUI does not retarget a separate local `herdr pane ...` or `herdr workspace ...` command;
-- `herdr --remote <target>` attaches the remote TUI and currently cannot be combined with pane/workspace subcommands;
-- the same pane id may exist independently on the local and remote server.
+- `herdr --machine <label-or-id> <command>` runs supported API commands against that saved machine's configured Herdr session without requiring an open remote Herdr window;
+- workspace, worktree, tab, pane, and agent commands can be addressed this way;
+- update Herdr on both machines before relying on CLI forwarding;
+- a failed remote command stays failed and never falls back to Local;
+- `herdr --remote <target>` remains the interactive remote-TUI attach path.
 
-Until upstream exposes native machine-scoped addressing, the explicit programmatic bridge is:
+Use the saved profile as the routing identity and discover ids on that remote server before mutation:
 
 ```bash
 # Discover the saved profile. Keep its id, target and session together.
 herdr machine list --json
 
-# Run Herdr on the selected remote server/session explicitly.
-# <target> is normally an SSH config alias; SSH owns its authentication.
-ssh <target> '~/.local/bin/herdr --session <session> pane list'
+# Route API commands through the saved machine profile.
+herdr --machine <label-or-id> workspace list
+herdr --machine <label-or-id> pane list --workspace <remote-workspace-id>
+herdr --machine <label-or-id> agent list
 ```
 
-After entering a remote server, re-read its live workspace/pane ids before mutation. Do not assume ids obtained from the local server are valid there.
+Do not assume ids obtained from the local server are valid remotely. For a pre-0.9.1 endpoint that must be bootstrapped or repaired, explicit SSH execution remains a compatibility/recovery path; upgrade the remote endpoint and return to `--machine` for normal programmatic control.
 
-The upstream multi-machine Ideas thread is [Discussion #515](https://github.com/herdrdev/herdr/discussions/515). Herdr-MCP will prefer a native machine-scoped API if Herdr exposes one later and the live schema/capabilities confirm it; the SSH bridge remains an explicit compatibility path, not a second identity system.
+The upstream multi-machine Ideas thread is [Discussion #515](https://github.com/herdrdev/herdr/discussions/515). The saved-machine profile remains an SSH/Herdr identity; native `--machine` forwarding does not merge it with the Herdr-MCP Edge `device_id` namespace.
+
+## Inspect client/server divergence before recovery
+
+Herdr-MCP 1.0 exposes a structured `herdr_native` projection in `herdr_inspect` instead of treating one version string as the whole dependency state:
+
+- `cli_version`: the installed local Herdr client found by Herdr-MCP;
+- `server_version`: the running Herdr server version returned by its live ping;
+- `machine_forwarding`: whether the installed CLI actually advertises native `--machine` API forwarding;
+- `saved_machine_count` / `saved_machines`: bounded local saved-profile inventory without SSH credentials or targets;
+- `version_state`: `current`, `server_restart_pending`, `version_mismatch`, or `unknown`;
+- `handoff_blocked_reason=legacy_sender_pane_limit`: the installed client is new enough, but an older running sender still has more than 64 panes and cannot perform the first live handoff safely.
+
+`server_restart_pending` is not a service failure and is not permission to stop Herdr. A compatible old server may keep existing terminals alive while the new client is already installed. Preserve user/other-task panes and converge only through a safe handoff/restart window.
 
 ## Which path should ChatGPT use?
 
@@ -66,6 +82,8 @@ Use the saved-machine/SSH path explicitly for maintenance, first-time bootstrap,
 
 - `delivery_state=not_delivered`: after connectivity/state verification, a reissue through an explicitly chosen path may be safe;
 - `delivery_unknown`, delivered/uncertain state, or missing delivery evidence: inspect live pane/Git/runtime/resource state first and do not replay the mutation blindly.
+
+For recovery, keep the transport ladder explicit: Edge while healthy → native `herdr --machine` only after proven non-delivery/live non-application and while the target Herdr server is reachable → raw SSH only when the target Herdr server or forwarding path itself needs bootstrap/recovery. Do not convert a label or hostname into an Edge `device_id`; any association between the two identities must be established by separate live evidence.
 
 Herdr TUI machine selection never changes the target of an Edge call. An Edge call stays bound to its explicit/default Herdr-MCP device and any returned `herdr_ref_*` affinity.
 
