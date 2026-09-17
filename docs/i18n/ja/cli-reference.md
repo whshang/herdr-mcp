@@ -135,7 +135,7 @@ herdr_call(
 
 このメソッドは呼び出しのたびに、ワークステーションの認証済み `gh` CLI を通じて GitHub を読み取ります。したがって、リポジトリの Auto-merge 設定や PR/check state について、設定 mutation の直後に Connector の projection に頼るのではなく、明示的な `source=local_gh_api`、`fresh=true`、`cache_policy=bypass_connector_cache` の境界を提供します。project root は Herdr が管理する live な Git root でなければならず、その `origin` は `github.com` 上にある必要があります。
 
-`pr_number` が指定された場合、結果には PR state、merge state、Auto-merge request、required checks、および外部デプロイなどの補足的な status が含まれます。すべての応答は決定論的な state `fingerprint` を持ちます。PR を監視している間はその値を `previous_fingerprint` として返してください。関連する変更がなければ、次の呼び出しは完全な status テーブルを再送するのではなく、簡潔な summary カウントと `changed=false` だけを返します。これは、端末スナップショットで未変更の job 出力を繰り返し重複させる `gh run watch` の代わりに推奨される planner の経路です。
+`pr_number` が指定された場合、結果には PR state、merge state、Auto-merge request、required checks、および外部デプロイなどの補足的な status が含まれます。すべての応答は決定論的な state `fingerprint` を持ちます。PR を監視している間はその値を `previous_fingerprint` として返してください。関連する変更がなければ、次の呼び出しは完全な status テーブルを再送するのではなく、簡潔な summary カウントと `changed=false` だけを返します。実行中の CI を監視する場合は `previous_fingerprint` と一緒に `wait_ms: 20000` を渡します。ワークステーション側で有界待機した後、同じ呼び出しの中で GitHub を一度だけ再確認します。変化があれば新しい状態を返し、変化がなければ `wait_timeout=true` を伴う簡潔な `changed=false` を返します。20 秒の上限は Edge の通常の request deadline と GitHub probe のための余裕を残し、planner 側の sleep + status の往復や `gh run watch` を避けます。
 
 ## Connector と Automation の資格情報
 

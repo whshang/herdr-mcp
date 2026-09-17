@@ -18,6 +18,10 @@ const GH_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_COMMAND_BYTES: usize = 256 * 1024;
 const MAX_STDERR_BYTES: usize = 2048;
 const MAX_CHECK_PAGES: usize = 32;
+// Edge's default tool-request deadline is 30s. Keep the local deferred refresh
+// well below it so one fresh PR probe still has headroom for the two bounded
+// `gh` commands plus transport overhead.
+const MAX_WAIT_MS: u64 = 20_000;
 
 const PR_STATUS_META_QUERY: &str = r#"
 query($owner:String!,$name:String!,$number:Int!){
@@ -76,6 +80,7 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
         "repository",
         "pr_number",
         "previous_fingerprint",
+        "wait_ms",
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -118,6 +123,16 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
             _ => return invalid_params("previous_fingerprint must be a non-empty string"),
         },
     };
+    let wait_ms = match object.get("wait_ms") {
+        None | Some(Value::Null) => 0,
+        Some(value) => match value.as_u64() {
+            Some(ms) if (1..=MAX_WAIT_MS).contains(&ms) => ms,
+            _ => return invalid_params("wait_ms must be an integer between 1 and 20000"),
+        },
+    };
+    if wait_ms > 0 && previous_fingerprint.is_none() {
+        return invalid_params("wait_ms requires previous_fingerprint");
+    }
     let explicit_repository = match object.get("repository") {
         None | Some(Value::Null) => None,
         Some(value) => match value.as_str().and_then(parse_repository_name) {
@@ -155,16 +170,31 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
     } else {
         root.clone()
     };
-    let (repository_json, pr_json, all_checks, required_checks) = if let Some(number) = pr_number {
-        let (repository_json, pr_json, pr_id) =
-            match fetch_pr_metadata(&gh, &gh_root, &repository, number) {
-                Ok(value) => value,
-                Err(error) => return error,
-            };
-        let (all_checks, required_checks) = match fetch_pr_checks(&gh, &gh_root, &pr_id, &pr_json) {
+    let mut probe =
+        || fetch_status_once(&gh, &gh_root, &repository, pr_number, previous_fingerprint);
+    if wait_ms == 0 {
+        return match probe() {
             Ok(value) => value,
-            Err(error) => return error,
+            Err(error) => error,
         };
+    }
+    wait_for_change(
+        Duration::from_millis(wait_ms),
+        &mut probe,
+        std::thread::sleep,
+    )
+}
+
+fn fetch_status_once(
+    gh: &Path,
+    gh_root: &Path,
+    repository: &str,
+    pr_number: Option<u64>,
+    previous_fingerprint: Option<&str>,
+) -> Result<Value, Value> {
+    let (repository_json, pr_json, all_checks, required_checks) = if let Some(number) = pr_number {
+        let (repository_json, pr_json, pr_id) = fetch_pr_metadata(gh, gh_root, repository, number)?;
+        let (all_checks, required_checks) = fetch_pr_checks(gh, gh_root, &pr_id, &pr_json)?;
         (
             repository_json,
             Some(pr_json),
@@ -173,21 +203,41 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
         )
     } else {
         let repo_api_path = format!("repos/{repository}");
-        let repository_json = match run_gh_json(&gh, &gh_root, &["api", &repo_api_path]) {
-            Ok(value) => value,
-            Err(error) => return error,
-        };
+        let repository_json = run_gh_json(gh, gh_root, &["api", &repo_api_path])?;
         (repository_json, None, None, None)
     };
 
-    render_status(
-        &repository,
+    Ok(render_status(
+        repository,
         &repository_json,
         pr_json.as_ref(),
         all_checks.as_ref(),
         required_checks.as_ref(),
         previous_fingerprint,
-    )
+    ))
+}
+
+fn wait_for_change<F, S>(wait: Duration, probe: &mut F, mut sleep: S) -> Value
+where
+    F: FnMut() -> Result<Value, Value>,
+    S: FnMut(Duration),
+{
+    sleep(wait);
+    let mut result = match probe() {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let changed = result.get("changed").and_then(Value::as_bool) == Some(true);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("waited_ms".to_owned(), json!(duration_ms(wait)));
+        object.insert("polls".to_owned(), json!(1));
+        object.insert("wait_timeout".to_owned(), json!(!changed));
+    }
+    result
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn managed_project_root(snapshot: &Value, root_raw: &str) -> Result<PathBuf, Value> {
@@ -1028,6 +1078,86 @@ mod tests {
         assert!(second.get("checks").is_none());
         assert_eq!(second["summary"]["required"]["pass"], 1);
         assert_eq!(second["summary"]["all"]["pending"], 1);
+    }
+
+    #[test]
+    fn wait_ms_requires_a_prior_fingerprint_and_stays_bounded() {
+        let root = temp_repo();
+        let snapshot = json!({
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy(),
+            }],
+            "agents": []
+        });
+
+        let missing = status(
+            &json!({
+                "project_root": root.to_string_lossy(),
+                "repository": "o/r",
+                "wait_ms": 1000,
+            }),
+            &snapshot,
+        );
+        assert_eq!(missing["code"], "invalid_params");
+        assert_eq!(missing["message"], "wait_ms requires previous_fingerprint");
+
+        let oversized = status(
+            &json!({
+                "project_root": root.to_string_lossy(),
+                "repository": "o/r",
+                "previous_fingerprint": "sha256:old",
+                "wait_ms": MAX_WAIT_MS + 1,
+            }),
+            &snapshot,
+        );
+        assert_eq!(oversized["code"], "invalid_params");
+        assert_eq!(
+            oversized["message"],
+            "wait_ms must be an integer between 1 and 20000"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wait_for_change_returns_changed_after_one_deferred_probe() {
+        let mut sleeps = Vec::new();
+        let mut calls = 0_u64;
+        let mut probe = || {
+            calls += 1;
+            Ok(json!({"ok": true, "changed": true, "fingerprint": "sha256:new"}))
+        };
+        let result = wait_for_change(Duration::from_secs(20), &mut probe, |duration| {
+            sleeps.push(duration)
+        });
+
+        assert_eq!(calls, 1);
+        assert_eq!(sleeps, vec![Duration::from_secs(20)]);
+        assert_eq!(result["changed"], true);
+        assert_eq!(result["waited_ms"], 20_000);
+        assert_eq!(result["polls"], 1);
+        assert_eq!(result["wait_timeout"], false);
+    }
+
+    #[test]
+    fn wait_for_change_times_out_with_one_bounded_probe() {
+        let mut sleeps = Vec::new();
+        let mut calls = 0_u64;
+        let mut probe = || {
+            calls += 1;
+            Ok(json!({"ok": true, "changed": false, "fingerprint": "sha256:same"}))
+        };
+        let result = wait_for_change(Duration::from_secs(20), &mut probe, |duration| {
+            sleeps.push(duration)
+        });
+
+        assert_eq!(calls, 1);
+        assert_eq!(sleeps, vec![Duration::from_secs(20)]);
+        assert_eq!(result["changed"], false);
+        assert_eq!(result["waited_ms"], 20_000);
+        assert_eq!(result["polls"], 1);
+        assert_eq!(result["wait_timeout"], true);
     }
 
     #[test]

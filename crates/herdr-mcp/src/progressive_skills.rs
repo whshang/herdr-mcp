@@ -118,6 +118,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "repository": {"type": "string"},
                     "pr_number": {"type": "integer", "minimum": 1},
                     "previous_fingerprint": {"type": "string"},
+                    "wait_ms": {"type": "integer", "minimum": 1, "maximum": 20000},
                 },
                 "required": ["project_root"],
                 "empty": false,
@@ -1045,7 +1046,8 @@ impl ProgressiveSkillService {
                 "params": {
                     "project_root": "required managed git project/worktree root",
                     "pr_number": "optional positive integer; omit for repository Auto-merge state only",
-                    "previous_fingerprint": "optional fingerprint from the prior call; unchanged state returns a compact changed=false response"
+                    "previous_fingerprint": "optional fingerprint from the prior call; unchanged state returns a compact changed=false response",
+                    "wait_ms": "optional 1..20000; requires previous_fingerprint and combines planner waiting plus one fresh GitHub status probe into a single bounded call"
                 }
             },
             "cleanup_preview": {
@@ -1075,6 +1077,7 @@ impl ProgressiveSkillService {
                     "when deterministic shell/Git arguments are already known and share one safety boundary, execute them in one bounded herdr_exec and perform intermediate local checks inside that call instead of returning to the model after every command",
                     "load multiple required Skill ids in one herdr_mcp.skill.load call and keep unchanged Skill content sticky",
                     "reuse github.status previous_fingerprint and exec_read next_offset; unchanged state and already-read output are not fetched again",
+                    "for active GitHub CI monitoring, prefer github.status with previous_fingerprint plus wait_ms=20000 over a separate planner sleep followed by a status call or gh run watch; after the bounded local wait it performs one fresh probe and unchanged state returns compact changed=false",
                     "prefer summary private methods such as cleanup.preview over rebuilding the same view with many MCP calls",
                     "start long work once and read only deltas when completion or actionable progress could plausibly have changed; do not poll idle state or emit planner heartbeats",
                     "re-plan only when a result changes later arguments or safety, a human action is required, or mutation delivery is uncertain",
@@ -2479,6 +2482,10 @@ mod tests {
         assert_eq!(
             methods[0]["params"]["properties"]["repository"]["type"],
             "string"
+        );
+        assert_eq!(
+            methods[0]["params"]["properties"]["wait_ms"]["maximum"],
+            20_000
         );
 
         let methods = local_method_schemas("exec.wait");
