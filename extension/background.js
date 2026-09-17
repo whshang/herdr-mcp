@@ -2682,7 +2682,7 @@ async function sendHandoffTabMessage(tabId, site, message) {
 // once enough historical bindings exist. The server already includes the
 // workspace id in agent events and an all-workspace snapshot in hello, so a
 // single unfiltered stream is sufficient; fan-out happens in this worker.
-let pushStream = null; // { ctrl }
+let pushStream = null; // { ctrl, bootId }
 let pushDispatch = Promise.resolve();
 const pendingOutputByPane = new Map(); // `${storeKey}::${pane}` -> output
 let pushWorkspaceCatalog = [];
@@ -2782,6 +2782,15 @@ function stopPushStream() {
   if (stream) { try { stream.ctrl.abort(); } catch {} }
 }
 
+function reconcilePushStreamRuntime(state) {
+  const currentBootId = String(state?.boot_id || "").trim();
+  const streamBootId = String(pushStream?.bootId || "").trim();
+  if (!pushStream || !currentBootId || !streamBootId || currentBootId === streamBootId) return false;
+  callLog(`push stream runtime changed ${streamBootId} -> ${currentBootId}; forcing reconnect`);
+  stopPushStream();
+  return true;
+}
+
 async function ensurePushStream(bindings) {
   await configReady;
   // Keep exactly one extension-wide observation stream even when automatic
@@ -2789,7 +2798,7 @@ async function ensurePushStream(bindings) {
   // HUD and popup stay observable regardless of the global/Project automation policy.
   if (pushStream) return;
   const ctrl = new AbortController();
-  pushStream = { ctrl };
+  pushStream = { ctrl, bootId: null };
   void runPushStream(ctrl);
 }
 
@@ -2822,7 +2831,7 @@ async function runPushStream(ctrl) {
           const block = buf.slice(0, idx);
           buf = buf.slice(idx + 2);
           pushDispatch = pushDispatch
-            .then(() => handlePushBlock(block))
+            .then(() => handlePushBlock(block, ctrl))
             .catch((e) => callLog("push dispatch failed:", e?.message || String(e)));
         }
       };
@@ -3593,7 +3602,7 @@ async function handleBrowserActuation(command) {
   }
 }
 
-async function handlePushBlock(block) {
+async function handlePushBlock(block, streamCtrl = null) {
   let event = null, data = null;
   for (const line of block.split("\n")) {
     if (line.startsWith("event:")) event = line.slice(6).trim();
@@ -3605,6 +3614,9 @@ async function handlePushBlock(block) {
     return;
   }
   if (event === "hello") {
+    if (pushStream?.ctrl === streamCtrl) {
+      pushStream.bootId = String(data.boot_id || "").trim() || null;
+    }
     // A reconnect is the reconciliation boundary for the Control Center.
     // Fetch exactly one authoritative snapshot; steady-state changes remain
     // incremental through the shared event stream below.
@@ -6612,7 +6624,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         );
       }
       // Opening a browser control surface wakes the service worker; restore streams and timers lost to suspension.
-      void ensureAlive(bindings);
+      void ensureAlive(bindings, authoritativeState);
       let convInfo = null;
       if (msg.tabId) {
         convInfo = await conversationInfoForTab(msg.tabId);
@@ -6727,7 +6739,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     void (async () => {
       // Workspace discovery must prefer a fresh state read. The push hello cache
       // is an optimization for HUD rendering, not the authority for discovery.
-      sendResponse(await fetchStateFresh() || { error: "fetch-failed" });
+      const state = await fetchStateFresh() || { error: "fetch-failed" };
+      await ensureAlive(undefined, state);
+      sendResponse(state);
     })();
     return true;
   }
@@ -7257,12 +7271,16 @@ async function rebuildStreams() {
 
 // After service-worker suspension, restore missing in-memory streams and timers
 // from storage without aborting live streams or resetting existing clocks.
-async function ensureAlive(preloaded) {
+async function ensureAlive(preloaded, runtimeState = null) {
   await configReady;
   if (!(await extensionOwnerAllowsControl())) {
     stopPushStream();
     reconcileProgressTimers({});
     return;
+  }
+  if (pushStream) {
+    const currentState = runtimeState?.ok === true ? runtimeState : await fetchStateFresh();
+    reconcilePushStreamRuntime(currentState);
   }
   // Endpoint bootstrap can legitimately fail when the extension starts before
   // a runtime that exposes Browser Registry is active. Reuse the existing
