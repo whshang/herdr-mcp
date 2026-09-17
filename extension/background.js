@@ -2949,6 +2949,7 @@ async function closeArchivedChatGptTabAfterProjectHome({
     return { closed: false, reason: "already_in_flight" };
   }
   archiveTabCloseInFlight.add(closeKey);
+  let projectHomeRecoveryAttempted = false;
   try {
     const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
     do {
@@ -2990,6 +2991,30 @@ async function closeArchivedChatGptTabAfterProjectHome({
         }
         browserTabScopes.delete(tabId);
         return { closed: true, reason: "archived_project_home" };
+      }
+      let atChatGptRoot = false;
+      try {
+        const current = new URL(String(tab?.url || ""));
+        atChatGptRoot = current.origin === "https://chatgpt.com"
+          && current.pathname === "/"
+          && !current.search
+          && !current.hash;
+      } catch (_) {}
+      if (!projectHomeRecoveryAttempted && atChatGptRoot) {
+        // ChatGPT currently redirects a successfully archived Project chat to
+        // the account root instead of the originating Project home. Restore
+        // only this exact, proven-safe post-archive state, then keep the
+        // existing rule that the tab closes only after the same Project home
+        // is observed. Unknown routes still fail closed.
+        projectHomeRecoveryAttempted = true;
+        try {
+          await chrome.tabs.update(tabId, {
+            url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
+          });
+          continue;
+        } catch (_) {
+          return { closed: false, reason: "project_home_restore_failed" };
+        }
       }
       if (Date.now() >= deadline) break;
       await new Promise((resolve) => setTimeout(resolve, Math.max(1, Number(pollMs) || 1)));
@@ -3089,24 +3114,47 @@ async function resolveBrowserCreateAnchorWindow({
 } = {}) {
   if (sourceSessionRef) {
     let target = browserSessionTargets.get(sourceSessionRef) || null;
-    if (!target
-        || target.provider !== provider
-        || target.observationGeneration !== expectedGeneration) {
+    let sourceTab = null;
+    if (target
+        && target.provider === provider
+        && target.observationGeneration === expectedGeneration
+        && target.conversationId) {
+      try {
+        const candidate = await chrome.tabs.get(target.tabId);
+        if (String(candidate?.url || "").includes(`/c/${target.conversationId}`)) {
+          sourceTab = candidate;
+        } else {
+          target = null;
+        }
+      } catch (_) {
+        target = null;
+      }
+    } else {
+      target = null;
+    }
+    if (!target) {
       const recovered = await recoverBrowserSessionTarget(sourceSessionRef, expectedGeneration);
       if (recovered.ambiguous || !recovered.target) {
         return { windowId: null, unavailable: true, reason: "source_session_unavailable" };
       }
       target = recovered.target;
+      try {
+        const candidate = await chrome.tabs.get(target.tabId);
+        if (!target.conversationId
+            || !String(candidate?.url || "").includes(`/c/${target.conversationId}`)) {
+          return { windowId: null, unavailable: true, reason: "source_session_route_mismatch" };
+        }
+        sourceTab = candidate;
+      } catch (_) {
+        return { windowId: null, unavailable: true, reason: "source_session_tab_unavailable" };
+      }
     }
     if (target.provider !== provider || target.observationGeneration !== expectedGeneration) {
       return { windowId: null, unavailable: true, reason: "source_session_scope_mismatch" };
     }
-    try {
-      const sourceTab = await chrome.tabs.get(target.tabId);
-      if (Number.isInteger(sourceTab?.windowId)) {
-        return { windowId: sourceTab.windowId, unavailable: false, reason: "source_session" };
-      }
-    } catch (_) {}
+    if (Number.isInteger(sourceTab?.windowId)) {
+      return { windowId: sourceTab.windowId, unavailable: false, reason: "source_session" };
+    }
     return { windowId: null, unavailable: true, reason: "source_session_tab_unavailable" };
   }
 

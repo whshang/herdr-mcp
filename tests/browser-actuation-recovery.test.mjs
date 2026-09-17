@@ -131,6 +131,7 @@ function archiveCleanupHarness({
   const tabId = 41;
   const tabs = new Map([[tabId, { id: tabId, url: tabUrl }]]);
   const removeCalls = [];
+  const updateCalls = [];
   const chrome = {
     tabs: {
       async get(id) {
@@ -141,6 +142,13 @@ function archiveCleanupHarness({
       async remove(id) {
         removeCalls.push(id);
         tabs.delete(id);
+      },
+      async update(id, update) {
+        updateCalls.push({ id, update: { ...update } });
+        const tab = tabs.get(id);
+        if (!tab) throw new Error(`tab ${id} missing`);
+        tabs.set(id, { ...tab, ...update });
+        return { ...tabs.get(id) };
       },
     },
   };
@@ -175,6 +183,7 @@ function archiveCleanupHarness({
     projectId,
     tabs,
     removeCalls,
+    updateCalls,
     browserSessionTargets,
     browserTabScopes,
   };
@@ -288,8 +297,8 @@ test("ChatGPT session.create anchors to the exact source session window across m
   const sourceSessionRef = "br_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const harness = createAnchorHarness({
     tabs: [
-      { id: 71, windowId: 11 },
-      { id: 72, windowId: 22 },
+      { id: 71, windowId: 11, url: "https://chatgpt.com/c/other-conv" },
+      { id: 72, windowId: 22, url: "https://chatgpt.com/c/source-conv" },
     ],
     scopes: [
       [71, { provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space", observationGeneration: 17 }],
@@ -298,6 +307,7 @@ test("ChatGPT session.create anchors to the exact source session window across m
     targets: [[sourceSessionRef, {
       provider: "chatgpt",
       tabId: 72,
+      conversationId: "source-conv",
       observationGeneration: 17,
     }]],
   });
@@ -310,6 +320,41 @@ test("ChatGPT session.create anchors to the exact source session window across m
   });
   assert.deepEqual(result, { windowId: 22, unavailable: false, reason: "source_session" });
   assert.deepEqual(harness.recoverCalls, []);
+});
+
+test("ChatGPT session.create recovers instead of trusting a stale cached source tab route", async () => {
+  const sourceSessionRef = "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const harness = createAnchorHarness({
+    tabs: [
+      { id: 71, windowId: 11, url: "https://chatgpt.com/c/source-conv" },
+      { id: 72, windowId: 22, url: "https://chatgpt.com/g/g-p-project/project" },
+    ],
+    targets: [[sourceSessionRef, {
+      provider: "chatgpt",
+      tabId: 72,
+      conversationId: "source-conv",
+      observationGeneration: 17,
+    }]],
+    recovered: {
+      target: {
+        provider: "chatgpt",
+        tabId: 71,
+        conversationId: "source-conv",
+        observationGeneration: 17,
+      },
+      observedGeneration: 17,
+      ambiguous: false,
+    },
+  });
+  const result = await harness.resolve({
+    provider: "chatgpt",
+    accountRef: "br_account",
+    spaceRef: "br_space",
+    expectedGeneration: 17,
+    sourceSessionRef,
+  });
+  assert.deepEqual(result, { windowId: 11, unavailable: false, reason: "source_session" });
+  assert.deepEqual(harness.recoverCalls, [{ sessionRef: sourceSessionRef, expectedGeneration: 17 }]);
 });
 
 test("ChatGPT session.create without source affinity fails closed across matching windows", async () => {
@@ -422,6 +467,26 @@ test("archive cleanup keeps the tab when archive is uncertain or the exact Proje
   });
   assert.deepEqual(wrongProject, { closed: false, reason: "wrong_project" });
   assert.deepEqual(wrongProjectHarness.removeCalls, []);
+});
+
+test("archive cleanup restores a proven archived Project tab from ChatGPT root before closing", async () => {
+  const harness = archiveCleanupHarness({
+    tabUrl: "https://chatgpt.com/",
+  });
+  const result = await harness.closeArchivedChatGptTabAfterProjectHome({
+    tabId: harness.tabId,
+    sessionRef: harness.sessionRef,
+    expectedGeneration: harness.generation,
+    projectId: harness.projectId,
+    timeoutMs: 0,
+  });
+  assert.deepEqual(harness.updateCalls, [{
+    id: harness.tabId,
+    update: { url: `https://chatgpt.com/g/${harness.projectId}` },
+  }]);
+  assert.deepEqual(result, { closed: true, reason: "archived_project_home" });
+  assert.deepEqual(harness.removeCalls, [harness.tabId]);
+  assert.equal(harness.tabs.has(harness.tabId), false);
 });
 
 test("archive cleanup is exact-generation fenced and duplicate close attempts are idempotent", async () => {
@@ -569,6 +634,8 @@ test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and
   const ackStart = wakeSource.indexOf("function submitWasAccepted(baseline) {");
   const ackEnd = wakeSource.indexOf("async function waitForSubmitAck", ackStart);
   const ackSegment = wakeSource.slice(ackStart, ackEnd);
+  assert.match(ackSegment, /ADAPTER\.name !== "chatgpt"\) return !ADAPTER\.inputHasContent\(\)/);
+  assert.doesNotMatch(ackSegment, /if \(!ADAPTER\.inputHasContent\(\)\) return true/);
   assert.match(ackSegment, /location\.href !== baseline\.href/);
   assert.doesNotMatch(ackSegment, /baseline\?\.generating|isComposerGenerating\(\)/);
   assert.doesNotMatch(ackSegment, /sendButton\.isConnected|isSendButton\(baseline\.sendButton\)/);
