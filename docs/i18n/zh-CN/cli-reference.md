@@ -136,7 +136,7 @@ herdr_call(
 
 该方法每次都直接使用 workstation 已登录的 `gh` CLI 读取 GitHub，因此会显式返回 `source=local_gh_api`、`fresh=true` 和 `cache_policy=bypass_connector_cache`。在刚修改仓库 Auto-merge 等设置之后，planner 不必依赖可能仍有缓存延迟的 Connector 投影。`project_root` 必须是当前 Herdr live snapshot 里的受管 Git root，且 `origin` 必须位于 `github.com`。
 
-传入 `pr_number` 后会返回 PR state、merge state、Auto-merge request、required checks，以及 Deno Deploy 等 supplemental status。每次结果都有确定性的 `fingerprint`；继续监控时把它作为 `previous_fingerprint` 传回，如果状态没有变化，下一次只返回精简 summary 和 `changed=false`，不会重新输出整张检查表。因此 planner 应优先使用该方法，而不是会反复打印完整 job snapshot 的 `gh run watch`。
+传入 `pr_number` 后会返回 PR state、merge state、Auto-merge request、required checks，以及 Deno Deploy 等 supplemental status。每次结果都有确定性的 `fingerprint`；继续监控时把它作为 `previous_fingerprint` 传回，如果状态没有变化，下一次只返回精简 summary 和 `changed=false`，不会重新输出整张检查表。监控正在运行的 CI 时，同时传入 `wait_ms: 20000`：工作站在本机完成这段有界等待，再在同一次调用里执行一次新的 GitHub 状态探测。状态变化时返回完整新状态；没有变化时返回精简的 `changed=false` 并标记 `wait_timeout=true`。20 秒上限为 Edge 的正常请求 deadline 和 GitHub 探测保留余量，也省掉 planner 单独 sleep 再查状态的一次往返。
 
 ## Connector 与 Automation 凭据
 
