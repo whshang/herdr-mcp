@@ -3,6 +3,7 @@ use crate::capability_inventory::{AgentCapabilityRecord, CapabilityInventoryStor
 use crate::capability_probe::{binary_identity, version_probe};
 use crate::capability_resolver::{WorkerCapability, project_capabilities_with_inventory};
 use crate::herdr::HerdrClient;
+use crate::herdr_native;
 use crate::paths::RuntimePaths;
 use crate::projects::{self, ProjectInfo, ProjectTopology};
 use crate::snapshot::{self, SnapshotSource};
@@ -59,6 +60,7 @@ pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Val
             (inventory, scanned)
         })
         .unwrap_or_default();
+    let cli_probe = herdr_native::probe_cli();
     project_snapshot(
         &snapshot_result.value,
         &pong,
@@ -66,6 +68,7 @@ pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Val
         &visibility,
         &inventory,
         inventory_scanned,
+        &cli_probe,
     )
 }
 
@@ -106,6 +109,7 @@ fn project_snapshot(
     visibility: &AgentVisibility,
     inventory: &[AgentCapabilityRecord],
     inventory_scanned: bool,
+    cli_probe: &herdr_native::HerdrCliProbe,
 ) -> Value {
     let topology = projects::derive(snapshot);
     let agents_raw = array(snapshot, "agents");
@@ -151,6 +155,7 @@ fn project_snapshot(
         .map(|agent| project_agent(agent, &capability_by_pane))
         .collect::<Vec<_>>();
     let panes = visibility.redact_panes(panes);
+    let pane_count = panes.len();
     let (agents, hidden_agents) = visibility.filter_agents(agents);
 
     let mut output = Map::new();
@@ -173,6 +178,18 @@ fn project_snapshot(
     output.insert(
         "herdr_version".to_owned(),
         pong.get("version").cloned().unwrap_or(Value::Null),
+    );
+    output.insert(
+        "herdr_server_version".to_owned(),
+        pong.get("version").cloned().unwrap_or(Value::Null),
+    );
+    output.insert(
+        "herdr_native".to_owned(),
+        herdr_native::project_runtime(
+            cli_probe,
+            pong.get("version").and_then(Value::as_str),
+            pane_count,
+        ),
     );
     output.insert(
         "protocol".to_owned(),
@@ -571,6 +588,17 @@ mod tests {
             &visibility,
             &[],
             false,
+            &herdr_native::HerdrCliProbe {
+                cli_version: Some("herdr 0.9.1".to_owned()),
+                machine_forwarding: Some(true),
+                saved_machine_count: Some(1),
+                saved_machines: Some(vec![json!({
+                    "id": "machine-1",
+                    "label": "r5c",
+                    "session": "default",
+                    "enabled": true
+                })]),
+            },
         );
 
         assert_eq!(output["ok"], true);
@@ -593,6 +621,14 @@ mod tests {
         assert_eq!(output["agents"][0]["status"], "working");
         assert_eq!(output["agents"][0]["session_ref"]["source"], "herdr:pi");
         assert_eq!(output["herdr_version"], "0.9.0");
+        assert_eq!(output["herdr_server_version"], "0.9.0");
+        assert_eq!(output["herdr_native"]["cli_version"], "herdr 0.9.1");
+        assert_eq!(
+            output["herdr_native"]["version_state"],
+            "server_restart_pending"
+        );
+        assert_eq!(output["herdr_native"]["machine_forwarding"], true);
+        assert_eq!(output["herdr_native"]["saved_machine_count"], 1);
         assert_eq!(output["protocol"], 22);
         assert_eq!(output["endpoint_protocol_generation"], 1);
         assert_eq!(output["herdr_capabilities"]["surface_interest"], true);
@@ -627,6 +663,7 @@ mod tests {
             &visibility,
             &[],
             false,
+            &herdr_native::HerdrCliProbe::default(),
         );
         assert_eq!(output["agents"][0]["name"], "w1:p1");
         assert_eq!(output["agents"][0]["agent_id"], "w1:p1");
@@ -743,6 +780,7 @@ mod tests {
             &visibility,
             &[scanned_record("pi"), scanned_record("claude")],
             true,
+            &herdr_native::HerdrCliProbe::default(),
         );
         assert_eq!(output["agents"].as_array().unwrap().len(), 1);
         assert_eq!(output["agents_hidden"], 1);
@@ -785,6 +823,7 @@ mod tests {
             &visibility,
             &[],
             false,
+            &herdr_native::HerdrCliProbe::default(),
         );
         assert_eq!(
             output["warnings"],
@@ -801,6 +840,7 @@ mod tests {
             &AgentVisibility::All,
             &[],
             true,
+            &herdr_native::HerdrCliProbe::default(),
         );
         assert_eq!(output["capability_inventory"]["source"], "scan_cache");
         assert_eq!(output["capability_inventory"]["needs_scan"], false);

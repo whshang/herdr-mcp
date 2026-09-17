@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::herdr::HerdrClient;
+use crate::herdr_native;
 use crate::herdr_supervisor;
 use crate::macos_privacy;
 use crate::native_host_install;
@@ -94,6 +95,17 @@ fn collect(paths: &RuntimePaths, config: &Config) -> StatusReport {
 
 pub fn print_status(paths: &RuntimePaths, config: &Config) {
     let report = collect(paths, config);
+    let cli_probe = herdr_native::probe_cli();
+    let server_version = paths
+        .herdr_socket
+        .as_ref()
+        .and_then(|socket| HerdrClient::new(socket).ping().ok())
+        .and_then(|pong| {
+            pong.get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let native_runtime = herdr_native::project_runtime(&cli_probe, server_version.as_deref(), 0);
     println!("Herdr MCP {}", crate::runtime_meta::runtime_version());
     println!(
         "runtime channel: {}",
@@ -120,6 +132,25 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
         } else {
             "unreachable"
         }
+    );
+    println!(
+        "herdr native: cli={} server={} state={} machine_forwarding={} saved_machines={}",
+        native_runtime["cli_version"].as_str().unwrap_or("unknown"),
+        native_runtime["server_version"]
+            .as_str()
+            .unwrap_or("unknown"),
+        native_runtime["version_state"]
+            .as_str()
+            .unwrap_or("unknown"),
+        native_runtime["machine_forwarding"]
+            .as_bool()
+            .map(|value| if value { "true" } else { "false" })
+            .unwrap_or("unknown"),
+        native_runtime["saved_machine_count"]
+            .as_u64()
+            .map(|value| value.to_string())
+            .as_deref()
+            .unwrap_or("unknown")
     );
     println!(
         "tcc broker: {}",
@@ -176,6 +207,23 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         .map(|socket| native_tools::inspect(&HerdrClient::new(socket), None, None))
         .unwrap_or_else(|| json!({"ok": false}));
     let inspect_healthy = inspect_result["ok"].as_bool() == Some(true);
+    let cli_probe = herdr_native::probe_cli();
+    let server_version = paths
+        .herdr_socket
+        .as_ref()
+        .and_then(|socket| HerdrClient::new(socket).ping().ok())
+        .and_then(|pong| {
+            pong.get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let pane_count = snapshot_result
+        .as_ref()
+        .ok()
+        .map(|snapshot| snapshot::collection_count(&snapshot.value, "panes"))
+        .unwrap_or_default();
+    let native_runtime =
+        herdr_native::project_runtime(&cli_probe, server_version.as_deref(), pane_count);
     let event_cache = probe_event_cache(paths);
     let documents_permission = macos_privacy::probe_documents_permission(&paths.config_dir);
     let code_identity = macos_privacy::probe_code_identity();
@@ -218,6 +266,28 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     println!("{}", crate::tcc_broker::doctor_line(&paths.config_dir));
     println!("{}", code_identity.doctor_line());
     println!("{}", herdr_supervisor::doctor_line());
+    println!(
+        "LAYER herdr-native cli={} server={} state={} machine_forwarding={} saved_machines={} handoff_blocked_reason={}",
+        native_runtime["cli_version"].as_str().unwrap_or("unknown"),
+        native_runtime["server_version"]
+            .as_str()
+            .unwrap_or("unknown"),
+        native_runtime["version_state"]
+            .as_str()
+            .unwrap_or("unknown"),
+        native_runtime["machine_forwarding"]
+            .as_bool()
+            .map(|value| if value { "true" } else { "false" })
+            .unwrap_or("unknown"),
+        native_runtime["saved_machine_count"]
+            .as_u64()
+            .map(|value| value.to_string())
+            .as_deref()
+            .unwrap_or("unknown"),
+        native_runtime["handoff_blocked_reason"]
+            .as_str()
+            .unwrap_or("none")
+    );
     println!("{}", crate::child_process::doctor_line());
     println!("{}", standalone_browser.doctor_line());
     print_check("local agent Skill", local_agent_skill.0);
@@ -258,6 +328,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
             "oauth_metadata": remote.oauth_state.as_str(),
             "mcp_surface": remote.mcp_surface_state.as_str(),
             "standalone_extension": standalone_browser.as_json(),
+            "herdr_native": native_runtime,
             "overall": readiness.as_str(),
         })
     );

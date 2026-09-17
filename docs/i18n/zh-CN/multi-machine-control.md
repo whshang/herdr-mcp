@@ -61,6 +61,19 @@ herdr --machine <label-or-id> agent list
 
 upstream 多机器 Ideas 主线程是 [Discussion #515](https://github.com/herdrdev/herdr/discussions/515)。saved-machine profile 仍属于 SSH/Herdr 身份；原生 `--machine` forwarding 不会把它与 Herdr-MCP Edge `device_id` 身份合并。
 
+## 恢复前先区分 client/server 版本状态
+
+Herdr-MCP 1.0 在 `herdr_inspect` 中提供结构化 `herdr_native` 投影，不再把一个版本号当作整个 Herdr 依赖状态：
+
+- `cli_version`：Herdr-MCP 实际找到的本机 Herdr CLI 版本；
+- `server_version`：当前运行中的 Herdr server 通过 live ping 返回的版本；
+- `machine_forwarding`：已安装 CLI 是否真实暴露原生 `--machine` API forwarding；
+- `saved_machine_count` / `saved_machines`：有界的本机 saved profile 清单，不包含 SSH credential 或 target；
+- `version_state`：`current`、`server_restart_pending`、`version_mismatch` 或 `unknown`；
+- `handoff_blocked_reason=legacy_sender_pane_limit`：本机 CLI 已升级，但旧 server 仍拥有超过 64 个 pane，第一次 live handoff 不能安全完成。
+
+`server_restart_pending` 不是 service failure，也不授权自动停止 Herdr。兼容的旧 server 可以继续保留现有终端，而新 CLI 已经安装。必须保留用户和其他任务的 pane，只在安全的 handoff/restart 窗口完成收敛。
+
 ## ChatGPT 应该走哪条路径
 
 如果 workstation 已经 enroll 为 Edge device，ChatGPT/Web-AI 默认走 Edge。Edge 提供 immutable device identity、generation fence、reconnect state 和 mutation delivery evidence。
@@ -69,6 +82,8 @@ saved-machine/SSH 路径用于明确的维护、首次 bootstrap、Debian/Linux 
 
 - `delivery_state=not_delivered`：在重新验证连接和实时状态后，可以通过明确选择的路径安全重发；
 - `delivery_unknown`、delivered/uncertain 或缺少 delivery evidence：先检查实时 pane/Git/runtime/resource 状态，禁止盲目重放 mutation。
+
+恢复时保持显式 transport 顺序：Edge 健康时继续使用 Edge → 只有在确认未投递或实时状态证明 mutation 未应用、且目标 Herdr server 可达时，才使用原生 `herdr --machine` → 只有目标 Herdr server 或 forwarding 路径本身需要 bootstrap/修复时才退到 raw SSH。禁止根据 label/hostname 推导 Edge `device_id`；两套身份之间的对应关系必须由独立的实时证据确认。
 
 Herdr TUI 当前选择哪台 machine，不会改变 Edge call 的目标。Edge call 始终绑定显式/默认的 Herdr-MCP device，以及返回的 `herdr_ref_*` affinity。
 

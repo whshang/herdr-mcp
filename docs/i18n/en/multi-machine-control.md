@@ -61,6 +61,19 @@ Do not assume ids obtained from the local server are valid remotely. For a pre-0
 
 The upstream multi-machine Ideas thread is [Discussion #515](https://github.com/herdrdev/herdr/discussions/515). The saved-machine profile remains an SSH/Herdr identity; native `--machine` forwarding does not merge it with the Herdr-MCP Edge `device_id` namespace.
 
+## Inspect client/server divergence before recovery
+
+Herdr-MCP 1.0 exposes a structured `herdr_native` projection in `herdr_inspect` instead of treating one version string as the whole dependency state:
+
+- `cli_version`: the installed local Herdr client found by Herdr-MCP;
+- `server_version`: the running Herdr server version returned by its live ping;
+- `machine_forwarding`: whether the installed CLI actually advertises native `--machine` API forwarding;
+- `saved_machine_count` / `saved_machines`: bounded local saved-profile inventory without SSH credentials or targets;
+- `version_state`: `current`, `server_restart_pending`, `version_mismatch`, or `unknown`;
+- `handoff_blocked_reason=legacy_sender_pane_limit`: the installed client is new enough, but an older running sender still has more than 64 panes and cannot perform the first live handoff safely.
+
+`server_restart_pending` is not a service failure and is not permission to stop Herdr. A compatible old server may keep existing terminals alive while the new client is already installed. Preserve user/other-task panes and converge only through a safe handoff/restart window.
+
 ## Which path should ChatGPT use?
 
 When a workstation is enrolled as an Edge device, ChatGPT/Web-AI operations normally use the Edge path. It provides immutable device identity, generation fencing, reconnect state, and mutation-delivery evidence.
@@ -69,6 +82,8 @@ Use the saved-machine/SSH path explicitly for maintenance, first-time bootstrap,
 
 - `delivery_state=not_delivered`: after connectivity/state verification, a reissue through an explicitly chosen path may be safe;
 - `delivery_unknown`, delivered/uncertain state, or missing delivery evidence: inspect live pane/Git/runtime/resource state first and do not replay the mutation blindly.
+
+For recovery, keep the transport ladder explicit: Edge while healthy → native `herdr --machine` only after proven non-delivery/live non-application and while the target Herdr server is reachable → raw SSH only when the target Herdr server or forwarding path itself needs bootstrap/recovery. Do not convert a label or hostname into an Edge `device_id`; any association between the two identities must be established by separate live evidence.
 
 Herdr TUI machine selection never changes the target of an Edge call. An Edge call stays bound to its explicit/default Herdr-MCP device and any returned `herdr_ref_*` affinity.
 
