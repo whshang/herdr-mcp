@@ -16,11 +16,13 @@ const README_PRIMARY = [
 const INSTALL_PRIMARY = [
   ["docs/i18n/en/install.md", "## Step 1: install the native herdr-mcp runtime"],
   ["docs/i18n/zh-CN/install.md", "## 第一步：安装原生 herdr-mcp runtime"],
+  ["docs/i18n/ja/install.md", "## ステップ 1：ネイティブ herdr-mcp runtime をインストールする"],
 ];
 
 const QUICK_START_POST_INSTALL = [
   ["docs/i18n/en/quick-start.md", /this page starts after herdr-mcp is installed and connected/i, /## 1\. Start with a read-only check/],
   ["docs/i18n/zh-CN/quick-start.md", /本页从“herdr-mcp 已安装并连接”开始/, /## 1\. 先做一次只读检查/],
+  ["docs/i18n/ja/quick-start.md", /このページは herdr-mcp がインストールされ接続された後から始まります/, /## 1\. まず読み取り専用のチェックから始める/],
 ];
 
 function numericConstant(rel, name) {
@@ -120,7 +122,7 @@ test("source-development docs expose DEV/PROD dogfood without the retired npm re
     assert.doesNotMatch(doc, /herdr-mcp dev sync/, `${rel} keeps contributor DEV activation out of the top-level user path`);
   }
 
-  for (const rel of ["docs/i18n/en/cli-reference.md", "docs/i18n/zh-CN/cli-reference.md"]) {
+  for (const rel of ["docs/i18n/en/cli-reference.md", "docs/i18n/zh-CN/cli-reference.md", "docs/i18n/ja/cli-reference.md"]) {
     const doc = read(rel);
     assert.match(doc, /herdr-mcp dev status/);
     assert.match(doc, /herdr-mcp dev sync --dry-run/);
@@ -136,14 +138,14 @@ test("standalone extension path drift diagnosis stays documented", () => {
     assert.match(doc, /~\/.config\/herdr-mcp\/extensions\/standalone\/current/);
   }
 
-  for (const rel of ["docs/i18n/en/extension.md", "docs/i18n/zh-CN/extension.md"]) {
+  for (const rel of ["docs/i18n/en/extension.md", "docs/i18n/zh-CN/extension.md", "docs/i18n/ja/extension.md"]) {
     const doc = read(rel);
     assert.match(doc, /herdr-mcp doctor/);
     assert.match(doc, /standalone-extension-load state=drift/);
     assert.match(doc, /chrome:\/\/extensions/);
   }
 
-  for (const rel of ["docs/i18n/en/troubleshooting.md", "docs/i18n/zh-CN/troubleshooting.md"]) {
+  for (const rel of ["docs/i18n/en/troubleshooting.md", "docs/i18n/zh-CN/troubleshooting.md", "docs/i18n/ja/troubleshooting.md"]) {
     const doc = read(rel);
     assert.match(doc, /DOCTOR_JSON\.standalone_extension/);
     assert.match(doc, /expected_path/);
@@ -163,6 +165,7 @@ test("workstation_offline docs track live reconnect/recycle constants and delive
   const cases = [
     ["docs/i18n/en/troubleshooting.md", `${edgeGraceMs / 1000} seconds`, `${localRecycleMs / 1000} seconds`, /delivery_state=not_delivered/, /browser extension does not make this decision/],
     ["docs/i18n/zh-CN/troubleshooting.md", `${edgeGraceMs / 1000} 秒`, `${localRecycleMs / 1000} 秒`, /not_delivered/, /浏览器扩展不参与这个错误判定/],
+    ["docs/i18n/ja/troubleshooting.md", `${edgeGraceMs / 1000} 秒`, `${localRecycleMs / 1000} 秒`, /not_delivered/, /この判断をブラウザ拡張が行うことはありません/],
   ];
   for (const [rel, edgeGrace, localRecycle, notDelivered, extensionBoundary] of cases) {
     const doc = read(rel);
@@ -178,6 +181,7 @@ test("continuity guide stays no-ID and fail-closed while README only links the f
   const cases = [
     ["docs/i18n/en/browser-continuity.md", /does not need to remember or type the `continuity_id`/, /text-only match remains confirmation-required/, /never chooses by newest-or-most-similar heuristics/],
     ["docs/i18n/zh-CN/browser-continuity.md", /不需要记住或输入 `continuity_id`/, /单纯文本匹配即使只剩一个候选也仍需要用户确认/, /禁止用“最近一次”或“最像”直接猜/],
+    ["docs/i18n/ja/browser-continuity.md", /`continuity_id` を覚えたり入力したりする必要はありません/, /テキストのみの一致は候補が 1 つでもユーザーの確認が必要です/, /newest-or-most-similar のヒューリスティックで選ぶことは決してありません/],
   ];
   for (const [rel, intent, noId, failClosed] of cases) {
     const doc = read(rel);
