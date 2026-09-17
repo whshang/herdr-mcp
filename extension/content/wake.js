@@ -862,9 +862,10 @@ const H2W_CONTENT_VERSION = "0.1.97";
   }
 
   function submitWasAccepted(baseline) {
-    if (!ADAPTER.inputHasContent()) return true;
-    if (ADAPTER.name !== "chatgpt") return false;
-    // React may replace the Send button while the composer is merely rerendering;
+    if (ADAPTER.name !== "chatgpt") return !ADAPTER.inputHasContent();
+    // ChatGPT may transiently clear and restore the composer while a submit is
+    // still rejected upstream, so empty input alone is not provider acceptance.
+    // React may also replace the Send button while the composer is rerendering;
     // that node transition alone is not provider acceptance. Require a stronger
     // post-submit signal before stopping retries: navigation to the new ChatGPT
     // conversation or a matching user turn. A transient busy/generating control
@@ -893,8 +894,8 @@ const H2W_CONTENT_VERSION = "0.1.97";
 
   // ---- Submission ----
   // For contenteditable sites, wait for an enabled send button because ProseMirror
-  // often consumes synthetic keyboard events. ChatGPT can accept a send before
-  // ProseMirror clears, so success also observes the Send-button transition or new user turn.
+  // often consumes synthetic keyboard events. ChatGPT success requires durable
+  // conversation navigation or a matching new user turn, not transient composer UI.
   async function submitAfterPermissionClick() {
     if (!lastPermClickAt || Date.now() - lastPermClickAt > 6000) return false;
     await wait(1200);

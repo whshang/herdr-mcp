@@ -235,6 +235,8 @@ ok(wakeSource.includes('regenerate-thread-error-button')
   "ChatGPT explicit send-timeout cards retry once or safely reload before generic recovery");
 ok(wakeSource.includes("captureSubmitAckBaseline")
     && wakeSource.includes("waitForSubmitAck")
+    && wakeSource.includes('ADAPTER.name !== "chatgpt") return !ADAPTER.inputHasContent()')
+    && !wakeSource.includes("if (!ADAPTER.inputHasContent()) return true")
     && wakeSource.includes("location.href !== baseline.href")
     && !wakeSource.includes("baseline?.generating")
     && !wakeSource.includes("!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton)")
