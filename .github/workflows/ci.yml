@@ -60,13 +60,13 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
           $herdr = $null
           try {
-            Invoke-WebRequest -Uri "https://github.com/herdrdev/herdr/releases/download/v0.9.0/herdr-windows-x86_64.zip" -OutFile $archive
+            Invoke-WebRequest -Uri "https://github.com/herdrdev/herdr/releases/download/v0.9.1/herdr-windows-x86_64.zip" -OutFile $archive
             $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-            $expected = "b4508c445de1c1a68c760a01735da2aba2fa214b2aafd4b07f732e49b2a64b11"
-            if ($actual -ne $expected) { throw "Herdr 0.9.0 Windows archive SHA-256 mismatch" }
+            $expected = "04ce380cac5af27bfcf75d0951ac49b7afe4c984aee8852985806d4f71f93a6e"
+            if ($actual -ne $expected) { throw "Herdr 0.9.1 Windows archive SHA-256 mismatch" }
             Expand-Archive -Path $archive -DestinationPath $root -Force
             $archiveHerdr = Get-ChildItem -Path $root -Filter herdr.exe -File -Recurse | Select-Object -First 1
-            if (-not $archiveHerdr) { throw "herdr.exe missing from Herdr 0.9.0 Windows archive" }
+            if (-not $archiveHerdr) { throw "herdr.exe missing from Herdr 0.9.1 Windows archive" }
             $officialHerdrDir = Join-Path $env:LOCALAPPDATA "Programs\Herdr\bin"
             New-Item -ItemType Directory -Force -Path $officialHerdrDir | Out-Null
             Copy-Item -Path (Join-Path $archiveHerdr.Directory.FullName "*") -Destination $officialHerdrDir -Recurse -Force
