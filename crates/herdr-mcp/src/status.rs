@@ -641,8 +641,49 @@ fn format_native_messaging_layer() -> String {
 }
 
 fn format_link_layer(paths: &RuntimePaths) -> String {
-    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    crate::link::doctor_layer_summary(&home, &paths.config_dir)
+    #[cfg(target_os = "linux")]
+    {
+        return match crate::linux_service_manager::link_status_report() {
+            Ok(report) => format_linux_link_layer_report(&report),
+            Err(error) => format!("error detail={}", compact_detail(&error)),
+        };
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+        crate::link::doctor_layer_summary(&home, &paths.config_dir)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn format_linux_link_layer_report(report: &Value) -> String {
+    let owner = report
+        .get("production_owner")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let implementation = report
+        .get("implementation")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let link_loaded = report
+        .get("link_loaded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let eligible = report
+        .get("production_ready_eligible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ownership = if owner == "rust" {
+        "owned"
+    } else if owner == "absent" {
+        "absent"
+    } else {
+        "unowned"
+    };
+    format!(
+        "{ownership} production_owner={owner} prod_impl=not-applicable prod_loaded=false link_impl={implementation} link_loaded={link_loaded} candidate_label=not-applicable production_ready_eligible={eligible} remote-probe=edge-layer"
+    )
 }
 
 fn format_link_transport_layer(paths: &RuntimePaths, config: &Config) -> String {
@@ -1475,6 +1516,22 @@ fn print_check(label: &str, pass: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_link_doctor_layer_uses_native_linux_status_report() {
+        let layer = format_linux_link_layer_report(&serde_json::json!({
+            "implementation": "rust-systemd-user",
+            "production_owner": "rust",
+            "production_ready_eligible": true,
+            "link_loaded": true,
+        }));
+        assert!(layer.starts_with("owned "));
+        assert!(layer.contains("production_owner=rust"));
+        assert!(layer.contains("link_impl=rust-systemd-user"));
+        assert!(layer.contains("link_loaded=true"));
+        assert!(layer.contains("production_ready_eligible=true"));
+        assert!(!layer.contains("production_owner=absent"));
+    }
 
     #[test]
     fn parses_http_status_line() {
