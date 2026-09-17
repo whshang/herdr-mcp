@@ -177,6 +177,15 @@ fn run() -> Result<ExitCode, String> {
                 },
             )
         }
+        cli::Command::Network(cli::NetworkCommand::Repair) => {
+            let paths = paths::RuntimePaths::discover()?;
+            let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
+            let edge_origin = config.link_upstream_origin().ok_or_else(|| {
+                "no Edge origin is configured; configure or bootstrap a Worker first".to_owned()
+            })?;
+            worker_bootstrap::repair_workers_dev_hosts_interactive(edge_origin, language)?;
+            Ok(ExitCode::SUCCESS)
+        }
         cli::Command::Uninstall => product_lifecycle::uninstall(),
         cli::Command::Reinstall => product_lifecycle::reinstall(),
         cli::Command::DocumentsProbe => Ok(macos_privacy::run_documents_probe_child()),

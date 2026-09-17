@@ -13,8 +13,6 @@ use std::io::IsTerminal;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process::Stdio;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2113,7 +2111,7 @@ fn verify_health(
                 Ok(Some(resolved)) => {
                     match probe_health(&resolved, edge_origin, worker_name, expected_version) {
                         Ok(()) => {
-                            report_workers_dev_hosts_recovery(edge_origin);
+                            report_workers_dev_repair_available(edge_origin);
                             return Ok(resolved);
                         }
                         Err(error) if !error.may_retry_via_proxy() => {
@@ -2173,7 +2171,7 @@ pub(crate) fn client_for_edge_origin(
             match trusted_dns_direct_client(edge_origin) {
                 Ok(Some(resolved)) => match probe_edge_transport(&resolved, edge_origin) {
                     Ok(()) => {
-                        report_workers_dev_hosts_recovery(edge_origin);
+                        report_workers_dev_repair_available(edge_origin);
                         return Ok(resolved.client);
                     }
                     Err(error) if !error.may_retry_via_proxy() => {
@@ -2404,34 +2402,81 @@ fn resolve_worker_ips_with_doh(
     Ok(ips)
 }
 
-fn report_workers_dev_hosts_recovery(edge_origin: &str) {
-    match persist_workers_dev_hosts_mapping(edge_origin) {
-        Ok(true) => eprintln!(
-            "workers.dev DNS recovery: persisted a verified direct mapping in the system hosts file; subsequent Link attempts can stay on the direct route"
-        ),
-        Ok(false) => {}
-        Err(error) => eprintln!(
-            "workers.dev DNS recovery: trusted-DNS direct access works, but the verified hosts mapping could not be persisted: {error}"
-        ),
+fn report_workers_dev_repair_available(edge_origin: &str) {
+    if edge_origin_host(edge_origin).is_ok_and(|host| host.ends_with(".workers.dev")) {
+        eprintln!(
+            "workers.dev DNS recovery: trusted public DNS verified a direct route; system hosts were not changed. Run `herdr-mcp network repair` in an interactive terminal to persist the Herdr-managed mapping"
+        );
     }
-}
-
-fn persist_workers_dev_hosts_mapping(edge_origin: &str) -> Result<bool, String> {
-    persist_workers_dev_hosts_mapping_with_mode(edge_origin, true)
-}
-
-pub(crate) fn recover_workers_dev_direct_noninteractive(endpoint: &str) -> Result<bool, String> {
-    let edge_origin = workers_dev_origin_from_endpoint(endpoint)?;
-    if probe_workers_dev_origin_direct(&edge_origin).is_ok() {
-        return Ok(true);
-    }
-    persist_workers_dev_hosts_mapping_with_mode(&edge_origin, false)?;
-    probe_workers_dev_origin_direct(&edge_origin).map(|_| true)
 }
 
 pub(crate) fn probe_workers_dev_direct(endpoint: &str) -> Result<bool, String> {
     let edge_origin = workers_dev_origin_from_endpoint(endpoint)?;
     probe_workers_dev_origin_direct(&edge_origin).map(|_| true)
+}
+
+pub(crate) fn repair_workers_dev_hosts_interactive(
+    edge_origin: &str,
+    language: Locale,
+) -> Result<(), String> {
+    let host = edge_origin_host(edge_origin)?;
+    if !host.ends_with(".workers.dev") {
+        return Err(language
+            .text(
+                "the configured Link origin is not workers.dev; no hosts repair is applicable",
+                "当前配置的 Link 地址不是 workers.dev，无需进行 hosts 修复",
+                "設定されている Link の接続先は workers.dev ではないため、hosts 修復は不要です",
+            )
+            .to_owned());
+    }
+    if probe_workers_dev_origin_direct(edge_origin).is_ok() {
+        println!(
+            "{}",
+            language.text(
+                "workers.dev is already reachable directly; no system change was made.",
+                "workers.dev 已可直接访问，未修改系统 hosts。",
+                "workers.dev はすでに直接アクセス可能です。システム hosts は変更していません。",
+            )
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        language.text(
+            "Verifying workers.dev with trusted public DNS before requesting administrator permission...",
+            "正在通过可信公共 DNS 验证 workers.dev，验证通过后才会请求管理员权限……",
+            "信頼できるパブリック DNS で workers.dev を検証しています。検証後にのみ管理者権限を要求します…",
+        )
+    );
+    let changed = persist_workers_dev_hosts_mapping_interactive(edge_origin)?;
+    probe_workers_dev_origin_direct(edge_origin).map_err(|error| {
+        format!(
+            "{}: {error}",
+            language.text(
+                "hosts was updated but direct workers.dev verification still failed",
+                "hosts 已更新，但 workers.dev 直连验证仍然失败",
+                "hosts を更新しましたが、workers.dev の直接接続検証に失敗しました",
+            )
+        )
+    })?;
+    println!(
+        "{}",
+        if changed {
+            language.text(
+                "workers.dev direct access is restored. Only the Herdr-managed hosts entry was changed.",
+                "workers.dev 直连已恢复，仅修改了 Herdr 管理的 hosts 条目。",
+                "workers.dev の直接接続を復旧しました。変更したのは Herdr 管理の hosts エントリだけです。",
+            )
+        } else {
+            language.text(
+                "The Herdr-managed hosts mapping was already current and direct access is verified.",
+                "Herdr 管理的 hosts 映射已是最新，workers.dev 直连验证通过。",
+                "Herdr 管理の hosts マッピングはすでに最新で、workers.dev の直接接続を確認しました。",
+            )
+        }
+    );
+    Ok(())
 }
 
 fn probe_workers_dev_origin_direct(edge_origin: &str) -> Result<(), String> {
@@ -2460,10 +2505,7 @@ fn workers_dev_origin_from_endpoint(endpoint: &str) -> Result<String, String> {
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
-fn persist_workers_dev_hosts_mapping_with_mode(
-    edge_origin: &str,
-    allow_interactive_sudo: bool,
-) -> Result<bool, String> {
+fn persist_workers_dev_hosts_mapping_interactive(edge_origin: &str) -> Result<bool, String> {
     let host = edge_origin_host(edge_origin)?;
     if !host.ends_with(".workers.dev") {
         return Ok(false);
@@ -2481,7 +2523,7 @@ fn persist_workers_dev_hosts_mapping_with_mode(
     if updated == current {
         return Ok(false);
     }
-    write_system_hosts(&hosts_path, &updated, allow_interactive_sudo)?;
+    write_system_hosts_interactive(&hosts_path, &updated)?;
     let verified = fs::read_to_string(&hosts_path).map_err(|error| {
         format!(
             "cannot verify {} after update: {error}",
@@ -2581,11 +2623,7 @@ fn system_hosts_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn write_system_hosts(
-    path: &Path,
-    content: &str,
-    allow_interactive_sudo: bool,
-) -> Result<(), String> {
+fn write_system_hosts_interactive(path: &Path, content: &str) -> Result<(), String> {
     match fs::write(path, content) {
         Ok(()) => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
@@ -2600,45 +2638,29 @@ fn write_system_hosts(
     fs::write(&temp, content)
         .map_err(|error| format!("cannot prepare hosts recovery file: {error}"))?;
 
-    let try_sudo = |non_interactive: bool| -> Result<bool, String> {
-        let mut command = Command::new("sudo");
-        if non_interactive {
-            command
-                .arg("-n")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-        }
-        let status = command
-            .arg("cp")
-            .arg(&temp)
-            .arg(path)
-            .status()
-            .map_err(|error| format!("cannot run sudo for hosts recovery: {error}"))?;
-        Ok(status.success())
-    };
-
-    let mut written = try_sudo(true).unwrap_or(false);
-    if !written && allow_interactive_sudo && io::stdin().is_terminal() && io::stderr().is_terminal()
-    {
-        written = try_sudo(false)?;
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        let _ = fs::remove_file(&temp);
+        return Err(format!(
+            "administrator approval is required to update {}; run `herdr-mcp network repair` in an interactive terminal",
+            path.display()
+        ));
     }
+
+    let status = Command::new("sudo").arg("cp").arg(&temp).arg(path).status();
     let _ = fs::remove_file(&temp);
-    if written {
+    let status = status.map_err(|error| format!("cannot run sudo for hosts recovery: {error}"))?;
+    if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "administrator approval is required to update {}; rerun the Worker bootstrap/connect command in an interactive terminal and approve the sudo prompt",
+            "administrator approval was not granted to update {}; no hosts change was applied",
             path.display()
         ))
     }
 }
 
 #[cfg(windows)]
-fn write_system_hosts(
-    path: &Path,
-    content: &str,
-    _allow_interactive_sudo: bool,
-) -> Result<(), String> {
+fn write_system_hosts_interactive(path: &Path, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|error| {
         format!(
             "cannot update {}: {error}; rerun Worker bootstrap/connect from an elevated PowerShell or Terminal",
@@ -2648,11 +2670,7 @@ fn write_system_hosts(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn write_system_hosts(
-    _path: &Path,
-    _content: &str,
-    _allow_interactive_sudo: bool,
-) -> Result<(), String> {
+fn write_system_hosts_interactive(_path: &Path, _content: &str) -> Result<(), String> {
     Err("system hosts recovery is unsupported on this platform".to_owned())
 }
 
