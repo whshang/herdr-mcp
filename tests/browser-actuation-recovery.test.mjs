@@ -18,6 +18,11 @@ assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart, "recovery helper mu
 const canonicalRecoverySource = backgroundSource.slice(canonicalRecoveryStart, recoveryStart);
 const recoverySource = backgroundSource.slice(recoveryStart, recoveryEnd);
 
+const createAnchorStart = backgroundSource.indexOf("async function resolveBrowserCreateAnchorWindow(");
+const createAnchorEnd = backgroundSource.indexOf("\nasync function handleBrowserActuation", createAnchorStart);
+assert.ok(createAnchorStart >= 0 && createAnchorEnd > createAnchorStart, "create anchor helper must remain extractable");
+const createAnchorSource = backgroundSource.slice(createAnchorStart, createAnchorEnd);
+
 const archiveCleanupStart = backgroundSource.indexOf("function shouldCloseArchivedChatGptTab(");
 const archiveCleanupEnd = backgroundSource.indexOf("\nasync function recoverBrowserSessionTarget", archiveCleanupStart);
 assert.ok(archiveCleanupStart >= 0 && archiveCleanupEnd > archiveCleanupStart, "archive tab cleanup helpers must remain extractable");
@@ -85,6 +90,34 @@ function recoveryHarness(tabRecords) {
     `${recoverySource}; return recoverBrowserSessionTarget;`,
   )(chrome, activeH2WTabUrls, browserConversationInfoFromSupportedUrl, browserSessionTargets);
   return { recover, browserSessionTargets };
+}
+
+function createAnchorHarness({ tabs = [], scopes = [], targets = [], recovered = null } = {}) {
+  const tabMap = new Map(tabs.map((tab) => [tab.id, { ...tab }]));
+  const browserTabScopes = new Map(scopes);
+  const browserSessionTargets = new Map(targets);
+  const chrome = {
+    tabs: {
+      async get(tabId) {
+        const tab = tabMap.get(tabId);
+        if (!tab) throw new Error(`tab ${tabId} missing`);
+        return { ...tab };
+      },
+    },
+  };
+  const recoverCalls = [];
+  const recoverBrowserSessionTarget = async (sessionRef, expectedGeneration) => {
+    recoverCalls.push({ sessionRef, expectedGeneration });
+    return recovered || { target: null, observedGeneration: expectedGeneration, ambiguous: false };
+  };
+  const resolve = new Function(
+    "chrome",
+    "browserTabScopes",
+    "browserSessionTargets",
+    "recoverBrowserSessionTarget",
+    `${createAnchorSource}; return resolveBrowserCreateAnchorWindow;`,
+  )(chrome, browserTabScopes, browserSessionTargets, recoverBrowserSessionTarget);
+  return { resolve, recoverCalls };
 }
 
 function archiveCleanupHarness({
@@ -249,6 +282,74 @@ test("canonical ChatGPT session recovery rejects a stale browser scope generatio
   const harness = canonicalIdentityRecoveryHarness([{ id: 71, url: slugged }], scopes);
   const result = await harness.find("chatgpt", canonical, 17);
   assert.deepEqual(result, { target: null, ambiguous: false });
+});
+
+test("ChatGPT session.create anchors to the exact source session window across matching Project windows", async () => {
+  const sourceSessionRef = "br_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const harness = createAnchorHarness({
+    tabs: [
+      { id: 71, windowId: 11 },
+      { id: 72, windowId: 22 },
+    ],
+    scopes: [
+      [71, { provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space", observationGeneration: 17 }],
+      [72, { provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space", observationGeneration: 17 }],
+    ],
+    targets: [[sourceSessionRef, {
+      provider: "chatgpt",
+      tabId: 72,
+      observationGeneration: 17,
+    }]],
+  });
+  const result = await harness.resolve({
+    provider: "chatgpt",
+    accountRef: "br_account",
+    spaceRef: "br_space",
+    expectedGeneration: 17,
+    sourceSessionRef,
+  });
+  assert.deepEqual(result, { windowId: 22, unavailable: false, reason: "source_session" });
+  assert.deepEqual(harness.recoverCalls, []);
+});
+
+test("ChatGPT session.create without source affinity fails closed across matching windows", async () => {
+  const harness = createAnchorHarness({
+    tabs: [
+      { id: 71, windowId: 11 },
+      { id: 72, windowId: 22 },
+    ],
+    scopes: [
+      [71, { provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space", observationGeneration: 17 }],
+      [72, { provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space", observationGeneration: 17 }],
+    ],
+  });
+  const result = await harness.resolve({
+    provider: "chatgpt",
+    accountRef: "br_account",
+    spaceRef: "br_space",
+    expectedGeneration: 17,
+  });
+  assert.deepEqual(result, { windowId: null, unavailable: true, reason: "ambiguous_scope_windows" });
+});
+
+test("ChatGPT session.create without source affinity keeps single-window compatibility", async () => {
+  const harness = createAnchorHarness({
+    tabs: [
+      { id: 71, windowId: 11 },
+      { id: 72, windowId: 11 },
+    ],
+    scopes: [
+      [71, { provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space", observationGeneration: 17 }],
+      [72, { provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space", observationGeneration: 17 }],
+    ],
+  });
+  const result = await harness.resolve({
+    provider: "chatgpt",
+    accountRef: "br_account",
+    spaceRef: "br_space",
+    expectedGeneration: 17,
+  });
+  assert.deepEqual(result, { windowId: 11, unavailable: false, reason: "unique_scope_window" });
 });
 
 test("archive cleanup closes only the exact ChatGPT tab after proven archive reaches the same Project home", async () => {
@@ -454,6 +555,8 @@ test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and
   const submitEnd = wakeSource.indexOf("// ---- Auto-allow", submitStart);
   const submitSegment = wakeSource.slice(submitStart, submitEnd);
   assert.match(submitSegment, /await submitMainWorld\(selector\)/);
+  assert.match(submitSegment, /ADAPTER\.name === "chatgpt" && ADAPTER\.inputHasContent\(\)/);
+  assert.doesNotMatch(submitSegment, /ADAPTER\.name === "chatgpt" && attempt === 0/);
   const mainFallbackStart = submitSegment.indexOf("const mainSubmit = selector ? await submitMainWorld(selector) : null;");
   const mainFallbackEnd = submitSegment.indexOf("const baseline = captureSubmitAckBaseline(btn);", mainFallbackStart);
   assert.ok(mainFallbackStart >= 0 && mainFallbackEnd > mainFallbackStart, "MAIN submit fallback must remain bounded");
@@ -462,6 +565,13 @@ test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and
   const clickIndex = submitSegment.indexOf("btn.click();", mainFallbackEnd);
   const enterIndex = submitSegment.indexOf("dispatchEnterSubmit(el)", clickIndex);
   assert.ok(clickIndex > mainFallbackEnd && enterIndex > clickIndex, "DOM click and Enter remain ordered fallbacks");
+
+  const ackStart = wakeSource.indexOf("function submitWasAccepted(baseline) {");
+  const ackEnd = wakeSource.indexOf("async function waitForSubmitAck", ackStart);
+  const ackSegment = wakeSource.slice(ackStart, ackEnd);
+  assert.match(ackSegment, /location\.href !== baseline\.href/);
+  assert.doesNotMatch(ackSegment, /baseline\?\.generating|isComposerGenerating\(\)/);
+  assert.doesNotMatch(ackSegment, /sendButton\.isConnected|isSendButton\(baseline\.sendButton\)/);
 });
 
 test("terminal stale session reservations do not block ordinary browser identity recovery", () => {
@@ -1131,11 +1241,12 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(segment, /browserTabScopes\.get\(createdTab\.id\)/);
   assert.match(segment, /scope\.accountRef === accountRefCreate/);
   assert.match(segment, /scope\.spaceRef === spaceRefCreate/);
-  assert.match(segment, /browserTabScopes\.entries\(\)/);
+  assert.match(segment, /source_session_ref/);
+  assert.match(segment, /resolveBrowserCreateAnchorWindow/);
   assert.match(segment, /scope\.observationGeneration === expectedGeneration/);
-  assert.match(segment, /chrome\.tabs\.get\(tabId\)/);
   assert.match(segment, /windowId: anchorWindowId/);
   assert.match(segment, /chrome\.tabs\.create\(\{ url: launchUrl, active: true \}\)/);
+  assert.doesNotMatch(segment, /lastSeenAt/);
   assert.match(segment, /reservationRef/);
   assert.match(segment, /void sendBrowserActuationTabMessage\(createdTab\.id,/);
   assert.doesNotMatch(segment, /const response = await sendBrowserActuationTabMessage\(createdTab\.id,/);

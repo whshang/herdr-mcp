@@ -235,11 +235,13 @@ ok(wakeSource.includes('regenerate-thread-error-button')
   "ChatGPT explicit send-timeout cards retry once or safely reload before generic recovery");
 ok(wakeSource.includes("captureSubmitAckBaseline")
     && wakeSource.includes("waitForSubmitAck")
-    && wakeSource.includes("!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton)")
+    && wakeSource.includes("location.href !== baseline.href")
+    && !wakeSource.includes("baseline?.generating")
+    && !wakeSource.includes("!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton)")
     && wakeSource.includes('latestTurnForRole("user")')
     && wakeSource.includes("latestUser !== baseline?.userTurn")
     && wakeSource.includes('ADAPTER.name === "chatgpt" ? 8000 : 4000'),
-  "ChatGPT submit acknowledgement accepts the Send-button transition or matching new user turn before ProseMirror clears");
+  "ChatGPT submit acknowledgement requires strong provider evidence instead of Send-button rerender alone");
 ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes("连接已中断")
     && wakeSource.includes("消息发送超时，请重试")

@@ -856,6 +856,7 @@ const H2W_CONTENT_VERSION = "0.1.97";
     return {
       composer: composerNorm(),
       sendButton,
+      href: location.href,
       userTurn: ADAPTER.name === "chatgpt" ? latestTurnForRole("user") : null,
     };
   }
@@ -863,13 +864,12 @@ const H2W_CONTENT_VERSION = "0.1.97";
   function submitWasAccepted(baseline) {
     if (!ADAPTER.inputHasContent()) return true;
     if (ADAPTER.name !== "chatgpt") return false;
-    // An accepted ChatGPT send normally replaces or repurposes the exact Send
-    // button before ProseMirror clears. Checking that captured node is O(1) and
-    // avoids repeatedly scanning a long conversation while the page is hot.
-    if (baseline?.sendButton
-      && (!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton))) {
-      return true;
-    }
+    // React may replace the Send button while the composer is merely rerendering;
+    // that node transition alone is not provider acceptance. Require a stronger
+    // post-submit signal before stopping retries: navigation to the new ChatGPT
+    // conversation or a matching user turn. A transient busy/generating control
+    // is not sufficient because ChatGPT can show it before provider acceptance.
+    if (baseline?.href && location.href !== baseline.href) return true;
     const latestUser = latestTurnForRole("user");
     if (latestUser && latestUser !== baseline?.userTurn) {
       const latestText = normText(latestUser.innerText || latestUser.textContent || "");
@@ -942,7 +942,7 @@ const H2W_CONTENT_VERSION = "0.1.97";
         for (let i = 0; i < 40; i++) {
           const btn = findSendButton();
           if (isSendButton(btn)) {
-            if (ADAPTER.name === "chatgpt" && attempt === 0 && ADAPTER.inputHasContent()) {
+            if (ADAPTER.name === "chatgpt" && ADAPTER.inputHasContent()) {
               const selector = ADAPTER.getWatchMainWorldSelector();
               const mainBaseline = captureSubmitAckBaseline(btn);
               const mainSubmit = selector ? await submitMainWorld(selector) : null;
