@@ -40,18 +40,16 @@
     if (!messages) return null;
     const current = messages.length ? messages[messages.length - 1] : null;
     const currentRole = String(current?.author?.role || "");
-    let assistantIndex = -1;
+    let userIndex = -1;
     for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.author?.role === "user") { userIndex = i; break; }
+    }
+    let assistantIndex = -1;
+    for (let i = messages.length - 1; i > userIndex; i -= 1) {
       if (messages[i]?.author?.role === "assistant") { assistantIndex = i; break; }
     }
     const assistant = assistantIndex >= 0 ? messages[assistantIndex] : null;
-    let user = currentRole === "user" ? current : null;
-    if (!user) {
-      const start = assistantIndex >= 0 ? assistantIndex - 1 : messages.length - 1;
-      for (let i = start; i >= 0; i -= 1) {
-        if (messages[i]?.author?.role === "user") { user = messages[i]; break; }
-      }
-    }
+    const user = userIndex >= 0 ? messages[userIndex] : null;
     return { messages, current, currentRole, assistant, user };
   }
 

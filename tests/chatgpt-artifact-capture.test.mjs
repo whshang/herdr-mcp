@@ -71,6 +71,26 @@ test("ChatGPT artifact core scopes the real image-only payload to the latest use
   assert.equal(core.parseFileIdFromPart({ content_type: "image_asset_pointer", asset_pointer: "sediment://file_bad/slash" }), null);
 });
 
+test("ChatGPT latest turn never pairs a new user message with the previous assistant", () => {
+  const turn = core.latestTurnMessages({
+    messages: [
+      { id: "u0", author: { role: "user" }, content: { parts: ["old request"] } },
+      {
+        id: "a0",
+        author: { role: "assistant" },
+        status: "finished_successfully",
+        end_turn: true,
+        content: { parts: ["old answer"] },
+      },
+      { id: "u1", author: { role: "user" }, content: { parts: ["new request"] } },
+    ],
+  });
+
+  assert.equal(turn.user.id, "u1");
+  assert.equal(turn.assistant, null);
+  assert.equal(turn.currentRole, "user");
+});
+
 test("image-only settled capture key is stable and fail-closed", () => {
   const base = {
     adapterName: "chatgpt",
