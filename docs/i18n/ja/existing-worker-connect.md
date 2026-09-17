@@ -1,50 +1,76 @@
-# 既存の Herdr Worker に新しいコンピュータを接続する
+# マルチデバイス制御
 
-これは**新しいコンピュータを既存の herdr-mcp Worker/Connector に接続する**ための権威ある Agent 実行契約です。**新規 Worker デプロイではありません**。
+*一つの Herdr Worker と一つの ChatGPT 接続で、enrollment 済みの複数のコンピュータを制御する。*
 
-> **v0.4.8 では macOS と x86_64 Linux/Debian をサポートします。** macOS は最終デバイス資格情報を Keychain に保存し、Linux はユーザー専用の credential store（ディレクトリ `0700`、通常ファイル `0600`）に保存します。Windows の `worker pair` / `worker connect` は引き続き利用不可で fail closed です。
+Herdr の fleet は、一つの公開 Worker/Connector と、その背後にある独立した identity を持つ複数のコンピュータで構成されます。ChatGPT は fleet を検出し、タスクのためにデバイスを選び、後続の操作をそのデバイスに結び付けたままにできます。新しいコンピュータは短命な pairing を通じて既存の Worker に参加します。別の Worker をデプロイしたり、共有のグローバル秘密を受け取ったりはしません。
 
-## 始める前に
+Herdr 0.9.1 には、マルチマシン TUI 用の独自の保存済み SSH マシン層と、ネイティブの `herdr --machine <label-or-id> <command>` 転送もあります。この層は、同じ物理コンピュータ上であってもこの Edge fleet と共存できますが、`device_id` ルーティングを置き換えるものではありません。identity、ルーティング、フェイルオーバーの規則は [Herdr 0.9.1 のマルチマシンとデュアルパス制御](multi-machine-control.md)を参照してください。
 
-- この経路は **v0.4.3+** を必要とします。最新の stable Release のバージョン/能力を確認してください。stable がまだ `<0.4.3` の場合、またはインストール済み CLI が `herdr-mcp worker pair` / `herdr-mcp worker connect` を提供しない場合は、**停止してバージョン/能力の blocker を報告**してください。ユーザーが preview/source のテストを明示的に求めた場合を除き、prerelease/source build をインストールしないでください。
-- 最新の stable PROD herdr-mcp を **GitHub Release** からインストールしてください。repo checkout からはインストールしないでください。source/dev build を通常インストールとして扱わないでください。
-- これは**新規 Worker デプロイではありません**。Cloudflare Worker、Durable Object namespace、OAuth app/client、Connector を新規作成してはならず、旧来のグローバル `LINK_SHARED_SECRET` をコピーしてもいけません。ユーザーが既に持っている Worker に参加するだけです。
+> v0.4.8 は macOS と x86_64 Linux/Debian で安全な新規デバイス pairing をサポートします。macOS は最終的なデバイス資格情報を Keychain に保持します。Linux は `0700` のディレクトリと `0600` の通常の資格情報ファイルを使う、ユーザー専用の資格情報ストアを使います。Windows の pairing は引き続き利用できず、fail closed です。
 
-## ペアリングの仕組み
+## ChatGPT から fleet を見る
 
-1. **推奨: 登録済みのデバイスからペアリングを作成します。** fleet 内の任意の登録済みコンピュータで次を実行します:
+`herdr_devices` を使って、Worker が把握しているデバイスを列挙します。結果には、安定したデバイス identity に加えて、現在の認可、接続、スケジューリング、ヘルスの情報が含まれます。
 
-   ```bash
-   herdr-mcp worker pair
-   ```
+有用なプロンプトの例です。
 
-   `worker pair` は device/operator が管理する fleet アクションであり、このマシンが対象 Worker に登録済みであることを証明する資格情報が必要です。Worker control plane で pairing を作成するため、既存ワークステーションがオンラインである必要はありません。結果には、**ペアリングアドレス**、単回使用の **6 桁コード**、**正確な有効期限**、およびコピー可能な `herdr-mcp worker connect "<pairing-address>"` コマンドをまとめて表示します。通常の最大 TTL は 600 秒です。
+```text
+私の Herdr デバイスを一覧し、どれがオンラインかを示してください。バックエンドのタスクには macbook-main を、独立したテストタスクには macbook-lab を使ってください。両者の working tree は分離したまま保ち、完了を報告する前に両方の結果を検証してください。
+```
 
-2. **新しいコンピュータ**で、Agent が次を実行します:
+ルーティングは意図的に保守的です。
 
-   ```bash
-   herdr-mcp worker connect "<pairing-address>"
-   ```
+- 明示的に指名されたデバイスは、その操作に使われます。
+- 後続の参照と再試行は、元のデバイス identity を保ちます。
+- ルーティング可能なデバイスが一つだけなら、Herdr はそれを自動的に選べます。
+- mutation に対して複数のデバイスが有効な候補で、対象が指定されていない場合、Herdr は推測せず `device_ambiguous` を返します。
 
-   このコンピュータが同じ Worker にまだ登録されていない場合、CLI は**6 桁のコードの入力を求めます**。対話端末では入力した数字を通常どおり表示するため、打ち間違いを確認できます。コードは**コマンドライン引数にはならない**ため、shell history には残りません。
+enrollment 済みの各コンピュータは、独自の資格情報と不変の `device_id` を持ちます。デバイス名は人が使いやすいセレクタであり、基盤となる identity は安定したままです。
 
-   すでに登録済みの同じ端末が**同じ Worker**へ再度 `worker connect` する場合、この操作は冪等です。ローカルの永続設定にその Worker の既存 `device_id` があり、Worker 側でもその device が `active` と確認できれば、既存 enrollment を再利用します。6 桁コードの入力、新しい pairing の consume、新しい device identity の作成や上書きは行いません。同じ Worker のローカル enrollment が残っていても遠隔側で active でなければ fail closed とし、暗黙に 2 つ目の `device_id` を作成しません。別 Worker への接続だけが通常の新規 pairing 経路を続行します。
+## 新しいコンピュータを追加する
 
-   デフォルトでは、参加するコンピュータがプラットフォームから取得したコンピュータ名/hostname が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
+### 1. enrollment 済みデバイスから pairing を作成する
 
-   ペアリング消費後、`worker connect` はローカル service を起動し、登録済み Rust production Link を整合させます。macOS は launchd、Linux は `systemd --user` を優先し、user systemd manager がない場合は managed user-process backend を使います。ローカル service と Link が healthy になった場合だけ成功を返し、起動失敗時は未完了の登録を revoke してローカル credential/config を復元します。
+すでに fleet に enrollment されている任意のコンピュータで、次を実行します。
 
-3. 成功すると、一時的なペアリングが高エントロピーのデバイス単位資格情報と交換されます。macOS は最終資格情報を Keychain に、Linux は上記のユーザー専用 credential store に保存します。ペアリングコード/セッションは即座に使用不能になります。参加デバイスでは、Cloudflare デプロイ資格情報も旧来の `LINK_SHARED_SECRET` も使用されません。
+```bash
+herdr-mcp worker pair
+```
 
-## セキュリティ規則
+`worker pair` はデバイス / オペレーターによる fleet アクションです。このマシンが対象 Worker にすでに enrollment されていることを証明する資格情報を必要とします。操作をワークステーション経由でルーティングせず、Worker の control plane で pairing を作成します。応答は次の情報をまとめて示すはずです。
 
-- 6 桁のコードは、意図された短時間有効なペアリング資格情報です。単回使用で、10 分で期限切れになり、**誤った試行が 5 回**を超えるとセッションは永久にロックされます。
-- ペアリング id は高エントロピーで推測不可能であり、ペアリングアドレス（URL フラグメント）に含まれます。HTTP アクセスログのパスには含まれません。最終的なデバイス秘密情報はペアリングアドレスには決して含まれません。
-- 最終的なデバイス資格情報は OS の安全なローカル credential store に属します。印刷またはログ記録しないでください。
+- 高エントロピーの pairing id を含む pairing アドレス。
+- 単回使用の 6 桁検証コード。
+- 正確な有効期限。
+- コピー可能な `herdr-mcp worker connect "<pairing-address>"` コマンド。
 
-## 検証
+通常の最大 TTL は 600 秒です。pairing は永続的な招待として扱わず、ただちに使ってください。検出の探査として、新しいコンピュータで `worker pair` を実行してはいけません。これが最初の Herdr Worker で、enrollment 済みデバイスがまだ存在しない場合は、pairing の前に最初の Worker の Cloudflare bootstrap を完了してください。
 
-接続成功後、次を検証してください:
+### 2. 新しいコンピュータを接続する
+
+新しいコンピュータでは、Agent が次を実行します。
+
+```bash
+herdr-mcp worker connect "<pairing-address>"
+```
+
+このコンピュータが同じ Worker にまだ enrollment されていない場合、CLI は通常の可視のターミナル入力として 6 桁コードを求めます。入力した内容を確認できるようにするためです。このコードは通常のコマンドライン引数としては意図的に受け付けられないため、shell history には残りません。
+
+`worker connect` は、**同じ Worker** にすでに enrollment されたデバイスに対して冪等です。ローカルの永続設定がその Worker の既存の `device_id` を特定し、Worker の inventory がそのデバイスを今も `active` と確認できる場合、Herdr はその enrollment を再利用します。6 桁コードを求めず、新しい pairing を消費せず、デバイス identity を作成または上書きしません。ローカルに同じ Worker の enrollment があるが遠隔ではすでに active でない場合、コマンドは黙って二つ目の identity を作らずに fail closed します。別の Worker 向けの pairing は、引き続き明示的な pairing 経路に従います。
+
+既定では、参加するコンピュータがプラットフォームの報告するコンピュータ名 / hostname をデバイス表示名として登録します。ユーザーが明示的に別の初期名を望むときだけ `--name "<device-name>"` を使ってください。pairing の作成者が指定した `worker pair --name ...` の値も明示的な上書きであり、優先されます。
+
+pairing が消費された後、`worker connect` はローカルサービスをインストール / 起動し、enrollment 済みの Rust production Link を整合させます。macOS は launchd を使います。Linux は `systemd --user` を優先し、ユーザーの systemd manager がない場合は管理対象のユーザープロセス backend を使います。コマンドが成功するのは、ローカルサービスと Link が healthy になった後だけです。起動に失敗すると、未完了の enrollment を取り消し、ローカルの資格情報 / 設定の状態を復元します。
+
+Agent 支援のセットアップでは、新しいコンピュータにこの一文を貼り付けてください。
+
+```text
+このコンピュータを私の既存の Herdr fleet に接続してください。手順は https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/ja/existing-worker-connect.md に従ってください。pairing アドレスは <pairing-address> です。6 桁の検証コードは CLI が要求したときだけ私に尋ね、その後このデバイスが同じ Worker でオンラインになっていることを確認してください。
+```
+
+### 3. 新しいデバイスを検証する
+
+接続が成功した後で、次を実行します。
 
 ```bash
 herdr-mcp status
@@ -52,34 +78,48 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-結果として得られる不変な `device_id`、Link の online/healthy、ローカルバインドの成功を確認してください。
+そして ChatGPT に `herdr_devices` を呼ばせ、新しいデバイスが同じ Worker の下でオンラインであることを確認します。
 
-このコンピュータから `workers.dev` に直接到達できない場合も、同じ device 登録を維持してください。`link status` で既存 local proxy または shared Relay の経路が healthy なら再登録は不要です。
+このコンピュータが `workers.dev` に直接到達できない場合も、同じ enrollment を保ってください。`link status` は、対応しているローカルプロキシまたは共有 Relay の経路を示すことがあります。関連する結果は Link が healthy であることです。Link が healthy にならないときだけ[トラブルシューティング](troubleshooting.md)を参照してください。
 
-後から現在の登録済みコンピュータを明示的に改名する場合だけ、次を実行します:
+現在 enrollment されているコンピュータを後から明示的に改名するには、次を実行します。
 
 ```bash
 herdr-mcp worker rename "<new-device-name>"
 ```
 
-`herdr-mcp device rename ...` も同じ操作です。rename が変更するのは人向けの表示名だけで、不変な `device_id`、workstation identity、資格情報、authorization、scheduling は変わりません。Link の再接続で明示的な rename が上書きされることもありません。default/legacy workstation も最初の登録時にローカル Computer Name を記録します。
+`herdr-mcp device rename ...` は同等のエイリアスです。改名が変更するのは人向けの表示名だけであり、不変の `device_id`、ワークステーション identity、資格情報、認可、スケジューリング状態は変わりません。Link の再接続が明示的な改名を上書きすることはありません。既定 / 旧来のワークステーションも、最初の登録時にローカルの Computer Name を記録します。
 
-別の登録済みデバイスの認可を恒久的に取り消す場合、登録済みの任意のワークステーションで実行します。まず `herdr_devices` で不変の `device_id` を確認し、次を実行します:
+別の enrollment 済みデバイスから認可を恒久的に削除するには、任意の enrollment 済みワークステーションで次を実行します。まず `herdr_devices` から不変の `device_id` を取得し、その後に実行してください。
 
 ```bash
 herdr-mcp worker revoke "<device-id>" --confirm
 ```
 
-デバイス/オペレーターが fleet 管理を担当します。この操作は display name を受け付けず、不変の `device_id` を使用する必要があります。承認済み WebChat Connector は通常の MCP 権限のみで、デバイスを revoke できません。
+fleet の管理はデバイス / オペレーターが所有します。この操作は表示名を決して受け付けません。不変の `device_id` を使う必要があります。承認された WebChat Connector は通常の MCP のみであり、デバイスを revoke できません。enrollment 済みのデバイスはすべて、単一のオペレーターが所有する control plane の下でのピアです。デバイス間に owner / member の階層はありません。
 
-revoke はそのデバイス identity と資格情報に対して恒久的です。稼働中の Link は切断され、古い資格情報では再接続できません。古い identity の復活を防ぐため内部には最小の revoked tombstone を保持しますが、通常のデバイス一覧には表示しません。後で同じコンピュータを再追加する場合は、新しい pairing で新しいデバイス identity として登録してください。
+revoke は、そのデバイス identity と資格情報に対して恒久的です。live な Link は切断され、古い資格情報は二度と再接続できません。復活を防ぐため、revoked tombstone は内部に保持されます。revoked tombstone は通常の fleet / デバイス一覧からは隠されます。後でそのコンピュータを再度追加するには、新しい pairing を作成し、新しいデバイス identity として enrollment してください。
 
-## 不確実な配信 / リカバリ
+## pairing が変えるもの
 
-- いずれかの mutation が不確実な配信を報告した場合は、**盲目的に再試行せず**、まず現在の状態を確認してください。
-- connect がサーバー側の消費後に失敗した場合は、組み込みの補償/revoke 動作（正確なリモート revoke-self + ローカルのプラットフォーム credential store クリーンアップ + 以前の config の復元）に依存し、証拠を報告してください。手動の秘密情報処理を発明しないでください。
-- コードを 5 回間違って入力すると、セッションは永久にロックされます。`herdr-mcp worker pair` で新しいペアリングを作成してください。
+短命な pairing は、新しいデバイス単位の資格情報と交換されます。macOS は最終的な資格情報を Keychain に保存し、Linux は上記のユーザー専用の資格情報ストアに保存します。Worker はそのデバイスの認証に必要な verifier だけを保存します。pairing セッションは消費に成功した後は使用できなくなります。
 
-## 複数デバイスの検証
+参加するコンピュータは次を**必要としません**。
 
-接続後は ChatGPT から `herdr_devices` を確認し、新しいデバイスに対する実際の read-only RPC を 1 回実行して、同じ Worker/Connector 経由で到達できることを確認してください。
+- Cloudflare のデプロイ資格情報
+- 新しい Worker や Durable Object のデプロイ
+- 新しい ChatGPT Connector / OAuth クライアント
+- 旧来のグローバル `LINK_SHARED_SECRET`
+
+## pairing のセキュリティ
+
+- 6 桁コードは単回使用で、有効期間が短い。
+- 誤ったコード入力が 5 回でその pairing セッションは恒久的にロックされます。無期限に再試行せず、新しいものを作成してください。
+- pairing id は高エントロピーで、通常の HTTP access log のパスに置かれないよう URL フラグメントに留まります。
+- 最終的なデバイス単位の資格情報を表示またはコピーしないでください。それは OS の資格情報ストアに属します。
+
+## 復旧
+
+mutation が不確実な配信を報告した場合は、再試行の前に現在の状態を確認してください。配信がすでに起きているかもしれない操作を、盲目的に繰り返さないでください。
+
+サーバーが pairing を消費した後に接続が失敗した場合は、組み込みの compensation / revoke の挙動に頼り、結果として得られた状態を確認してください。新しい pairing は、前回の試行が使用できないと確認できた後にだけ作成します。

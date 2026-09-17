@@ -39,6 +39,7 @@ mod linux_service_manager;
 mod local_agent_cli;
 mod local_agent_skill;
 mod local_skills;
+mod locale;
 mod macos_credential_helper;
 mod macos_keychain;
 mod macos_permissions;
@@ -135,20 +136,18 @@ fn run() -> Result<ExitCode, String> {
         // SSOT for path/label/port discovery in this process.
         unsafe { std::env::set_var("HERDR_MCP_INSTANCE", name) };
     }
+    let language = locale::resolve(parsed.lang);
     match parsed.command {
         cli::Command::Help { section } => {
-            let text = match section {
-                cli::HelpSection::General => cli::help(),
-                cli::HelpSection::Worker => cli::worker_help(),
-                cli::HelpSection::Connector => cli::connector_help(),
-                cli::HelpSection::Automation => cli::automation_help(),
-                cli::HelpSection::Instance => cli::instance_help(),
-                cli::HelpSection::Qualification => cli::qualification_help(),
-                cli::HelpSection::Continuity => cli::continuity_help(),
-                cli::HelpSection::Memory => cli::memory_help(),
-                cli::HelpSection::WebChat => cli::webchat_help(),
-            };
+            let text = locale::help(section, language);
             print!("{text}");
+            Ok(ExitCode::SUCCESS)
+        }
+        cli::Command::Lang { preference } => {
+            if let Some(value) = preference {
+                locale::save_preference(&locale::preference_path()?, &value)?;
+            }
+            println!("{}", locale::resolve(parsed.lang).code());
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Version => {
@@ -164,13 +163,13 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Status => {
             let paths = paths::RuntimePaths::discover()?;
             let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-            status::print_status(&paths, &config);
+            status::print_status(&paths, &config, language);
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Doctor => {
             let paths = paths::RuntimePaths::discover()?;
             let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-            Ok(if status::print_doctor(&paths, &config) {
+            Ok(if status::print_doctor(&paths, &config, language) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(2)
@@ -252,7 +251,7 @@ fn run() -> Result<ExitCode, String> {
         }
         cli::Command::Instance(command) => instance_admin::run(command),
         cli::Command::Qualification(command) => qualification::run(command),
-        cli::Command::Worker(command) => worker::run(command),
+        cli::Command::Worker(command) => worker::run(command, language),
         cli::Command::AgentSkill(command) => local_agent_skill::run(command),
         cli::Command::Continuity(command) => local_agent_cli::run_continuity(command),
         cli::Command::Memory(command) => local_agent_cli::run_memory(command),
@@ -270,7 +269,7 @@ fn run() -> Result<ExitCode, String> {
                 command,
                 cli::ServiceCommand::Install { .. } | cli::ServiceCommand::Rollback
             );
-            let result = service_lifecycle::run(command)?;
+            let result = service_lifecycle::run_with_locale(command, language)?;
             if refresh_agent_skill && result == ExitCode::SUCCESS {
                 local_agent_skill::sync_after_install_best_effort();
             }

@@ -155,8 +155,8 @@ function headMeta({ pre, locale, canonicalHref, alternates, xDefault, descriptio
   <link rel="stylesheet" href="${pre}style.css">`;
 }
 
-// Language switcher: on article pages it maps the current slug to the other
-// locale's same slug; on locale index pages it maps to the other locale's
+// Language switcher: on article pages it maps the current slug to every other
+// locale's same slug; on locale index pages it maps to every other locale's
 // index. localePrefix is the prefix from the current page directory to the
 // docs root: "../" on /docs/<locale>/ pages.
 function langSwitcher({ locale, localePrefix, slug = null, current = null }) {
@@ -365,12 +365,14 @@ function localeEntryShell({ locale, docsBySlug, searchIndex, version }) {
 }
 
 // Neutral /docs/ entry: no language chooser. Default locale is English, but a
-// zh browser (without an explicit language pin) is routed to the Simplified
-// Chinese docs so the neutral entry never dumps Chinese readers into English.
+// zh or ja browser (without an explicit language pin) is routed to that locale's
+// docs, so the neutral entry never dumps a reader into the wrong language. An
+// explicit saved language choice always wins over browser detection.
 function docsRedirectShell() {
   const ui = UI[DEFAULT_LOCALE];
-  const enHome = `${origin}/docs/en/`;
-  const zhHome = `${origin}/docs/zh-CN/`;
+  const homes = Object.fromEntries(LOCALES.map((locale) => [locale, `./${locale}/`]));
+  const enHome = `${origin}/docs/${DEFAULT_LOCALE}/`;
+  const alternates = LOCALES.map((locale) => ({ lang: locale, href: `${origin}/docs/${locale}/` }));
   return `<!doctype html>
 <html lang="${ui.htmlLang}">
 <head>
@@ -380,19 +382,31 @@ function docsRedirectShell() {
   <meta name="color-scheme" content="light dark">
   <title>herdr-mcp ${esc(ui.docsNav)}</title>
   <link rel="canonical" href="${esc(enHome)}">
-  <link rel="alternate" hreflang="en" href="${esc(enHome)}">
-  <link rel="alternate" hreflang="zh-CN" href="${esc(zhHome)}">
+  ${alternates.map(({ lang, href }) => `<link rel="alternate" hreflang="${lang}" href="${esc(href)}">`).join("\n  ")}
   <link rel="alternate" hreflang="x-default" href="${esc(enHome)}">
-  <meta http-equiv="refresh" content="0; url=./en/">
+  <meta http-equiv="refresh" content="0; url=./${DEFAULT_LOCALE}/">
   <link rel="icon" type="image/png" href="../favicon.png">
   <link rel="stylesheet" href="../style.css">
 </head>
 <body class="docs-index-page">
-  <main class="docs-index"><div class="redirect-note"><span class="eyebrow">${esc(ui.docsNav)}</span><h1>herdr-mcp ${esc(ui.docsNav)}</h1><p>${esc(ui.indexLead)}</p><p class="redirect-links"><a href="./en/">English →</a><a href="./zh-CN/">简体中文</a></p></div></main>
+  <main class="docs-index"><div class="redirect-note"><span class="eyebrow">${esc(ui.docsNav)}</span><h1>herdr-mcp ${esc(ui.docsNav)}</h1><p>${esc(ui.indexLead)}</p><p class="redirect-links">${LOCALES.map((locale) => `<a href="./${locale}/">${esc(LOCALE_NAMES[locale])}</a>`).join("")}</p></div></main>
   <script>
     var langKey = "herdr-docs-lang";
-    var wantsZh = !localStorage.getItem(langKey) && (navigator.languages || [navigator.language]).some(function (l) { return (l || "").toLowerCase().indexOf("zh") === 0; });
-    location.replace(wantsZh ? "./zh-CN/" : "./en/");
+    var homes = ${JSON.stringify(homes)};
+    var fallback = "${DEFAULT_LOCALE}";
+    function pick() {
+      var saved = null;
+      try { saved = localStorage.getItem(langKey); } catch (e) { /* storage blocked */ }
+      if (saved && homes[saved]) return saved;
+      var langs = navigator.languages || [navigator.language];
+      for (var i = 0; i < langs.length; i++) {
+        var tag = (langs[i] || "").toLowerCase();
+        if (tag.indexOf("zh") === 0) return "zh-CN";
+        if (tag.indexOf("ja") === 0) return "ja";
+      }
+      return fallback;
+    }
+    location.replace(homes[pick()]);
   </script>
 </body>
 </html>`;
@@ -447,22 +461,33 @@ for (const locale of LOCALES) {
 }
 
 // Cross-language search: every item also carries the same document's title,
-// headings and blurb from the other locale, so a query typed in either language
-// finds the document from either side of the site.
+// headings and blurb from every other locale, so a query typed in one language
+// finds the document from any side of the site. The number of locales is not
+// fixed: all non-current locales contribute aliases.
+function otherLocaleAliases({ byLocale, locale, slug }) {
+  const aliases = [];
+  for (const other of LOCALES) {
+    if (other === locale) continue;
+    const data = byLocale.get(other);
+    const otherDoc = data.docsBySlug.get(slug);
+    const otherPage = data.rendered.get(slug);
+    if (!otherDoc || !otherPage) continue;
+    aliases.push(otherDoc.title, otherDoc.description, ...otherPage.toc.map((heading) => heading.title));
+  }
+  return [...new Set(aliases)].filter((text) => typeof text === "string" && text.length > 0);
+}
+
 for (const locale of LOCALES) {
   const { docsBySlug, rendered, searchIndex } = byLocale.get(locale);
-  const other = LOCALES.find((lang) => lang !== locale);
-  const otherData = byLocale.get(other);
   for (const item of searchIndex) {
     const slug = item.href.replace(/^\.\//, "").replace(/\.html$/, "");
-    const od = otherData.docsBySlug.get(slug);
-    const op = otherData.rendered.get(slug);
-    if (od && op) {
-      item.aliases = [od.title, od.description, ...op.toc.map((heading) => heading.title)].filter((text) => typeof text === "string" && text.length > 0);
-    }
+    item.aliases = otherLocaleAliases({ byLocale, locale, slug });
   }
-  byLocale.set(locale, { ...byLocale.get(locale), searchIndex });
+  byLocale.set(locale, { docsBySlug, rendered, searchIndex });
+}
 
+for (const locale of LOCALES) {
+  const { docsBySlug, rendered, searchIndex } = byLocale.get(locale);
   const localeOut = join(outDir, "docs", locale);
   await mkdir(localeOut, { recursive: true });
   for (const slug of DOC_ORDER) {

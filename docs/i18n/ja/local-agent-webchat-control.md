@@ -56,7 +56,7 @@ Web 会話はターン単位の遠隔コラボレータです。Herdr-MCP は境
 - Continuity/Work Memory で境界付きに履歴を復元し、その後会話で続ける。
 - ローカル Agent のコード変更後、Web AI planner に引き継ぐ。
 
-複数 WebChat / 複数アカウントの範囲は、返された browser registry と同じ広さです。検査した endpoint について `herdr-mcp webchat resources` が返した `session_ref` だけが操作対象で、返らないものは addressable ではありません。明記がない限り実験的機能として扱うものはありません（「現在の境界」を参照）。
+複数 WebChat / 複数アカウントの範囲は、返された browser registry と同じ広さです。検査した endpoint について `herdr-mcp webchat resources` が返した `session_ref` だけが操作対象で、返らないものは addressable ではありません。明記がない限り実験的機能として扱うものはありません（[現在の境界](#11-現在の境界) を参照）。
 
 ## 3. 使わない場合
 
@@ -348,7 +348,6 @@ Agent は次の順で進めます。
 - **非対応の browser 操作**（runtime は `code: "unsupported"` を返す）：`browser_space.create`、`browser_space.open`、`browser_message.append`、`browser_composer.set_reasoning`、`browser_composer.set_apps`、および `reasoning_effort` か `required_apps` を伴う `browser_dispatch.submit`。
 - **対応しているが現在 CLI ラッパーが無いもの**：`browser_session.open`、`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。runtime MCP の私有メソッド境界から到達でき、ローカル CLI にサブコマンドはありません。
 - **Handoff**：canonical な準備経路は `herdr_mcp.browser_handoff.prepare` で、ローカル Agent は `herdr-mcp webchat handoff` から使います（再利用し、続けて source ベースの配送を行う）。Web planner と extension HUD は引き続き私有メソッドを直接呼びます。`webchat create` は今も `source_url` を受け取らず、対応する handoff フラグもありません。
-- **Handoff**：canonical な準備経路は Web planner と extension HUD が使う私有 `herdr_mcp.browser_handoff.prepare` です。`herdr-mcp webchat handoff` CLI は無く、CLI の `create` は `source_url` を受け取りません。
 - **`ego-browser`** は開発/UAT インフラで、ユーザー依存でも、この control plane の代替でもありません。
 - **公開されていないもの**：ユーザーの非公開 ChatGPT 履歴本文の読み出し、dispatch 契約での添付送信、任意の DOM アクセス、registry が報告しない provider。
 
@@ -356,10 +355,8 @@ Agent は次の順で進めます。
 
 ## 関連ドキュメント
 
-（ja ロケールではこのページのみを公開しているため、関連ページは英語版へリンクします。）
-
-- [Browser continuity](../en/browser-continuity.md) — ページ側の continuity、Auto/Queue、手動 handoff と Copy Prompt。
-- [Browser Control Center](../en/browser-control-center.md) — Chrome Side Panel の workspace/pane/binding 状態。
-- [Browser extension](../en/extension.md) — extension の identity、ローカルセキュリティ境界、JSON → MCP bridge。
-- [CLI reference](../en/cli-reference.md) — `herdr-mcp` の全コマンド面。
-- [Troubleshooting](../en/troubleshooting.md) — runtime、link、ブラウザの診断。
+- [ブラウザ連続性](browser-continuity.md) — ページ側の continuity、Auto/Queue、手動 handoff と Copy Prompt。
+- [Browser Control Center](browser-control-center.md) — Chrome Side Panel の workspace/pane/binding 状態。
+- [ブラウザ拡張](extension.md) — extension の identity、ローカルセキュリティ境界、JSON → MCP bridge。
+- [CLI リファレンス](cli-reference.md) — `herdr-mcp` の全コマンド面。
+- [トラブルシューティング](troubleshooting.md) — runtime、link、ブラウザの診断。

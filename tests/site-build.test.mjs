@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { access, readFile, readdir, rm } from "node:fs/promises";
 import { constants } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import {
   DEFAULT_LOCALE,
   DOC_ORDER,
@@ -15,6 +15,7 @@ import {
   REDIRECTS,
   UI,
 } from "../scripts/site-i18n.mjs";
+import { checkLocale, formatReport } from "../scripts/i18n-doc-parity.mjs";
 
 const ROOT = new URL("../", import.meta.url).pathname;
 const OUT = join(ROOT, "site-dist");
@@ -32,12 +33,99 @@ function matches(text, regex) {
   return [...text.matchAll(regex)];
 }
 
-// First document the docs entries land on; short (sidebar-safe) titles.
+// First document the docs entries land on; short (sidebar-safe) titles per
+// locale. JA_TITLE is the Japanese heading of the same page.
 const FIRST_SLUG = DOC_ORDER[0];
 const EN_TITLE = "Agent install";
 const ZH_TITLE = "Agent 安装";
+const JA_TITLE = "Agent インストール";
 
-test("documentation site build publishes every logical doc x 2 locales under locale-aware URLs", async () => {
+// Locale-specific markers for the same generated page, used to prove the
+// search index and sidebars stay in their own language while aliases stay
+// cross-language.
+const TITLE_MARKERS = { en: /install/i, "zh-CN": /安装/, ja: /インストール/ };
+const HOME_CONTINUATION = {
+  en: /fresh manual conversation can simply say “continue”/,
+  "zh-CN": /手动新开会话后可直接说“继续”/,
+  ja: /手動で新規会話を開いたあと、「続けて」と言うだけで/,
+};
+// Same-slug page content proof for a behavior that must never drift when a
+// page is localized: local continuation confirmation stays confirmation-first.
+const CONTINUITY_CONFIRMATION = {
+  en: /text-only match remains confirmation-required/,
+  "zh-CN": /单纯文本匹配即使只剩一个候选也仍需要用户确认/,
+  ja: /テキストのみの一致は候補が 1 つでもユーザーの確認が必要です/,
+};
+
+test("every locale source directory ships exactly the maintained document set", async () => {
+  const expected = [...DOC_ORDER].sort();
+  for (const locale of LOCALES) {
+    const entries = await readdir(join(ROOT, "docs", "i18n", locale), { withFileTypes: true });
+    const slugs = entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+      .map((entry) => entry.name.replace(/\.md$/, ""))
+      .sort();
+    assert.deepEqual(slugs, expected, `docs/i18n/${locale} must contain exactly the ${DOC_ORDER.length} logical docs`);
+  }
+});
+
+test("site locale configuration keeps UI and navigation parity for every locale", () => {
+  assert.deepEqual(LOCALES, ["en", "zh-CN", "ja"], "EN/ZH-CN/JA are the published locales");
+  assert.equal(DEFAULT_LOCALE, "en", "English stays the default locale");
+  assert.deepEqual(Object.keys(LOCALE_NAMES).sort(), [...LOCALES].sort());
+
+  const enKeys = Object.keys(UI[DEFAULT_LOCALE]).sort();
+  assert.ok(enKeys.length > 0, "the default locale defines the UI key contract");
+  for (const locale of LOCALES) {
+    assert.deepEqual(Object.keys(UI[locale]).sort(), enKeys, `UI key parity for ${locale}`);
+    assert.equal(UI[locale].htmlLang, locale, `html lang for ${locale}`);
+    assert.equal(NAV_GROUP_LABELS[locale].length, NAV_GROUPS.length, `one nav group label per group (${locale})`);
+    assert.equal(LOCALE_NAMES[locale].length > 0, true);
+  }
+
+  // The Japanese locale must be real Japanese product copy, not English filler.
+  const japanese = /[\u3040-\u30ff\u4e00-\u9fff]/;
+  for (const key of ["docsNav", "onThisPage", "previous", "next", "searchHint", "indexTitle", "indexLead", "homeBrowserPathBody", "agentPrompt", "redirectFollow"]) {
+    assert.match(UI.ja[key], japanese, `UI.ja.${key} must be Japanese`);
+    assert.notEqual(UI.ja[key], UI.en[key], `UI.ja.${key} must not reuse the English string`);
+  }
+  assert.match(UI.ja.agentPrompt, /docs\/i18n\/ja\/agent-install\.md/, "the ja agent prompt points at the ja protocol");
+  const englishNavLabels = new Set(NAV_GROUP_LABELS.en);
+  for (const label of NAV_GROUP_LABELS.ja) {
+    assert.match(label, japanese, `nav group label "${label}" must be Japanese`);
+    assert.ok(!englishNavLabels.has(label), `nav group label "${label}" must not be the English label`);
+  }
+});
+
+test("same-slug parity keeps internal doc links resolvable inside every locale", async () => {
+  for (const locale of LOCALES) {
+    const dir = join(ROOT, "docs", "i18n", locale);
+    for (const slug of DOC_ORDER) {
+      const source = await readFile(join(dir, `${slug}.md`), "utf8");
+      for (const match of source.matchAll(/\]\(([^)\s]+\.md)(?:#[^)]*)?\)/g)) {
+        const target = match[1];
+        if (target.startsWith("../")) {
+          await access(join(dir, target), constants.R_OK);
+          continue;
+        }
+        const targetSlug = basename(target, ".md");
+        assert.ok(DOC_ORDER.includes(targetSlug), `${locale}/${slug} links unknown logical doc ${target}`);
+        await access(join(dir, `${targetSlug}.md`), constants.R_OK);
+      }
+    }
+  }
+});
+
+test("Japanese docs mirror the canonical English structure, commands, links, identifiers and numbers", async () => {
+  const report = await checkLocale({ root: ROOT, locale: "ja" });
+  assert.equal(
+    formatReport("ja", report),
+    "",
+    "every ja document must keep the English heading structure, fence sequence, shell commands, machine inline-code, numeric literals and link targets"
+  );
+});
+
+test("documentation site build publishes every logical doc x 3 locales under locale-aware URLs", async () => {
   await rm(OUT, { recursive: true, force: true });
   const env = {
     ...process.env,
@@ -70,7 +158,7 @@ test("documentation site build publishes every logical doc x 2 locales under loc
     }
   }
 
-  for (const rel of ["index.html", "style.css", "app.js", "favicon.png", "zh-CN/index.html", "docs/index.html", "herdr-mcp-SKILL.md", "release.json", ".nojekyll"]) {
+  for (const rel of ["index.html", "style.css", "app.js", "favicon.png", "zh-CN/index.html", "ja/index.html", "docs/index.html", "herdr-mcp-SKILL.md", "release.json", ".nojekyll"]) {
     await access(join(OUT, rel), constants.R_OK);
   }
 
@@ -83,14 +171,19 @@ test("documentation site build publishes every logical doc x 2 locales under loc
 
 test("neutral /docs/ entry routes by browser language to real locale homepages", async () => {
   assert.equal(DEFAULT_LOCALE, "en", "English must be the default locale");
+  assert.deepEqual(LOCALES, ["en", "zh-CN", "ja"], "the documented site is a three-locale surface");
   const entry = await readFile(join(OUT, "docs", "index.html"), "utf8");
   assert.match(entry, /<html lang="en">/);
   assert.doesNotMatch(entry, /data-search-open|data-search-dialog/, "neutral docs entry stays a lightweight locale router");
   assert.match(entry, /<meta http-equiv="refresh" content="0; url=\.\/en\/">/);
   assert.match(entry, /herdr-docs-lang/, "docs entry must carry the language-routing script");
-  assert.match(entry, /location\.replace\(wantsZh \? "\.\/zh-CN\/" : "\.\/en\/"\)/);
-  assert.match(entry, /href="\.\/en\/"/, "fallback link to the English homepage");
-  assert.match(entry, /href="\.\/zh-CN\/"/, "fallback link to the Chinese homepage");
+  assert.match(entry, /if \(saved && homes\[saved\]\) return saved;/, "an explicit saved language choice must win over browser detection");
+  assert.match(entry, /tag\.indexOf\("zh"\) === 0\) return "zh-CN"/, "docs entry must detect a zh browser");
+  assert.match(entry, /tag\.indexOf\("ja"\) === 0\) return "ja"/, "docs entry must detect a ja browser");
+  assert.match(entry, /var fallback = "en"/, "English stays the documented fallback");
+  for (const locale of LOCALES) {
+    assert.match(entry, new RegExp(`href="\\.\\/${locale}\\/"`), `fallback link to the ${locale} homepage`);
+  }
   assert.match(entry, new RegExp(`rel="canonical" href="${ORIGIN}/docs/en/"`));
   assert.deepEqual(
     matches(entry, /rel="alternate" hreflang="([^"]+)"/g).map((m) => m[1]).filter((lang) => lang !== "x-default"),
@@ -138,8 +231,7 @@ test("each locale docs entry is a real user-first homepage", async () => {
     assert.match(homepageMain, /class="agent-prompt" tabindex="0"/, `homepage (${locale}) install prompt must be keyboard-focusable`);
     assert.match(homepageMain, /Chrome Web Store/, `homepage (${locale}) browser path must be Store-first`);
     assert.match(homepageMain, /durable continuity/, `homepage (${locale}) must explain no-ID continuity discovery`);
-    if (locale === "en") assert.match(homepageMain, /fresh manual conversation can simply say “continue”/);
-    else assert.match(homepageMain, /手动新开会话后可直接说“继续”/);
+    assert.match(homepageMain, HOME_CONTINUATION[locale], `homepage (${locale}) must explain the no-ID continuation phrase`);
     assert.doesNotMatch(homepageMain, /\b(?:alpha|candidate|UAT|Runtime A\/B|worktree)\b|G\d+|GA scorecard/i, `homepage main content (${locale}) must keep release-engineering jargon out of the user path`);
   }
 });
@@ -153,8 +245,7 @@ test("article pages carry same-slug language switching, per-locale search isolat
       if (slug === "browser-continuity") {
         assert.match(html, /continuity\.search/);
         assert.match(html, /continuity_id/);
-        if (locale === "en") assert.match(html, /text-only match remains confirmation-required/);
-        else assert.match(html, /单纯文本匹配即使只剩一个候选也仍需要用户确认/);
+        assert.match(html, CONTINUITY_CONFIRMATION[locale], `no-ID continuity confirmation stays fail-closed (${locale})`);
       }
       assert.match(html, /class="topbar has-drawer"/);
       assert.match(html, /data-nav-toggle/);
@@ -185,8 +276,11 @@ test("article pages carry same-slug language switching, per-locale search isolat
           `same-slug switcher maps ${locale}/${slug} -> ${lang}/${slug}`
         );
       }
-      const other = LOCALES.find((lang) => lang !== locale);
-      assert.equal(matches(switcher, new RegExp(`href="\\.\\./${other}/${slug}\\.html"`, "g")).length, 1, `exactly one switch to ${other} same slug (${locale}/${slug})`);
+      const others = LOCALES.filter((lang) => lang !== locale);
+      for (const other of others) {
+        assert.equal(matches(switcher, new RegExp(`href="\\.\\./${other}/${slug}\\.html"`, "g")).length, 1, `exactly one switch to ${other} same slug (${locale}/${slug})`);
+      }
+      assert.equal(matches(switcher, /href="\.\.\/[^"]+\.html"/g).length, LOCALES.length, `switcher exposes exactly one link per locale (${locale}/${slug})`);
       assert.match(html, /class="brand" href="\.\.\/\.\.\/"/);
       assert.match(html, /rel="icon" type="image\/png" href="\.\.\/\.\.\/favicon\.png"/);
 
@@ -244,26 +338,26 @@ test("article pages carry same-slug language switching, per-locale search isolat
       assert.ok(searchDataMatch, `search index must be embedded (${locale}/${slug})`);
       const searchData = JSON.parse(searchDataMatch[1]);
       assert.deepEqual(searchData.map((item) => item.href), DOC_ORDER.map((sl) => `./${sl}.html`));
-      const zhTitles = searchData.some((item) => item.title === ZH_TITLE || item.title.includes("安装"));
-      const enTitles = searchData.some((item) => item.title === EN_TITLE || item.title.includes("Install"));
-      if (locale === "zh-CN") {
-        assert.ok(zhTitles, "zh-CN search index must contain zh-CN titles");
-        assert.ok(!enTitles, "zh-CN search index must not contain en titles as item titles");
-      } else {
-        assert.ok(enTitles, "en search index must contain en titles");
-        assert.ok(!zhTitles, "en search index must not contain zh-CN titles as item titles");
+      const ownMarker = TITLE_MARKERS[locale];
+      assert.ok(searchData.some((item) => ownMarker.test(item.title)), `${locale} search index must contain ${locale} titles`);
+      for (const other of LOCALES.filter((lang) => lang !== locale)) {
+        assert.ok(
+          searchData.every((item) => !TITLE_MARKERS[other].test(item.title)),
+          `${locale} search index must not use ${other} titles as item titles`
+        );
       }
       assert.ok(searchData.every((item) => Array.isArray(item.headings)));
-      // Every item exposes the other locale's same document as searchable aliases.
+      // Every item exposes every other locale's same document as searchable aliases.
       assert.ok(
         searchData.every((item) => Array.isArray(item.aliases) && item.aliases.length > 0),
         `cross-language search aliases (${locale}/${slug})`
       );
       const firstEntry = searchData.find((item) => item.href === `./${FIRST_SLUG}.html`);
-      if (locale === "en") {
-        assert.ok((firstEntry.aliases || []).some((alias) => alias.includes(ZH_TITLE)), "en index aliases the Chinese title");
-      } else {
-        assert.ok((firstEntry.aliases || []).some((alias) => alias.toLowerCase().includes(EN_TITLE.toLowerCase())), "zh-CN index aliases the English title");
+      for (const other of LOCALES.filter((lang) => lang !== locale)) {
+        assert.ok(
+          (firstEntry.aliases || []).some((alias) => TITLE_MARKERS[other].test(alias)),
+          `${locale} index aliases the ${other} title (${locale}/${slug})`
+        );
       }
 
       // Translated search UI blob consumed by app.js.
@@ -297,10 +391,13 @@ test("article pages carry same-slug language switching, per-locale search isolat
   // Sidebar titles stay per-locale; search aliases are cross-locale by design.
   const zn = await readFile(join(OUT, "docs", "zh-CN", `${FIRST_SLUG}.html`), "utf8");
   const en = await readFile(join(OUT, "docs", "en", `${FIRST_SLUG}.html`), "utf8");
+  const ja = await readFile(join(OUT, "docs", "ja", `${FIRST_SLUG}.html`), "utf8");
   const znSidebar = section(zn, '<nav class="sidebar-nav"', "</nav>");
   const enSidebar = section(en, '<nav class="sidebar-nav"', "</nav>");
+  const jaSidebar = section(ja, '<nav class="sidebar-nav"', "</nav>");
   assert.ok(znSidebar.includes(ZH_TITLE) && !znSidebar.includes(EN_TITLE), "zh-CN sidebar stays Chinese");
   assert.ok(enSidebar.includes(EN_TITLE) && !enSidebar.includes(ZH_TITLE), "en sidebar stays English");
+  assert.ok(jaSidebar.includes(JA_TITLE) && !jaSidebar.includes(EN_TITLE) && !jaSidebar.includes(ZH_TITLE), "ja sidebar stays Japanese");
 });
 
 test("shared runtime assets keep theme/drawer/search behavior and gain localized strings", async () => {
@@ -400,6 +497,33 @@ test("release.json, skill artifact and design invariants are preserved", async (
   assert.doesNotMatch(homeZh, /href="\.\.\/docs\/zh-CN\/capability-benchmark\.html"/);
   assert.match(homeZh, /href="\.\.\/" [^>]*hreflang="en"/);
 
+  // JA landing mirror: same structure, Japanese copy, JA docs links and a full
+  // three-locale switcher; the EN landing detects a ja browser too.
+  const homeJa = await readFile(join(OUT, "ja", "index.html"), "utf8");
+  assert.match(homeJa, /<html lang="ja">/);
+  assert.match(homeJa, /rel="icon" type="image\/png" href="\.\.\/favicon\.png"/);
+  assert.ok(matches(homeJa, /\.\.\/docs\/ja\//g).length >= 5, "ja homepage docs links all point at ja docs");
+  assert.doesNotMatch(homeJa, /href="\.\.\/docs\/"/, "ja homepage must not link the bare (English) docs entry");
+  assert.match(homeJa, /href="\.\.\/docs\/ja\/agent-install\.html"/);
+  assert.match(homeJa, /href="\.\.\/docs\/ja\/install\.html"/);
+  assert.match(homeJa, /href="\.\.\/docs\/ja\/privacy\.html"/);
+  assert.match(homeJa, /href="\.\.\/docs\/ja\/troubleshooting\.html"/);
+  assert.match(homeJa, /main\/docs\/i18n\/ja\/agent-install\.md/, "ja homepage install prompt points at the ja protocol");
+  assert.match(homeJa, /Browser Control Center/);
+  assert.doesNotMatch(homeJa, /href="\.\.\/docs\/ja\/runtime-self-upgrade\.html"/);
+  assert.doesNotMatch(homeJa, /href="\.\.\/docs\/ja\/capability-benchmark\.html"/);
+  for (const locale of LOCALES) {
+    const landing = locale === "en" ? home : locale === "zh-CN" ? homeZh : homeJa;
+    assert.match(landing, new RegExp(`hreflang="${locale}"`), `landing (${locale}) advertises its own hreflang`);
+    assert.match(
+      landing,
+      new RegExp(`data-locale="${locale}"`),
+      `landing (${locale}) offers a ${locale} switcher entry`
+    );
+  }
+  assert.match(home, /tag\.indexOf\("ja"\) === 0\) \{ location\.replace\("\.\/ja\/"\); break; \}/, "EN landing routes a ja browser to the ja mirror");
+  assert.match(home, /saved === "ja"\) location\.replace\("\.\/ja\/"\)/, "EN landing honors an explicit saved ja choice");
+
   for (const locale of LOCALES) {
     const control = await readFile(join(OUT, "docs", locale, "browser-control-center.html"), "utf8");
     assert.match(control, /Chrome Side Panel/);
@@ -425,11 +549,14 @@ test("release.json, skill artifact and design invariants are preserved", async (
   const edgeReadme = await readFile(join(ROOT, "edge", "cloudflare", "README.md"), "utf8");
   assert.match(readmeEn, /docs\/i18n\/en\//);
   assert.doesNotMatch(readmeEn, /docs\/i18n\/zh-CN\//);
+  assert.doesNotMatch(readmeEn, /docs\/i18n\/ja\//);
   assert.match(readmeZh, /docs\/i18n\/zh-CN\//);
   assert.doesNotMatch(readmeZh, /docs\/i18n\/en\//);
-  assert.match(readmeJa, /docs\/i18n\/en\//);
+  assert.match(readmeJa, /docs\/i18n\/ja\//, "the Japanese README points at the Japanese maintained docs");
+  assert.doesNotMatch(readmeJa, /docs\/i18n\/en\//, "the Japanese README must not fall back to English doc links");
   assert.doesNotMatch(readmeJa, /docs\/i18n\/zh-CN\//);
   assert.match(readmeJa, /\[English\]\(README\.md\)/);
+  assert.match(readmeJa, /\[简体中文\]\(README\.zh\.md\)/);
   assert.match(edgeReadme, /\.\.\/\.\.\/docs\/i18n\/en\/cloudflare-edge-deployment\.md/);
   assert.match(edgeReadme, /\.\.\/\.\.\/docs\/i18n\/en\/runtime-self-upgrade\.md/);
   assert.doesNotMatch(edgeReadme, /docs\/i18n\/zh-CN\//);

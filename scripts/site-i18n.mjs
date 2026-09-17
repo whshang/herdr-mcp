@@ -10,10 +10,11 @@ export const SITE_ORIGIN_ENV = "HERDR_SITE_ORIGIN";
 export const DEFAULT_ORIGIN = "https://whshang.github.io/herdr-mcp";
 
 // English is the canonical/default locale. The neutral /docs/ router still
-// honors an unpinned zh browser preference before landing on a locale homepage.
+// honors an unpinned zh or ja browser preference before landing on a locale
+// homepage; an explicit saved language choice always wins over detection.
 export const DEFAULT_LOCALE = "en";
-export const LOCALES = ["en", "zh-CN"];
-export const LOCALE_NAMES = { en: "English", "zh-CN": "简体中文" };
+export const LOCALES = ["en", "zh-CN", "ja"];
+export const LOCALE_NAMES = { en: "English", "zh-CN": "简体中文", ja: "日本語" };
 
 // Logical document catalog order — defines sidebar/search/build order in every
 // locale. Maintainer-only references remain discoverable but are deliberately
@@ -73,10 +74,11 @@ export const REDIRECTS = {
 export const NAV_GROUP_LABELS = {
   "zh-CN": ["开始", "使用 herdr-mcp", "浏览器（可选）", "运维与排障", "架构与进阶", "维护者参考"],
   en: ["Start", "Use herdr-mcp", "Browser (optional)", "Operate & troubleshoot", "Architecture & advanced", "Maintainer reference"],
+  ja: ["はじめに", "herdr-mcp を使う", "ブラウザ（任意）", "運用とトラブルシューティング", "アーキテクチャと発展", "メンテナー向けリファレンス"],
 };
 
 // Per-locale user-visible strings. The build fails fast if a label is missing,
-// so both locales must stay complete.
+// so every locale must stay complete against the English key set.
 export const UI = {
   "zh-CN": {
     htmlLang: "zh-CN",
@@ -173,6 +175,103 @@ export const UI = {
     redirectFollow: "此页面已迁移，请跟随新的地址继续阅读 →",
     copyCode: "复制",
     copiedCode: "已复制",
+  },
+  ja: {
+    htmlLang: "ja",
+    docsNav: "ドキュメント",
+    brandHomeAria: "herdr-mcp ホーム",
+    langSwitcherAria: "言語を切り替える",
+    searchTriggerAria: "検索を開く",
+    searchLabel: "検索",
+    searchCloseAria: "検索を閉じる",
+    searchEyebrow: "ドキュメント",
+    searchTitle: "herdr-mcp を検索",
+    searchPlaceholder: "ページやセクションを検索…",
+    searchHint: "入力してドキュメントを検索します。",
+    searchNoResults: "「%s」に一致する結果はありません。",
+    openNav: "ドキュメントナビゲーションを開く",
+    closeNav: "ドキュメントナビゲーションを閉じる",
+    themeToggleAria: "カラーテーマを切り替える",
+    themeToLight: "ライトテーマに切り替える",
+    themeToDark: "ダークテーマに切り替える",
+    docsSidebarAria: "ドキュメント",
+    onThisPage: "このページの内容",
+    tocEmpty: "セクションなし",
+    previous: "前へ",
+    next: "次へ",
+    pageNavAria: "前後のドキュメントページ",
+    docsIndex: "ドキュメント索引",
+    editSource: "ソースを編集",
+    indexEyebrow: "Web AI × ローカル開発現場",
+    indexTitle: "Web AI を、あなたのマシンの長期的な開発パートナーに。",
+    indexLead:
+      "ChatGPT などの Web AI を主要な思考の入口として使い続けます。MCP が安全なローカルツールを与え、Herdr が workspace、ターミナル、サービス、Agent を存続させ、任意のブラウザ拡張がローカルの変化を Web 会話へ戻します。",
+    homeWhyTitle: "なぜ Herdr-MCP か",
+    homeWhyBody: "Web AI のサブスクリプションはすでに強力な推論を提供します。Herdr-MCP はモデルを作り直すことも、特定の coding Agent を要求することもしません。その推論を、実在し、永続し、観測可能で、人間がいつでも引き継げる開発現場に接続します。",
+    homeFlowTitle: "下りの一本道と、任意の戻り経路",
+    homeFlowLead: "MCP が中核の実行経路で、ブラウザ拡張は任意の連続性の戻り経路です。",
+    homeFlowWeb: "Web AI",
+    homeFlowWebBody: "ChatGPT などの Web 会話が主要な planner であり続けます。",
+    homeFlowMcp: "MCP",
+    homeFlowMcpBody: "必要な分だけ読み取り、検索、patch、Git、コマンド実行を行います。",
+    homeFlowHerdr: "Herdr の作業現場",
+    homeFlowHerdrBody: "workspace、PTY、server、Agent はターンをまたいで残ります。",
+    homeFlowReturn: "ブラウザ連続性（任意）",
+    homeFlowReturnBody: "ローカルのイベント、復旧、handoff を Web 会話へ戻せます。",
+    homeValueTitle: "長期的な開発のための設計",
+    homeValueReasoning: "Web AI の推論を再利用",
+    homeValueReasoningBody: "すでに契約して慣れている Web AI を使い続け、ローカル実行のためにもう一つのモデル入口に縛られません。",
+    homeValueWorksite: "永続する作業現場",
+    homeValueWorksiteBody: "会話が終わっても workspace、ターミナル、サービス、分離された作業コピー、Agent は動き続けます。",
+    homeValueParallel: "直接ツール + 任意の Agent",
+    homeValueParallelBody: "小さな作業は決定的なツールで直接実行し、複雑な作業は交換可能なローカル Agent に並行して任せます。",
+    homeValueLoop: "任意の双方向ループ",
+    homeValueLoopBody: "無人ジョブ、ページ復旧、会話をまたぐ引き継ぎに戻り経路が必要なときだけブラウザ拡張をインストールします。",
+    homeResearchTitle: "なぜもう一つのプロジェクトが必要か",
+    homeResearchBody: "Coding MCP、永続 Runtime、リモート Worker、Codex-first Bridge はいずれも成立する路線です。Herdr-MCP は Web-first + persistent worksite の組み合わせに集中します。",
+    homeResearchLink: "エコシステムとアーキテクチャの比較を読む",
+    indexCtaConnect: "Agent にインストールさせる",
+    indexCtaArchitecture: "概要",
+    indexCtaDeploy: "ChatGPT に接続",
+    indexHome: "ホーム",
+    indexSource: "ソース",
+    indexFooterAria: "ドキュメント索引のフッターナビゲーション",
+    versionBadgeAria: "ソースバージョン",
+    agentIntroTitle: "最短ルート：coding Agent に直接インストールさせる",
+    agentIntroLead:
+      "次のプロンプトをローカルの coding Agent に渡してください。まずインストールプロトコル全体を読み、あなた自身の操作が必要ない手順はすべて自動化させます。",
+    agentPrompt:
+      "Herdr と herdr-mcp をインストールして設定してください。まず次のガイドを最初から最後まで読み、そのとおりに実行してください：https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/ja/agent-install.md 。ローカルの herdr-mcp runtime は git clone ではなく GitHub Releases からインストールします。私自身が Cloudflare へのサインイン / API Token の作成を行う場面と、ChatGPT に herdr Connector/アプリを追加する場面だけ停止して私に指示を求めてください。それ以外はすべて自動化して検証してください。",
+    agentSkillLink: "Agent インストールプロトコルの全文を読む",
+    homeWillDoTitle: "coding Agent が行うこと",
+    homeWillDoLead: "インストール、デプロイ、検証を自動化し、あなた本人が必要な identity 手順でだけ停止します。",
+    homeWillDoHerdr: "Herdr を確認またはインストールし、stable な herdr-mcp を GitHub Releases からインストールします。",
+    homeWillDoEdge: "Edge + Link をデプロイして設定し、Web AI がローカルの Herdr へ安全に到達できるようにします。",
+    homeWillDoVerify: "runtime / doctor の検証を実行し、問題があれば先に修正してから続けます。",
+    homeHandoffsTitle: "あなたが引き継ぐのは 2 回だけ",
+    homeCloudflareTitle: "1. Cloudflare のサインイン / Token",
+    homeCloudflareBody: "Agent が正しいページへ案内します。サインインまたは必要な Token の作成後に、制御を Agent へ戻してください。",
+    homeChatgptTitle: "2. ChatGPT Connector",
+    homeChatgptBody: "ChatGPT で herdr Connector を追加して OAuth を完了します。残りの設定と検証は Agent が続けます。",
+    homePathsTitle: "経路を選択",
+    homeAgentPathTitle: "Agent によるインストール（推奨）",
+    homeAgentPathBody: "上のプロンプトをコピーし、coding Agent にプロトコル全体を実行させます。",
+    homeManualPathTitle: "手動インストール",
+    homeManualPathBody: "すべての手順を自分で制御したい場合は、手動インストールのリファレンスを使います。",
+    homeBrowserPathTitle: "ブラウザ拡張（任意）",
+    homeBrowserPathBody: "Chrome Web Store からインストールし、会話の引き継ぎ、status HUD、Browser Control Center に使います。バインド済みの ChatGPT Project で手動で新規会話を開いたあと、「続けて」と言うだけで、Herdr が先に durable continuity を検索し、identity が曖昧なときだけ確認を求めます。",
+    homeOutcomesTitle: "インストール後に得られるもの",
+    homeOutcome1: "ローカルの Herdr workspace / Agent への安全なリモート MCP アクセス。",
+    homeOutcome2: "安定した ChatGPT Connector 経路と、evidence に基づくローカル Agent 能力の把握。",
+    homeOutcome3: "任意のブラウザ連続性・操作サーフェス、および安全な更新と rollback。",
+    homeSafetyTitle: "安全境界",
+    homeSafetyBody: "ブラウザページが長期的なローカル bearer を保持することはありません。Native Messaging は完全な拡張 identity とともにローカルに留まります。runtime と extension は独立して更新され、mutation は対象と delivery の状態を判定できるままです。",
+    homeSupportTitle: "さらに詳しく知りたい場合",
+    homeHistory: "履歴とリリースの evidence",
+    historyNav: "History / 履歴 evidence",
+    redirectFollow: "このページは移動しました。新しいアドレスへ進んでください →",
+    copyCode: "コピー",
+    copiedCode: "コピーしました",
   },
   en: {
     htmlLang: "en",
