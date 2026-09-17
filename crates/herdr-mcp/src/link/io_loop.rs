@@ -661,11 +661,7 @@ where
                 TransportAction::ScheduleReconnect(schedule) => {
                     if self.attempt_pre_online {
                         self.attempt_pre_online = false;
-                        let failed_route = self.ladder.current_route().clone();
-                        let advanced = self.ladder.record_failure();
-                        if advanced && failed_route.kind == TransportRouteKind::DirectWorkersDev {
-                            self.spawn_direct_hosts_recovery(failed_route.endpoint_url);
-                        }
+                        self.ladder.record_failure();
                     }
                     if !self.stopping {
                         self.arm_reconnect(schedule);
@@ -855,25 +851,6 @@ where
     fn cancel_offline_recycle(&mut self) {
         self.offline_recycle_generation = self.offline_recycle_generation.saturating_add(1);
         abort_task(&mut self.offline_recycle_timer);
-    }
-
-    fn spawn_direct_hosts_recovery(&mut self, endpoint: String) {
-        self.cancel_direct_recovery();
-        self.direct_recovery_generation = self.direct_recovery_generation.saturating_add(1);
-        let generation = self.direct_recovery_generation;
-        let event_tx = self.event_tx.clone();
-        self.direct_recovery_task = Some(tokio::spawn(async move {
-            let recovered = tokio::task::spawn_blocking(move || {
-                crate::worker_bootstrap::recover_workers_dev_direct_noninteractive(&endpoint)
-                    .unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false);
-            let _ = event_tx.send(LoopEvent::DirectRecoveryCompleted {
-                generation,
-                recovered,
-            });
-        }));
     }
 
     fn arm_direct_recovery(&mut self) {
