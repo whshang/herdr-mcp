@@ -2417,6 +2417,53 @@ fn report_workers_dev_hosts_recovery(edge_origin: &str) {
 }
 
 fn persist_workers_dev_hosts_mapping(edge_origin: &str) -> Result<bool, String> {
+    persist_workers_dev_hosts_mapping_with_mode(edge_origin, true)
+}
+
+pub(crate) fn recover_workers_dev_direct_noninteractive(endpoint: &str) -> Result<bool, String> {
+    let edge_origin = workers_dev_origin_from_endpoint(endpoint)?;
+    if probe_workers_dev_origin_direct(&edge_origin).is_ok() {
+        return Ok(true);
+    }
+    persist_workers_dev_hosts_mapping_with_mode(&edge_origin, false)?;
+    probe_workers_dev_origin_direct(&edge_origin).map(|_| true)
+}
+
+pub(crate) fn probe_workers_dev_direct(endpoint: &str) -> Result<bool, String> {
+    let edge_origin = workers_dev_origin_from_endpoint(endpoint)?;
+    probe_workers_dev_origin_direct(&edge_origin).map(|_| true)
+}
+
+fn probe_workers_dev_origin_direct(edge_origin: &str) -> Result<(), String> {
+    let client = EdgeHttpClient::direct()?;
+    probe_edge_transport(&client, edge_origin).map_err(EdgeHealthProbeError::into_message)
+}
+
+fn workers_dev_origin_from_endpoint(endpoint: &str) -> Result<String, String> {
+    let mut url = endpoint
+        .parse::<url::Url>()
+        .map_err(|_| "workers.dev Link endpoint is not a valid URL".to_owned())?;
+    if !matches!(url.scheme(), "https" | "wss") {
+        return Err("workers.dev Link endpoint must use HTTPS or WSS".to_owned());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "workers.dev Link endpoint has no hostname".to_owned())?;
+    if !host.ends_with(".workers.dev") {
+        return Err("Link endpoint is not a workers.dev origin".to_owned());
+    }
+    url.set_scheme("https")
+        .map_err(|_| "cannot normalize workers.dev Link endpoint".to_owned())?;
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+fn persist_workers_dev_hosts_mapping_with_mode(
+    edge_origin: &str,
+    allow_interactive_sudo: bool,
+) -> Result<bool, String> {
     let host = edge_origin_host(edge_origin)?;
     if !host.ends_with(".workers.dev") {
         return Ok(false);
@@ -2434,7 +2481,7 @@ fn persist_workers_dev_hosts_mapping(edge_origin: &str) -> Result<bool, String> 
     if updated == current {
         return Ok(false);
     }
-    write_system_hosts(&hosts_path, &updated)?;
+    write_system_hosts(&hosts_path, &updated, allow_interactive_sudo)?;
     let verified = fs::read_to_string(&hosts_path).map_err(|error| {
         format!(
             "cannot verify {} after update: {error}",
@@ -2534,7 +2581,11 @@ fn system_hosts_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn write_system_hosts(path: &Path, content: &str) -> Result<(), String> {
+fn write_system_hosts(
+    path: &Path,
+    content: &str,
+    allow_interactive_sudo: bool,
+) -> Result<(), String> {
     match fs::write(path, content) {
         Ok(()) => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
@@ -2567,7 +2618,8 @@ fn write_system_hosts(path: &Path, content: &str) -> Result<(), String> {
     };
 
     let mut written = try_sudo(true).unwrap_or(false);
-    if !written && io::stdin().is_terminal() && io::stderr().is_terminal() {
+    if !written && allow_interactive_sudo && io::stdin().is_terminal() && io::stderr().is_terminal()
+    {
         written = try_sudo(false)?;
     }
     let _ = fs::remove_file(&temp);
@@ -2582,7 +2634,11 @@ fn write_system_hosts(path: &Path, content: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn write_system_hosts(path: &Path, content: &str) -> Result<(), String> {
+fn write_system_hosts(
+    path: &Path,
+    content: &str,
+    _allow_interactive_sudo: bool,
+) -> Result<(), String> {
     fs::write(path, content).map_err(|error| {
         format!(
             "cannot update {}: {error}; rerun Worker bootstrap/connect from an elevated PowerShell or Terminal",
@@ -2592,7 +2648,11 @@ fn write_system_hosts(path: &Path, content: &str) -> Result<(), String> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn write_system_hosts(_path: &Path, _content: &str) -> Result<(), String> {
+fn write_system_hosts(
+    _path: &Path,
+    _content: &str,
+    _allow_interactive_sudo: bool,
+) -> Result<(), String> {
     Err("system hosts recovery is unsupported on this platform".to_owned())
 }
 

@@ -558,6 +558,30 @@ impl TransportLadder {
         self.current_index
     }
 
+    /// Prefer the validated direct workers.dev route after a recovery probe.
+    /// Explicit HERDR_LINK_PROXY remains authoritative and is never jumped over.
+    pub fn arm_direct_workers_dev_recovery(&mut self) -> bool {
+        if self.routes.first().is_some_and(|route| {
+            route.kind == TransportRouteKind::LocalProxy
+                && route
+                    .proxy
+                    .as_ref()
+                    .is_some_and(|proxy| proxy.source == ProxySource::HerdrLinkProxy)
+        }) {
+            return false;
+        }
+        let Some(index) = self
+            .routes
+            .iter()
+            .position(|route| route.kind == TransportRouteKind::DirectWorkersDev)
+        else {
+            return false;
+        };
+        self.current_index = index;
+        self.consecutive_failures = 0;
+        true
+    }
+
     /// Select the first route of `kind` before the ladder has gone online.
     ///
     /// This is deliberately a one-time initial-selection seam for diagnostics
@@ -1183,6 +1207,63 @@ mod tests {
         // Second failure moves to route 2
         assert!(ladder.record_failure());
         assert_eq!(ladder.current_index(), 2);
+    }
+
+    #[test]
+    fn direct_recovery_reselects_workers_dev_from_relay() {
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/w1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::SharedRelay,
+                endpoint_url: "wss://relay.test/v1/worker.workers.dev/ws/w1".to_owned(),
+                proxy: None,
+                relay_id: Some("relay-1".to_owned()),
+            },
+        ];
+        let mut ladder = TransportLadder::new(routes, 1).unwrap();
+        assert!(ladder.record_failure());
+        assert_eq!(ladder.current_route().kind, TransportRouteKind::SharedRelay);
+        assert!(ladder.arm_direct_workers_dev_recovery());
+        assert_eq!(
+            ladder.current_route().kind,
+            TransportRouteKind::DirectWorkersDev
+        );
+        assert_eq!(ladder.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn direct_recovery_preserves_explicit_herdr_proxy_authority() {
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::LocalProxy,
+                endpoint_url: "wss://worker.workers.dev/ws/w1".to_owned(),
+                proxy: Some(ResolvedProxy {
+                    url: "http://127.0.0.1:7890".to_owned(),
+                    source: ProxySource::HerdrLinkProxy,
+                }),
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/w1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::SharedRelay,
+                endpoint_url: "wss://relay.test/v1/worker.workers.dev/ws/w1".to_owned(),
+                proxy: None,
+                relay_id: Some("relay-1".to_owned()),
+            },
+        ];
+        let mut ladder = TransportLadder::new(routes, 1).unwrap();
+        assert!(!ladder.arm_direct_workers_dev_recovery());
+        assert_eq!(ladder.current_route().kind, TransportRouteKind::LocalProxy);
     }
 
     #[test]
