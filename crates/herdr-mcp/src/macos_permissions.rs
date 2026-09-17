@@ -912,9 +912,12 @@ mod tests {
         assert!(zh.required.contains("完全磁盘访问权限"));
         assert!(ja.required.contains("フルディスクアクセス"));
         for copy in [en, zh, ja] {
+            assert!(!copy.locate_error.trim().is_empty());
+            assert!(!copy.state_error.trim().is_empty());
             assert!(copy.verify.contains("herdr-mcp permissions verify"));
             assert!(copy.setup.contains("herdr-mcp permissions setup"));
             assert!(!copy.target.trim().is_empty());
+            assert!(!copy.open_error.trim().is_empty());
         }
     }
 

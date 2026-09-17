@@ -121,7 +121,7 @@ fn parse_apple_languages(output: &str) -> Option<Locale> {
         .find_map(|item| Locale::environment(item.trim().trim_matches('"')))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn read_preferred_language(command: &mut std::process::Command) -> Option<Locale> {
     use std::io::Read;
     use std::process::Stdio;
