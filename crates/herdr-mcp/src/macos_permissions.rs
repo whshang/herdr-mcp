@@ -383,6 +383,55 @@ fn run_setup(upgrade_broker: bool) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy)]
+struct PermissionOnboardingCopy {
+    locate_error: &'static str,
+    state_error: &'static str,
+    required: &'static str,
+    target: &'static str,
+    verify: &'static str,
+    setup: &'static str,
+    open_error: &'static str,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn permission_onboarding_copy(language: crate::locale::Locale) -> PermissionOnboardingCopy {
+    PermissionOnboardingCopy {
+        locate_error: language.text(
+            "macOS permissions: unable to locate stable broker",
+            "macOS 权限：无法定位稳定 broker",
+            "macOS 権限: stable broker を特定できません",
+        ),
+        state_error: language.text(
+            "macOS permissions: unable to read onboarding state",
+            "macOS 权限：无法读取引导状态",
+            "macOS 権限: onboarding 状態を読み取れません",
+        ),
+        required: language.text(
+            "macOS permissions: Full Disk Access is required for uninterrupted access to protected project folders",
+            "macOS 权限：要持续访问受保护的项目目录，需要授予“完全磁盘访问权限”",
+            "macOS 権限: 保護されたプロジェクトフォルダへ継続的にアクセスするには「フルディスクアクセス」が必要です",
+        ),
+        target: language.text("permission target", "授权目标", "権限付与対象"),
+        verify: language.text(
+            "after granting access, run `herdr-mcp permissions verify`",
+            "授权完成后运行 `herdr-mcp permissions verify`",
+            "権限を付与した後に `herdr-mcp permissions verify` を実行してください",
+        ),
+        setup: language.text(
+            "run `herdr-mcp permissions setup` to open Full Disk Access settings",
+            "运行 `herdr-mcp permissions setup` 打开“完全磁盘访问权限”设置",
+            "`herdr-mcp permissions setup` を実行して「フルディスクアクセス」設定を開いてください",
+        ),
+        open_error: language.text(
+            "macOS permissions: could not open Full Disk Access settings",
+            "macOS 权限：无法打开“完全磁盘访问权限”设置",
+            "macOS 権限: 「フルディスクアクセス」設定を開けませんでした",
+        ),
+    }
+}
+
 /// Best-effort completion step for an interactive macOS install.
 ///
 /// The service transaction is already committed before this runs. Failure to
@@ -390,22 +439,26 @@ fn run_setup(upgrade_broker: bool) -> Result<ExitCode, String> {
 /// stable broker is installed separately during install preflight; this step
 /// only asks the user to authorize that stable broker once.
 #[cfg(target_os = "macos")]
-pub(crate) fn post_service_install_onboarding(instance_is_named: bool) {
+pub(crate) fn post_service_install_onboarding(
+    instance_is_named: bool,
+    language: crate::locale::Locale,
+) {
     if instance_is_named {
         return;
     }
 
+    let copy = permission_onboarding_copy(language);
     let config_dir = match crate::paths::RuntimePaths::discover() {
         Ok(paths) => paths.config_dir,
         Err(error) => {
-            eprintln!("macOS permissions: unable to locate stable broker: {error}");
+            eprintln!("{}: {error}", copy.locate_error);
             return;
         }
     };
     let pending = match authorization_required(&config_dir) {
         Ok(pending) => pending,
         Err(error) => {
-            eprintln!("macOS permissions: unable to read onboarding state: {error}");
+            eprintln!("{}: {error}", copy.state_error);
             return;
         }
     };
@@ -414,23 +467,21 @@ pub(crate) fn post_service_install_onboarding(instance_is_named: bool) {
     }
     let broker_path = tcc_broker::broker_path(&config_dir);
 
-    eprintln!(
-        "macOS permissions: Full Disk Access is required for uninterrupted access to protected project folders"
-    );
-    eprintln!("permission target: {}", broker_path.display());
-    eprintln!("after granting access, run `herdr-mcp permissions verify`");
+    eprintln!("{}", copy.required);
+    eprintln!("{}: {}", copy.target, broker_path.display());
+    eprintln!("{}", copy.verify);
 
     let interactive = std::io::stdin().is_terminal()
         || std::io::stdout().is_terminal()
         || std::io::stderr().is_terminal();
     let dry_run = std::env::var_os("HERDR_MCP_PERMISSIONS_DRY_RUN").is_some();
     if !should_open_full_disk_access_onboarding(PermissionState::NeedsSetup, interactive, dry_run) {
-        eprintln!("run `herdr-mcp permissions setup` to open Full Disk Access settings");
+        eprintln!("{}", copy.setup);
         return;
     }
 
     if let Err(error) = open_full_disk_access_settings() {
-        eprintln!("macOS permissions: could not open Full Disk Access settings: {error}");
+        eprintln!("{}: {error}", copy.open_error);
     }
 }
 
@@ -848,6 +899,23 @@ mod tests {
         assert!(!PermissionState::Unknown.doctor_pass());
         assert_eq!(PermissionState::NotApplicable.as_str(), "not_applicable");
         assert!(PermissionState::NotApplicable.doctor_pass());
+    }
+
+    #[test]
+    fn install_onboarding_copy_tracks_cli_locale() {
+        use crate::locale::Locale;
+
+        let en = permission_onboarding_copy(Locale::En);
+        let zh = permission_onboarding_copy(Locale::ZhCn);
+        let ja = permission_onboarding_copy(Locale::Ja);
+        assert!(en.required.contains("Full Disk Access"));
+        assert!(zh.required.contains("完全磁盘访问权限"));
+        assert!(ja.required.contains("フルディスクアクセス"));
+        for copy in [en, zh, ja] {
+            assert!(copy.verify.contains("herdr-mcp permissions verify"));
+            assert!(copy.setup.contains("herdr-mcp permissions setup"));
+            assert!(!copy.target.trim().is_empty());
+        }
     }
 
     #[test]

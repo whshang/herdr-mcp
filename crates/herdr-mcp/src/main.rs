@@ -251,7 +251,7 @@ fn run() -> Result<ExitCode, String> {
         }
         cli::Command::Instance(command) => instance_admin::run(command),
         cli::Command::Qualification(command) => qualification::run(command),
-        cli::Command::Worker(command) => worker::run(command),
+        cli::Command::Worker(command) => worker::run(command, language),
         cli::Command::AgentSkill(command) => local_agent_skill::run(command),
         cli::Command::Continuity(command) => local_agent_cli::run_continuity(command),
         cli::Command::Memory(command) => local_agent_cli::run_memory(command),
@@ -269,7 +269,7 @@ fn run() -> Result<ExitCode, String> {
                 command,
                 cli::ServiceCommand::Install { .. } | cli::ServiceCommand::Rollback
             );
-            let result = service_lifecycle::run(command)?;
+            let result = service_lifecycle::run_with_locale(command, language)?;
             if refresh_agent_skill && result == ExitCode::SUCCESS {
                 local_agent_skill::sync_after_install_best_effort();
             }

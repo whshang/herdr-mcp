@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::instance::InstanceId;
 #[cfg(target_os = "macos")]
 use crate::link::ownership::LINK_PROD_LABEL;
+use crate::locale::Locale;
 use crate::paths::RuntimePaths;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use reqwest::blocking::{Client, Response};
@@ -300,10 +301,16 @@ fn worker_command_requires_supported_workstation(command: &WorkerCommand) -> boo
     )
 }
 
-pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
+pub fn run(command: WorkerCommand, language: Locale) -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     if paths.instance.is_named() {
-        return Err("Worker pairing is available only on the default Herdr instance".to_owned());
+        return Err(language
+            .text(
+                "Worker pairing is available only on the default Herdr instance",
+                "Worker 配对仅可用于默认 Herdr 实例",
+                "Worker pairing は既定の Herdr instance でのみ利用できます",
+            )
+            .to_owned());
     }
     #[cfg(target_os = "linux")]
     if worker_command_requires_supported_workstation(&command) {
@@ -311,7 +318,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     }
     match command {
         WorkerCommand::List => list_devices(&paths),
-        WorkerCommand::Bootstrap => crate::worker_bootstrap::run(&paths),
+        WorkerCommand::Bootstrap => crate::worker_bootstrap::run(&paths, language),
         WorkerCommand::Update => {
             let result = crate::worker_bootstrap::update_current_worker(&paths)?;
             print_json(&result)?;
@@ -326,13 +333,14 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             ttl_seconds,
             name.as_deref(),
             recover_device_id.as_deref(),
+            language,
         ),
         WorkerCommand::Connect {
             pairing_address,
             name,
         } => {
             let name = name.or_else(crate::device_name::system_device_display_name);
-            connect_existing_worker(&paths, &pairing_address, name.as_deref())
+            connect_existing_worker(&paths, &pairing_address, name.as_deref(), language)
         }
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
@@ -342,7 +350,9 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             credential_verifier_sha256,
         } => apply_device_credential_repair(&paths, &device_id, &credential_verifier_sha256),
         WorkerCommand::CredentialRepairFinalize => finalize_device_credential_repair(&paths),
-        WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
+        WorkerCommand::ConnectorApprove { request_id } => {
+            approve_connector(&paths, &request_id, language)
+        }
         WorkerCommand::ConnectorCancel { request_id } => cancel_connector(&paths, &request_id),
         WorkerCommand::ConnectorList { include_all } => list_connectors(&paths, include_all),
         WorkerCommand::ConnectorRevoke { connector_id } => revoke_connector(&paths, &connector_id),
@@ -720,9 +730,78 @@ fn create_pairing(
     _paths: &RuntimePaths,
     _ttl_seconds: u64,
     _name: Option<&str>,
+    _recover_device_id: Option<&str>,
+    language: Locale,
 ) -> Result<ExitCode, String> {
-    Err("worker pair is supported on macOS, Linux, and Windows enrolled devices; this platform has no supported enrolled-device credential backend"
-        .to_owned())
+    Err(language.text(
+        "worker pair is supported on macOS, Linux, and Windows enrolled devices; this platform has no supported enrolled-device credential backend",
+        "worker pair 支持 macOS、Linux 和 Windows 已登记设备；当前平台没有受支持的设备凭据后端",
+        "worker pair は macOS、Linux、Windows の登録済みデバイスで利用できます。このプラットフォームには対応するデバイス資格情報 backend がありません",
+    ).to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn pairing_created_text(
+    language: Locale,
+    edge_origin: &str,
+    pairing_address: &str,
+    code: &str,
+    expires_at: Option<&str>,
+    ttl_seconds: u64,
+) -> String {
+    let docs_locale = match language {
+        Locale::En => "en",
+        Locale::ZhCn => "zh-CN",
+        Locale::Ja => "ja",
+    };
+    let created = match language {
+        Locale::En => format!("Pairing created for Worker {edge_origin}"),
+        Locale::ZhCn => format!("已为 Worker {edge_origin} 创建配对"),
+        Locale::Ja => format!("Worker {edge_origin} の pairing を作成しました"),
+    };
+    let validity = match language {
+        Locale::En => format!("Valid for at most {ttl_seconds} seconds; use it immediately."),
+        Locale::ZhCn => format!("最多有效 {ttl_seconds} 秒，请立即使用。"),
+        Locale::Ja => format!("有効時間は最大 {ttl_seconds} 秒です。すぐに使用してください。"),
+    };
+    let agent_prompt = match language {
+        Locale::En => format!(
+            "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/{docs_locale}/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {pairing_address}  Then enter the separately displayed 6-digit verification code at the visible CLI prompt (the code is never part of the copyable command)."
+        ),
+        Locale::ZhCn => format!(
+            "请按照 https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/{docs_locale}/existing-worker-connect.md 把这台电脑连接到我现有的 Herdr Worker。配对地址：{pairing_address}  然后只在可见的 CLI 提示中输入单独显示的 6 位验证码（验证码绝不会包含在可复制命令中）。"
+        ),
+        Locale::Ja => format!(
+            "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/{docs_locale}/existing-worker-connect.md に従い、このコンピュータを既存の Herdr Worker に接続してください。Pairing アドレス: {pairing_address}  その後、別に表示された 6 桁の確認コードを可視の CLI プロンプトにだけ入力してください（コードはコピー可能なコマンドには含まれません）。"
+        ),
+    };
+    let mut out = format!(
+        "{created}\n\n{}: {pairing_address}\n{}: {}\n",
+        language.text("Pairing address", "配对地址", "Pairing アドレス"),
+        language.text("Verification code", "验证码", "確認コード"),
+        format_pairing_code(code),
+    );
+    if let Some(expires_at) = expires_at {
+        out.push_str(&format!(
+            "{}: {expires_at} (UTC)\n",
+            language.text("Expires at", "过期时间", "有効期限")
+        ));
+    }
+    out.push_str(&format!(
+        "{validity}\n\n{}\n  herdr-mcp worker connect \"{pairing_address}\"\n{}\n\n{}\n{agent_prompt}\n",
+        language.text("On the new computer, run:", "在新电脑上运行：", "新しいコンピュータで実行してください："),
+        language.text(
+            "and enter the verification code when prompted.",
+            "然后在提示时输入验证码。",
+            "その後、プロンプトに従って確認コードを入力してください。",
+        ),
+        language.text(
+            "Agent prompt (copy to the new computer's Coding Agent):",
+            "Agent 提示词（复制到新电脑的 Coding Agent）：",
+            "Agent プロンプト（新しいコンピュータの Coding Agent にコピー）：",
+        ),
+    ));
+    out
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -731,6 +810,7 @@ fn create_pairing(
     ttl_seconds: u64,
     name: Option<&str>,
     recover_device_id: Option<&str>,
+    language: Locale,
 ) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let owner = resolve_fleet_link_identity(paths, &config)?;
@@ -768,23 +848,17 @@ fn create_pairing(
         .ok_or_else(|| "device pairing creation returned no expiry".to_owned())?;
 
     let pairing_address = format!("{}/pair#{}", owner.edge_origin, pairing_id);
-    println!("Pairing created for Worker {}", owner.edge_origin);
-    println!();
-    println!("Pairing address: {}", pairing_address);
-    println!("Verification code: {}", format_pairing_code(code));
-    if let Some(expires_at) = format_pairing_expiry(expires_at_ms) {
-        println!("Expires at: {expires_at} (UTC)");
-    }
-    println!("Valid for at most {ttl_seconds} seconds; use it immediately.");
-    println!();
-    println!("On the new computer, run:");
-    println!("  herdr-mcp worker connect \"{}\"", pairing_address);
-    println!("and enter the verification code when prompted.");
-    println!();
-    println!("Agent prompt (copy to the new computer's Coding Agent):");
-    println!(
-        "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Then enter the separately displayed 6-digit verification code at the visible CLI prompt (the code is never part of the copyable command).",
-        pairing_address
+    let expires_at = format_pairing_expiry(expires_at_ms);
+    print!(
+        "{}",
+        pairing_created_text(
+            language,
+            &owner.edge_origin,
+            &pairing_address,
+            code,
+            expires_at.as_deref(),
+            ttl_seconds,
+        )
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -794,8 +868,15 @@ fn connect_existing_worker(
     _paths: &RuntimePaths,
     _pairing_address: &str,
     _name: Option<&str>,
+    language: Locale,
 ) -> Result<ExitCode, String> {
-    Err("worker connect is unsupported on this platform".to_owned())
+    Err(language
+        .text(
+            "worker connect is unsupported on this platform",
+            "当前平台不支持 worker connect",
+            "このプラットフォームでは worker connect を利用できません",
+        )
+        .to_owned())
 }
 
 #[cfg(target_os = "windows")]
@@ -803,9 +884,10 @@ fn connect_existing_worker(
     paths: &RuntimePaths,
     pairing_address: &str,
     name: Option<&str>,
+    language: Locale,
 ) -> Result<ExitCode, String> {
     let (edge_origin, pairing_id) = parse_pairing_address(pairing_address)?;
-    let code = read_pairing_code_tty()?;
+    let code = read_pairing_code_tty(language)?;
     connect_macos_inner(
         paths,
         &edge_origin,
@@ -828,6 +910,7 @@ fn connect_existing_worker(
     paths: &RuntimePaths,
     pairing_address: &str,
     name: Option<&str>,
+    language: Locale,
 ) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     connect_existing_worker_flow(
@@ -836,7 +919,7 @@ fn connect_existing_worker(
         name,
         &config,
         || extension_fleet_snapshot(paths),
-        read_pairing_code_tty,
+        || read_pairing_code_tty(language),
         |paths, edge_origin, pairing_id, code, name| {
             connect_macos_inner(
                 paths,
@@ -862,6 +945,7 @@ fn connect_existing_worker(
     paths: &RuntimePaths,
     pairing_address: &str,
     name: Option<&str>,
+    language: Locale,
 ) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     connect_existing_worker_flow(
@@ -870,7 +954,7 @@ fn connect_existing_worker(
         name,
         &config,
         || extension_fleet_snapshot(paths),
-        read_pairing_code_tty,
+        || read_pairing_code_tty(language),
         |paths, edge_origin, pairing_id, code, name| {
             connect_macos_inner(
                 paths,
@@ -1088,42 +1172,59 @@ fn connector_service_ready(status: &Value) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_connector_local_runtime_ready() -> Result<(), String> {
+fn ensure_connector_local_runtime_ready(language: Locale) -> Result<(), String> {
     let service = crate::service_manager::doctor_status()?;
     if !connector_service_ready(&service) {
-        return Err(
-            "local herdr-mcp service is not ready; run `herdr-mcp service start`, verify `herdr-mcp service status`, then retry this approval command"
-                .to_owned(),
-        );
+        return Err(language.text(
+            "local herdr-mcp service is not ready; run `herdr-mcp service start`, verify `herdr-mcp service status`, then retry this approval command",
+            "本机 herdr-mcp 服务未就绪；请运行 `herdr-mcp service start`，用 `herdr-mcp service status` 确认后再重试批准命令",
+            "ローカル herdr-mcp サービスが準備できていません。`herdr-mcp service start` を実行し、`herdr-mcp service status` で確認してから承認コマンドを再試行してください",
+        ).to_owned());
     }
     if !crate::herdr_supervisor::connector_ready()? {
-        return Err(
-            "local Herdr server is not ready; run `herdr-mcp herdr-supervisor start`, verify `herdr-mcp herdr-supervisor status`, then retry this approval command"
-                .to_owned(),
-        );
+        return Err(language.text(
+            "local Herdr server is not ready; run `herdr-mcp herdr-supervisor start`, verify `herdr-mcp herdr-supervisor status`, then retry this approval command",
+            "本机 Herdr server 未就绪；请运行 `herdr-mcp herdr-supervisor start`，用 `herdr-mcp herdr-supervisor status` 确认后再重试批准命令",
+            "ローカル Herdr server が準備できていません。`herdr-mcp herdr-supervisor start` を実行し、`herdr-mcp herdr-supervisor status` で確認してから承認コマンドを再試行してください",
+        ).to_owned());
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn ensure_connector_local_runtime_ready() -> Result<(), String> {
+fn ensure_connector_local_runtime_ready(_language: Locale) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn approve_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
-    Err(
-        "connector approval is supported on macOS, Linux, and Windows enrolled devices; this platform has no supported enrolled-device credential backend"
-            .to_owned(),
-    )
+fn approve_connector(
+    _paths: &RuntimePaths,
+    _request_id: &str,
+    language: Locale,
+) -> Result<ExitCode, String> {
+    Err(language.text(
+        "connector approval is supported on macOS, Linux, and Windows enrolled devices; this platform has no supported enrolled-device credential backend",
+        "Connector 批准支持 macOS、Linux 和 Windows 已登记设备；当前平台没有受支持的设备凭据后端",
+        "Connector 承認は macOS、Linux、Windows の登録済みデバイスで利用できます。このプラットフォームには対応するデバイス資格情報 backend がありません",
+    ).to_owned())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, String> {
+fn approve_connector(
+    paths: &RuntimePaths,
+    request_id: &str,
+    language: Locale,
+) -> Result<ExitCode, String> {
     if request_id.trim().is_empty() || request_id.len() > 256 {
-        return Err("connector approval request id is invalid".to_owned());
+        return Err(language
+            .text(
+                "connector approval request id is invalid",
+                "Connector 批准请求 ID 无效",
+                "Connector 承認リクエスト ID が無効です",
+            )
+            .to_owned());
     }
-    ensure_connector_local_runtime_ready()?;
+    ensure_connector_local_runtime_ready(language)?;
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
@@ -1140,9 +1241,17 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
         .send()
         .map_err(|error| format!("cannot inspect Connector approval: {error}"))?;
     let details = parse_json_response(inspect, "connector approval inspection")?;
-    eprintln!("Connector approval request:");
     eprintln!(
-        "  client: {} ({})",
+        "{}",
+        language.text(
+            "Connector approval request:",
+            "Connector 批准请求：",
+            "Connector 承認リクエスト："
+        )
+    );
+    eprintln!(
+        "  {}: {} ({})",
+        language.text("client", "客户端", "client"),
         details
             .get("client_name")
             .and_then(Value::as_str)
@@ -1153,14 +1262,16 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
             .unwrap_or("unknown")
     );
     eprintln!(
-        "  redirect: {}",
+        "  {}: {}",
+        language.text("redirect", "回调地址", "redirect"),
         details
             .get("redirect_uri")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
     );
     eprintln!(
-        "  resource/scope: {} / {}",
+        "  {}: {} / {}",
+        language.text("resource/scope", "资源/权限范围", "resource/scope"),
         details
             .get("resource")
             .and_then(Value::as_str)
@@ -1173,9 +1284,12 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
     if let Some(expires_at_ms) = details.get("expires_at_ms").and_then(Value::as_u64)
         && let Some(expires_at) = format_pairing_expiry(expires_at_ms)
     {
-        eprintln!("  expires: {expires_at}");
+        eprintln!(
+            "  {}: {expires_at}",
+            language.text("expires", "过期时间", "有効期限")
+        );
     }
-    let code = read_pairing_code_tty()?;
+    let code = read_pairing_code_tty(language)?;
     let response = client
         .post(endpoint(&identity.edge_origin, "/connectors/approve")?)
         .headers(headers)
@@ -2730,14 +2844,21 @@ fn read_pairing_code_from<R: BufRead>(reader: &mut R) -> Result<String, String> 
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn read_pairing_code_tty() -> Result<String, String> {
+fn read_pairing_code_tty(language: Locale) -> Result<String, String> {
     use std::io::IsTerminal;
     let stdin = io::stdin();
     if stdin.is_terminal() {
         // The six-digit value is a short-lived verification code, not a
         // password. Keep it out of argv/shell history, but let users see what
         // they type so transcription mistakes are obvious.
-        eprint!("Enter 6-digit verification code: ");
+        eprint!(
+            "{}",
+            language.text(
+                "Enter 6-digit verification code: ",
+                "请输入 6 位验证码：",
+                "6 桁の確認コードを入力してください: ",
+            )
+        );
         let _ = io::stderr().flush();
     }
     let mut reader = io::BufReader::new(stdin.lock());
@@ -3039,6 +3160,38 @@ mod tests {
     fn pairing_code_formats_with_a_space_for_humans() {
         assert_eq!(format_pairing_code("123456"), "123 456");
         assert_eq!(format_pairing_code("000000"), "000 000");
+    }
+
+    #[test]
+    fn pairing_human_output_tracks_cli_locale_and_docs_locale() {
+        let cases = [
+            (
+                Locale::En,
+                "Pairing created",
+                "/i18n/en/",
+                "Verification code",
+            ),
+            (Locale::ZhCn, "创建配对", "/i18n/zh-CN/", "验证码"),
+            (Locale::Ja, "pairing を作成", "/i18n/ja/", "確認コード"),
+        ];
+        for (language, marker, docs_locale, code_label) in cases {
+            let text = pairing_created_text(
+                language,
+                "https://edge.example",
+                "https://edge.example/pair#pair_test",
+                "123456",
+                Some("2026-09-17T03:00:00Z"),
+                600,
+            );
+            assert!(text.contains(marker), "{language:?}: {text}");
+            assert!(text.contains(docs_locale), "{language:?}: {text}");
+            assert!(text.contains(code_label), "{language:?}: {text}");
+            assert!(text.contains("123 456"), "{language:?}: {text}");
+            assert!(
+                text.contains("herdr-mcp worker connect"),
+                "{language:?}: {text}"
+            );
+        }
     }
 
     #[test]

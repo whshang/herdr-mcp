@@ -4,7 +4,7 @@
 
 Herdr の fleet は、一つの公開 Worker/Connector と、その背後にある独立した identity を持つ複数のコンピュータで構成されます。ChatGPT は fleet を検出し、タスクのためにデバイスを選び、後続の操作をそのデバイスに結び付けたままにできます。新しいコンピュータは短命な pairing を通じて既存の Worker に参加します。別の Worker をデプロイしたり、共有のグローバル秘密を受け取ったりはしません。
 
-Herdr 0.9 には、マルチマシン TUI 用の独自の保存済み SSH マシン層もあります。この層は、同じ物理コンピュータ上であってもこの Edge fleet と共存できますが、`device_id` ルーティングを置き換えるものではありません。identity、ルーティング、フェイルオーバーの規則は [Herdr 0.9 のマルチマシンとデュアルパス制御](multi-machine-control.md)を参照してください。
+Herdr 0.9.1 には、マルチマシン TUI 用の独自の保存済み SSH マシン層と、ネイティブの `herdr --machine <label-or-id> <command>` 転送もあります。この層は、同じ物理コンピュータ上であってもこの Edge fleet と共存できますが、`device_id` ルーティングを置き換えるものではありません。identity、ルーティング、フェイルオーバーの規則は [Herdr 0.9.1 のマルチマシンとデュアルパス制御](multi-machine-control.md)を参照してください。
 
 > v0.4.8 は macOS と x86_64 Linux/Debian で安全な新規デバイス pairing をサポートします。macOS は最終的なデバイス資格情報を Keychain に保持します。Linux は `0700` のディレクトリと `0600` の通常の資格情報ファイルを使う、ユーザー専用の資格情報ストアを使います。Windows の pairing は引き続き利用できず、fail closed です。
 

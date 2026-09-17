@@ -1,8 +1,8 @@
-# Herdr 0.9 のマルチマシン制御と二経路の使い分け
+# Herdr 0.9.1 のマルチマシン制御と二経路の使い分け
 
 *Herdr の saved SSH machine と Herdr-MCP Edge device を、両者の identity を混同せずに併用します。*
 
-Herdr 0.9 と Herdr-MCP は、マルチマシン制御の異なる部分を解決します:
+Herdr 0.9.1 と Herdr-MCP は、マルチマシン制御の異なる部分を解決します:
 
 | 制御面 | identity | transport | 最適な用途 |
 | --- | --- | --- | --- |
@@ -33,30 +33,46 @@ Herdr のサーバー id はサーバー/session スコープです。二つの�
 
 Edge の作業では、`device_id` または device に束縛された `herdr_ref_*` を workspace/pane 参照と一緒に保ってください。saved-machine の作業では、machine profile + Herdr session を workspace/pane id と一緒に保ってください。裸の `w1:p1` をグローバルに一意であるかのようにキャッシュしたり受け渡したりしないでください。
 
-Herdr issue [#3732](https://github.com/herdrdev/herdr/issues/3732) は、0.9.0 に実在するクロスマシンの workspace-id 曖昧性を追跡しています。そのため Herdr-MCP は、saved machine と Edge device が同じワークステーションに到達する場合でも、device affinity を明示的に保ちます。
+Herdr 0.9.1 は issue [#3732](https://github.com/herdrdev/herdr/issues/3732) で追跡されていたクライアント側の同一 id フィルタリングを修正します。それでも workspace / pane id は一つの Herdr サーバー/session にスコープされるため、saved machine と Edge device が同じワークステーションに到達する場合でも、Herdr-MCP は device affinity を明示的に保ちます。
 
-## Herdr 0.9 における現在のプログラム的制限
+## Herdr 0.9.1 のネイティブ machine-scoped CLI
 
-Connecting Machines TUI は saved machine を表示および切り替えできますが、Herdr 0.9 はまだ通常の CLI/socket 面で machine-scoped な pane/workspace コマンドを公開していません:
+Herdr 0.9.1 は、保存済み SSH マシンへのネイティブ CLI 転送を追加します:
 
-- TUI でリモートマシンを選択しても、別個のローカルな `herdr pane ...` や `herdr workspace ...` コマンドは retarget されません。
-- `herdr --remote <target>` はリモート TUI に attach するものであり、現時点では pane/workspace サブコマンドと組み合わせられません。
-- 同じ pane id がローカルサーバーとリモートサーバーに独立して存在する場合があります。
+- `herdr --machine <label-or-id> <command>` は、リモート Herdr ウィンドウを開かなくても、その saved machine に設定された Herdr session に対して対応 API コマンドを実行します。
+- workspace、worktree、tab、pane、agent の各コマンドをこの方法でアドレスできます。
+- CLI 転送に依存する前に、両方のマシンの Herdr を更新してください。
+- リモートコマンドが失敗した場合は失敗のままとし、Local へフォールバックしません。
+- `herdr --remote <target>` は引き続き対話的なリモート TUI attach 経路です。
 
-upstream がネイティブの machine-scoped addressing を公開するまで、明示的なプログラム的ブリッジは次のとおりです:
+saved profile を routing identity として使い、mutation の前にそのリモートサーバー上の id を検出してください:
 
 ```bash
 # saved profile を検出します。id、target、session を一緒に保ってください。
 herdr machine list --json
 
-# 選択したリモートサーバー/session 上で Herdr を明示的に実行します。
-# <target> は通常 SSH config の alias です。認証は SSH が所有します。
-ssh <target> '~/.local/bin/herdr --session <session> pane list'
+# saved machine profile 経由で API コマンドをルーティングします。
+herdr --machine <label-or-id> workspace list
+herdr --machine <label-or-id> pane list --workspace <remote-workspace-id>
+herdr --machine <label-or-id> agent list
 ```
 
-リモートサーバーに入ったら、mutation の前にそのサーバーの live な workspace/pane id を読み直してください。ローカルサーバーで取得した id がそこでも有効だと仮定しないでください。
+ローカルサーバーで取得した id がリモートでも有効だと仮定しないでください。bootstrap または修復が必要な pre-0.9.1 endpoint では、明示的な SSH 実行を互換 / 復旧経路として使えます。リモート endpoint を更新した後は、通常のプログラム的制御を `--machine` に戻してください。
 
-upstream のマルチマシン Ideas スレッドは [Discussion #515](https://github.com/herdrdev/herdr/discussions/515) です。Herdr-MCP は、将来 Herdr がネイティブの machine-scoped API を公開し、live な schema/capabilities がそれを確認できれば、ネイティブ経路を優先します。SSH ブリッジは明示的な互換経路のままであり、第二の identity システムではありません。
+upstream のマルチマシン Ideas スレッドは [Discussion #515](https://github.com/herdrdev/herdr/discussions/515) です。saved-machine profile は SSH/Herdr identity のままであり、ネイティブ `--machine` 転送によって Herdr-MCP Edge の `device_id` namespace と統合されることはありません。
+
+## 復旧前にクライアント / サーバーのずれを確認する
+
+Herdr-MCP 1.0 は、単一の version string を依存関係全体の状態として扱わず、`herdr_inspect` に構造化された `herdr_native` projection を公開します:
+
+- `cli_version`: Herdr-MCP が検出した、インストール済みローカル Herdr client。
+- `server_version`: live ping から返された、実行中 Herdr server の version。
+- `machine_forwarding`: インストール済み CLI がネイティブ `--machine` API 転送を実際に公開しているか。
+- `saved_machine_count` / `saved_machines`: SSH credential や target を含まない、有界なローカル saved-profile inventory。
+- `version_state`: `current`、`server_restart_pending`、`version_mismatch`、`unknown` のいずれか。
+- `handoff_blocked_reason=legacy_sender_pane_limit`: client は十分新しいものの、古い実行中 sender が 64 を超える pane を持ち、最初の live handoff を安全に実行できない状態。
+
+`server_restart_pending` は service failure ではなく、Herdr を停止する許可でもありません。互換性のある古い server は、新しい client がすでにインストールされた後も既存 terminal を生かしたまま動作できます。ユーザーや他タスクの pane を保護し、安全な handoff / restart window だけで収束させてください。
 
 ## ChatGPT はどの経路を使うべきか
 
@@ -66,6 +82,8 @@ saved-machine/SSH 経路は、保守、初回 bootstrap、Debian/Linux UAT、ま
 
 - `delivery_state=not_delivered`: 接続性と状態の検証後、明示的に選択した経路での再発行は安全な場合があります。
 - `delivery_unknown`、delivered/uncertain な状態、または delivery evidence の欠落: 先に live な pane/Git/runtime/resource 状態を検査し、mutation を盲目的に再生しないでください。
+
+復旧では transport ladder を明示的に保ってください。Edge が healthy な間は Edge → non-delivery / live non-application が証明され、対象 Herdr server に到達できる場合だけネイティブ `herdr --machine` → 対象 Herdr server または forwarding 経路そのものの bootstrap / 復旧が必要な場合だけ raw SSH、の順です。label や hostname を Edge `device_id` に変換しないでください。二つの identity の対応関係は、別々の live evidence で確立する必要があります。
 
 Herdr TUI のマシン選択は、Edge 呼び出しのターゲットを決して変更しません。Edge 呼び出しは、その明示的/既定の Herdr-MCP device および返された `herdr_ref_*` affinity に束縛されたままです。
 
