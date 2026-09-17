@@ -640,19 +640,19 @@ fn format_native_messaging_layer() -> String {
     }
 }
 
-fn format_link_layer(paths: &RuntimePaths) -> String {
+fn format_link_layer(_paths: &RuntimePaths) -> String {
     #[cfg(target_os = "linux")]
     {
-        return match crate::linux_service_manager::link_status_report() {
+        match crate::linux_service_manager::link_status_report() {
             Ok(report) => format_linux_link_layer_report(&report),
             Err(error) => format!("error detail={}", compact_detail(&error)),
-        };
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-        crate::link::doctor_layer_summary(&home, &paths.config_dir)
+        crate::link::doctor_layer_summary(&home, &_paths.config_dir)
     }
 }
 
