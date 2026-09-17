@@ -653,8 +653,13 @@ mod tests {
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let staged = dir.join(format!(".{name}.staged"));
+        fs::write(&staged, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+        // Publish a closed inode before exec. Linux can reject an executable
+        // with ETXTBSY while any writer still owns the inode; staging + rename
+        // keeps that filesystem race out of the capability-probe fixture.
+        fs::rename(&staged, &path).unwrap();
         path
     }
 
