@@ -275,6 +275,11 @@ pub enum WebChatCommand {
     DispatchStatus {
         dispatch_id: String,
     },
+    Open {
+        session_ref: String,
+        expected_generation: i64,
+        idempotency_key: String,
+    },
     Archive {
         session_ref: String,
         expected_generation: i64,
@@ -709,13 +714,14 @@ fn parse_webchat(args: &[String]) -> Result<Command, String> {
                 dispatch_id: args[1].clone(),
             }))
         }
+        Some("open") => parse_webchat_open(&args[1..]),
         Some("archive") => parse_webchat_archive(&args[1..]),
         Some("handoff") => parse_webchat_handoff(&args[1..]),
         Some(value) => Err(format!(
-            "unknown webchat command '{value}' (expected endpoints, resources, inspect, create, send, dispatch-status, archive, or handoff)"
+            "unknown webchat command '{value}' (expected endpoints, resources, inspect, create, send, dispatch-status, open, archive, or handoff)"
         )),
         None => Err(
-            "webchat requires endpoints, resources, inspect, create, send, dispatch-status, archive, or handoff"
+            "webchat requires endpoints, resources, inspect, create, send, dispatch-status, open, archive, or handoff"
                 .to_owned(),
         ),
     }
@@ -834,6 +840,34 @@ fn parse_webchat_send(args: &[String]) -> Result<Command, String> {
             .ok_or_else(|| "webchat send requires --expected-generation".to_owned())?,
         idempotency_key: required_flag(idempotency_key, "--idempotency-key")?,
         work_chain_id,
+    }))
+}
+
+fn parse_webchat_open(args: &[String]) -> Result<Command, String> {
+    let mut session_ref = None;
+    let mut expected_generation = None;
+    let mut idempotency_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match flag {
+            "--session-ref" => session_ref = Some(value.clone()),
+            "--expected-generation" => {
+                expected_generation = Some(parse_positive_i64(value, "--expected-generation")?)
+            }
+            "--idempotency-key" => idempotency_key = Some(value.clone()),
+            _ => return Err(format!("unknown webchat open flag '{flag}'")),
+        }
+        index += 2;
+    }
+    Ok(Command::WebChat(WebChatCommand::Open {
+        session_ref: required_flag(session_ref, "--session-ref")?,
+        expected_generation: expected_generation
+            .ok_or_else(|| "webchat open requires --expected-generation".to_owned())?,
+        idempotency_key: required_flag(idempotency_key, "--idempotency-key")?,
     }))
 }
 
@@ -2314,6 +2348,7 @@ Usage:\n\
   herdr-mcp webchat create --endpoint-ref REF --provider PROVIDER --account-ref REF --display-label LABEL --message MESSAGE --expected-generation N --idempotency-key KEY [--space-ref REF] [--work-chain-id ID]\n\
   herdr-mcp webchat send --session-ref REF --message MESSAGE --expected-generation N --idempotency-key KEY [--work-chain-id ID]\n\
   herdr-mcp webchat dispatch-status <dispatch_id>\n\
+  herdr-mcp webchat open --session-ref REF --expected-generation N --idempotency-key KEY\n\
   herdr-mcp webchat archive --session-ref REF --expected-generation N --idempotency-key KEY\n\
   herdr-mcp webchat handoff --continuity-id HC --source-url URL [--objective TEXT] [--work-chain-id ID] [--handoff-id ID] [--idempotency-key KEY] [--prepare-only]\n\n\
 Discover capability first: endpoints -> resources -> inspect. Refs are opaque; never\n\
@@ -2435,6 +2470,31 @@ mod tests {
         ] {
             assert!(parse(args(&invalid)).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn webchat_open_parses_exact_session_mutation() {
+        assert_eq!(
+            parse(args(&[
+                "webchat",
+                "open",
+                "--session-ref",
+                "br_session",
+                "--expected-generation",
+                "7",
+                "--idempotency-key",
+                "open-key-1",
+            ]))
+            .unwrap()
+            .command,
+            Command::WebChat(WebChatCommand::Open {
+                session_ref: "br_session".to_owned(),
+                expected_generation: 7,
+                idempotency_key: "open-key-1".to_owned(),
+            })
+        );
+        assert!(parse(args(&["webchat", "open", "--session-ref", "br_session"])).is_err());
+        assert!(webchat_help().contains("herdr-mcp webchat open --session-ref REF"));
     }
 
     #[test]

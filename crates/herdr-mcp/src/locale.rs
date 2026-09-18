@@ -349,7 +349,7 @@ fn memory_help(l: Locale) -> String {
 
 fn webchat_help(l: Locale) -> String {
     format!(
-        "Herdr-MCP — {}\n\n  herdr-mcp webchat endpoints [--limit N]\n  herdr-mcp webchat resources [--endpoint-ref REF] [--provider PROVIDER] [--kind account|space|session] [--parent-ref REF] [--limit N]\n  herdr-mcp webchat inspect <resource_ref>\n  herdr-mcp webchat create ...\n  herdr-mcp webchat send ...\n  herdr-mcp webchat dispatch-status <dispatch_id>\n  herdr-mcp webchat archive ...\n  herdr-mcp webchat handoff --continuity-id HC --source-url URL ...\n\n{}\n",
+        "Herdr-MCP — {}\n\n  herdr-mcp webchat endpoints [--limit N]\n  herdr-mcp webchat resources [--endpoint-ref REF] [--provider PROVIDER] [--kind account|space|session] [--parent-ref REF] [--limit N]\n  herdr-mcp webchat inspect <resource_ref>\n  herdr-mcp webchat create ...\n  herdr-mcp webchat send ...\n  herdr-mcp webchat dispatch-status <dispatch_id>\n  herdr-mcp webchat open ...\n  herdr-mcp webchat archive ...\n  herdr-mcp webchat handoff --continuity-id HC --source-url URL ...\n\n{}\n",
         l.text("", "受支持的本机 WebChat 控制", "サポート対象のローカル WebChat 操作"),
         l.text(
             "",

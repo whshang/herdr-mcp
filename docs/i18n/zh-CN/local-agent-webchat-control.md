@@ -136,7 +136,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `browser_dispatch.submit`（普通消息） | `herdr-mcp webchat send` | 支持 |
 | `browser_dispatch.status` | `herdr-mcp webchat dispatch-status` | 支持（只读） |
 | `browser_session.archive` | `herdr-mcp webchat archive` | 支持 |
-| `browser_session.open` | — | 支持的私有方法，无 CLI 包装 |
+| `browser_session.open` | `herdr-mcp webchat open` | 支持 |
 | `browser_dispatch.stop` | — | 支持的私有方法，无 CLI 包装 |
 | `browser_message.append` | — | 不支持 |
 | `browser_composer.set_reasoning` / `set_apps` | — | 不支持 |
@@ -346,7 +346,7 @@ Agent 应按这个顺序做：
 这一节刻意写清楚，避免有人针对尚不存在的能力写文档或做开发：
 
 - **不支持的浏览器操作**（runtime 返回 `code: "unsupported"`）：`browser_space.create`、`browser_space.open`、`browser_message.append`、`browser_composer.set_reasoning`、`browser_composer.set_apps`，以及带 `reasoning_effort` 或 `required_apps` 的 `browser_dispatch.submit`。
-- **支持但当前没有 CLI 包装**：`browser_session.open`、`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。它们可通过 runtime MCP 私有方法边界调用，本地 CLI 没有对应子命令。
+- **支持但当前没有 CLI 包装**：`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。它们可通过 runtime MCP 私有方法边界调用。`browser_session.open` 已通过 `herdr-mcp webchat open` 暴露。
 - **Handoff**：canonical 准备路径是 `herdr_mcp.browser_handoff.prepare`，本地 Agent 通过 `herdr-mcp webchat handoff` 使用它（复用它并接着做基于 source 的投递）。Web planner 与扩展 HUD 仍直接调用该私有方法。`webchat create` 仍不接受 `source_url`，也没有对应的 handoff 参数。
 - **`ego-browser`** 是开发/UAT 基础设施，既不是用户依赖，也不是这条 control plane 的替代品。
 - **完全没有暴露**：读取用户 ChatGPT 私有历史正文、经 dispatch 契约发送附件、任意 DOM 访问，以及 registry 未报告的任何 provider。
