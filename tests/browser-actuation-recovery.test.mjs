@@ -1554,7 +1554,11 @@ const createBranchSource = (() => {
   return backgroundSource.slice(start, end);
 })();
 
-function createActuationBranchHarness({ publishOnProbe = true, contentMode = "success" } = {}) {
+function createActuationBranchHarness({
+  publishOnProbe = true,
+  publishOnProbeAttempt = 1,
+  contentMode = "success",
+} = {}) {
   // Virtual clock: the old 8s scope-gate deadline must elapse immediately so a
   // harness that models the no-probe failure returns fast.
   const clock = { value: 1_000_000 };
@@ -1567,6 +1571,7 @@ function createActuationBranchHarness({ publishOnProbe = true, contentMode = "su
   const postCalls = [];
   const actuationMessages = [];
   let nextTabId = 100;
+  let identityProbeAttempts = 0;
   const liveScopesByTab = new Map();
 
   const chrome = {
@@ -1586,10 +1591,13 @@ function createActuationBranchHarness({ publishOnProbe = true, contentMode = "su
         return { ...tab };
       },
       async sendMessage(tabId, message) {
-        if (message?.type === "h2w_get_convkey" && publishOnProbe) {
-          // The content-script identity handshake drives lazy registration,
-          // which publishes the tab's Browser Registry scope on the next poll.
-          if (liveScopesByTab.has(tabId)) browserTabScopes.set(tabId, liveScopesByTab.get(tabId));
+        if (message?.type === "h2w_get_convkey") {
+          identityProbeAttempts += 1;
+          if (publishOnProbe && identityProbeAttempts >= publishOnProbeAttempt) {
+            // The content-script identity handshake drives lazy registration,
+            // which publishes the tab's Browser Registry scope on the next poll.
+            if (liveScopesByTab.has(tabId)) browserTabScopes.set(tabId, liveScopesByTab.get(tabId));
+          }
         }
         return {};
       },
@@ -1684,6 +1692,7 @@ function createActuationBranchHarness({ publishOnProbe = true, contentMode = "su
     browserSessionTargets,
     tabs,
     liveScopesByTab,
+    identityProbeAttempts: () => identityProbeAttempts,
     dateShim,
   };
 }
@@ -1733,6 +1742,52 @@ test("session.create closes the startup scope deadlock with a non-mutating ident
   assert.ok(success, "probe-driven create must complete with resource_available=true");
   assert.equal(success.evidence.command_accepted, true);
   assert.equal(harness.postCalls.some((c) => c.evidence?.resource_available === false), false);
+});
+
+test("user Given a late ChatGPT content script When create retries read-only identity probes Then the matching scope is accepted without retrying the mutation", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ publishOnProbeAttempt: 3 });
+  harness.browserTabScopes.set(71, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(71, { id: 71, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "9".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "a".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  assert.ok(
+    harness.identityProbeAttempts() >= 3,
+    "late content injection must trigger another read-only identity probe",
+  );
+  assert.deepEqual(
+    harness.actuationMessages.map((message) => message.tabId),
+    [100],
+    "the create mutation must still be delivered exactly once",
+  );
+  const success = harness.postCalls.find((call) => call.evidence?.resource_available === true);
+  assert.ok(success, "late scope registration must still complete the create actuation");
+  assert.equal(success.evidence.command_accepted, true);
+  assert.equal(
+    harness.postCalls.some((call) => call.evidence?.result?.error === "browser_create_scope_unavailable"),
+    false,
+  );
 });
 
 test("user receives a precise boundary reason | Given fresh create content reports unavailable without a reason | When background settles the actuation | Then the missing content reason is classified", async () => {
