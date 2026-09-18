@@ -3609,6 +3609,57 @@ impl StateStore {
         }
     }
 
+    pub fn browser_latest_session_ref_for_canonical_url(
+        &self,
+        canonical_url: &str,
+    ) -> Result<Option<String>, String> {
+        if canonical_url.is_empty()
+            || canonical_url.len() > 2048
+            || canonical_url != canonical_url.trim()
+            || canonical_url.chars().any(char::is_control)
+            || !canonical_url.starts_with("https://")
+        {
+            return Err("browser_canonical_url_invalid".to_owned());
+        }
+        // Browser source affinity may follow the newest observation of one
+        // canonical conversation across browser-profile/extension identity
+        // changes. An exact newest timestamp tie remains fail-closed. Continuity
+        // URL resume intentionally keeps using the stricter all-history resolver.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.resource_ref, MAX(l.observed_at) AS observed_at
+                 FROM browser_resource_locators l
+                 JOIN browser_resources r ON r.resource_ref = l.resource_ref
+                 WHERE l.canonical_url = ?1
+                   AND r.kind = 'session'
+                   AND r.provider = 'chatgpt'
+                 GROUP BY r.resource_ref
+                 ORDER BY observed_at DESC, r.resource_ref
+                 LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare browser source URL lookup: {error}"))?;
+        let mut refs = stmt
+            .query_map([canonical_url], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| format!("cannot query browser source URL lookup: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser source URL lookup: {error}"))?;
+        match refs.len() {
+            0 => Ok(None),
+            1 => Ok(Some(refs.remove(0).0)),
+            _ => {
+                let (newest_ref, newest_at) = refs.remove(0);
+                let (_, runner_up_at) = refs.remove(0);
+                if runner_up_at == newest_at {
+                    return Err("browser_canonical_url_ambiguous".to_owned());
+                }
+                Ok(Some(newest_ref))
+            }
+        }
+    }
+
     /// Persist one fail-closed correlation between an opaque MCP caller session
     /// and an already-observed browser session. The caller session itself is
     /// never stored. A key already bound to another browser session is a
@@ -12259,6 +12310,13 @@ mod tests {
                 .unwrap_err(),
             "browser_canonical_url_ambiguous"
         );
+        assert_eq!(
+            store
+                .browser_latest_session_ref_for_canonical_url(URL)
+                .unwrap()
+                .as_deref(),
+            Some(newer.as_str())
+        );
         // Re-observing the same single session under the same URL is not an ambiguity,
         // and a late lower-timestamp locator must not change the single-session answer.
         let mut store = StateStore::open(":memory:").unwrap();
@@ -12284,7 +12342,21 @@ mod tests {
         );
         assert_eq!(
             store
+                .browser_latest_session_ref_for_canonical_url(URL)
+                .unwrap_err(),
+            "browser_canonical_url_ambiguous"
+        );
+        assert_eq!(
+            store
                 .browser_session_ref_for_canonical_url("https://chatgpt.com/c/never-observed")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .browser_latest_session_ref_for_canonical_url(
+                    "https://chatgpt.com/c/never-observed",
+                )
                 .unwrap(),
             None
         );
