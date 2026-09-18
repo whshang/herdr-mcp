@@ -4171,6 +4171,7 @@ mod tests {
 
     #[test]
     fn browser_actuation_timeout_leaves_edge_request_headroom() {
+        assert!(BROWSER_EXTENSION_LIVE_WINDOW > SSE_HEARTBEAT);
         assert!(BROWSER_ACTUATION_TIMEOUT > SSE_HEARTBEAT);
         assert!(BROWSER_ACTUATION_TIMEOUT <= Duration::from_secs(22));
         assert!(BROWSER_ACTUATION_TIMEOUT < Duration::from_secs(30));
