@@ -1897,7 +1897,11 @@ const H2W_CONTENT_VERSION = "0.1.98";
       while (!ADAPTER.getInputEl() && Date.now() < composerReadyDeadline) {
         if (!runtimeAlive()) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
-          return { ...evidence, resource_available: false };
+          return {
+            ...evidence,
+            resource_available: false,
+            result: { error: "browser_create_runtime_unavailable" },
+          };
         }
         await wait(200);
       }

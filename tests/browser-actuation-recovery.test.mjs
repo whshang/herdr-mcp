@@ -1431,6 +1431,12 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
 // handshake (which drives lazy registerCurrentConversation registration) while
 // retaining the account/space/generation equality gate. Old code never probes,
 // so the scope never materializes and the create still fails closed.
+const recoverBrowserSessionTargetSource = (() => {
+  const start = backgroundSource.indexOf("async function recoverBrowserSessionTarget(");
+  const end = backgroundSource.indexOf("async function resolveBrowserCreateAnchorWindow({", start);
+  assert.ok(start >= 0 && end > start, "session target recovery helper must remain extractable");
+  return backgroundSource.slice(start, end);
+})();
 const createAnchorSource2 = (() => {
   const start = backgroundSource.indexOf("async function resolveBrowserCreateAnchorWindow({");
   const end = backgroundSource.indexOf("async function handleBrowserActuation", start);
@@ -1535,7 +1541,7 @@ function createActuationBranchHarness({ publishOnProbe = true } = {}) {
     `const operation = String(command?.operation || "");\n` +
     `const expectedGeneration = Number(command?.expected_generation || 0);\n` +
     `const params = command?.params && typeof command.params === "object" ? command.params : {};\n` +
-    `${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
+    `${recoverBrowserSessionTargetSource}\n${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
   )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrls,
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
@@ -1631,4 +1637,38 @@ test("session.create still fails closed when the fresh tab can never be identifi
   const failure = harness.postCalls.find((c) => c.evidence?.resource_available === false);
   assert.ok(failure, "unidentifiable fresh tab must fail closed with resource_available=false");
   assert.equal(failure.evidence.command_accepted, false);
+  assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
+});
+
+test("session.create preserves the exact source-window failure reason", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness();
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "2".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      source_session_ref: "br_" + "3".repeat(64),
+      reservation_ref: "bsr_" + "4".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+
+  const failure = harness.postCalls.find((c) => c.evidence?.resource_available === false);
+  assert.ok(failure, "missing exact source session must fail closed");
+  assert.equal(failure.evidence.command_accepted, false);
+  assert.equal(failure.evidence.result?.error, "source_session_unavailable");
+  assert.equal(harness.actuationMessages.length, 0);
 });
