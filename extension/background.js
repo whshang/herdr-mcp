@@ -3183,28 +3183,28 @@ async function resolveBrowserCreateAnchorWindow({
     }
     if (!target) {
       const recovered = await recoverBrowserSessionTarget(sourceSessionRef, expectedGeneration);
-      if (recovered.ambiguous || !recovered.target) {
-        return { windowId: null, unavailable: true, reason: "source_session_unavailable" };
+      if (!recovered.ambiguous && recovered.target) {
+        target = recovered.target;
       }
-      target = recovered.target;
-      try {
-        const candidate = await chrome.tabs.get(target.tabId);
-        if (!target.conversationId
-            || !String(candidate?.url || "").includes(`/c/${target.conversationId}`)) {
-          return { windowId: null, unavailable: true, reason: "source_session_route_mismatch" };
+      if (target) {
+        try {
+          const candidate = await chrome.tabs.get(target.tabId);
+          if (!target.conversationId
+              || !String(candidate?.url || "").includes(`/c/${target.conversationId}`)) {
+            return { windowId: null, unavailable: true, reason: "source_session_route_mismatch" };
+          }
+          sourceTab = candidate;
+        } catch (_) {
+          target = null;
         }
-        sourceTab = candidate;
-      } catch (_) {
-        return { windowId: null, unavailable: true, reason: "source_session_tab_unavailable" };
       }
     }
-    if (target.provider !== provider || target.observationGeneration !== expectedGeneration) {
+    if (target && (target.provider !== provider || target.observationGeneration !== expectedGeneration)) {
       return { windowId: null, unavailable: true, reason: "source_session_scope_mismatch" };
     }
-    if (Number.isInteger(sourceTab?.windowId)) {
+    if (target && Number.isInteger(sourceTab?.windowId)) {
       return { windowId: sourceTab.windowId, unavailable: false, reason: "source_session" };
     }
-    return { windowId: null, unavailable: true, reason: "source_session_tab_unavailable" };
   }
 
   const matchingWindowIds = new Set();
@@ -3221,13 +3221,28 @@ async function resolveBrowserCreateAnchorWindow({
       if (Number.isInteger(anchorTab?.windowId)) matchingWindowIds.add(anchorTab.windowId);
     } catch (_) {}
   }
-  if (matchingWindowIds.size > 1) {
-    return { windowId: null, unavailable: true, reason: "ambiguous_scope_windows" };
+  if (matchingWindowIds.size > 0) {
+    // A create never mutates an existing worker tab: the exact authorized
+    // account/Project/generation scope only selects which Chrome window hosts
+    // the fresh tab created below. Multiple windows with the same exact scope
+    // therefore do not create an authority ambiguity. Pick deterministically,
+    // then verify the fresh tab publishes that same scope before delivery.
+    const windowId = [...matchingWindowIds].sort((left, right) => left - right)[0];
+    return {
+      windowId,
+      unavailable: false,
+      reason: sourceSessionRef
+        ? "source_scope_window"
+        : (matchingWindowIds.size === 1 ? "unique_scope_window" : "exact_scope_window"),
+    };
+  }
+  if (sourceSessionRef) {
+    return { windowId: null, unavailable: true, reason: "source_session_unavailable" };
   }
   return {
-    windowId: matchingWindowIds.size === 1 ? [...matchingWindowIds][0] : null,
+    windowId: null,
     unavailable: false,
-    reason: matchingWindowIds.size === 1 ? "unique_scope_window" : "no_scope_window",
+    reason: "no_scope_window",
   };
 }
 
