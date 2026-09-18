@@ -1401,6 +1401,17 @@ const H2W_CONTENT_VERSION = "0.1.99";
     };
   }
 
+  function browserUnavailableEvidence(evidence, reason) {
+    const safeReason = typeof reason === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(reason)
+      ? reason
+      : "browser_actuation_reason_invalid";
+    return {
+      ...evidence,
+      resource_available: false,
+      result: { error: safeReason },
+    };
+  }
+
   function providerMessageSnapshot(role) {
     try {
       if (typeof ADAPTER.getMessageSnapshot === "function") {
@@ -1688,15 +1699,17 @@ const H2W_CONTENT_VERSION = "0.1.99";
   }
 
   async function performChatGptSessionArchive(command, evidence) {
-    if (ADAPTER.name !== "chatgpt") return { ...evidence, resource_available: false };
+    if (ADAPTER.name !== "chatgpt") {
+      return browserUnavailableEvidence(evidence, "browser_archive_provider_unavailable");
+    }
     const params = command?.params && typeof command.params === "object" ? command.params : {};
     const sessionRef = typeof params.session_ref === "string" ? params.session_ref : "";
     const conversationId = chatGptConversationId();
     if (!sessionRef || sessionRef !== registeredBrowserSessionRef || !conversationId) {
-      return { ...evidence, resource_available: false };
+      return browserUnavailableEvidence(evidence, "browser_archive_session_unavailable");
     }
     if (evidence.observed_generation !== registeredBrowserGeneration) {
-      return { ...evidence, resource_available: false };
+      return browserUnavailableEvidence(evidence, "browser_archive_generation_unavailable");
     }
     const idempotencyKey = typeof params.idempotency_key === "string" ? params.idempotency_key : "";
     const durableAuthority = command?.durable_archive === true;
@@ -1782,21 +1795,21 @@ const H2W_CONTENT_VERSION = "0.1.99";
     if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)
         || !Number.isSafeInteger(expectedGeneration)
         || expectedGeneration < 1) {
-      return { ...evidence, resource_available: false };
+      return browserUnavailableEvidence(evidence, "browser_actuation_context_unavailable");
     }
     if (command?.expectedConvKey && command.expectedConvKey !== ADAPTER.getConversationKey()) {
-      return { ...evidence, resource_available: false };
+      return browserUnavailableEvidence(evidence, "browser_session_identity_mismatch");
     }
     if (creatingSession) {
       const params = command?.params && typeof command.params === "object" ? command.params : {};
       const reservationRef = typeof params.reservation_ref === "string" ? params.reservation_ref : "";
       if (ADAPTER.name !== "chatgpt" || !/^bsr_[0-9a-f]{64}$/.test(reservationRef)) {
-        return { ...evidence, resource_available: false };
+        return browserUnavailableEvidence(evidence, "browser_create_reservation_invalid");
       }
       try {
         sessionStorage.setItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef);
       } catch (_) {
-        return { ...evidence, resource_available: false };
+        return browserUnavailableEvidence(evidence, "browser_create_reservation_storage_unavailable");
       }
       evidence.stable_resource_ref_observed = false;
       evidence.lifecycle_observed = false;
@@ -1804,25 +1817,25 @@ const H2W_CONTENT_VERSION = "0.1.99";
     }
     if (command?.operation === "herdr_mcp.browser_session.open") {
       if (ADAPTER.name !== "chatgpt") {
-        return { ...evidence, resource_available: false };
+        return browserUnavailableEvidence(evidence, "browser_open_provider_unavailable");
       }
       const params = command?.params && typeof command.params === "object" ? command.params : {};
       const sessionRef = typeof params.session_ref === "string" ? params.session_ref : "";
       if (!sessionRef || sessionRef !== registeredBrowserSessionRef) {
-        return { ...evidence, resource_available: false };
+        return browserUnavailableEvidence(evidence, "browser_open_session_unavailable");
       }
       if (expectedGeneration !== registeredBrowserGeneration) {
-        return { ...evidence, resource_available: false };
+        return browserUnavailableEvidence(evidence, "browser_open_generation_unavailable");
       }
       const currentConvKey = ADAPTER.getConversationKey();
       if (!currentConvKey || currentConvKey !== registeredConvKey) {
-        return { ...evidence, resource_available: false };
+        return browserUnavailableEvidence(evidence, "browser_open_conversation_unavailable");
       }
       if (!providerCanonicalConversationObserved()) {
-        return { ...evidence, resource_available: false };
+        return browserUnavailableEvidence(evidence, "browser_open_canonical_url_unavailable");
       }
       if (document.hidden) {
-        return { ...evidence, resource_available: false };
+        return browserUnavailableEvidence(evidence, "browser_open_page_hidden");
       }
       evidence.command_accepted = true;
       evidence.resource_available = true;
@@ -1836,7 +1849,7 @@ const H2W_CONTENT_VERSION = "0.1.99";
       return performChatGptSessionArchive(command, evidence);
     }
     if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)) {
-      return { ...evidence, resource_available: false };
+      return browserUnavailableEvidence(evidence, "browser_actuation_provider_unavailable");
     }
     if (command?.operation === "herdr_mcp.browser_dispatch.stop") {
       const candidates = typeof ADAPTER.getStopButtonCandidates === "function"
