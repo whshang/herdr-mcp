@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.100";
+const H2W_CONTENT_VERSION = "0.1.101";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -1412,6 +1412,17 @@ const H2W_CONTENT_VERSION = "0.1.100";
     };
   }
 
+  function browserRejectedEvidence(evidence, reason) {
+    const safeReason = typeof reason === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(reason)
+      ? reason
+      : "browser_actuation_reason_invalid";
+    return {
+      ...evidence,
+      rejected: true,
+      result: { error: safeReason },
+    };
+  }
+
   function providerMessageSnapshot(role) {
     try {
       if (typeof ADAPTER.getMessageSnapshot === "function") {
@@ -1719,9 +1730,8 @@ const H2W_CONTENT_VERSION = "0.1.100";
         // into page-local sessionStorage: tell the runtime no provider actuation
         // occurred so it can return the intent to pending and re-arm after idle.
         return {
-          ...evidence,
+          ...browserRejectedEvidence(evidence, "browser_archive_turn_in_progress"),
           command_accepted: false,
-          rejected: true,
           stable_resource_ref_observed: true,
           lifecycle_observed: false,
         };
@@ -1729,7 +1739,7 @@ const H2W_CONTENT_VERSION = "0.1.100";
       // The authoritative self-archive request is accepted and persisted now;
       // it executes once the source turn is no longer in progress.
       if (!enqueuePendingSelfArchive(params, sessionRef, registeredBrowserGeneration, conversationId)) {
-        return { ...evidence, rejected: true };
+        return browserRejectedEvidence(evidence, "browser_archive_intent_storage_unavailable");
       }
       schedulePendingSelfArchiveDrain();
       evidence.command_accepted = true;
@@ -1742,7 +1752,9 @@ const H2W_CONTENT_VERSION = "0.1.100";
       sessionRef,
       generation: registeredBrowserGeneration,
     }, { durableAuthority });
-    if (attempt.outcome === "rejected") return { ...evidence, rejected: true };
+    if (attempt.outcome === "rejected") {
+      return browserRejectedEvidence(evidence, "browser_archive_control_unavailable");
+    }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
     if (attempt.outcome === "applied") evidence.lifecycle_observed = true;
@@ -1860,7 +1872,7 @@ const H2W_CONTENT_VERSION = "0.1.100";
         return button?.getAttribute?.("aria-disabled") !== "true";
       });
       if (!stopButton || !isTurnInProgress()) {
-        return { ...evidence, rejected: true };
+        return browserRejectedEvidence(evidence, "browser_stop_control_unavailable");
       }
       stopButton.click();
       evidence.command_accepted = true;
@@ -1880,7 +1892,7 @@ const H2W_CONTENT_VERSION = "0.1.100";
       return evidence;
     }
     if (!creatingSession && command?.operation !== "herdr_mcp.browser_dispatch.submit") {
-      return { ...evidence, rejected: true };
+      return browserRejectedEvidence(evidence, "browser_operation_unavailable");
     }
     const params = command?.params && typeof command.params === "object" ? command.params : {};
     const message = typeof params.message === "string" ? params.message.trim() : "";
@@ -1890,7 +1902,10 @@ const H2W_CONTENT_VERSION = "0.1.100";
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
-      return { ...evidence, rejected: true };
+      return browserRejectedEvidence(
+        evidence,
+        creatingSession ? "browser_create_params_invalid" : "browser_dispatch_params_invalid",
+      );
     }
     if (ADAPTER.name === "chatgpt") {
       const chatMode = await ensureChatGptChatMode();
@@ -1920,14 +1935,17 @@ const H2W_CONTENT_VERSION = "0.1.100";
       }
       if (!ADAPTER.getInputEl()) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
-        return { ...evidence, rejected: true };
+        return browserRejectedEvidence(evidence, "browser_create_composer_unavailable");
       }
     }
     if (isTurnInProgress() || ADAPTER.inputHasContent()) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
-      return { ...evidence, rejected: true };
+      return browserRejectedEvidence(
+        evidence,
+        creatingSession ? "browser_create_composer_busy" : "browser_dispatch_composer_busy",
+      );
     }
 
     if (requiredApps.length > 0) {
@@ -1956,7 +1974,10 @@ const H2W_CONTENT_VERSION = "0.1.100";
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
-      return { ...evidence, rejected: true };
+      return browserRejectedEvidence(
+        evidence,
+        creatingSession ? "browser_create_submit_failed" : "browser_dispatch_submit_failed",
+      );
     }
     evidence.command_accepted = true;
 

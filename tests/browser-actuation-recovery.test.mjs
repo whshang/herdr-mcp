@@ -823,6 +823,101 @@ test("user Given unavailable browser actuation When the content script rejects i
   }
 });
 
+test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
+  assert.ok(commandStart >= 0 && commandEnd > commandStart);
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+
+  function makeActuator(ctx = {}) {
+    return new Function("ctx", `
+      const ADAPTER = {
+        name: "chatgpt",
+        getConversationKey: () => "conv-current",
+        getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
+        getInputEl: () => (ctx.inputAvailable === false ? null : {}),
+        inputHasContent: () => ctx.inputHasContent === true,
+        getStopButtonCandidates: () => [],
+        getMessageSnapshot: () => ({}),
+      };
+      const chatGptConversationId = () => "current";
+      const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+      const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+      let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
+      let registeredBrowserGeneration = 17;
+      let registeredConvKey = "conv-current";
+      const providerCanonicalConversationObserved = () => true;
+      const document = { hidden: false };
+      const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
+      const isTurnInProgress = () => ctx.turnInProgress === true;
+      const runtimeAlive = () => true;
+      const wait = async () => {};
+      const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
+      const fetchChatGptConversationSnapshot = async () => ({ ok: false });
+      const performWake = async () => ({ ok: ctx.wakeOk !== false });
+      const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+      ${evidenceSource}
+      ${commandSource}
+      return performBrowserActuationCommand;
+    `)(ctx);
+  }
+
+  const reservation = "bsr_" + "c".repeat(64);
+  const cases = [
+    {
+      name: "create composer busy",
+      ctx: { turnInProgress: true },
+      command: {
+        operation: "herdr_mcp.browser_session.create",
+        expected_generation: 17,
+        params: { reservation_ref: reservation, message: "worker A" },
+      },
+      reason: "browser_create_composer_busy",
+    },
+    {
+      name: "create submit failure",
+      ctx: { wakeOk: false },
+      command: {
+        operation: "herdr_mcp.browser_session.create",
+        expected_generation: 17,
+        params: { reservation_ref: reservation, message: "worker A" },
+      },
+      reason: "browser_create_submit_failed",
+    },
+    {
+      name: "dispatch composer busy",
+      ctx: { inputHasContent: true },
+      command: {
+        operation: "herdr_mcp.browser_dispatch.submit",
+        expected_generation: 17,
+        params: { message: "next turn" },
+      },
+      reason: "browser_dispatch_composer_busy",
+    },
+    {
+      name: "stop control unavailable",
+      ctx: {},
+      command: {
+        operation: "herdr_mcp.browser_dispatch.stop",
+        expected_generation: 17,
+        params: {},
+      },
+      reason: "browser_stop_control_unavailable",
+    },
+  ];
+
+  for (const item of cases) {
+    const result = await makeActuator(item.ctx)(item.command);
+    assert.equal(result.command_accepted, false, item.name);
+    assert.equal(result.rejected, true, item.name);
+    assert.equal(result.result?.error, item.reason, item.name);
+  }
+});
+
 test("adapter capability reprobe advances observation generation on snapshot change", () => {
   assert.match(backgroundSource, /const browserCapabilitySnapshots = new Map\(\)/);
   assert.match(backgroundSource, /getBrowserObservationGeneration\(provider, capabilities\)/);
@@ -1046,6 +1141,11 @@ function selfArchiveHarness(overrides = {}) {
       return ctx.archiveVerifies ? { ok: true, body: { is_archived: true } } : { ok: false };
     };
     const wait = (ms) => { Date.advance(ms); return Promise.resolve(); };
+    const browserRejectedEvidence = (evidence, reason) => ({
+      ...evidence,
+      rejected: true,
+      result: { error: reason },
+    });
     let registeredBrowserSessionRef = ctx.sessionRef;
     let registeredBrowserGeneration = ctx.generation;
     ${segment}
