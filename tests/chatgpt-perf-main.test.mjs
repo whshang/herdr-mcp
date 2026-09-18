@@ -288,6 +288,7 @@ function makeContext() {
     clearTimeout: fakeClearTimeout,
     requestIdleCallback: fakeRequestIdleCallback,
     cancelIdleCallback: fakeCancelIdleCallback,
+    getComputedStyle: (element) => ({ overflowY: element?._overflowY || "visible" }),
     innerHeight: 900,
     scrollByCalls: [],
     scrollBy(x, y) { this.scrollByCalls.push([x, y]); },
@@ -409,7 +410,7 @@ test("user scroll burst freezes Herdr mutations | Given an active wheel burst | 
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.deferred_mutation_batches, 1);
 });
 
-test("user scroll settlement preserves viewport anchor | Given deferred mutations during scroll | When the burst ends | Then one bounded reconcile compensates anchor delta", () => {
+test("user scroll settlement preserves window viewport anchor | Given no element scroll container | When the burst ends | Then window scroll compensates anchor delta", () => {
   const { context, document, FakeElement, mutationObservers, runAllTimers, runAllIdle } = makeContext();
   const turn = new FakeElement("div");
   turn.ownerDocument = document;
@@ -429,6 +430,36 @@ test("user scroll settlement preserves viewport anchor | Given deferred mutation
 
   assert.equal(context.__HERDR_CHATGPT_PERF__.stats.anchored_reconciles, 1);
   assert.deepEqual(context.scrollByCalls, [[0, 28]]);
+});
+
+test("user scroll settlement preserves element viewport anchor | Given an internal scroll container | When the burst ends | Then that container scrollTop compensates anchor delta", () => {
+  const { context, document, FakeElement, mutationObservers, runAllTimers, runAllIdle } = makeContext();
+  const scrollContainer = new FakeElement("div");
+  scrollContainer.ownerDocument = document;
+  scrollContainer._overflowY = "auto";
+  scrollContainer.scrollHeight = 5000;
+  scrollContainer.clientHeight = 900;
+  scrollContainer.scrollTop = 1200;
+  const turn = new FakeElement("section");
+  turn.ownerDocument = document;
+  turn.setAttribute("data-testid", "conversation-turn-42");
+  let geometryRead = 0;
+  turn.getBoundingClientRect = () => {
+    geometryRead += 1;
+    const top = geometryRead === 1 ? 140 : 166;
+    return { top, bottom: top + 80 };
+  };
+  scrollContainer.appendChild(turn);
+  document.body.appendChild(scrollContainer);
+
+  document.emit("wheel", { target: turn });
+  mutationObservers[0].trigger([{ target: turn, addedNodes: [], removedNodes: [] }]);
+  runAllTimers();
+  runAllIdle();
+
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.anchored_reconciles, 1);
+  assert.equal(scrollContainer.scrollTop, 1226);
+  assert.deepEqual(context.scrollByCalls, []);
 });
 
 test("user tool summary state survives incremental growth | Given an expanded keyed summary | When a new tool arrives | Then the same summary node remains expanded", () => {

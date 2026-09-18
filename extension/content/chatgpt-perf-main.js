@@ -976,7 +976,6 @@
   }
 
   function captureViewportAnchor() {
-    if (typeof window.scrollBy !== "function") return null;
     const viewportHeight = Number(window.innerHeight || document.documentElement?.clientHeight || 0);
     if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return null;
     let inspected = 0;
@@ -989,7 +988,18 @@
       const top = Number(rect.top);
       const bottom = Number(rect.bottom);
       if (!Number.isFinite(top) || !Number.isFinite(bottom)) continue;
-      if (bottom > 0 && top < viewportHeight) return { turn, top };
+      if (bottom > 0 && top < viewportHeight) {
+        let scrollContainer = null;
+        for (let node = turn.parentElement; node instanceof Element; node = node.parentElement) {
+          const overflowY = String(window.getComputedStyle?.(node)?.overflowY || "");
+          if (/(auto|scroll|overlay)/.test(overflowY)
+            && Number(node.scrollHeight) > Number(node.clientHeight) + 1) {
+            scrollContainer = node;
+            break;
+          }
+        }
+        return { turn, top, scrollContainer };
+      }
     }
     return null;
   }
@@ -1004,7 +1014,11 @@
     if (!Number.isFinite(nextTop)) return discovered;
     const delta = nextTop - anchor.top;
     if (Math.abs(delta) >= 0.5) {
-      window.scrollBy(0, delta);
+      if (anchor.scrollContainer?.isConnected) {
+        anchor.scrollContainer.scrollTop += delta;
+      } else if (typeof window.scrollBy === "function") {
+        window.scrollBy(0, delta);
+      }
       stats.anchor_adjustments += 1;
     }
     return discovered;
