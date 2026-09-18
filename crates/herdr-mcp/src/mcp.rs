@@ -3123,7 +3123,7 @@ fn browser_source_route(
     source_url: &str,
 ) -> Result<BrowserSourceRoute, String> {
     let session_ref = store
-        .browser_session_ref_for_canonical_url(source_url)?
+        .browser_latest_session_ref_for_canonical_url(source_url)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
     let session = store
         .browser_resource(&session_ref)?
