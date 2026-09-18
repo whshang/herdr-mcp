@@ -1528,6 +1528,13 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
 // handshake (which drives lazy registerCurrentConversation registration) while
 // retaining the account/space/generation equality gate. Old code never probes,
 // so the scope never materializes and the create still fails closed.
+const contentActuationEvidenceWithReasonSource = (() => {
+  const start = backgroundSource.indexOf("function contentActuationEvidenceWithReason(");
+  const end = backgroundSource.indexOf("function unavailableBrowserActuationEvidence(", start);
+  assert.ok(start >= 0 && end > start, "content evidence reason helper must remain extractable");
+  return backgroundSource.slice(start, end);
+})();
+
 const recoverBrowserSessionTargetSource = (() => {
   const start = backgroundSource.indexOf("async function recoverBrowserSessionTarget(");
   const end = backgroundSource.indexOf("async function resolveBrowserCreateAnchorWindow({", start);
@@ -1609,6 +1616,28 @@ function createActuationBranchHarness({ publishOnProbe = true, contentMode = "su
     actuationMessages.push({ tabId, message });
     if (contentMode === "throw") throw new Error("content dispatch failed");
     if (contentMode === "missing") return {};
+    if (contentMode === "unavailable-missing-reason") {
+      return {
+        evidence: {
+          observed_generation: 17,
+          command_accepted: false,
+          browser_online: true,
+          resource_available: false,
+          rejected: false,
+          stable_resource_ref_observed: false,
+          lifecycle_observed: false,
+          canonical_url_observed: false,
+          accepted_message_observed: false,
+          message_baseline_advanced: false,
+          reasoning_effort_readback: null,
+          required_apps_readback: [],
+          generation_owner: null,
+          generation_status_observed: false,
+          generation_stopped: false,
+          result: null,
+        },
+      };
+    }
     return {
       evidence: {
         observed_generation: 17,
@@ -1641,7 +1670,7 @@ function createActuationBranchHarness({ publishOnProbe = true, contentMode = "su
     `const operation = String(command?.operation || "");\n` +
     `const expectedGeneration = Number(command?.expected_generation || 0);\n` +
     `const params = command?.params && typeof command.params === "object" ? command.params : {};\n` +
-    `${recoverBrowserSessionTargetSource}\n${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
+    `${contentActuationEvidenceWithReasonSource}\n${recoverBrowserSessionTargetSource}\n${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
   )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrls,
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
@@ -1704,6 +1733,39 @@ test("session.create closes the startup scope deadlock with a non-mutating ident
   assert.ok(success, "probe-driven create must complete with resource_available=true");
   assert.equal(success.evidence.command_accepted, true);
   assert.equal(harness.postCalls.some((c) => c.evidence?.resource_available === false), false);
+});
+
+test("user receives a precise boundary reason | Given fresh create content reports unavailable without a reason | When background settles the actuation | Then the missing content reason is classified", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ contentMode: "unavailable-missing-reason" });
+  harness.browserTabScopes.set(71, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(71, { id: 71, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "9".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "9".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  const evidence = harness.postCalls.at(-1)?.evidence;
+  assert.equal(evidence?.resource_available, false);
+  assert.equal(evidence?.result?.error, "browser_create_content_reason_missing");
 });
 
 test("user Given a fresh ChatGPT create When the content response is missing Then the exact machine reason is preserved", async () => {
