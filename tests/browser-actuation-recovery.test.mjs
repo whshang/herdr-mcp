@@ -56,6 +56,42 @@ function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) 
   return { find };
 }
 
+function claudeCanonicalIdentityRecoveryHarness(tabRecords) {
+  const chrome = {
+    tabs: {
+      async query() {
+        return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
+      },
+    },
+  };
+  const activeH2WTabUrls = () => ["https://claude.ai/*"];
+  const browserTabScopes = new Map(tabRecords
+    .filter((record) => record.scope)
+    .map((record) => [record.id, record.scope]));
+  const browserConversationInfo = (provider, rawUrl) => {
+    if (provider !== "claude") return null;
+    const match = String(rawUrl || "").match(
+      /^https:\/\/claude\.ai\/chat\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i,
+    );
+    if (!match) return null;
+    const conversationId = match[1].toLowerCase();
+    return {
+      site: "claude",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey: `https://claude.ai/chat/${conversationId}`,
+    };
+  };
+  const find = new Function(
+    "chrome",
+    "activeH2WTabUrls",
+    "browserConversationInfo",
+    "browserTabScopes",
+    `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
+  )(chrome, activeH2WTabUrls, browserConversationInfo, browserTabScopes);
+  return { find };
+}
+
 function recoveryHarness(tabRecords) {
   const browserSessionTargets = new Map();
   const chrome = {
@@ -1469,6 +1505,32 @@ test("ChatGPT session.archive can reopen its durable canonical URL when the targ
   assert.match(segment, /createdTab\?\.id/);
 });
 
+test("user recovers a Claude dispatch target | Given one canonical Claude tab after service-worker target loss | When background performs canonical recovery | Then the unique tab is restored and duplicate views stay ambiguous", async () => {
+  const canonical = "https://claude.ai/chat/46ea4d77-ef82-4ef6-a8f0-46c27f7593d0";
+  const scope = {
+    provider: "claude",
+    observationGeneration: 17,
+    accountRef: "br_claude_account",
+    spaceRef: null,
+  };
+  const unique = claudeCanonicalIdentityRecoveryHarness([
+    { id: 71, url: canonical, scope },
+  ]);
+  const recovered = await unique.find("claude", canonical, 17);
+  assert.equal(recovered.ambiguous, false);
+  assert.equal(recovered.target?.tabId, 71);
+  assert.equal(recovered.target?.provider, "claude");
+  assert.equal(recovered.target?.convKey, canonical);
+
+  const duplicate = claudeCanonicalIdentityRecoveryHarness([
+    { id: 71, url: canonical, scope },
+    { id: 72, url: canonical, scope },
+  ]);
+  const ambiguous = await duplicate.find("claude", canonical, 17);
+  assert.equal(ambiguous.target, null);
+  assert.equal(ambiguous.ambiguous, true);
+});
+
 test("browser dispatch evicts a stale cached target before exact recovery", () => {
   const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
   const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);
@@ -1479,7 +1541,13 @@ test("browser dispatch evicts a stale cached target before exact recovery", () =
   assert.match(segment, /browserSessionTargets\.delete\(sessionRef\);\s*target = null;/);
   const staleEviction = segment.indexOf("browserSessionTargets.delete(sessionRef)");
   const recovery = segment.indexOf("recoverBrowserSessionTarget(sessionRef, expectedGeneration)", staleEviction);
+  const canonicalRecovery = segment.indexOf(
+    "findBrowserSessionTargetByCanonicalIdentity(",
+    recovery,
+  );
   assert.ok(staleEviction >= 0 && recovery > staleEviction, "stale cached target must be evicted before one exact recovery");
+  assert.ok(canonicalRecovery > recovery, "canonical recovery must remain a bounded fallback after exact session-ref recovery");
+  assert.match(segment, /browserSessionTargets\.set\(sessionRef, target\)/);
   assert.match(segment, /live\?\.convKey !== target\.convKey/);
 });
 
