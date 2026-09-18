@@ -179,6 +179,7 @@ run_hygiene() {
     bin/watchdog.sh \
     bin/lib/i18n.sh \
     scripts/ci-herdr-runtime.sh \
+    scripts/ci-node-gate.sh \
     scripts/release-gate.sh \
     scripts/sign-macos-release.sh \
     scripts/macos-signed-launchd-uat.sh

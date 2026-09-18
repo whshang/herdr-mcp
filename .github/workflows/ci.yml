@@ -56,7 +56,13 @@ jobs:
         env:
           TEST_POLICY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: node scripts/lint-test-policy.mjs "$TEST_POLICY_BASE_SHA"
+      - name: Select Node test scope
+        id: node_scope
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_TEST_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+        run: node scripts/select-ci-tests.mjs "$CI_TEST_BASE_SHA" >> "$GITHUB_OUTPUT"
       - name: Node/docs/Edge release gate
-        run: scripts/release-gate.sh node
+        run: scripts/ci-node-gate.sh "${{ steps.node_scope.outputs.mode }}"
       - name: Package and diff hygiene
         run: scripts/release-gate.sh hygiene
