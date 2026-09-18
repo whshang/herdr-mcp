@@ -1962,10 +1962,16 @@ fn push_events_response(
             let current_agents = push_agent_views(&digest.agents);
             let mut body = String::new();
 
-            if state.trusted_extension_ipc
-                && let Some(command) = state.browser_actuation.take_next_for_extension()
-            {
-                body.push_str(&sse_event("browser_actuation", &command));
+            if state.trusted_extension_ipc {
+                // The trusted extension is still actively polling this SSE body even
+                // when there is no browser command to deliver. Refresh browser-control
+                // liveness on every stream poll/heartbeat so an idle healthy stream
+                // cannot age past BROWSER_EXTENSION_LIVE_WINDOW and be misclassified
+                // as browser_offline between mutations.
+                state.browser_actuation.note_extension_poll();
+                if let Some(command) = state.browser_actuation.take_next_for_extension() {
+                    body.push_str(&sse_event("browser_actuation", &command));
+                }
             }
 
             for event in &digest.events {
@@ -4076,11 +4082,20 @@ mod tests {
     }
 
     #[test]
-    fn browser_actuation_liveness_covers_one_idle_sse_heartbeat() {
-        let state = BrowserActuationState {
-            last_extension_poll: Some(Instant::now() - SSE_HEARTBEAT),
-            ..BrowserActuationState::default()
-        };
+    fn browser_actuation_liveness_refreshes_on_idle_sse_heartbeat() {
+        let broker = BrowserActuationBroker::default();
+        {
+            let (lock, _) = &*broker.inner;
+            let mut state = lock.lock().unwrap();
+            state.last_extension_poll =
+                Some(Instant::now() - BROWSER_EXTENSION_LIVE_WINDOW - Duration::from_secs(1));
+            assert!(!BrowserActuationBroker::extension_live(&state));
+        }
+
+        broker.note_extension_poll();
+
+        let (lock, _) = &*broker.inner;
+        let state = lock.lock().unwrap();
         assert!(BrowserActuationBroker::extension_live(&state));
     }
 
@@ -4156,6 +4171,7 @@ mod tests {
 
     #[test]
     fn browser_actuation_timeout_leaves_edge_request_headroom() {
+        assert!(BROWSER_EXTENSION_LIVE_WINDOW > SSE_HEARTBEAT);
         assert!(BROWSER_ACTUATION_TIMEOUT > SSE_HEARTBEAT);
         assert!(BROWSER_ACTUATION_TIMEOUT <= Duration::from_secs(22));
         assert!(BROWSER_ACTUATION_TIMEOUT < Duration::from_secs(30));

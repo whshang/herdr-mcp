@@ -7,8 +7,8 @@ use crate::paths::RuntimePaths;
 use crate::progressive_skills::{
     BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD, BROWSER_ENDPOINT_LIST_METHOD,
     BROWSER_HANDOFF_PREPARE_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
-    BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD,
+    BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_OPEN_METHOD,
+    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::state_store::BrowserDeliveryState;
 use serde_json::{Map, Value, json};
@@ -127,6 +127,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             provider,
             account_ref,
             space_ref,
+            source_url,
             display_label,
             message,
             expected_generation,
@@ -139,13 +140,23 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
                 account_ref: account_ref.clone(),
             };
             let mut params = Map::new();
-            params.insert("endpoint_ref".to_owned(), json!(endpoint_ref));
-            params.insert("provider".to_owned(), json!(provider));
-            params.insert("account_ref".to_owned(), json!(account_ref));
-            insert_optional(&mut params, "space_ref", space_ref);
-            params.insert("display_label".to_owned(), json!(display_label));
+            if let Some(source_url) = source_url {
+                params.insert("source_url".to_owned(), json!(source_url));
+            } else {
+                params.insert("endpoint_ref".to_owned(), json!(endpoint_ref));
+                params.insert("provider".to_owned(), json!(provider));
+                params.insert("account_ref".to_owned(), json!(account_ref));
+                insert_optional(&mut params, "space_ref", space_ref);
+                params.insert(
+                    "display_label".to_owned(),
+                    json!(display_label.expect("direct create requires display_label")),
+                );
+                params.insert(
+                    "expected_generation".to_owned(),
+                    json!(expected_generation.expect("direct create requires expected_generation")),
+                );
+            }
             params.insert("message".to_owned(), json!(message));
-            params.insert("expected_generation".to_owned(), json!(expected_generation));
             params.insert("idempotency_key".to_owned(), json!(idempotency_key));
             insert_optional(&mut params, "work_chain_id", work_chain_id);
             print_private_result(call_private(
@@ -179,6 +190,22 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             json!({"dispatch_id": dispatch_id}),
             None,
         )?),
+        WebChatCommand::Open {
+            session_ref,
+            expected_generation,
+            idempotency_key,
+        } => {
+            let grant = grant_for_resource(&session_ref)?;
+            print_private_result(call_private(
+                BROWSER_SESSION_OPEN_METHOD,
+                json!({
+                    "session_ref": session_ref,
+                    "expected_generation": expected_generation,
+                    "idempotency_key": idempotency_key,
+                }),
+                Some(&grant),
+            )?)
+        }
         WebChatCommand::Archive {
             session_ref,
             expected_generation,

@@ -1829,6 +1829,48 @@ impl BrowserPostconditionEvidence {
             result: None,
         }
     }
+
+    fn resource_unavailable_with_reason(expected_generation: i64, reason: &str) -> Self {
+        let mut evidence = Self::resource_unavailable(expected_generation);
+        evidence.result = Some(json!({"error": reason}));
+        evidence
+    }
+}
+
+fn browser_evidence_machine_reason(
+    evidence: &BrowserPostconditionEvidence,
+) -> Result<Option<String>, String> {
+    let Some(value) = evidence
+        .result
+        .as_ref()
+        .and_then(|result| result.get("error"))
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(reason) = value.as_str() else {
+        return Err("browser_evidence_reason_invalid".to_owned());
+    };
+    let mut chars = reason.chars();
+    let Some(first) = chars.next() else {
+        return Err("browser_evidence_reason_invalid".to_owned());
+    };
+    if !first.is_ascii_lowercase()
+        || reason.len() > 96
+        || !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err("browser_evidence_reason_invalid".to_owned());
+    }
+    Ok(Some(reason.to_owned()))
+}
+
+fn browser_resource_unavailable_reason(
+    evidence: &BrowserPostconditionEvidence,
+) -> Result<String, String> {
+    Ok(browser_evidence_machine_reason(evidence)?
+        .unwrap_or_else(|| "browser_actuation_reason_missing".to_owned()))
 }
 
 fn browser_delivery_state_from_postcondition(
@@ -3520,7 +3562,9 @@ fn browser_session_create(
             Ok(None) => {
                 return json!({
                     "ok": false,
-                    "code": "resource_unavailable",
+                    "code": "browser_session_launcher_unavailable",
+                    "reason": "browser_session_launcher_unavailable",
+                    "delivery_state": BrowserDeliveryState::ResourceUnavailable.as_str(),
                     "message": "browser session creation requires an observed local account/project launcher",
                 });
             }
@@ -3584,9 +3628,13 @@ fn browser_session_create(
         );
     }
     if current_delivery != BrowserDeliveryState::NotApplied {
+        let persisted_failure_reason = (current_delivery
+            == BrowserDeliveryState::ResourceUnavailable)
+            .then_some("browser_session_create_previous_resource_unavailable");
         return json!({
             "ok": false,
-            "code": current_delivery.as_str(),
+            "code": persisted_failure_reason.unwrap_or_else(|| current_delivery.as_str()),
+            "reason": persisted_failure_reason,
             "reservation_ref": reservation.reservation_ref,
             "reservation_state": reservation.state,
             "delivery_state": current_delivery.as_str(),
@@ -3629,7 +3677,10 @@ fn browser_session_create(
             Ok(evidence) => evidence,
             Err(error) => return browser_store_error(error),
         },
-        None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+        None => BrowserPostconditionEvidence::resource_unavailable_with_reason(
+            expected_generation,
+            "browser_actuator_unavailable",
+        ),
     };
     let delivery_state = match browser_delivery_state_from_postcondition(
         BrowserOperation::SessionCreate,
@@ -3639,6 +3690,14 @@ fn browser_session_create(
     ) {
         Ok(state) => state,
         Err(error) => return browser_store_error(error),
+    };
+    let unavailable_reason = if delivery_state == BrowserDeliveryState::ResourceUnavailable {
+        match browser_resource_unavailable_reason(&evidence) {
+            Ok(reason) => Some(reason),
+            Err(error) => return browser_store_error(error),
+        }
+    } else {
+        None
     };
     let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
         Ok(value) => value,
@@ -3681,7 +3740,8 @@ fn browser_session_create(
     }
     json!({
         "ok": false,
-        "code": delivery_state.as_str(),
+        "code": unavailable_reason.as_deref().unwrap_or_else(|| delivery_state.as_str()),
+        "reason": unavailable_reason,
         "operation": BrowserOperation::SessionCreate.method(),
         "reservation_ref": updated.reservation_ref,
         "reservation_state": updated.state,
@@ -7940,6 +8000,31 @@ mod tests {
             )
             .unwrap(),
             BrowserDeliveryState::Stopped
+        );
+    }
+
+    #[test]
+    fn browser_resource_unavailable_reason_is_machine_bounded_and_never_generic() {
+        let exact = BrowserPostconditionEvidence::resource_unavailable_with_reason(
+            7,
+            "source_session_unavailable",
+        );
+        assert_eq!(
+            browser_resource_unavailable_reason(&exact).unwrap(),
+            "source_session_unavailable"
+        );
+
+        let missing = BrowserPostconditionEvidence::resource_unavailable(7);
+        assert_eq!(
+            browser_resource_unavailable_reason(&missing).unwrap(),
+            "browser_actuation_reason_missing"
+        );
+
+        let mut unsafe_reason = BrowserPostconditionEvidence::resource_unavailable(7);
+        unsafe_reason.result = Some(json!({"error": "Failed to click <button>"}));
+        assert_eq!(
+            browser_resource_unavailable_reason(&unsafe_reason).unwrap_err(),
+            "browser_evidence_reason_invalid"
         );
     }
 
