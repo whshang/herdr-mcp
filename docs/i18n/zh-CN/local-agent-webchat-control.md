@@ -272,7 +272,7 @@ Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-ke
 
 **准备完成不等于已投递。** 当源会话当前未注册、或 browser control 不可用时，packet 与 `manual_delivery.copy_prompt` 仍会返回，同时 `automatic_delivery.attempted=false` 并带上 runtime 的原因。这是可用于手工接力的结果，**不是**已完成的 handoff：只有 `automatic_delivery.completed=true`（即 `delivery_state=applied`）才代表真的新建了会话。`uncertain` 状态会如实返回，绝不会自动重试。
 
-**仍然成立**：`herdr-mcp webchat create` 不接受 `source_url`。基于 source 的投递只留在这条 handoff 路径里，普通 create 接口依旧要求显式 routing id。
+`herdr-mcp webchat create --source-url URL` 现在也支持精确 source-window affinity。CLI 仍要求传入已观察到的 endpoint/provider/account ref 以附加 trusted local grant，但这些 routing id 不会进入 create 请求体；实际 route 仍由 Runtime 根据已注册的 canonical source URL 解析并校验。
 
 ## 7. 本地 Agent 示例
 
@@ -347,7 +347,7 @@ Agent 应按这个顺序做：
 
 - **不支持的浏览器操作**（runtime 返回 `code: "unsupported"`）：`browser_space.create`、`browser_space.open`、`browser_message.append`、`browser_composer.set_reasoning`、`browser_composer.set_apps`，以及带 `reasoning_effort` 或 `required_apps` 的 `browser_dispatch.submit`。
 - **支持但当前没有 CLI 包装**：`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。它们可通过 runtime MCP 私有方法边界调用。`browser_session.open` 已通过 `herdr-mcp webchat open` 暴露。
-- **Handoff**：canonical 准备路径是 `herdr_mcp.browser_handoff.prepare`，本地 Agent 通过 `herdr-mcp webchat handoff` 使用它（复用它并接着做基于 source 的投递）。Web planner 与扩展 HUD 仍直接调用该私有方法。`webchat create` 仍不接受 `source_url`，也没有对应的 handoff 参数。
+- **Handoff**：canonical 准备路径是 `herdr_mcp.browser_handoff.prepare`，本地 Agent 通过 `herdr-mcp webchat handoff` 使用它（复用它并接着做基于 source 的投递）。Web planner 与扩展 HUD 仍直接调用该私有方法。普通 `webchat create` 也接受 `--source-url` 来获得精确 source-window affinity；它不会生成或改写 handoff packet。
 - **`ego-browser`** 是开发/UAT 基础设施，既不是用户依赖，也不是这条 control plane 的替代品。
 - **完全没有暴露**：读取用户 ChatGPT 私有历史正文、经 dispatch 契约发送附件、任意 DOM 访问，以及 registry 未报告的任何 provider。
 

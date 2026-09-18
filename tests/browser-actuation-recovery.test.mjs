@@ -1351,6 +1351,12 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);
   const createSegment = wakeSource.slice(createStart, createEnd);
   assert.match(createSegment, /sessionStorage\.setItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef\)/);
+  assert.match(createSegment, /const chatMode = await ensureChatGptChatMode\(\)/);
+  assert.match(createSegment, /result: \{ error: chatMode\.error \}/);
+  assert.ok(
+    createSegment.indexOf("const chatMode = await ensureChatGptChatMode()") < createSegment.indexOf("const composerReadyDeadline"),
+    "fresh-session actuation must enter Chat mode before waiting for the composer",
+  );
   assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 20000/);
   assert.match(createSegment, /while \(!ADAPTER\.getInputEl\(\) && Date\.now\(\) < composerReadyDeadline\)/);
   assert.match(createSegment, /await wait\(200\)/);
@@ -1382,6 +1388,25 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
 });
 
+test("ChatGPT browser actuation switches Work mode to Chat mode through the visible radio control", () => {
+  const visibleHelperStart = wakeSource.indexOf("function visibleChatGptModeRadio(pattern)");
+  const helperStart = wakeSource.indexOf("async function ensureChatGptChatMode()");
+  const helperEnd = wakeSource.indexOf("\n  async function performBrowserActuationCommand", helperStart);
+  assert.ok(visibleHelperStart >= 0 && helperStart > visibleHelperStart && helperEnd > helperStart, "Chat mode helpers must exist before browser actuation");
+  const helper = wakeSource.slice(visibleHelperStart, helperEnd);
+  assert.match(helper, /button\[role="radio"\]/);
+  assert.match(helper, /getBoundingClientRect\(\)/);
+  assert.match(helper, /rect\.width > 0/);
+  assert.match(helper, /rect\.height > 0/);
+  assert.match(helper, /聊天\|Chat\|チャット/);
+  assert.match(helper, /工作\|Work\|作業/);
+  assert.match(helper, /work\.getAttribute\("aria-checked"\) !== "true"/);
+  assert.match(helper, /chat\.click\(\)/);
+  assert.match(helper, /chat\.getAttribute\("aria-checked"\) === "true"/);
+  assert.match(helper, /work\.getAttribute\("aria-checked"\) === "false"/);
+  assert.match(helper, /chat_mode_switch_timeout/);
+});
+
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {
   assert.match(backgroundSource, /"composer\.select_tool"/);
   assert.match(chatGptAdapterSource, /#composer-plus-btn/);
@@ -1406,6 +1431,12 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
 // handshake (which drives lazy registerCurrentConversation registration) while
 // retaining the account/space/generation equality gate. Old code never probes,
 // so the scope never materializes and the create still fails closed.
+const recoverBrowserSessionTargetSource = (() => {
+  const start = backgroundSource.indexOf("async function recoverBrowserSessionTarget(");
+  const end = backgroundSource.indexOf("async function resolveBrowserCreateAnchorWindow({", start);
+  assert.ok(start >= 0 && end > start, "session target recovery helper must remain extractable");
+  return backgroundSource.slice(start, end);
+})();
 const createAnchorSource2 = (() => {
   const start = backgroundSource.indexOf("async function resolveBrowserCreateAnchorWindow({");
   const end = backgroundSource.indexOf("async function handleBrowserActuation", start);
@@ -1510,7 +1541,7 @@ function createActuationBranchHarness({ publishOnProbe = true } = {}) {
     `const operation = String(command?.operation || "");\n` +
     `const expectedGeneration = Number(command?.expected_generation || 0);\n` +
     `const params = command?.params && typeof command.params === "object" ? command.params : {};\n` +
-    `${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
+    `${recoverBrowserSessionTargetSource}\n${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
   )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrls,
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
@@ -1606,4 +1637,38 @@ test("session.create still fails closed when the fresh tab can never be identifi
   const failure = harness.postCalls.find((c) => c.evidence?.resource_available === false);
   assert.ok(failure, "unidentifiable fresh tab must fail closed with resource_available=false");
   assert.equal(failure.evidence.command_accepted, false);
+  assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
+});
+
+test("session.create preserves the exact source-window failure reason", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness();
+  const sourceTabId = 71;
+  harness.browserTabScopes.set(sourceTabId, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(sourceTabId, { id: sourceTabId, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "2".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      source_session_ref: "br_" + "3".repeat(64),
+      reservation_ref: "bsr_" + "4".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+
+  const failure = harness.postCalls.find((c) => c.evidence?.resource_available === false);
+  assert.ok(failure, "missing exact source session must fail closed");
+  assert.equal(failure.evidence.command_accepted, false);
+  assert.equal(failure.evidence.result?.error, "source_session_unavailable");
+  assert.equal(harness.actuationMessages.length, 0);
 });

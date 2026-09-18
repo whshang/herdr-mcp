@@ -3257,7 +3257,10 @@ async function handleBrowserActuation(command) {
         || !launchUrl.startsWith("https://")) {
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration),
+        {
+          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          result: { error: "browser_create_params_invalid" },
+        },
       );
       return;
     }
@@ -3271,7 +3274,10 @@ async function handleBrowserActuation(command) {
     if (anchor.unavailable) {
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration),
+        {
+          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          result: { error: anchor.reason || "browser_create_anchor_unavailable" },
+        },
       );
       return;
     }
@@ -3285,7 +3291,10 @@ async function handleBrowserActuation(command) {
     if (!createdTab?.id) {
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration),
+        {
+          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          result: { error: "browser_create_tab_open_failed" },
+        },
       );
       return;
     }
@@ -3323,7 +3332,10 @@ async function handleBrowserActuation(command) {
     if (!scope) {
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration),
+        {
+          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          result: { error: "browser_create_scope_unavailable" },
+        },
       );
       return;
     }
