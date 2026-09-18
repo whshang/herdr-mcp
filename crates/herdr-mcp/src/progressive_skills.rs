@@ -37,6 +37,7 @@ pub const BROWSER_RESOURCE_LIST_METHOD: &str = "herdr_mcp.browser_resource.list"
 pub const BROWSER_RESOURCE_INSPECT_METHOD: &str = "herdr_mcp.browser_resource.inspect";
 pub const BROWSER_RESOURCE_RESOLVE_METHOD: &str = "herdr_mcp.browser_resource.resolve";
 pub const BROWSER_HANDOFF_PREPARE_METHOD: &str = "herdr_mcp.browser_handoff.prepare";
+pub const BROWSER_SOURCE_RESOLVE_METHOD: &str = "herdr_mcp.browser_source.resolve";
 pub const BROWSER_SPACE_CREATE_METHOD: &str = "herdr_mcp.browser_space.create";
 pub const BROWSER_SPACE_OPEN_METHOD: &str = "herdr_mcp.browser_space.open";
 pub const BROWSER_SPACE_INSPECT_METHOD: &str = "herdr_mcp.browser_space.inspect";

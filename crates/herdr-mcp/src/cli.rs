@@ -255,9 +255,9 @@ pub enum WebChatCommand {
         resource_ref: String,
     },
     Create {
-        endpoint_ref: String,
-        provider: String,
-        account_ref: String,
+        endpoint_ref: Option<String>,
+        provider: Option<String>,
+        account_ref: Option<String>,
         space_ref: Option<String>,
         source_url: Option<String>,
         display_label: Option<String>,
@@ -799,6 +799,15 @@ fn parse_webchat_create(args: &[String]) -> Result<Command, String> {
         index += 2;
     }
     if source_url.is_none() {
+        if endpoint_ref.is_none() {
+            return Err("webchat create requires --endpoint-ref without --source-url".to_owned());
+        }
+        if provider.is_none() {
+            return Err("webchat create requires --provider without --source-url".to_owned());
+        }
+        if account_ref.is_none() {
+            return Err("webchat create requires --account-ref without --source-url".to_owned());
+        }
         if display_label.is_none() {
             return Err("webchat create requires --display-label without --source-url".to_owned());
         }
@@ -809,9 +818,9 @@ fn parse_webchat_create(args: &[String]) -> Result<Command, String> {
         }
     }
     Ok(Command::WebChat(WebChatCommand::Create {
-        endpoint_ref: required_flag(endpoint_ref, "--endpoint-ref")?,
-        provider: required_flag(provider, "--provider")?,
-        account_ref: required_flag(account_ref, "--account-ref")?,
+        endpoint_ref,
+        provider,
+        account_ref,
         space_ref,
         source_url,
         display_label,
@@ -2359,7 +2368,7 @@ Usage:\n\
   herdr-mcp webchat resources [--endpoint-ref REF] [--provider PROVIDER] [--kind account|space|session] [--parent-ref REF] [--limit N]\n\
   herdr-mcp webchat inspect <resource_ref>\n\
   herdr-mcp webchat create --endpoint-ref REF --provider PROVIDER --account-ref REF --display-label LABEL --message MESSAGE --expected-generation N --idempotency-key KEY [--space-ref REF] [--work-chain-id ID]\n\
-  herdr-mcp webchat create --source-url URL --endpoint-ref REF --provider PROVIDER --account-ref REF --message MESSAGE --idempotency-key KEY [--work-chain-id ID]\n\
+  herdr-mcp webchat create --source-url URL --message MESSAGE --idempotency-key KEY [--work-chain-id ID]\n\
   herdr-mcp webchat send --session-ref REF --message MESSAGE --expected-generation N --idempotency-key KEY [--work-chain-id ID]\n\
   herdr-mcp webchat dispatch-status <dispatch_id>\n\
   herdr-mcp webchat open --session-ref REF --expected-generation N --idempotency-key KEY\n\
@@ -2519,12 +2528,6 @@ mod tests {
                 "create",
                 "--source-url",
                 "https://chatgpt.com/g/g-p-test/c/source",
-                "--endpoint-ref",
-                "bep_test",
-                "--provider",
-                "chatgpt",
-                "--account-ref",
-                "br_account",
                 "--message",
                 "continue",
                 "--idempotency-key",
@@ -2533,9 +2536,9 @@ mod tests {
             .unwrap()
             .command,
             Command::WebChat(WebChatCommand::Create {
-                endpoint_ref: "bep_test".to_owned(),
-                provider: "chatgpt".to_owned(),
-                account_ref: "br_account".to_owned(),
+                endpoint_ref: None,
+                provider: None,
+                account_ref: None,
                 space_ref: None,
                 source_url: Some("https://chatgpt.com/g/g-p-test/c/source".to_owned()),
                 display_label: None,
@@ -2544,6 +2547,21 @@ mod tests {
                 idempotency_key: "create-key-1".to_owned(),
                 work_chain_id: None,
             })
+        );
+        assert!(
+            parse(args(&[
+                "webchat",
+                "create",
+                "--message",
+                "continue",
+                "--idempotency-key",
+                "create-key-missing-route",
+                "--display-label",
+                "Worker",
+                "--expected-generation",
+                "7",
+            ]))
+            .is_err()
         );
         assert!(
             parse(args(&[

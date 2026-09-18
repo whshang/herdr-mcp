@@ -13,10 +13,11 @@ use crate::progressive_skills::{
     BROWSER_ENDPOINT_INSPECT_METHOD, BROWSER_ENDPOINT_LIST_METHOD, BROWSER_HANDOFF_PREPARE_METHOD,
     BROWSER_MESSAGE_APPEND_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
     BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD,
-    BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SPACE_CREATE_METHOD,
-    BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD, EXEC_WAIT_METHOD,
-    WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD,
-    WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
+    BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD,
+    EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
+    WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
+    WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
@@ -142,6 +143,7 @@ pub struct RuntimeContext<'a> {
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
+    pub trusted_local_ipc: bool,
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -316,6 +318,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if method == BROWSER_SOURCE_RESOLVE_METHOD {
+                browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
                 browser_handoff_prepare(context.state_store, &params)
             } else if method == "herdr_mcp.page_assist" {
@@ -3185,6 +3189,44 @@ fn browser_source_route(
         display_label,
         expected_generation: session.observation_generation,
     })
+}
+
+fn browser_source_resolve(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    trusted_local_ipc: bool,
+) -> Value {
+    if !trusted_local_ipc {
+        return json!({"ok": false, "code": "trusted_local_ipc_required"});
+    }
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "browser_source_resolve_params_invalid"});
+    };
+    if object.len() != 1 || !object.contains_key("source_url") {
+        return json!({"ok": false, "code": "browser_source_resolve_params_invalid"});
+    }
+    let source_url = match browser_required_string(params, "source_url", 2048) {
+        Ok(value) => value,
+        Err(_) => return json!({"ok": false, "code": "browser_source_url_invalid"}),
+    };
+    let Ok(store) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    match browser_source_route(&store, source_url) {
+        Ok(route) => json!({
+            "ok": true,
+            "route": {
+                "session_ref": route.session_ref,
+                "provider": route.provider,
+                "endpoint_ref": route.endpoint_ref,
+                "account_ref": route.account_ref,
+                "space_ref": route.space_ref,
+                "display_label": route.display_label,
+                "expected_generation": route.expected_generation,
+            }
+        }),
+        Err(error) => browser_store_error(error),
+    }
 }
 
 fn browser_handoff_prepare(
@@ -10193,6 +10235,176 @@ mod tests {
     fn browser_session_create_reconciliation_stays_within_request_headroom() {
         let intervals = BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS.saturating_sub(1) as u64;
         assert!(intervals * BROWSER_SESSION_CREATE_PRODUCTION_RECONCILE_INTERVAL_MS <= 5_000);
+    }
+
+    #[test]
+    fn user_source_route_resolve_is_local_only_latest_and_fail_closed_on_tie() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        const URL: &str =
+            "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+        fn observe(
+            store: &mut StateStore,
+            seed: &str,
+            account_identity: &str,
+            session_identity: &str,
+            observed_at: i64,
+        ) -> (String, String) {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: seed,
+                    browser_family: "chrome",
+                    extension_version: "0.1.101",
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: observed_at,
+                    capabilities_json: r#"{"operations":["session.create"]}"#,
+                    observed_at,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: account_identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: session_identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    URL,
+                    observed_at,
+                    observed_at,
+                )
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_a, account_a) = {
+            let mut guard = store.lock().unwrap();
+            observe(
+                &mut guard,
+                "source-grant-profile-seed-a-0123456789",
+                "account-a",
+                "session-a",
+                100,
+            )
+        };
+        assert_eq!(
+            browser_source_resolve(&store, &json!({"source_url": URL}), false)["code"],
+            "trusted_local_ipc_required"
+        );
+        let (endpoint_b, account_b) = {
+            let mut guard = store.lock().unwrap();
+            observe(
+                &mut guard,
+                "source-grant-profile-seed-b-0123456789",
+                "account-b",
+                "session-b",
+                200,
+            )
+        };
+        let resolved = browser_source_resolve(&store, &json!({"source_url": URL}), true);
+        assert_eq!(resolved["ok"], true);
+        assert_eq!(resolved["route"]["endpoint_ref"], endpoint_b);
+        assert_eq!(resolved["route"]["account_ref"], account_b);
+        assert_ne!(resolved["route"]["endpoint_ref"], endpoint_a);
+        assert_ne!(resolved["route"]["account_ref"], account_a);
+        {
+            let mut guard = store.lock().unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint_b,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 201,
+                })
+                .unwrap();
+        }
+        let account_b_resource = store
+            .lock()
+            .unwrap()
+            .browser_resource(&account_b)
+            .unwrap()
+            .unwrap();
+        let stale_a_grant = [BrowserCallerGrant {
+            endpoint_ref: endpoint_a.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: account_a.clone(),
+        }];
+        assert_eq!(
+            browser_resource_actuation_decision(
+                &store.lock().unwrap(),
+                "session.create",
+                &account_b_resource,
+                &stale_a_grant,
+                Some(200),
+            )
+            .unwrap(),
+            (false, Some("caller_grant_missing"))
+        );
+        let exact_b_grant = [BrowserCallerGrant {
+            endpoint_ref: endpoint_b.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: account_b.clone(),
+        }];
+        assert_eq!(
+            browser_resource_actuation_decision(
+                &store.lock().unwrap(),
+                "session.create",
+                &account_b_resource,
+                &exact_b_grant,
+                Some(200),
+            )
+            .unwrap(),
+            (true, None)
+        );
+
+        {
+            let mut guard = store.lock().unwrap();
+            observe(
+                &mut guard,
+                "source-grant-profile-seed-tie-0123456789",
+                "account-tie",
+                "session-tie",
+                200,
+            );
+        }
+        assert_eq!(
+            browser_source_resolve(&store, &json!({"source_url": URL}), true)["code"],
+            "browser_canonical_url_ambiguous"
+        );
     }
 
     #[test]

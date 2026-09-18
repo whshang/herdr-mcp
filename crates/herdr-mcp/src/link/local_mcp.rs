@@ -767,12 +767,14 @@ impl LocalMcpTransport {
         &self,
         body: String,
         rpc_id: String,
+        force_trusted_ipc: bool,
         webchat_grants_header: Option<String>,
         page_assist_grants_header: Option<String>,
         authorization_header: Option<String>,
         browser_caller_session_header: Option<String>,
     ) -> RuntimeToolResult {
-        if webchat_grants_header.is_some()
+        if force_trusted_ipc
+            || webchat_grants_header.is_some()
             || page_assist_grants_header.is_some()
             || authorization_header.is_some()
             || browser_caller_session_header.is_some()
@@ -792,6 +794,21 @@ impl LocalMcpTransport {
     }
 
     async fn dispatch_inner(&self, request: RuntimeRequest) -> RuntimeToolResult {
+        self.dispatch_inner_with_trust(request, false).await
+    }
+
+    pub async fn dispatch_trusted_local_read_request(
+        &self,
+        request: RuntimeRequest,
+    ) -> RuntimeToolResult {
+        self.dispatch_inner_with_trust(request, true).await
+    }
+
+    async fn dispatch_inner_with_trust(
+        &self,
+        request: RuntimeRequest,
+        force_trusted_ipc: bool,
+    ) -> RuntimeToolResult {
         if request.request_id.is_empty() {
             return self.failure(code::BAD_REQUEST, false, "invalid tool request frame", None);
         }
@@ -920,6 +937,7 @@ impl LocalMcpTransport {
             result = self.dispatch_routed(
                 body,
                 rpc_id,
+                force_trusted_ipc,
                 webchat_grants_header,
                 page_assist_grants_header,
                 authorization_header,

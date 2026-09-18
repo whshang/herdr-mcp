@@ -272,7 +272,7 @@ herdr-mcp webchat handoff \
 
 **準備済みは配送済みではありません。** ソース会話が未登録、または browser control が利用できない場合でも packet と `manual_delivery.copy_prompt` は返り、`automatic_delivery.attempted=false` と runtime の理由が付きます。これは手動継続に使える結果ですが、**完了した handoff ではありません**。実際に会話が作成されたのは `automatic_delivery.completed=true`（つまり `delivery_state=applied`）のときだけです。`uncertain` はそのまま報告され、自動再試行はしません。
 
-`herdr-mcp webchat create --source-url URL` は、正確な source-window affinity のために source ベースの経路も利用できます。CLI は trusted local grant を付与するため観測済み endpoint/provider/account ref を引き続き要求しますが、それらの routing id は create payload には送られず、実際の route は登録済み canonical source URL から Runtime が解決・検証します。
+`herdr-mcp webchat create --source-url URL` は、正確な source-window affinity のために source ベースの経路を利用し、呼び出し側が endpoint/provider/account ref を指定する必要はありません。ローカル CLI は trusted Unix IPC 経由で Runtime に同じ canonical source resolver を使わせ、最新の exact route から trusted local grant を作ります。create payload の route 入力は引き続き `source_url` だけで、Runtime は mutation 前にもう一度解決・検証します。その間に route が変われば exact grant が一致せず fail closed となり、古い endpoint へ誤配送しません。明示的な direct create では endpoint/provider/account と generation が引き続き必要です。
 
 ## 7. ローカル Agent の例
 
