@@ -48,7 +48,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.98";
+const H2W_SCRIPT_VERSION = "0.1.99";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -1915,7 +1915,10 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
     return { ok: false, claimed: true, error: "archive-claim-invalid", trigger };
   }
 
-  let evidence = unavailableBrowserActuationEvidence(expectedGeneration);
+  let evidence = unavailableBrowserActuationEvidence(
+    expectedGeneration,
+    "durable_archive_not_delivered",
+  );
   // The page owns only a bounded wake-up hint. Runtime SQLite remains the
   // authority. If the service worker disappears before the no-replay fence,
   // this later wake lets the runtime reclaim the expired pre-actuation claim.
@@ -1932,7 +1935,12 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
   } catch (_) {}
   const live = chatGptConversationInfo(tab?.url || "");
   if (!tab || live?.conversation_id !== info.conversation_id) {
-    evidence = { ...evidence, browser_online: true, resource_available: false };
+    evidence = {
+      ...evidence,
+      browser_online: true,
+      resource_available: false,
+      result: { error: "durable_archive_tab_unavailable" },
+    };
     const completion = await completeDurableSelfArchive(archiveRef, claimAttempt, evidence);
     if (completion?.retryable === true) {
       void scheduleDurableArchiveRetry(
@@ -1972,7 +1980,13 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
     });
     evidence = response?.evidence && typeof response.evidence === "object"
       ? response.evidence
-      : { ...evidence, command_accepted: true, browser_online: true, resource_available: true };
+      : {
+          ...evidence,
+          command_accepted: true,
+          browser_online: true,
+          resource_available: true,
+          result: { error: "durable_archive_content_response_missing" },
+        };
   } catch (_) {
     // `archive.begin` has already committed. Any send-side exception, including
     // a missing receiver, is therefore delivery-uncertain unless a content
@@ -1982,6 +1996,7 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
       command_accepted: true,
       browser_online: true,
       resource_available: true,
+      result: { error: "durable_archive_content_dispatch_failed" },
     };
   }
   const completion = await completeDurableSelfArchive(archiveRef, claimAttempt, evidence);
@@ -2903,7 +2918,10 @@ async function postBrowserActuationEvidence(actuationId, evidence) {
   }
 }
 
-function unavailableBrowserActuationEvidence(expectedGeneration, observedGeneration = expectedGeneration) {
+function unavailableBrowserActuationEvidence(expectedGeneration, reason, observedGeneration = expectedGeneration) {
+  if (typeof reason !== "string" || !/^[a-z][a-z0-9_]{0,95}$/.test(reason)) {
+    throw new Error("browser_actuation_reason_invalid");
+  }
   return {
     observed_generation: Math.max(1, Number(observedGeneration) || Number(expectedGeneration) || 1),
     command_accepted: false,
@@ -2920,6 +2938,7 @@ function unavailableBrowserActuationEvidence(expectedGeneration, observedGenerat
     generation_owner: null,
     generation_status_observed: false,
     generation_stopped: false,
+    result: { error: reason },
   };
 }
 
@@ -3203,7 +3222,10 @@ async function handleBrowserActuation(command) {
   }
   if (command?.protocol !== "herdr-browser-actuation/v1") {
     await postBrowserActuationEvidence(actuationId, {
-      ...unavailableBrowserActuationEvidence(expectedGeneration),
+      ...unavailableBrowserActuationEvidence(
+        expectedGeneration,
+        "browser_actuation_protocol_mismatch",
+      ),
       resource_available: true,
       rejected: true,
     }).catch(() => {});
@@ -3236,7 +3258,7 @@ async function handleBrowserActuation(command) {
       result = { ok: false, error: "page_assist_invalid_result" };
     }
     await postBrowserActuationEvidence(actuationId, {
-      ...unavailableBrowserActuationEvidence(expectedGeneration),
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "page_assist_unavailable"),
       command_accepted: true,
       resource_available: true,
       result,
@@ -3258,7 +3280,7 @@ async function handleBrowserActuation(command) {
       await postBrowserActuationEvidence(
         actuationId,
         {
-          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          ...unavailableBrowserActuationEvidence(expectedGeneration, "browser_create_params_invalid"),
           result: { error: "browser_create_params_invalid" },
         },
       );
@@ -3275,7 +3297,10 @@ async function handleBrowserActuation(command) {
       await postBrowserActuationEvidence(
         actuationId,
         {
-          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          ...unavailableBrowserActuationEvidence(
+            expectedGeneration,
+            anchor.reason || "browser_create_anchor_unavailable",
+          ),
           result: { error: anchor.reason || "browser_create_anchor_unavailable" },
         },
       );
@@ -3292,7 +3317,7 @@ async function handleBrowserActuation(command) {
       await postBrowserActuationEvidence(
         actuationId,
         {
-          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          ...unavailableBrowserActuationEvidence(expectedGeneration, "browser_create_tab_open_failed"),
           result: { error: "browser_create_tab_open_failed" },
         },
       );
@@ -3333,7 +3358,7 @@ async function handleBrowserActuation(command) {
       await postBrowserActuationEvidence(
         actuationId,
         {
-          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          ...unavailableBrowserActuationEvidence(expectedGeneration, "browser_create_scope_unavailable"),
           result: { error: "browser_create_scope_unavailable" },
         },
       );
@@ -3359,21 +3384,30 @@ async function handleBrowserActuation(command) {
         const evidence = response?.evidence && typeof response.evidence === "object"
           ? response.evidence
           : {
-              ...unavailableBrowserActuationEvidence(expectedGeneration),
+              ...unavailableBrowserActuationEvidence(
+                expectedGeneration,
+                "browser_create_content_response_missing",
+              ),
               command_accepted: true,
               resource_available: true,
             };
         await postBrowserActuationEvidence(actuationId, evidence);
       }).catch(async () => {
         await postBrowserActuationEvidence(actuationId, {
-          ...unavailableBrowserActuationEvidence(expectedGeneration),
+          ...unavailableBrowserActuationEvidence(
+            expectedGeneration,
+            "browser_create_content_dispatch_failed",
+          ),
           command_accepted: true,
           resource_available: true,
         }).catch(() => {});
       });
     } catch (_) {
       await postBrowserActuationEvidence(actuationId, {
-        ...unavailableBrowserActuationEvidence(expectedGeneration),
+        ...unavailableBrowserActuationEvidence(
+          expectedGeneration,
+          "browser_create_dispatch_setup_failed",
+        ),
         command_accepted: true,
         resource_available: true,
       }).catch(() => {});
@@ -3387,7 +3421,7 @@ async function handleBrowserActuation(command) {
     if (providerOpen !== "chatgpt" || !sessionRefOpen) {
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration),
+        unavailableBrowserActuationEvidence(expectedGeneration, "browser_open_params_invalid"),
       );
       return;
     }
@@ -3398,7 +3432,11 @@ async function handleBrowserActuation(command) {
       if (!targetOpen && recovered.ambiguous) {
         await postBrowserActuationEvidence(
           actuationId,
-          unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+          unavailableBrowserActuationEvidence(
+            expectedGeneration,
+            "browser_open_target_ambiguous",
+            recovered.observedGeneration,
+          ),
         );
         return;
       }
@@ -3407,7 +3445,11 @@ async function handleBrowserActuation(command) {
         if (!canonicalInfo?.conversation_id) {
           await postBrowserActuationEvidence(
             actuationId,
-            unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+            unavailableBrowserActuationEvidence(
+              expectedGeneration,
+              "browser_open_canonical_url_invalid",
+              recovered.observedGeneration,
+            ),
           );
           return;
         }
@@ -3417,7 +3459,11 @@ async function handleBrowserActuation(command) {
         if (existing.ambiguous) {
           await postBrowserActuationEvidence(
             actuationId,
-            unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+            unavailableBrowserActuationEvidence(
+              expectedGeneration,
+              "browser_open_canonical_ambiguous",
+              recovered.observedGeneration,
+            ),
           );
           return;
         }
@@ -3430,7 +3476,11 @@ async function handleBrowserActuation(command) {
           if (!createdTab?.id) {
             await postBrowserActuationEvidence(
               actuationId,
-              unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+              unavailableBrowserActuationEvidence(
+                expectedGeneration,
+                "browser_open_tab_create_failed",
+                recovered.observedGeneration,
+              ),
             );
             return;
           }
@@ -3443,7 +3493,10 @@ async function handleBrowserActuation(command) {
           } while (Date.now() < deadline);
           if (!targetOpen) {
             await postBrowserActuationEvidence(actuationId, {
-              ...unavailableBrowserActuationEvidence(expectedGeneration),
+              ...unavailableBrowserActuationEvidence(
+                expectedGeneration,
+                "browser_open_target_register_timeout",
+              ),
               command_accepted: true,
               resource_available: true,
             }).catch(() => {});
@@ -3454,7 +3507,11 @@ async function handleBrowserActuation(command) {
       if (!targetOpen) {
         await postBrowserActuationEvidence(
           actuationId,
-          unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+          unavailableBrowserActuationEvidence(
+            expectedGeneration,
+            "browser_open_target_unavailable",
+            recovered.observedGeneration,
+          ),
         );
         return;
       }
@@ -3462,7 +3519,11 @@ async function handleBrowserActuation(command) {
     if (targetOpen.observationGeneration !== expectedGeneration || targetOpen.provider !== providerOpen) {
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration, targetOpen.observationGeneration),
+        unavailableBrowserActuationEvidence(
+          expectedGeneration,
+          "browser_open_scope_mismatch",
+          targetOpen.observationGeneration,
+        ),
       );
       return;
     }
@@ -3473,7 +3534,7 @@ async function handleBrowserActuation(command) {
       browserSessionTargets.delete(sessionRefOpen);
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration),
+        unavailableBrowserActuationEvidence(expectedGeneration, "browser_open_tab_identity_mismatch"),
       );
       return;
     }
@@ -3493,11 +3554,21 @@ async function handleBrowserActuation(command) {
       });
       const evidence = response?.evidence && typeof response.evidence === "object"
         ? response.evidence
-        : { ...unavailableBrowserActuationEvidence(expectedGeneration), command_accepted: true, resource_available: true };
+        : {
+            ...unavailableBrowserActuationEvidence(
+              expectedGeneration,
+              "browser_open_content_response_missing",
+            ),
+            command_accepted: true,
+            resource_available: true,
+          };
       await postBrowserActuationEvidence(actuationId, evidence);
     } catch (_) {
       await postBrowserActuationEvidence(actuationId, {
-        ...unavailableBrowserActuationEvidence(expectedGeneration),
+        ...unavailableBrowserActuationEvidence(
+          expectedGeneration,
+          "browser_open_content_dispatch_failed",
+        ),
         command_accepted: true,
         resource_available: true,
       }).catch(() => {});
@@ -3526,7 +3597,11 @@ async function handleBrowserActuation(command) {
     if (!target && recovered.ambiguous) {
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+        unavailableBrowserActuationEvidence(
+          expectedGeneration,
+          "browser_session_target_ambiguous",
+          recovered.observedGeneration,
+        ),
       );
       return;
     }
@@ -3541,7 +3616,11 @@ async function handleBrowserActuation(command) {
         if (existing.ambiguous) {
           await postBrowserActuationEvidence(
             actuationId,
-            unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+            unavailableBrowserActuationEvidence(
+              expectedGeneration,
+              "browser_archive_canonical_ambiguous",
+              recovered.observedGeneration,
+            ),
           );
           return;
         }
@@ -3566,7 +3645,11 @@ async function handleBrowserActuation(command) {
     if (!target) {
       await postBrowserActuationEvidence(
         actuationId,
-        unavailableBrowserActuationEvidence(expectedGeneration, recovered.observedGeneration),
+        unavailableBrowserActuationEvidence(
+          expectedGeneration,
+          "browser_session_target_unavailable",
+          recovered.observedGeneration,
+        ),
       );
       return;
     }
@@ -3575,7 +3658,11 @@ async function handleBrowserActuation(command) {
     browserSessionTargets.delete(sessionRef);
     await postBrowserActuationEvidence(
       actuationId,
-      unavailableBrowserActuationEvidence(expectedGeneration, target.observationGeneration),
+      unavailableBrowserActuationEvidence(
+        expectedGeneration,
+        "browser_session_generation_mismatch",
+        target.observationGeneration,
+      ),
     );
     return;
   }
@@ -3587,7 +3674,7 @@ async function handleBrowserActuation(command) {
     browserSessionTargets.delete(sessionRef);
     await postBrowserActuationEvidence(
       actuationId,
-      unavailableBrowserActuationEvidence(expectedGeneration),
+      unavailableBrowserActuationEvidence(expectedGeneration, "browser_session_tab_identity_mismatch"),
     );
     return;
   }
@@ -3603,7 +3690,14 @@ async function handleBrowserActuation(command) {
     });
     const evidence = response?.evidence && typeof response.evidence === "object"
       ? response.evidence
-      : { ...unavailableBrowserActuationEvidence(expectedGeneration), command_accepted: true, resource_available: true };
+      : {
+          ...unavailableBrowserActuationEvidence(
+            expectedGeneration,
+            "browser_session_content_response_missing",
+          ),
+          command_accepted: true,
+          resource_available: true,
+        };
     await postBrowserActuationEvidence(actuationId, evidence);
     const archiveProjectId = live?.project_id || target.projectId || null;
     if (shouldCloseArchivedChatGptTab(operation, evidence, targetProvider, archiveProjectId)) {
@@ -3624,7 +3718,10 @@ async function handleBrowserActuation(command) {
     // The command may already have crossed into the content script. Report an
     // uncertain attempt rather than a retryable not-applied result.
     await postBrowserActuationEvidence(actuationId, {
-      ...unavailableBrowserActuationEvidence(expectedGeneration),
+      ...unavailableBrowserActuationEvidence(
+        expectedGeneration,
+        "browser_session_content_dispatch_failed",
+      ),
       command_accepted: true,
       resource_available: true,
     }).catch(() => {});

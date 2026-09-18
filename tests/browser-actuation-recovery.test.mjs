@@ -1450,7 +1450,7 @@ const createBranchSource = (() => {
   return backgroundSource.slice(start, end);
 })();
 
-function createActuationBranchHarness({ publishOnProbe = true } = {}) {
+function createActuationBranchHarness({ publishOnProbe = true, contentMode = "success" } = {}) {
   // Virtual clock: the old 8s scope-gate deadline must elapse immediately so a
   // harness that models the no-probe failure returns fast.
   const clock = { value: 1_000_000 };
@@ -1497,18 +1497,21 @@ function createActuationBranchHarness({ publishOnProbe = true } = {}) {
     const info = chatGptConversationInfo(rawUrl);
     return info ? { ...info } : null;
   };
-  const unavailable = (expectedGeneration, observedGeneration = expectedGeneration) => ({
+  const unavailable = (expectedGeneration, reason, observedGeneration = expectedGeneration) => ({
     observed_generation: Math.max(1, Number(observedGeneration) || Number(expectedGeneration) || 1),
     command_accepted: false, browser_online: false, resource_available: false, rejected: false,
     stable_resource_ref_observed: false, lifecycle_observed: false, canonical_url_observed: false,
     accepted_message_observed: false, message_baseline_advanced: false,
     reasoning_effort_readback: null, required_apps_readback: [],
-    generation_owner: null, generation_status_observed: false, generation_stopped: false, result: null,
+    generation_owner: null, generation_status_observed: false, generation_stopped: false,
+    result: { error: reason },
   });
   const postBrowserActuationEvidence = async (id, evidence) => { postCalls.push({ id, evidence }); };
   const protectBoundTab = async () => {};
   const sendBrowserActuationTabMessage = async (tabId, message) => {
     actuationMessages.push({ tabId, message });
+    if (contentMode === "throw") throw new Error("content dispatch failed");
+    if (contentMode === "missing") return {};
     return {
       evidence: {
         observed_generation: 17,
@@ -1604,6 +1607,74 @@ test("session.create closes the startup scope deadlock with a non-mutating ident
   assert.ok(success, "probe-driven create must complete with resource_available=true");
   assert.equal(success.evidence.command_accepted, true);
   assert.equal(harness.postCalls.some((c) => c.evidence?.resource_available === false), false);
+});
+
+test("user Given a fresh ChatGPT create When the content response is missing Then the exact machine reason is preserved", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ contentMode: "missing" });
+  harness.browserTabScopes.set(71, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(71, { id: 71, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "5".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "6".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  const evidence = harness.postCalls.at(-1)?.evidence;
+  assert.equal(evidence?.command_accepted, true);
+  assert.equal(evidence?.resource_available, true);
+  assert.equal(evidence?.result?.error, "browser_create_content_response_missing");
+});
+
+test("user Given a fresh ChatGPT create When content dispatch throws Then the exact machine reason is preserved", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const harness = createActuationBranchHarness({ contentMode: "throw" });
+  harness.browserTabScopes.set(71, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.tabs.set(71, { id: 71, url: `https://chatgpt.com/g/${projectId}/project`, windowId: 11 });
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  await harness.actuate({
+    protocol: "herdr-browser-actuation/v1",
+    actuation_id: "ba_" + "7".repeat(16),
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      provider: "chatgpt",
+      account_ref: accountRef,
+      space_ref: spaceRef,
+      reservation_ref: "bsr_" + "8".repeat(64),
+      launch_url: `https://chatgpt.com/g/${projectId}`,
+    },
+  });
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+
+  const evidence = harness.postCalls.at(-1)?.evidence;
+  assert.equal(evidence?.command_accepted, true);
+  assert.equal(evidence?.resource_available, true);
+  assert.equal(evidence?.result?.error, "browser_create_content_dispatch_failed");
 });
 
 test("session.create still fails closed when the fresh tab can never be identified", async () => {
