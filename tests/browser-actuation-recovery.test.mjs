@@ -722,8 +722,105 @@ test("ChatGPT session.open is the only supported existing-view open", () => {
   assert.match(backgroundSource, /provider_model_reasoning_combinations:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /"session\.open"/);
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
-  // No provider except chatgpt should ever reach the open postcondition.
-  assert.match(wakeSource, /if \(ADAPTER\.name !== "chatgpt"\)\s*\{\s*return \{[^}]*resource_available:\s*false/);
+});
+
+test("user Given unavailable browser actuation When the content script rejects it Then the exact machine reason is returned", async () => {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart, "browser evidence helpers must remain extractable");
+  assert.ok(commandStart >= 0 && commandEnd > commandStart, "browser actuation command must remain extractable");
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+
+  function makeActuator(ctx = {}) {
+    return new Function("ctx", `
+      const ADAPTER = {
+        name: ctx.adapterName || "chatgpt",
+        getConversationKey: () => ctx.currentConvKey || "conv-current",
+        getCanonicalConversationUrl: () => ctx.canonicalObserved === false ? "" : "https://chatgpt.com/c/current",
+      };
+      const chatGptConversationId = () => "current";
+      const sessionStorage = {
+        setItem: () => { if (ctx.storageFails) throw new Error("storage unavailable"); },
+        removeItem: () => {},
+      };
+      const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+      let registeredBrowserSessionRef = ctx.registeredSessionRef || "br_${"a".repeat(64)}";
+      let registeredBrowserGeneration = ctx.registeredGeneration || 17;
+      let registeredConvKey = ctx.registeredConvKey || "conv-current";
+      const providerCanonicalConversationObserved = () => ctx.canonicalObserved !== false;
+      const document = { hidden: ctx.hidden === true };
+      ${evidenceSource}
+      ${commandSource}
+      return performBrowserActuationCommand;
+    `)(ctx);
+  }
+
+  const cases = [
+    {
+      name: "unsupported provider context",
+      ctx: { adapterName: "z.ai" },
+      command: { operation: "herdr_mcp.browser_dispatch.submit", expected_generation: 17 },
+      reason: "browser_actuation_context_unavailable",
+    },
+    {
+      name: "non-ChatGPT session.open",
+      ctx: { adapterName: "gemini" },
+      command: { operation: "herdr_mcp.browser_session.open", expected_generation: 17 },
+      reason: "browser_open_provider_unavailable",
+    },
+    {
+      name: "wrong session",
+      ctx: {},
+      command: { operation: "herdr_mcp.browser_session.open", expected_generation: 17, params: { session_ref: "br_" + "b".repeat(64) } },
+      reason: "browser_open_session_unavailable",
+    },
+    {
+      name: "generation drift",
+      ctx: { registeredSessionRef: "br_" + "b".repeat(64), registeredGeneration: 18 },
+      command: { operation: "herdr_mcp.browser_session.open", expected_generation: 17, params: { session_ref: "br_" + "b".repeat(64) } },
+      reason: "browser_open_generation_unavailable",
+    },
+    {
+      name: "conversation drift",
+      ctx: { registeredSessionRef: "br_" + "b".repeat(64), registeredConvKey: "conv-old", currentConvKey: "conv-current" },
+      command: { operation: "herdr_mcp.browser_session.open", expected_generation: 17, params: { session_ref: "br_" + "b".repeat(64) } },
+      reason: "browser_open_conversation_unavailable",
+    },
+    {
+      name: "canonical URL unavailable",
+      ctx: { registeredSessionRef: "br_" + "b".repeat(64), canonicalObserved: false },
+      command: { operation: "herdr_mcp.browser_session.open", expected_generation: 17, params: { session_ref: "br_" + "b".repeat(64) } },
+      reason: "browser_open_canonical_url_unavailable",
+    },
+    {
+      name: "hidden page",
+      ctx: { registeredSessionRef: "br_" + "b".repeat(64), hidden: true },
+      command: { operation: "herdr_mcp.browser_session.open", expected_generation: 17, params: { session_ref: "br_" + "b".repeat(64) } },
+      reason: "browser_open_page_hidden",
+    },
+    {
+      name: "invalid create reservation",
+      ctx: {},
+      command: { operation: "herdr_mcp.browser_session.create", expected_generation: 17, params: { reservation_ref: "invalid" } },
+      reason: "browser_create_reservation_invalid",
+    },
+    {
+      name: "create reservation storage unavailable",
+      ctx: { storageFails: true },
+      command: { operation: "herdr_mcp.browser_session.create", expected_generation: 17, params: { reservation_ref: "bsr_" + "c".repeat(64) } },
+      reason: "browser_create_reservation_storage_unavailable",
+    },
+  ];
+
+  for (const item of cases) {
+    const result = await makeActuator(item.ctx)(item.command);
+    assert.equal(result.resource_available, false, item.name);
+    assert.equal(result.command_accepted, false, item.name);
+    assert.equal(result.result?.error, item.reason, item.name);
+  }
 });
 
 test("adapter capability reprobe advances observation generation on snapshot change", () => {
