@@ -75,6 +75,20 @@ test("Actions consume the shared gate and keep Cloudflare deployment on the gate
   assert.match(ci, /scripts\/release-gate\.sh hygiene/);
   const selectiveGate = await readFile(join(ROOT, "scripts/ci-node-gate.sh"), "utf8");
   assert.match(selectiveGate, /exec scripts\/release-gate\.sh node/);
+  for (const requiredExtensionContract of [
+    "browser-extension-store-listing.test.mjs",
+    "continuity-journal.test.mjs",
+    "extension-auth.test.mjs",
+    "extension-local-auth.test.mjs",
+    "extension-native-host.test.mjs",
+    "extension-recovery.test.mjs",
+    "pack-extension.test.mjs",
+  ]) {
+    assert.ok(
+      selectiveGate.includes(requiredExtensionContract),
+      `extension-focused CI must retain ${requiredExtensionContract}`,
+    );
+  }
   assert.match(gate, /npm run build:site/);
   assert.match(gate, /extension_smoke\.mjs/);
   assert.match(pages, /npm run build:site/);
