@@ -767,13 +767,13 @@ pub(crate) fn update_existing_worker_for_release(
     drop(refresh_token);
     drop(token);
 
-    // The public origin may be a Custom Domain. Verify through the same origin
-    // used by Connector/OAuth rather than assuming workers.dev routing.
-    verify_health(
-        &current.edge_origin,
-        &current.worker_name,
-        Some(target_version),
-    )?;
+    // Cloudflare may acknowledge the script upload before every edge location
+    // serves the new deployment. Never replay the mutation. Instead, poll the
+    // read-only fleet identity for a bounded interval and require it to remain
+    // the exact same Worker/origin while its version converges. Once the target
+    // version is visible, run the ordinary strict health admission as the final
+    // post-update proof.
+    wait_for_worker_update_convergence(paths, &current, target_version)?;
     Ok(json!({
         "ok": true,
         "code": "worker_update_succeeded",
@@ -784,6 +784,70 @@ pub(crate) fn update_existing_worker_for_release(
         "version": target_version,
         "connector_readd_required": false,
     }))
+}
+
+fn worker_update_readback_converged(
+    previous: &ExistingWorkerStatus,
+    observed: &ExistingWorkerStatus,
+    target_version: &str,
+) -> Result<bool, String> {
+    if observed.worker_name != previous.worker_name || observed.edge_origin != previous.edge_origin
+    {
+        return Err(
+            "Worker update readback changed Worker/public origin identity; refusing to continue"
+                .to_owned(),
+        );
+    }
+    if observed.edge_version == target_version {
+        return Ok(true);
+    }
+    if observed.edge_version == previous.edge_version {
+        return Ok(false);
+    }
+    Err(format!(
+        "Worker update readback observed unexpected Edge version {}; expected stale {} or target {}",
+        observed.edge_version, previous.edge_version, target_version
+    ))
+}
+
+fn wait_for_worker_update_convergence(
+    paths: &RuntimePaths,
+    previous: &ExistingWorkerStatus,
+    target_version: &str,
+) -> Result<(), String> {
+    let delays = [
+        Duration::ZERO,
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+    ];
+    for (attempt, delay) in delays.into_iter().enumerate() {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let observed = existing_worker_status(paths, target_version)?;
+        let Some(observed) = observed else {
+            return Err(
+                "Worker update readback lost the configured public Worker identity".to_owned(),
+            );
+        };
+        if worker_update_readback_converged(previous, &observed, target_version)? {
+            verify_health(
+                &observed.edge_origin,
+                &observed.worker_name,
+                Some(target_version),
+            )?;
+            return Ok(());
+        }
+        if attempt + 1 == delays.len() {
+            break;
+        }
+    }
+    Err(format!(
+        "Worker update was accepted by Cloudflare but the public Edge did not converge from version {} to {} within the bounded readback window; no upload retry was attempted",
+        previous.edge_version, target_version
+    ))
 }
 
 fn ensure_worker_version_can_advance(current: &str, target: &str) -> Result<(), String> {
@@ -3781,6 +3845,38 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("USER_CUSTOM_BINDING"));
         assert!(error.contains("refusing"));
+    }
+
+    #[test]
+    fn worker_update_readback_waits_only_for_same_identity_stale_version() {
+        let previous = ExistingWorkerStatus {
+            edge_origin: "https://herdr-edge-mac.example.workers.dev".to_owned(),
+            worker_name: "herdr-edge-mac".to_owned(),
+            edge_version: "1.0.0-alpha.8".to_owned(),
+            target_version: "1.0.0-alpha.9".to_owned(),
+        };
+        let stale = previous.clone();
+        assert!(!worker_update_readback_converged(&previous, &stale, "1.0.0-alpha.9").unwrap());
+
+        let mut converged = previous.clone();
+        converged.edge_version = "1.0.0-alpha.9".to_owned();
+        assert!(worker_update_readback_converged(&previous, &converged, "1.0.0-alpha.9").unwrap());
+
+        let mut wrong_worker = stale.clone();
+        wrong_worker.worker_name = "herdr-edge-other".to_owned();
+        assert!(
+            worker_update_readback_converged(&previous, &wrong_worker, "1.0.0-alpha.9")
+                .unwrap_err()
+                .contains("changed Worker/public origin identity")
+        );
+
+        let mut unexpected = stale;
+        unexpected.edge_version = "1.0.0-alpha.7".to_owned();
+        assert!(
+            worker_update_readback_converged(&previous, &unexpected, "1.0.0-alpha.9")
+                .unwrap_err()
+                .contains("unexpected Edge version")
+        );
     }
 
     #[test]
