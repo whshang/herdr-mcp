@@ -2164,9 +2164,21 @@ fn browser_dispatch_submit(
         dispatch.delivery_state,
         BrowserDeliveryState::Applied | BrowserDeliveryState::Stopped
     );
+    let reason = if matches!(
+        dispatch.delivery_state,
+        BrowserDeliveryState::ResourceUnavailable | BrowserDeliveryState::Rejected
+    ) {
+        match browser_resource_unavailable_reason(&evidence) {
+            Ok(reason) => Some(reason),
+            Err(error) => return browser_store_error(error),
+        }
+    } else {
+        None
+    };
     json!({
         "ok": success,
         "code": if success { Value::Null } else { json!(dispatch.delivery_state.as_str()) },
+        "reason": reason,
         "dispatch": browser_dispatch_json(dispatch),
         "replayed": false,
         "work_memory_writeback": work_memory_writeback,
@@ -8172,6 +8184,7 @@ mod tests {
             None,
         );
         assert_eq!(first["code"], "resource_unavailable");
+        assert_eq!(first["reason"], "browser_actuation_reason_missing");
         assert_eq!(first["replayed"], false);
         assert_eq!(first["dispatch"]["delivery_state"], "resource_unavailable");
         let dispatch_id = first["dispatch"]["dispatch_id"]
@@ -8199,6 +8212,43 @@ mod tests {
         assert_eq!(status["dispatch"]["delivery_state"], "resource_unavailable");
         assert_eq!(status["dispatch"]["execution_state"], "failed");
         assert!(!status.to_string().contains("delivery-session-hidden"));
+
+        struct ExactReasonActuator;
+        impl BrowserActuator for ExactReasonActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(
+                    BrowserPostconditionEvidence::resource_unavailable_with_reason(
+                        expected_generation,
+                        "browser_dispatch_composer_busy",
+                    ),
+                )
+            }
+        }
+
+        let exact_reason_params = json!({
+            "session_ref": session_ref,
+            "message": "dispatch with exact rejection reason",
+            "expected_generation": 7,
+            "idempotency_key": "delivery-exact-reason-idempotency-key"
+        });
+        let exact_reason = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &exact_reason_params,
+            true,
+            Some(&ExactReasonActuator),
+        );
+        assert_eq!(exact_reason["ok"], false);
+        assert_eq!(exact_reason["code"], "resource_unavailable");
+        assert_eq!(exact_reason["reason"], "browser_dispatch_composer_busy");
+        assert_eq!(exact_reason["replayed"], false);
+        assert!(exact_reason["dispatch"]["accepted_user_message_ref"].is_null());
 
         struct UncertainThenReconcileActuator {
             reconcile_calls: std::sync::atomic::AtomicUsize,
