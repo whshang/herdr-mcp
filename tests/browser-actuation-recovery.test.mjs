@@ -1351,6 +1351,12 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);
   const createSegment = wakeSource.slice(createStart, createEnd);
   assert.match(createSegment, /sessionStorage\.setItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef\)/);
+  assert.match(createSegment, /const chatMode = await ensureChatGptChatMode\(\)/);
+  assert.match(createSegment, /result: \{ error: chatMode\.error \}/);
+  assert.ok(
+    createSegment.indexOf("const chatMode = await ensureChatGptChatMode()") < createSegment.indexOf("const composerReadyDeadline"),
+    "fresh-session actuation must enter Chat mode before waiting for the composer",
+  );
   assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 20000/);
   assert.match(createSegment, /while \(!ADAPTER\.getInputEl\(\) && Date\.now\(\) < composerReadyDeadline\)/);
   assert.match(createSegment, /await wait\(200\)/);
@@ -1380,6 +1386,22 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const refreshClearStart = wakeSource.indexOf("function clearBrowserPendingDispatchRefresh");
   const refreshClearSegment = wakeSource.slice(refreshClearStart, refreshClearStart + 500);
   assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
+});
+
+test("ChatGPT browser actuation switches Work mode to Chat mode through the visible radio control", () => {
+  const visibleHelperStart = wakeSource.indexOf("function visibleChatGptModeRadio(pattern)");
+  const helperStart = wakeSource.indexOf("async function ensureChatGptChatMode()");
+  const helperEnd = wakeSource.indexOf("\n  async function performBrowserActuationCommand", helperStart);
+  assert.ok(visibleHelperStart >= 0 && helperStart > visibleHelperStart && helperEnd > helperStart, "Chat mode helpers must exist before browser actuation");
+  const helper = wakeSource.slice(visibleHelperStart, helperEnd);
+  assert.match(helper, /button\[role="radio"\]/);
+  assert.match(helper, /聊天\|Chat\|チャット/);
+  assert.match(helper, /工作\|Work\|作業/);
+  assert.match(helper, /work\.getAttribute\("aria-checked"\) !== "true"/);
+  assert.match(helper, /chat\.click\(\)/);
+  assert.match(helper, /chat\.getAttribute\("aria-checked"\) === "true"/);
+  assert.match(helper, /work\.getAttribute\("aria-checked"\) === "false"/);
+  assert.match(helper, /chat_mode_switch_timeout/);
 });
 
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {

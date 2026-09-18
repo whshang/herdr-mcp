@@ -1737,6 +1737,41 @@ const H2W_CONTENT_VERSION = "0.1.98";
     return evidence;
   }
 
+  function visibleChatGptModeRadio(pattern) {
+    return [...document.querySelectorAll('button[role="radio"]')].find((button) => (
+      ADAPTER.elementVisible(button)
+      && pattern.test(normText(button.innerText || button.textContent || ""))
+    )) || null;
+  }
+
+  async function ensureChatGptChatMode() {
+    if (ADAPTER.name !== "chatgpt") return { ok: true, switched: false };
+    const chat = visibleChatGptModeRadio(/^(?:聊天|Chat|チャット)$/i);
+    const work = visibleChatGptModeRadio(/^(?:工作|Work|作業)$/i);
+    if (!chat && !work) return { ok: true, switched: false };
+    if (!chat || !work) return { ok: false, error: "chat_mode_ambiguous" };
+    if (chat.getAttribute("aria-checked") === "true") {
+      return { ok: true, switched: false };
+    }
+    if (work.getAttribute("aria-checked") !== "true") {
+      return { ok: false, error: "chat_mode_ambiguous" };
+    }
+    try {
+      chat.click();
+    } catch (_) {
+      return { ok: false, error: "chat_mode_switch_failed" };
+    }
+    const deadline = Date.now() + 3000;
+    do {
+      if (chat.getAttribute("aria-checked") === "true"
+          && work.getAttribute("aria-checked") === "false") {
+        return { ok: true, switched: true };
+      }
+      await wait(100);
+    } while (Date.now() < deadline);
+    return { ok: false, error: "chat_mode_switch_timeout" };
+  }
+
   async function performBrowserActuationCommand(command) {
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
@@ -1840,6 +1875,15 @@ const H2W_CONTENT_VERSION = "0.1.98";
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
       return { ...evidence, rejected: true };
+    }
+    if (ADAPTER.name === "chatgpt") {
+      const chatMode = await ensureChatGptChatMode();
+      if (!chatMode.ok) {
+        if (creatingSession) {
+          try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+        }
+        return { ...evidence, rejected: true, result: { error: chatMode.error } };
+      }
     }
     if (creatingSession) {
       // Browser Registry scope registration can beat ChatGPT's Project-home

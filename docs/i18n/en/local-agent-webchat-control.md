@@ -272,7 +272,7 @@ Idempotency: one logical handoff keeps one key. Without `--idempotency-key` the 
 
 **Prepared is not delivered.** When the source conversation is not currently registered, or browser control is unavailable, the packet and `manual_delivery.copy_prompt` are still returned with `automatic_delivery.attempted=false` and the runtime's reason. That is a usable result for manual continuation, and it is **not** a completed handoff: only `automatic_delivery.completed=true` (that is, `delivery_state=applied`) means a new conversation was actually created. An `uncertain` delivery is reported as-is and never retried automatically.
 
-**Still true:** `herdr-mcp webchat create` does not accept `source_url`. Source-anchored delivery stays inside this handoff path so the ordinary create interface keeps requiring explicit routing ids.
+`herdr-mcp webchat create --source-url URL` now exposes the same source-anchored route for exact window affinity. The CLI still requires the observed endpoint/provider/account refs to attach the trusted local grant, but those routing ids are not sent in the create payload; Runtime resolves and validates the actual route from the registered canonical source URL.
 
 ## 7. Local agent example
 
@@ -347,7 +347,7 @@ This section is deliberately explicit so nobody documents or builds against a ca
 
 - **Unsupported browser operations** (runtime returns `code: "unsupported"`): `browser_space.create`, `browser_space.open`, `browser_message.append`, `browser_composer.set_reasoning`, `browser_composer.set_apps`, and `browser_dispatch.submit` with `reasoning_effort` or `required_apps`.
 - **Supported but without a CLI wrapper today:** `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`. They are reachable as private methods through the runtime MCP boundary. `browser_session.open` is exposed as `herdr-mcp webchat open`.
-- **Handoff:** the canonical preparation path is `herdr_mcp.browser_handoff.prepare`, exposed to local agents as `herdr-mcp webchat handoff` (which reuses it and then performs the source-anchored delivery). The Web planner and the extension HUD keep calling the private method directly. There is still no `herdr-mcp webchat handoff`-style flag on `webchat create`, and `webchat create` does not accept `source_url`.
+- **Handoff:** the canonical preparation path is `herdr_mcp.browser_handoff.prepare`, exposed to local agents as `herdr-mcp webchat handoff` (which reuses it and then performs the source-anchored delivery). The Web planner and the extension HUD keep calling the private method directly. Ordinary `webchat create` also accepts `--source-url` for exact source-window affinity; it does not generate or rewrite a handoff packet.
 - **`ego-browser`** is development/UAT infrastructure, never a user dependency and never a substitute for this control plane.
 - **Not exposed at all:** reading a user's private ChatGPT history body, attachments through the dispatch contract, arbitrary DOM access, and any provider other than the ones the registry actually reports.
 

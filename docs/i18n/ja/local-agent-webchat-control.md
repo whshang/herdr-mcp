@@ -272,7 +272,7 @@ herdr-mcp webchat handoff \
 
 **準備済みは配送済みではありません。** ソース会話が未登録、または browser control が利用できない場合でも packet と `manual_delivery.copy_prompt` は返り、`automatic_delivery.attempted=false` と runtime の理由が付きます。これは手動継続に使える結果ですが、**完了した handoff ではありません**。実際に会話が作成されたのは `automatic_delivery.completed=true`（つまり `delivery_state=applied`）のときだけです。`uncertain` はそのまま報告され、自動再試行はしません。
 
-**引き続き真実**：`herdr-mcp webchat create` は `source_url` を受け取りません。source ベースの配送はこの handoff 経路だけに閉じ込め、通常の create インタフェースは明示的な routing id を要求し続けます。
+`herdr-mcp webchat create --source-url URL` は、正確な source-window affinity のために source ベースの経路も利用できます。CLI は trusted local grant を付与するため観測済み endpoint/provider/account ref を引き続き要求しますが、それらの routing id は create payload には送られず、実際の route は登録済み canonical source URL から Runtime が解決・検証します。
 
 ## 7. ローカル Agent の例
 
@@ -347,7 +347,7 @@ Agent は次の順で進めます。
 
 - **非対応の browser 操作**（runtime は `code: "unsupported"` を返す）：`browser_space.create`、`browser_space.open`、`browser_message.append`、`browser_composer.set_reasoning`、`browser_composer.set_apps`、および `reasoning_effort` か `required_apps` を伴う `browser_dispatch.submit`。
 - **対応しているが現在 CLI ラッパーが無いもの**：`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。runtime MCP の私有メソッド境界から到達できます。`browser_session.open` は `herdr-mcp webchat open` で利用できます。
-- **Handoff**：canonical な準備経路は `herdr_mcp.browser_handoff.prepare` で、ローカル Agent は `herdr-mcp webchat handoff` から使います（再利用し、続けて source ベースの配送を行う）。Web planner と extension HUD は引き続き私有メソッドを直接呼びます。`webchat create` は今も `source_url` を受け取らず、対応する handoff フラグもありません。
+- **Handoff**：canonical な準備経路は `herdr_mcp.browser_handoff.prepare` で、ローカル Agent は `herdr-mcp webchat handoff` から使います（再利用し、続けて source ベースの配送を行う）。Web planner と extension HUD は引き続き私有メソッドを直接呼びます。通常の `webchat create` も正確な source-window affinity のため `--source-url` を受け取れますが、handoff packet の生成や書き換えは行いません。
 - **`ego-browser`** は開発/UAT インフラで、ユーザー依存でも、この control plane の代替でもありません。
 - **公開されていないもの**：ユーザーの非公開 ChatGPT 履歴本文の読み出し、dispatch 契約での添付送信、任意の DOM アクセス、registry が報告しない provider。
 
