@@ -1738,10 +1738,13 @@ const H2W_CONTENT_VERSION = "0.1.98";
   }
 
   function visibleChatGptModeRadio(pattern) {
-    return [...document.querySelectorAll('button[role="radio"]')].find((button) => (
-      ADAPTER.elementVisible(button)
-      && pattern.test(normText(button.innerText || button.textContent || ""))
-    )) || null;
+    return [...document.querySelectorAll('button[role="radio"]')].find((button) => {
+      if (!ADAPTER.elementVisible(button)) return false;
+      const rect = button.getBoundingClientRect();
+      return rect.width > 0
+        && rect.height > 0
+        && pattern.test(normText(button.innerText || button.textContent || ""));
+    }) || null;
   }
 
   async function ensureChatGptChatMode() {

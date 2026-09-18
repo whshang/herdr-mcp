@@ -1395,6 +1395,9 @@ test("ChatGPT browser actuation switches Work mode to Chat mode through the visi
   assert.ok(visibleHelperStart >= 0 && helperStart > visibleHelperStart && helperEnd > helperStart, "Chat mode helpers must exist before browser actuation");
   const helper = wakeSource.slice(visibleHelperStart, helperEnd);
   assert.match(helper, /button\[role="radio"\]/);
+  assert.match(helper, /getBoundingClientRect\(\)/);
+  assert.match(helper, /rect\.width > 0/);
+  assert.match(helper, /rect\.height > 0/);
   assert.match(helper, /聊天\|Chat\|チャット/);
   assert.match(helper, /工作\|Work\|作業/);
   assert.match(helper, /work\.getAttribute\("aria-checked"\) !== "true"/);
