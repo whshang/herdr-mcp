@@ -797,6 +797,8 @@ impl LocalMcpTransport {
         self.dispatch_inner_with_trust(request, false).await
     }
 
+    /// Local CLI-only read path. This is intentionally not part of the routed
+    /// transport trait, so remote requests cannot select trusted IPC.
     pub async fn dispatch_trusted_local_read_request(
         &self,
         request: RuntimeRequest,
