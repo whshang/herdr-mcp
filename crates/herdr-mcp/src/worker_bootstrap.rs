@@ -668,9 +668,11 @@ pub(crate) fn existing_worker_status(
 }
 
 pub(crate) fn update_current_worker(paths: &RuntimePaths) -> Result<Value, String> {
-    if crate::runtime_meta::runtime_channel() != "prod" {
+    let channel = crate::runtime_meta::runtime_channel();
+    let has_dev_bundle_override = std::env::var_os("HERDR_MCP_EDGE_BUNDLE_PATH").is_some();
+    if !worker_update_channel_allowed(channel, has_dev_bundle_override) {
         return Err(
-            "worker update requires an installed PROD release runtime; DEV source runtimes must not mutate a user's production Worker"
+            "worker update requires an installed PROD release runtime; an exact DEV/UAT candidate may run it only with an explicit HERDR_MCP_EDGE_BUNDLE_PATH from the same qualified artifact"
                 .to_owned(),
         );
     }
@@ -678,6 +680,10 @@ pub(crate) fn update_current_worker(paths: &RuntimePaths) -> Result<Value, Strin
         .filter(|value| valid_source_commit(value))
         .ok_or_else(|| "worker update requires an exact release source commit".to_owned())?;
     update_existing_worker_for_release(paths, source_commit, crate::runtime_meta::runtime_version())
+}
+
+fn worker_update_channel_allowed(channel: &str, has_dev_bundle_override: bool) -> bool {
+    channel == "prod" || (channel == "dev" && has_dev_bundle_override)
 }
 
 pub(crate) fn update_existing_worker_for_release(
@@ -2247,7 +2253,15 @@ fn validate_edge_transport_payload(payload: &Value, edge_origin: &str) -> Result
         }
         None => {}
     }
-    validate_health_payload(payload, service, None)
+    let contract = crate::link::edge_contract::parse_edge_health_contract(&payload.to_string())
+        .map_err(|error| format!("Worker health runtime contract is invalid: {error}"))?;
+    if !crate::link::daemon::is_runtime_rollback_compatible(
+        contract.contract_epoch,
+        &contract.contract_hash,
+    ) {
+        return Err(crate::link::edge_contract::refuse_edge_for_rust_link(&contract).to_string());
+    }
+    Ok(())
 }
 
 fn expected_worker_service_from_origin(edge_origin: &str) -> Result<Option<String>, String> {
@@ -3326,6 +3340,44 @@ mod tests {
     }
 
     #[test]
+    fn management_health_preflight_accepts_known_epoch2_only_for_fleet_recovery() {
+        let payload = json!({
+            "ok": true,
+            "service": "herdr-edge-mac",
+            "edgeVersion": "0.4.8",
+            "contractEpoch": 3,
+            "contractHash": "sha256:public-v3",
+            "runtimeContractEpoch": 2,
+            "runtimeContractHash": crate::link::daemon::LEGACY_EPOCH2_CONTRACT_HASH,
+        });
+        assert!(
+            validate_edge_transport_payload(&payload, "https://herdr-edge-mac.example.workers.dev")
+                .is_ok(),
+            "fleet administration must be able to identify and update a known enrolled epoch-2 Worker"
+        );
+        let strict = validate_health_payload(&payload, "herdr-edge-mac", None)
+            .expect_err("Link/install health admission must remain current/N-1 only");
+        assert!(strict.contains("outside the admission window"), "{strict}");
+    }
+
+    #[test]
+    fn management_health_preflight_rejects_unknown_epoch2_hash() {
+        let payload = json!({
+            "ok": true,
+            "service": "herdr-edge-mac",
+            "edgeVersion": "0.4.8",
+            "contractEpoch": 3,
+            "contractHash": "sha256:public-v3",
+            "runtimeContractEpoch": 2,
+            "runtimeContractHash": "sha256:not-the-frozen-epoch2-contract",
+        });
+        let error =
+            validate_edge_transport_payload(&payload, "https://herdr-edge-mac.example.workers.dev")
+                .expect_err("unknown legacy contract hashes must fail closed");
+        assert!(error.contains("outside the admission window"), "{error}");
+    }
+
+    #[test]
     fn management_health_preflight_rejects_non_herdr_custom_domain_service() {
         let payload = json!({
             "ok": true,
@@ -3751,6 +3803,15 @@ mod tests {
         });
         let error = require_current_release_contract(&changed).unwrap_err();
         assert!(error.contains("explicit contract migration"));
+    }
+
+    #[test]
+    fn worker_update_channel_allows_prod_and_explicit_dev_uat_bundle_only() {
+        assert!(worker_update_channel_allowed("prod", false));
+        assert!(worker_update_channel_allowed("prod", true));
+        assert!(!worker_update_channel_allowed("dev", false));
+        assert!(worker_update_channel_allowed("dev", true));
+        assert!(!worker_update_channel_allowed("preview", true));
     }
 
     #[test]
