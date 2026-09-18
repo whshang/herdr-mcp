@@ -136,7 +136,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `browser_dispatch.submit`（通常メッセージ） | `herdr-mcp webchat send` | 対応 |
 | `browser_dispatch.status` | `herdr-mcp webchat dispatch-status` | 対応（読み取り専用） |
 | `browser_session.archive` | `herdr-mcp webchat archive` | 対応 |
-| `browser_session.open` | — | 対応する私有メソッド、CLI ラッパーなし |
+| `browser_session.open` | `herdr-mcp webchat open` | 対応 |
 | `browser_dispatch.stop` | — | 対応する私有メソッド、CLI ラッパーなし |
 | `browser_message.append` | — | 非対応 |
 | `browser_composer.set_reasoning` / `set_apps` | — | 非対応 |
@@ -346,7 +346,7 @@ Agent は次の順で進めます。
 存在しない能力に対して文書や実装を積み上げないよう、ここを明示します。
 
 - **非対応の browser 操作**（runtime は `code: "unsupported"` を返す）：`browser_space.create`、`browser_space.open`、`browser_message.append`、`browser_composer.set_reasoning`、`browser_composer.set_apps`、および `reasoning_effort` か `required_apps` を伴う `browser_dispatch.submit`。
-- **対応しているが現在 CLI ラッパーが無いもの**：`browser_session.open`、`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。runtime MCP の私有メソッド境界から到達でき、ローカル CLI にサブコマンドはありません。
+- **対応しているが現在 CLI ラッパーが無いもの**：`browser_dispatch.stop`、`browser_endpoint.inspect`、`browser_space.inspect`。runtime MCP の私有メソッド境界から到達できます。`browser_session.open` は `herdr-mcp webchat open` で利用できます。
 - **Handoff**：canonical な準備経路は `herdr_mcp.browser_handoff.prepare` で、ローカル Agent は `herdr-mcp webchat handoff` から使います（再利用し、続けて source ベースの配送を行う）。Web planner と extension HUD は引き続き私有メソッドを直接呼びます。`webchat create` は今も `source_url` を受け取らず、対応する handoff フラグもありません。
 - **`ego-browser`** は開発/UAT インフラで、ユーザー依存でも、この control plane の代替でもありません。
 - **公開されていないもの**：ユーザーの非公開 ChatGPT 履歴本文の読み出し、dispatch 契約での添付送信、任意の DOM アクセス、registry が報告しない provider。

@@ -136,7 +136,7 @@ The private method `herdr_mcp.browser_endpoint.inspect` additionally exposes the
 | `browser_dispatch.submit` (plain message) | `herdr-mcp webchat send` | supported |
 | `browser_dispatch.status` | `herdr-mcp webchat dispatch-status` | supported (read-only) |
 | `browser_session.archive` | `herdr-mcp webchat archive` | supported |
-| `browser_session.open` | — | supported private method, no CLI wrapper |
+| `browser_session.open` | `herdr-mcp webchat open` | supported |
 | `browser_dispatch.stop` | — | supported private method, no CLI wrapper |
 | `browser_message.append` | — | not supported |
 | `browser_composer.set_reasoning` / `set_apps` | — | not supported |
@@ -346,7 +346,7 @@ The practical failure mode is collapsing these into one "session id". `continuit
 This section is deliberately explicit so nobody documents or builds against a capability that does not exist yet:
 
 - **Unsupported browser operations** (runtime returns `code: "unsupported"`): `browser_space.create`, `browser_space.open`, `browser_message.append`, `browser_composer.set_reasoning`, `browser_composer.set_apps`, and `browser_dispatch.submit` with `reasoning_effort` or `required_apps`.
-- **Supported but without a CLI wrapper today:** `browser_session.open`, `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`. They are reachable as private methods through the runtime MCP boundary; the local CLI does not expose a subcommand for them.
+- **Supported but without a CLI wrapper today:** `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`. They are reachable as private methods through the runtime MCP boundary. `browser_session.open` is exposed as `herdr-mcp webchat open`.
 - **Handoff:** the canonical preparation path is `herdr_mcp.browser_handoff.prepare`, exposed to local agents as `herdr-mcp webchat handoff` (which reuses it and then performs the source-anchored delivery). The Web planner and the extension HUD keep calling the private method directly. There is still no `herdr-mcp webchat handoff`-style flag on `webchat create`, and `webchat create` does not accept `source_url`.
 - **`ego-browser`** is development/UAT infrastructure, never a user dependency and never a substitute for this control plane.
 - **Not exposed at all:** reading a user's private ChatGPT history body, attachments through the dispatch contract, arbitrary DOM access, and any provider other than the ones the registry actually reports.
