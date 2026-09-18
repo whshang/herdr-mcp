@@ -76,6 +76,18 @@ scripts/ci-herdr-runtime.sh stop
 
 Never run repository-wide `npm test` in a fresh worktree and interpret the result without first building `dist/`. Several retained compatibility tests import `dist/*.js`; `ERR_MODULE_NOT_FOUND` for `dist/...` after a direct `npm test` is normally a missing-build precondition, not a Rust runtime regression. Do not report it as a Rust service failure.
 
+### Test design policy
+
+Tests describe externally observable behavior. Prefer a user/public entrypoint through the real implementation to assertions about internal calls, private methods, or implementation structure. A behavior-preserving refactor should not require broad test rewrites.
+
+For new JavaScript tests, write the acceptance scenario before implementation and name it in this form: `user <outcome> | Given <context> | When <action> | Then <observable result>`. `scripts/lint-test-policy.mjs` checks newly added test declarations in CI so historical tests can migrate when they are intentionally touched instead of creating a repository-wide rename.
+
+Do not add mocking frameworks or mocking APIs. Use the real Redis/PostgreSQL/local runtime when the dependency is practical in CI. When an external system cannot be used directly, inject a small fake at the external boundary and keep a contract test proving the fake matches the real protocol. For time-dependent behavior use a fake clock/timer; do not make correctness depend on multi-second sleeps.
+
+Prefer end-to-end coverage from a supported user or operator entrypoint to the observable result. Add narrower tests only when the end-to-end path cannot isolate the requirement cheaply. High-frequency CI should keep core behavior plus tests affected by the changed component; scheduled/release qualification remains the place for the complete suite.
+
+Branch coverage has a 90% target after the behavioral suite is sound. Review uncovered branches, especially failure paths, before adding tests. Never add implementation-coupled tests solely to raise a coverage number.
+
 When the task is specifically about the active `herdr-mcp` runtime, establish runtime ownership first with the active Rust binary and service status, then use the Rust gate above. Do not infer runtime ownership from `package.json`, Node test files, a compatibility Link process, or historical `dist/server.js` paths.
 
 ### Service mutation safety

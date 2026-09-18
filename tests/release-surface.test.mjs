@@ -46,6 +46,7 @@ test("non-node public CLI files are executable", async () => {
 test("CI/CD and documentation publishing entrypoints are tracked in the release tree", async () => {
   for (const rel of [
     ".github/workflows/ci.yml",
+    ".github/workflows/windows-candidate.yml",
     ".github/workflows/pages.yml",
     ".github/workflows/cloudflare-edge.yml",
     "scripts/release-gate.sh",
@@ -206,6 +207,7 @@ test("current workflows pin checkout and setup-node to reviewed v7 commits", asy
   const setupNode = "820762786026740c76f36085b0efc47a31fe5020";
   for (const rel of [
     ".github/workflows/ci.yml",
+    ".github/workflows/windows-candidate.yml",
     ".github/workflows/pages.yml",
     ".github/workflows/cloudflare-edge.yml",
     ".github/workflows/rust-release.yml",
@@ -235,6 +237,32 @@ test("CI Rust gate uses a trusted-main-only shared compiler cache", async () => 
     /mozilla-actions\/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba/,
     "sccache action must stay pinned to the reviewed commit",
   );
+});
+
+test("user changes unrelated code | Given the Windows candidate workflow | When CI selects jobs | Then Windows runs only for relevant inputs and reuses trusted compiler cache", async () => {
+  const ci = await readFile(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  const windows = await readFile(join(ROOT, ".github/workflows/windows-candidate.yml"), "utf8");
+  assert.doesNotMatch(ci, /^\s{2}windows:\s*$/m, "ordinary CI must not unconditionally schedule Windows");
+  for (const path of [
+    "crates/herdr-mcp/**",
+    "contracts/**",
+    "assets/**",
+    "Cargo.lock",
+    "Cargo.toml",
+    "rust-toolchain.toml",
+    "edge/cloudflare/**",
+    "package-lock.json",
+    "package.json",
+  ]) {
+    assert.ok(windows.includes(path), "missing Windows impact path: " + path);
+  }
+  assert.equal(windows.includes("extension/**"), false);
+  assert.equal(windows.includes("docs/**"), false);
+  assert.match(windows, /RUSTC_WRAPPER:\s*sccache/);
+  assert.match(windows, /SCCACHE_GHA_ENABLED:\s*["']true["']/);
+  assert.match(windows, /READ_WRITE/);
+  assert.match(windows, /READ_ONLY/);
+  assert.match(windows, /mozilla-actions\/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba/);
 });
 
 test("Rust release publishes authoritative macOS ARM64 + Debian-compatible Linux ARM64/x64 + Windows ARM64/x64 targets", async () => {
