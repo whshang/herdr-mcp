@@ -50,6 +50,8 @@ test("CI/CD and documentation publishing entrypoints are tracked in the release 
     ".github/workflows/pages.yml",
     ".github/workflows/cloudflare-edge.yml",
     "scripts/release-gate.sh",
+    "scripts/ci-node-gate.sh",
+    "scripts/select-ci-tests.mjs",
     "scripts/sign-macos-release.sh",
     "scripts/sign-macos-tcc-broker.sh",
     "scripts/build-site.mjs",
@@ -68,8 +70,11 @@ test("Actions consume the shared gate and keep Cloudflare deployment on the gate
   const pages = await readFile(join(ROOT, ".github/workflows/pages.yml"), "utf8");
   const edge = await readFile(join(ROOT, ".github/workflows/cloudflare-edge.yml"), "utf8");
   assert.match(ci, /scripts\/release-gate\.sh rust/);
-  assert.match(ci, /scripts\/release-gate\.sh node/);
+  assert.match(ci, /scripts\/ci-node-gate\.sh/);
+  assert.match(ci, /scripts\/select-ci-tests\.mjs/);
   assert.match(ci, /scripts\/release-gate\.sh hygiene/);
+  const selectiveGate = await readFile(join(ROOT, "scripts/ci-node-gate.sh"), "utf8");
+  assert.match(selectiveGate, /exec scripts\/release-gate\.sh node/);
   assert.match(gate, /npm run build:site/);
   assert.match(gate, /extension_smoke\.mjs/);
   assert.match(pages, /npm run build:site/);
