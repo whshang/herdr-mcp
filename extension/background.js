@@ -48,7 +48,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.99";
+const H2W_SCRIPT_VERSION = "0.1.100";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -2918,6 +2918,27 @@ async function postBrowserActuationEvidence(actuationId, evidence) {
   }
 }
 
+function contentActuationEvidenceWithReason(evidence, missingReason) {
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return null;
+  if (evidence.resource_available !== false) return evidence;
+  const existingReason = evidence?.result?.error;
+  if (typeof existingReason === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(existingReason)) {
+    return evidence;
+  }
+  if (typeof missingReason !== "string" || !/^[a-z][a-z0-9_]{0,95}$/.test(missingReason)) {
+    throw new Error("browser_actuation_reason_invalid");
+  }
+  return {
+    ...evidence,
+    result: {
+      ...(evidence?.result && typeof evidence.result === "object" && !Array.isArray(evidence.result)
+        ? evidence.result
+        : {}),
+      error: missingReason,
+    },
+  };
+}
+
 function unavailableBrowserActuationEvidence(expectedGeneration, reason, observedGeneration = expectedGeneration) {
   if (typeof reason !== "string" || !/^[a-z][a-z0-9_]{0,95}$/.test(reason)) {
     throw new Error("browser_actuation_reason_invalid");
@@ -3382,7 +3403,10 @@ async function handleBrowserActuation(command) {
         },
       }).then(async (response) => {
         const evidence = response?.evidence && typeof response.evidence === "object"
-          ? response.evidence
+          ? contentActuationEvidenceWithReason(
+              response.evidence,
+              "browser_create_content_reason_missing",
+            )
           : {
               ...unavailableBrowserActuationEvidence(
                 expectedGeneration,
@@ -3553,7 +3577,10 @@ async function handleBrowserActuation(command) {
         },
       });
       const evidence = response?.evidence && typeof response.evidence === "object"
-        ? response.evidence
+        ? contentActuationEvidenceWithReason(
+            response.evidence,
+            "browser_open_content_reason_missing",
+          )
         : {
             ...unavailableBrowserActuationEvidence(
               expectedGeneration,
@@ -3689,7 +3716,10 @@ async function handleBrowserActuation(command) {
       },
     });
     const evidence = response?.evidence && typeof response.evidence === "object"
-      ? response.evidence
+      ? contentActuationEvidenceWithReason(
+          response.evidence,
+          "browser_session_content_reason_missing",
+        )
       : {
           ...unavailableBrowserActuationEvidence(
             expectedGeneration,
