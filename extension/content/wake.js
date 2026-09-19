@@ -1296,7 +1296,7 @@ const H2W_CONTENT_VERSION = "0.1.101";
     const values = [el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent]
       .map((value) => String(value || "").trim().replace(/\s+/g, " "))
       .filter(Boolean);
-    return values.some((value) => /^(?:stop|stop generating|stop streaming|停止|停止生成|停止流式)$/i.test(value));
+    return values.some((value) => /^(?:stop|stop generating|stop streaming|stop response|停止|停止生成|停止流式|停止回答)$/i.test(value));
   }
 
   function stopButtons() {

@@ -852,6 +852,29 @@ test("user Given unavailable browser actuation When the content script rejects i
   }
 });
 
+test("user can stop a live answer | Given ChatGPT labels the stop button in Chinese or English | When Herdr classifies the control | Then the stop action remains available", () => {
+  const start = wakeSource.indexOf("  function explicitStopControl(");
+  const end = wakeSource.indexOf("  function stopButtons()", start);
+  assert.ok(start >= 0 && end > start, "stop-control classifier must remain extractable");
+  const explicitStopControl = new Function(
+    "elementVisible",
+    `${wakeSource.slice(start, end)}
+    return explicitStopControl;`,
+  )(() => true);
+  const button = (ariaLabel) => ({
+    getAttribute(name) {
+      if (name === "aria-label") return ariaLabel;
+      return null;
+    },
+    innerText: "",
+    textContent: "",
+  });
+
+  assert.equal(explicitStopControl(button("停止回答")), true);
+  assert.equal(explicitStopControl(button("Stop response")), true);
+  assert.equal(explicitStopControl(button("Stop sharing")), false);
+});
+
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
