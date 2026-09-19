@@ -892,6 +892,42 @@ const H2W_CONTENT_VERSION = "0.1.103";
     return submitWasAccepted(baseline);
   }
 
+  async function submitBrowserActuationOnce() {
+    if (isComposerGenerating()) {
+      return { ok: false, attempted: false, error: "composer-busy" };
+    }
+    const postInsertMs = Math.min(
+      800,
+      300 + Math.floor((ADAPTER.getInputEl()?.innerText?.length || 0) / 40) * 40,
+    );
+    await wait(postInsertMs);
+    const buttonDeadline = Date.now() + 1200;
+    let btn = null;
+    do {
+      btn = findSendButton();
+      if (isSendButton(btn)) break;
+      await wait(100);
+    } while (Date.now() < buttonDeadline);
+    if (!isSendButton(btn)) {
+      return { ok: false, attempted: false, error: "submit-unavailable" };
+    }
+    const baseline = captureSubmitAckBaseline(btn);
+    try {
+      btn.click();
+    } catch (_) {
+      return { ok: false, attempted: false, error: "submit-click-failed" };
+    }
+    if (await waitForSubmitAck(baseline, 5000)) {
+      return { ok: true, attempted: true };
+    }
+    return {
+      ok: false,
+      attempted: true,
+      uncertain: true,
+      error: "submit-unconfirmed",
+    };
+  }
+
   // ---- Submission ----
   // For contenteditable sites, wait for an enabled send button because ProseMirror
   // often consumes synthetic keyboard events. ChatGPT success requires durable
@@ -1058,6 +1094,7 @@ const H2W_CONTENT_VERSION = "0.1.103";
     const text = (data.template || "").trim();
     if (!text) return { ok: false, error: "empty-template" };
     const n = normText(text);
+    const boundedBrowserActuation = data.browserActuation === true && ADAPTER.name === "chatgpt";
     // Short-window deduplication prevents repeated insertion from retries or duplicate timers.
     if (!data.queueInsert && n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
       return { ok: false, blocked: "dedupe" };
@@ -1096,6 +1133,11 @@ const H2W_CONTENT_VERSION = "0.1.103";
       }
 
       if (resumeOnly) {
+        if (boundedBrowserActuation) {
+          const outcome = await submitBrowserActuationOnce();
+          noteWakeResult(n, outcome.ok);
+          return { ...outcome, committed: true, resumed: true, site: ADAPTER.name };
+        }
         const sent = await submit();
         noteWakeResult(n, sent);
         return { ok: sent, committed: true, resumed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
@@ -1104,7 +1146,9 @@ const H2W_CONTENT_VERSION = "0.1.103";
       if (clearBeforeInsert) await clearComposer();
 
       if (ADAPTER.needsMainWorldInsert) {
-        const idle = await waitForComposerIdle(data.manual === true ? 1200 : 15000);
+        const idle = await waitForComposerIdle(
+          data.manual === true ? 1200 : (boundedBrowserActuation ? 1500 : 15000),
+        );
         if (!idle) {
           return {
             ok: false,
@@ -1117,7 +1161,7 @@ const H2W_CONTENT_VERSION = "0.1.103";
 
       let committedOk = false;
       if (ADAPTER.needsMainWorldInsert) {
-        committedOk = await ensureCommitted(text);
+        committedOk = await ensureCommitted(text, boundedBrowserActuation ? 1 : 3);
         if (!committedOk) {
           try {
             const el = ADAPTER.getInputEl();
@@ -1125,6 +1169,11 @@ const H2W_CONTENT_VERSION = "0.1.103";
             if (el) strip(el);
           } catch (e) {}
           return { ok: false, error: "insert-failed" };
+        }
+        if (boundedBrowserActuation) {
+          const outcome = await submitBrowserActuationOnce();
+          noteWakeResult(n, outcome.ok);
+          return { ...outcome, committed: true, site: ADAPTER.name };
         }
         const sent = await submit();
         noteWakeResult(n, sent);
@@ -2026,20 +2075,30 @@ const H2W_CONTENT_VERSION = "0.1.103";
       evidence.required_apps_readback = appSelection.apps;
     }
 
+    const exactChatGptDispatchIdentity = ADAPTER.name === "chatgpt"
+      && !creatingSession
+      && command?.operation === "herdr_mcp.browser_dispatch.submit";
+    const snapshotTimeoutMs = exactChatGptDispatchIdentity ? 1200 : 6000;
     const beforeServer = ADAPTER.name === "chatgpt"
-      ? await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }))
+      ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
     const result = await performWake({
       template: message,
       autoAllow: false,
-      browserActuation: true,
+      browserActuation: exactChatGptDispatchIdentity,
       requiredApps,
     });
     if (!result?.ok) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+      }
+      if (exactChatGptDispatchIdentity && result?.uncertain === true) {
+        evidence.command_accepted = true;
+        evidence.resource_available = true;
+        evidence.canonical_url_observed = providerCanonicalConversationObserved();
+        return evidence;
       }
       return browserRejectedEvidence(
         evidence,
@@ -2048,13 +2107,10 @@ const H2W_CONTENT_VERSION = "0.1.103";
     }
     evidence.command_accepted = true;
 
-    const exactChatGptDispatchIdentity = ADAPTER.name === "chatgpt"
-      && !creatingSession
-      && command?.operation === "herdr_mcp.browser_dispatch.submit";
-    const deadline = Date.now() + (exactChatGptDispatchIdentity ? 12000 : 6000);
+    const deadline = Date.now() + 6000;
     do {
       const afterServer = ADAPTER.name === "chatgpt"
-        ? await fetchChatGptConversationSnapshot().catch(() => ({ ok: false }))
+        ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
         : { ok: false };
       const afterDom = providerMessageSnapshot("user");
       const afterAssistant = providerMessageSnapshot("assistant");
@@ -3216,10 +3272,10 @@ const H2W_CONTENT_VERSION = "0.1.103";
     };
   }
 
-  async function fetchChatGptConversationSnapshot() {
+  async function fetchChatGptConversationSnapshot(timeoutMs = 6000) {
     const conversationId = chatGptConversationId();
     if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, reason: "not-chatgpt-conversation" };
-    const conversation = await fetchChatGptConversation({ conversationId, timeoutMs: 6000 });
+    const conversation = await fetchChatGptConversation({ conversationId, timeoutMs });
     if (!conversation.ok) return { ok: false, reason: conversation.reason || "conversation-failed" };
     const body = conversation.body;
     const pluralSnapshot = chatGptPluralConversationSnapshot(body);
