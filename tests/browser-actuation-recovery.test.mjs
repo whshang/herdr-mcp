@@ -978,7 +978,7 @@ test("background session.open recovers unique target via recoverBrowserSessionTa
   assert.match(segment, /providerOpen !== "chatgpt"/);
 });
 
-test("user archive recovery reuses canonical aliases before creating any disposable view", () => {
+test("user archive recovery reuses canonical aliases | Given an exact session target is absent | When archive or archive-status resolves its canonical route | Then one existing alias is reused before any disposable view", () => {
   const openStart = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
   const archiveStart = backgroundSource.indexOf('if (!target && (', openStart);
   assert.ok(archiveStart > openStart, "archive fallback must exist after session.open");
@@ -1545,7 +1545,7 @@ test("ChatGPT session.open can restore a disposable view from a local canonical 
   assert.doesNotMatch(contentSegment, /performWake|findSendButton|dispatchEnterSubmit/);
 });
 
-test("user archive reconciliation restores the canonical view with mutation and read-only tab semantics", () => {
+test("user archive reconciliation uses bounded temporary views | Given the exact session tab is closed | When archive or archive-status restores the canonical URL | Then mutation is visible while read-only status uses and closes an inactive temporary tab", () => {
   const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
   const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);
   assert.ok(start >= 0 && end > start, "archive target routing block must remain extractable");
