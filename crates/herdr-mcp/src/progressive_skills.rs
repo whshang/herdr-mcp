@@ -2751,7 +2751,7 @@ mod tests {
         );
     }
 
-    // ---- v0.4.2 local skill registry ----
+    // ---- local skill registry ----
 
     const USER_SKILL: &str = "---\nname: ego
 version: 1.2.3

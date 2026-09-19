@@ -23,14 +23,14 @@ Extension identity is independent from the Runtime DEV/PROD plane:
 | Channel | Purpose | Chromium identity |
 | --- | --- | --- |
 | **STORE** | default for ordinary users | fixed Chrome Web Store identity, updated by the store |
-| **STANDALONE** | v0.4.3+ GitHub/manual independent distribution | fixed non-Store identity; moving the install directory does not change the ID |
+| **STANDALONE** | GitHub/manual independent distribution | fixed non-Store identity; moving the install directory does not change the ID |
 | **DEV** | source development | Load unpacked from repo/worktree `extension/`; ID is path-derived |
 
-Stable v0.4.2 only has STORE/DEV Native Host ownership. STANDALONE requires a v0.4.3+ runtime that actually implements that contract. A path-derived DEV build must not masquerade as standalone.
+Current runtimes support STORE / STANDALONE / DEV Native Host ownership. STANDALONE uses a fixed non-Store identity; a path-derived DEV build must not masquerade as standalone. Older runtimes may expose fewer channels, so inspect the installed runtime before changing ownership.
 
 Default to the [official Herdr Chrome Web Store extension](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp). Use STANDALONE only when Store distribution is not appropriate and the installed runtime explicitly supports it. DEV is for source development only.
 
-A v0.4.3+ runtime can materialize a Load-unpacked STANDALONE copy directly from the GitHub repository without cloning the source tree:
+A current runtime can materialize a Load-unpacked STANDALONE copy directly from the GitHub repository without cloning the source tree:
 
 ```bash
 herdr-mcp extension standalone install
@@ -42,7 +42,7 @@ A release runtime defaults to its immutable compile-time source commit; only a d
 Runtimes that advertise `--path` may choose the Chrome-facing Load-unpacked path explicitly:
 
 ```bash
-herdr-mcp extension standalone install --ref extension-v0.1.91 --path ~/Documents/herdr-mcp/extension
+herdr-mcp extension standalone install --ref <release-tag-or-commit> --path ~/Documents/herdr-mcp/extension
 ```
 
 `--path` is optional and defaults to `~/Documents/herdr-mcp/extension`. A custom path must resolve below the user's HOME. The managed copy always stays at `~/.config/herdr-mcp/extensions/standalone/current`, and the selected path is a stable symlink to it, so changing `--path` does not change the standalone extension identity. An explicitly requested path that is already occupied fails closed instead of being overwritten; a default-path conflict is left untouched and the installer falls back to the managed path. Run `herdr-mcp extension standalone status` and use its `chrome.load_unpacked_path` value when automation needs the exact directory to select in `chrome://extensions` → Developer mode → Load unpacked; future updates reuse the same path. That value is the Chrome-facing path recorded by the last install, read from `~/.config` state, so it stays stable even when macOS permissions prevent inspecting `~/Documents`; `user_visible_path.status` reports that alias inspection as `unverified` without changing `chrome.load_unpacked_path`.
@@ -106,7 +106,7 @@ The z.ai / DeepSeek JSON → MCP integrations are experimental and disabled by d
 
 ## Release and maintenance boundary
 
-STORE / STANDALONE / DEV identities may coexist, but the managed Native Messaging manifest has one active owner. `contracts/browser-extension-store.json` is the machine-readable SSOT for Store identity; v0.4.3 uses `contracts/browser-extension-standalone.json` for Standalone; DEV remains path-derived.
+STORE / STANDALONE / DEV identities may coexist, but the managed Native Messaging manifest has one active owner. `contracts/browser-extension-store.json` is the machine-readable SSOT for Store identity; `contracts/browser-extension-standalone.json` is the SSOT for Standalone; DEV remains path-derived.
 
 After `native-host use store` / `use standalone` / `use dev`, refresh supported pages that were already open. Extension versions evolve independently from the Rust runtime; only a new Native Host identity/channel contract requires matching runtime support.
 
