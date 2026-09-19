@@ -978,11 +978,13 @@ test("background session.open recovers unique target via recoverBrowserSessionTa
   assert.match(segment, /providerOpen !== "chatgpt"/);
 });
 
-test("ChatGPT archive recovery also reuses canonical aliases before creating a disposable view", () => {
+test("user archive recovery reuses canonical aliases before creating any disposable view", () => {
   const openStart = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
-  const archiveStart = backgroundSource.indexOf('if (!target && operation === "herdr_mcp.browser_session.archive")', openStart);
+  const archiveStart = backgroundSource.indexOf('if (!target && (', openStart);
   assert.ok(archiveStart > openStart, "archive fallback must exist after session.open");
-  const segment = backgroundSource.slice(archiveStart, archiveStart + 3500);
+  const segment = backgroundSource.slice(archiveStart, archiveStart + 5000);
+  assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive"/);
+  assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive_status"/);
   assert.match(segment, /findBrowserSessionTargetByCanonicalIdentity/);
   assert.match(segment, /existing\.ambiguous/);
   assert.ok(
@@ -1543,15 +1545,21 @@ test("ChatGPT session.open can restore a disposable view from a local canonical 
   assert.doesNotMatch(contentSegment, /performWake|findSendButton|dispatchEnterSubmit/);
 });
 
-test("ChatGPT session.archive can reopen its durable canonical URL when the target tab is closed", () => {
+test("user archive reconciliation restores the canonical view with mutation and read-only tab semantics", () => {
   const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
   const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);
   assert.ok(start >= 0 && end > start, "archive target routing block must remain extractable");
   const segment = backgroundSource.slice(start, end);
   assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive"/);
+  assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive_status"/);
   assert.match(segment, /const canonicalUrl = String\(params\.canonical_url \|\| ""\)/);
   assert.match(segment, /browserConversationInfo\(providerArchive, canonicalUrl\)/);
-  assert.match(segment, /chrome\.tabs\.create\(\{ url: canonicalUrl, active: true \}\)/);
+  assert.match(
+    segment,
+    /chrome\.tabs\.create\(\{\s*url: canonicalUrl,\s*active: operation !== "herdr_mcp\.browser_session\.archive_status"/,
+  );
+  assert.match(segment, /temporaryArchiveStatusTabId = createdTab\.id/);
+  assert.match(segment, /chrome\.tabs\.remove\(temporaryArchiveStatusTabId\)/);
   assert.match(segment, /browserSessionTargets\.get\(sessionRef\)/);
   assert.match(segment, /Date\.now\(\) \+ 8000/);
   assert.match(segment, /createdTab\?\.id/);
