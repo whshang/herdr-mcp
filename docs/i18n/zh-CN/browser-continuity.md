@@ -287,7 +287,7 @@ ChatGPT composer 旁的 **排队** 和 HUD 的“手动继续”不是同一种�
 有排队内容？ ── yes ──► 合并并发送下一条用户消息
        │ no
        ▼
-再考虑通用 LLM auto-continue / idle nudge
+再考虑语义 Auto：Jev -> LLM -> 有界脚本兜底
 ```
 
 这条优先级很重要：**明确的用户下一轮意图优先于模型自己判断“要不要继续”。**
@@ -321,9 +321,9 @@ Herdr 工具权限卡是唯一不跟随 Auto 的例外：受支持、明确标�
 
 支持的站点使用会话级 Auto，按 conversation identity 保存。
 
-z.ai / DeepSeek 的 Auto 只负责 Herdr progress / settled 回推；ChatGPT 专属的 stale-view 恢复、权限卡处理、LLM 回合判断和自动 rollover 不会移植过去假装通用。
+z.ai / DeepSeek 的 Auto 只负责 Herdr progress / settled 回推；ChatGPT 专属的 stale-view 恢复、权限卡处理、回合结束语义判断和自动 rollover 不会移植过去假装通用。
 
-## ChatGPT 回复结束后的 LLM 判断
+## ChatGPT 回复结束后的语义判断
 
 有些回复从页面上看已经“结束”，但语义上其实停在半途，比如：
 
@@ -331,13 +331,26 @@ z.ai / DeepSeek 的 Auto 只负责 Herdr progress / settled 回推；ChatGPT 专
 - “还需要验证生产环境……”
 - “下一步是查看 Git 状态……”
 
-扩展可以使用一个单独配置的小模型，对最近用户/助手正文做轻量判断。
+普通 Auto 的判断顺序固定为：
 
-小模型只负责回答一个问题：**这轮是不是明显还需要继续？**
+```text
+确定性的安全 / 作用域门
+        |
+        v
+已配置时先用 TypeSafe Jev / System One
+        |
+        v 不确定 / 不可用
+已配置时再用 OpenAI-compatible LLM judge
+        |
+        v 含糊 / 不可用
+有界机械脚本兜底
+```
 
-它不是第二 planner，也不决定代码修改方案。判断需要继续时，扩展将受控继续消息提交给当前 ChatGPT 会话。
+Jev 先回答窄化的语义问题；普通 Auto 中，高置信度的 continue/done 结果直接生效。Jev 无法确定时才交给 LLM；LLM 仍无法明确判断时才退到精度较低的机械脚本。脚本的作用是保证没有 Jev/LLM API 的用户仍有基础 Auto，不能反向推翻 Jev/LLM 已经作出的判断。
 
-未配置小模型时，这个自动判断不会偷偷降级为脆弱的关键词猜测；用户仍可手动继续或使用 herdr监控。
+用户只配置各 Provider 的 endpoint、model 和 API key。语义策略、概率边界、judge prompt 与 completion token 都由产品内置，不作为用户设置。
+
+Goal 模式使用更强的边界。Jev 可以一次向现有 LLM Goal Supervisor 提供五个有界语义 prior：`can_continue`、`needs_human`、`waiting_external`、`task_completed`、`needs_handoff`。这些概率只用于辅助判断；Work Memory/TODO evidence 与确定性的 runtime guard 仍是完成、等待、接力、人工边界和 uncertain delivery 的权威。
 
 ## 页面卡住：先判断发生了什么
 
@@ -435,12 +448,13 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
 达到高压力只代表**可以考虑接力**，不代表立即切会话。自动接力还必须满足：
 
 - 当前 ChatGPT Project `自动 开`；
-- 已绑定 workspace；
-- workspace 不在 working；
+- 如存在已绑定 workspace，则它不在 working；
 - 页面无 streaming / tool / 权限卡；
 - 没有人工未发送草稿；
 - 没有 delivery uncertainty；
 - 没有另一条 handoff 正在进行。
+
+handoff 本身不要求 workspace binding；只要当前页面是受支持的具体会话，并且可以解析到 durable continuity，就可以接力。
 
 ## handoff 的 fail-closed 流程
 

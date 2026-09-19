@@ -15,7 +15,7 @@ To provide that user-facing functionality, the extension may handle the followin
 - **Website content and personal communications:** conversation text and page state needed for continuity, queued messages, handoff/recovery, optional LLM analysis, and the user-invoked handoff fallback described below.
 - **Web history:** the current supported-site URL, conversation/project identifiers derived from that URL, and limited navigation state needed to associate the active page with a Herdr workspace. The extension does not build or sell a general-purpose browsing-history profile.
 - **User activity:** turn state, submit/settle/recovery timestamps, extension button/toggle state, and other bounded interaction state needed to determine when continuity and recovery actions are safe.
-- **Authentication information:** an optional API key for a user-configured OpenAI-compatible LLM endpoint when the user explicitly configures that feature.
+- **Authentication information:** optional API keys for user-configured TypeSafe/Jev and OpenAI-compatible LLM endpoints when the user explicitly configures those features.
 - **Local Herdr state:** workspace, pane, agent, status, output-tail, binding, and pinned-target information returned by the locally installed Herdr / herdr-mcp runtime.
 
 The extension does not request or intentionally collect health information, financial/payment information, precise location, or data for advertising profiles.
@@ -29,7 +29,7 @@ The extension uses `chrome.storage.local` to keep settings and continuity state 
 - automation preferences and recovery budgets/state;
 - pinned local targets and locale settings;
 - the local herdr-mcp endpoint configuration;
-- optional user-configured LLM endpoint, model, and API key.
+- optional user-configured TypeSafe/Jev and OpenAI-compatible LLM endpoints, models, and API keys.
 
 This local state exists so the Manifest V3 service worker and browser pages can recover safely after Chrome suspends or reloads them. The publisher does not operate an extension analytics or telemetry service that receives this local state.
 
@@ -41,7 +41,7 @@ The extension communicates only as needed for its user-facing features:
 
 1. **Local Herdr / herdr-mcp on the same computer.** Native Messaging is used to exchange bounded requests and live workspace state with the installed native host. This traffic stays on the user's computer.
 2. **Supported and experimental Web AI sites.** The extension runs on documented browser surfaces to observe the current conversation state and perform user-facing continuity/recovery interactions. ChatGPT is the primary supported surface and Claude uses its documented adapter. z.ai and DeepSeek are experimental integrations, are disabled by default, and their content scripts are registered only after the user explicitly enables the corresponding switch in Herdr Settings and grants Chrome access to that exact site.
-3. **A user-configured LLM endpoint, only for configured LLM features.** If the user configures an OpenAI-compatible LLM endpoint, Chrome asks for access to that endpoint's exact origin when the user saves or tests the configuration. The extension can then send relevant user/assistant text plus the user-supplied API credential to that endpoint for optional post-turn analysis. If conversation handoff is invoked by the user, or is triggered by an Auto policy the user enabled, and the current Web AI conversation cannot produce the required handoff summary because it has reached a hard conversation limit, the handoff prompt cannot be submitted, or the primary summary settles without a valid packet, the extension can instead send a bounded source transcript to that same configured endpoint to generate the handoff packet. The fallback transcript contains only user/assistant conversation text selected by the extension and is bounded to the extension's handoff limit (currently 70,000 characters, preserving early task framing plus recent operational state when truncation is required). The endpoint is chosen by the user and is not selected or operated by the Herdr publisher by default; the endpoint provider's own privacy and retention terms apply.
+3. **User-configured semantic-judgment endpoints.** If the user configures TypeSafe/Jev or an OpenAI-compatible LLM endpoint, Chrome asks for access to that endpoint's exact origin when the user saves or tests the configuration. Ordinary Auto can send a bounded latest user/assistant turn to TypeSafe/Jev for fast semantic judgment and, when needed, relevant user/assistant text to the configured LLM judge. Goal-aware Auto can additionally send a bounded objective/open-TODO/runtime summary plus recent user/assistant text to TypeSafe/Jev for the five advisory semantic signals described in the product documentation; those signals are not completion evidence. The configured OpenAI-compatible endpoint is also used by the existing bounded Goal Supervisor and can be used for handoff fallback generation. If conversation handoff is invoked by the user, or is triggered by an Auto policy the user enabled, and the current Web AI conversation cannot produce the required handoff summary because it has reached a hard conversation limit, the handoff prompt cannot be submitted, or the primary summary settles without a valid packet, the extension can send a bounded source transcript to that configured LLM endpoint to generate the handoff packet. The fallback transcript contains only user/assistant conversation text selected by the extension and is bounded to the extension's handoff limit (currently 70,000 characters, preserving early task framing plus recent operational state when truncation is required). Each endpoint is chosen by the user and is not selected or operated by the Herdr publisher by default; each endpoint provider's own privacy and retention terms apply.
 
 The extension does not sell user data, send user data to advertising networks, or transfer user data for unrelated profiling or credit/lending decisions.
 
@@ -54,7 +54,7 @@ The extension requests Chrome permissions only to provide the described function
 - `alarms` — wake the MV3 service worker periodically so it can restore missing local Herdr state streams and timers after Chrome suspends it;
 - `nativeMessaging` — connect to the locally installed herdr-mcp native host;
 - `sidePanel` — host Herdr Browser Control Center;
-- host access — always-on access is limited to the documented ChatGPT/Claude surfaces and the local herdr-mcp endpoint. Experimental z.ai/DeepSeek access and a user-configured LLM endpoint use optional Chrome host permissions requested only after the user explicitly enables or configures them; Herdr does not require `<all_urls>` as an always-on host permission.
+- host access — always-on access is limited to the documented ChatGPT/Claude surfaces and the local herdr-mcp endpoint. Experimental z.ai/DeepSeek access and user-configured TypeSafe/Jev or LLM endpoints use optional Chrome host permissions requested only after the user explicitly enables or configures them; Herdr does not require `<all_urls>` as an always-on host permission.
 
 **No remote executable code is used.** All executable JavaScript is packaged with the extension. Network responses are handled as data and are not evaluated, imported, or executed as JavaScript or Wasm.
 
@@ -72,7 +72,7 @@ Chrome Web Store policy reference: <https://developer.chrome.com/docs/webstore/u
 
 ## Security
 
-Public network connections initiated by the extension use HTTPS/WSS where applicable. Native Messaging traffic between the extension and the native program on the same computer remains local. Secrets such as an optional LLM API key are not intentionally written to project repositories or publisher telemetry.
+Public network connections initiated by the extension use HTTPS/WSS where applicable. Native Messaging traffic between the extension and the native program on the same computer remains local. Secrets such as optional TypeSafe/Jev or LLM API keys are not intentionally written to project repositories or publisher telemetry.
 
 ## Changes to this policy
 

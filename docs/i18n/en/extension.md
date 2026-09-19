@@ -100,6 +100,8 @@ The browser owns interaction and visualization; Native Host is the trusted local
 5. Keep Auto off while you verify status, Pinned Target, and manual controls.
 6. Enable scoped Continuity automation only when you actually need unattended long-running work.
 
+For semantic Auto, provider configuration is deliberately small: TypeSafe/Jev and the OpenAI-compatible LLM judge each expose only endpoint, model and API key. Ordinary Auto uses Jev -> LLM -> bounded script fallback; Goal-aware Auto can use Jev as an advisory semantic prior for the existing LLM Goal Supervisor. The script fallback keeps basic Auto available without either API, while Work Memory/TODO evidence and deterministic safety guards remain authoritative. Semantic policy, Jev's decision boundary, judge prompts, and completion tokens are product-owned rather than user settings.
+
 The z.ai / DeepSeek JSON → MCP integrations are experimental and disabled by default; enable them explicitly in Herdr experimental settings.
 
 ## Release and maintenance boundary

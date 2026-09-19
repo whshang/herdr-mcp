@@ -246,7 +246,7 @@ current assistant turn ends
 queued content? ── yes ──► merge and send the next user message
        │ no
        ▼
-then consider generic LLM auto-continue / idle nudge
+then consider semantic Auto: Jev -> LLM -> bounded script fallback
 ```
 
 This priority is deliberate: **an explicit next-turn user instruction outranks the model deciding for itself whether to continue.**
@@ -280,17 +280,32 @@ Herdr tool permission cards are the one exception that does not follow Auto: a s
 
 Where supported, these use conversation-scoped Auto.
 
-z.ai and DeepSeek Auto only performs Herdr progress/settled wake behavior. ChatGPT-specific stale-view recovery, permission-card handling, end-of-turn LLM judgement and automatic rollover are not treated as generic capabilities.
+z.ai and DeepSeek Auto only performs Herdr progress/settled wake behavior. ChatGPT-specific stale-view recovery, permission-card handling, end-of-turn semantic judgement and automatic rollover are not treated as generic capabilities.
 
-## End-of-turn LLM judgement
+## End-of-turn semantic judgement
 
 A ChatGPT reply can be syntactically finished while semantically unfinished: for example, it may say that tests still need to run or that the next step is to inspect Git.
 
-An optional small model can answer one narrow question: **does this turn clearly need to continue?**
+For ordinary Auto, the decision path is fixed and progressive:
 
-It is not a second planner. It does not choose implementation strategy. If configured and the judgement says continue, the extension submits a bounded continuation message.
+```text
+deterministic safety / scope gates
+        |
+        v
+TypeSafe Jev / System One, when configured
+        |
+        v uncertain / unavailable
+OpenAI-compatible LLM judge, when configured
+        |
+        v ambiguous / unavailable
+bounded mechanical script fallback
+```
 
-Without the small model, automatic turn judgement does not silently fall back to broad keyword guessing. Manual controls remain available.
+Jev answers the narrow semantic question first; a clear high-confidence continue/done result is final for ordinary Auto. The LLM judge handles cases Jev cannot settle. The script fallback is deliberately less accurate and exists so Auto still has basic behavior when neither provider is configured or both semantic stages are unavailable. Script heuristics never override a Jev/LLM result.
+
+Users configure only each provider's endpoint, model and API key. Semantic policy, probability boundaries, judge prompts and completion tokens are product-owned rather than user settings.
+
+Goal-aware automation keeps a stronger boundary. Jev can provide one bounded five-signal semantic prior — `can_continue`, `needs_human`, `waiting_external`, `task_completed`, `needs_handoff` — to the existing LLM Goal Supervisor. Those probabilities are advisory only. Work Memory/TODO evidence and deterministic runtime guards remain authoritative for completion, waiting, handoff, human boundaries and uncertain delivery.
 
 ## Recovery is evidence-first
 
@@ -365,7 +380,7 @@ The extension uses conservative pressure signals:
 - a persisted monotonic message-count floor;
 - reserved headroom for Project/system/tool payloads not visible in the page.
 
-High pressure only makes rollover eligible. Automatic handoff still requires a safe boundary: Project Auto on, bound workspace not working, no stream/tool/permission card, no unsent manual draft, no uncertain delivery and no other handoff in progress.
+High pressure only makes rollover eligible. Automatic handoff still requires a safe boundary: Project Auto on, any bound workspace not working, no stream/tool/permission card, no unsent manual draft, no uncertain delivery and no other handoff in progress. Handoff itself does not require a workspace binding; durable continuity plus the current supported conversation identity is sufficient.
 
 ## Fail-closed handoff
 

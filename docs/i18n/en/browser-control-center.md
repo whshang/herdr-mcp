@@ -18,7 +18,7 @@ The extension now has two related but distinct operational surfaces:
 |---|---|---|
 | HUD / Continuity | What is this page doing, what is Herdr doing, and should I run Auto or one of the three preset conversation actions? | Inside supported Web AI pages |
 | Control Center | Which Project / conversation is the active tab, what is it bound to, what is happening locally, and which pane is the explicit target? | Chrome Side Panel |
-| Options | What low-frequency timing / model / language settings should apply? | Control Center Settings |
+| Options | What low-frequency timing / semantic-provider / language settings should apply? | Control Center Settings |
 
 The HUD is deliberately **not a second control panel**. It has no drawer, workspace picker, binding editor, timing form, or local Herdr mutation controls. It shows Web state, Herdr state, one compact binding badge (`🔗N`), Auto, the three preset progression actions, and Manual handoff because those actions operate on the current web conversation. Pane and Agent detail stays in the Control Center.
 

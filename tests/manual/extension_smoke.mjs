@@ -19,7 +19,7 @@ import {
   progressOutputFingerprint,
   isIdleNudgeText, looksLikeSubstantiveReply, isHerdrWakeComposerText,
   interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
-  parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
+  assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
   conversationInfoFromSupportedUrl,
 } from "../../extension/binding-core.js";
 import {
@@ -83,10 +83,10 @@ const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-mod
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
-ok(manifest.version === "0.1.101", "manifest version stays aligned with the browser product build");
+ok(manifest.version === "0.1.103", "manifest version stays aligned with the browser product build");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.101"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.101"'), "content version matches manifest");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.103"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.103"'), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
@@ -252,15 +252,19 @@ ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes('performWake({ template: "继续", autoAllow: false, recovery: true })')
     && wakeSource.includes("(assistantChanged || curLen > lastAsstLen)"),
   "ChatGPT explicit transport failures stop faking progress and use one bounded reload followed by at most one safe Continue");
-ok(backgroundSource.includes("idleNudgeInFlight")
-    && backgroundSource.includes("assistantDeclaresPendingWork")
-    && backgroundSource.includes("scheduleIdleNudgeRetry(convKey, 30000)")
-    && backgroundSource.includes("assistant_pending_override"),
-  "LLM auto-continue retries ambiguous/send-failed turns and honors strong pending-work declarations");
+const semanticAutoStart = backgroundSource.indexOf("const jevConfigured = isJevJudgeConfigured(CFG)");
+const semanticAutoEnd = backgroundSource.indexOf("function paceIntervalSec()", semanticAutoStart);
+const semanticAutoSource = backgroundSource.slice(semanticAutoStart, semanticAutoEnd);
+ok(semanticAutoStart >= 0
+    && semanticAutoSource.indexOf("if (jevConfigured)") >= 0
+    && semanticAutoSource.indexOf("if (llmConfigured)") > semanticAutoSource.indexOf("if (jevConfigured)")
+    && semanticAutoSource.lastIndexOf("autoContinueWithoutLlm") > semanticAutoSource.indexOf("if (llmConfigured)")
+    && !semanticAutoSource.includes("assistant_pending_override"),
+  "Auto semantic order is Jev then LLM then deterministic script fallback with no regex override");
 ok(backgroundSource.includes("autoContinueWithoutLlm")
     && backgroundSource.includes('status: "auto_continue_fallback_nudge"')
     && backgroundSource.includes("shouldAutoContinueWithoutLlm"),
-  "Auto falls back to bounded Continue when the LLM provider is unavailable");
+  "Auto keeps bounded script fallback when semantic providers are unavailable or ambiguous");
 ok(wakeSource.includes("i === 2 && hudCache?.llmConfigured !== true"),
   "manual LLM judge is hidden when no provider is configured");
 ok(wakeSource.includes('data-testid^="conversation-turn-"')
@@ -1692,8 +1696,9 @@ console.log("\n[llmJudge]");
 ok(isLlmJudgeConfigured({ llmJudgeBaseUrl: "https://x/v1", llmJudgeApiKey: "k", llmJudgeModel: "m" }), "configured when three set");
 ok(!isLlmJudgeConfigured({ llmJudgeBaseUrl: "", llmJudgeApiKey: "k", llmJudgeModel: "m" }), "empty url = off");
 ok(llmJudgeCompletionsUrl("https://x/v1") === "https://x/v1/chat/completions", "url append completions");
+ok(llmJudgeCompletionsUrl("https://x//v1") === "", "mistyped duplicate path slash is rejected instead of silently normalized");
 ok(llmJudgeCompletionsUrl("https://x/v1/chat/completions") === "https://x/v1/chat/completions", "url already full");
-ok(buildLlmJudgeUserMessage("看：{content}", { assistantText: "hello" }).includes("hello"), "prompt fills content");
+ok(buildLlmJudgeUserMessage({ assistantText: "hello" }).includes("hello"), "built-in judge prompt fills content");
 ok(interpretLlmJudgeReply("好的").done === true, "好的 → done");
 ok(interpretLlmJudgeReply("继续").cont === true, "继续 → continue");
 ok(interpretLlmJudgeReply("继续").nudgeText === "继续", "bare 继续 sends model text");
@@ -1725,11 +1730,8 @@ ok(shouldAutoContinueWithoutLlm(configuredContinue, "Validation is not yet compl
   "configured Continue may chain only when the assistant explicitly declares unfinished work");
 ok(assistantNudgeFingerprint("abc") === assistantNudgeFingerprint("abc"), "fp stable");
 ok(assistantNudgeFingerprint("abc") !== assistantNudgeFingerprint("abd"), "fp differs");
-ok(parseLlmSkipKeywords("").includes("好的"), "empty skip → built-in");
-ok(parseLlmSkipKeywords("完成\nPASS").join(",") === "完成,PASS", "custom skip parse");
-ok(llmReplyMatchesSkipKeyword("完成。", "完成\nPASS"), "custom skip match");
-ok(interpretLlmJudgeReply("完成", { skipKeywords: "完成\nPASS" }).done === true, "custom skip → done");
-ok(interpretLlmJudgeReply("好的", { skipKeywords: "完成" }).done === false, "好的 not in custom skip → not done");
+ok(interpretLlmJudgeReply("done.").done === true, "built-in English done token → done");
+ok(interpretLlmJudgeReply("完成").done === false, "non-protocol completion text stays ambiguous");
 
 console.log("\n[browser result settlement]");
 ok(backgroundSource.includes('operation: "dispatch.result"')

@@ -174,6 +174,8 @@ herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.c
 
 The browser extension is optional for the core ChatGPT → MCP → workstation connection. Install it when you want conversation continuity, queued next-turn messages, Browser Control Center, or supported ChatGPT artifact capture.
 
+For ChatGPT Auto, deterministic browser/runtime safety gates stay authoritative. Ordinary post-turn semantic judgment uses a fixed progressive chain: **Jev/System One when configured → OpenAI-compatible LLM judge when configured → bounded script fallback**. Goal-aware automation additionally gives the existing LLM Goal Supervisor one bounded Jev semantic prior, while Work Memory/TODO evidence remains the completion authority. Users configure only each provider's endpoint, model, and API key; semantic policy, probability boundaries, judge prompts, and completion tokens are product-owned.
+
 If you use the macOS STANDALONE channel, `herdr-mcp doctor` also checks whether Google Chrome is actually loading the fixed Herdr standalone ID from the managed `~/.config/herdr-mcp/extensions/standalone/current` path. A `standalone-extension-load state=drift` warning means Chrome is still using another Load-unpacked directory; reload the Herdr extension from the `expected` path shown by `doctor`.
 
 [Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [Extension guide](docs/i18n/en/extension.md) · [Browser continuity](docs/i18n/en/browser-continuity.md)

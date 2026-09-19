@@ -58,7 +58,6 @@ test("Simplified Chinese editable automation prompts use Chinese prose", () => {
     "default_wake_template",
     "default_progress_template",
     "default_partial_template",
-    "default_llm_judge_prompt",
     "handoff_request_template",
     "handoff_seed_template",
   ];
@@ -66,6 +65,33 @@ test("Simplified Chinese editable automation prompts use Chinese prose", () => {
   for (const legacyEnglish of ["Agent", "mutation", "runtime", "Project", "handoff packet", "worker"]) {
     assert.equal(prompts.includes(legacyEnglish), false, `legacy English prose remains in prompt: ${legacyEnglish}`);
   }
+});
+
+test("user sees only provider parameters | Given retired semantic policy controls | When Options and locale copy are inspected | Then prompt skip mode and threshold controls stay absent", () => {
+  for (const retired of [
+    "llmJudgePromptTemplate",
+    "llmJudgeSkipKeywords",
+    "jevJudgeMode",
+    "jevJudgeThreshold",
+  ]) {
+    assert.doesNotMatch(optionsHtml, new RegExp(`id="${retired}"`));
+  }
+  for (const retiredKey of [
+    "label_llm_prompt",
+    "hint_llm_prompt",
+    "label_llm_skip",
+    "hint_llm_skip",
+    "label_jev_mode",
+    "jev_mode_shadow",
+    "jev_mode_assist",
+    "label_jev_threshold",
+    "default_llm_judge_prompt",
+  ]) {
+    assert.equal(Object.prototype.hasOwnProperty.call(zh, retiredKey), false);
+  }
+  assert.match(zh.hint_idle_nudge, /Jev/);
+  assert.match(zh.hint_idle_nudge, /LLM judge/);
+  assert.match(zh.hint_jev_section, /0\.70/);
 });
 
 test("Options waits for locale before showing fallback English copy", () => {
