@@ -136,6 +136,34 @@
     <div class="hint" id="hint_llm_skip"></div>
   </section>
 
+  <section class="card experimental">
+    <h2 id="title_jev">Jev auxiliary judge</h2>
+    <div class="hint" id="hint_jev_sec"></div>
+
+    <label id="lab_jev_mode">Mode</label>
+    <select id="jevJudgeMode">
+      <option id="jev_mode_off" value="off">Off</option>
+      <option id="jev_mode_shadow" value="shadow">Shadow compare</option>
+      <option id="jev_mode_assist" value="assist">Assist LLM</option>
+    </select>
+    <div class="hint" id="hint_jev_mode"></div>
+
+    <label id="lab_jev_url">TypeSafe API base URL</label>
+    <input type="text" id="jevJudgeBaseUrl" placeholder="https://api.typesafe.ai/v1">
+    <div class="hint" id="hint_jev_url"></div>
+
+    <label id="lab_jev_key">TypeSafe API key (Bearer)</label>
+    <input type="password" id="jevJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
+    <div class="hint" id="hint_jev_key"></div>
+
+    <label id="lab_jev_model">Jev model</label>
+    <input type="text" id="jevJudgeModel" placeholder="jev-latest">
+
+    <label id="lab_jev_threshold">Assist probability threshold</label>
+    <input type="number" id="jevJudgeThreshold" min="0.5" max="0.99" step="0.01" value="0.8">
+    <div class="hint" id="hint_jev_threshold"></div>
+  </section>
+
   <section class="card">
     <h2 id="title_page_assist">Page Assist</h2>
     <div class="hint" id="hint_page_assist">Explicit per-origin permissions for generic page inspection and interaction.</div>
@@ -151,6 +179,7 @@
       <button class="primary" id="save">Save</button>
       <button id="test">Test connection</button>
       <button id="testLlm">Test LLM judge</button>
+      <button id="testJev">Test Jev judge</button>
     </div>
     <div id="status"></div>
   </section>

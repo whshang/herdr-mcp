@@ -31,6 +31,12 @@ import {
   planTransportRecovery, resolveAuthoritativeWorkMemoryLocator, supervise,
 } from "./goal-supervisor-core.js";
 import {
+  DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_THRESHOLD,
+  JEV_JUDGE_MODE_ASSIST, assistLlmVerdictWithJev, buildJevPendingWorkRequest,
+  interpretJevPendingWorkAnswer, isJevJudgeConfigured, jevAgreementWithLlm,
+  jevSystemOneUrl, normalizeJevJudgeMode, normalizeJevJudgeThreshold,
+} from "./jev-judge-core.js";
+import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
 } from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
@@ -53,7 +59,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.101";
+const H2W_SCRIPT_VERSION = "0.1.102";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -421,6 +427,14 @@ let CFG = {
   llmJudgeModel: "",
   llmJudgePromptTemplate: "",
   llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+  // Optional TypeSafe Jev auxiliary judgement. Shadow records comparisons
+  // without changing behavior; assist may recover a missed continuation but
+  // never suppresses an existing LLM continue decision.
+  jevJudgeMode: "off",
+  jevJudgeBaseUrl: DEFAULT_JEV_BASE_URL,
+  jevJudgeApiKey: "",
+  jevJudgeModel: DEFAULT_JEV_MODEL,
+  jevJudgeThreshold: DEFAULT_JEV_THRESHOLD,
   // Experimental Web AI origins stay opt-in until their compatibility/UAT gate passes.
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
@@ -490,6 +504,10 @@ async function hasHostPermission(pattern) {
 
 async function hasLlmHostPermission(cfg) {
   return hasHostPermission(hostPermissionPatternForUrl(cfg?.llmJudgeBaseUrl));
+}
+
+async function hasJevHostPermission(cfg) {
+  return hasHostPermission(hostPermissionPatternForUrl(cfg?.jevJudgeBaseUrl));
 }
 
 async function reloadOpenTabsAfterExperimentalRegistration(site, matches) {
@@ -728,6 +746,10 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
+    CFG.jevJudgeMode = normalizeJevJudgeMode(CFG.jevJudgeMode);
+    CFG.jevJudgeThreshold = normalizeJevJudgeThreshold(CFG.jevJudgeThreshold);
+    CFG.jevJudgeBaseUrl = String(CFG.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim() || DEFAULT_JEV_BASE_URL;
+    CFG.jevJudgeModel = String(CFG.jevJudgeModel || DEFAULT_JEV_MODEL).trim() || DEFAULT_JEV_MODEL;
     delete CFG[PROJECT_AUTOMATION_STORAGE_KEY];
     delete CFG[CONVERSATION_AUTOMATION_STORAGE_KEY];
     PROJECT_AUTOMATION = sanitizeProjectAutomation(stored[PROJECT_AUTOMATION_STORAGE_KEY]);
@@ -4027,6 +4049,7 @@ const lastTurnEndedPayload = new Map(); // convKey -> last h2w_turn_ended payloa
 const LLM_JUDGE_TIMEOUT_MS = 60000;
 const LLM_JUDGE_MAX_ATTEMPTS = 2;
 const MANUAL_LLM_JUDGE_TIMEOUT_MS = 15000;
+const JEV_JUDGE_TIMEOUT_MS = 15000;
 
 /**
  * One-shot OpenAI-compatible chat/completions call to judge if the turn is done.
@@ -4137,6 +4160,57 @@ async function fetchLlmJudge(
     await new Promise((r) => setTimeout(r, 800));
   }
   return last;
+}
+
+async function fetchJevJudgeOnce(
+  userText,
+  assistantText,
+  cfgOverride = null,
+  timeoutMs = JEV_JUDGE_TIMEOUT_MS,
+) {
+  const cfg = cfgOverride || CFG;
+  if (!isJevJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
+  if (!await hasJevHostPermission(cfg)) {
+    return { ok: false, reason: "permission", error: "Jev endpoint site access is not granted" };
+  }
+  let url;
+  try {
+    url = jevSystemOneUrl(cfg.jevJudgeBaseUrl);
+  } catch (_) {
+    return { ok: false, reason: "invalid_url" };
+  }
+  const body = buildJevPendingWorkRequest(
+    userText,
+    assistantText,
+    String(cfg.jevJudgeModel || DEFAULT_JEV_MODEL).trim(),
+  );
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${String(cfg.jevJudgeApiKey || "").trim()}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || JEV_JUDGE_TIMEOUT_MS, 60000))),
+    });
+    if (!resp.ok) {
+      return {
+        ok: false,
+        reason: "http",
+        status: resp.status,
+        error: (await resp.text().catch(() => "")).slice(0, 200),
+      };
+    }
+    const parsed = await resp.json();
+    return interpretJevPendingWorkAnswer(parsed, normalizeJevJudgeThreshold(cfg.jevJudgeThreshold));
+  } catch (error) {
+    const name = error?.name || "";
+    if (name === "TimeoutError" || name === "AbortError") {
+      return { ok: false, reason: "timeout", error: `timed out after ${timeoutMs}ms` };
+    }
+    return { ok: false, reason: "network", error: error?.message || String(error) };
+  }
 }
 
 async function fetchLlmHandoffOnce(prompt) {
@@ -4315,6 +4389,28 @@ function rememberIdleNudge(convKey, result) {
   lastIdleNudgeResult.set(convKey, row);
   callLog(`llm-judge: ${convKey} → ${result.reason}${result.raw != null ? ` raw=${JSON.stringify(result.raw).slice(0, 80)}` : ""}`);
   return result;
+}
+
+function trackJevComparison(convKey, assistantFp, llmVerdict, jevPromise, mode = "shadow") {
+  void jevPromise.then((jev) => {
+    const row = lastIdleNudgeResult.get(convKey);
+    if (!row || row.assistant_fp !== assistantFp) return;
+    Object.assign(row, {
+      jev_mode: mode,
+      jev_probability: jev?.ok ? jev.probability : null,
+      jev_signal: jev?.ok ? jev.signal : "unavailable",
+      jev_reason: jev?.ok ? null : jev?.reason || "unknown",
+      jev_assisted: false,
+      judge_agreement: jevAgreementWithLlm(llmVerdict, jev),
+    });
+    callLog(
+      `jev-${mode}: ${convKey} → ${row.jev_signal}`
+      + `${row.jev_probability != null ? ` p=${Number(row.jev_probability).toFixed(3)}` : ""}`
+      + ` agreement=${row.judge_agreement}`,
+    );
+  }).catch((error) => {
+    callLog(`jev-shadow failed ${convKey}:`, error?.message || String(error));
+  });
 }
 
 function clearIdleNudgeRetry(convKey) {
@@ -4992,6 +5088,11 @@ async function maybeIdleNudgeInner(msg) {
     return autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs);
   }
 
+  const jevMode = normalizeJevJudgeMode(CFG.jevJudgeMode);
+  const jevConfigured = isJevJudgeConfigured(CFG);
+  const jevPromise = jevConfigured
+    ? fetchJevJudgeOnce(userText, assistantText)
+    : Promise.resolve({ ok: false, reason: "not_configured" });
   const judged = await fetchLlmJudge(userText, assistantText);
   if (!judged.ok) {
     return autoContinueWithoutLlm(
@@ -5004,10 +5105,12 @@ async function maybeIdleNudgeInner(msg) {
       `llm_${judged.reason}`,
     );
   }
-  let verdict = interpretLlmJudgeReply(judged.content, {
+  const llmVerdict = interpretLlmJudgeReply(judged.content, {
     skipKeywords: CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   });
-  if (assistantDeclaresPendingWork(assistantText) && !verdict.cont) {
+  let verdict = { ...llmVerdict };
+  const assistantPendingOverride = assistantDeclaresPendingWork(assistantText) && !verdict.cont;
+  if (assistantPendingOverride) {
     verdict = {
       done: false,
       cont: true,
@@ -5019,43 +5122,90 @@ async function maybeIdleNudgeInner(msg) {
       raw: `${verdict.raw || ""} [assistant_pending_override]`.trim(),
     };
   }
+
+  let jev = { ok: false, reason: jevConfigured ? "pending" : "not_configured" };
+  let jevAssisted = false;
+  if (jevMode === JEV_JUDGE_MODE_ASSIST && jevConfigured && !assistantPendingOverride) {
+    jev = await jevPromise;
+    const composed = assistLlmVerdictWithJev(
+      verdict,
+      jev,
+      localizedText(
+        "default_auto_continue_nudge",
+        null,
+        "Continue with the unfinished work you identified.",
+      ),
+    );
+    verdict = composed.verdict;
+    jevAssisted = composed.assisted;
+  }
+  const jevMeta = {
+    jev_mode: jevMode,
+    jev_probability: jev?.ok ? jev.probability : null,
+    jev_signal: jev?.ok ? jev.signal : (jevMode === "shadow" && jevConfigured ? "pending" : "unavailable"),
+    jev_reason: jev?.ok ? null : jev?.reason || "unknown",
+    jev_assisted: jevAssisted,
+    judge_agreement: jevAgreementWithLlm(llmVerdict, jev),
+  };
+  const rememberWithJev = (result) => {
+    const remembered = rememberIdleNudge(convKey, result);
+    if (jevConfigured && (jevMode === "shadow" || assistantPendingOverride)) {
+      trackJevComparison(convKey, fp, llmVerdict, jevPromise, jevMode);
+    }
+    return remembered;
+  };
+
   if (verdict.done) {
     lastJudgedAssistantFp.set(convKey, fp);
     clearIdleNudgeRetry(convKey);
-    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_done", raw: verdict.raw, assistant_fp: fp });
+    return rememberWithJev({
+      nudged: false,
+      reason: "llm_done",
+      raw: verdict.raw,
+      assistant_fp: fp,
+      ...jevMeta,
+    });
   }
   if (!verdict.cont || !verdict.nudgeText) {
     scheduleIdleNudgeRetry(convKey, 30000);
-    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_ambiguous", raw: verdict.raw, assistant_fp: fp });
+    return rememberWithJev({
+      nudged: false,
+      reason: "llm_ambiguous",
+      raw: verdict.raw,
+      assistant_fp: fp,
+      ...jevMeta,
+    });
   }
 
   lastIdleNudgeAt.set(convKey, Date.now());
   setActionBadge("!", "#dc2626", 8000);
   const wakeResult = await routeWake(b, {
-    status: "llm_continue_nudge",
-    output: `llm-judge continue; raw=${verdict.raw.slice(0, 80)}`,
+    status: jevAssisted ? "jev_assisted_continue_nudge" : "llm_continue_nudge",
+    output: `${jevAssisted ? "jev-assisted" : "llm-judge"} continue; raw=${verdict.raw.slice(0, 80)}`,
     working_count: 0,
     pane: b.pane,
     agent: b.agent,
   }, verdict.nudgeText);
   if (!wakeResult?.ok) {
     scheduleIdleNudgeRetry(convKey, cooldownMs);
-    return rememberIdleNudge(convKey, {
+    return rememberWithJev({
       nudged: false,
       reason: "wake_failed",
       raw: verdict.raw,
       assistant_fp: fp,
       send: verdict.nudgeText,
       error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
+      ...jevMeta,
     });
   }
   lastJudgedAssistantFp.set(convKey, fp);
-  return rememberIdleNudge(convKey, {
+  return rememberWithJev({
     nudged: true,
-    reason: "llm_continue",
+    reason: jevAssisted ? "jev_assisted_continue" : "llm_continue",
     raw: verdict.raw,
     assistant_fp: fp,
     send: verdict.nudgeText,
+    ...jevMeta,
   });
 }
 
@@ -7277,6 +7427,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         incoming.manualContinueMessage = String(incoming.manualContinueMessage || "").trim().slice(0, 4000)
           || defaultManualContinueMessage();
       }
+      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeMode")) {
+        incoming.jevJudgeMode = normalizeJevJudgeMode(incoming.jevJudgeMode);
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeThreshold")) {
+        incoming.jevJudgeThreshold = normalizeJevJudgeThreshold(incoming.jevJudgeThreshold);
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeBaseUrl")) {
+        incoming.jevJudgeBaseUrl = String(incoming.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim()
+          || DEFAULT_JEV_BASE_URL;
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeModel")) {
+        incoming.jevJudgeModel = String(incoming.jevJudgeModel || DEFAULT_JEV_MODEL).trim()
+          || DEFAULT_JEV_MODEL;
+      }
       delete incoming.enabled;
       delete incoming.idleNudgeEnabled;
       CFG = { ...CFG, ...incoming };
@@ -7373,6 +7537,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         done: verdict.done,
         cont: verdict.cont,
         nudgeText: verdict.nudgeText,
+      });
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_test_jev") {
+    void (async () => {
+      const form = {
+        ...(msg.config || {}),
+        jevJudgeMode: "shadow",
+      };
+      const judged = await fetchJevJudgeOnce(
+        form.userText || "继续验证",
+        form.assistantText || "实现已经完成。下一步我会继续跑生产验证。",
+        form,
+      );
+      if (!judged.ok) {
+        sendResponse({
+          ok: false,
+          reason: judged.reason,
+          status: judged.status || null,
+          error: judged.error || "",
+        });
+        return;
+      }
+      sendResponse({
+        ok: true,
+        probability: judged.probability,
+        signal: judged.signal,
+        threshold: judged.threshold,
+        model: judged.model,
+        usage: judged.usage || null,
       });
     })();
     return true;

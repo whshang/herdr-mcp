@@ -3,6 +3,10 @@ import { detectOrLoadLocale, setLocale, getLocale, t, onLocaleReady } from "./i1
 import {
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 } from "./binding-core.js";
+import {
+  DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_THRESHOLD,
+  normalizeJevJudgeMode, normalizeJevJudgeThreshold,
+} from "./jev-judge-core.js";
 import { nativeHostFailure } from "./native-host-diagnostics.js";
 
 const $ = (id) => document.getElementById(id);
@@ -11,6 +15,7 @@ const KEYS = [
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
+  "jevJudgeMode", "jevJudgeBaseUrl", "jevJudgeApiKey", "jevJudgeModel", "jevJudgeThreshold",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled",
   "pageAssistOrigins",
 ];
@@ -37,6 +42,10 @@ function configuredHostPermissionOrigins(config) {
   if (config.experimentalGrokEnabled === true) origins.push("https://grok.com/*");
   const llmOrigin = hostPermissionPatternForUrl(config.llmJudgeBaseUrl);
   if (llmOrigin) origins.push(llmOrigin);
+  if (normalizeJevJudgeMode(config.jevJudgeMode) !== "off") {
+    const jevOrigin = hostPermissionPatternForUrl(config.jevJudgeBaseUrl);
+    if (jevOrigin) origins.push(jevOrigin);
+  }
   for (const origin of config.pageAssistOrigins || []) {
     const pattern = hostPermissionPatternForUrl(origin);
     if (pattern) origins.push(pattern);
@@ -106,6 +115,20 @@ function applyI18n() {
   $("hint_llm_prompt").textContent = t("hint_llm_prompt");
   $("lab_llm_skip").textContent = t("label_llm_skip");
   $("hint_llm_skip").textContent = t("hint_llm_skip");
+  $("title_jev").textContent = t("label_jev_section");
+  $("hint_jev_sec").textContent = t("hint_jev_section");
+  $("lab_jev_mode").textContent = t("label_jev_mode");
+  $("jev_mode_off").textContent = t("jev_mode_off");
+  $("jev_mode_shadow").textContent = t("jev_mode_shadow");
+  $("jev_mode_assist").textContent = t("jev_mode_assist");
+  $("hint_jev_mode").textContent = t("hint_jev_mode");
+  $("lab_jev_url").textContent = t("label_jev_url");
+  $("hint_jev_url").textContent = t("hint_jev_url");
+  $("lab_jev_key").textContent = t("label_jev_key");
+  $("hint_jev_key").textContent = t("hint_jev_key");
+  $("lab_jev_model").textContent = t("label_jev_model");
+  $("lab_jev_threshold").textContent = t("label_jev_threshold");
+  $("hint_jev_threshold").textContent = t("hint_jev_threshold");
   $("lab_automation_mode").textContent = t("label_automation_mode");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
   $("title_experimental").textContent = t("label_experimental_section");
@@ -125,9 +148,12 @@ function applyI18n() {
   $("hint_page_assist_origins").textContent = t("hint_page_assist_origins");
   $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
   $("llmJudgeModel").placeholder = t("placeholder_llm_model");
+  $("jevJudgeApiKey").placeholder = t("placeholder_jev_key");
+  $("jevJudgeModel").placeholder = DEFAULT_JEV_MODEL;
   $("save").textContent = t("save");
   $("test").textContent = t("test");
   $("testLlm").textContent = t("test_llm");
+  $("testJev").textContent = t("test_jev");
   $("uiLocale").value = getLocale();
   document.documentElement.classList.remove("i18n-pending");
 }
@@ -156,6 +182,11 @@ async function loadForm() {
   $("llmJudgeSkipKeywords").value = (cfg.llmJudgeSkipKeywords && String(cfg.llmJudgeSkipKeywords).trim())
     ? cfg.llmJudgeSkipKeywords
     : DEFAULT_LLM_SKIP_KEYWORDS_TEXT;
+  $("jevJudgeMode").value = normalizeJevJudgeMode(cfg.jevJudgeMode);
+  $("jevJudgeBaseUrl").value = cfg.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL;
+  $("jevJudgeApiKey").value = cfg.jevJudgeApiKey || "";
+  $("jevJudgeModel").value = cfg.jevJudgeModel || DEFAULT_JEV_MODEL;
+  $("jevJudgeThreshold").value = normalizeJevJudgeThreshold(cfg.jevJudgeThreshold);
   $("automationMode").checked = cfg.automationMode === "project_auto"
     || (cfg.automationMode == null && cfg.enabled === true);
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
@@ -225,6 +256,11 @@ $("save").addEventListener("click", async () => {
     llmJudgeModel: $("llmJudgeModel").value.trim(),
     llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
     llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+    jevJudgeMode: normalizeJevJudgeMode($("jevJudgeMode").value),
+    jevJudgeBaseUrl: $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL,
+    jevJudgeApiKey: $("jevJudgeApiKey").value.trim(),
+    jevJudgeModel: $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL,
+    jevJudgeThreshold: normalizeJevJudgeThreshold($("jevJudgeThreshold").value),
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
@@ -356,6 +392,67 @@ $("testLlm").addEventListener("click", async () => {
     cont: t(resp.cont ? "boolean_yes" : "boolean_no"),
     send,
   })}`, "ok");
+});
+
+$("testJev").addEventListener("click", async () => {
+  const base = $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL;
+  const key = $("jevJudgeApiKey").value.trim();
+  const model = $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL;
+  const threshold = normalizeJevJudgeThreshold($("jevJudgeThreshold").value);
+  if (!base || !key || !model) {
+    setStatus(t("jev_need_config"), "err");
+    return;
+  }
+  let origin;
+  try {
+    origin = hostPermissionPatternForUrl(base);
+  } catch (_) {
+    setStatus("✖ " + t("host_permission_invalid_url"), "err");
+    return;
+  }
+  let granted = false;
+  try { granted = await requestHostPermissions([origin]); } catch (_) { granted = false; }
+  if (!granted) {
+    setStatus("✖ " + t("host_permission_denied"), "err");
+    return;
+  }
+  const ephemeralOrigins = loadedHostPermissionOrigins.includes(origin) ? [] : [origin];
+  const btn = $("testJev");
+  btn.disabled = true;
+  setStatus(t("testing"), "");
+  const { resp, error } = await runtimeMessage({
+    type: "h2w_test_jev",
+    config: {
+      jevJudgeBaseUrl: base,
+      jevJudgeApiKey: key,
+      jevJudgeModel: model,
+      jevJudgeThreshold: threshold,
+    },
+  });
+  btn.disabled = false;
+  if (ephemeralOrigins.length) await removeHostPermissions(ephemeralOrigins);
+  if (error) {
+    setStatus("✖ " + error, "err");
+    return;
+  }
+  if (!resp?.ok) {
+    if (resp?.reason === "timeout") setStatus("✖ " + t("jev_timeout"), "err");
+    else if (resp?.reason === "permission") setStatus("✖ " + t("host_permission_denied"), "err");
+    else if (resp?.reason === "http") {
+      setStatus("✖ " + t("jev_test_http_error", {
+        status: resp.status || "?",
+        detail: resp.error ? ": " + resp.error : "",
+      }), "err");
+    } else {
+      setStatus("✖ " + t("jev_test_failed", { error: resp?.error || resp?.reason || "?" }), "err");
+    }
+    return;
+  }
+  setStatus("✓ " + t("jev_test_result", {
+    probability: Number(resp.probability).toFixed(3),
+    signal: t("jev_signal_" + (resp.signal || "unknown")),
+    threshold: Number(resp.threshold).toFixed(2),
+  }), "ok");
 });
 
 onLocaleReady(async () => {

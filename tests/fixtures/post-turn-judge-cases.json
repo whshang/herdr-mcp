@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "zh-explicit-next-validation",
+      "expected": "continue",
+      "user": "完成修复并跑完发布前验证。",
+      "assistant": "修复已经提交。下一步我会继续跑真实浏览器 UAT 和发布 gate，完成后再清理分支。"
+    },
+    {
+      "id": "zh-complete",
+      "expected": "done",
+      "user": "完成剩余工作并验证。",
+      "assistant": "剩余实现、测试和清理都已完成，所有必需 gate 通过。"
+    },
+    {
+      "id": "zh-optional-offer",
+      "expected": "done",
+      "user": "把这个问题解释清楚。",
+      "assistant": "原因和影响已经解释完。如果你希望，我还可以再整理成一份文档。"
+    },
+    {
+      "id": "zh-needs-human-choice",
+      "expected": "done",
+      "user": "部署到生产。",
+      "assistant": "构建和预检查已完成。生产部署需要你在 A/B 两个租户中选择目标，我需要你的决定后才能继续。"
+    },
+    {
+      "id": "zh-more-work",
+      "expected": "continue",
+      "user": "修复问题并收尾。",
+      "assistant": "根因已经定位并修复，但回归验证还没跑完。我会继续跑扩展 smoke 和真实会话验收。"
+    },
+    {
+      "id": "zh-blocked-credential",
+      "expected": "done",
+      "user": "调用第三方服务完成同步。",
+      "assistant": "本地准备已完成，但当前缺少第三方 API 密钥。需要你提供或配置凭据后才能继续同步。"
+    },
+    {
+      "id": "en-explicit-next",
+      "expected": "continue",
+      "user": "Finish the implementation and validate it.",
+      "assistant": "The implementation is complete. Next I will run the production smoke test and fix any regression it exposes."
+    },
+    {
+      "id": "en-complete",
+      "expected": "done",
+      "user": "Finish the task and clean up.",
+      "assistant": "All requested work is complete. Tests pass and the temporary branch has been cleaned up."
+    },
+    {
+      "id": "en-optional-offer",
+      "expected": "done",
+      "user": "Summarize the design.",
+      "assistant": "The design summary is complete. I can also turn it into slides if that would be useful."
+    },
+    {
+      "id": "en-human-decision",
+      "expected": "done",
+      "user": "Ship the release.",
+      "assistant": "The release candidate is ready, but publishing requires your explicit approval. I cannot proceed until you approve it."
+    },
+    {
+      "id": "en-pending-investigation",
+      "expected": "continue",
+      "user": "Find and fix the flaky test.",
+      "assistant": "I reproduced the flake and narrowed it to the retry path. I still need to patch it and rerun the suite."
+    },
+    {
+      "id": "en-wait-external",
+      "expected": "done",
+      "user": "Complete the migration.",
+      "assistant": "The migration is prepared, but it is waiting on an external database snapshot that is not available yet. There is no safe next action I can take until it arrives."
+    },
+    {
+      "id": "ja-next",
+      "expected": "continue",
+      "user": "修正を完了して検証してください。",
+      "assistant": "修正は完了しました。次に実ブラウザの UAT と回帰テストを続けます。"
+    },
+    {
+      "id": "ja-complete",
+      "expected": "done",
+      "user": "残りの作業を完了してください。",
+      "assistant": "依頼された実装、検証、後片付けはすべて完了しました。"
+    },
+    {
+      "id": "mixed-plan-only",
+      "expected": "continue",
+      "user": "不要只汇报计划，完成开发和验证。",
+      "assistant": "我已经确认实现位置。接下来先修改判断逻辑，再补测试并跑完整回归。"
+    },
+    {
+      "id": "mixed-question-block",
+      "expected": "done",
+      "user": "把集成做好。",
+      "assistant": "集成代码已准备好，但需要你决定是否允许把生产数据发送到新的外部服务。在你确认前我不会继续。"
+    }
+  ]
+}
