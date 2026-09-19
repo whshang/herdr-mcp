@@ -7,7 +7,7 @@ export const JEV_JUDGE_MODE_ASSIST = "assist";
 export const JEV_JUDGE_MODE_AUTO = "auto";
 export const DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai/v1";
 export const DEFAULT_JEV_MODEL = "jev-latest";
-export const DEFAULT_JEV_THRESHOLD = 0.75;
+export const DEFAULT_JEV_THRESHOLD = 0.70;
 
 const VALID_MODES = new Set([
   JEV_JUDGE_MODE_OFF,

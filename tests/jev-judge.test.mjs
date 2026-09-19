@@ -106,6 +106,6 @@ test("user can configure the TypeSafe endpoint without hiding provider choices |
   assert.equal(normalizeJevJudgeMode("auto"), JEV_JUDGE_MODE_AUTO);
   assert.equal(normalizeJevJudgeMode("anything"), "off");
   assert.equal(normalizeJevJudgeThreshold("0.9"), 0.9);
-  assert.equal(DEFAULT_JEV_THRESHOLD, 0.75);
+  assert.equal(DEFAULT_JEV_THRESHOLD, 0.70);
   assert.equal(normalizeJevJudgeThreshold("0.2"), DEFAULT_JEV_THRESHOLD);
 });

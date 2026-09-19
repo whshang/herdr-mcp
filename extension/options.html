@@ -118,19 +118,19 @@
     <h2 id="title_llm">Post-turn LLM judge</h2>
     <div class="hint" id="hint_llm_sec"></div>
 
-    <label id="lab_llm_url">Judge API base URL</label>
-    <input type="text" id="llmJudgeBaseUrl" placeholder="https://example.com/v1">
-    <div class="hint" id="hint_llm_url"></div>
-
     <label id="lab_llm_key">Judge API key (Bearer)</label>
     <input type="password" id="llmJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
     <div class="hint" id="hint_llm_key"></div>
 
-    <label id="lab_llm_model">Judge model</label>
-    <input type="text" id="llmJudgeModel" placeholder="e.g. small-fast-model">
-
     <details class="advanced">
       <summary id="llm_advanced_summary">Advanced LLM judge settings</summary>
+      <label id="lab_llm_url">Judge API base URL</label>
+      <input type="text" id="llmJudgeBaseUrl" placeholder="https://example.com/v1">
+      <div class="hint" id="hint_llm_url"></div>
+
+      <label id="lab_llm_model">Judge model</label>
+      <input type="text" id="llmJudgeModel" placeholder="e.g. small-fast-model">
+
       <label id="lab_llm_prompt">Judge prompt template</label>
       <textarea id="llmJudgePromptTemplate"></textarea>
       <div class="hint" id="hint_llm_prompt"></div>
