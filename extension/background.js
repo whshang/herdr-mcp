@@ -3498,8 +3498,76 @@ async function handleBrowserActuation(command) {
       return;
     }
     let targetOpen = browserSessionTargets.get(sessionRefOpen);
+    let observedGenerationOpen = expectedGeneration;
+    const canonicalInfoOpen = canonicalUrl
+      ? browserConversationInfo(providerOpen, canonicalUrl)
+      : null;
+    if (!targetOpen && canonicalUrl) {
+      if (!canonicalInfoOpen?.conversation_id) {
+        await postBrowserActuationEvidence(
+          actuationId,
+          unavailableBrowserActuationEvidence(
+            expectedGeneration,
+            "browser_open_canonical_url_invalid",
+            observedGenerationOpen,
+          ),
+        );
+        return;
+      }
+      const existing = await findBrowserSessionTargetByCanonicalIdentity(
+        providerOpen, canonicalUrl, expectedGeneration,
+      );
+      if (existing.ambiguous) {
+        await postBrowserActuationEvidence(
+          actuationId,
+          unavailableBrowserActuationEvidence(
+            expectedGeneration,
+            "browser_open_canonical_ambiguous",
+            observedGenerationOpen,
+          ),
+        );
+        return;
+      }
+      targetOpen = existing.target;
+      if (!targetOpen) {
+        let createdTab = null;
+        try {
+          createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
+        } catch (_) {}
+        if (!createdTab?.id) {
+          await postBrowserActuationEvidence(
+            actuationId,
+            unavailableBrowserActuationEvidence(
+              expectedGeneration,
+              "browser_open_tab_create_failed",
+              observedGenerationOpen,
+            ),
+          );
+          return;
+        }
+        const deadline = Date.now() + 8000;
+        do {
+          targetOpen = browserSessionTargets.get(sessionRefOpen);
+          if (targetOpen?.tabId === createdTab.id) break;
+          targetOpen = null;
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        } while (Date.now() < deadline);
+        if (!targetOpen) {
+          await postBrowserActuationEvidence(actuationId, {
+            ...unavailableBrowserActuationEvidence(
+              expectedGeneration,
+              "browser_open_target_register_timeout",
+            ),
+            command_accepted: true,
+            resource_available: true,
+          }).catch(() => {});
+          return;
+        }
+      }
+    }
     if (!targetOpen) {
       const recovered = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration);
+      observedGenerationOpen = recovered.observedGeneration;
       targetOpen = recovered.target;
       if (!targetOpen && recovered.ambiguous) {
         await postBrowserActuationEvidence(
@@ -3507,86 +3575,22 @@ async function handleBrowserActuation(command) {
           unavailableBrowserActuationEvidence(
             expectedGeneration,
             "browser_open_target_ambiguous",
-            recovered.observedGeneration,
+            observedGenerationOpen,
           ),
         );
         return;
       }
-      if (!targetOpen && canonicalUrl) {
-        const canonicalInfo = browserConversationInfo(providerOpen, canonicalUrl);
-        if (!canonicalInfo?.conversation_id) {
-          await postBrowserActuationEvidence(
-            actuationId,
-            unavailableBrowserActuationEvidence(
-              expectedGeneration,
-              "browser_open_canonical_url_invalid",
-              recovered.observedGeneration,
-            ),
-          );
-          return;
-        }
-        const existing = await findBrowserSessionTargetByCanonicalIdentity(
-          providerOpen, canonicalUrl, expectedGeneration,
-        );
-        if (existing.ambiguous) {
-          await postBrowserActuationEvidence(
-            actuationId,
-            unavailableBrowserActuationEvidence(
-              expectedGeneration,
-              "browser_open_canonical_ambiguous",
-              recovered.observedGeneration,
-            ),
-          );
-          return;
-        }
-        targetOpen = existing.target;
-        if (!targetOpen) {
-          let createdTab = null;
-          try {
-            createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
-          } catch (_) {}
-          if (!createdTab?.id) {
-            await postBrowserActuationEvidence(
-              actuationId,
-              unavailableBrowserActuationEvidence(
-                expectedGeneration,
-                "browser_open_tab_create_failed",
-                recovered.observedGeneration,
-              ),
-            );
-            return;
-          }
-          const deadline = Date.now() + 8000;
-          do {
-            targetOpen = browserSessionTargets.get(sessionRefOpen);
-            if (targetOpen?.tabId === createdTab.id) break;
-            targetOpen = null;
-            await new Promise((resolve) => setTimeout(resolve, 200));
-          } while (Date.now() < deadline);
-          if (!targetOpen) {
-            await postBrowserActuationEvidence(actuationId, {
-              ...unavailableBrowserActuationEvidence(
-                expectedGeneration,
-                "browser_open_target_register_timeout",
-              ),
-              command_accepted: true,
-              resource_available: true,
-            }).catch(() => {});
-            return;
-          }
-        }
-      }
-      if (!targetOpen) {
-        await postBrowserActuationEvidence(
-          actuationId,
-          unavailableBrowserActuationEvidence(
-            expectedGeneration,
-            "browser_open_target_unavailable",
-            recovered.observedGeneration,
-          ),
-        );
-        return;
-      }
+    }
+    if (!targetOpen) {
+      await postBrowserActuationEvidence(
+        actuationId,
+        unavailableBrowserActuationEvidence(
+          expectedGeneration,
+          "browser_open_target_unavailable",
+          observedGenerationOpen,
+        ),
+      );
+      return;
     }
     if (targetOpen.observationGeneration !== expectedGeneration || targetOpen.provider !== providerOpen) {
       await postBrowserActuationEvidence(
@@ -3637,6 +3641,16 @@ async function handleBrowserActuation(command) {
             command_accepted: true,
             resource_available: true,
           };
+      if (evidence.command_accepted === true
+          && evidence.resource_available !== false
+          && evidence.stable_resource_ref_observed === true
+          && evidence.observed_generation === expectedGeneration) {
+        browserSessionTargets.set(sessionRefOpen, {
+          ...targetOpen,
+          observationGeneration: expectedGeneration,
+          lastSeenAt: Date.now(),
+        });
+      }
       await postBrowserActuationEvidence(actuationId, evidence);
     } catch (_) {
       await postBrowserActuationEvidence(actuationId, {

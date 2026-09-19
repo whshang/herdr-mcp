@@ -1149,7 +1149,7 @@ test("adapter capability reprobe advances observation generation on snapshot cha
   assert.match(backgroundSource, /browserCapabilitySnapshots\.set\(provider, snapshot\)/);
 });
 
-test("background session.open recovers unique target via recoverBrowserSessionTarget and activates without message insert", () => {
+test("user resumes an exact ChatGPT session | Given service-worker target cache is lost | When session.open has a canonical locator | Then Herdr reuses that view before broad probing and caches the verified target", () => {
   const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
   assert.ok(start >= 0, "session.open branch must exist in handleBrowserActuation");
   const segment = backgroundSource.slice(start, backgroundSource.indexOf("\n  const sessionRef = String(params.session_ref", start));
@@ -1157,14 +1157,19 @@ test("background session.open recovers unique target via recoverBrowserSessionTa
   assert.match(segment, /findBrowserSessionTargetByCanonicalIdentity/);
   assert.match(segment, /recovered\.ambiguous/);
   assert.ok(
+    segment.indexOf("findBrowserSessionTargetByCanonicalIdentity") < segment.indexOf("recoverBrowserSessionTarget"),
+    "session.open must reuse the durable canonical locator before broad identity probing",
+  );
+  assert.ok(
     segment.indexOf("findBrowserSessionTargetByCanonicalIdentity") < segment.indexOf("chrome.tabs.create"),
     "session.open must try canonical-identity tab reuse before creating a new view",
   );
+  assert.match(segment, /browserSessionTargets\.set\(sessionRefOpen/);
+  assert.match(segment, /stable_resource_ref_observed === true/);
   assert.match(segment, /chrome\.tabs\.update.*active:\s*true.*autoDiscardable:\s*false/);
   assert.match(segment, /protectBoundTab/);
   assert.doesNotMatch(segment, /insertMainWorld|performWake|tabs\.reload|executeScript/);
-  // Must fail closed on missing/duplicate/stale/provider mismatch.
-  assert.match(segment, /observedGeneration/);
+  assert.match(segment, /observedGenerationOpen/);
   assert.match(segment, /providerOpen !== "chatgpt"/);
 });
 
