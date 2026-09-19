@@ -303,7 +303,7 @@ bounded mechanical script fallback
 
 Jev は最初に狭い意味判定を行い、通常の Auto では高信頼の continue/done を最終結果として扱います。Jev が確定できない場合のみ LLM に進み、LLM も確定できない場合のみ精度の低い機械的な script fallback を使います。この fallback により Jev/LLM API を持たないユーザーでも基本 Auto を利用できますが、script が Jev/LLM の結果を上書きすることはありません。
 
-ユーザーが設定するのは各 Provider の endpoint、model、API key だけです。Jev の mode/threshold と LLM judge の prompt / done-token ポリシーは製品に組み込まれ、ユーザー設定ではありません。
+ユーザーが設定するのは各 Provider の endpoint、model、API key だけです。semantic policy、probability boundary、judge prompt、completion token は製品側で管理され、ユーザー設定ではありません。
 
 Goal-aware automation ではさらに強い境界を維持します。Jev は既存の LLM Goal Supervisor に、`can_continue`、`needs_human`、`waiting_external`、`task_completed`、`needs_handoff` の 5 つの有界 semantic prior を一度に提供できます。これらの確率は advisory にすぎず、完了・待機・handoff・人間の判断境界・uncertain delivery については Work Memory/TODO evidence と deterministic runtime guard が引き続き authoritative です。
 

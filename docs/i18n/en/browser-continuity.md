@@ -303,7 +303,7 @@ bounded mechanical script fallback
 
 Jev answers the narrow semantic question first; a clear high-confidence continue/done result is final for ordinary Auto. The LLM judge handles cases Jev cannot settle. The script fallback is deliberately less accurate and exists so Auto still has basic behavior when neither provider is configured or both semantic stages are unavailable. Script heuristics never override a Jev/LLM result.
 
-Users configure only each provider's endpoint, model and API key. Jev mode/threshold and the LLM judge prompt/done-token policy are built in rather than user settings.
+Users configure only each provider's endpoint, model and API key. Semantic policy, probability boundaries, judge prompts and completion tokens are product-owned rather than user settings.
 
 Goal-aware automation keeps a stronger boundary. Jev can provide one bounded five-signal semantic prior — `can_continue`, `needs_human`, `waiting_external`, `task_completed`, `needs_handoff` — to the existing LLM Goal Supervisor. Those probabilities are advisory only. Work Memory/TODO evidence and deterministic runtime guards remain authoritative for completion, waiting, handoff, human boundaries and uncertain delivery.
 

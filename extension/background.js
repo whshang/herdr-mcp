@@ -741,7 +741,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   try {
     // The four semantic-policy keys below are migration tombstones only. They
     // are read so upgrades can erase historical user policy, never to restore
-    // Shadow/Assist, a user threshold, an editable prompt, or custom done tokens.
+    // Retired user-programmable semantic-policy controls are removed on startup.
     const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", "jevJudgeMode", "jevJudgeThreshold", "llmJudgePromptTemplate", "llmJudgeSkipKeywords", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };

@@ -348,7 +348,7 @@ z.ai / DeepSeek 的 Auto 只负责 Herdr progress / settled 回推；ChatGPT 专
 
 Jev 先回答窄化的语义问题；普通 Auto 中，高置信度的 continue/done 结果直接生效。Jev 无法确定时才交给 LLM；LLM 仍无法明确判断时才退到精度较低的机械脚本。脚本的作用是保证没有 Jev/LLM API 的用户仍有基础 Auto，不能反向推翻 Jev/LLM 已经作出的判断。
 
-用户只配置各 Provider 的 endpoint、model 和 API key。Jev 的 mode/threshold，以及 LLM judge 的 prompt / done-token 规则都由产品内置，不再是用户设置。
+用户只配置各 Provider 的 endpoint、model 和 API key。语义策略、概率边界、judge prompt 与 completion token 都由产品内置，不作为用户设置。
 
 Goal 模式使用更强的边界。Jev 可以一次向现有 LLM Goal Supervisor 提供五个有界语义 prior：`can_continue`、`needs_human`、`waiting_external`、`task_completed`、`needs_handoff`。这些概率只用于辅助判断；Work Memory/TODO evidence 与确定性的 runtime guard 仍是完成、等待、接力、人工边界和 uncertain delivery 的权威。
 

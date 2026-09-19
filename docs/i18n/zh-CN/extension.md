@@ -100,7 +100,7 @@ herdr-mcp Rust runtime
 5. 保持 Auto 关闭，先核对状态、Pinned Target 与人工操作；
 6. 只有需要长时间无人值守时再按作用域开启 Continuity 自动化。
 
-语义 Auto 的 Provider 配置刻意保持简单：TypeSafe/Jev 与 OpenAI-compatible LLM judge 都只暴露 endpoint、model、API key。普通 Auto 固定按 Jev -> LLM -> 有界脚本兜底；Goal 模式可把 Jev 作为现有 LLM Goal Supervisor 的 advisory semantic prior。即使两个 API 都没有，脚本兜底仍提供基础 Auto；Work Memory/TODO evidence 与确定性安全门继续保持权威。Shadow/Assist mode、用户自定义 Jev threshold、可编辑 judge prompt 与 done/skip keywords 都已经退役。
+语义 Auto 的 Provider 配置刻意保持简单：TypeSafe/Jev 与 OpenAI-compatible LLM judge 都只暴露 endpoint、model、API key。普通 Auto 固定按 Jev -> LLM -> 有界脚本兜底；Goal 模式可把 Jev 作为现有 LLM Goal Supervisor 的 advisory semantic prior。即使两个 API 都没有，脚本兜底仍提供基础 Auto；Work Memory/TODO evidence 与确定性安全门继续保持权威。语义策略、Jev 判定边界、judge prompt 与 completion token 都由产品内置，不作为用户设置。
 
 z.ai / DeepSeek 的 JSON → MCP 属于实验性集成，默认关闭，需要在 Herdr 设置的实验性功能中显式开启。
 
