@@ -1122,6 +1122,7 @@ function selfArchiveHarness(overrides = {}) {
     conversationId: "conv-self-archive",
     archiveAvailable: true,
     archiveVerifies: true,
+    archiveListContains: false,
     providerArchived: false,
     archiveClickThrows: false,
     onArchiveClick: null,
@@ -1175,6 +1176,12 @@ function selfArchiveHarness(overrides = {}) {
         ? { ok: true, body: { is_archived: ctx.providerArchived === true } }
         : { ok: false };
     };
+    const fetchChatGptArchivedConversationList = async () => ({
+      ok: true,
+      items: ctx.archiveListContains
+        ? [{ id: ctx.conversationId, is_archived: true }]
+        : [],
+    });
     const wait = (ms) => { Date.advance(ms); return Promise.resolve(); };
     const browserRejectedEvidence = (evidence, reason) => ({
       ...evidence,
@@ -1232,6 +1239,25 @@ test("user archive status stays unknown on readback failure and never clicks | G
   assert.equal(result.command_accepted, true);
   assert.equal(result.lifecycle_observed, false);
   assert.equal(result.result?.error, "browser_archive_status_readback_unavailable");
+  assert.equal(ctx.clicks.length, 0);
+});
+
+test("user archive status reconciles from the archived list without mutation | Given direct conversation readback is unavailable but the exact id is in the archived list | When status is read | Then archived is proven and Archive is never clicked", async () => {
+  const { ctx, api } = selfArchiveHarness({
+    archiveVerifies: false,
+    archiveListContains: true,
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7 },
+  };
+  const result = await api.performChatGptSessionArchiveStatus(command, { observed_generation: 7 });
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.lifecycle_observed, true);
+  assert.equal(result.result?.is_archived, true);
+  assert.equal(result.result?.archive_state, "archived");
+  assert.equal(result.result?.readback_source, "archive_list");
   assert.equal(ctx.clicks.length, 0);
 });
 
