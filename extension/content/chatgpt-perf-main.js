@@ -54,6 +54,14 @@
   const QUIET_MS = 300;
   const MAX_DISCOVERY_LATENCY_MS = 1000;
   const DISCOVERY_IDLE_TIMEOUT_MS = 100;
+  const SCROLL_QUIET_MS = 160;
+  const TRACKED_ELEMENT_LIMIT = 256;
+  const ANCHOR_CANDIDATE_LIMIT = 12;
+  const TURN_SELECTOR = [
+    '[data-message-author-role="user"]',
+    '[data-message-author-role="assistant"]',
+    '[data-testid^="conversation-turn-"]',
+  ].join(", ");
   const STOP_SELECTORS = [
     'button[data-testid="stop-button"]',
     '[role="button"][data-testid="stop-button"]',
@@ -98,6 +106,11 @@
     max_editable_block_height_px: 0,
     last_tool_cluster_height_px: 0,
     max_tool_cluster_height_px: 0,
+    scroll_bursts: 0,
+    deferred_mutation_batches: 0,
+    anchored_reconciles: 0,
+    anchor_adjustments: 0,
+    tracked_element_evictions: 0,
   };
 
   let enabled = true;
@@ -113,6 +126,9 @@
   let discoveryPending = false;
   let toolFindSuspendUntil = 0;
   let toolFindResumeTimer = null;
+  let scrollTimer = null;
+  let scrolling = false;
+  let deferredDuringScroll = false;
 
   const viewerHeights = new WeakMap();
   const pendingViewers = new Set();
@@ -122,6 +138,19 @@
   const observedToolClusters = new Set();
   const toolClusterHeights = new WeakMap();
   const foldedToolRuns = new WeakMap();
+
+  function addTrackedElement(set, element, onEvict) {
+    if (!(element instanceof Element) || set.has(element)) return false;
+    set.add(element);
+    while (set.size > TRACKED_ELEMENT_LIMIT) {
+      const oldest = set.values().next().value;
+      if (!(oldest instanceof Element)) break;
+      set.delete(oldest);
+      try { onEvict?.(oldest); } catch (_) {}
+      stats.tracked_element_evictions += 1;
+    }
+    return true;
+  }
 
   function publish(value) {
     try {
@@ -357,7 +386,10 @@
   }
 
   function handleBlockEntries(entries) {
-    if (!enabled) return;
+    if (!enabled || scrolling) {
+      if (scrolling && entries?.length) deferredDuringScroll = true;
+      return;
+    }
     const safety = safetySnapshot();
     const unsafeByRoot = new Map();
 
@@ -399,7 +431,10 @@
     if (!enabled || !(block instanceof Element) || !isEditableRoot(block.parentElement)) return false;
     if (observedBlocks.has(block)) return false;
     if (!installBlockObserver()) return false;
-    observedBlocks.add(block);
+    addTrackedElement(observedBlocks, block, (oldest) => {
+      try { blockObserver?.unobserve?.(oldest); } catch (_) {}
+      clearEditableBlock(oldest);
+    });
     blockObserver.observe(block);
     stats.editable_blocks_observed += 1;
     return true;
@@ -408,7 +443,7 @@
   function observeRoot(root, rearm = false) {
     if (!enabled || !isEditableRoot(root)) return false;
     if (!observedRoots.has(root)) {
-      observedRoots.add(root);
+      addTrackedElement(observedRoots, root);
       stats.editable_roots_observed += 1;
     }
     for (const block of root.children || []) {
@@ -504,7 +539,10 @@
   }
 
   function handleToolClusterEntries(entries) {
-    if (!enabled) return;
+    if (!enabled || scrolling) {
+      if (scrolling && entries?.length) deferredDuringScroll = true;
+      return;
+    }
     const safety = safetySnapshot();
     const suspended = toolHidingSuspended();
     for (const entry of entries) {
@@ -540,7 +578,11 @@
   function observeToolCluster(cluster) {
     if (!enabled || !(cluster instanceof Element) || observedToolClusters.has(cluster)) return false;
     if (!installToolClusterObserver()) return false;
-    observedToolClusters.add(cluster);
+    addTrackedElement(observedToolClusters, cluster, (oldest) => {
+      try { toolClusterObserver?.unobserve?.(oldest); } catch (_) {}
+      clearToolCluster(oldest);
+      try { oldest.removeAttribute(TOOL_CLUSTER_OBSERVED_ATTR); } catch (_) {}
+    });
     try {
       cluster.setAttribute(TOOL_CLUSTER_OBSERVED_ATTR, "1");
       toolClusterObserver.observe(cluster);
@@ -822,7 +864,7 @@
   function markViewerDirty(viewer) {
     if (!isCurrentViewer(viewer)) return false;
     clearViewer(viewer);
-    pendingViewers.add(viewer);
+    addTrackedElement(pendingViewers, viewer, clearViewer);
     return true;
   }
 
@@ -854,10 +896,15 @@
 
   function handleMutations(records) {
     if (!enabled) return;
-    installStyle();
     stats.observer_batches += 1;
     stats.mutation_records += records.length;
     stats.last_batch_records = records.length;
+    if (scrolling) {
+      deferredDuringScroll = true;
+      stats.deferred_mutation_batches += 1;
+      return;
+    }
+    installStyle();
 
     let toolStructureChanged = false;
     for (const record of records) {
@@ -894,7 +941,7 @@
     let discovered = 0;
 
     for (const viewer of document.querySelectorAll?.(VIEWER_SELECTOR) || []) {
-      pendingViewers.add(viewer);
+      addTrackedElement(pendingViewers, viewer, clearViewer);
       discovered += 1;
     }
 
@@ -928,6 +975,55 @@
     return discovered;
   }
 
+  function captureViewportAnchor() {
+    const viewportHeight = Number(window.innerHeight || document.documentElement?.clientHeight || 0);
+    if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) return null;
+    let inspected = 0;
+    for (const turn of document.querySelectorAll?.(TURN_SELECTOR) || []) {
+      if (!(turn instanceof Element) || !turn.isConnected) continue;
+      if (inspected >= ANCHOR_CANDIDATE_LIMIT) break;
+      inspected += 1;
+      const rect = turn.getBoundingClientRect?.();
+      if (!rect) continue;
+      const top = Number(rect.top);
+      const bottom = Number(rect.bottom);
+      if (!Number.isFinite(top) || !Number.isFinite(bottom)) continue;
+      if (bottom > 0 && top < viewportHeight) {
+        let scrollContainer = null;
+        for (let node = turn.parentElement; node instanceof Element; node = node.parentElement) {
+          const overflowY = String(window.getComputedStyle?.(node)?.overflowY || "");
+          if (/(auto|scroll|overlay)/.test(overflowY)
+            && Number(node.scrollHeight) > Number(node.clientHeight) + 1) {
+            scrollContainer = node;
+            break;
+          }
+        }
+        return { turn, top, scrollContainer };
+      }
+    }
+    return null;
+  }
+
+  function reconcileWithAnchor() {
+    const anchor = captureViewportAnchor();
+    const discovered = scan();
+    stats.anchored_reconciles += 1;
+    if (!anchor?.turn?.isConnected) return discovered;
+    const rect = anchor.turn.getBoundingClientRect?.();
+    const nextTop = Number(rect?.top);
+    if (!Number.isFinite(nextTop)) return discovered;
+    const delta = nextTop - anchor.top;
+    if (Math.abs(delta) >= 0.5) {
+      if (anchor.scrollContainer?.isConnected) {
+        anchor.scrollContainer.scrollTop += delta;
+      } else if (typeof window.scrollBy === "function") {
+        window.scrollBy(0, delta);
+      }
+      stats.anchor_adjustments += 1;
+    }
+    return discovered;
+  }
+
   function runSettledScan() {
     quietTimer = null;
     if (!enabled || !discoveryPending) return;
@@ -946,7 +1042,7 @@
     queueDiscoveryScan(true);
   }
 
-  function queueDiscoveryScan(forced) {
+  function queueDiscoveryScan(forced, preserveAnchor = false) {
     discoveryPending = false;
     if (quietTimer != null) {
       clearTimeout(quietTimer);
@@ -960,7 +1056,10 @@
 
     const run = () => {
       idleHandle = null;
-      if (enabled) scan();
+      if (enabled) {
+        if (preserveAnchor) reconcileWithAnchor();
+        else scan();
+      }
     };
     if (typeof requestIdleCallback === "function") {
       idleHandle = requestIdleCallback(run, { timeout: DISCOVERY_IDLE_TIMEOUT_MS });
@@ -978,6 +1077,25 @@
     }
     if (quietTimer != null) return;
     quietTimer = setTimeout(runSettledScan, QUIET_MS);
+  }
+
+  function finishScrollBurst() {
+    scrollTimer = null;
+    if (!enabled || !scrolling) return;
+    scrolling = false;
+    if (!deferredDuringScroll) return;
+    deferredDuringScroll = false;
+    discoveryPending = true;
+    rearmToolClusters();
+    queueDiscoveryScan(false, true);
+  }
+
+  function noteScrollIntent() {
+    if (!enabled) return;
+    if (!scrolling) stats.scroll_bursts += 1;
+    scrolling = true;
+    if (scrollTimer != null) clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(finishScrollBurst, SCROLL_QUIET_MS);
   }
 
   function startObserver() {
@@ -1023,6 +1141,10 @@
     if (!enabled) return;
     if ((event?.metaKey || event?.ctrlKey) && String(event?.key || "").toLowerCase() === "f") {
       suspendToolHiding();
+      return;
+    }
+    if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(String(event?.key || ""))) {
+      noteScrollIntent();
     }
   }
 
@@ -1038,6 +1160,8 @@
     document.addEventListener("focusout", handleFocusOut, true);
     document.addEventListener("selectionchange", handleSelectionChange, true);
     document.addEventListener("keydown", handleKeyDown, true);
+    document.addEventListener("wheel", noteScrollIntent, true);
+    document.addEventListener("touchmove", noteScrollIntent, true);
     document.addEventListener("beforematch", handleBeforeMatch, true);
     document.addEventListener("click", handleToolRunClick, true);
     listenersInstalled = true;
@@ -1049,6 +1173,8 @@
     document.removeEventListener("focusout", handleFocusOut, true);
     document.removeEventListener("selectionchange", handleSelectionChange, true);
     document.removeEventListener("keydown", handleKeyDown, true);
+    document.removeEventListener("wheel", noteScrollIntent, true);
+    document.removeEventListener("touchmove", noteScrollIntent, true);
     document.removeEventListener("beforematch", handleBeforeMatch, true);
     document.removeEventListener("click", handleToolRunClick, true);
     listenersInstalled = false;
@@ -1086,6 +1212,12 @@
       clearTimeout(toolFindResumeTimer);
       toolFindResumeTimer = null;
     }
+    if (scrollTimer != null) {
+      clearTimeout(scrollTimer);
+      scrollTimer = null;
+    }
+    scrolling = false;
+    deferredDuringScroll = false;
     toolFindSuspendUntil = 0;
     discoveryPending = false;
   }

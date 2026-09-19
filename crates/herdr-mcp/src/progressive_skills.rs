@@ -37,12 +37,14 @@ pub const BROWSER_RESOURCE_LIST_METHOD: &str = "herdr_mcp.browser_resource.list"
 pub const BROWSER_RESOURCE_INSPECT_METHOD: &str = "herdr_mcp.browser_resource.inspect";
 pub const BROWSER_RESOURCE_RESOLVE_METHOD: &str = "herdr_mcp.browser_resource.resolve";
 pub const BROWSER_HANDOFF_PREPARE_METHOD: &str = "herdr_mcp.browser_handoff.prepare";
+pub const BROWSER_SOURCE_RESOLVE_METHOD: &str = "herdr_mcp.browser_source.resolve";
 pub const BROWSER_SPACE_CREATE_METHOD: &str = "herdr_mcp.browser_space.create";
 pub const BROWSER_SPACE_OPEN_METHOD: &str = "herdr_mcp.browser_space.open";
 pub const BROWSER_SPACE_INSPECT_METHOD: &str = "herdr_mcp.browser_space.inspect";
 pub const BROWSER_SESSION_CREATE_METHOD: &str = "herdr_mcp.browser_session.create";
 pub const BROWSER_SESSION_OPEN_METHOD: &str = "herdr_mcp.browser_session.open";
 pub const BROWSER_SESSION_ARCHIVE_METHOD: &str = "herdr_mcp.browser_session.archive";
+pub const BROWSER_SESSION_ARCHIVE_STATUS_METHOD: &str = "herdr_mcp.browser_session.archive_status";
 pub const BROWSER_SESSION_INSPECT_METHOD: &str = "herdr_mcp.browser_session.inspect";
 pub const BROWSER_MESSAGE_APPEND_METHOD: &str = "herdr_mcp.browser_message.append";
 pub const BROWSER_COMPOSER_SET_REASONING_METHOD: &str = "herdr_mcp.browser_composer.set_reasoning";
@@ -485,6 +487,20 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     {"required": ["session_ref", "expected_generation"]},
                     {"required": ["current_user_message"]},
                 ],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "session_ref": {"type": "string", "maxLength": 96},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                },
+                "required": ["session_ref", "expected_generation"],
                 "empty": false,
             },
         }),
@@ -2552,7 +2568,7 @@ mod tests {
         assert_eq!(methods[5]["params"]["oneOf"].as_array().unwrap().len(), 2);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
-        assert_eq!(methods.len(), 19);
+        assert_eq!(methods.len(), 20);
         assert_eq!(methods[0]["method"], BROWSER_ENDPOINT_LIST_METHOD);
         assert_eq!(methods[1]["method"], BROWSER_ENDPOINT_INSPECT_METHOD);
         assert_eq!(methods[2]["method"], BROWSER_RESOURCE_LIST_METHOD);
@@ -2599,17 +2615,23 @@ mod tests {
             methods[10]["params"]["properties"]["current_user_message"]["maxLength"],
             262144
         );
-        assert_eq!(methods[11]["method"], BROWSER_SESSION_INSPECT_METHOD);
-        assert_eq!(methods[12]["method"], BROWSER_MESSAGE_APPEND_METHOD);
-        assert_eq!(methods[13]["method"], BROWSER_COMPOSER_SET_REASONING_METHOD);
-        assert_eq!(methods[14]["method"], BROWSER_COMPOSER_SET_APPS_METHOD);
-        assert_eq!(methods[15]["method"], BROWSER_DISPATCH_SUBMIT_METHOD);
-        assert_eq!(methods[16]["method"], BROWSER_DISPATCH_STATUS_METHOD);
-        assert_eq!(methods[17]["method"], BROWSER_DISPATCH_STOP_METHOD);
-        assert_eq!(methods[18]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
-        assert_eq!(methods[18]["access"], "read_only");
+        assert_eq!(methods[11]["method"], BROWSER_SESSION_ARCHIVE_STATUS_METHOD);
+        assert_eq!(methods[11]["access"], "read_only");
         assert_eq!(
-            methods[18]["params"]["required"],
+            methods[11]["params"]["required"],
+            json!(["session_ref", "expected_generation"])
+        );
+        assert_eq!(methods[12]["method"], BROWSER_SESSION_INSPECT_METHOD);
+        assert_eq!(methods[13]["method"], BROWSER_MESSAGE_APPEND_METHOD);
+        assert_eq!(methods[14]["method"], BROWSER_COMPOSER_SET_REASONING_METHOD);
+        assert_eq!(methods[15]["method"], BROWSER_COMPOSER_SET_APPS_METHOD);
+        assert_eq!(methods[16]["method"], BROWSER_DISPATCH_SUBMIT_METHOD);
+        assert_eq!(methods[17]["method"], BROWSER_DISPATCH_STATUS_METHOD);
+        assert_eq!(methods[18]["method"], BROWSER_DISPATCH_STOP_METHOD);
+        assert_eq!(methods[19]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
+        assert_eq!(methods[19]["access"], "read_only");
+        assert_eq!(
+            methods[19]["params"]["required"],
             json!(["continuity_id", "source_url"])
         );
         assert_eq!(
@@ -2617,7 +2639,7 @@ mod tests {
                 .iter()
                 .filter(|method| method["access"] == "read_only")
                 .count(),
-            9
+            10
         );
         assert!(methods.iter().all(|method| {
             let name = method["method"].as_str().unwrap();

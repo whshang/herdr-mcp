@@ -12,11 +12,13 @@ use crate::progressive_skills::{
     BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_STOP_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD,
     BROWSER_ENDPOINT_INSPECT_METHOD, BROWSER_ENDPOINT_LIST_METHOD, BROWSER_HANDOFF_PREPARE_METHOD,
     BROWSER_MESSAGE_APPEND_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
-    BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD,
-    BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SPACE_CREATE_METHOD,
-    BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD, EXEC_WAIT_METHOD,
-    WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD,
-    WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD,
+    BROWSER_SESSION_ARCHIVE_STATUS_METHOD, BROWSER_SESSION_CREATE_METHOD,
+    BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
+    BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD,
+    EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
+    WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
+    WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
@@ -142,6 +144,7 @@ pub struct RuntimeContext<'a> {
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
     pub browser_mutation_gate: Option<&'a std::sync::RwLock<()>>,
     pub browser_mutation_admission: Option<&'a BrowserMutationAdmission>,
+    pub trusted_local_ipc: bool,
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -316,6 +319,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if method == BROWSER_SOURCE_RESOLVE_METHOD {
+                browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
                 browser_handoff_prepare(context.state_store, &params)
             } else if method == "herdr_mcp.page_assist" {
@@ -1715,6 +1720,7 @@ enum BrowserOperation {
     SessionCreate,
     SessionOpen,
     SessionArchive,
+    SessionArchiveStatus,
     SessionInspect,
     MessageAppend,
     ComposerSetReasoning,
@@ -1733,6 +1739,7 @@ impl BrowserOperation {
             BROWSER_SESSION_CREATE_METHOD => Some(Self::SessionCreate),
             BROWSER_SESSION_OPEN_METHOD => Some(Self::SessionOpen),
             BROWSER_SESSION_ARCHIVE_METHOD => Some(Self::SessionArchive),
+            BROWSER_SESSION_ARCHIVE_STATUS_METHOD => Some(Self::SessionArchiveStatus),
             BROWSER_SESSION_INSPECT_METHOD => Some(Self::SessionInspect),
             BROWSER_MESSAGE_APPEND_METHOD => Some(Self::MessageAppend),
             BROWSER_COMPOSER_SET_REASONING_METHOD => Some(Self::ComposerSetReasoning),
@@ -1752,6 +1759,7 @@ impl BrowserOperation {
             Self::SessionCreate => BROWSER_SESSION_CREATE_METHOD,
             Self::SessionOpen => BROWSER_SESSION_OPEN_METHOD,
             Self::SessionArchive => BROWSER_SESSION_ARCHIVE_METHOD,
+            Self::SessionArchiveStatus => BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
             Self::SessionInspect => BROWSER_SESSION_INSPECT_METHOD,
             Self::MessageAppend => BROWSER_MESSAGE_APPEND_METHOD,
             Self::ComposerSetReasoning => BROWSER_COMPOSER_SET_REASONING_METHOD,
@@ -1765,7 +1773,10 @@ impl BrowserOperation {
     fn is_mutation(self) -> bool {
         !matches!(
             self,
-            Self::SpaceInspect | Self::SessionInspect | Self::DispatchStatus
+            Self::SpaceInspect
+                | Self::SessionArchiveStatus
+                | Self::SessionInspect
+                | Self::DispatchStatus
         )
     }
 
@@ -1777,6 +1788,7 @@ impl BrowserOperation {
             Self::SessionCreate => "session.create",
             Self::SessionOpen => "session.open",
             Self::SessionArchive => "session.archive",
+            Self::SessionArchiveStatus => "session.inspect",
             Self::SessionInspect => "session.inspect",
             Self::MessageAppend => "message.append",
             Self::ComposerSetReasoning => "composer.set_reasoning",
@@ -1920,6 +1932,9 @@ fn browser_delivery_state_from_postcondition(
                 && evidence.canonical_url_observed
         }
         BrowserOperation::SessionArchive => {
+            evidence.stable_resource_ref_observed && evidence.lifecycle_observed
+        }
+        BrowserOperation::SessionArchiveStatus => {
             evidence.stable_resource_ref_observed && evidence.lifecycle_observed
         }
         BrowserOperation::MessageAppend => {
@@ -3187,6 +3202,44 @@ fn browser_source_route(
     })
 }
 
+fn browser_source_resolve(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    trusted_local_ipc: bool,
+) -> Value {
+    if !trusted_local_ipc {
+        return json!({"ok": false, "code": "trusted_local_ipc_required"});
+    }
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "browser_source_resolve_params_invalid"});
+    };
+    if object.len() != 1 || !object.contains_key("source_url") {
+        return json!({"ok": false, "code": "browser_source_resolve_params_invalid"});
+    }
+    let source_url = match browser_required_string(params, "source_url", 2048) {
+        Ok(value) => value,
+        Err(_) => return json!({"ok": false, "code": "browser_source_url_invalid"}),
+    };
+    let Ok(store) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    match browser_source_route(&store, source_url) {
+        Ok(route) => json!({
+            "ok": true,
+            "route": {
+                "session_ref": route.session_ref,
+                "provider": route.provider,
+                "endpoint_ref": route.endpoint_ref,
+                "account_ref": route.account_ref,
+                "space_ref": route.space_ref,
+                "display_label": route.display_label,
+                "expected_generation": route.expected_generation,
+            }
+        }),
+        Err(error) => browser_store_error(error),
+    }
+}
+
 fn browser_handoff_prepare(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -4287,6 +4340,135 @@ fn browser_operation_call_with_controls(
             operation,
             caller_webchat_control_grants,
         ),
+        BrowserOperation::SessionArchiveStatus => {
+            let expected_generation = params
+                .get("expected_generation")
+                .and_then(Value::as_i64)
+                .unwrap();
+            let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+            let mut actuation_params = params.clone();
+            {
+                let Ok(guard) = store.lock() else {
+                    return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+                };
+                let session = match guard.browser_resource(session_ref) {
+                    Ok(Some(resource)) if resource.kind == "session" => resource,
+                    Ok(Some(_)) => {
+                        return json!({"ok": false, "code": "browser_resource_kind_mismatch"});
+                    }
+                    Ok(None) => {
+                        return json!({"ok": false, "code": "browser_resource_not_found"});
+                    }
+                    Err(error) => return browser_store_error(error),
+                };
+                if session.provider != "chatgpt" {
+                    return json!({
+                        "ok": false,
+                        "code": "unsupported",
+                        "operation": operation.method(),
+                    });
+                }
+                if session.observation_generation != expected_generation {
+                    return json!({"ok": false, "code": "stale_capability_generation"});
+                }
+                let decision = match browser_resource_actuation_decision(
+                    &guard,
+                    operation.capability_operation(),
+                    &session,
+                    caller_webchat_control_grants,
+                    Some(expected_generation),
+                ) {
+                    Ok(decision) => decision,
+                    Err(error) => return browser_store_error(error),
+                };
+                match decision {
+                    (true, None) => {}
+                    (false, Some(reason)) => {
+                        return json!({
+                            "ok": false,
+                            "code": reason,
+                            "actuation_available": false,
+                        });
+                    }
+                    _ => {
+                        return json!({
+                            "ok": false,
+                            "code": "capability_unknown",
+                            "actuation_available": false,
+                        });
+                    }
+                }
+                if let Some(object) = actuation_params.as_object_mut() {
+                    object.insert("provider".to_owned(), json!(session.provider));
+                    match guard.browser_resource_locator(session_ref) {
+                        Ok(Some(locator))
+                            if locator.observation_generation == expected_generation =>
+                        {
+                            object.insert("canonical_url".to_owned(), json!(locator.canonical_url));
+                        }
+                        Ok(Some(_)) => {
+                            return json!({"ok": false, "code": "stale_capability_generation"});
+                        }
+                        Ok(None) => {}
+                        Err(error) => return browser_store_error(error),
+                    }
+                }
+            }
+            let evidence = match browser_actuator {
+                Some(actuator) => {
+                    match actuator.actuate(
+                        operation.method(),
+                        &actuation_params,
+                        expected_generation,
+                        None,
+                    ) {
+                        Ok(evidence) => evidence,
+                        Err(error) => return browser_store_error(error),
+                    }
+                }
+                None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+            };
+            if evidence.observed_generation != expected_generation {
+                return json!({"ok": false, "code": "stale_capability_generation"});
+            }
+            let is_archived = evidence
+                .result
+                .as_ref()
+                .and_then(|result| result.get("is_archived"))
+                .and_then(Value::as_bool);
+            if evidence.browser_online
+                && evidence.resource_available
+                && !evidence.rejected
+                && evidence.stable_resource_ref_observed
+                && evidence.lifecycle_observed
+                && is_archived.is_some()
+            {
+                return json!({
+                    "ok": true,
+                    "operation": operation.method(),
+                    "session_ref": session_ref,
+                    "expected_generation": expected_generation,
+                    "archive_state": if is_archived == Some(true) { "archived" } else { "active" },
+                    "is_archived": is_archived,
+                    "read_only": true,
+                });
+            }
+            let reason = browser_evidence_machine_reason(&evidence)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "browser_archive_status_unknown".to_owned());
+            json!({
+                "ok": false,
+                "code": "archive_status_unknown",
+                "reason": reason,
+                "operation": operation.method(),
+                "session_ref": session_ref,
+                "expected_generation": expected_generation,
+                "archive_state": "unknown",
+                "is_archived": Value::Null,
+                "read_only": true,
+            })
+        }
         BrowserOperation::SessionCreate => browser_session_create(
             store,
             params,
@@ -4453,6 +4635,7 @@ fn validate_browser_operation_params(
         BrowserOperation::SessionArchive => {
             &["session_ref", "expected_generation", "idempotency_key"]
         }
+        BrowserOperation::SessionArchiveStatus => &["session_ref", "expected_generation"],
         BrowserOperation::SessionInspect => &["session_ref"],
         BrowserOperation::MessageAppend => &[
             "session_ref",
@@ -4547,6 +4730,10 @@ fn validate_browser_operation_params(
             browser_required_string(params, "session_ref", 96)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::SessionArchiveStatus => {
+            browser_required_string(params, "session_ref", 96)?;
+            browser_required_generation(params)?;
         }
         BrowserOperation::SessionInspect => {
             browser_required_string(params, "session_ref", 96)?;
@@ -4701,6 +4888,7 @@ fn browser_operation_actuation_decision(
             resource
         }
         BrowserOperation::SpaceInspect
+        | BrowserOperation::SessionArchiveStatus
         | BrowserOperation::SessionInspect
         | BrowserOperation::DispatchStatus => {
             return Err("browser_operation_not_mutating".to_owned());
@@ -4810,6 +4998,7 @@ fn browser_operation_mutation_scope(
             browser_operation_resource(store, &dispatch.target_session_ref, "session")?
         }
         BrowserOperation::SpaceInspect
+        | BrowserOperation::SessionArchiveStatus
         | BrowserOperation::SessionInspect
         | BrowserOperation::DispatchStatus => {
             return Err("browser_operation_not_mutating".to_owned());
@@ -9577,6 +9766,105 @@ mod tests {
         );
         assert_eq!(archived["ok"], true);
         assert_eq!(archived["delivery_state"], "applied");
+
+        struct SessionArchiveStatusActuator {
+            expected_session_ref: String,
+            archived: Option<bool>,
+        }
+        impl BrowserActuator for SessionArchiveStatusActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, "herdr_mcp.browser_session.archive_status");
+                assert_eq!(expected_generation, 7);
+                assert!(dispatch_id.is_none());
+                assert_eq!(params["session_ref"], self.expected_session_ref);
+                assert!(params.get("idempotency_key").is_none());
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: self.archived.is_some(),
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: Some(match self.archived {
+                        Some(is_archived) => json!({"is_archived": is_archived}),
+                        None => json!({"error": "browser_archive_status_readback_unavailable"}),
+                    }),
+                })
+            }
+        }
+
+        for (provider_state, expected_state) in [(Some(true), "archived"), (Some(false), "active")]
+        {
+            let status = browser_operation_call_with_grant(
+                &store,
+                "herdr_mcp.browser_session.archive_status",
+                &json!({
+                    "session_ref": session_ref,
+                    "expected_generation": 7,
+                }),
+                true,
+                Some(&SessionArchiveStatusActuator {
+                    expected_session_ref: session_ref.clone(),
+                    archived: provider_state,
+                }),
+            );
+            assert_eq!(status["ok"], true);
+            assert_eq!(status["archive_state"], expected_state);
+            assert_eq!(status["is_archived"], provider_state.unwrap());
+            assert_eq!(status["read_only"], true);
+        }
+
+        let unknown = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.archive_status",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 7,
+            }),
+            true,
+            Some(&SessionArchiveStatusActuator {
+                expected_session_ref: session_ref.clone(),
+                archived: None,
+            }),
+        );
+        assert_eq!(unknown["ok"], false);
+        assert_eq!(unknown["code"], "archive_status_unknown");
+        assert_eq!(
+            unknown["reason"],
+            "browser_archive_status_readback_unavailable"
+        );
+        assert_eq!(unknown["archive_state"], "unknown");
+
+        let ungranted = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.archive_status",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 7,
+            }),
+            false,
+            Some(&SessionArchiveStatusActuator {
+                expected_session_ref: session_ref.clone(),
+                archived: Some(true),
+            }),
+        );
+        assert_eq!(ungranted["ok"], false);
+        assert_eq!(ungranted["code"], "caller_grant_missing");
     }
 
     #[test]
@@ -10193,6 +10481,176 @@ mod tests {
     fn browser_session_create_reconciliation_stays_within_request_headroom() {
         let intervals = BROWSER_SESSION_CREATE_RECONCILE_ATTEMPTS.saturating_sub(1) as u64;
         assert!(intervals * BROWSER_SESSION_CREATE_PRODUCTION_RECONCILE_INTERVAL_MS <= 5_000);
+    }
+
+    #[test]
+    fn user_source_route_resolve_is_local_only_latest_and_fail_closed_on_tie() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        const URL: &str =
+            "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/c/source-conv";
+        fn observe(
+            store: &mut StateStore,
+            seed: &str,
+            account_identity: &str,
+            session_identity: &str,
+            observed_at: i64,
+        ) -> (String, String) {
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: seed,
+                    browser_family: "chrome",
+                    extension_version: "0.1.101",
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: observed_at,
+                    capabilities_json: r#"{"operations":["session.create"]}"#,
+                    observed_at,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: account_identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: session_identity,
+                    display_label: None,
+                    observation_generation: observed_at,
+                    observed_at,
+                })
+                .unwrap();
+            store
+                .upsert_browser_resource_locator(
+                    &session.resource_ref,
+                    URL,
+                    observed_at,
+                    observed_at,
+                )
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_a, account_a) = {
+            let mut guard = store.lock().unwrap();
+            observe(
+                &mut guard,
+                "source-grant-profile-seed-a-0123456789",
+                "account-a",
+                "session-a",
+                100,
+            )
+        };
+        assert_eq!(
+            browser_source_resolve(&store, &json!({"source_url": URL}), false)["code"],
+            "trusted_local_ipc_required"
+        );
+        let (endpoint_b, account_b) = {
+            let mut guard = store.lock().unwrap();
+            observe(
+                &mut guard,
+                "source-grant-profile-seed-b-0123456789",
+                "account-b",
+                "session-b",
+                200,
+            )
+        };
+        let resolved = browser_source_resolve(&store, &json!({"source_url": URL}), true);
+        assert_eq!(resolved["ok"], true);
+        assert_eq!(resolved["route"]["endpoint_ref"], endpoint_b);
+        assert_eq!(resolved["route"]["account_ref"], account_b);
+        assert_ne!(resolved["route"]["endpoint_ref"], endpoint_a);
+        assert_ne!(resolved["route"]["account_ref"], account_a);
+        {
+            let mut guard = store.lock().unwrap();
+            guard
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint_b,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 201,
+                })
+                .unwrap();
+        }
+        let account_b_resource = store
+            .lock()
+            .unwrap()
+            .browser_resource(&account_b)
+            .unwrap()
+            .unwrap();
+        let stale_a_grant = [BrowserCallerGrant {
+            endpoint_ref: endpoint_a.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: account_a.clone(),
+        }];
+        assert_eq!(
+            browser_resource_actuation_decision(
+                &store.lock().unwrap(),
+                "session.create",
+                &account_b_resource,
+                &stale_a_grant,
+                Some(200),
+            )
+            .unwrap(),
+            (false, Some("caller_grant_missing"))
+        );
+        let exact_b_grant = [BrowserCallerGrant {
+            endpoint_ref: endpoint_b.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: account_b.clone(),
+        }];
+        assert_eq!(
+            browser_resource_actuation_decision(
+                &store.lock().unwrap(),
+                "session.create",
+                &account_b_resource,
+                &exact_b_grant,
+                Some(200),
+            )
+            .unwrap(),
+            (true, None)
+        );
+
+        {
+            let mut guard = store.lock().unwrap();
+            observe(
+                &mut guard,
+                "source-grant-profile-seed-tie-0123456789",
+                "account-tie",
+                "session-tie",
+                200,
+            );
+        }
+        assert_eq!(
+            browser_source_resolve(&store, &json!({"source_url": URL}), true)["code"],
+            "browser_canonical_url_ambiguous"
+        );
     }
 
     #[test]

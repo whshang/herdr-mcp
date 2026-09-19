@@ -26,6 +26,11 @@ import {
   CONTINUITY_JOURNAL_STORAGE_KEY, turnFingerprint,
 } from "./continuity-journal.js";
 import {
+  classifyCheckpointPutError, createBoundedSupervisorAdapter, deriveGoalLedger,
+  goalLedgerFromCheckpoint, mergeGoalCheckpoint, normalizeGoalLedger,
+  planTransportRecovery, resolveAuthoritativeWorkMemoryLocator, supervise,
+} from "./goal-supervisor-core.js";
+import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
 } from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
@@ -3183,28 +3188,28 @@ async function resolveBrowserCreateAnchorWindow({
     }
     if (!target) {
       const recovered = await recoverBrowserSessionTarget(sourceSessionRef, expectedGeneration);
-      if (recovered.ambiguous || !recovered.target) {
-        return { windowId: null, unavailable: true, reason: "source_session_unavailable" };
+      if (!recovered.ambiguous && recovered.target) {
+        target = recovered.target;
       }
-      target = recovered.target;
-      try {
-        const candidate = await chrome.tabs.get(target.tabId);
-        if (!target.conversationId
-            || !String(candidate?.url || "").includes(`/c/${target.conversationId}`)) {
-          return { windowId: null, unavailable: true, reason: "source_session_route_mismatch" };
+      if (target) {
+        try {
+          const candidate = await chrome.tabs.get(target.tabId);
+          if (!target.conversationId
+              || !String(candidate?.url || "").includes(`/c/${target.conversationId}`)) {
+            return { windowId: null, unavailable: true, reason: "source_session_route_mismatch" };
+          }
+          sourceTab = candidate;
+        } catch (_) {
+          target = null;
         }
-        sourceTab = candidate;
-      } catch (_) {
-        return { windowId: null, unavailable: true, reason: "source_session_tab_unavailable" };
       }
     }
-    if (target.provider !== provider || target.observationGeneration !== expectedGeneration) {
+    if (target && (target.provider !== provider || target.observationGeneration !== expectedGeneration)) {
       return { windowId: null, unavailable: true, reason: "source_session_scope_mismatch" };
     }
-    if (Number.isInteger(sourceTab?.windowId)) {
+    if (target && Number.isInteger(sourceTab?.windowId)) {
       return { windowId: sourceTab.windowId, unavailable: false, reason: "source_session" };
     }
-    return { windowId: null, unavailable: true, reason: "source_session_tab_unavailable" };
   }
 
   const matchingWindowIds = new Set();
@@ -3221,13 +3226,28 @@ async function resolveBrowserCreateAnchorWindow({
       if (Number.isInteger(anchorTab?.windowId)) matchingWindowIds.add(anchorTab.windowId);
     } catch (_) {}
   }
-  if (matchingWindowIds.size > 1) {
-    return { windowId: null, unavailable: true, reason: "ambiguous_scope_windows" };
+  if (matchingWindowIds.size > 0) {
+    // A create never mutates an existing worker tab: the exact authorized
+    // account/Project/generation scope only selects which Chrome window hosts
+    // the fresh tab created below. Multiple windows with the same exact scope
+    // therefore do not create an authority ambiguity. Pick deterministically,
+    // then verify the fresh tab publishes that same scope before delivery.
+    const windowId = [...matchingWindowIds].sort((left, right) => left - right)[0];
+    return {
+      windowId,
+      unavailable: false,
+      reason: sourceSessionRef
+        ? "source_scope_window"
+        : (matchingWindowIds.size === 1 ? "unique_scope_window" : "exact_scope_window"),
+    };
+  }
+  if (sourceSessionRef) {
+    return { windowId: null, unavailable: true, reason: "source_session_unavailable" };
   }
   return {
-    windowId: matchingWindowIds.size === 1 ? [...matchingWindowIds][0] : null,
+    windowId: null,
     unavailable: false,
-    reason: matchingWindowIds.size === 1 ? "unique_scope_window" : "no_scope_window",
+    reason: "no_scope_window",
   };
 }
 
@@ -3605,6 +3625,16 @@ async function handleBrowserActuation(command) {
     return;
   }
   const sessionRef = String(params.session_ref || "");
+  let temporaryArchiveStatusTabId = null;
+  const closeTemporaryArchiveStatusTab = async () => {
+    if (!temporaryArchiveStatusTabId) return;
+    const cached = browserSessionTargets.get(sessionRef);
+    if (cached?.tabId === temporaryArchiveStatusTabId) {
+      browserSessionTargets.delete(sessionRef);
+    }
+    try { await chrome.tabs.remove(temporaryArchiveStatusTabId); } catch (_) {}
+    temporaryArchiveStatusTabId = null;
+  };
   let target = browserSessionTargets.get(sessionRef) || null;
   if (target) {
     let cachedTab = null;
@@ -3634,7 +3664,10 @@ async function handleBrowserActuation(command) {
       );
       return;
     }
-    if (!target && operation === "herdr_mcp.browser_session.archive") {
+    if (!target && (
+      operation === "herdr_mcp.browser_session.archive"
+      || operation === "herdr_mcp.browser_session.archive_status"
+    )) {
       const providerArchive = String(params.provider || "");
       const canonicalUrl = String(params.canonical_url || "");
       const canonicalInfo = browserConversationInfo(providerArchive, canonicalUrl);
@@ -3657,9 +3690,15 @@ async function handleBrowserActuation(command) {
         if (!target) {
           let createdTab = null;
           try {
-            createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
+            createdTab = await chrome.tabs.create({
+              url: canonicalUrl,
+              active: operation !== "herdr_mcp.browser_session.archive_status",
+            });
           } catch (_) {}
           if (createdTab?.id) {
+            if (operation === "herdr_mcp.browser_session.archive_status") {
+              temporaryArchiveStatusTabId = createdTab.id;
+            }
             const deadline = Date.now() + 8000;
             do {
               target = browserSessionTargets.get(sessionRef) || null;
@@ -3672,6 +3711,7 @@ async function handleBrowserActuation(command) {
       }
     }
     if (!target) {
+      await closeTemporaryArchiveStatusTab();
       await postBrowserActuationEvidence(
         actuationId,
         unavailableBrowserActuationEvidence(
@@ -3685,6 +3725,7 @@ async function handleBrowserActuation(command) {
   }
   if (target.observationGeneration !== expectedGeneration) {
     browserSessionTargets.delete(sessionRef);
+    await closeTemporaryArchiveStatusTab();
     await postBrowserActuationEvidence(
       actuationId,
       unavailableBrowserActuationEvidence(
@@ -3701,6 +3742,7 @@ async function handleBrowserActuation(command) {
   const live = browserConversationInfo(targetProvider, tab?.url || "");
   if (!tab || live?.conversation_id !== target.conversationId || live?.convKey !== target.convKey) {
     browserSessionTargets.delete(sessionRef);
+    await closeTemporaryArchiveStatusTab();
     await postBrowserActuationEvidence(
       actuationId,
       unavailableBrowserActuationEvidence(expectedGeneration, "browser_session_tab_identity_mismatch"),
@@ -3731,6 +3773,7 @@ async function handleBrowserActuation(command) {
           resource_available: true,
         };
     await postBrowserActuationEvidence(actuationId, evidence);
+    await closeTemporaryArchiveStatusTab();
     const archiveProjectId = live?.project_id || target.projectId || null;
     if (shouldCloseArchivedChatGptTab(operation, evidence, targetProvider, archiveProjectId)) {
       try {
@@ -3757,6 +3800,7 @@ async function handleBrowserActuation(command) {
       command_accepted: true,
       resource_available: true,
     }).catch(() => {});
+    await closeTemporaryArchiveStatusTab();
   }
 }
 
@@ -3890,9 +3934,36 @@ async function onPushSettled(storeKey, data) {
     data,
     scope,
   );
+  const priorAgentStatus = String(b.status || "unknown");
   b.status = d.status;
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
+
+  // Goal-aware WAIT_EXTERNAL wake-up: this is the existing meaningful agent
+  // transition, so a supervisor session waiting on the local agent is woken and
+  // may decide to continue. Only a real transition (prior != settled) is
+  // meaningful; repeated identical settles are deduplicated.
+  const settledAgent = data?.agent || "";
+  const prior = priorAgentStatus;
+  for (const storeKey of Object.keys(bindings)) {
+    const row = bindings[storeKey];
+    if (!row) continue;
+    const rawB = row.workingPaneMap ? row : row;
+    if (normalizeWorkspaceId(rawB) !== ws) continue;
+    // Agent-settle is the WAIT_EXTERNAL wake-up: only meaningful when this
+    // session already holds an authoritative Work Memory locator from the wait.
+    if (!supervisorCarry(bindingDeliveryConvKey(rawB) || storeKey)?.locator) continue;
+    const owned = await runGoalSupervisor(bindingDeliveryConvKey(rawB) || storeKey, {
+      type: "agent_settled",
+      status: String(d.status || ""),
+      previous_status: prior,
+      agent: settledAgent,
+      workspace: ws,
+    }, {
+      locator: supervisorCarry(bindingDeliveryConvKey(rawB) || storeKey)?.locator,
+    });
+    if (owned) callLog(`supervisor woken on agent settled ${ws} -> ${d.status}`);
+  }
 
   if (d.kind === "round") clearProgressTimer(storeKey);
   if (!d.wake) return;
@@ -3964,12 +4035,50 @@ const MANUAL_LLM_JUDGE_TIMEOUT_MS = 15000;
  * @param {string} assistantText
  * @param {object|null} [cfgOverride] — Options test may pass form values before Save.
  */
+/**
+ * One bounded OpenAI-compatible chat/completions call for Auto judgements and
+ * supervisor decisions. Reuses CFG's provider/model/key and the existing
+ * host-permission boundary — no provider, model or endpoint is hardcoded here.
+ * @param {Array<{role:string,content:string}>} messages
+ */
+async function llmJudgeChatOnce(messages, { timeoutMs = LLM_JUDGE_TIMEOUT_MS } = {}) {
+  if (!isLlmJudgeConfigured(CFG)) return { ok: false, reason: "not_configured" };
+  if (!await hasLlmHostPermission(CFG)) return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
+  const body = {
+    model: String(CFG.llmJudgeModel).trim(),
+    messages,
+    temperature: 0,
+    stream: false,
+    response_format: { type: "json_object" },
+  };
+  try {
+    const resp = await fetch(llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${String(CFG.llmJudgeApiKey).trim()}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || LLM_JUDGE_TIMEOUT_MS, 60000))),
+    });
+    if (!resp.ok) {
+      return { ok: false, reason: "http", status: resp.status, error: (await resp.text().catch(() => "")).slice(0, 200) };
+    }
+    const parsed = await resp.json();
+    const content = parsed?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" || !content.trim()) return { ok: false, reason: "bad_response" };
+    return { ok: true, content };
+  } catch (e) {
+    const name = e?.name || "";
+    if (name === "TimeoutError" || name === "AbortError") return { ok: false, reason: "timeout", error: e.message };
+    return { ok: false, reason: "network", error: e.message };
+  }
+}
+
 async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null, timeoutMs = LLM_JUDGE_TIMEOUT_MS) {
   const cfg = cfgOverride || CFG;
   if (!isLlmJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
-  if (!await hasLlmHostPermission(cfg)) {
-    return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
-  }
+  if (!await hasLlmHostPermission(cfg)) return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
   const url = llmJudgeCompletionsUrl(cfg.llmJudgeBaseUrl);
   const prompt = buildLlmJudgeUserMessage(cfg.llmJudgePromptTemplate, { userText, assistantText });
   const body = {
@@ -4004,6 +4113,13 @@ async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null, ti
     return { ok: false, reason: "network", error: e.message };
   }
 }
+
+/**
+ * Supervisor transport. It reuses the SAME configured provider/model/key and
+ * host-permission boundary as the existing Auto judge: no provider, model, key
+ * or endpoint is hardcoded here, and the payload is the bounded supervisor
+ * projection produced by goal-supervisor-core.js.
+ */
 
 async function fetchLlmJudge(
   userText,
@@ -4222,8 +4338,7 @@ function scheduleIdleNudgeRetry(convKey, delayMs) {
 }
 
 async function retryIdleNudge(convKey) {
-  if (!automationScopeForConversation(convKey).enabled) return;
-  const cooldownSec = paceIntervalSec();
+  if (!automationScopeForConversation(convKey).enabled) return;  const cooldownSec = paceIntervalSec();
   if (cooldownSec <= 0) return;
   const bindings = await loadBindings();
   const primary = primaryBindingForConv(bindings, convKey);
@@ -4255,6 +4370,468 @@ async function retryIdleNudge(convKey) {
   }
   callLog(`llm-judge retry firing: ${convKey}`);
   await maybeIdleNudge(payload);
+}
+
+// ---------------------------------------------------------------------------
+// Goal supervisor gateway (minimal wiring)
+//
+// Deterministic policy lives in goal-supervisor-core.js. This block only
+// projects live state, reuses the configured judge transport, and applies
+// guarded effects through the EXISTING wake and handoff paths.
+//
+// Work Chain / Continuity / Work Memory stay the only authorities: nothing here
+// is persisted, and the only state kept across boundaries is bounded in-memory
+// bookkeeping (retry budget, wait state) for at most SUPERVISOR_SESSION_MAX
+// conversations. The derived ledger is recomputed at every boundary.
+// ---------------------------------------------------------------------------
+
+const SUPERVISOR_SESSION_MAX = 24;
+const CONTEXT_PRESSURE_BY_CONV_KEY = "h2wContextPressureByConv";
+const supCarry = new Map(); // convKey -> { at, checkpointRevision, locator, ledger }
+
+function supervisorCarry(convKey) {
+  return supCarry.get(convKey) || null;
+}
+
+function rememberSupervisorCarry(convKey, entry) {
+  if (!convKey) return;
+  supCarry.set(convKey, { at: Date.now(), ...entry });
+  if (supCarry.size > SUPERVISOR_SESSION_MAX) {
+    const oldest = [...supCarry.entries()].sort((a, b) => a[1].at - b[1].at)
+      .slice(0, supCarry.size - SUPERVISOR_SESSION_MAX);
+    for (const [key] of oldest) supCarry.delete(key);
+  }
+}
+
+/** Call a private herdr_call method through the existing trusted bridge. */
+async function supervisorCallHerdr(method, params, timeoutMs = 15_000) {
+  const call = await jsonBridgeRpc("tools/call", {
+    name: "herdr_call",
+    arguments: { method, params: JSON.stringify(params) },
+  }, timeoutMs).catch((error) => ({ ok: false, error: error?.message || "herdr_call_failed" }));
+  if (!call?.ok) return { ok: false, error: call?.error || "herdr_call_failed" };
+  const content = Array.isArray(call.result?.content) ? call.result.content : [];
+  const text = content.filter((item) => item?.type === "text")
+    .map((item) => String(item.text || ""))
+    .join("");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: false, error: "herdr_call_bad_response" };
+  }
+}
+
+/**
+ * Authoritative Work Memory locator for a conversation. Uses the existing
+ * `continuity.search` exact-identity path: accept only a single candidate who
+ * is `unique_exact` AND whose continuity_id matches the binding AND whose
+ * work_memory locator is complete. Ambiguous or mismatched always fail closed.
+ */
+async function resolveAuthoritativeWorkMemory(binding, conversationId, projectId) {
+  const expectedContinuityId = String(binding?.continuity_id || "").trim();
+  if (!expectedContinuityId) return { ok: false, reason: "no_continuity_id" };
+  const params = { project_id: projectId || null, conversation_id: conversationId || null, limit: 2 };
+  try {
+    const out = await supervisorCallHerdr("continuity.search", params);
+    if (!out?.ok || out.resolution !== "unique_exact") {
+      return { ok: false, reason: out?.resolution === "none" ? "no_chain" : "not_unique" };
+    }
+    const candidate = Array.isArray(out.candidates) ? out.candidates[0] : null;
+    if (!candidate) return { ok: false, reason: "no_candidate" };
+    const resolved = resolveAuthoritativeWorkMemoryLocator(candidate, expectedContinuityId);
+    if (!resolved.ok) return resolved;
+    return { ok: true, locator: resolved.locator, continuity_id: resolved.continuity_id || expectedContinuityId };
+  } catch (error) {
+    return { ok: false, reason: "search_failed", error: error?.message || String(error) };
+  }
+}
+
+/**
+ * Authoritative checkpoint revision + goal ledger via work_memory.resume.
+ * Returns the current checkpoint and its revision so a later CAS put can use
+ * exactly that revision.
+ */
+async function authoritativeGoalAndRevision(locator) {
+  try {
+    const out = await supervisorCallHerdr("work_memory.resume", {
+      project_ref: locator.project_ref,
+      repo_id: locator.repo_id,
+      work_chain_id: locator.work_chain_id,
+      max_turns: 4,
+    });
+    if (!out?.ok) return { ok: false, reason: "resume_failed", error: out?.code || out?.reason || null };
+    const checkpoint = out.checkpoint && typeof out.checkpoint === "object" ? out.checkpoint : null;
+    let checkpointJson = null;
+    if (checkpoint?.checkpoint_json) {
+      try { checkpointJson = JSON.parse(checkpoint.checkpoint_json); } catch { checkpointJson = null; }
+    }
+    const ledger = goalLedgerFromCheckpoint(checkpointJson);
+    const revision = Number(out.checkpoint_revision ?? checkpoint?.revision ?? 0);
+    return {
+      ok: true,
+      checkpoint_revision: Number.isFinite(revision) && revision >= 0 ? revision : 0,
+      checkpoint_json: checkpointJson,
+      goal: ledger,
+      updated_at: Number(out.checkpoint?.created_at || 0) || null,
+      continuity_id: String(out.continuity_id || "").trim() || null,
+    };
+  } catch (error) {
+    return { ok: false, reason: "resume_failed", error: error?.message || String(error) };
+  }
+}
+
+/**
+ * CAS write-back of the goal section into the existing Work Memory checkpoint.
+ * Preserves every other checkpoint field (merge, not overwrite). `throughMessageId`
+ * is the real settled-turn assistant id already POSTed to /extension/continuity/turn;
+ * a missing/un-acked anchor is a fail-closed condition, never last-write-wins.
+ */
+async function persistGoalCheckpoint({
+  continuityId = null,
+  expectedRevision = 0,
+  summary = "goal_supervisor",
+  checkpointJson = null,
+  throughMessageId = null,
+  createdAt = Date.now(),
+} = {}) {
+  if (!continuityId) return { ok: false, reason: "no_continuity_id", classified: { kind: "other" } };
+  const params = {
+    continuity_id: continuityId,
+    expected_checkpoint_revision: expectedRevision,
+    summary: String(summary).slice(0, 8 * 1024),
+    checkpoint_json: JSON.stringify(checkpointJson || {}),
+    created_at: createdAt,
+  };
+  if (throughMessageId) params.through_message_id = String(throughMessageId).slice(0, 128);
+  try {
+    const out = await supervisorCallHerdr("work_memory.checkpoint.put", params);
+    if (out?.ok) {
+      return { ok: true, revision: Number(out.checkpoint?.revision ?? expectedRevision) };
+    }
+    return { ok: false, reason: out?.code || out?.error || "checkpoint_put_failed", classified: classifyCheckpointPutError(out?.code || out?.error || out?.reason) };
+  } catch (error) {
+    return { ok: false, reason: "checkpoint_put_failed", classified: { kind: "other", retry: false } };
+  }
+}
+
+/**
+ * Baseline ledger for a boundary. The authoritative Work Memory goal section
+ * (via a verified unique_exact locator + resume) wins when present; otherwise
+ * it is re-derived from the user's standing instruction on the current turn.
+ * Cross-boundary WAIT_EXTERNAL continuity comes ONLY from an authoritative
+ * resume — there is no in-memory surrogate for the ledger.
+ */
+function derivedSupervisorLedger(binding, { authoredTurns = [], assistantText = "", checkpoint = null, goal = null, now = Date.now() } = {}) {
+  if (goal) {
+    // Authoritative: restored from Work Memory resume; no re-derivation needed.
+    return normalizeGoalLedger({
+      ...goal,
+      continuity_id: binding?.continuity_id || goal.continuity_id,
+      work_chain_id: binding?.work_chain_id || goal.work_chain_id,
+      updated_at: now,
+    });
+  }
+  const declaredRemaining = assistantText && assistantDeclaresPendingWork(assistantText)
+    ? [{ id: "w1", title: localizedText("supervisor_declared_remaining", null, "work the WebChat said is still unfinished"), kind: "unknown" }]
+    : [];
+  return deriveGoalLedger({
+    continuityId: binding?.continuity_id || null,
+    workChainId: binding?.work_chain_id || null,
+    checkpoint,
+    authoredTurns,
+    declaredRemaining,
+    now,
+  });
+}
+
+/** Live state projection. Unbound or unknown always collapses to the conservative value. */
+async function supervisorRuntimeProjection(convKey, binding, extra = {}) {
+  const ws = normalizeWorkspaceId(binding) || "";
+  const agentStatus = String(binding?.status || "unknown");
+  const agentRunning = Object.keys(workingPaneMap(binding) || {}).length > 0 || agentStatus === "working";
+  let handoffActive = false;
+  try {
+    handoffActive = Boolean(activeTransferFromSource(await loadHandoffTransfers(), bindingDeliveryConvKey(binding) || convKey));
+  } catch (_) {
+    handoffActive = false;
+  }
+
+  let contextState = extra.context_state || null;
+  if (!contextState) {
+    contextState = "healthy";
+    try {
+      const stored = await chrome.storage.local.get([CONTEXT_PRESSURE_BY_CONV_KEY]);
+      const record = stored?.[CONTEXT_PRESSURE_BY_CONV_KEY]?.[convKey];
+      const pressure = globalThis?.H2W_CONTEXT_PRESSURE;
+      // The page owns the pressure estimator. Without it, fail closed to
+      // "healthy" so HANDOFF is never authorised without evidence.
+      if (record && pressure?.summarizeContextRecord) {
+        contextState = String(pressure.summarizeContextRecord(record)?.state || "healthy");
+      }
+    } catch (_) {
+      contextState = "healthy";
+    }
+  }
+
+  // Observed evidence only: an agent settlement seen on the Herdr push stream.
+  const observed = [];
+  const evidence = [];
+  if (ws && ["idle", "done", "blocked"].includes(agentStatus)) {
+    const at = Number(binding?.lastSettle?.at || binding?.lastSettle?.seq || 0);
+    const ref = `agent:${ws}:${agentStatus}:${at || "latest"}`;
+    observed.push(ref);
+    evidence.push({ kind: "herdr_agent", ref, summary: `Herdr agent observed status=${agentStatus} in ${ws}` });
+  }
+
+  return {
+    evidence,
+    runtime: {
+      agent_running: agentRunning,
+      agent_status: agentStatus,
+      external_owner: agentRunning ? `herdr_agent:${String(binding?.focus_agent || binding?.agent || ws || "local").slice(0, 40)}` : null,
+      generation_settled: extra.generation_settled !== false,
+      delivery_uncertain: extra.delivery_uncertain === true,
+      mutation_pending: extra.mutation_pending === true,
+      handoff_active: handoffActive,
+      handoff_capable: extra.handoff_capable !== false,
+      context_state: contextState,
+      provider_error: extra.provider_error || null,
+      browser_online: extra.browser_online !== false,
+      bound: Boolean(binding),
+      observed_evidence_refs: observed,
+    },
+  };
+}
+
+function applySupervisorOutcome(convKey, binding, result, assistantText = "") {
+  if (!result?.ok) {
+    // A denied or failed decision is reported, never executed.
+    const askHuman = result?.status !== "guard_denied" || result.safeDecision === "ASK_HUMAN";
+    clearIdleNudgeRetry(convKey);
+    setActionBadge(askHuman ? "?" : "!", askHuman ? "#dc2626" : "#d97706", 10000);
+    rememberIdleNudge(convKey, {
+      nudged: false,
+      reason: askHuman ? "supervisor_ask_human" : "supervisor_blocked",
+      cause: result?.reason || null,
+    });
+    return;
+  }
+
+  const effects = result.effects || {};
+  if (effects.complete) {
+    // Stop every continuing stimulus once the goal is finished.
+    clearIdleNudgeRetry(convKey);
+    clearProgressTimer(bindingStoreKeyFromBinding(binding));
+    setActionBadge("\u2713", "#16a34a", 8000);
+    rememberIdleNudge(convKey, { nudged: false, reason: "supervisor_complete", decision: result.decision });
+    return;
+  }
+  if (effects.wait_external || effects.ask_human || effects.reconcile?.required) {
+    // Waiting on the local side, on a human, or for reconciliation are all
+    // "do not send" states: cancel the continue retry.
+    clearIdleNudgeRetry(convKey);
+    setActionBadge(
+      effects.wait_external ? "\u23f3" : "!",
+      effects.wait_external ? "#2563eb" : "#dc2626",
+      effects.wait_external ? 0 : 10000,
+    );
+    rememberIdleNudge(convKey, {
+      nudged: false,
+      reason: effects.wait_external ? "supervisor_wait_external" : "supervisor_ask_human",
+      decision: result.decision,
+      owner: effects.wait_external?.owner || null,
+    });
+    return;
+  }
+  if (effects.handoff) {
+    // Continuity transfer stays owned by the canonical context-pressure path.
+    clearIdleNudgeRetry(convKey);
+    rememberIdleNudge(convKey, { nudged: false, reason: "supervisor_handoff", decision: result.decision });
+    if (binding?.tabId) {
+      void startHandoffForTab(binding.tabId, "context_pressure")
+        .catch((error) => callLog(`supervisor handoff failed: ${error?.message || error}`));
+    }
+    return;
+  }
+  if (effects.send) {
+    return routeWake(binding, {
+      status: result.decision === "ANSWER_DECISION" ? "supervisor_answer" : "supervisor_continue",
+      output: `supervisor ${result.decision}: ${String(result.reason || "").slice(0, 160)}`,
+      working_count: 0,
+      pane: binding.pane,
+      agent: binding.agent,
+    }, effects.send.text).then((wakeResult) => {
+      if (!wakeResult?.ok) {
+        rememberIdleNudge(convKey, {
+          nudged: false,
+          reason: "wake_failed",
+          cause: wakeResult?.error || wakeResult?.reason || "submit-failed",
+          send: effects.send.text,
+        });
+        return;
+      }
+      // The supervisor already decided this turn: the same assistant body must
+      // not be judged again by the legacy path.
+      if (assistantText) lastJudgedAssistantFp.set(convKey, assistantNudgeFingerprint(assistantText));
+      lastIdleNudgeAt.set(convKey, Date.now());
+      setActionBadge("\u2192", "#16a34a", 6000);
+      rememberIdleNudge(convKey, {
+        nudged: true,
+        reason: result.decision === "ANSWER_DECISION" ? "supervisor_answer" : "supervisor_continue",
+        decision: result.decision,
+        send: effects.send.text,
+      });
+    });
+  }
+  rememberIdleNudge(convKey, { nudged: false, reason: "supervisor_blocked", decision: result.decision });
+  return undefined;
+}
+
+/**
+ * One supervisor decision. `owned:false` means the caller keeps the existing
+ * Auto path unchanged; `owned:true` means the supervisor produced this
+ * boundary's outcome, so the legacy judge/fallback must not also act on it.
+ */
+async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
+  if (!convKey) return { owned: false, status: "no_conv" };
+  if (!automationScopeForConversation(convKey).enabled) return { owned: false, status: "disabled" };
+  if (!isLlmJudgeConfigured(CFG)) return { owned: false, status: "llm_not_configured" };
+
+  const bindings = await loadBindings();
+  const primary = primaryBindingForConv(bindings, convKey);
+  if (!primary) return { owned: false, status: "unbound" };
+
+  const turn = options.turn || {};
+  const authoredTurns = [];
+  const userText = String(turn.userText || "").trim();
+  if (userText && !isIdleNudgeText(userText)) authoredTurns.push({ role: "user", text: userText });
+  if (turn.assistantText) authoredTurns.push({ role: "assistant", text: turn.assistantText });
+
+  // Authoritative Work Memory locator via existing continuity.search. Only a
+  // unique_exact candidate whose continuity_id matches the binding and whose
+  // locator is complete is accepted; anything else fails closed to a current-
+  // boundary derived ledger (no cross-boundary goal recovery). A locator already
+  // carried on this convKey (e.g. set during a WAIT_EXTERNAL turn) is reused so
+  // an agent-settle reentry can resume the same goal without re-searching.
+  const carry = supervisorCarry(convKey);
+  const locatorHint = options.locator || carry?.locator || null;
+  const search = locatorHint
+    ? { ok: true, locator: locatorHint, continuity_id: primary?.continuity_id || null }
+    : await resolveAuthoritativeWorkMemory(
+      primary,
+      String(turn.conversationId || "").trim(),
+      String(turn.projectId || "").trim(),
+    );
+  let authoritative = null;
+  if (search.ok) {
+    // Keep the locator keyed by convKey on this session so an agent-settle
+    // reentry can resume the same goal without re-searching.
+    rememberSupervisorCarry(convKey, { locator: search.locator, continuity_id: search.continuity_id });
+    authoritative = await authoritativeGoalAndRevision(search.locator);
+  }
+
+  const ledger = derivedSupervisorLedger(primary, {
+    authoredTurns,
+    assistantText: String(turn.assistantText || ""),
+    checkpoint: turn.checkpoint || null,
+    goal: authoritative?.goal || null,
+  });
+  if (!ledger.objective) return { owned: false, status: "no_goal", locator: search.ok ? "derived" : search.reason };
+
+  // Real, deterministic Rust-known anchor for the settled assistant turn, derived
+  // exactly as journalAppendContinuityTurn does so the id already exists (or will
+  // exist) in continuity_turns. Without a valid anchor, checkpoint.put fails
+  // closed and never overwrites.
+  const assistantText0 = String(turn.assistantText || "").trim();
+  const assistantMessageId = String(turn.assistantMessageId || "").trim()
+    || (assistantText0
+      ? `jt:${turnFingerprint({
+        convKey,
+        startedAt: turn.startedAt,
+        userText: "",
+        assistantText: assistantText0,
+      }).slice(0, 16)}`
+      : "");
+
+  const projection = await supervisorRuntimeProjection(convKey, primary, options.runtime || {});
+  const adapter = createBoundedSupervisorAdapter({
+    isConfigured: () => isLlmJudgeConfigured(CFG),
+    request: (payload) => llmJudgeChatOnce([
+      { role: "system", content: payload.system },
+      { role: "user", content: payload.user },
+    ], { timeoutMs: payload.timeoutMs }),
+  });
+
+  const result = await supervise({
+    ledger,
+    boundaryEvent,
+    authoredTurns,
+    evidence: projection.evidence,
+    runtime: projection.runtime,
+    adapter,
+    now: Date.now(),
+    carry: supervisorCarry(convKey),
+  });
+
+  // Persist the goal section back into the authoritative Work Memory
+  // checkpoint with the exact revision resume returned (CAS). Preserve every
+  // other checkpoint field. Only write once a real assistant turn anchor has
+  // been acknowledged by Rust through the ordinary continuity path.
+  if (result.ok && (result.ledger?.objective || result.ledger?.todos?.length)) {
+    const continuityId = authoritative?.continuity_id || ledger.continuity_id || primary?.continuity_id || null;
+    if (authoritative && ((assistantMessageId && continuityId) || (authoritative?.checkpoint_revision || 0) > 0)) {
+      const merged = mergeGoalCheckpoint(authoritative?.checkpoint_json || turn.checkpoint || null, result.ledger);
+      const write = await persistGoalCheckpoint({
+        continuityId,
+        expectedRevision: authoritative?.checkpoint_revision || 0,
+        summary: `goal_supervisor ${result.decision}`,
+        checkpointJson: merged,
+        throughMessageId: assistantMessageId || null,
+      });
+      if (write.ok) {
+        rememberSupervisorCarry(convKey, { locator: search.locator, checkpointRevision: write.revision });
+      } else if (write.classified?.kind === "revision_conflict") {
+        // Re-resume for the authoritative latest revision and reconcile rather
+        // than overwriting (never last-write-wins).
+        if (search.ok) {
+          const fresh = await authoritativeGoalAndRevision(search.locator);
+          if (fresh.ok) rememberSupervisorCarry(convKey, { locator: search.locator, checkpointRevision: fresh.checkpoint_revision });
+        }
+      } else if (write.classified?.kind === "turn_missing" || write.classified?.kind === "evidence_missing") {
+        // The anchor is not yet acked by Rust; fail closed, reconcile on a later boundary.
+        callLog(`supervisor checkpoint anchored to an unacked turn ${continuityId}: ${write.reason}`);
+      }
+    }
+  }
+
+  if (result.status === "provider_failed") {
+    // A judgement-service failure is bounded recovery, routed through the same
+    // guard: no message, no blind replay, budget honoured.
+    const planned = planTransportRecovery({
+      ledger: result.ledger,
+      runtime: projection.runtime,
+      reason: result.reason,
+      boundary: boundaryEvent?.type || "provider_error",
+      now: Date.now(),
+    });
+    clearIdleNudgeRetry(convKey);
+    rememberIdleNudge(convKey, {
+      nudged: false,
+      reason: planned.allowed ? "supervisor_recover" : "supervisor_ask_human",
+      cause: result.reason,
+    });
+    return { owned: true, status: result.status, planned };
+  }
+
+  await applySupervisorOutcome(convKey, primary, result, String(turn.assistantText || ""));
+  return {
+    owned: true,
+    status: result.status,
+    decision: result.decision || null,
+    result,
+    locator: search.ok && search.locator ? "verified_work_memory" : null,
+    restarted_authoritative: search.ok && Boolean(authoritative?.goal),
+  };
 }
 
 /** Post-turn nudge: LLM judge plus strong assistant self-declared pending work. */
@@ -4375,6 +4952,41 @@ async function maybeIdleNudgeInner(msg) {
   }
 
   clearIdleNudgeRetry(convKey);
+
+  // Goal-aware supervisor: when a derived goal (or goal section in the Work
+  // Memory checkpoint) is available for this conversation, the supervisor owns
+  // the settled-boundary decision. It returns owned:true on every outcome
+  // (decide, guard-deny, or transport recovery), so the legacy judge/fallback
+  // below must never also act on this same turn. When there is no goal, the
+  // supervisor is not configured, or the conversation is not bound, the legacy
+  // path is preserved unchanged.
+  const supervisor = await runGoalSupervisor(convKey, { type: "turn_settled" }, {
+    turn: {
+      userText,
+      assistantText,
+      startedAt: msg.startedAt,
+      conversationId: msg.conversation_id,
+      projectId: msg.project_id,
+    },
+  });
+  if (supervisor.owned) {
+    return rememberIdleNudge(convKey, {
+      nudged: supervisor.status !== "decided" ? false : Boolean(supervisor.result?.effects?.send),
+      reason: supervisor.status === "decided"
+        ? ({
+          CONTINUE: "supervisor_continue", WAIT_EXTERNAL: "supervisor_wait_external",
+          ANSWER_DECISION: "supervisor_answer", RECOVER: "supervisor_recover",
+          HANDOFF: "supervisor_handoff", COMPLETE: "supervisor_complete", ASK_HUMAN: "supervisor_ask_human",
+        }[supervisor.decision] || "supervisor_blocked")
+        : supervisor.result?.effects?.ask_human
+          ? "supervisor_ask_human"
+          : supervisor.result?.planned?.allowed
+            ? "supervisor_recover"
+            : "supervisor_blocked",
+      cause: !supervisor.result?.effects ? supervisor.result?.reason || supervisor.result?.status || null : null,
+      decision: supervisor.decision || null,
+    });
+  }
 
   if (!isLlmJudgeConfigured(CFG)) {
     return autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs);
@@ -4585,7 +5197,7 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
   if (activeTransferFromSource(handoffs, bindingDeliveryConvKey(b) || b?.convKey || "")) {
     return { ok: false, reason: "handoff_active" };
   }
-  const isLlmNudge = ["llm_continue_nudge", "auto_continue_fallback_nudge"].includes(extra.status);
+  const isLlmNudge = ["llm_continue_nudge", "auto_continue_fallback_nudge", "supervisor_continue", "supervisor_answer"].includes(extra.status);
   const rawText = String(template || "").trim();
 
   if (isLlmNudge) {
