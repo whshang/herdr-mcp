@@ -461,6 +461,7 @@
   "hint_experimental_grok": "既定はオフです。grok.com の権限だけを要求し、Grok HUD、継続性、ブラウザ dispatch adapter を有効にします。変更後は開いている Grok タブを再読み込みしてください。",  "open_github_setup_guide": "Herdr の GitHub セットアップガイドを開く",
   "host_permission_denied": "サイトアクセスが許可されていません。Herdr は明示的に有効化したサイトまたはエンドポイントだけを要求します。",
   "host_permission_invalid_url": "設定するエンドポイントは http:// または https:// を使用してください。",
+  "api_base_url_duplicate_slash": "エンドポイントのパスに重複したスラッシュがあります。保存前に {suggestion} に修正してください。",
   "hud_reason_llm_permission": "LLM サイトアクセス未許可",
   "hud_reason_fallback_continue": "Auto フォールバックで Continue を送信しました",
   "hud_reason_fallback_complete": "有界 Continue の後に Auto フォールバックを停止しました"

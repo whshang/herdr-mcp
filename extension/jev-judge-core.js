@@ -1,26 +1,9 @@
-// Jev auxiliary judge — pure request/response and composition helpers.
-// Keep provider transport in background.js; this file owns only typed policy.
+// Jev semantic gate — pure request/response helpers.
+// Provider transport lives in background.js. Users configure only endpoint/model/key.
 
-export const JEV_JUDGE_MODE_OFF = "off";
-export const JEV_JUDGE_MODE_SHADOW = "shadow";
-export const JEV_JUDGE_MODE_ASSIST = "assist";
-export const JEV_JUDGE_MODE_AUTO = "auto";
 export const DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai/v1";
 export const DEFAULT_JEV_MODEL = "jev-latest";
 export const DEFAULT_JEV_THRESHOLD = 0.70;
-
-const VALID_MODES = new Set([
-  JEV_JUDGE_MODE_OFF,
-  JEV_JUDGE_MODE_SHADOW,
-  JEV_JUDGE_MODE_ASSIST,
-  JEV_JUDGE_MODE_AUTO,
-]);
-
-export function normalizeJevJudgeMode(value) {
-  return VALID_MODES.has(String(value || "").trim())
-    ? String(value).trim()
-    : JEV_JUDGE_MODE_OFF;
-}
 
 export function normalizeJevJudgeThreshold(value) {
   const n = Number(value);
@@ -29,8 +12,7 @@ export function normalizeJevJudgeThreshold(value) {
 }
 
 export function isJevJudgeConfigured(cfg) {
-  return normalizeJevJudgeMode(cfg?.jevJudgeMode) !== JEV_JUDGE_MODE_OFF
-    && Boolean(String(cfg?.jevJudgeBaseUrl || "").trim())
+  return Boolean(String(cfg?.jevJudgeBaseUrl || "").trim())
     && Boolean(String(cfg?.jevJudgeApiKey || "").trim())
     && Boolean(String(cfg?.jevJudgeModel || "").trim());
 }
@@ -89,42 +71,11 @@ export function interpretJevPendingWorkAnswer(payload, threshold = DEFAULT_JEV_T
   };
 }
 
-export function jevAgreementWithLlm(verdict, jev) {
-  if (!jev?.ok || jev.signal === "uncertain") return "unresolved";
-  if (verdict?.cont) return jev.signal === "continue" ? "agree_continue" : "disagree_llm_continue";
-  if (verdict?.done) return jev.signal === "done" ? "agree_done" : "disagree_llm_done";
-  return "llm_ambiguous";
-}
-
-export function decideJevAutoPolicy(jev, explicitPending = false) {
+export function decideJevAutoPolicy(jev) {
   if (jev?.ok) {
     if (jev.signal === "continue") return { action: "continue", reason: "jev_continue" };
     if (jev.signal === "done") return { action: "stop", reason: "jev_done" };
-    return { action: "stop", reason: "jev_uncertain" };
+    return { action: "fallback", reason: "jev_uncertain" };
   }
-  if (explicitPending) {
-    return { action: "continue", reason: "jev_explicit_pending_fallback" };
-  }
-  return { action: "stop", reason: "jev_unavailable" };
-}
-
-export function assistLlmVerdictWithJev(verdict, jev, continueText) {
-  const base = {
-    done: Boolean(verdict?.done),
-    cont: Boolean(verdict?.cont),
-    nudgeText: String(verdict?.nudgeText || ""),
-    raw: String(verdict?.raw || ""),
-  };
-  if (!jev?.ok || jev.signal !== "continue" || base.cont) {
-    return { verdict: base, assisted: false };
-  }
-  return {
-    assisted: true,
-    verdict: {
-      done: false,
-      cont: true,
-      nudgeText: String(continueText || "").trim(),
-      raw: `${base.raw} [jev_assist p=${Number(jev.probability).toFixed(3)}]`.trim(),
-    },
-  };
+  return { action: "fallback", reason: "jev_unavailable" };
 }

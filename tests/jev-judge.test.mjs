@@ -3,80 +3,52 @@ import assert from "node:assert/strict";
 
 import {
   DEFAULT_JEV_THRESHOLD,
-  JEV_JUDGE_MODE_ASSIST,
-  JEV_JUDGE_MODE_AUTO,
-  assistLlmVerdictWithJev,
   buildJevPendingWorkRequest,
   decideJevAutoPolicy,
   interpretJevPendingWorkAnswer,
-  jevAgreementWithLlm,
+  isJevJudgeConfigured,
   jevSystemOneUrl,
-  normalizeJevJudgeMode,
-  normalizeJevJudgeThreshold,
 } from "../extension/jev-judge-core.js";
+import {
+  llmJudgeCompletionsUrl,
+  validateApiBaseUrl,
+} from "../extension/binding-core.js";
 
-test("user gets a narrow Jev pending-work question | Given a settled user and assistant turn | When the auxiliary request is built | Then only bounded task state and one Noul judgment are sent", () => {
+test("user gets one narrow Jev question | Given a settled turn | When the semantic gate request is built | Then only bounded user and assistant state are sent", () => {
   const request = buildJevPendingWorkRequest(
     "Please finish the implementation and verify it.",
     "Implementation is done. Next: I will run the production verification.",
-    "jev-latest",
   );
   assert.equal(request.model, "jev-latest");
   assert.deepEqual(Object.keys(request.questions), ["has_unfinished_work"]);
   assert.equal(request.questions.has_unfinished_work.type, "noul");
   assert.match(request.questions.has_unfinished_work.instructions, /assistant itself can continue/i);
   assert.match(request.questions.has_unfinished_work.criteria.false, /requires a user\/external decision/i);
-  assert.equal(request.state.user_request, "Please finish the implementation and verify it.");
 });
 
-test("user gets calibrated Jev signals | Given high yes, high no, and middle probabilities | When the response is interpreted | Then continue, done, and uncertain stay distinct", () => {
+test("user gets the calibrated fixed Jev boundary | Given continue done and middle probabilities | When Jev is interpreted | Then 0.70 separates continue done and fallback", () => {
   const answer = (noul) => ({ model: "jev-latest", answers: { has_unfinished_work: { type: "noul", noul } } });
-  assert.equal(interpretJevPendingWorkAnswer(answer(0.91), 0.8).signal, "continue");
-  assert.equal(interpretJevPendingWorkAnswer(answer(0.09), 0.8).signal, "done");
-  assert.equal(interpretJevPendingWorkAnswer(answer(0.55), 0.8).signal, "uncertain");
-  assert.equal(interpretJevPendingWorkAnswer(answer(2), 0.8).ok, false);
+  assert.equal(DEFAULT_JEV_THRESHOLD, 0.70);
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.70)).signal, "continue");
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.30)).signal, "done");
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.55)).signal, "uncertain");
+  assert.equal(interpretJevPendingWorkAnswer(answer(2)).ok, false);
 });
 
-test("user keeps the existing LLM continuation | Given the LLM already says continue and Jev disagrees | When assist mode composes the judgments | Then Jev cannot suppress the existing continue", () => {
-  const result = assistLlmVerdictWithJev(
-    { done: false, cont: true, nudgeText: "Continue.", raw: "Continue." },
-    { ok: true, signal: "done", probability: 0.05 },
-    "Continue with unfinished work.",
-  );
-  assert.equal(result.assisted, false);
-  assert.equal(result.verdict.cont, true);
-  assert.equal(jevAgreementWithLlm(result.verdict, { ok: true, signal: "done" }), "disagree_llm_continue");
+test("user automatically enables Jev from provider parameters | Given endpoint model and key are complete | When configuration is checked | Then no separate mode or threshold is required", () => {
+  assert.equal(isJevJudgeConfigured({
+    jevJudgeBaseUrl: "https://api.typesafe.ai/v1",
+    jevJudgeApiKey: "secret",
+    jevJudgeModel: "jev-latest",
+  }), true);
+  assert.equal(isJevJudgeConfigured({
+    jevJudgeBaseUrl: "https://api.typesafe.ai/v1",
+    jevJudgeApiKey: "",
+    jevJudgeModel: "jev-latest",
+  }), false);
 });
 
-test("user recovers a false done judgment | Given the LLM says done but Jev strongly sees autonomous unfinished work | When assist mode composes the judgments | Then it changes only that missed continuation into a bounded nudge", () => {
-  const result = assistLlmVerdictWithJev(
-    { done: true, cont: false, nudgeText: "", raw: "DONE" },
-    { ok: true, signal: "continue", probability: 0.94 },
-    "Continue with the unfinished work you identified.",
-  );
-  assert.equal(result.assisted, true);
-  assert.equal(result.verdict.done, false);
-  assert.equal(result.verdict.cont, true);
-  assert.equal(result.verdict.nudgeText, "Continue with the unfinished work you identified.");
-  assert.match(result.verdict.raw, /jev_assist p=0\.940/);
-});
-
-test("user is not auto-continued by uncertain Jev evidence | Given the existing LLM is done or ambiguous and Jev is below the configured confidence boundary | When judgments are composed | Then the original result remains unchanged", () => {
-  for (const verdict of [
-    { done: true, cont: false, raw: "DONE" },
-    { done: false, cont: false, raw: "maybe" },
-  ]) {
-    const result = assistLlmVerdictWithJev(
-      verdict,
-      { ok: true, signal: "uncertain", probability: 0.61 },
-      "Continue.",
-    );
-    assert.equal(result.assisted, false);
-    assert.equal(result.verdict.cont, false);
-  }
-});
-
-test("user gets a fail-closed automatic policy | Given Jev continue done uncertain and provider failure | When Auto decides the next turn | Then only continue or an explicit-pending outage fallback can send", () => {
+test("user gets Jev first and fallback only on uncertainty or outage | Given explicit Jev outcomes | When Auto selects the semantic stage | Then continue and done are final while uncertain or unavailable fall through", () => {
   assert.deepEqual(
     decideJevAutoPolicy({ ok: true, signal: "continue", probability: 0.91 }),
     { action: "continue", reason: "jev_continue" },
@@ -87,25 +59,24 @@ test("user gets a fail-closed automatic policy | Given Jev continue done uncerta
   );
   assert.deepEqual(
     decideJevAutoPolicy({ ok: true, signal: "uncertain", probability: 0.51 }),
-    { action: "stop", reason: "jev_uncertain" },
+    { action: "fallback", reason: "jev_uncertain" },
   );
   assert.deepEqual(
-    decideJevAutoPolicy({ ok: false, reason: "timeout" }, false),
-    { action: "stop", reason: "jev_unavailable" },
-  );
-  assert.deepEqual(
-    decideJevAutoPolicy({ ok: false, reason: "timeout" }, true),
-    { action: "continue", reason: "jev_explicit_pending_fallback" },
+    decideJevAutoPolicy({ ok: false, reason: "timeout" }),
+    { action: "fallback", reason: "jev_unavailable" },
   );
 });
 
-test("user can configure the TypeSafe endpoint without hiding provider choices | Given a base URL, mode, and threshold | When settings are normalized | Then endpoint construction is explicit and invalid thresholds fail to the conservative default", () => {
+test("user keeps provider URLs explicit | Given TypeSafe base URLs | When the System One URL is built | Then only the documented endpoint suffix is appended", () => {
   assert.equal(jevSystemOneUrl("https://api.typesafe.ai/v1"), "https://api.typesafe.ai/v1/systemone");
   assert.equal(jevSystemOneUrl("https://example.test/custom/systemone"), "https://example.test/custom/systemone");
-  assert.equal(normalizeJevJudgeMode("assist"), JEV_JUDGE_MODE_ASSIST);
-  assert.equal(normalizeJevJudgeMode("auto"), JEV_JUDGE_MODE_AUTO);
-  assert.equal(normalizeJevJudgeMode("anything"), "off");
-  assert.equal(normalizeJevJudgeThreshold("0.9"), 0.9);
-  assert.equal(DEFAULT_JEV_THRESHOLD, 0.70);
-  assert.equal(normalizeJevJudgeThreshold("0.2"), DEFAULT_JEV_THRESHOLD);
+});
+
+test("user is warned about a mistyped LLM base URL | Given a duplicate path slash | When settings validate the URL | Then saving is rejected with a display-only suggestion and runtime does not silently repair it", () => {
+  const bad = validateApiBaseUrl("https://cc.whshang.me//v1");
+  assert.equal(bad.ok, false);
+  assert.equal(bad.reason, "duplicate_path_slash");
+  assert.equal(bad.suggestion, "https://cc.whshang.me/v1");
+  assert.equal(llmJudgeCompletionsUrl("https://cc.whshang.me//v1"), "");
+  assert.equal(llmJudgeCompletionsUrl("https://cc.whshang.me/v1"), "https://cc.whshang.me/v1/chat/completions");
 });

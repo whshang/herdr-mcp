@@ -252,15 +252,19 @@ ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes('performWake({ template: "继续", autoAllow: false, recovery: true })')
     && wakeSource.includes("(assistantChanged || curLen > lastAsstLen)"),
   "ChatGPT explicit transport failures stop faking progress and use one bounded reload followed by at most one safe Continue");
-ok(backgroundSource.includes("idleNudgeInFlight")
-    && backgroundSource.includes("assistantDeclaresPendingWork")
-    && backgroundSource.includes("scheduleIdleNudgeRetry(convKey, 30000)")
-    && backgroundSource.includes("assistant_pending_override"),
-  "LLM auto-continue retries ambiguous/send-failed turns and honors strong pending-work declarations");
+const semanticAutoStart = backgroundSource.indexOf("const jevConfigured = isJevJudgeConfigured(CFG)");
+const semanticAutoEnd = backgroundSource.indexOf("function paceIntervalSec()", semanticAutoStart);
+const semanticAutoSource = backgroundSource.slice(semanticAutoStart, semanticAutoEnd);
+ok(semanticAutoStart >= 0
+    && semanticAutoSource.indexOf("if (jevConfigured)") >= 0
+    && semanticAutoSource.indexOf("if (llmConfigured)") > semanticAutoSource.indexOf("if (jevConfigured)")
+    && semanticAutoSource.lastIndexOf("autoContinueWithoutLlm") > semanticAutoSource.indexOf("if (llmConfigured)")
+    && !semanticAutoSource.includes("assistant_pending_override"),
+  "Auto semantic order is Jev then LLM then deterministic script fallback with no regex override");
 ok(backgroundSource.includes("autoContinueWithoutLlm")
     && backgroundSource.includes('status: "auto_continue_fallback_nudge"')
     && backgroundSource.includes("shouldAutoContinueWithoutLlm"),
-  "Auto falls back to bounded Continue when the LLM provider is unavailable");
+  "Auto keeps bounded script fallback when semantic providers are unavailable or ambiguous");
 ok(wakeSource.includes("i === 2 && hudCache?.llmConfigured !== true"),
   "manual LLM judge is hidden when no provider is configured");
 ok(wakeSource.includes('data-testid^="conversation-turn-"')
@@ -1692,7 +1696,7 @@ console.log("\n[llmJudge]");
 ok(isLlmJudgeConfigured({ llmJudgeBaseUrl: "https://x/v1", llmJudgeApiKey: "k", llmJudgeModel: "m" }), "configured when three set");
 ok(!isLlmJudgeConfigured({ llmJudgeBaseUrl: "", llmJudgeApiKey: "k", llmJudgeModel: "m" }), "empty url = off");
 ok(llmJudgeCompletionsUrl("https://x/v1") === "https://x/v1/chat/completions", "url append completions");
-ok(llmJudgeCompletionsUrl("https://x//v1") === "https://x/v1/chat/completions", "url normalizes duplicate path slashes");
+ok(llmJudgeCompletionsUrl("https://x//v1") === "", "mistyped duplicate path slash is rejected instead of silently normalized");
 ok(llmJudgeCompletionsUrl("https://x/v1/chat/completions") === "https://x/v1/chat/completions", "url already full");
 ok(buildLlmJudgeUserMessage("看：{content}", { assistantText: "hello" }).includes("hello"), "prompt fills content");
 ok(interpretLlmJudgeReply("好的").done === true, "好的 → done");

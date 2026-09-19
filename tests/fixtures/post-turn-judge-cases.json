@@ -192,6 +192,18 @@
       "expected": "continue",
       "user": "修正と検証を最後まで進めてください。",
       "assistant": "修正は完了しましたが、回帰テストがまだ残っています。続けてテストを実行します。"
+    },
+    {
+      "id": "zh-current-herdr-auto-refactor-live-20260919",
+      "expected": "continue",
+      "user": "实现 Auto 判断链：无模型时使用脚本兜底；有 Jev 和 LLM 时按 Jev > LLM > Script；去掉用户策略选项；URL 保存时严格提示；用当前对话完成开发、验证和 PR。",
+      "assistant": "核心判断顺序、配置简化和 URL 严格校验已经完成，专项回归全绿。还剩当前对话真实 Jev/LLM/Script 判断、把结果固化进 fixture、提交分支并跑 PR CI。"
+    },
+    {
+      "id": "zh-current-herdr-auto-refactor-complete-counterexample",
+      "expected": "done",
+      "user": "实现 Auto 判断链并完成开发、验证和收尾。",
+      "assistant": "Auto 判断链、URL 校验、真实对话验收、提交、CI 和清理都已经完成，没有剩余任务。后续如果需要还可以继续优化更多判断类型。"
     }
   ]
 }

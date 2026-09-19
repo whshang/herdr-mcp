@@ -8,12 +8,12 @@ import {
   buildLlmJudgeUserMessage,
   interpretLlmJudgeReply,
   llmJudgeCompletionsUrl,
+  shouldAutoContinueWithoutLlm,
 } from "../extension/binding-core.js";
 import {
   DEFAULT_JEV_BASE_URL,
   DEFAULT_JEV_MODEL,
   DEFAULT_JEV_THRESHOLD,
-  assistLlmVerdictWithJev,
   buildJevPendingWorkRequest,
   interpretJevPendingWorkAnswer,
   jevSystemOneUrl,
@@ -58,7 +58,7 @@ function jevConfig() {
     baseUrl: env("TYPESAFE_BASE_URL", DEFAULT_JEV_BASE_URL),
     apiKey: env("TYPESAFE_API_KEY"),
     model: env("TYPESAFE_MODEL", DEFAULT_JEV_MODEL),
-    threshold: Number(env("TYPESAFE_JEV_THRESHOLD", String(DEFAULT_JEV_THRESHOLD))),
+    threshold: DEFAULT_JEV_THRESHOLD,
   };
 }
 
@@ -139,18 +139,16 @@ async function runJev(row, cfg) {
   };
 }
 
-function combineAssist(llm, jev) {
-  if (!llm?.ok) return { ok: false, prediction: "unavailable" };
-  if (!jev?.ok) return { ok: true, prediction: llm.prediction, assisted: false };
-  const composed = assistLlmVerdictWithJev(
-    llm.verdict,
-    jev,
-    "Continue with the unfinished work you identified.",
-  );
+function combinePriority(row, llm, jev) {
+  if (jev?.ok && jev.prediction === "continue") return { ok: true, prediction: "continue", source: "jev" };
+  if (jev?.ok && jev.prediction === "done") return { ok: true, prediction: "done", source: "jev" };
+  if (llm?.ok && (llm.prediction === "continue" || llm.prediction === "done")) {
+    return { ok: true, prediction: llm.prediction, source: "llm" };
+  }
   return {
     ok: true,
-    prediction: composed.verdict.cont ? "continue" : composed.verdict.done ? "done" : "uncertain",
-    assisted: composed.assisted,
+    prediction: shouldAutoContinueWithoutLlm(row.user, row.assistant) ? "continue" : "done",
+    source: "script",
   };
 }
 
@@ -221,27 +219,27 @@ if (missing.length) {
 const rows = [];
 for (const row of cases) {
   const [llmResult, jevResult] = await Promise.all([runLlm(row, llm), runJev(row, jev)]);
-  const assist = combineAssist(llmResult, jevResult);
+  const auto = combinePriority(row, llmResult, jevResult);
   rows.push({
     id: row.id,
     expected: row.expected,
     llm: llmResult,
     jev: jevResult,
-    assist,
+    auto,
   });
 }
 
 const llmResults = rows.map((r) => ({ ...r.llm, expected: r.expected }));
 const jevResults = rows.map((r) => ({ ...r.jev, expected: r.expected }));
-const assistResults = rows.map((r) => ({
-  ...r.assist,
+const autoResults = rows.map((r) => ({
+  ...r.auto,
   expected: r.expected,
   latency_ms: Math.max(Number(r.llm.latency_ms) || 0, Number(r.jev.latency_ms) || 0),
 }));
 const summaries = [
   summarize("LLM", llmResults),
   summarize("Jev", jevResults),
-  summarize("Assist", assistResults),
+  summarize("Auto", autoResults),
 ];
 
 if (jsonOutput) {
@@ -253,8 +251,7 @@ if (jsonOutput) {
     const jevP = row.jev?.ok ? Number(row.jev.probability).toFixed(3) : row.jev?.reason || "error";
     console.log(
       `${row.id}: expected=${row.expected} llm=${row.llm.prediction || row.llm.reason}`
-      + ` jev=${row.jev.prediction || row.jev.reason}(${jevP}) assist=${row.assist.prediction}`
-      + `${row.assist.assisted ? " assisted" : ""}`,
+      + ` jev=${row.jev.prediction || row.jev.reason}(${jevP}) auto=${row.auto.prediction}(${row.auto.source})`,
     );
   }
 }

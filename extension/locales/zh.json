@@ -461,6 +461,7 @@
   "hint_experimental_grok": "默认关闭。开启时仅申请 grok.com 站点权限，并启用 Grok HUD、连续性与浏览器派发适配器。切换后请刷新已打开的 Grok 页面。",  "open_github_setup_guide": "打开 Herdr GitHub 新手配置指南",
   "host_permission_denied": "未授予站点访问权限。Herdr 只会请求你明确启用的站点或接口地址。",
   "host_permission_invalid_url": "配置的接口地址必须使用 http:// 或 https://。",
+  "api_base_url_duplicate_slash": "接口路径包含重复斜杠，请修改为 {suggestion} 后再保存。",
   "hud_reason_llm_permission": "未授予小模型站点访问权限",
   "hud_reason_fallback_continue": "自动兜底已发送“继续”",
   "hud_reason_fallback_complete": "自动兜底已在有界“继续”后停止"

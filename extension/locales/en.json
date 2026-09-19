@@ -461,6 +461,7 @@
   "hint_experimental_grok": "Off by default. Requests access only to grok.com and enables the Grok HUD, continuity, and browser dispatch adapter. Reload existing Grok tabs after changing this switch.",  "open_github_setup_guide": "Open the Herdr GitHub setup guide",
   "host_permission_denied": "Site access was not granted. Herdr only requests access to sites or endpoints you explicitly enable.",
   "host_permission_invalid_url": "The configured endpoint must use http:// or https://.",
+  "api_base_url_duplicate_slash": "The endpoint path contains a duplicate slash. Change it to {suggestion} before saving.",
   "hud_reason_llm_permission": "LLM site access not granted",
   "hud_reason_fallback_continue": "Auto fallback sent Continue",
   "hud_reason_fallback_complete": "Auto fallback stopped after bounded Continue"

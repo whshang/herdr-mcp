@@ -32,10 +32,8 @@ import {
 } from "./goal-supervisor-core.js";
 import {
   DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_THRESHOLD,
-  JEV_JUDGE_MODE_ASSIST, JEV_JUDGE_MODE_AUTO, assistLlmVerdictWithJev, buildJevPendingWorkRequest,
-  decideJevAutoPolicy,
-  interpretJevPendingWorkAnswer, isJevJudgeConfigured, jevAgreementWithLlm,
-  jevSystemOneUrl, normalizeJevJudgeMode, normalizeJevJudgeThreshold,
+  buildJevPendingWorkRequest, decideJevAutoPolicy,
+  interpretJevPendingWorkAnswer, isJevJudgeConfigured, jevSystemOneUrl,
 } from "./jev-judge-core.js";
 import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
@@ -428,14 +426,11 @@ let CFG = {
   llmJudgeModel: "",
   llmJudgePromptTemplate: "",
   llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-  // Optional TypeSafe Jev auxiliary judgement. Shadow records comparisons
-  // without changing behavior; assist may recover a missed continuation but
-  // never suppresses an existing LLM continue decision.
-  jevJudgeMode: "off",
+  // Optional TypeSafe Jev semantic gate. Presence of a complete provider
+  // configuration enables it automatically; users do not choose policy modes.
   jevJudgeBaseUrl: DEFAULT_JEV_BASE_URL,
   jevJudgeApiKey: "",
   jevJudgeModel: DEFAULT_JEV_MODEL,
-  jevJudgeThreshold: DEFAULT_JEV_THRESHOLD,
   // Experimental Web AI origins stay opt-in until their compatibility/UAT gate passes.
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
@@ -744,11 +739,11 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   await detectOrLoadLocale();
   let stored = {};
   try {
-    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
+    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", "jevJudgeMode", "jevJudgeThreshold", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
-    CFG.jevJudgeMode = normalizeJevJudgeMode(CFG.jevJudgeMode);
-    CFG.jevJudgeThreshold = normalizeJevJudgeThreshold(CFG.jevJudgeThreshold);
+    delete CFG.jevJudgeMode;
+    delete CFG.jevJudgeThreshold;
     CFG.jevJudgeBaseUrl = String(CFG.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim() || DEFAULT_JEV_BASE_URL;
     CFG.jevJudgeModel = String(CFG.jevJudgeModel || DEFAULT_JEV_MODEL).trim() || DEFAULT_JEV_MODEL;
     delete CFG[PROJECT_AUTOMATION_STORAGE_KEY];
@@ -762,16 +757,6 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
   }
   const patch = {};
-  if (String(CFG.jevJudgeApiKey || "").trim()
-    && (CFG.jevJudgeMode === "shadow" || CFG.jevJudgeMode === "assist")) {
-    // 0.1.102 exposed experimental composition choices. 0.1.103 folds those
-    // into the measured Jev-primary automatic policy so existing testers do
-    // not have to revisit Options after upgrading.
-    CFG.jevJudgeMode = JEV_JUDGE_MODE_AUTO;
-    CFG.jevJudgeThreshold = DEFAULT_JEV_THRESHOLD;
-    patch.jevJudgeMode = CFG.jevJudgeMode;
-    patch.jevJudgeThreshold = CFG.jevJudgeThreshold;
-  }
   if (String(CFG.llmJudgePromptTemplate || "").trim() === LEGACY_DEFAULT_LLM_JUDGE_PROMPT) {
     CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
     patch.llmJudgePromptTemplate = CFG.llmJudgePromptTemplate;
@@ -4214,7 +4199,7 @@ async function fetchJevJudgeOnce(
       };
     }
     const parsed = await resp.json();
-    return interpretJevPendingWorkAnswer(parsed, normalizeJevJudgeThreshold(cfg.jevJudgeThreshold));
+    return interpretJevPendingWorkAnswer(parsed, DEFAULT_JEV_THRESHOLD);
   } catch (error) {
     const name = error?.name || "";
     if (name === "TimeoutError" || name === "AbortError") {
@@ -4400,28 +4385,6 @@ function rememberIdleNudge(convKey, result) {
   lastIdleNudgeResult.set(convKey, row);
   callLog(`llm-judge: ${convKey} → ${result.reason}${result.raw != null ? ` raw=${JSON.stringify(result.raw).slice(0, 80)}` : ""}`);
   return result;
-}
-
-function trackJevComparison(convKey, assistantFp, llmVerdict, jevPromise, mode = "shadow") {
-  void jevPromise.then((jev) => {
-    const row = lastIdleNudgeResult.get(convKey);
-    if (!row || row.assistant_fp !== assistantFp) return;
-    Object.assign(row, {
-      jev_mode: mode,
-      jev_probability: jev?.ok ? jev.probability : null,
-      jev_signal: jev?.ok ? jev.signal : "unavailable",
-      jev_reason: jev?.ok ? null : jev?.reason || "unknown",
-      jev_assisted: false,
-      judge_agreement: jevAgreementWithLlm(llmVerdict, jev),
-    });
-    callLog(
-      `jev-${mode}: ${convKey} → ${row.jev_signal}`
-      + `${row.jev_probability != null ? ` p=${Number(row.jev_probability).toFixed(3)}` : ""}`
-      + ` agreement=${row.judge_agreement}`,
-    );
-  }).catch((error) => {
-    callLog(`jev-shadow failed ${convKey}:`, error?.message || String(error));
-  });
 }
 
 function clearIdleNudgeRetry(convKey) {
@@ -4941,7 +4904,7 @@ async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
   };
 }
 
-/** Post-turn nudge: LLM judge plus strong assistant self-declared pending work. */
+/** Final deterministic fallback when semantic judges are unavailable/ambiguous. */
 async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs, cause = "llm_not_configured") {
   const nudgeText = autoGoalContinueMessage();
   if (!shouldAutoContinueWithoutLlm(userText, assistantText, nudgeText)) {
@@ -4970,6 +4933,43 @@ async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, c
   }
   lastJudgedAssistantFp.set(convKey, fp);
   return rememberIdleNudge(convKey, { nudged: true, reason: "fallback_continue", cause, assistant_fp: fp, send: nudgeText });
+}
+
+async function sendSemanticContinue(convKey, b, fp, cooldownMs, {
+  reason,
+  status,
+  output,
+  nudgeText = autoGoalContinueMessage(),
+  meta = {},
+} = {}) {
+  lastIdleNudgeAt.set(convKey, Date.now());
+  setActionBadge("!", "#dc2626", 8000);
+  const wakeResult = await routeWake(b, {
+    status,
+    output,
+    working_count: 0,
+    pane: b.pane,
+    agent: b.agent,
+  }, nudgeText);
+  if (!wakeResult?.ok) {
+    scheduleIdleNudgeRetry(convKey, cooldownMs);
+    return rememberIdleNudge(convKey, {
+      nudged: false,
+      reason: "wake_failed",
+      assistant_fp: fp,
+      send: nudgeText,
+      error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
+      ...meta,
+    });
+  }
+  lastJudgedAssistantFp.set(convKey, fp);
+  return rememberIdleNudge(convKey, {
+    nudged: true,
+    reason,
+    assistant_fp: fp,
+    send: nudgeText,
+    ...meta,
+  });
 }
 
 async function maybeIdleNudge(msg) {
@@ -5019,6 +5019,7 @@ async function maybeIdleNudgeInner(msg) {
   if (!String(assistantText).trim()) {
     return rememberIdleNudge(convKey, { nudged: false, reason: "empty_assistant" });
   }
+  const semanticJudgeConfigured = isJevJudgeConfigured(CFG) || isLlmJudgeConfigured(CFG);
 
   if (b.tabId) {
     try {
@@ -5028,16 +5029,16 @@ async function maybeIdleNudgeInner(msg) {
         return rememberIdleNudge(convKey, { nudged: false, reason: "still_generating" });
       }
       if (snap?.assistantText) assistantText = snap.assistantText;
-      if (!looksLikeSubstantiveReply(assistantText)) {
+      if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(assistantText)) {
         return rememberIdleNudge(convKey, { nudged: false, reason: "not_substantive" });
       }
     } catch (e) {
-      callLog(`llm-judge live snapshot failed ${convKey}:`, e.message);
-      if (!looksLikeSubstantiveReply(assistantText)) {
+      callLog(`semantic judge live snapshot failed ${convKey}:`, e.message);
+      if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(assistantText)) {
         return rememberIdleNudge(convKey, { nudged: false, reason: "not_substantive" });
       }
     }
-  } else if (!looksLikeSubstantiveReply(assistantText)) {
+  } else if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(assistantText)) {
     return rememberIdleNudge(convKey, { nudged: false, reason: "not_substantive" });
   }
 
@@ -5095,26 +5096,28 @@ async function maybeIdleNudgeInner(msg) {
     });
   }
 
-  const jevMode = normalizeJevJudgeMode(CFG.jevJudgeMode);
   const jevConfigured = isJevJudgeConfigured(CFG);
-  if (jevMode === JEV_JUDGE_MODE_AUTO && jevConfigured) {
+  const llmConfigured = isLlmJudgeConfigured(CFG);
+  const continueText = autoGoalContinueMessage();
+
+  if (jevConfigured) {
     const jev = await fetchJevJudgeOnce(userText, assistantText);
-    const continueText = localizedText(
-      "default_auto_continue_nudge",
-      null,
-      "Continue with the unfinished work you identified.",
-    );
+    const policy = decideJevAutoPolicy(jev);
     const jevMeta = {
-      jev_mode: jevMode,
       jev_probability: jev?.ok ? jev.probability : null,
       jev_signal: jev?.ok ? jev.signal : "unavailable",
       jev_reason: jev?.ok ? null : jev?.reason || "unknown",
     };
-    const explicitPendingFallback = !jev?.ok && assistantDeclaresPendingWork(assistantText);
-    const policy = decideJevAutoPolicy(jev, explicitPendingFallback);
-    if (policy.action !== "continue") {
-      // Done, uncertainty, and provider failure without explicit pending work
-      // are all non-actionable. Never fall through to the eager legacy LLM.
+    if (policy.action === "continue") {
+      return sendSemanticContinue(convKey, b, fp, cooldownMs, {
+        reason: "jev_continue",
+        status: "jev_continue_nudge",
+        output: `Jev continue p=${Number(jev.probability).toFixed(3)}`,
+        nudgeText: continueText,
+        meta: jevMeta,
+      });
+    }
+    if (policy.action === "stop") {
       lastJudgedAssistantFp.set(convKey, fp);
       clearIdleNudgeRetry(convKey);
       return rememberIdleNudge(convKey, {
@@ -5124,48 +5127,46 @@ async function maybeIdleNudgeInner(msg) {
         ...jevMeta,
       });
     }
+    callLog(`jev fallback ${convKey}: ${policy.reason}`);
+  }
 
-    lastIdleNudgeAt.set(convKey, Date.now());
-    setActionBadge("!", "#dc2626", 8000);
-    const wakeResult = await routeWake(b, {
-      status: explicitPendingFallback ? "jev_explicit_pending_fallback" : "jev_continue_nudge",
-      output: explicitPendingFallback
-        ? "Jev unavailable; explicit unfinished-work signal allowed one bounded continue"
-        : `Jev continue p=${Number(jev.probability).toFixed(3)}`,
-      working_count: 0,
-      pane: b.pane,
-      agent: b.agent,
-    }, continueText);
-    if (!wakeResult?.ok) {
-      scheduleIdleNudgeRetry(convKey, cooldownMs);
-      return rememberIdleNudge(convKey, {
-        nudged: false,
-        reason: "wake_failed",
-        assistant_fp: fp,
-        send: continueText,
-        error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
-        ...jevMeta,
+  if (llmConfigured) {
+    const judged = await fetchLlmJudge(userText, assistantText);
+    if (judged.ok) {
+      const verdict = interpretLlmJudgeReply(judged.content, {
+        skipKeywords: CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
       });
+      if (verdict.done) {
+        lastJudgedAssistantFp.set(convKey, fp);
+        clearIdleNudgeRetry(convKey);
+        return rememberIdleNudge(convKey, {
+          nudged: false,
+          reason: "llm_done",
+          raw: verdict.raw,
+          assistant_fp: fp,
+        });
+      }
+      if (verdict.cont && verdict.nudgeText) {
+        return sendSemanticContinue(convKey, b, fp, cooldownMs, {
+          reason: "llm_continue",
+          status: "llm_continue_nudge",
+          output: `llm-judge continue; raw=${verdict.raw.slice(0, 80)}`,
+          nudgeText: verdict.nudgeText,
+          meta: { raw: verdict.raw },
+        });
+      }
+      callLog(`llm fallback ${convKey}: ambiguous`);
+      return autoContinueWithoutLlm(
+        convKey,
+        b,
+        userText,
+        assistantText,
+        fp,
+        cooldownMs,
+        "llm_ambiguous",
+      );
     }
-    lastJudgedAssistantFp.set(convKey, fp);
-    return rememberIdleNudge(convKey, {
-      nudged: true,
-      reason: explicitPendingFallback ? "jev_explicit_pending_fallback" : "jev_continue",
-      assistant_fp: fp,
-      send: continueText,
-      ...jevMeta,
-    });
-  }
-
-  if (!isLlmJudgeConfigured(CFG)) {
-    return autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs);
-  }
-
-  const jevPromise = jevConfigured
-    ? fetchJevJudgeOnce(userText, assistantText)
-    : Promise.resolve({ ok: false, reason: "not_configured" });
-  const judged = await fetchLlmJudge(userText, assistantText);
-  if (!judged.ok) {
+    callLog(`llm fallback ${convKey}: ${judged.reason}`);
     return autoContinueWithoutLlm(
       convKey,
       b,
@@ -5176,108 +5177,16 @@ async function maybeIdleNudgeInner(msg) {
       `llm_${judged.reason}`,
     );
   }
-  const llmVerdict = interpretLlmJudgeReply(judged.content, {
-    skipKeywords: CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-  });
-  let verdict = { ...llmVerdict };
-  const assistantPendingOverride = assistantDeclaresPendingWork(assistantText) && !verdict.cont;
-  if (assistantPendingOverride) {
-    verdict = {
-      done: false,
-      cont: true,
-      nudgeText: localizedText(
-        "default_auto_continue_nudge",
-        null,
-        "Continue with the unfinished work you identified.",
-      ),
-      raw: `${verdict.raw || ""} [assistant_pending_override]`.trim(),
-    };
-  }
 
-  let jev = { ok: false, reason: jevConfigured ? "pending" : "not_configured" };
-  let jevAssisted = false;
-  if (jevMode === JEV_JUDGE_MODE_ASSIST && jevConfigured && !assistantPendingOverride) {
-    jev = await jevPromise;
-    const composed = assistLlmVerdictWithJev(
-      verdict,
-      jev,
-      localizedText(
-        "default_auto_continue_nudge",
-        null,
-        "Continue with the unfinished work you identified.",
-      ),
-    );
-    verdict = composed.verdict;
-    jevAssisted = composed.assisted;
-  }
-  const jevMeta = {
-    jev_mode: jevMode,
-    jev_probability: jev?.ok ? jev.probability : null,
-    jev_signal: jev?.ok ? jev.signal : (jevMode === "shadow" && jevConfigured ? "pending" : "unavailable"),
-    jev_reason: jev?.ok ? null : jev?.reason || "unknown",
-    jev_assisted: jevAssisted,
-    judge_agreement: jevAgreementWithLlm(llmVerdict, jev),
-  };
-  const rememberWithJev = (result) => {
-    const remembered = rememberIdleNudge(convKey, result);
-    if (jevConfigured && (jevMode === "shadow" || assistantPendingOverride)) {
-      trackJevComparison(convKey, fp, llmVerdict, jevPromise, jevMode);
-    }
-    return remembered;
-  };
-
-  if (verdict.done) {
-    lastJudgedAssistantFp.set(convKey, fp);
-    clearIdleNudgeRetry(convKey);
-    return rememberWithJev({
-      nudged: false,
-      reason: "llm_done",
-      raw: verdict.raw,
-      assistant_fp: fp,
-      ...jevMeta,
-    });
-  }
-  if (!verdict.cont || !verdict.nudgeText) {
-    scheduleIdleNudgeRetry(convKey, 30000);
-    return rememberWithJev({
-      nudged: false,
-      reason: "llm_ambiguous",
-      raw: verdict.raw,
-      assistant_fp: fp,
-      ...jevMeta,
-    });
-  }
-
-  lastIdleNudgeAt.set(convKey, Date.now());
-  setActionBadge("!", "#dc2626", 8000);
-  const wakeResult = await routeWake(b, {
-    status: jevAssisted ? "jev_assisted_continue_nudge" : "llm_continue_nudge",
-    output: `${jevAssisted ? "jev-assisted" : "llm-judge"} continue; raw=${verdict.raw.slice(0, 80)}`,
-    working_count: 0,
-    pane: b.pane,
-    agent: b.agent,
-  }, verdict.nudgeText);
-  if (!wakeResult?.ok) {
-    scheduleIdleNudgeRetry(convKey, cooldownMs);
-    return rememberWithJev({
-      nudged: false,
-      reason: "wake_failed",
-      raw: verdict.raw,
-      assistant_fp: fp,
-      send: verdict.nudgeText,
-      error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
-      ...jevMeta,
-    });
-  }
-  lastJudgedAssistantFp.set(convKey, fp);
-  return rememberWithJev({
-    nudged: true,
-    reason: jevAssisted ? "jev_assisted_continue" : "llm_continue",
-    raw: verdict.raw,
-    assistant_fp: fp,
-    send: verdict.nudgeText,
-    ...jevMeta,
-  });
+  return autoContinueWithoutLlm(
+    convKey,
+    b,
+    userText,
+    assistantText,
+    fp,
+    cooldownMs,
+    jevConfigured ? "jev_fallback_no_llm" : "semantic_judge_not_configured",
+  );
 }
 
 function paceIntervalSec() {
@@ -5422,7 +5331,6 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
     "llm_continue_nudge",
     "auto_continue_fallback_nudge",
     "jev_continue_nudge",
-    "jev_explicit_pending_fallback",
     "supervisor_continue",
     "supervisor_answer",
   ].includes(extra.status);
@@ -7505,12 +7413,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         incoming.manualContinueMessage = String(incoming.manualContinueMessage || "").trim().slice(0, 4000)
           || defaultManualContinueMessage();
       }
-      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeMode")) {
-        incoming.jevJudgeMode = normalizeJevJudgeMode(incoming.jevJudgeMode);
-      }
-      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeThreshold")) {
-        incoming.jevJudgeThreshold = normalizeJevJudgeThreshold(incoming.jevJudgeThreshold);
-      }
+      delete incoming.jevJudgeMode;
+      delete incoming.jevJudgeThreshold;
       if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeBaseUrl")) {
         incoming.jevJudgeBaseUrl = String(incoming.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim()
           || DEFAULT_JEV_BASE_URL;
@@ -7526,7 +7430,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       CFG.idleNudgeEnabled = false;
       delete CFG.idleNudgeCooldownSec;
       await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
-      try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token"]); } catch (e) {}
+      try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token", "jevJudgeMode", "jevJudgeThreshold"]); } catch (e) {}
       await syncExperimentalContentScripts();
       void rebuildStreams();
       sendResponse({ ok: true });
@@ -7621,10 +7525,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_test_jev") {
     void (async () => {
-      const form = {
-        ...(msg.config || {}),
-        jevJudgeMode: "shadow",
-      };
+      const form = { ...(msg.config || {}) };
       const judged = await fetchJevJudgeOnce(
         form.userText || "继续验证",
         form.assistantText || "实现已经完成。下一步我会继续跑生产验证。",

@@ -1,11 +1,10 @@
 // options.js — settings + locale
 import { detectOrLoadLocale, setLocale, getLocale, t, onLocaleReady } from "./i18n.js";
 import {
-  DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+  DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT, validateApiBaseUrl,
 } from "./binding-core.js";
 import {
-  DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_THRESHOLD,
-  JEV_JUDGE_MODE_AUTO, normalizeJevJudgeMode,
+  DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL,
 } from "./jev-judge-core.js";
 import { nativeHostFailure } from "./native-host-diagnostics.js";
 
@@ -15,7 +14,7 @@ const KEYS = [
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
-  "jevJudgeMode", "jevJudgeBaseUrl", "jevJudgeApiKey", "jevJudgeModel", "jevJudgeThreshold",
+  "jevJudgeBaseUrl", "jevJudgeApiKey", "jevJudgeModel",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled",
   "pageAssistOrigins",
 ];
@@ -42,7 +41,7 @@ function configuredHostPermissionOrigins(config) {
   if (config.experimentalGrokEnabled === true) origins.push("https://grok.com/*");
   const llmOrigin = hostPermissionPatternForUrl(config.llmJudgeBaseUrl);
   if (llmOrigin) origins.push(llmOrigin);
-  if (normalizeJevJudgeMode(config.jevJudgeMode) !== "off") {
+  if (String(config.jevJudgeApiKey || "").trim()) {
     const jevOrigin = hostPermissionPatternForUrl(config.jevJudgeBaseUrl);
     if (jevOrigin) origins.push(jevOrigin);
   }
@@ -70,6 +69,17 @@ function runtimeMessage(message) {
       resolve({ resp, error: chrome.runtime.lastError?.message || "" });
     });
   });
+}
+
+function validateProviderBaseUrl(rawUrl) {
+  const checked = validateApiBaseUrl(rawUrl);
+  if (checked.ok) return checked;
+  if (checked.reason === "duplicate_path_slash" && checked.suggestion) {
+    setStatus(`${t("save_failed")}: ${t("api_base_url_duplicate_slash", { suggestion: checked.suggestion })}`, "err");
+  } else {
+    setStatus(`${t("save_failed")}: ${t("host_permission_invalid_url")}`, "err");
+  }
+  return checked;
 }
 
 /** Seconds: empty/invalid → fallback; <=0 → 0 (off); cap 86400. */
@@ -236,6 +246,21 @@ $("save").addEventListener("click", async () => {
       return;
     }
   }
+  const llmBase = $("llmJudgeBaseUrl").value.trim();
+  const llmKey = $("llmJudgeApiKey").value.trim();
+  const llmModel = $("llmJudgeModel").value.trim();
+  if (llmKey) {
+    if (!llmBase || !llmModel) {
+      setStatus(`${t("save_failed")}: ${t("llm_need_config")}`, "err");
+      return;
+    }
+    if (!validateProviderBaseUrl(llmBase).ok) return;
+  }
+  const jevBase = $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL;
+  const jevKey = $("jevJudgeApiKey").value.trim();
+  const jevModel = $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL;
+  if (jevKey && !validateProviderBaseUrl(jevBase).ok) return;
+
   const config = {
     herdrMcpUrl: $("url").value.trim(),
     wakeTemplate: $("template").value,
@@ -244,16 +269,14 @@ $("save").addEventListener("click", async () => {
     progressTemplate: $("progressTemplate").value,
     manualContinueMessage: $("manualContinueMessage").value.trim() || t("manual_continue_message"),
     automationMode: $("automationMode").checked ? "project_auto" : "manual",
-    llmJudgeBaseUrl: $("llmJudgeBaseUrl").value.trim(),
-    llmJudgeApiKey: $("llmJudgeApiKey").value.trim(),
-    llmJudgeModel: $("llmJudgeModel").value.trim(),
+    llmJudgeBaseUrl: llmBase,
+    llmJudgeApiKey: llmKey,
+    llmJudgeModel: llmModel,
     llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
     llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-    jevJudgeMode: $("jevJudgeApiKey").value.trim() ? JEV_JUDGE_MODE_AUTO : "off",
-    jevJudgeBaseUrl: $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL,
-    jevJudgeApiKey: $("jevJudgeApiKey").value.trim(),
-    jevJudgeModel: $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL,
-    jevJudgeThreshold: DEFAULT_JEV_THRESHOLD,
+    jevJudgeBaseUrl: jevBase,
+    jevJudgeApiKey: jevKey,
+    jevJudgeModel: jevModel,
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
@@ -332,6 +355,7 @@ $("testLlm").addEventListener("click", async () => {
     setStatus(t("llm_need_config"), "err");
     return;
   }
+  if (!validateProviderBaseUrl(base).ok) return;
   let origin;
   try {
     origin = hostPermissionPatternForUrl(base);
@@ -391,11 +415,11 @@ $("testJev").addEventListener("click", async () => {
   const base = $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL;
   const key = $("jevJudgeApiKey").value.trim();
   const model = $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL;
-  const threshold = DEFAULT_JEV_THRESHOLD;
   if (!base || !key || !model) {
     setStatus(t("jev_need_config"), "err");
     return;
   }
+  if (!validateProviderBaseUrl(base).ok) return;
   let origin;
   try {
     origin = hostPermissionPatternForUrl(base);
@@ -419,7 +443,6 @@ $("testJev").addEventListener("click", async () => {
       jevJudgeBaseUrl: base,
       jevJudgeApiKey: key,
       jevJudgeModel: model,
-      jevJudgeThreshold: threshold,
     },
   });
   btn.disabled = false;
