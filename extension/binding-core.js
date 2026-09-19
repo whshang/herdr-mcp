@@ -580,8 +580,16 @@ export function isLlmJudgeConfigured(cfg) {
  * https://host/v1 or https://host/v1/chat/completions
  */
 export function llmJudgeCompletionsUrl(baseUrl) {
-  const b = String(baseUrl || "").trim().replace(/\/+$/, "");
-  if (!b) return "";
+  const raw = String(baseUrl || "").trim();
+  if (!raw) return "";
+  let b = raw.replace(/\/+$/, "");
+  try {
+    const parsed = new URL(b);
+    parsed.pathname = parsed.pathname.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+    parsed.search = "";
+    parsed.hash = "";
+    b = parsed.toString().replace(/\/+$/, "");
+  } catch (_) {}
   if (/\/chat\/completions$/i.test(b)) return b;
   if (/\/v1$/i.test(b)) return `${b}/chat/completions`;
   return `${b}/v1/chat/completions`;

@@ -4,14 +4,16 @@
 export const JEV_JUDGE_MODE_OFF = "off";
 export const JEV_JUDGE_MODE_SHADOW = "shadow";
 export const JEV_JUDGE_MODE_ASSIST = "assist";
+export const JEV_JUDGE_MODE_AUTO = "auto";
 export const DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai/v1";
 export const DEFAULT_JEV_MODEL = "jev-latest";
-export const DEFAULT_JEV_THRESHOLD = 0.8;
+export const DEFAULT_JEV_THRESHOLD = 0.75;
 
 const VALID_MODES = new Set([
   JEV_JUDGE_MODE_OFF,
   JEV_JUDGE_MODE_SHADOW,
   JEV_JUDGE_MODE_ASSIST,
+  JEV_JUDGE_MODE_AUTO,
 ]);
 
 export function normalizeJevJudgeMode(value) {
@@ -92,6 +94,18 @@ export function jevAgreementWithLlm(verdict, jev) {
   if (verdict?.cont) return jev.signal === "continue" ? "agree_continue" : "disagree_llm_continue";
   if (verdict?.done) return jev.signal === "done" ? "agree_done" : "disagree_llm_done";
   return "llm_ambiguous";
+}
+
+export function decideJevAutoPolicy(jev, explicitPending = false) {
+  if (jev?.ok) {
+    if (jev.signal === "continue") return { action: "continue", reason: "jev_continue" };
+    if (jev.signal === "done") return { action: "stop", reason: "jev_done" };
+    return { action: "stop", reason: "jev_uncertain" };
+  }
+  if (explicitPending) {
+    return { action: "continue", reason: "jev_explicit_pending_fallback" };
+  }
+  return { action: "stop", reason: "jev_unavailable" };
 }
 
 export function assistLlmVerdictWithJev(verdict, jev, continueText) {

@@ -5,7 +5,7 @@ import {
 } from "./binding-core.js";
 import {
   DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_THRESHOLD,
-  normalizeJevJudgeMode, normalizeJevJudgeThreshold,
+  JEV_JUDGE_MODE_AUTO, normalizeJevJudgeMode,
 } from "./jev-judge-core.js";
 import { nativeHostFailure } from "./native-host-diagnostics.js";
 
@@ -117,18 +117,13 @@ function applyI18n() {
   $("hint_llm_skip").textContent = t("hint_llm_skip");
   $("title_jev").textContent = t("label_jev_section");
   $("hint_jev_sec").textContent = t("hint_jev_section");
-  $("lab_jev_mode").textContent = t("label_jev_mode");
-  $("jev_mode_off").textContent = t("jev_mode_off");
-  $("jev_mode_shadow").textContent = t("jev_mode_shadow");
-  $("jev_mode_assist").textContent = t("jev_mode_assist");
-  $("hint_jev_mode").textContent = t("hint_jev_mode");
+  $("llm_advanced_summary").textContent = t("llm_advanced_summary");
+  $("jev_advanced_summary").textContent = t("jev_advanced_summary");
   $("lab_jev_url").textContent = t("label_jev_url");
   $("hint_jev_url").textContent = t("hint_jev_url");
   $("lab_jev_key").textContent = t("label_jev_key");
   $("hint_jev_key").textContent = t("hint_jev_key");
   $("lab_jev_model").textContent = t("label_jev_model");
-  $("lab_jev_threshold").textContent = t("label_jev_threshold");
-  $("hint_jev_threshold").textContent = t("hint_jev_threshold");
   $("lab_automation_mode").textContent = t("label_automation_mode");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
   $("title_experimental").textContent = t("label_experimental_section");
@@ -182,11 +177,9 @@ async function loadForm() {
   $("llmJudgeSkipKeywords").value = (cfg.llmJudgeSkipKeywords && String(cfg.llmJudgeSkipKeywords).trim())
     ? cfg.llmJudgeSkipKeywords
     : DEFAULT_LLM_SKIP_KEYWORDS_TEXT;
-  $("jevJudgeMode").value = normalizeJevJudgeMode(cfg.jevJudgeMode);
   $("jevJudgeBaseUrl").value = cfg.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL;
   $("jevJudgeApiKey").value = cfg.jevJudgeApiKey || "";
   $("jevJudgeModel").value = cfg.jevJudgeModel || DEFAULT_JEV_MODEL;
-  $("jevJudgeThreshold").value = normalizeJevJudgeThreshold(cfg.jevJudgeThreshold);
   $("automationMode").checked = cfg.automationMode === "project_auto"
     || (cfg.automationMode == null && cfg.enabled === true);
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
@@ -256,11 +249,11 @@ $("save").addEventListener("click", async () => {
     llmJudgeModel: $("llmJudgeModel").value.trim(),
     llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
     llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-    jevJudgeMode: normalizeJevJudgeMode($("jevJudgeMode").value),
+    jevJudgeMode: $("jevJudgeApiKey").value.trim() ? JEV_JUDGE_MODE_AUTO : "off",
     jevJudgeBaseUrl: $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL,
     jevJudgeApiKey: $("jevJudgeApiKey").value.trim(),
     jevJudgeModel: $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL,
-    jevJudgeThreshold: normalizeJevJudgeThreshold($("jevJudgeThreshold").value),
+    jevJudgeThreshold: DEFAULT_JEV_THRESHOLD,
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
@@ -398,7 +391,7 @@ $("testJev").addEventListener("click", async () => {
   const base = $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL;
   const key = $("jevJudgeApiKey").value.trim();
   const model = $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL;
-  const threshold = normalizeJevJudgeThreshold($("jevJudgeThreshold").value);
+  const threshold = DEFAULT_JEV_THRESHOLD;
   if (!base || !key || !model) {
     setStatus(t("jev_need_config"), "err");
     return;

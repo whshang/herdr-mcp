@@ -96,6 +96,102 @@
       "expected": "done",
       "user": "把集成做好。",
       "assistant": "集成代码已准备好，但需要你决定是否允许把生产数据发送到新的外部服务。在你确认前我不会继续。"
+    },
+    {
+      "id": "todo-open-runnable",
+      "expected": "continue",
+      "user": "完成 TODO 列表后再收尾。",
+      "assistant": "TODO: [x] 修复实现；[ ] 跑回归；[ ] 浏览器 UAT。实现已完成，接下来我会继续跑回归测试。"
+    },
+    {
+      "id": "todo-all-done",
+      "expected": "done",
+      "user": "完成 TODO 列表后再收尾。",
+      "assistant": "TODO: [x] 修复实现；[x] 跑回归；[x] 浏览器 UAT。所有要求均已完成并验证。"
+    },
+    {
+      "id": "todo-open-needs-login",
+      "expected": "done",
+      "user": "把剩余 TODO 全部完成。",
+      "assistant": "还剩生产验收，但下一步需要你先登录供应商后台完成 MFA；在你登录前我没有可继续执行的安全动作。"
+    },
+    {
+      "id": "todo-open-needs-approval",
+      "expected": "done",
+      "user": "完成发布。",
+      "assistant": "代码、测试、包都已准备好。最后一步是生产发布，但发布属于不可逆操作，需要你的明确批准后才能继续。"
+    },
+    {
+      "id": "todo-open-missing-secret",
+      "expected": "done",
+      "user": "完成第三方同步。",
+      "assistant": "同步逻辑已经验证，剩余 TODO 是调用生产 API。目前没有生产密钥，需要你配置凭据后才能继续。"
+    },
+    {
+      "id": "todo-open-external-wait",
+      "expected": "done",
+      "user": "把迁移做完。",
+      "assistant": "迁移已提交，数据库快照正在由外部系统生成。当前没有安全的本地动作，必须等快照可用后才能继续。"
+    },
+    {
+      "id": "todo-open-can-investigate",
+      "expected": "continue",
+      "user": "修复 CI 失败并验证。",
+      "assistant": "CI 失败日志已经拿到，定位到 Windows 路径处理。下一步我会修改路径归一化并重跑相关测试。"
+    },
+    {
+      "id": "optional-help",
+      "expected": "done",
+      "user": "解释这个架构差异。",
+      "assistant": "差异已经解释完整。如果你想，我可以继续补一张架构图。"
+    },
+    {
+      "id": "user-next-step",
+      "expected": "done",
+      "user": "把集成跑通。",
+      "assistant": "本地集成已完成。下一步你需要在 SaaS 控制台点击授权；授权后我才能继续做生产验证。"
+    },
+    {
+      "id": "safe-default",
+      "expected": "continue",
+      "user": "把配置收敛好，能自动决定的不要问我。",
+      "assistant": "有两个可逆的技术配置都满足约束，我会采用仓库默认值继续实现并跑测试，不需要你做选择。"
+    },
+    {
+      "id": "product-choice",
+      "expected": "done",
+      "user": "把设置页面做简单。",
+      "assistant": "实现已到最后一步，但“默认隐藏高级参数”还是“完全删除高级参数”是产品取舍，会影响高级用户能力，需要你决定。"
+    },
+    {
+      "id": "continue-after-partial",
+      "expected": "continue",
+      "user": "不要只汇报，完成开发验证清理。",
+      "assistant": "开发和单测已完成，但真实浏览器验收与临时分支清理还没做。我会继续完成这两项。"
+    },
+    {
+      "id": "wait-ci-running",
+      "expected": "done",
+      "user": "CI 绿后合并。",
+      "assistant": "CI 仍在运行，目前没有新的失败可处理。需要等待 CI 结束；合并还需要你的确认。"
+    },
+    {
+      "id": "can-check-other-evidence",
+      "expected": "continue",
+      "user": "完整验收后再结束。",
+      "assistant": "主 CI 还在运行，不过本地浏览器 UAT 和发布包校验尚未执行，我可以先继续完成这两项独立验收。"
+    },
+    {
+      "id": "ja-human-boundary",
+      "expected": "done",
+      "user": "本番リリースまで完了してください。",
+      "assistant": "検証は完了しました。次は本番公開ですが、公開にはあなたの明示的な承認が必要です。承認までは進めません。"
+    },
+    {
+      "id": "ja-runnable",
+      "expected": "continue",
+      "user": "修正と検証を最後まで進めてください。",
+      "assistant": "修正は完了しましたが、回帰テストがまだ残っています。続けてテストを実行します。"
     }
   ]
 }

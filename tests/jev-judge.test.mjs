@@ -4,8 +4,10 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_JEV_THRESHOLD,
   JEV_JUDGE_MODE_ASSIST,
+  JEV_JUDGE_MODE_AUTO,
   assistLlmVerdictWithJev,
   buildJevPendingWorkRequest,
+  decideJevAutoPolicy,
   interpretJevPendingWorkAnswer,
   jevAgreementWithLlm,
   jevSystemOneUrl,
@@ -74,11 +76,36 @@ test("user is not auto-continued by uncertain Jev evidence | Given the existing 
   }
 });
 
+test("user gets a fail-closed automatic policy | Given Jev continue done uncertain and provider failure | When Auto decides the next turn | Then only continue or an explicit-pending outage fallback can send", () => {
+  assert.deepEqual(
+    decideJevAutoPolicy({ ok: true, signal: "continue", probability: 0.91 }),
+    { action: "continue", reason: "jev_continue" },
+  );
+  assert.deepEqual(
+    decideJevAutoPolicy({ ok: true, signal: "done", probability: 0.08 }),
+    { action: "stop", reason: "jev_done" },
+  );
+  assert.deepEqual(
+    decideJevAutoPolicy({ ok: true, signal: "uncertain", probability: 0.51 }),
+    { action: "stop", reason: "jev_uncertain" },
+  );
+  assert.deepEqual(
+    decideJevAutoPolicy({ ok: false, reason: "timeout" }, false),
+    { action: "stop", reason: "jev_unavailable" },
+  );
+  assert.deepEqual(
+    decideJevAutoPolicy({ ok: false, reason: "timeout" }, true),
+    { action: "continue", reason: "jev_explicit_pending_fallback" },
+  );
+});
+
 test("user can configure the TypeSafe endpoint without hiding provider choices | Given a base URL, mode, and threshold | When settings are normalized | Then endpoint construction is explicit and invalid thresholds fail to the conservative default", () => {
   assert.equal(jevSystemOneUrl("https://api.typesafe.ai/v1"), "https://api.typesafe.ai/v1/systemone");
   assert.equal(jevSystemOneUrl("https://example.test/custom/systemone"), "https://example.test/custom/systemone");
   assert.equal(normalizeJevJudgeMode("assist"), JEV_JUDGE_MODE_ASSIST);
+  assert.equal(normalizeJevJudgeMode("auto"), JEV_JUDGE_MODE_AUTO);
   assert.equal(normalizeJevJudgeMode("anything"), "off");
   assert.equal(normalizeJevJudgeThreshold("0.9"), 0.9);
+  assert.equal(DEFAULT_JEV_THRESHOLD, 0.75);
   assert.equal(normalizeJevJudgeThreshold("0.2"), DEFAULT_JEV_THRESHOLD);
 });

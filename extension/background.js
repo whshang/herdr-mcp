@@ -32,7 +32,8 @@ import {
 } from "./goal-supervisor-core.js";
 import {
   DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_THRESHOLD,
-  JEV_JUDGE_MODE_ASSIST, assistLlmVerdictWithJev, buildJevPendingWorkRequest,
+  JEV_JUDGE_MODE_ASSIST, JEV_JUDGE_MODE_AUTO, assistLlmVerdictWithJev, buildJevPendingWorkRequest,
+  decideJevAutoPolicy,
   interpretJevPendingWorkAnswer, isJevJudgeConfigured, jevAgreementWithLlm,
   jevSystemOneUrl, normalizeJevJudgeMode, normalizeJevJudgeThreshold,
 } from "./jev-judge-core.js";
@@ -59,7 +60,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.102";
+const H2W_SCRIPT_VERSION = "0.1.103";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -761,6 +762,16 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
   }
   const patch = {};
+  if (String(CFG.jevJudgeApiKey || "").trim()
+    && (CFG.jevJudgeMode === "shadow" || CFG.jevJudgeMode === "assist")) {
+    // 0.1.102 exposed experimental composition choices. 0.1.103 folds those
+    // into the measured Jev-primary automatic policy so existing testers do
+    // not have to revisit Options after upgrading.
+    CFG.jevJudgeMode = JEV_JUDGE_MODE_AUTO;
+    CFG.jevJudgeThreshold = DEFAULT_JEV_THRESHOLD;
+    patch.jevJudgeMode = CFG.jevJudgeMode;
+    patch.jevJudgeThreshold = CFG.jevJudgeThreshold;
+  }
   if (String(CFG.llmJudgePromptTemplate || "").trim() === LEGACY_DEFAULT_LLM_JUDGE_PROMPT) {
     CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
     patch.llmJudgePromptTemplate = CFG.llmJudgePromptTemplate;
@@ -5084,12 +5095,72 @@ async function maybeIdleNudgeInner(msg) {
     });
   }
 
+  const jevMode = normalizeJevJudgeMode(CFG.jevJudgeMode);
+  const jevConfigured = isJevJudgeConfigured(CFG);
+  if (jevMode === JEV_JUDGE_MODE_AUTO && jevConfigured) {
+    const jev = await fetchJevJudgeOnce(userText, assistantText);
+    const continueText = localizedText(
+      "default_auto_continue_nudge",
+      null,
+      "Continue with the unfinished work you identified.",
+    );
+    const jevMeta = {
+      jev_mode: jevMode,
+      jev_probability: jev?.ok ? jev.probability : null,
+      jev_signal: jev?.ok ? jev.signal : "unavailable",
+      jev_reason: jev?.ok ? null : jev?.reason || "unknown",
+    };
+    const explicitPendingFallback = !jev?.ok && assistantDeclaresPendingWork(assistantText);
+    const policy = decideJevAutoPolicy(jev, explicitPendingFallback);
+    if (policy.action !== "continue") {
+      // Done, uncertainty, and provider failure without explicit pending work
+      // are all non-actionable. Never fall through to the eager legacy LLM.
+      lastJudgedAssistantFp.set(convKey, fp);
+      clearIdleNudgeRetry(convKey);
+      return rememberIdleNudge(convKey, {
+        nudged: false,
+        reason: policy.reason,
+        assistant_fp: fp,
+        ...jevMeta,
+      });
+    }
+
+    lastIdleNudgeAt.set(convKey, Date.now());
+    setActionBadge("!", "#dc2626", 8000);
+    const wakeResult = await routeWake(b, {
+      status: explicitPendingFallback ? "jev_explicit_pending_fallback" : "jev_continue_nudge",
+      output: explicitPendingFallback
+        ? "Jev unavailable; explicit unfinished-work signal allowed one bounded continue"
+        : `Jev continue p=${Number(jev.probability).toFixed(3)}`,
+      working_count: 0,
+      pane: b.pane,
+      agent: b.agent,
+    }, continueText);
+    if (!wakeResult?.ok) {
+      scheduleIdleNudgeRetry(convKey, cooldownMs);
+      return rememberIdleNudge(convKey, {
+        nudged: false,
+        reason: "wake_failed",
+        assistant_fp: fp,
+        send: continueText,
+        error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
+        ...jevMeta,
+      });
+    }
+    lastJudgedAssistantFp.set(convKey, fp);
+    return rememberIdleNudge(convKey, {
+      nudged: true,
+      reason: explicitPendingFallback ? "jev_explicit_pending_fallback" : "jev_continue",
+      assistant_fp: fp,
+      send: continueText,
+      ...jevMeta,
+    });
+  }
+
   if (!isLlmJudgeConfigured(CFG)) {
     return autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs);
   }
 
-  const jevMode = normalizeJevJudgeMode(CFG.jevJudgeMode);
-  const jevConfigured = isJevJudgeConfigured(CFG);
   const jevPromise = jevConfigured
     ? fetchJevJudgeOnce(userText, assistantText)
     : Promise.resolve({ ok: false, reason: "not_configured" });
@@ -5347,7 +5418,14 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
   if (activeTransferFromSource(handoffs, bindingDeliveryConvKey(b) || b?.convKey || "")) {
     return { ok: false, reason: "handoff_active" };
   }
-  const isLlmNudge = ["llm_continue_nudge", "auto_continue_fallback_nudge", "supervisor_continue", "supervisor_answer"].includes(extra.status);
+  const isLlmNudge = [
+    "llm_continue_nudge",
+    "auto_continue_fallback_nudge",
+    "jev_continue_nudge",
+    "jev_explicit_pending_fallback",
+    "supervisor_continue",
+    "supervisor_answer",
+  ].includes(extra.status);
   const rawText = String(template || "").trim();
 
   if (isLlmNudge) {
