@@ -852,27 +852,54 @@ test("user Given unavailable browser actuation When the content script rejects i
   }
 });
 
-test("user can stop a live answer | Given ChatGPT labels the stop button in Chinese or English | When Herdr classifies the control | Then the stop action remains available", () => {
-  const start = wakeSource.indexOf("  function explicitStopControl(");
-  const end = wakeSource.indexOf("  function stopButtons()", start);
-  assert.ok(start >= 0 && end > start, "stop-control classifier must remain extractable");
-  const explicitStopControl = new Function(
-    "elementVisible",
-    `${wakeSource.slice(start, end)}
-    return explicitStopControl;`,
-  )(() => true);
-  const button = (ariaLabel) => ({
-    getAttribute(name) {
-      if (name === "aria-label") return ariaLabel;
-      return null;
-    },
-    innerText: "",
-    textContent: "",
-  });
+test("user can stop a live answer | Given an explicit visible stop control while the generic turn probe lags | When stop is requested | Then Herdr clicks once and verifies the stopped postcondition", async () => {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
+  assert.ok(commandStart >= 0 && commandEnd > commandStart);
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const ctx = { clicked: false };
+  const act = new Function("ctx", `
+    const stopButton = {
+      disabled: false,
+      getAttribute: (name) => name === "aria-disabled" ? "false" : null,
+      click: () => { ctx.clicked = true; },
+    };
+    const ADAPTER = {
+      name: "chatgpt",
+      getConversationKey: () => "conv-current",
+      getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
+      getStopButtonCandidates: () => ctx.clicked ? [] : [stopButton],
+      elementVisible: () => true,
+    };
+    const chatGptConversationId = () => "current";
+    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = "conv-current";
+    const providerCanonicalConversationObserved = () => true;
+    const document = { hidden: false };
+    const isTurnInProgress = () => false;
+    const wait = async () => {};
+    ${evidenceSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)(ctx);
 
-  assert.equal(explicitStopControl(button("停止回答")), true);
-  assert.equal(explicitStopControl(button("Stop response")), true);
-  assert.equal(explicitStopControl(button("Stop sharing")), false);
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.stop",
+    expected_generation: 17,
+    params: {},
+  });
+  assert.equal(ctx.clicked, true);
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.generation_owner, 17);
+  assert.equal(result.generation_status_observed, true);
+  assert.equal(result.generation_stopped, true);
 });
 
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {

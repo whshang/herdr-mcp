@@ -1938,7 +1938,7 @@ const H2W_CONTENT_VERSION = "0.1.101";
         if (!ADAPTER.elementVisible(button) || button?.disabled === true) return false;
         return button?.getAttribute?.("aria-disabled") !== "true";
       });
-      if (!stopButton || !isTurnInProgress()) {
+      if (!stopButton) {
         return browserRejectedEvidence(evidence, "browser_stop_control_unavailable");
       }
       stopButton.click();
