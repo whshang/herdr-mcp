@@ -3,8 +3,6 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import {
-  DEFAULT_LLM_JUDGE_PROMPT,
-  DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   buildLlmJudgeUserMessage,
   interpretLlmJudgeReply,
   llmJudgeCompletionsUrl,
@@ -48,8 +46,6 @@ function llmConfig() {
     baseUrl: env("HERDR_LLM_JUDGE_BASE_URL"),
     apiKey: env("HERDR_LLM_JUDGE_API_KEY"),
     model: env("HERDR_LLM_JUDGE_MODEL"),
-    prompt: DEFAULT_LLM_JUDGE_PROMPT,
-    skipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   };
 }
 
@@ -96,7 +92,7 @@ async function postJson(url, apiKey, body, timeoutMs) {
 }
 
 async function runLlm(row, cfg) {
-  const prompt = buildLlmJudgeUserMessage(cfg.prompt, {
+  const prompt = buildLlmJudgeUserMessage({
     userText: row.user,
     assistantText: row.assistant,
   });
@@ -114,7 +110,7 @@ async function runLlm(row, cfg) {
   if (!response.ok) return response;
   const content = response.body?.choices?.[0]?.message?.content;
   if (typeof content !== "string") return { ...response, ok: false, reason: "bad_response" };
-  const verdict = interpretLlmJudgeReply(content, { skipKeywords: cfg.skipKeywords });
+  const verdict = interpretLlmJudgeReply(content);
   return {
     ok: true,
     latency_ms: response.latency_ms,

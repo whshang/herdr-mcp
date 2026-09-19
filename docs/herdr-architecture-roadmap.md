@@ -14,6 +14,7 @@
 - **生产 Link 是 Rust**，执行 `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`。
 - **first-party DEV/PROD 公共 Edge contract 为 epoch 7 / 19 actions，workstation Runtime Execution Contract 为 epoch 4 / 18 tools**；第 19 个 `herdr_devices` 由 Edge 本地执行，不转发到 workstation；Runtime epoch 2/3 与公共 Edge epoch 3 仅作为有界的 rollback/compatibility 身份保留。
 - **浏览器控制面是有界的**：不宣称 browser true-steer；普通终端只开放有 target fencing 的窄化 `Run command -> pane.send_input + Enter`，任意 Herdr method 仍保持 preview-only。
+- **浏览器 Auto 的语义判断是固定策略，不是用户可编程 prompt**：普通 post-turn 顺序为 deterministic safety/scope gates → Jev/System One（配置时）→ OpenAI-compatible LLM judge（配置时）→ bounded script fallback。Goal Supervisor 可以消费 Jev 的五信号 advisory prior（`can_continue / needs_human / waiting_external / task_completed / needs_handoff`），但 Work Memory/TODO evidence 与 deterministic runtime guard 仍独占完成、等待、接力、人工边界和 uncertain-delivery 的执行许可。用户只配置 Provider endpoint/model/key；不得重新引入 Shadow/Assist、用户阈值、可编辑 judge prompt/done keywords 或第二套 Goal authority。
 - **`v0.4.8` 是当前稳定 0.4.x 产品基线**；1.0 未发布能力仍必须描述为 development/upcoming，不能提前写成当前产品能力。
 
 ## 总体目标

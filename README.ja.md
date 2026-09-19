@@ -164,6 +164,8 @@ herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.c
 
 ChatGPT → MCP → 開発マシンの基本接続には必須ではありません。会話の継続、queued next-turn、Browser Control Center、対応する ChatGPT artifact capture が必要な場合に追加します。
 
+ChatGPT Auto では deterministic な browser/runtime safety gate が常に authoritative です。通常の turn 終了後の semantic judgment は、固定された段階的な順序 **Jev/System One（設定済みの場合）→ OpenAI 互換 LLM judge（設定済みの場合）→ bounded script fallback** で動きます。Goal-aware automation では Jev の 5 signal を既存 LLM Goal Supervisor の advisory prior として使えますが、完了の authority は Work Memory/TODO evidence に残ります。ユーザーが設定するのは各 Provider の endpoint、model、API key のみで、Shadow/Assist、ユーザー threshold、judge prompt、done-keyword list は提供しません。
+
 macOS で STANDALONE channel を使う場合、`herdr-mcp doctor` は Google Chrome が固定 Herdr standalone ID を managed path `~/.config/herdr-mcp/extensions/standalone/current` から実際に読み込んでいるかも確認します。`standalone-extension-load state=drift` が出た場合、Chrome は別の Load-unpacked directory を使っているため、`doctor` が示す `expected` path から Herdr extension を再読み込みしてください。
 
 [Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [拡張の手引き](docs/i18n/ja/extension.md) · [ブラウザ連続性](docs/i18n/ja/browser-continuity.md)

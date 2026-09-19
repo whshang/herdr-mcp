@@ -100,6 +100,8 @@ herdr-mcp Rust runtime
 5. 状態、Pinned Target、手動操作を確認している間は Auto をオフのままにします。
 6. 無人で長時間動く作業が本当に必要なときにだけ、スコープ付きの Continuity 自動化を有効にします。
 
+semantic Auto の Provider 設定は意図的に小さく保たれています。TypeSafe/Jev と OpenAI 互換 LLM judge は、それぞれ endpoint、model、API key だけを公開します。通常の Auto は Jev -> LLM -> bounded script fallback の固定順序で動き、Goal-aware Auto では Jev を既存 LLM Goal Supervisor の advisory semantic prior として利用できます。どちらの API がなくても script fallback が基本 Auto を維持し、Work Memory/TODO evidence と deterministic safety guard は引き続き authoritative です。Shadow/Assist mode、ユーザー設定の Jev threshold、編集可能な judge prompt、done/skip keywords は退役済みです。
+
 z.ai / DeepSeek の JSON → MCP 連携は実験的で、既定では無効です。Herdr の実験的設定で明示的に有効にしてください。
 
 ## リリースとメンテナンスの境界

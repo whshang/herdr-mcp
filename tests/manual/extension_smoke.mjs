@@ -19,7 +19,7 @@ import {
   progressOutputFingerprint,
   isIdleNudgeText, looksLikeSubstantiveReply, isHerdrWakeComposerText,
   interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
-  parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
+  assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
   conversationInfoFromSupportedUrl,
 } from "../../extension/binding-core.js";
 import {
@@ -1698,7 +1698,7 @@ ok(!isLlmJudgeConfigured({ llmJudgeBaseUrl: "", llmJudgeApiKey: "k", llmJudgeMod
 ok(llmJudgeCompletionsUrl("https://x/v1") === "https://x/v1/chat/completions", "url append completions");
 ok(llmJudgeCompletionsUrl("https://x//v1") === "", "mistyped duplicate path slash is rejected instead of silently normalized");
 ok(llmJudgeCompletionsUrl("https://x/v1/chat/completions") === "https://x/v1/chat/completions", "url already full");
-ok(buildLlmJudgeUserMessage("看：{content}", { assistantText: "hello" }).includes("hello"), "prompt fills content");
+ok(buildLlmJudgeUserMessage({ assistantText: "hello" }).includes("hello"), "built-in judge prompt fills content");
 ok(interpretLlmJudgeReply("好的").done === true, "好的 → done");
 ok(interpretLlmJudgeReply("继续").cont === true, "继续 → continue");
 ok(interpretLlmJudgeReply("继续").nudgeText === "继续", "bare 继续 sends model text");
@@ -1730,11 +1730,8 @@ ok(shouldAutoContinueWithoutLlm(configuredContinue, "Validation is not yet compl
   "configured Continue may chain only when the assistant explicitly declares unfinished work");
 ok(assistantNudgeFingerprint("abc") === assistantNudgeFingerprint("abc"), "fp stable");
 ok(assistantNudgeFingerprint("abc") !== assistantNudgeFingerprint("abd"), "fp differs");
-ok(parseLlmSkipKeywords("").includes("好的"), "empty skip → built-in");
-ok(parseLlmSkipKeywords("完成\nPASS").join(",") === "完成,PASS", "custom skip parse");
-ok(llmReplyMatchesSkipKeyword("完成。", "完成\nPASS"), "custom skip match");
-ok(interpretLlmJudgeReply("完成", { skipKeywords: "完成\nPASS" }).done === true, "custom skip → done");
-ok(interpretLlmJudgeReply("好的", { skipKeywords: "完成" }).done === false, "好的 not in custom skip → not done");
+ok(interpretLlmJudgeReply("done.").done === true, "built-in English done token → done");
+ok(interpretLlmJudgeReply("完成").done === false, "non-protocol completion text stays ambiguous");
 
 console.log("\n[browser result settlement]");
 ok(backgroundSource.includes('operation: "dispatch.result"')

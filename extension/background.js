@@ -14,7 +14,6 @@ import {
   pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
   assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
-  DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   conversationInfoFromSupportedUrl,
 } from "./binding-core.js";
 import {
@@ -421,7 +420,9 @@ let CFG = {
   progressTemplate: "",
   manualContinueMessage: "",
   idleNudgeEnabled: true,
-  // Post-turn LLM judge (OpenAI-compatible). Defaults empty — fill in Options.
+  // OpenAI-compatible semantic/planning provider. Ordinary Auto reaches it
+  // after Jev uncertainty/unavailability; Goal Supervisor also uses it for
+  // bounded structured decisions. Users configure endpoint/model/key only.
   llmJudgeBaseUrl: "",
   llmJudgeApiKey: "",
   llmJudgeModel: "",
@@ -738,6 +739,9 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   await detectOrLoadLocale();
   let stored = {};
   try {
+    // The four semantic-policy keys below are migration tombstones only. They
+    // are read so upgrades can erase historical user policy, never to restore
+    // Shadow/Assist, a user threshold, an editable prompt, or custom done tokens.
     const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", "jevJudgeMode", "jevJudgeThreshold", "llmJudgePromptTemplate", "llmJudgeSkipKeywords", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
@@ -793,7 +797,8 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   }
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
-  // during upgrade; old extension binaries remain server-compatible separately.
+  // during upgrade. The semantic-policy names are retired migration tombstones:
+  // 0.1.103 also erases them so hidden legacy settings cannot survive an update.
   try {
     await chrome.storage.local.remove([
       "autoAllow",
@@ -4102,7 +4107,7 @@ async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null, ti
   if (!isLlmJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
   if (!await hasLlmHostPermission(cfg)) return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
   const url = llmJudgeCompletionsUrl(cfg.llmJudgeBaseUrl);
-  const prompt = buildLlmJudgeUserMessage(DEFAULT_LLM_JUDGE_PROMPT, { userText, assistantText });
+  const prompt = buildLlmJudgeUserMessage({ userText, assistantText });
   const body = {
     model: String(cfg.llmJudgeModel).trim(),
     messages: [{ role: "user", content: prompt }],
@@ -5226,9 +5231,7 @@ async function maybeIdleNudgeInner(msg) {
   if (llmConfigured) {
     const judged = await fetchLlmJudge(userText, assistantText);
     if (judged.ok) {
-      const verdict = interpretLlmJudgeReply(judged.content, {
-        skipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-      });
+      const verdict = interpretLlmJudgeReply(judged.content);
       if (verdict.done) {
         lastJudgedAssistantFp.set(convKey, fp);
         clearIdleNudgeRetry(convKey);
@@ -5646,9 +5649,7 @@ async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
       status: judged.status || null,
     });
   }
-  const verdict = interpretLlmJudgeReply(judged.content, {
-    skipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-  });
+  const verdict = interpretLlmJudgeReply(judged.content);
   if (verdict.done) {
     return rememberIdleNudge(convKey, { ok: true, continued: false, nudged: false, reason: "llm_done", raw: verdict.raw });
   }
@@ -7506,8 +7507,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         incoming.manualContinueMessage = String(incoming.manualContinueMessage || "").trim().slice(0, 4000)
           || defaultManualContinueMessage();
       }
+      // Retired semantic-policy inputs are ignored even when a stale Options
+      // page or older content script submits them during an extension update.
       delete incoming.jevJudgeMode;
       delete incoming.jevJudgeThreshold;
+      delete incoming.llmJudgePromptTemplate;
+      delete incoming.llmJudgeSkipKeywords;
       if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeBaseUrl")) {
         incoming.jevJudgeBaseUrl = String(incoming.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim()
           || DEFAULT_JEV_BASE_URL;
@@ -7522,6 +7527,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       CFG.enabled = false;
       CFG.idleNudgeEnabled = false;
       delete CFG.idleNudgeCooldownSec;
+      delete CFG.jevJudgeMode;
+      delete CFG.jevJudgeThreshold;
+      delete CFG.llmJudgePromptTemplate;
+      delete CFG.llmJudgeSkipKeywords;
       await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
       try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token", "jevJudgeMode", "jevJudgeThreshold", "llmJudgePromptTemplate", "llmJudgeSkipKeywords"]); } catch (e) {}
       await syncExperimentalContentScripts();
@@ -7603,9 +7612,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
         return;
       }
-      const verdict = interpretLlmJudgeReply(judged.content, {
-        skipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-      });
+      const verdict = interpretLlmJudgeReply(judged.content);
       sendResponse({
         ok: true,
         content: judged.content,
