@@ -31,7 +31,7 @@
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-Windows 使用官方 `install.ps1`，并验证 `herdr --version` 与 `herdr api schema`。Windows UAT 使用对应 PR CI 的 `windows-uat` artifact，不使用 0.4.8，也不从源码编译。
+Windows 使用官方 `install.ps1`，并验证 `herdr --version` 与 `herdr api schema`。Windows 在实体机资格完成前仍属于 Candidate；Release/UAT 必须使用正在验收的精确 candidate artifact，不得用旧 stable binary 或临时源码构建替代。
 
 然后从 <https://github.com/whshang/herdr-mcp/releases> 取得当前 **Latest stable** 的平台二进制，放入用户 `PATH`（推荐 `~/.local/bin/herdr-mcp`），并执行：
 

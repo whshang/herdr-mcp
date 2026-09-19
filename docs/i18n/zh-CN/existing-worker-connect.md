@@ -6,7 +6,7 @@ Herdr 的多设备模型是：一个公网 Worker/Connector，后面连接多台
 
 Herdr 0.9.1 还提供独立的 SSH saved machine 多机器 TUI，以及原生 `herdr --machine <label-or-id> <command>` forwarding。这一层可以与 Herdr-MCP Edge 设备同时存在，甚至同时指向同一台物理机，但它不会替代 `device_id` 路由。身份、路由和故障切换规则见 [Herdr 0.9.1 多机器与双线控制](multi-machine-control.md)。
 
-> v0.4.8 的安全新设备配对支持 macOS 与 x86_64 Linux/Debian。macOS 最终凭据仍进入 Keychain；Linux 使用用户私有 credential store，目录权限为 `0700`、常规凭据文件为 `0600`。Windows 配对仍不可用并 fail closed。
+> 当前 1.0 代码支持 macOS、原生 Linux 与 Windows 的安全新设备配对。macOS 最终凭据进入 Keychain；Linux 使用用户私有 credential store，目录权限为 `0700`、常规凭据文件为 `0600`；Windows 使用当前用户的 Windows Credential Manager。Windows 在平台支持矩阵中的实体机资格完成前仍属于 Candidate。
 
 ## 在 ChatGPT 查看设备组
 

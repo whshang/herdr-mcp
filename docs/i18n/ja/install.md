@@ -164,10 +164,10 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 ブラウザ拡張は、Side Panel Control Center、workspace binding、長い会話の continuity、キューされた次ターンのメッセージを追加します。基本の MCP ループには必要ありません。
 
-拡張には 3 つの identity があります。**STORE / STANDALONE / DEV** です。v0.4.2 の Native Host は Store/DEV ownership をサポートし、v0.4.3+ は GitHub / 手動配布向けの固定 identity の STANDALONE 経路を追加します。
+拡張には現在 3 つの identity があります。**STORE / STANDALONE / DEV** です。STORE は通常ユーザー向け、STANDALONE は固定 identity の GitHub / 手動配布向け、DEV はソース開発専用です。
 
 - STORE：一般ユーザーのデフォルト経路。固定の Chrome Web Store identity と Store 経由の更新;
-- STANDALONE：v0.4.3+。独立 / GitHub 配布向けの固定非 Store identity;
+- STANDALONE：独立 / GitHub 配布向けの固定非 Store identity;
 - DEV：ソース開発専用。リポジトリ / worktree の `extension/` から Load unpacked し、パス由来の identity を持つ。
 
 サポートされているチャネルをインストール / 選択した後に次を実行します。
@@ -207,7 +207,7 @@ maintainer の UAT、GA gate、リリースエビデンスは、通常のユー�
 
 ## 修復・再インストール・アンインストール
 
-v0.4.3+ では、launchd ファイルや runtime ディレクトリを手動で削除するのではなく、製品レベルの lifecycle コマンドを使用してください。
+launchd ファイルや runtime ディレクトリを手動で削除するのではなく、製品レベルの lifecycle コマンドを使用してください。
 
 ```bash
 herdr-mcp reinstall

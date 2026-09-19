@@ -111,13 +111,13 @@ ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。
 
 新的 ChatGPT 接力在 Rust journal 不可用或实时确认失败时直接失败并保留源会话与完整旧 URL，不再请求源 WebChat 或 fallback LLM 生成接力摘要。`HERDR_HANDOFF_V1` 只作为升级前已存在 transfer 和 provider-specific legacy contract（例如 z.ai）的读取/恢复兼容，不再由新的 ChatGPT 接力生成。
 
-### 未来目标：Continuity 2.0
+### 1.0 Work Memory 与 continuity 压缩
 
-`v0.4.2` 解决的是“平时持续记录，窗口或会话失效后仍能恢复”。后续正式路线中的 Continuity 2.0 继续解决“同一个工作链持续几天、几百轮甚至更久以后，恢复上下文如何仍然保持很小”。它当前不属于 `v0.4.2`，也尚未绑定具体版本号；版本归属继续作为独立的 post-`v0.4.2` release planning 决策。
+1.0 runtime 已在 Continuity Journal 之上实现 Project Work Memory 与 verified rolling checkpoint。finalized raw turns 继续作为持久 continuity evidence；`work_memory.checkpoint.put` 通过 checkpoint revision CAS 写入紧凑结构化 checkpoint，并要求来自同一 Work Memory partition 的真实 message/evidence anchor。
 
-Continuity 2.0 会持续把较老 raw turns 压成 rolling semantic checkpoint，保留目标、已完成事项、关键决定、约束、活跃文件/分支/commit、待办、下一步和 literal anchors。恢复时优先使用“最新 checkpoint + 最近 raw tail”，而不是重新发送完整长会话。只有新 checkpoint 已验证可恢复后，系统才能回收更早的 raw body；页面内存、长 DOM 和主线程/render 压力也会与模型 context pressure 一起参与 rollover 决策。
+`work_memory.resume` 按精确的 `project_ref + repo_id + work_chain_id` partition 恢复，返回最新 verified checkpoint、有界 recent raw tail 与本机 evidence。这样长期工作链可以保持有界恢复上下文，同时继续只有一套任务状态权威。浏览器 handoff 继续复用同一个 `continuity_id`；Provider 自带 Memory 不承担恢复权威。
 
-实施顺序保持 `Reliability Kernel → Continuity 2.0`，详细技术设计见 [Rust Native Rearchitecture](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20) 的 Phase 8 章节。
+只有 replacement checkpoint 的 evidence 已生成并验证后，才允许回收更早的 raw body。页面内存、长 DOM、主线程/render 压力和模型 context pressure 可以参与 rollover 判断，但不会改变 Work Memory 权威或 replay safety。checkpoint mutation 继续受 Reliability Kernel 的 generation、idempotency、delivery 与 uncertain-result 规则保护。原始设计 provenance 保留在 [Rust Native Rearchitecture Phase 8](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20) 和 [1.0 Alpha 2 Work Memory 设计](../../history/architecture/v1.0-alpha2-work-memory.md)。
 
 ## 人工与自动控制
 

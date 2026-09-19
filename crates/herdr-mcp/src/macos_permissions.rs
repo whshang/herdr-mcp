@@ -1,6 +1,6 @@
 //! User-facing macOS permission lifecycle for the unsigned stable TCC broker.
 //!
-//! Developer ID signing is optional hardening, not a v0.4.2 gate. The stable
+//! Developer ID signing is optional hardening, not an installation gate. The stable
 //! identity is the installed broker at `<config_dir>/tcc-broker/herdr-mcp-broker`.
 //! `setup` may open Privacy & Security settings and must never claim to grant
 //! permission.

@@ -23,14 +23,14 @@ ChatGPT composer 旁的“排队”属于浏览器交互：它等待当前回复
 | 通道 | 用途 | Chromium 身份 |
 | --- | --- | --- |
 | **STORE** | 普通用户默认 | Chrome Web Store 固定身份，由商店更新 |
-| **STANDALONE** | v0.4.3+ GitHub / 手动独立分发 | 固定非 Store 身份，安装路径变化不改变 ID |
+| **STANDALONE** | GitHub / 手动独立分发 | 固定非 Store 身份，安装路径变化不改变 ID |
 | **DEV** | 源码开发 | repo/worktree `extension/` Load unpacked，ID 由路径派生 |
 
-stable v0.4.2 的 Native Host contract 只有 STORE/DEV；STANDALONE 需要实际支持该 contract 的 v0.4.3+ runtime。不要用路径派生 DEV build 冒充 standalone。
+当前 runtime 支持 STORE / STANDALONE / DEV 三种 Native Host ownership。STANDALONE 使用固定的非 Store 身份；不要用路径派生 DEV build 冒充 standalone。更老的 runtime 可能只暴露部分通道，切换 ownership 前先检查已安装 runtime。
 
 默认安装 [Herdr Chrome Web Store 官方扩展](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp)。只有 Store 不适用且 runtime 明确支持时才选 STANDALONE；DEV 只用于源码开发。
 
-v0.4.3+ 可直接从 GitHub 仓库生成本机可 Load unpacked 的 STANDALONE 副本，不需要 clone 源码仓库：
+当前 runtime 可直接从 GitHub 仓库生成本机可 Load unpacked 的 STANDALONE 副本，不需要 clone 源码仓库：
 
 ```bash
 herdr-mcp extension standalone install
@@ -42,7 +42,7 @@ herdr-mcp native-host use standalone
 支持 `--path` 的 runtime 可以显式指定 Chrome “加载已解压的扩展程序”看到的路径：
 
 ```bash
-herdr-mcp extension standalone install --ref extension-v0.1.91 --path ~/Documents/herdr-mcp/extension
+herdr-mcp extension standalone install --ref <release-tag-or-commit> --path ~/Documents/herdr-mcp/extension
 ```
 
 `--path` 可省略，默认用户可见路径为 `~/Documents/herdr-mcp/extension`。自定义路径必须解析到用户 HOME 目录以内。真实受管副本始终保留在 `~/.config/herdr-mcp/extensions/standalone/current`，指定路径只是指向受管副本的稳定软链，因此改变 `--path` 不会改变 standalone 扩展身份。用户显式指定的路径若已被占用，命令直接失败而不是覆盖；默认路径冲突则保持原内容不动，并回退到受管路径。自动化需要确定 `chrome://extensions` → Developer mode → Load unpacked 应选择哪个目录时，运行 `herdr-mcp extension standalone status` 并读取 `chrome.load_unpacked_path`；后续更新继续复用同一路径。该值是上次安装记录的 Chrome 可见路径，读取自 `~/.config` state，因此即使 macOS 权限不允许读取 `~/Documents` 也保持稳定；此时 `user_visible_path.status` 会显示 `unverified`，但不会改变 `chrome.load_unpacked_path`。
@@ -104,7 +104,7 @@ z.ai / DeepSeek 的 JSON → MCP 属于实验性集成，默认关闭，需要�
 
 ## 发布与维护边界
 
-STORE / STANDALONE / DEV 可以作为不同扩展身份共存，但受管 Native Messaging manifest 只有一个 active owner。Store 身份以 `contracts/browser-extension-store.json` 为机器可读 SSOT；v0.4.3 Standalone 身份以 `contracts/browser-extension-standalone.json` 为 SSOT；DEV 继续使用路径派生身份。
+STORE / STANDALONE / DEV 可以作为不同扩展身份共存，但受管 Native Messaging manifest 只有一个 active owner。Store 身份以 `contracts/browser-extension-store.json` 为机器可读 SSOT；Standalone 身份以 `contracts/browser-extension-standalone.json` 为 SSOT；DEV 继续使用路径派生身份。
 
 切换 `native-host use store` / `use standalone` / `use dev` 后刷新已经打开的受支持页面。扩展版本生命周期独立于 Rust runtime；只有新增 Native Host identity/channel contract 时才要求相应 runtime 能力。
 

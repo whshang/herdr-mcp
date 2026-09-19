@@ -253,7 +253,7 @@ herdr-mcp doctor
 2. まず `herdr-mcp status` / `herdr-mcp doctor` で、ローカル runtime が健全であることを証明してください。
 3. `herdr-mcp native-host status` が Native Messaging host の登録を報告するはずです。
 4. Chrome が Store の拡張を更新した直後なら、影響を受ける Web ページを更新してください（必要なら Chrome を再起動します）。現在の content script が読み込まれるようにするためです。
-5. `herdr-mcp native-host status` は、意図して選択した extension identity/channel と、active runtime generation と整合する Native Host runtime を報告するはずです。v0.4.2 でサポートされる ownership channel は Store/DEV で、v0.4.3+ では STANDALONE も報告され得ます。origin mismatch を、別のチャネルを推測して直そうとしないでください。まずインストール済み runtime がサポートするコマンドと、Chrome の実際の extension identity を inspect してください。
+5. `herdr-mcp native-host status` は、意図して選択した extension identity/channel と、active runtime generation と整合する Native Host runtime を報告するはずです。現在の runtime は STORE / STANDALONE / DEV をサポートし、古い runtime では利用できる channel が少ない場合があります。origin mismatch を、別のチャネルを推測して直そうとしないでください。まずインストール済み runtime がサポートするコマンドと、Chrome の実際の extension identity を inspect してください。
 6. `Runtime healthy · event stream reconnecting` は、増分イベントが復旧している間もパネルが snapshot を持っていることを意味し、ローカル runtime 全体が停止していることを意味しません。権威ある reconciliation には Refresh を使ってください。
 
 `Send instruction` は信頼されたローカル制御経路で実行されます。`Adjust current task` は正確な provider capability/outcome を返し、黙って Prompt になることはありません。ターミナルのみの pane では、fencing された `pane.send_input + Enter` 経路でコマンドを実行できます。任意の `Herdr API` は Preview-only のままです。いずれかの mutation が `uncertain` を報告した場合は、再試行の前に live state を inspect してください。Steer が `session_not_resolved` を報告する場合、選択された provider session に検証可能な control endpoint/thread/active-turn のマッピングがありません。これは capability の結果であり、transport の失敗ではありません。

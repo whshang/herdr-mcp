@@ -46,7 +46,7 @@ macOS 上，`reinstall` 是产品级修复 / 重装入口；Linux 的 runtime �
 
 ## 源码开发 Runtime：DEV / PROD
 
-v0.4.3+ 只有这一条正式路径可以让开发机 dogfood herdr-mcp 源码，同时始终保留稳定 PROD 恢复源：
+当前 runtime 只有这一条正式路径可以让开发机 dogfood herdr-mcp 源码，同时始终保留稳定 PROD 恢复源：
 
 ```bash
 herdr-mcp dev status
@@ -100,7 +100,7 @@ probe 子进程没有 stdin，超时上限为三秒，输出有大小上限，�
 
 ### Web planner 的动态规划建议
 
-v0.4.3+ 继续保持 18 个 public MCP tools，不新增专用 planning tool。`herdr_skill` 的 progressive bootstrap 会声明一个现有 `herdr_call` 可调用的本地只读方法：
+当前 workstation Runtime Execution Contract 为 epoch 4 / 18 tools，不新增专用 planning tool；first-party 公共 Edge contract 为 epoch 7 / 19 actions，其中 `herdr_devices` 只在 Edge 执行。`herdr_skill` 的 progressive bootstrap 会声明一个现有 `herdr_call` 可调用的本地只读方法：
 
 ```text
 herdr_call(

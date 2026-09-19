@@ -6,7 +6,7 @@ A Herdr fleet has one public Worker/Connector and multiple independently identif
 
 Herdr 0.9.1 also has its own saved SSH-machine layer for a multi-machine TUI and native `herdr --machine <label-or-id> <command>` forwarding. That layer can coexist with this Edge fleet, including on the same physical computer, but it does not replace `device_id` routing. See [Herdr 0.9.1 multi-machine and dual-path control](multi-machine-control.md) for the identity, routing, and failover rules.
 
-> v0.4.8 supports secure new-device pairing on macOS and x86_64 Linux/Debian. macOS keeps the final device credential in Keychain; Linux uses a private per-user credential store with a `0700` directory and `0600` regular credential files. Windows pairing remains unavailable and fails closed.
+> Current 1.0 code supports secure new-device pairing on macOS, native Linux, and Windows. macOS keeps the final device credential in Keychain; Linux uses a private per-user credential store with a `0700` directory and `0600` regular credential files; Windows uses the current-user Windows Credential Manager. Windows remains a Candidate platform until the physical qualification in the platform support matrix is complete.
 
 ## See the fleet from ChatGPT
 
