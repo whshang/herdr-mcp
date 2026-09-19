@@ -136,6 +136,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `browser_dispatch.submit`（普通消息） | `herdr-mcp webchat send` | 支持 |
 | `browser_dispatch.status` | `herdr-mcp webchat dispatch-status` | 支持（只读） |
 | `browser_session.archive` | `herdr-mcp webchat archive` | 支持 |
+| `browser_session.archive_status` | `herdr-mcp webchat archive-status` | 支持（只读 provider 归档状态核对） |
 | `browser_session.open` | `herdr-mcp webchat open` | 支持 |
 | `browser_dispatch.stop` | — | 支持的私有方法，无 CLI 包装 |
 | `browser_message.append` | — | 不支持 |

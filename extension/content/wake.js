@@ -1632,6 +1632,13 @@ const H2W_CONTENT_VERSION = "0.1.101";
       // inconclusive. Never click a second time; stay honest about uncertainty.
       return { outcome: "uncertain", delivered: true };
     }
+    const existing = await fetchChatGptConversation({
+      conversationId,
+      timeoutMs: 2500,
+    }).catch(() => ({ ok: false }));
+    if (existing?.ok && existing?.body?.is_archived === true) {
+      return { outcome: "applied", delivered: false, alreadyArchived: true };
+    }
     const archive = await openChatGptArchiveMenu();
     if (!archive) return { outcome: "rejected", delivered: false };
     // Converge the one-shot rule here, before the real click: persist and verify
@@ -1757,8 +1764,46 @@ const H2W_CONTENT_VERSION = "0.1.101";
     }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
-    if (attempt.outcome === "applied") evidence.lifecycle_observed = true;
-    else evidence.lifecycle_observed = false;
+    if (attempt.outcome === "applied") {
+      evidence.lifecycle_observed = true;
+      if (attempt.alreadyArchived === true) {
+        evidence.result = { is_archived: true, already_archived: true };
+      }
+    } else {
+      evidence.lifecycle_observed = false;
+    }
+    return evidence;
+  }
+
+  async function performChatGptSessionArchiveStatus(command, evidence) {
+    if (ADAPTER.name !== "chatgpt") {
+      return browserUnavailableEvidence(evidence, "browser_archive_status_provider_unavailable");
+    }
+    const params = command?.params && typeof command.params === "object" ? command.params : {};
+    const sessionRef = typeof params.session_ref === "string" ? params.session_ref : "";
+    const conversationId = chatGptConversationId();
+    if (!sessionRef || sessionRef !== registeredBrowserSessionRef || !conversationId) {
+      return browserUnavailableEvidence(evidence, "browser_archive_status_session_unavailable");
+    }
+    if (evidence.observed_generation !== registeredBrowserGeneration) {
+      return browserUnavailableEvidence(evidence, "browser_archive_status_generation_unavailable");
+    }
+    evidence.command_accepted = true;
+    evidence.stable_resource_ref_observed = true;
+    const readback = await fetchChatGptConversation({
+      conversationId,
+      timeoutMs: 2500,
+    }).catch(() => ({ ok: false }));
+    if (!readback?.ok || typeof readback?.body?.is_archived !== "boolean") {
+      evidence.lifecycle_observed = false;
+      evidence.result = { error: "browser_archive_status_readback_unavailable" };
+      return evidence;
+    }
+    evidence.lifecycle_observed = true;
+    evidence.result = {
+      is_archived: readback.body.is_archived,
+      archive_state: readback.body.is_archived ? "archived" : "active",
+    };
     return evidence;
   }
 
@@ -1856,6 +1901,9 @@ const H2W_CONTENT_VERSION = "0.1.101";
       evidence.canonical_url_observed = true;
       evidence.observed_generation = expectedGeneration;
       return evidence;
+    }
+    if (command?.operation === "herdr_mcp.browser_session.archive_status") {
+      return performChatGptSessionArchiveStatus(command, evidence);
     }
     if (command?.operation === "herdr_mcp.browser_session.archive") {
       return performChatGptSessionArchive(command, evidence);

@@ -7,8 +7,9 @@ use crate::paths::RuntimePaths;
 use crate::progressive_skills::{
     BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD, BROWSER_ENDPOINT_LIST_METHOD,
     BROWSER_HANDOFF_PREPARE_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
-    BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_OPEN_METHOD,
-    BROWSER_SOURCE_RESOLVE_METHOD, WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
+    BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
+    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::state_store::BrowserDeliveryState;
 use serde_json::{Map, Value, json};
@@ -223,6 +224,20 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
                     "session_ref": session_ref,
                     "expected_generation": expected_generation,
                     "idempotency_key": idempotency_key,
+                }),
+                Some(&grant),
+            )?)
+        }
+        WebChatCommand::ArchiveStatus {
+            session_ref,
+            expected_generation,
+        } => {
+            let grant = grant_for_resource(&session_ref)?;
+            print_private_result(call_private(
+                BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
+                json!({
+                    "session_ref": session_ref,
+                    "expected_generation": expected_generation,
                 }),
                 Some(&grant),
             )?)

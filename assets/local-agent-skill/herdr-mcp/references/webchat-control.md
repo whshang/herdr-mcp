@@ -59,6 +59,14 @@ Archive a session this task created:
 herdr-mcp webchat archive --session-ref SESSION_REF --expected-generation N --idempotency-key KEY
 ```
 
+Reconcile provider archive state without clicking Archive:
+
+```sh
+herdr-mcp webchat archive-status --session-ref SESSION_REF --expected-generation N
+```
+
+`archive-status` is read-only provider readback and returns `archive_state=archived|active|unknown`. After an `archive` result of `uncertain`, never replay the archive mutation blindly. Reopen the exact registered session if needed, run `archive-status`, and act only on that evidence. If it reports `archived`, a later `archive` convergence call is safe for view cleanup because the browser adapter first rechecks provider state and returns applied without a second Archive click. If it reports `active`, the previous uncertain attempt did not leave the provider archived; a new archive mutation is then a new evidence-backed attempt. If it reports `unknown`, stop and keep the outcome unresolved.
+
 Continuation / handoff contract:
 
 ```sh
