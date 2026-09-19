@@ -112,7 +112,7 @@ workstation ── outbound WSS ──► Edge
 
 OAuth と public な `/health` は動作するのに、tool call が `workstation offline` を報告する場合は、Connector を再インストールするのではなく link を調査してください。
 
-v0.4.3+ では、Edge は最近接続していたワークステーションにまず短いインメモリの reconnect grace を与えます。validated Link が戻らない場合、MCP エラーは `retryable`、`delivery_state`、`retry_after_ms` と有界な読み取り専用 recovery policy を提示するため、Agent は replay が安全かどうかを推測する必要がありません。ワークステーション側の Link には独自の reconnect/backoff と長時間オフライン時の recycle 経路があります。この recovery はブラウザ拡張の状態を使用せず、request-led な Durable Object write/alarm も追加しません。正確な replay ルールは [トラブルシューティング](troubleshooting.md) を参照してください。
+現在の Edge は、最近接続していたワークステーションにまず短いインメモリの reconnect grace を与えます。validated Link が戻らない場合、MCP エラーは `retryable`、`delivery_state`、`retry_after_ms` と有界な読み取り専用 recovery policy を提示するため、Agent は replay が安全かどうかを推測する必要がありません。ワークステーション側の Link には独自の reconnect/backoff と長時間オフライン時の recycle 経路があります。この recovery はブラウザ拡張の状態を使用せず、request-led な Durable Object write/alarm も追加しません。正確な replay ルールは [トラブルシューティング](troubleshooting.md) を参照してください。
 
 ## 最初の検証シーケンス
 

@@ -241,7 +241,7 @@ herdr-mcp doctor
 2. `herdr-mcp status` / `herdr-mcp doctor` 应该先证明本机 runtime 正常；
 3. `herdr-mcp native-host status` 应显示 Native Messaging host 已注册；
 4. Chrome 刚更新商店扩展后，刷新受影响网页（必要时重启 Chrome），让当前 content script 重新加载；
-5. `herdr-mcp native-host status` 应显示用户明确选择的扩展 identity/channel，并确认 Native Host runtime 与当前 runtime generation 一致。v0.4.2 支持 Store/DEV ownership，v0.4.3+ 才可能显示 STANDALONE。出现 origin mismatch 时不要猜测另一个通道并直接覆盖；先检查当前 runtime 实际支持的命令和 Chrome 中真实安装的扩展身份；
+5. `herdr-mcp native-host status` 应显示用户明确选择的扩展 identity/channel，并确认 Native Host runtime 与当前 runtime generation 一致。当前 runtime 支持 STORE / STANDALONE / DEV；更老的 runtime 可能只暴露部分通道。出现 origin mismatch 时不要猜测另一个通道并直接覆盖；先检查当前 runtime 实际支持的命令和 Chrome 中真实安装的扩展身份；
 6. 顶部如果显示“运行时正常 · 事件流正在重连”，说明已有 snapshot，但增量事件正在恢复，不等于整个 runtime 离线；可以先点刷新让 Side Panel 做一次权威 reconciliation。
 
 Control Center 的`发送指令`会走本地可信控制链真实执行；`调整当前任务`会返回真实 provider capability/outcome，绝不会偷偷降级成 Prompt。普通终端可以通过有 target fencing 的 `pane.send_input + Enter` 路径直接运行命令；任意 `Herdr API` 仍是 Preview-only。任何 mutation 返回 `uncertain` 时都先检查 live state 再考虑重试；Steer 返回 `session_not_resolved` 表示当前所选 provider session 没有可验证的 control endpoint/thread/active-turn 映射，这是 capability 结果，不是 transport 故障。

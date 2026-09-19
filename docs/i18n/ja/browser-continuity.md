@@ -115,13 +115,13 @@ continuity id は conversation をまたぐ一つの安定した work chain を�
 
 これにより、消えゆく source ページを、作業状態の唯一の復旧可能なコピーの責任者にすることなく、continuity を保てます。
 
-### 将来の目標：Continuity 2.0
+### 1.0 Work Memory と continuity compaction
 
-`v0.4.2` は最初の耐久性問題を解決します。作業中の turn を記録し続けることで、タブの消失、拡張のリロード、runtime の再起動、conversation の rollover があっても、唯一の復旧可能な context を消さないようにします。Continuity 2.0 は、別の問題に対する正式な post-`v0.4.2` の roadmap ターゲットです。一つの work chain が数日、数百 turn、あるいはそれ以上に及んでも、復旧 context を小さく保つことです。これは `v0.4.2` のスコープには含まれず、具体的な Release 番号もまだ割り当てられていません。その Release への割り当ては、独立した post-`v0.4.2` の計画判断として残ります。
+1.0 runtime は Continuity Journal の上に Project Work Memory と verified rolling checkpoint を実装しています。finalized raw turn は durable な continuity evidence として残り、`work_memory.checkpoint.put` は checkpoint revision CAS の下で compact な structured checkpoint を書き込み、同じ Work Memory partition に属する実在の message/evidence anchor を要求します。
 
-Continuity 2.0 は、古い raw turn を増分的に rolling semantic checkpoint へ圧縮し、目標、完了した作業、決定、制約、active なファイル/ブランチ/commit、pending な作業、次のアクション、literal anchor を保持します。resume は完全な長い conversation を再生するのではなく、最新の検証済み checkpoint と最近の raw tail を消費するようになります。古い raw body を回収できるのは、置き換えとなる checkpoint が生成され検証された後だけです。ブラウザメモリ、長い DOM のコスト、main-thread/render の負荷も、model context pressure と並ぶ rollover の入力になります。
+`work_memory.resume` は正確な `project_ref + repo_id + work_chain_id` partition を解決し、最新の verified checkpoint、bounded recent raw tail、ローカル evidence を返します。これにより長期 work chain の復旧 context を bounded に保ちながら、task-state authority は一つのままです。browser handoff は同じ `continuity_id` を引き続き再利用し、Provider 固有の Memory は復旧 authority になりません。
 
-実装順序は `Reliability Kernel → Continuity 2.0` のままです。Reliability Kernel は、checkpoint の生成、ACK、raw journal の保持に関する操作 identity、idempotency、delivery phase、不確実な結果の reconciliation を提供します。詳細な設計は [Rust Native Rearchitecture ドキュメントの Phase 8](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20) にあります。
+古い raw body を回収できるのは、replacement checkpoint の evidence が生成・検証された後だけです。browser memory、長い DOM のコスト、main-thread/render の負荷、model context pressure は rollover 判断に利用できますが、Work Memory authority や replay safety は変更しません。checkpoint mutation は Reliability Kernel の generation、idempotency、delivery、uncertain-result rules に引き続き保護されます。元の設計 provenance は [Rust Native Rearchitecture Phase 8](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20) と [1.0 Alpha 2 Work Memory design](../../history/architecture/v1.0-alpha2-work-memory.md) に保持されています。
 
 ## 手動制御と自動制御
 

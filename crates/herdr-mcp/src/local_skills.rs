@@ -1,4 +1,4 @@
-//! v0.4.2 local skill registry: deterministic, bounded, canonical-path-confined
+//! Local skill registry: deterministic, bounded, canonical-path-confined
 //! discovery of local `SKILL.md` / `skill.md` skills from `.agents/skills`
 //! scopes (project and user). Discovery returns metadata only; load returns the
 //! body on demand. Never a vector for arbitrary home scanning.

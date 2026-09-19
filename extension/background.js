@@ -3651,12 +3651,14 @@ async function handleBrowserActuation(command) {
     return;
   }
   const sessionRef = String(params.session_ref || "");
+  let actuationSessionRef = sessionRef;
   let temporaryArchiveStatusTabId = null;
   const closeTemporaryArchiveStatusTab = async () => {
     if (!temporaryArchiveStatusTabId) return;
-    const cached = browserSessionTargets.get(sessionRef);
-    if (cached?.tabId === temporaryArchiveStatusTabId) {
-      browserSessionTargets.delete(sessionRef);
+    for (const [cachedRef, cached] of browserSessionTargets.entries()) {
+      if (cached?.tabId === temporaryArchiveStatusTabId) {
+        browserSessionTargets.delete(cachedRef);
+      }
     }
     try { await chrome.tabs.remove(temporaryArchiveStatusTabId); } catch (_) {}
     temporaryArchiveStatusTabId = null;
@@ -3690,6 +3692,33 @@ async function handleBrowserActuation(command) {
       );
       return;
     }
+    if (!target) {
+      const providerRecovery = String(params.provider || "");
+      const canonicalUrlRecovery = String(params.canonical_url || "");
+      if (providerRecovery && canonicalUrlRecovery) {
+        const canonical = browserConversationInfo(providerRecovery, canonicalUrlRecovery);
+        if (canonical?.conversation_id) {
+          const existing = await findBrowserSessionTargetByCanonicalIdentity(
+            providerRecovery,
+            canonicalUrlRecovery,
+            expectedGeneration,
+          );
+          if (existing.ambiguous) {
+            await postBrowserActuationEvidence(
+              actuationId,
+              unavailableBrowserActuationEvidence(
+                expectedGeneration,
+                "browser_session_target_ambiguous",
+                recovered.observedGeneration,
+              ),
+            );
+            return;
+          }
+          target = existing.target;
+          if (target) browserSessionTargets.set(sessionRef, target);
+        }
+      }
+    }
     if (!target && (
       operation === "herdr_mcp.browser_session.archive"
       || operation === "herdr_mcp.browser_session.archive_status"
@@ -3713,6 +3742,16 @@ async function handleBrowserActuation(command) {
           return;
         }
         target = existing.target;
+        if (target && operation === "herdr_mcp.browser_session.archive_status") {
+          for (const [candidateRef, candidateTarget] of browserSessionTargets.entries()) {
+            if (candidateTarget?.tabId === target.tabId
+                && candidateTarget?.convKey === target.convKey
+                && candidateTarget?.observationGeneration === expectedGeneration) {
+              actuationSessionRef = candidateRef;
+              break;
+            }
+          }
+        }
         if (!target) {
           let createdTab = null;
           try {
@@ -3728,7 +3767,22 @@ async function handleBrowserActuation(command) {
             const deadline = Date.now() + 8000;
             do {
               target = browserSessionTargets.get(sessionRef) || null;
-              if (target?.tabId === createdTab.id) break;
+              if (target?.tabId === createdTab.id) {
+                actuationSessionRef = sessionRef;
+                break;
+              }
+              if (operation === "herdr_mcp.browser_session.archive_status") {
+                for (const [candidateRef, candidateTarget] of browserSessionTargets.entries()) {
+                  if (candidateTarget?.tabId === createdTab.id
+                      && candidateTarget?.convKey === canonicalInfo.convKey
+                      && candidateTarget?.observationGeneration === expectedGeneration) {
+                    target = candidateTarget;
+                    actuationSessionRef = candidateRef;
+                    break;
+                  }
+                }
+                if (target) break;
+              }
               target = null;
               await new Promise((resolve) => setTimeout(resolve, 200));
             } while (Date.now() < deadline);
@@ -3776,12 +3830,16 @@ async function handleBrowserActuation(command) {
     return;
   }
   try {
+    const actuationParams = operation === "herdr_mcp.browser_session.archive_status"
+        && actuationSessionRef !== sessionRef
+      ? { ...params, session_ref: actuationSessionRef }
+      : params;
     const response = await sendBrowserActuationTabMessage(target.tabId, {
       type: "h2w_browser_actuation",
       command: {
         operation,
         expected_generation: expectedGeneration,
-        params,
+        params: actuationParams,
         expectedConvKey: target.convKey,
       },
     });

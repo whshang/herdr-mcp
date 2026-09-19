@@ -164,10 +164,10 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 浏览器扩展用于 Side Panel 控制中心、workspace binding、长对话连续性和“排队”下一轮消息。基础 MCP 连接不依赖它。
 
-扩展分为三种身份：**STORE / STANDALONE / DEV**。v0.4.2 的 Native Host 只支持 Store/DEV ownership；v0.4.3+ 增加固定身份的 STANDALONE，作为正式手动/GitHub 分发路径。
+扩展当前分为三种身份：**STORE / STANDALONE / DEV**。STORE 是普通用户路径；STANDALONE 是固定身份的手动/GitHub 分发路径；DEV 只用于源码开发。
 
 - STORE：普通用户默认，Chrome Web Store 固定身份与更新；
-- STANDALONE：v0.4.3+，固定非 Store 身份；Store 不可用或用户明确选择独立分发时使用；
+- STANDALONE：固定非 Store 身份；Store 不可用或用户明确选择独立分发时使用；
 - DEV：仅源码开发，Load unpacked repo/worktree `extension/`，身份随路径派生。
 
 安装/切换后运行：
@@ -207,7 +207,7 @@ herdr-mcp native-host status
 
 ## 修复、重装与卸载
 
-v0.4.3+ 应使用产品级 lifecycle 命令，不要手工删除 launchd plist 或 runtime 目录：
+应使用产品级 lifecycle 命令，不要手工删除 launchd plist 或 runtime 目录：
 
 ```bash
 herdr-mcp reinstall

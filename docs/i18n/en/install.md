@@ -164,10 +164,10 @@ See [ChatGPT Connector](chatgpt-connector.md).
 
 The browser extension adds Side Panel Control Center, workspace binding, long-conversation continuity, and queued next-turn messages. It is not required for the base MCP loop.
 
-The extension has three identities: **STORE / STANDALONE / DEV**. The v0.4.2 Native Host supports Store/DEV ownership; v0.4.3+ adds the fixed-identity STANDALONE path for GitHub/manual distribution.
+The extension has three current identities: **STORE / STANDALONE / DEV**. STORE is the ordinary-user path, STANDALONE is the fixed-identity GitHub/manual distribution path, and DEV is source-development only.
 
 - STORE: default ordinary-user path, fixed Chrome Web Store identity and Store updates;
-- STANDALONE: v0.4.3+, fixed non-Store identity for independent/GitHub distribution;
+- STANDALONE: fixed non-Store identity for independent/GitHub distribution;
 - DEV: source development only, Load unpacked from repo/worktree `extension/`, with a path-derived identity.
 
 After installing/selecting a supported channel, run:
@@ -207,7 +207,7 @@ Maintainer UAT, GA gates, and release evidence are intentionally outside the nor
 
 ## Repair, reinstall, and uninstall
 
-On v0.4.3+, use the product-level lifecycle commands rather than manually deleting launchd files or runtime directories:
+Use the product-level lifecycle commands rather than manually deleting launchd files or runtime directories:
 
 ```bash
 herdr-mcp reinstall

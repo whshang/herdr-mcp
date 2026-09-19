@@ -267,6 +267,20 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "created_at": {"type": "integer", "minimum": 0},
                 },
                 "required": ["continuity_id", "expected_checkpoint_revision", "summary", "checkpoint_json", "created_at"],
+                "anyOf": [
+                    {
+                        "properties": {
+                            "through_message_id": {"type": "string", "minLength": 1, "maxLength": 512},
+                        },
+                        "required": ["through_message_id"],
+                    },
+                    {
+                        "properties": {
+                            "through_evidence_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        },
+                        "required": ["through_evidence_id"],
+                    },
+                ],
                 "empty": false,
             },
         }),
@@ -2553,6 +2567,24 @@ mod tests {
         assert_eq!(methods.len(), 6);
         assert_eq!(methods[0]["method"], WORK_MEMORY_BIND_METHOD);
         assert_eq!(methods[0]["schema_version"], 1);
+        assert_eq!(methods[3]["method"], WORK_MEMORY_CHECKPOINT_PUT_METHOD);
+        assert_eq!(
+            methods[3]["params"]["anyOf"],
+            json!([
+                {
+                    "properties": {
+                        "through_message_id": {"type": "string", "minLength": 1, "maxLength": 512}
+                    },
+                    "required": ["through_message_id"]
+                },
+                {
+                    "properties": {
+                        "through_evidence_id": {"type": "string", "minLength": 1, "maxLength": 128}
+                    },
+                    "required": ["through_evidence_id"]
+                }
+            ])
+        );
         assert_eq!(methods[4]["method"], WORK_MEMORY_RESUME_METHOD);
         assert_eq!(
             methods[4]["params"]["required"],
@@ -2719,7 +2751,7 @@ mod tests {
         );
     }
 
-    // ---- v0.4.2 local skill registry ----
+    // ---- local skill registry ----
 
     const USER_SKILL: &str = "---\nname: ego
 version: 1.2.3

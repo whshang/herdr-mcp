@@ -45,7 +45,7 @@ macOS では、`reinstall` が製品の修復/置き換え経路です。Linux �
 
 ## ソース開発 runtime: DEV / PROD
 
-v0.4.3+ には、安定した復旧元を失わずに herdr-mcp ソースを dogfood するための明示的な経路が 1 つだけあります:
+現在の runtime には、安定した復旧元を失わずに herdr-mcp ソースを dogfood するための明示的な経路が 1 つだけあります:
 
 ```bash
 herdr-mcp dev status
@@ -99,7 +99,7 @@ probe のサブプロセスは stdin を受け取らず、3 秒の timeout と�
 
 ### Web planner 向けの動的プランニング助言
 
-v0.4.3+ はワークステーションの Runtime Execution Contract を 18 tools に保ち、専用の planning tool を追加しません。`herdr_devices` が Edge ローカルであるため、公開 Edge contract は 19 actions です。progressive な `herdr_skill` bootstrap は、既存の `herdr_call` tool を経由する読み取り専用のローカルメソッドを告知します:
+現在のワークステーション Runtime Execution Contract は epoch 4 / 18 tools で、専用の planning tool は追加しません。first-party の公開 Edge contract は epoch 7 / 19 actions で、`herdr_devices` は Edge ローカルです。progressive な `herdr_skill` bootstrap は、既存の `herdr_call` tool を経由する読み取り専用のローカルメソッドを告知します:
 
 ```text
 herdr_call(
@@ -120,7 +120,7 @@ Web planner はその後、直接実行、既存 Agent の再利用、新しい 
 
 ### GitHub PR / Auto-merge の最新 status
 
-v0.4.5 は、18-tool のワークステーション contract を変えることなく、既存の `herdr_call` tool を通じて別の読み取り専用ローカルメソッドを追加します:
+runtime は、18-tool のワークステーション contract を変えることなく、既存の `herdr_call` tool を通じて別の読み取り専用ローカルメソッドも公開します:
 
 ```text
 herdr_call(

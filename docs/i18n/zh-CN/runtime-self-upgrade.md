@@ -63,7 +63,7 @@ generation B
 
 ## DEV / PROD 是 generation 之上的 provenance 平面
 
-v0.4.3+ 在同一套 generation 机制之上增加明确的源码开发平面，但**不会**因此多出第三套长期 runtime 环境：
+当前 runtime 在同一套 generation 机制之上提供明确的源码开发平面，但**不会**因此多出第三套长期 runtime 环境：
 
 ```text
 PROD
