@@ -279,7 +279,7 @@ test("user is not told the work is finished on the model's word | Given a pendin
   assert.equal(direct.effects, null);
 });
 
-test("user's observable TODO cannot be checked off by prose or invented evidence | Given a code TODO | When a done update carries only human evidence, then an unobserved Herdr reference | Then both are refused", () => {
+test("user observable TODO cannot be checked off by prose or invented evidence | Given a code TODO | When a done update carries only human evidence, then an unobserved Herdr reference | Then both are refused", () => {
   const prose = applyTodoUpdates(ledger(), [{ id: "t1", status: "done", evidence: [{ kind: "human", ref: "assistant said so" }] }], 12_000);
   assert.equal(prose.ledger.todos[0].status, "pending");
   assert.deepEqual(prose.rejections, [{ id: "t1", reason: "herdr_evidence_required" }]);
@@ -298,7 +298,7 @@ test("user's observable TODO cannot be checked off by prose or invented evidence
   assert.equal(invented.effects, null);
 });
 
-test("user's WebChat settlement is not proof of local work | Given a done code TODO from the Work Memory checkpoint whose only evidence is a settled browser turn | When completion is evaluated | Then the ledger is not complete", () => {
+test("user WebChat settlement is not proof of local work | Given a done code TODO from the Work Memory checkpoint whose only evidence is a settled browser turn | When completion is evaluated | Then the ledger is not complete", () => {
   const check = goalLedgerComplete(ledger(undefined, {
     checkpoint: {
       goal_supervisor: {
@@ -441,7 +441,7 @@ test("user keeps working across a long conversation and is not rolled over early
 // G. bounded input, strict contract, meaningful boundaries only
 // ---------------------------------------------------------------------------
 
-test("user's supervisor never receives the whole transcript or tool bodies | Given twenty turns including a raw tool payload and a very long turn | When the bounded input is built | Then it is capped, the tool body is dropped, and the long turn is truncated", () => {
+test("user supervisor never receives the whole transcript or tool bodies | Given twenty turns including a raw tool payload and a very long turn | When the bounded input is built | Then it is capped, the tool body is dropped, and the long turn is truncated", () => {
   const turns = Array.from({ length: 20 }, (_, i) => ({ role: "assistant", text: `turn ${i} `.repeat(40) }));
   turns.push({ role: "tool", text: "{\"tool\":\"herdr_exec\"}" });
   turns.push({ role: "assistant", text: `{"tool":"herdr_exec","args":{"command":"${"x".repeat(2000)}"}}` });
@@ -535,7 +535,7 @@ test("user is not supervised at all without a configured provider | Given no LLM
 // H. the ledger is derived, not stored
 // ---------------------------------------------------------------------------
 
-test("user's goal is read from the existing Work Memory checkpoint first | Given a checkpoint carrying a goal section and different turn text | When the ledger is derived | Then the checkpoint wins and is marked as its source", () => {
+test("user goal is read from the existing Work Memory checkpoint first | Given a checkpoint carrying a goal section and different turn text | When the ledger is derived | Then the checkpoint wins and is marked as its source", () => {
   const fromCheckpoint = deriveGoalLedger({
     continuityId: "hc:1",
     checkpoint: {
@@ -555,7 +555,7 @@ test("user's goal is read from the existing Work Memory checkpoint first | Given
   assert.equal(goalLedgerFromCheckpoint({ other: 1 }), null);
 });
 
-test("user's goal falls back to the continuity-anchored conversation | Given no checkpoint goal section and a user instruction with declared remaining work | When the ledger is derived | Then the objective is the user's own instruction and every derived TODO starts pending", () => {
+test("user goal falls back to the continuity-anchored conversation | Given no checkpoint goal section and a user instruction with declared remaining work | When the ledger is derived | Then the objective is the user's own instruction and every derived TODO starts pending", () => {
   const derived = deriveGoalLedger({
     continuityId: "hc:2",
     authoredTurns: [{ role: "user", text: OBJ }],
@@ -569,7 +569,7 @@ test("user's goal falls back to the continuity-anchored conversation | Given no 
   assert.equal(goalLedgerComplete(derived).complete, false);
 });
 
-test("user's derived ledger cannot be grown or closed by a model answer | Given a model answer with forty TODOs and a done claim | When the updates are applied | Then the ledger stays bounded and nothing is closed without evidence", () => {
+test("user derived ledger cannot be grown or closed by a model answer | Given a model answer with forty TODOs and a done claim | When the updates are applied | Then the ledger stays bounded and nothing is closed without evidence", () => {
   const updates = Array.from({ length: 40 }, (_, i) => ({ id: `t${i}`, status: "done", title: "T".repeat(2000) }));
   const applied = applyTodoUpdates(ledger(Array.from({ length: 40 }, (_, i) => pendingTodo({ id: `t${i}` }))), updates, 5);
   assert.ok(applied.ledger.todos.length <= SUPERVISOR_LIMITS.todos);
@@ -581,7 +581,7 @@ test("user's derived ledger cannot be grown or closed by a model answer | Given 
 // I. guard surface
 // ---------------------------------------------------------------------------
 
-test("user's guard always explains a refusal in a form code can act on | Given a denied proposal for an incomplete goal, an invalid proposal, and a still-generating turn | When the guard returns | Then each carries a reason, a safe state, and no executable send", () => {
+test("user guard always explains a refusal in a form code can act on | Given a denied proposal for an incomplete goal, an invalid proposal, and a still-generating turn | When the guard returns | Then each carries a reason, a safe state, and no executable send", () => {
   const proposals = [
     [{ ok: true, decision: "COMPLETE", reason: "done", retry_class: "none", todo_updates: [], message_to_send: null, choice: null, derived_from: null, external_owner: null }, healthyRuntime],
     [{ ok: false, error: "unknown_decision" }, healthyRuntime],
@@ -621,7 +621,7 @@ test("user is never double-sent on a supervisor-owned boundary | Given a settled
   assert.equal(other.claimed, true);
 });
 
-test("user's goal is only resumed from a unique exact Work Memory locator | Given a continuity.search candidate that is unique_exact and matches the binding, one that is ambiguous, and one whose continuity mismatches | When each is resolved | Then only the unique exact match yields a locator", () => {
+test("user goal is only resumed from a unique exact Work Memory locator | Given a continuity.search candidate that is unique_exact and matches the binding, one that is ambiguous, and one whose continuity mismatches | When each is resolved | Then only the unique exact match yields a locator", () => {
   const good = resolveAuthoritativeWorkMemoryLocator({
     continuity_id: "hc:abc",
     work_memory: { project_ref: "proj", repo_id: "repo", work_chain_id: "wc_1" },
@@ -643,7 +643,7 @@ test("user's goal is only resumed from a unique exact Work Memory locator | Give
   }, "hc:x").ok, false);
 });
 
-test("user's goal carries its objective, human constraints and accepted decisions across a checkpoint round-trip | Given a ledger with a constraint and an accepted decision | When it is merged into a checkpoint and read back | Then the goal section round-trips fully", () => {
+test("user goal carries its objective, human constraints and accepted decisions across a checkpoint round-trip | Given a ledger with a constraint and an accepted decision | When it is merged into a checkpoint and read back | Then the goal section round-trips fully", () => {
   const goal = normalizeGoalLedger({
     objective: OBJ,
     human_constraints: ["\u4e0d\u5f97\u6539\u52a8\u751f\u4ea7\u914d\u7f6e"],
@@ -661,7 +661,7 @@ test("user's goal carries its objective, human constraints and accepted decision
   assert.equal(restored.todos[0].status, "working");
 });
 
-test("user's checkpoint is never overwritten on a CAS conflict | Given an expected revision that no longer matches the authoritative checkpoint | When the put error is classified | Then it is a reconciliation-retry, never a last-write-wins, and a missing turn or missing evidence stays failed closed", () => {
+test("user checkpoint is never overwritten on a CAS conflict | Given an expected revision that no longer matches the authoritative checkpoint | When the put error is classified | Then it is a reconciliation-retry, never a last-write-wins, and a missing turn or missing evidence stays failed closed", () => {
   const conflict = classifyCheckpointPutError("work_memory_checkpoint_revision_conflict:7");
   assert.equal(conflict.kind, "revision_conflict");
   assert.equal(conflict.revision, 7);
