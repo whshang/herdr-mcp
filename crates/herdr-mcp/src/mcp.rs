@@ -1468,6 +1468,12 @@ fn work_memory_call(
                     Ok(value) => value,
                     Err(error) => return error,
                 };
+            if through_message_id.is_none() && through_evidence_id.is_none() {
+                return json!({
+                    "ok": false,
+                    "code": "work_memory_checkpoint_anchor_required",
+                });
+            }
             let created_at = match work_memory_required_i64(params, "created_at") {
                 Ok(value) => value,
                 Err(error) => return error,
@@ -7455,12 +7461,59 @@ mod tests {
             "crates/herdr-mcp/src/mcp.rs"
         );
 
-        let checkpoint = work_memory_call(
+        let missing_anchor = work_memory_call(
             &store,
             "work_memory.checkpoint.put",
             &json!({
                 "continuity_id": "wm:mcp",
                 "expected_checkpoint_revision": 0,
+                "summary": "must fail before StateStore",
+                "checkpoint_json": "{\"goal\":\"missing-anchor\"}",
+                "created_at": 117,
+            }),
+        );
+        assert_eq!(missing_anchor["ok"], false);
+        assert_eq!(
+            missing_anchor["code"],
+            "work_memory_checkpoint_anchor_required"
+        );
+
+        let message_only = work_memory_call(
+            &store,
+            "work_memory.checkpoint.put",
+            &json!({
+                "continuity_id": "wm:mcp",
+                "expected_checkpoint_revision": 0,
+                "summary": "message anchored",
+                "checkpoint_json": "{\"goal\":\"message-only\"}",
+                "through_message_id": message_ids[1],
+                "created_at": 118,
+            }),
+        );
+        assert_eq!(message_only["ok"], true);
+        assert_eq!(message_only["checkpoint"]["revision"], 1);
+
+        let evidence_only = work_memory_call(
+            &store,
+            "work_memory.checkpoint.put",
+            &json!({
+                "continuity_id": "wm:mcp",
+                "expected_checkpoint_revision": 1,
+                "summary": "evidence anchored",
+                "checkpoint_json": "{\"goal\":\"evidence-only\"}",
+                "through_evidence_id": evidence["evidence_id"],
+                "created_at": 119,
+            }),
+        );
+        assert_eq!(evidence_only["ok"], true);
+        assert_eq!(evidence_only["checkpoint"]["revision"], 2);
+
+        let checkpoint = work_memory_call(
+            &store,
+            "work_memory.checkpoint.put",
+            &json!({
+                "continuity_id": "wm:mcp",
+                "expected_checkpoint_revision": 2,
                 "summary": "MCP checkpoint\nready for handoff",
                 "checkpoint_json": "{\n\t\"goal\": \"alpha2\"\n}",
                 "through_message_id": message_ids[1],
@@ -7469,7 +7522,7 @@ mod tests {
             }),
         );
         assert_eq!(checkpoint["ok"], true);
-        assert_eq!(checkpoint["checkpoint"]["revision"], 1);
+        assert_eq!(checkpoint["checkpoint"]["revision"], 3);
         assert_eq!(checkpoint["checkpoint"]["verified"], true);
 
         let resumed = work_memory_call(
