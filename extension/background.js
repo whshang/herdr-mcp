@@ -3664,6 +3664,33 @@ async function handleBrowserActuation(command) {
       );
       return;
     }
+    if (!target) {
+      const providerRecovery = String(params.provider || "");
+      const canonicalUrlRecovery = String(params.canonical_url || "");
+      if (providerRecovery && canonicalUrlRecovery) {
+        const canonical = browserConversationInfo(providerRecovery, canonicalUrlRecovery);
+        if (canonical?.conversation_id) {
+          const existing = await findBrowserSessionTargetByCanonicalIdentity(
+            providerRecovery,
+            canonicalUrlRecovery,
+            expectedGeneration,
+          );
+          if (existing.ambiguous) {
+            await postBrowserActuationEvidence(
+              actuationId,
+              unavailableBrowserActuationEvidence(
+                expectedGeneration,
+                "browser_session_target_ambiguous",
+                recovered.observedGeneration,
+              ),
+            );
+            return;
+          }
+          target = existing.target;
+          if (target) browserSessionTargets.set(sessionRef, target);
+        }
+      }
+    }
     if (!target && (
       operation === "herdr_mcp.browser_session.archive"
       || operation === "herdr_mcp.browser_session.archive_status"
