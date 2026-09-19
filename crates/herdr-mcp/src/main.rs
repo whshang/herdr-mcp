@@ -62,6 +62,7 @@ mod release_trust;
 mod residue;
 mod runtime_meta;
 mod schema;
+mod semantic;
 mod service_lifecycle;
 mod service_manager;
 mod skill;

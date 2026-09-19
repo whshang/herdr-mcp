@@ -3,10 +3,13 @@ use crate::capability_inventory::{AgentCapabilityRecord, CapabilityInventoryStor
 use crate::capability_resolver::{WorkerCapability, project_capabilities_with_inventory};
 use crate::local_skills::{self, LocalSkillFile, parse_frontmatter, read_file_bounded};
 use crate::paths::RuntimePaths;
+use crate::semantic::{
+    DEFAULT_DECISION_THRESHOLD, SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService,
+};
 use crate::skill_dispatch::{DispatchAdvice, TaskProfile, advise_dispatch};
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
@@ -95,6 +98,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "params": {
                 "properties": {
                     "deterministic_tool": {"type": "string"},
+                    "task_text": {"type": "string", "maxLength": 8192},
                     "project_root": {"type": "string"},
                     "explicit_target": {"type": "string"},
                     "requires_code_edit": {"type": "boolean"},
@@ -1056,6 +1060,7 @@ impl ProgressiveSkillService {
                 "effect": "read_only_advice",
                 "params": {
                     "deterministic_tool": "optional non-empty string",
+                    "task_text": "optional bounded task text; when a semantic provider is available it supplies advisory task-profile and Skill/method relevance without overriding explicit fields",
                     "project_root": "optional non-empty string",
                     "explicit_target": "optional non-empty agent id/kind/pane id",
                     "requires_code_edit": "optional boolean",
@@ -1159,6 +1164,7 @@ impl ProgressiveSkillService {
     ) -> Value {
         const KEYS: &[&str] = &[
             "deterministic_tool",
+            "task_text",
             "project_root",
             "explicit_target",
             "requires_code_edit",
@@ -1174,9 +1180,20 @@ impl ProgressiveSkillService {
         if let Err(error) = validate_object_keys(params, KEYS) {
             return error;
         }
-        let task = match task_profile_from_params(params) {
+        let task_text = match optional_bounded_nonempty_string(params, "task_text", 8192) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let mut task = match task_profile_from_params(params) {
             Ok(task) => task,
             Err(error) => return error,
+        };
+        let semantic = if task.deterministic_tool.is_none() {
+            task_text
+                .as_deref()
+                .map(|task_text| self.semantic_planning_advice(task_text, params, &mut task))
+        } else {
+            None
         };
         let visibility = AgentVisibility::from_env();
         let capabilities = project_capabilities_with_inventory(snapshot, &visibility, inventory);
@@ -1185,6 +1202,15 @@ impl ProgressiveSkillService {
             "ok": true,
             "decision_owner": "web_planner",
             "advice": dispatch_advice_json(&advice),
+            "semantic": semantic.unwrap_or_else(|| json!({
+                "attempted": false,
+                "reason": if task_text.is_none() {
+                    "task_text_absent"
+                } else {
+                    "deterministic_tool_explicit"
+                },
+                "capability": SemanticService::from_env().capability_json(),
+            })),
             "context_resolution": {
                 "level": "required_before_prior_or_ambiguous_project_discussion",
                 "order": ["device", "project_workspace", "continuity_history", "live_git_runtime", "requirements_planning"],
@@ -1216,6 +1242,297 @@ impl ProgressiveSkillService {
                 "live": "herdr_inspect/herdr_since",
                 "capabilities": "herdr-mcp scan --probe",
             },
+        })
+    }
+
+    fn semantic_planning_advice(
+        &self,
+        task_text: &str,
+        params: &Value,
+        task: &mut TaskProfile,
+    ) -> Value {
+        const MAX_SKILLS: usize = 48;
+        const MAX_METHODS: usize = 48;
+        const TOP_ROUTES: usize = 6;
+
+        let service = SemanticService::from_env();
+        let capability = service.capability_json();
+        if !service.configured() {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "reason": "not_configured",
+                "capability": capability,
+            });
+        }
+
+        let project_root = task.project_root.as_deref().map(Path::new);
+        let skills = self
+            .effective_catalog(project_root)
+            .into_iter()
+            .take(MAX_SKILLS)
+            .collect::<Vec<_>>();
+        let methods = local_method_schemas("")
+            .into_iter()
+            .filter(|schema| {
+                schema.get("method").and_then(Value::as_str) != Some(PLANNING_ADVISE_METHOD)
+            })
+            .take(MAX_METHODS)
+            .collect::<Vec<_>>();
+
+        let mut request = SemanticRequest::new(json!({"task": task_text}))
+            .ask(
+                "requires_code_edit",
+                SemanticQuestion::noul(
+                    "Does completing the task require editing source code or tracked configuration?",
+                    "A source or tracked configuration edit is required",
+                    "No source or tracked configuration edit is required",
+                ),
+            )
+            .ask(
+                "requires_shell",
+                SemanticQuestion::noul(
+                    "Does completing the task require shell commands, builds, tests, or local processes?",
+                    "Shell or local process execution is required",
+                    "No shell or local process execution is required",
+                ),
+            )
+            .ask(
+                "requires_vision",
+                SemanticQuestion::noul(
+                    "Does completing the task require visual inspection of an image, rendered page, browser UI, or screenshot?",
+                    "Visual inspection is required",
+                    "Text and structured evidence are sufficient",
+                ),
+            )
+            .ask(
+                "destructive_production_mutation",
+                SemanticQuestion::noul(
+                    "Does the task explicitly require an irreversible or destructive production mutation?",
+                    "An irreversible or destructive production mutation is required",
+                    "No such production mutation is explicitly required",
+                ),
+            )
+            .ask(
+                "delegates_other_workers",
+                SemanticQuestion::noul(
+                    "Would a delegated worker itself need to dispatch or manage other workers?",
+                    "The delegated worker would need to manage workers",
+                    "The delegated worker can complete its assigned work directly",
+                ),
+            )
+            .ask(
+                "shared_runtime_state",
+                SemanticQuestion::noul(
+                    "Would parallel lanes contend for the same mutable runtime, repository, browser session, or other shared state?",
+                    "Parallel lanes would share mutable state",
+                    "No shared mutable runtime or state is implied",
+                ),
+            )
+            .ask(
+                "independent_units",
+                SemanticQuestion::choice(
+                    "How many independently completable units are clearly present in the task?",
+                    BTreeMap::from([
+                        ("one".to_owned(), Some("One coherent unit of work".to_owned())),
+                        ("two".to_owned(), Some("Two independent units".to_owned())),
+                        ("three".to_owned(), Some("Three independent units".to_owned())),
+                        (
+                            "four_plus".to_owned(),
+                            Some("Four or more independent units".to_owned()),
+                        ),
+                    ]),
+                ),
+            )
+            .ask(
+                "reasoning_tier",
+                SemanticQuestion::score(
+                    "How much reasoning depth does the task appear to require?",
+                    vec![
+                        "Routine deterministic execution or lookup".to_owned(),
+                        "Moderate analysis with a few dependent decisions".to_owned(),
+                        "Deep multi-step reasoning, architecture, or difficult diagnosis".to_owned(),
+                    ],
+                ),
+            );
+
+        let skill_criteria = skills
+            .iter()
+            .map(|skill| {
+                (
+                    skill.id.clone(),
+                    Some(if skill.description.is_empty() {
+                        skill.name.clone()
+                    } else {
+                        skill.description.clone()
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if skill_criteria.len() >= 2 {
+            request = request.ask(
+                "skill_route",
+                SemanticQuestion::choice(
+                    "Which Skill is most directly useful for completing the task?",
+                    skill_criteria,
+                ),
+            );
+        }
+
+        let method_criteria = methods
+            .iter()
+            .filter_map(|schema| {
+                let method = schema.get("method").and_then(Value::as_str)?;
+                let properties = schema
+                    .pointer("/params/properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let description = if properties.is_empty() {
+                    "No parameters".to_owned()
+                } else {
+                    format!("Parameters: {}", properties.join(", "))
+                };
+                Some((method.to_owned(), Some(description)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if method_criteria.len() >= 2 {
+            request = request.ask(
+                "method_route",
+                SemanticQuestion::choice(
+                    "Which native/private method is most directly useful for the next task step?",
+                    method_criteria,
+                ),
+            );
+        }
+
+        let response = match service.evaluate(&request) {
+            Ok(response) => response,
+            Err(error) => {
+                return json!({
+                    "attempted": true,
+                    "used": false,
+                    "reason": error.code(),
+                    "capability": capability,
+                });
+            }
+        };
+
+        let mut applied_fields = Vec::new();
+        let mut profile = Map::new();
+        let mut apply_positive = |answer_id: &str, param_key: &str, target: &mut bool| {
+            let probability = response
+                .answer(answer_id)
+                .and_then(SemanticAnswer::noul_probability);
+            profile.insert(param_key.to_owned(), json!(probability));
+            if params.get(param_key).is_none()
+                && probability.is_some_and(|value| value >= DEFAULT_DECISION_THRESHOLD)
+            {
+                *target = true;
+                applied_fields.push(param_key.to_owned());
+            }
+        };
+        apply_positive(
+            "requires_code_edit",
+            "requires_code_edit",
+            &mut task.requires_code_edit,
+        );
+        apply_positive("requires_shell", "requires_shell", &mut task.requires_shell);
+        apply_positive(
+            "requires_vision",
+            "requires_vision",
+            &mut task.requires_vision,
+        );
+        apply_positive(
+            "destructive_production_mutation",
+            "destructive_production_mutation",
+            &mut task.destructive_production_mutation,
+        );
+        apply_positive(
+            "delegates_other_workers",
+            "delegates_other_workers",
+            &mut task.delegates_other_workers,
+        );
+        apply_positive(
+            "shared_runtime_state",
+            "shared_runtime_state",
+            &mut task.shared_runtime_state,
+        );
+
+        let independent = response
+            .answer("independent_units")
+            .and_then(SemanticAnswer::choice_value);
+        profile.insert(
+            "independent_units".to_owned(),
+            independent
+                .map(|(choice, probabilities, confidence)| {
+                    json!({
+                        "choice": choice,
+                        "probabilities": probabilities,
+                        "confidence": confidence,
+                        "advisory_only": true,
+                    })
+                })
+                .unwrap_or(Value::Null),
+        );
+        let reasoning = response
+            .answer("reasoning_tier")
+            .and_then(SemanticAnswer::score_value);
+        profile.insert(
+            "reasoning_tier".to_owned(),
+            reasoning
+                .map(|(score, probabilities, confidence)| {
+                    json!({
+                        "score": score,
+                        "probabilities": probabilities,
+                        "confidence": confidence,
+                        "advisory_only": true,
+                    })
+                })
+                .unwrap_or(Value::Null),
+        );
+
+        let ranked = |answer_id: &str| {
+            let mut entries = response
+                .answer(answer_id)
+                .and_then(SemanticAnswer::choice_value)
+                .map(|(_, probabilities, _)| {
+                    probabilities
+                        .iter()
+                        .map(|(id, relevance)| (id.clone(), *relevance))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            entries.sort_by(|left, right| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            entries
+                .into_iter()
+                .take(TOP_ROUTES)
+                .map(|(id, relevance)| json!({"id": id, "relevance": relevance}))
+                .collect::<Vec<_>>()
+        };
+
+        json!({
+            "attempted": true,
+            "used": true,
+            "provider": response.provider,
+            "model": response.model,
+            "threshold": DEFAULT_DECISION_THRESHOLD,
+            "profile": Value::Object(profile),
+            "applied_fields": applied_fields,
+            "routing": {
+                "skills": ranked("skill_route"),
+                "methods": ranked("method_route"),
+                "skills_considered": skills.len(),
+                "methods_considered": methods.len(),
+            },
+            "capability": capability,
+            "authority": "advisory; deterministic gates remain authoritative",
         })
     }
 
@@ -1605,6 +1922,23 @@ fn optional_nonempty_string(params: &Value, key: &str) -> Result<Option<String>,
             "{key} must be a string when provided"
         ))),
     }
+}
+
+fn optional_bounded_nonempty_string(
+    params: &Value,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, Value> {
+    let value = optional_nonempty_string(params, key)?;
+    if value
+        .as_deref()
+        .is_some_and(|value| value.len() > max_bytes || value.chars().any(char::is_control))
+    {
+        return Err(invalid_params(&format!(
+            "{key} must be at most {max_bytes} bytes and contain no control characters"
+        )));
+    }
+    Ok(value)
 }
 
 fn optional_bool(params: &Value, key: &str) -> Result<bool, Value> {
