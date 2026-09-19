@@ -55,6 +55,79 @@ export function buildJevPendingWorkRequest(userText, assistantText, model = DEFA
   };
 }
 
+export const JEV_GOAL_SIGNAL_KEYS = Object.freeze([
+  "can_continue",
+  "needs_human",
+  "waiting_external",
+  "task_completed",
+  "needs_handoff",
+]);
+
+export function buildJevGoalSemanticRequest({
+  objective = "",
+  userText = "",
+  assistantText = "",
+  openTodos = [],
+  boundary = "",
+  runtimeSummary = "",
+} = {}, model = DEFAULT_JEV_MODEL) {
+  return {
+    state: {
+      objective: boundedText(objective, 4000),
+      user_request: boundedText(userText, 4000),
+      assistant_latest_response: boundedText(assistantText, 8000),
+      open_todos: Array.isArray(openTodos)
+        ? openTodos.slice(0, 16).map((v) => boundedText(v, 240))
+        : [],
+      boundary: boundedText(boundary, 80),
+      runtime_summary: boundedText(runtimeSummary, 1200),
+    },
+    model: String(model || DEFAULT_JEV_MODEL).trim() || DEFAULT_JEV_MODEL,
+    questions: {
+      can_continue: {
+        type: "noul",
+        instructions: "Can the assistant autonomously continue useful work toward the current objective right now without a new human decision or unavailable external event?",
+      },
+      needs_human: {
+        type: "noul",
+        instructions: "Does the next safe step require a human decision, approval, subjective preference, credential, payment, publication, deletion, or other human-owned action?",
+      },
+      waiting_external: {
+        type: "noul",
+        instructions: "Is progress currently blocked waiting for an external system, running agent, CI/job, provider, or other event that the assistant should not replace with another Continue message?",
+      },
+      task_completed: {
+        type: "noul",
+        instructions: "Does the latest state appear to have completed the requested objective with no concrete work remaining? This is only a semantic hint, not evidence that TODOs are actually closed.",
+      },
+      needs_handoff: {
+        type: "noul",
+        instructions: "Does the latest state indicate that continuing the same objective requires handing off to a fresh conversation because of context pressure or an explicit planned continuity transfer?",
+      },
+    },
+  };
+}
+
+export function interpretJevGoalSemanticAnswer(payload, threshold = DEFAULT_JEV_THRESHOLD) {
+  const t = normalizeJevJudgeThreshold(threshold);
+  const probabilities = {};
+  for (const key of JEV_GOAL_SIGNAL_KEYS) {
+    const p = Number(payload?.answers?.[key]?.noul);
+    if (!Number.isFinite(p) || p < 0 || p > 1) {
+      return { ok: false, reason: "bad_response", probabilities: null, strong: [] };
+    }
+    probabilities[key] = p;
+  }
+  return {
+    ok: true,
+    threshold: t,
+    probabilities,
+    strong: JEV_GOAL_SIGNAL_KEYS.filter((key) => probabilities[key] >= t),
+    model: typeof payload?.model === "string" ? payload.model : null,
+    usage: payload?.usage && typeof payload.usage === "object" ? payload.usage : null,
+  };
+}
+
 export function interpretJevPendingWorkAnswer(payload, threshold = DEFAULT_JEV_THRESHOLD) {
   const p = Number(payload?.answers?.has_unfinished_work?.noul);
   if (!Number.isFinite(p) || p < 0 || p > 1) {

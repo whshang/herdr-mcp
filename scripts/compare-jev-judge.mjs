@@ -48,8 +48,8 @@ function llmConfig() {
     baseUrl: env("HERDR_LLM_JUDGE_BASE_URL"),
     apiKey: env("HERDR_LLM_JUDGE_API_KEY"),
     model: env("HERDR_LLM_JUDGE_MODEL"),
-    prompt: env("HERDR_LLM_JUDGE_PROMPT", DEFAULT_LLM_JUDGE_PROMPT),
-    skipKeywords: env("HERDR_LLM_JUDGE_SKIP_KEYWORDS", DEFAULT_LLM_SKIP_KEYWORDS_TEXT),
+    prompt: DEFAULT_LLM_JUDGE_PROMPT,
+    skipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   };
 }
 

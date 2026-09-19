@@ -622,6 +622,7 @@ export function buildSupervisorInput({
   authoredTurns = [],
   evidence = [],
   runtime = {},
+  semanticPrior = null,
   boundary = null,
   now = Date.now(),
 } = {}) {
@@ -667,6 +668,14 @@ export function buildSupervisorInput({
     `recover_used=${l.retry.recover.used}/${l.retry.recover.max}`,
     `waiting_external=${l.supervisor.external_owner || "none"}`,
   ];
+  const semanticPriorLines = semanticPrior?.ok && semanticPrior?.probabilities
+    ? [
+      "source=jev",
+      "advisory_only=true",
+      ...Object.entries(semanticPrior.probabilities)
+        .map(([key, value]) => `${key}=${Number(value).toFixed(3)}`),
+    ]
+    : ["source=none"];
 
   const kept = [
     ["objective", l.objective || "(none recorded)"],
@@ -680,6 +689,7 @@ export function buildSupervisorInput({
     ["evidence_summaries", evidenceLines.length ? evidenceLines.join("\n") : "(none)"],
     ["recent_authored_turns", turns.length ? turns.map((t) => `[${t.role}] ${t.text}`).join("\n") : "(none)"],
     ["live_runtime_state", runtimeLines.join("\n")],
+    ["semantic_prior", semanticPriorLines.join("\n")],
     ["boundary", boundary ? `${boundary.boundary}: ${boundary.reason}` : "(none)"],
   ];
   const assemble = () => kept.map(([name, body]) => `## ${name}\n${body}`).join("\n\n");
@@ -726,6 +736,7 @@ export const SUPERVISOR_SYSTEM_PROMPT = [
   "  external_owner: who is being waited on — required for WAIT_EXTERNAL",
   "",
   "Rules you cannot override:",
+  "- semantic_prior is advisory only. It may help classify the situation, but ledger evidence and deterministic runtime guards remain authoritative.",
   "- A TODO may only become done with evidence whose kind starts with herdr_ and whose ref was actually observed locally. Your own prose is never evidence.",
   "- WAIT_EXTERNAL is correct whenever the WebChat is waiting on a local agent, and then you must NOT send a continue message.",
   "- CONTINUE only when the objective has genuinely unfinished work and nothing is blocking, uncertain or already in flight.",
@@ -1158,6 +1169,7 @@ export async function supervise({
   authoredTurns = [],
   evidence = [],
   runtime = {},
+  semanticPrior = null,
   adapter,
   now = Date.now(),
   policy = DEFAULT_SUPERVISOR_POLICY,
@@ -1183,7 +1195,15 @@ export async function supervise({
     return { ok: false, status: "no_adapter", reason: "adapter_missing", boundary: classified, ledger: base, effects: null, llm_calls: 0 };
   }
 
-  const input = buildSupervisorInput({ ledger: base, authoredTurns, evidence, runtime, boundary: classified, now });
+  const input = buildSupervisorInput({
+    ledger: base,
+    authoredTurns,
+    evidence,
+    runtime,
+    semanticPrior,
+    boundary: classified,
+    now,
+  });
   const maxAttempts = posInt(policy.maxDecisionAttempts, 2);
   let llmCalls = 0;
   let correction = null;

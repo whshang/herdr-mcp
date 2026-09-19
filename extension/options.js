@@ -1,7 +1,7 @@
 // options.js — settings + locale
 import { detectOrLoadLocale, setLocale, getLocale, t, onLocaleReady } from "./i18n.js";
 import {
-  DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT, validateApiBaseUrl,
+  validateApiBaseUrl,
 } from "./binding-core.js";
 import {
   DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL,
@@ -13,7 +13,6 @@ const KEYS = [
   "herdrMcpUrl", "wakeTemplate", "progressTickSec", "progressFallbackSec",
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
-  "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
   "jevJudgeBaseUrl", "jevJudgeApiKey", "jevJudgeModel",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled",
   "pageAssistOrigins",
@@ -121,10 +120,6 @@ function applyI18n() {
   $("lab_llm_key").textContent = t("label_llm_key");
   $("hint_llm_key").textContent = t("hint_llm_key");
   $("lab_llm_model").textContent = t("label_llm_model");
-  $("lab_llm_prompt").textContent = t("label_llm_prompt");
-  $("hint_llm_prompt").textContent = t("hint_llm_prompt");
-  $("lab_llm_skip").textContent = t("label_llm_skip");
-  $("hint_llm_skip").textContent = t("hint_llm_skip");
   $("title_jev").textContent = t("label_jev_section");
   $("hint_jev_sec").textContent = t("hint_jev_section");
   $("llm_advanced_summary").textContent = t("llm_advanced_summary");
@@ -181,12 +176,6 @@ async function loadForm() {
   $("llmJudgeBaseUrl").value = cfg.llmJudgeBaseUrl || "";
   $("llmJudgeApiKey").value = cfg.llmJudgeApiKey || "";
   $("llmJudgeModel").value = cfg.llmJudgeModel || "";
-  $("llmJudgePromptTemplate").value = (cfg.llmJudgePromptTemplate && String(cfg.llmJudgePromptTemplate).trim())
-    ? cfg.llmJudgePromptTemplate
-    : t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT;
-  $("llmJudgeSkipKeywords").value = (cfg.llmJudgeSkipKeywords && String(cfg.llmJudgeSkipKeywords).trim())
-    ? cfg.llmJudgeSkipKeywords
-    : DEFAULT_LLM_SKIP_KEYWORDS_TEXT;
   $("jevJudgeBaseUrl").value = cfg.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL;
   $("jevJudgeApiKey").value = cfg.jevJudgeApiKey || "";
   $("jevJudgeModel").value = cfg.jevJudgeModel || DEFAULT_JEV_MODEL;
@@ -272,8 +261,6 @@ $("save").addEventListener("click", async () => {
     llmJudgeBaseUrl: llmBase,
     llmJudgeApiKey: llmKey,
     llmJudgeModel: llmModel,
-    llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
-    llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
     jevJudgeBaseUrl: jevBase,
     jevJudgeApiKey: jevKey,
     jevJudgeModel: jevModel,
@@ -307,8 +294,6 @@ $("save").addEventListener("click", async () => {
   loadedHostPermissionOrigins = nextPermissionOrigins;
   setStatus(`✓ ${t("saved")}`, "ok");
   $("manualContinueMessage").value = config.manualContinueMessage;
-  $("llmJudgePromptTemplate").value = config.llmJudgePromptTemplate;
-  $("llmJudgeSkipKeywords").value = config.llmJudgeSkipKeywords;
 });
 
 $("test").addEventListener("click", () => {
@@ -379,8 +364,6 @@ $("testLlm").addEventListener("click", async () => {
       llmJudgeBaseUrl: base,
       llmJudgeApiKey: key,
       llmJudgeModel: model,
-      llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
-      llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
     },
   });
   btn.disabled = false;

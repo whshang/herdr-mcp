@@ -3,8 +3,11 @@ import assert from "node:assert/strict";
 
 import {
   DEFAULT_JEV_THRESHOLD,
+  JEV_GOAL_SIGNAL_KEYS,
+  buildJevGoalSemanticRequest,
   buildJevPendingWorkRequest,
   decideJevAutoPolicy,
+  interpretJevGoalSemanticAnswer,
   interpretJevPendingWorkAnswer,
   isJevJudgeConfigured,
   jevSystemOneUrl,
@@ -79,4 +82,30 @@ test("user is warned about a mistyped LLM base URL | Given a duplicate path slas
   assert.equal(bad.suggestion, "https://cc.whshang.me/v1");
   assert.equal(llmJudgeCompletionsUrl("https://cc.whshang.me//v1"), "");
   assert.equal(llmJudgeCompletionsUrl("https://cc.whshang.me/v1"), "https://cc.whshang.me/v1/chat/completions");
+});
+
+test("user gets one bounded Jev Goal classification | Given a goal boundary | When the semantic prior is requested | Then the five fixed Noul signals are evaluated together", () => {
+  const request = buildJevGoalSemanticRequest({
+    objective: "Finish the release.",
+    userText: "Continue until everything is done.",
+    assistantText: "Tests pass, CI is still running.",
+    openTodos: ["verify CI", "publish after approval"],
+    boundary: "turn_settled",
+  });
+  assert.deepEqual(Object.keys(request.questions), [...JEV_GOAL_SIGNAL_KEYS]);
+  assert.equal(request.questions.can_continue.type, "noul");
+  assert.equal(request.questions.needs_human.type, "noul");
+  assert.equal(request.questions.waiting_external.type, "noul");
+  assert.equal(request.questions.task_completed.type, "noul");
+  assert.equal(request.questions.needs_handoff.type, "noul");
+});
+
+test("user gets probability hints rather than a second Goal authority | Given a complete five-signal Jev response | When it is interpreted | Then probabilities and strong signals are returned without an executable decision", () => {
+  const answers = Object.fromEntries(JEV_GOAL_SIGNAL_KEYS.map((key) => [key, { type: "noul", noul: 0.1 }]));
+  answers.waiting_external.noul = 0.92;
+  const result = interpretJevGoalSemanticAnswer({ model: "jev-latest", answers });
+  assert.equal(result.ok, true);
+  assert.equal(result.probabilities.waiting_external, 0.92);
+  assert.deepEqual(result.strong, ["waiting_external"]);
+  assert.equal(Object.prototype.hasOwnProperty.call(result, "decision"), false);
 });
