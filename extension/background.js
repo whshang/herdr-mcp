@@ -3625,6 +3625,16 @@ async function handleBrowserActuation(command) {
     return;
   }
   const sessionRef = String(params.session_ref || "");
+  let temporaryArchiveStatusTabId = null;
+  const closeTemporaryArchiveStatusTab = async () => {
+    if (!temporaryArchiveStatusTabId) return;
+    const cached = browserSessionTargets.get(sessionRef);
+    if (cached?.tabId === temporaryArchiveStatusTabId) {
+      browserSessionTargets.delete(sessionRef);
+    }
+    try { await chrome.tabs.remove(temporaryArchiveStatusTabId); } catch (_) {}
+    temporaryArchiveStatusTabId = null;
+  };
   let target = browserSessionTargets.get(sessionRef) || null;
   if (target) {
     let cachedTab = null;
@@ -3654,7 +3664,10 @@ async function handleBrowserActuation(command) {
       );
       return;
     }
-    if (!target && operation === "herdr_mcp.browser_session.archive") {
+    if (!target && (
+      operation === "herdr_mcp.browser_session.archive"
+      || operation === "herdr_mcp.browser_session.archive_status"
+    )) {
       const providerArchive = String(params.provider || "");
       const canonicalUrl = String(params.canonical_url || "");
       const canonicalInfo = browserConversationInfo(providerArchive, canonicalUrl);
@@ -3677,9 +3690,15 @@ async function handleBrowserActuation(command) {
         if (!target) {
           let createdTab = null;
           try {
-            createdTab = await chrome.tabs.create({ url: canonicalUrl, active: true });
+            createdTab = await chrome.tabs.create({
+              url: canonicalUrl,
+              active: operation !== "herdr_mcp.browser_session.archive_status",
+            });
           } catch (_) {}
           if (createdTab?.id) {
+            if (operation === "herdr_mcp.browser_session.archive_status") {
+              temporaryArchiveStatusTabId = createdTab.id;
+            }
             const deadline = Date.now() + 8000;
             do {
               target = browserSessionTargets.get(sessionRef) || null;
@@ -3692,6 +3711,7 @@ async function handleBrowserActuation(command) {
       }
     }
     if (!target) {
+      await closeTemporaryArchiveStatusTab();
       await postBrowserActuationEvidence(
         actuationId,
         unavailableBrowserActuationEvidence(
@@ -3705,6 +3725,7 @@ async function handleBrowserActuation(command) {
   }
   if (target.observationGeneration !== expectedGeneration) {
     browserSessionTargets.delete(sessionRef);
+    await closeTemporaryArchiveStatusTab();
     await postBrowserActuationEvidence(
       actuationId,
       unavailableBrowserActuationEvidence(
@@ -3721,6 +3742,7 @@ async function handleBrowserActuation(command) {
   const live = browserConversationInfo(targetProvider, tab?.url || "");
   if (!tab || live?.conversation_id !== target.conversationId || live?.convKey !== target.convKey) {
     browserSessionTargets.delete(sessionRef);
+    await closeTemporaryArchiveStatusTab();
     await postBrowserActuationEvidence(
       actuationId,
       unavailableBrowserActuationEvidence(expectedGeneration, "browser_session_tab_identity_mismatch"),
@@ -3751,6 +3773,7 @@ async function handleBrowserActuation(command) {
           resource_available: true,
         };
     await postBrowserActuationEvidence(actuationId, evidence);
+    await closeTemporaryArchiveStatusTab();
     const archiveProjectId = live?.project_id || target.projectId || null;
     if (shouldCloseArchivedChatGptTab(operation, evidence, targetProvider, archiveProjectId)) {
       try {
@@ -3777,6 +3800,7 @@ async function handleBrowserActuation(command) {
       command_accepted: true,
       resource_available: true,
     }).catch(() => {});
+    await closeTemporaryArchiveStatusTab();
   }
 }
 

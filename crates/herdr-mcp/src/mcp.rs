@@ -4346,6 +4346,7 @@ fn browser_operation_call_with_controls(
                 .and_then(Value::as_i64)
                 .unwrap();
             let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+            let mut actuation_params = params.clone();
             {
                 let Ok(guard) = store.lock() else {
                     return json!({"ok": false, "code": "browser_operation_store_unavailable"});
@@ -4397,10 +4398,30 @@ fn browser_operation_call_with_controls(
                         });
                     }
                 }
+                if let Some(object) = actuation_params.as_object_mut() {
+                    object.insert("provider".to_owned(), json!(session.provider));
+                    match guard.browser_resource_locator(session_ref) {
+                        Ok(Some(locator))
+                            if locator.observation_generation == expected_generation =>
+                        {
+                            object.insert("canonical_url".to_owned(), json!(locator.canonical_url));
+                        }
+                        Ok(Some(_)) => {
+                            return json!({"ok": false, "code": "stale_capability_generation"});
+                        }
+                        Ok(None) => {}
+                        Err(error) => return browser_store_error(error),
+                    }
+                }
             }
             let evidence = match browser_actuator {
                 Some(actuator) => {
-                    match actuator.actuate(operation.method(), params, expected_generation, None) {
+                    match actuator.actuate(
+                        operation.method(),
+                        &actuation_params,
+                        expected_generation,
+                        None,
+                    ) {
                         Ok(evidence) => evidence,
                         Err(error) => return browser_store_error(error),
                     }
