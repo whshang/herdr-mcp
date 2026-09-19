@@ -268,8 +268,18 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 },
                 "required": ["continuity_id", "expected_checkpoint_revision", "summary", "checkpoint_json", "created_at"],
                 "anyOf": [
-                    {"required": ["through_message_id"]},
-                    {"required": ["through_evidence_id"]},
+                    {
+                        "properties": {
+                            "through_message_id": {"type": "string", "minLength": 1, "maxLength": 512},
+                        },
+                        "required": ["through_message_id"],
+                    },
+                    {
+                        "properties": {
+                            "through_evidence_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        },
+                        "required": ["through_evidence_id"],
+                    },
                 ],
                 "empty": false,
             },
@@ -2561,8 +2571,18 @@ mod tests {
         assert_eq!(
             methods[3]["params"]["anyOf"],
             json!([
-                {"required": ["through_message_id"]},
-                {"required": ["through_evidence_id"]}
+                {
+                    "properties": {
+                        "through_message_id": {"type": "string", "minLength": 1, "maxLength": 512}
+                    },
+                    "required": ["through_message_id"]
+                },
+                {
+                    "properties": {
+                        "through_evidence_id": {"type": "string", "minLength": 1, "maxLength": 128}
+                    },
+                    "required": ["through_evidence_id"]
+                }
             ])
         );
         assert_eq!(methods[4]["method"], WORK_MEMORY_RESUME_METHOD);
