@@ -136,6 +136,7 @@ The private method `herdr_mcp.browser_endpoint.inspect` additionally exposes the
 | `browser_dispatch.submit` (plain message) | `herdr-mcp webchat send` | supported |
 | `browser_dispatch.status` | `herdr-mcp webchat dispatch-status` | supported (read-only) |
 | `browser_session.archive` | `herdr-mcp webchat archive` | supported |
+| `browser_session.archive_status` | `herdr-mcp webchat archive-status` | supported (read-only provider reconciliation) |
 | `browser_session.open` | `herdr-mcp webchat open` | supported |
 | `browser_dispatch.stop` | — | supported private method, no CLI wrapper |
 | `browser_message.append` | — | not supported |
@@ -272,7 +273,7 @@ Idempotency: one logical handoff keeps one key. Without `--idempotency-key` the 
 
 **Prepared is not delivered.** When the source conversation is not currently registered, or browser control is unavailable, the packet and `manual_delivery.copy_prompt` are still returned with `automatic_delivery.attempted=false` and the runtime's reason. That is a usable result for manual continuation, and it is **not** a completed handoff: only `automatic_delivery.completed=true` (that is, `delivery_state=applied`) means a new conversation was actually created. An `uncertain` delivery is reported as-is and never retried automatically.
 
-`herdr-mcp webchat create --source-url URL` now exposes the same source-anchored route for exact window affinity. The CLI still requires the observed endpoint/provider/account refs to attach the trusted local grant, but those routing ids are not sent in the create payload; Runtime resolves and validates the actual route from the registered canonical source URL.
+`herdr-mcp webchat create --source-url URL` now exposes the same source-anchored route for exact window affinity without requiring caller-supplied endpoint/provider/account refs. The local CLI first asks Runtime over trusted Unix IPC to resolve the latest exact route with the same canonical source resolver, then attaches the trusted local grant derived from that route. The create payload still uses `source_url` as its only route input and Runtime resolves and validates it again before mutation. If the route changes between those reads, the exact grant no longer matches and the operation fails closed instead of targeting the stale endpoint. Explicit direct create still requires endpoint/provider/account and generation.
 
 ## 7. Local agent example
 

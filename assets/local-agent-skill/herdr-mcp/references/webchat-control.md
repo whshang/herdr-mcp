@@ -59,6 +59,14 @@ Archive a session this task created:
 herdr-mcp webchat archive --session-ref SESSION_REF --expected-generation N --idempotency-key KEY
 ```
 
+Reconcile provider archive state without clicking Archive:
+
+```sh
+herdr-mcp webchat archive-status --session-ref SESSION_REF --expected-generation N
+```
+
+`archive-status` is read-only provider readback and returns `archive_state=archived|active|unknown`. After an `archive` result of `uncertain`, never replay the archive mutation blindly. Reopen the exact registered session if needed, run `archive-status`, and act only on that evidence. If it reports `archived`, a later `archive` convergence call is safe for view cleanup because the browser adapter first rechecks provider state and returns applied without a second Archive click. If it reports `active`, the previous uncertain attempt did not leave the provider archived; a new archive mutation is then a new evidence-backed attempt. If it reports `unknown`, stop and keep the outcome unresolved.
+
 Continuation / handoff contract:
 
 ```sh
@@ -103,7 +111,7 @@ continuity_id
 ## Current boundaries (do not document or emulate past these)
 
 - Not supported today (runtime returns `code: "unsupported"`): `browser_space.create`, `browser_space.open`, `browser_message.append`, `browser_composer.set_reasoning`, `browser_composer.set_apps`, and `dispatch.submit` with `reasoning_effort` or `required_apps`.
-- Supported private methods with **no CLI wrapper**: `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`. `browser_session.open` is available through `herdr-mcp webchat open`; `browser_handoff.prepare` is reached through `herdr-mcp webchat handoff`. `webchat create --source-url URL` is available for exact source-window affinity; the explicit endpoint/provider/account refs are used only to attach the trusted local grant, while Runtime resolves and validates the actual route from the registered canonical source URL.
+- Supported private methods with **no CLI wrapper**: `browser_dispatch.stop`, `browser_endpoint.inspect`, `browser_space.inspect`, and the trusted-local read-only source resolver used internally by the CLI. `browser_session.open` is available through `herdr-mcp webchat open`; `browser_handoff.prepare` is reached through `herdr-mcp webchat handoff`. `webchat create --source-url URL` is available for exact source-window affinity and requires only the canonical source URL plus the normal message/idempotency inputs; the trusted local CLI resolves the latest exact endpoint/account route and attaches that grant internally, while Runtime resolves and validates the same canonical route again before mutation.
 - `code: "caller_grant_missing"` means you are not on the trusted local path (for example a raw TCP MCP client); grants cannot be asserted over TCP. Use the CLI.
 - `ego-browser` is development/UAT infrastructure, never a user dependency.
 

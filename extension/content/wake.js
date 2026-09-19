@@ -1632,6 +1632,13 @@ const H2W_CONTENT_VERSION = "0.1.101";
       // inconclusive. Never click a second time; stay honest about uncertainty.
       return { outcome: "uncertain", delivered: true };
     }
+    const existing = await fetchChatGptConversation({
+      conversationId,
+      timeoutMs: 2500,
+    }).catch(() => ({ ok: false }));
+    if (existing?.ok && existing?.body?.is_archived === true) {
+      return { outcome: "applied", delivered: false, alreadyArchived: true };
+    }
     const archive = await openChatGptArchiveMenu();
     if (!archive) return { outcome: "rejected", delivered: false };
     // Converge the one-shot rule here, before the real click: persist and verify
@@ -1757,8 +1764,65 @@ const H2W_CONTENT_VERSION = "0.1.101";
     }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
-    if (attempt.outcome === "applied") evidence.lifecycle_observed = true;
-    else evidence.lifecycle_observed = false;
+    if (attempt.outcome === "applied") {
+      evidence.lifecycle_observed = true;
+      if (attempt.alreadyArchived === true) {
+        evidence.result = { is_archived: true, already_archived: true };
+      }
+    } else {
+      evidence.lifecycle_observed = false;
+    }
+    return evidence;
+  }
+
+  async function performChatGptSessionArchiveStatus(command, evidence) {
+    if (ADAPTER.name !== "chatgpt") {
+      return browserUnavailableEvidence(evidence, "browser_archive_status_provider_unavailable");
+    }
+    const params = command?.params && typeof command.params === "object" ? command.params : {};
+    const sessionRef = typeof params.session_ref === "string" ? params.session_ref : "";
+    const conversationId = chatGptConversationId();
+    if (!sessionRef || sessionRef !== registeredBrowserSessionRef || !conversationId) {
+      return browserUnavailableEvidence(evidence, "browser_archive_status_session_unavailable");
+    }
+    if (evidence.observed_generation !== registeredBrowserGeneration) {
+      return browserUnavailableEvidence(evidence, "browser_archive_status_generation_unavailable");
+    }
+    evidence.command_accepted = true;
+    evidence.stable_resource_ref_observed = true;
+    const readback = await fetchChatGptConversation({
+      conversationId,
+      timeoutMs: 2500,
+    }).catch(() => ({ ok: false }));
+    if (readback?.ok && typeof readback?.body?.is_archived === "boolean") {
+      evidence.lifecycle_observed = true;
+      evidence.result = {
+        is_archived: readback.body.is_archived,
+        archive_state: readback.body.is_archived ? "archived" : "active",
+        readback_source: "conversation",
+      };
+      return evidence;
+    }
+    const archivedList = await fetchChatGptArchivedConversationList({
+      timeoutMs: 3000,
+    }).catch(() => ({ ok: false }));
+    const archived = archivedList?.ok
+      && Array.isArray(archivedList.items)
+      && archivedList.items.some((item) => {
+        const id = String(item?.id || item?.conversation_id || "");
+        return id === conversationId;
+      });
+    if (archived) {
+      evidence.lifecycle_observed = true;
+      evidence.result = {
+        is_archived: true,
+        archive_state: "archived",
+        readback_source: "archive_list",
+      };
+      return evidence;
+    }
+    evidence.lifecycle_observed = false;
+    evidence.result = { error: "browser_archive_status_readback_unavailable" };
     return evidence;
   }
 
@@ -1856,6 +1920,9 @@ const H2W_CONTENT_VERSION = "0.1.101";
       evidence.canonical_url_observed = true;
       evidence.observed_generation = expectedGeneration;
       return evidence;
+    }
+    if (command?.operation === "herdr_mcp.browser_session.archive_status") {
+      return performChatGptSessionArchiveStatus(command, evidence);
     }
     if (command?.operation === "herdr_mcp.browser_session.archive") {
       return performChatGptSessionArchive(command, evidence);
@@ -3255,6 +3322,63 @@ const H2W_CONTENT_VERSION = "0.1.101";
       return { ok: true, body };
     } catch (error) {
       return { ok: false, error: "conversation-failed", reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function fetchChatGptArchivedConversationList({ timeoutMs = 3000 } = {}) {
+    if (ADAPTER.name !== "chatgpt") {
+      return { ok: false, error: "not-chatgpt-conversation" };
+    }
+    const accessToken = await readChatGptAccessToken();
+    if (!accessToken) return { ok: false, error: "session-missing", reason: "auth", status: 401 };
+    const sessionToken = String(accessToken);
+    if (sessionToken.length === 0 || sessionToken.length > 4096) {
+      return { ok: false, error: "session-missing", reason: "auth" };
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const query = new URLSearchParams({
+        offset: "0",
+        limit: "100",
+        order: "updated",
+        is_archived: "true",
+        is_starred: "false",
+      });
+      const response = await fetch(`/backend-api/conversations?${query.toString()}`, {
+        credentials: "include",
+        cache: "no-store",
+        redirect: "error",
+        headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        return {
+          ok: false,
+          error: "archive-list-http",
+          reason: `http-${response.status}`,
+          status: response.status,
+        };
+      }
+      const body = await response.json();
+      const items = Array.isArray(body)
+        ? body
+        : Array.isArray(body?.items)
+          ? body.items
+          : Array.isArray(body?.conversations)
+            ? body.conversations
+            : null;
+      return Array.isArray(items)
+        ? { ok: true, items }
+        : { ok: false, error: "archive-list-shape" };
+    } catch (error) {
+      return {
+        ok: false,
+        error: "archive-list-failed",
+        reason: error?.name === "AbortError" ? "timeout" : "fetch-failed",
+      };
     } finally {
       clearTimeout(timer);
     }

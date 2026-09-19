@@ -99,6 +99,12 @@ function makeContext() {
       if (selector === '[data-message-author-role="assistant"]') {
         return this.getAttribute("data-message-author-role") === "assistant";
       }
+      if (selector === '[data-message-author-role="user"]') {
+        return this.getAttribute("data-message-author-role") === "user";
+      }
+      if (selector === '[data-testid^="conversation-turn-"]') {
+        return String(this.getAttribute("data-testid") || "").startsWith("conversation-turn-");
+      }
       if (selector === '.ProseMirror[contenteditable="true"]') {
         return this.classList.contains("ProseMirror") && this.getAttribute("contenteditable") === "true";
       }
@@ -282,6 +288,10 @@ function makeContext() {
     clearTimeout: fakeClearTimeout,
     requestIdleCallback: fakeRequestIdleCallback,
     cancelIdleCallback: fakeCancelIdleCallback,
+    getComputedStyle: (element) => ({ overflowY: element?._overflowY || "visible" }),
+    innerHeight: 900,
+    scrollByCalls: [],
+    scrollBy(x, y) { this.scrollByCalls.push([x, y]); },
   };
   context.window = context;
   vm.createContext(context);
@@ -382,8 +392,117 @@ test("v9 keeps React mutation hot path free of synchronous layout reads", () => 
   const { context, originalAppendChild } = makeContext();
   assert.equal(context.__HERDR_CHATGPT_PERF__.version, "9");
   assert.equal(context.Node.prototype.appendChild, originalAppendChild);
-  assert.equal(source.includes("getBoundingClientRect"), false);
   assert.equal(source.includes('querySelectorAll?.("*")'), false);
+});
+
+test("user scroll burst freezes Herdr mutations | Given an active wheel burst | When ChatGPT mutates | Then Herdr defers presentation updates", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const { viewer, code } = codeViewer(FakeElement, document, "a\nb");
+  document.body.appendChild(viewer);
+  context.__HERDR_CHATGPT_PERF__.scan();
+  assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), "1");
+
+  document.emit("wheel", { target: document.body });
+  code.textContent = "a\nb\nc";
+  mutationObservers[0].trigger([{ target: code, addedNodes: [], removedNodes: [] }]);
+
+  assert.equal(viewer.getAttribute("data-herdr-code-block-contained"), "1");
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.deferred_mutation_batches, 1);
+});
+
+test("user scroll settlement preserves window viewport anchor | Given no element scroll container | When the burst ends | Then window scroll compensates anchor delta", () => {
+  const { context, document, FakeElement, mutationObservers, runAllTimers, runAllIdle } = makeContext();
+  const turn = new FakeElement("div");
+  turn.ownerDocument = document;
+  turn.setAttribute("data-message-author-role", "assistant");
+  let geometryRead = 0;
+  turn.getBoundingClientRect = () => {
+    geometryRead += 1;
+    const top = geometryRead === 1 ? 120 : 148;
+    return { top, bottom: top + 80 };
+  };
+  document.body.appendChild(turn);
+
+  document.emit("wheel", { target: turn });
+  mutationObservers[0].trigger([{ target: turn, addedNodes: [], removedNodes: [] }]);
+  runAllTimers();
+  runAllIdle();
+
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.anchored_reconciles, 1);
+  assert.deepEqual(context.scrollByCalls, [[0, 28]]);
+});
+
+test("user scroll settlement preserves element viewport anchor | Given an internal scroll container | When the burst ends | Then that container scrollTop compensates anchor delta", () => {
+  const { context, document, FakeElement, mutationObservers, runAllTimers, runAllIdle } = makeContext();
+  const scrollContainer = new FakeElement("div");
+  scrollContainer.ownerDocument = document;
+  scrollContainer._overflowY = "auto";
+  scrollContainer.scrollHeight = 5000;
+  scrollContainer.clientHeight = 900;
+  scrollContainer.scrollTop = 1200;
+  const turn = new FakeElement("section");
+  turn.ownerDocument = document;
+  turn.setAttribute("data-testid", "conversation-turn-42");
+  let geometryRead = 0;
+  turn.getBoundingClientRect = () => {
+    geometryRead += 1;
+    const top = geometryRead === 1 ? 140 : 166;
+    return { top, bottom: top + 80 };
+  };
+  scrollContainer.appendChild(turn);
+  document.body.appendChild(scrollContainer);
+
+  document.emit("wheel", { target: turn });
+  mutationObservers[0].trigger([{ target: turn, addedNodes: [], removedNodes: [] }]);
+  runAllTimers();
+  runAllIdle();
+
+  assert.equal(context.__HERDR_CHATGPT_PERF__.stats.anchored_reconciles, 1);
+  assert.equal(scrollContainer.scrollTop, 1226);
+  assert.deepEqual(context.scrollByCalls, []);
+});
+
+test("user tool summary state survives incremental growth | Given an expanded keyed summary | When a new tool arrives | Then the same summary node remains expanded", () => {
+  const { context, document, FakeElement, mutationObservers } = makeContext();
+  const stack = new FakeElement("div");
+  stack.ownerDocument = document;
+  const reply = new FakeElement("div");
+  reply.ownerDocument = document;
+  reply.setAttribute("data-message-author-role", "assistant");
+  const addTool = () => {
+    const wrap = new FakeElement("div", "contents");
+    wrap.ownerDocument = document;
+    const tool = new FakeElement("span", "group/tool-message");
+    tool.ownerDocument = document;
+    wrap.appendChild(tool);
+    stack.insertBefore(wrap, reply);
+    return wrap;
+  };
+  stack.appendChild(reply);
+  document.body.appendChild(stack);
+  addTool();
+  addTool();
+  context.__HERDR_CHATGPT_PERF__.scan();
+  const summary = stack.children.find((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1");
+  document.emit("click", summary);
+  const added = addTool();
+  mutationObservers[0].trigger([{ target: stack, addedNodes: [added], removedNodes: [] }]);
+  const after = stack.children.find((child) => child.getAttribute?.("data-herdr-tool-run-summary") === "1");
+
+  assert.equal(after, summary);
+  assert.equal(after.getAttribute("aria-expanded"), "true");
+});
+
+test("user long conversation tracking stays bounded | Given more tracked writing blocks than the cache limit | When Herdr scans | Then retained element references stay bounded", () => {
+  const { context, document, FakeElement } = makeContext();
+  for (let index = 0; index < 320; index += 1) {
+    const { message } = assistantWritingRoot(FakeElement, document);
+    document.body.appendChild(message);
+  }
+
+  context.__HERDR_CHATGPT_PERF__.scan();
+
+  assert.ok(context.__HERDR_CHATGPT_PERF__.stats.tracked_element_evictions > 0);
 });
 
 test("v9 does not install the rejected streaming style throttle", () => {

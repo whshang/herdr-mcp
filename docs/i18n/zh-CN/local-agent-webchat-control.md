@@ -136,6 +136,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `browser_dispatch.submit`（普通消息） | `herdr-mcp webchat send` | 支持 |
 | `browser_dispatch.status` | `herdr-mcp webchat dispatch-status` | 支持（只读） |
 | `browser_session.archive` | `herdr-mcp webchat archive` | 支持 |
+| `browser_session.archive_status` | `herdr-mcp webchat archive-status` | 支持（只读 provider 归档状态核对） |
 | `browser_session.open` | `herdr-mcp webchat open` | 支持 |
 | `browser_dispatch.stop` | — | 支持的私有方法，无 CLI 包装 |
 | `browser_message.append` | — | 不支持 |
@@ -272,7 +273,7 @@ Idempotency：一次 logical handoff 只用一个 key。不传 `--idempotency-ke
 
 **准备完成不等于已投递。** 当源会话当前未注册、或 browser control 不可用时，packet 与 `manual_delivery.copy_prompt` 仍会返回，同时 `automatic_delivery.attempted=false` 并带上 runtime 的原因。这是可用于手工接力的结果，**不是**已完成的 handoff：只有 `automatic_delivery.completed=true`（即 `delivery_state=applied`）才代表真的新建了会话。`uncertain` 状态会如实返回，绝不会自动重试。
 
-`herdr-mcp webchat create --source-url URL` 现在也支持精确 source-window affinity。CLI 仍要求传入已观察到的 endpoint/provider/account ref 以附加 trusted local grant，但这些 routing id 不会进入 create 请求体；实际 route 仍由 Runtime 根据已注册的 canonical source URL 解析并校验。
+`herdr-mcp webchat create --source-url URL` 现在也支持精确 source-window affinity，并且不再要求调用方传 endpoint/provider/account ref。本地 CLI 先通过 trusted Unix IPC 让 Runtime 用同一个 canonical source resolver 读取最新 exact route，再用该 route 附加 trusted local grant；create 请求体仍只把 `source_url` 作为路由输入，Runtime 在 mutation 前再次解析并校验。若两次解析之间 route 又变化，exact grant 会失配并 fail closed，不会把写操作误投到旧 endpoint。显式 direct create 仍要求 endpoint/provider/account 与 generation。
 
 ## 7. 本地 Agent 示例
 

@@ -393,7 +393,7 @@ test("ChatGPT session.create recovers instead of trusting a stale cached source 
   assert.deepEqual(harness.recoverCalls, [{ sessionRef: sourceSessionRef, expectedGeneration: 17 }]);
 });
 
-test("ChatGPT session.create without source affinity fails closed across matching windows", async () => {
+test("user keeps exact Project affinity | Given the same authorized Project is open in multiple windows | When session.create needs a host window | Then it deterministically selects one exact-scope window", async () => {
   const harness = createAnchorHarness({
     tabs: [
       { id: 71, windowId: 11 },
@@ -410,7 +410,36 @@ test("ChatGPT session.create without source affinity fails closed across matchin
     spaceRef: "br_space",
     expectedGeneration: 17,
   });
-  assert.deepEqual(result, { windowId: null, unavailable: true, reason: "ambiguous_scope_windows" });
+  assert.deepEqual(result, { windowId: 11, unavailable: false, reason: "exact_scope_window" });
+});
+
+test("user can fan out after source route drift | Given the registered source tab is unavailable but exact account Project generation scope remains | When session.create resolves its anchor | Then it uses the exact scope without reusing a worker tab", async () => {
+  const sourceSessionRef = "br_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  const harness = createAnchorHarness({
+    tabs: [
+      { id: 71, windowId: 22, url: "https://chatgpt.com/c/worker-a" },
+      { id: 72, windowId: 11, url: "https://chatgpt.com/c/worker-b" },
+    ],
+    scopes: [
+      [71, {
+        provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space",
+        observationGeneration: 17, executionState: "generating",
+      }],
+      [72, {
+        provider: "chatgpt", accountRef: "br_account", spaceRef: "br_space",
+        observationGeneration: 17, executionState: "generating",
+      }],
+    ],
+  });
+  const result = await harness.resolve({
+    provider: "chatgpt",
+    accountRef: "br_account",
+    spaceRef: "br_space",
+    expectedGeneration: 17,
+    sourceSessionRef,
+  });
+  assert.deepEqual(result, { windowId: 11, unavailable: false, reason: "source_scope_window" });
+  assert.deepEqual(harness.recoverCalls, [{ sessionRef: sourceSessionRef, expectedGeneration: 17 }]);
 });
 
 test("ChatGPT session.create without source affinity keeps single-window compatibility", async () => {
@@ -985,11 +1014,13 @@ test("background session.open recovers unique target via recoverBrowserSessionTa
   assert.match(segment, /providerOpen !== "chatgpt"/);
 });
 
-test("ChatGPT archive recovery also reuses canonical aliases before creating a disposable view", () => {
+test("user archive recovery reuses canonical aliases | Given an exact session target is absent | When archive or archive-status resolves its canonical route | Then one existing alias is reused before any disposable view", () => {
   const openStart = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
-  const archiveStart = backgroundSource.indexOf('if (!target && operation === "herdr_mcp.browser_session.archive")', openStart);
+  const archiveStart = backgroundSource.indexOf('if (!target && (', openStart);
   assert.ok(archiveStart > openStart, "archive fallback must exist after session.open");
-  const segment = backgroundSource.slice(archiveStart, archiveStart + 3500);
+  const segment = backgroundSource.slice(archiveStart, archiveStart + 5000);
+  assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive"/);
+  assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive_status"/);
   assert.match(segment, /findBrowserSessionTargetByCanonicalIdentity/);
   assert.match(segment, /existing\.ambiguous/);
   assert.ok(
@@ -1127,6 +1158,8 @@ function selfArchiveHarness(overrides = {}) {
     conversationId: "conv-self-archive",
     archiveAvailable: true,
     archiveVerifies: true,
+    archiveListContains: false,
+    providerArchived: false,
     archiveClickThrows: false,
     onArchiveClick: null,
     verifyGate: null,
@@ -1168,14 +1201,23 @@ function selfArchiveHarness(overrides = {}) {
         ? { click: () => {
             ctx.clicks.push(Date.now());
             if (typeof ctx.onArchiveClick === "function") ctx.onArchiveClick();
+            if (ctx.archiveVerifies) ctx.providerArchived = true;
             if (ctx.archiveClickThrows) throw new Error("archive click failed after dispatch");
           } }
         : null;
     };
     const fetchChatGptConversation = async () => {
-      if (ctx.verifyGate) await ctx.verifyGate;
-      return ctx.archiveVerifies ? { ok: true, body: { is_archived: true } } : { ok: false };
+      if (ctx.verifyGate && ctx.clicks.length > 0) await ctx.verifyGate;
+      return ctx.archiveVerifies
+        ? { ok: true, body: { is_archived: ctx.providerArchived === true } }
+        : { ok: false };
     };
+    const fetchChatGptArchivedConversationList = async () => ({
+      ok: true,
+      items: ctx.archiveListContains
+        ? [{ id: ctx.conversationId, is_archived: true }]
+        : [],
+    });
     const wait = (ms) => { Date.advance(ms); return Promise.resolve(); };
     const browserRejectedEvidence = (evidence, reason) => ({
       ...evidence,
@@ -1187,6 +1229,7 @@ function selfArchiveHarness(overrides = {}) {
     ${segment}
     return {
       performChatGptSessionArchive,
+      performChatGptSessionArchiveStatus,
       drain: drainPendingSelfArchives,
       pendingCount: () => readPendingSelfArchives().length,
       setGeneration: (value) => { registeredBrowserGeneration = value; },
@@ -1195,6 +1238,79 @@ function selfArchiveHarness(overrides = {}) {
   `)(ctx, sessionStorage, () => 0, dateShim);
   return { ctx, api, storage, writeState };
 }
+
+test("user archive status reads provider state without clicking Archive | Given an active then archived conversation | When status is read | Then state changes and click count stays zero", async () => {
+  const { ctx, api } = selfArchiveHarness();
+  const command = {
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7 },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  const active = await api.performChatGptSessionArchiveStatus(command, evidence());
+  assert.equal(active.command_accepted, true);
+  assert.equal(active.lifecycle_observed, true);
+  assert.equal(active.result?.is_archived, false);
+  assert.equal(active.result?.archive_state, "active");
+  assert.equal(ctx.clicks.length, 0);
+
+  ctx.providerArchived = true;
+  const archived = await api.performChatGptSessionArchiveStatus(command, evidence());
+  assert.equal(archived.command_accepted, true);
+  assert.equal(archived.lifecycle_observed, true);
+  assert.equal(archived.result?.is_archived, true);
+  assert.equal(archived.result?.archive_state, "archived");
+  assert.equal(ctx.clicks.length, 0);
+});
+
+test("user archive status stays unknown on readback failure and never clicks | Given provider readback unavailable | When status is read | Then lifecycle is unconfirmed", async () => {
+  const { ctx, api } = selfArchiveHarness({ archiveVerifies: false });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7 },
+  };
+  const result = await api.performChatGptSessionArchiveStatus(command, { observed_generation: 7 });
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.lifecycle_observed, false);
+  assert.equal(result.result?.error, "browser_archive_status_readback_unavailable");
+  assert.equal(ctx.clicks.length, 0);
+});
+
+test("user archive status reconciles from the archived list without mutation | Given direct conversation readback is unavailable but the exact id is in the archived list | When status is read | Then archived is proven and Archive is never clicked", async () => {
+  const { ctx, api } = selfArchiveHarness({
+    archiveVerifies: false,
+    archiveListContains: true,
+  });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7 },
+  };
+  const result = await api.performChatGptSessionArchiveStatus(command, { observed_generation: 7 });
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.lifecycle_observed, true);
+  assert.equal(result.result?.is_archived, true);
+  assert.equal(result.result?.archive_state, "archived");
+  assert.equal(result.result?.readback_source, "archive_list");
+  assert.equal(ctx.clicks.length, 0);
+});
+
+test("user re-archive of an already archived conversation confirms lifecycle without a second click | Given provider state already archived | When archive runs | Then it is applied readback-only", async () => {
+  const { ctx, api } = selfArchiveHarness({ providerArchived: true, turnInProgress: false });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-known-1" },
+  };
+  const result = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.lifecycle_observed, true);
+  assert.equal(result.result?.is_archived, true);
+  assert.equal(result.result?.already_archived, true);
+  assert.equal(ctx.clicks.length, 0);
+});
 
 test("deferred self-archive waits for idle, dedupes idempotently, and fails closed on generation drift", async () => {
   const sessionRef = "br_self_archive";
@@ -1491,15 +1607,21 @@ test("ChatGPT session.open can restore a disposable view from a local canonical 
   assert.doesNotMatch(contentSegment, /performWake|findSendButton|dispatchEnterSubmit/);
 });
 
-test("ChatGPT session.archive can reopen its durable canonical URL when the target tab is closed", () => {
+test("user archive reconciliation uses bounded temporary views | Given the exact session tab is closed | When archive or archive-status restores the canonical URL | Then mutation is visible while read-only status uses and closes an inactive temporary tab", () => {
   const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
   const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);
   assert.ok(start >= 0 && end > start, "archive target routing block must remain extractable");
   const segment = backgroundSource.slice(start, end);
   assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive"/);
+  assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive_status"/);
   assert.match(segment, /const canonicalUrl = String\(params\.canonical_url \|\| ""\)/);
   assert.match(segment, /browserConversationInfo\(providerArchive, canonicalUrl\)/);
-  assert.match(segment, /chrome\.tabs\.create\(\{ url: canonicalUrl, active: true \}\)/);
+  assert.match(
+    segment,
+    /chrome\.tabs\.create\(\{\s*url: canonicalUrl,\s*active: operation !== "herdr_mcp\.browser_session\.archive_status"/,
+  );
+  assert.match(segment, /temporaryArchiveStatusTabId = createdTab\.id/);
+  assert.match(segment, /chrome\.tabs\.remove\(temporaryArchiveStatusTabId\)/);
   assert.match(segment, /browserSessionTargets\.get\(sessionRef\)/);
   assert.match(segment, /Date\.now\(\) \+ 8000/);
   assert.match(segment, /createdTab\?\.id/);
@@ -2059,6 +2181,55 @@ test("user Given a fresh ChatGPT create When content dispatch throws Then the ex
   assert.equal(evidence?.result?.error, "browser_create_content_dispatch_failed");
 });
 
+test("user can create two independent workers | Given one exact Project scope spans multiple windows and the original source tab is unavailable | When two session.create mutations run consecutively while sibling workers are generating | Then each mutation opens and delivers only to its own fresh tab", async () => {
+  const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
+  const sourceSessionRef = "br_" + "3".repeat(64);
+  const harness = createActuationBranchHarness();
+  harness.browserTabScopes.set(71, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17, executionState: "generating",
+  });
+  harness.browserTabScopes.set(72, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17, executionState: "generating",
+  });
+  harness.tabs.set(71, { id: 71, url: `https://chatgpt.com/g/${projectId}/c/worker-a`, windowId: 22 });
+  harness.tabs.set(72, { id: 72, url: `https://chatgpt.com/g/${projectId}/c/worker-b`, windowId: 11 });
+  harness.liveScopesByTab.set(100, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+  harness.liveScopesByTab.set(101, {
+    provider: "chatgpt", accountRef, spaceRef, observationGeneration: 17,
+  });
+
+  for (const [suffix, reservationDigit] of [["a", "4"], ["b", "5"]]) {
+    await harness.actuate({
+      protocol: "herdr-browser-actuation/v1",
+      actuation_id: "ba_" + suffix.repeat(16),
+      operation: "herdr_mcp.browser_session.create",
+      expected_generation: 17,
+      params: {
+        provider: "chatgpt",
+        account_ref: accountRef,
+        space_ref: spaceRef,
+        source_session_ref: sourceSessionRef,
+        reservation_ref: "bsr_" + reservationDigit.repeat(64),
+        launch_url: `https://chatgpt.com/g/${projectId}`,
+      },
+    });
+    for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  }
+
+  assert.deepEqual(harness.actuationMessages.map((message) => message.tabId), [100, 101]);
+  assert.equal(harness.tabs.get(100)?.windowId, 11);
+  assert.equal(harness.tabs.get(101)?.windowId, 11);
+  assert.equal(harness.postCalls.filter((call) => call.evidence?.command_accepted === true).length, 2);
+  assert.equal(
+    harness.postCalls.some((call) => call.evidence?.result?.error === "source_session_unavailable"),
+    false,
+  );
+});
+
 test("session.create still fails closed when the fresh tab can never be identified", async () => {
   const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2093,7 +2264,7 @@ test("session.create still fails closed when the fresh tab can never be identifi
   assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
 });
 
-test("session.create preserves the exact source-window failure reason", async () => {
+test("user still fails closed after source recovery | Given source affinity falls back to an exact Project scope | When the fresh tab never proves that scope | Then no create command is delivered", async () => {
   const accountRef = "br_account_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   const spaceRef = "br_space_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const projectId = "g-p-6a89c078669481918c8eb70fdfd3d978";
@@ -2120,8 +2291,8 @@ test("session.create preserves the exact source-window failure reason", async ()
   });
 
   const failure = harness.postCalls.find((c) => c.evidence?.resource_available === false);
-  assert.ok(failure, "missing exact source session must fail closed");
+  assert.ok(failure, "unverified fresh tab must fail closed");
   assert.equal(failure.evidence.command_accepted, false);
-  assert.equal(failure.evidence.result?.error, "source_session_unavailable");
+  assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
   assert.equal(harness.actuationMessages.length, 0);
 });
