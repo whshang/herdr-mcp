@@ -12,7 +12,8 @@ use crate::progressive_skills::{
     BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_STOP_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD,
     BROWSER_ENDPOINT_INSPECT_METHOD, BROWSER_ENDPOINT_LIST_METHOD, BROWSER_HANDOFF_PREPARE_METHOD,
     BROWSER_MESSAGE_APPEND_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
-    BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD,
+    BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD,
+    BROWSER_SESSION_ARCHIVE_STATUS_METHOD, BROWSER_SESSION_CREATE_METHOD,
     BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
     BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD,
     EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
@@ -1719,6 +1720,7 @@ enum BrowserOperation {
     SessionCreate,
     SessionOpen,
     SessionArchive,
+    SessionArchiveStatus,
     SessionInspect,
     MessageAppend,
     ComposerSetReasoning,
@@ -1737,6 +1739,7 @@ impl BrowserOperation {
             BROWSER_SESSION_CREATE_METHOD => Some(Self::SessionCreate),
             BROWSER_SESSION_OPEN_METHOD => Some(Self::SessionOpen),
             BROWSER_SESSION_ARCHIVE_METHOD => Some(Self::SessionArchive),
+            BROWSER_SESSION_ARCHIVE_STATUS_METHOD => Some(Self::SessionArchiveStatus),
             BROWSER_SESSION_INSPECT_METHOD => Some(Self::SessionInspect),
             BROWSER_MESSAGE_APPEND_METHOD => Some(Self::MessageAppend),
             BROWSER_COMPOSER_SET_REASONING_METHOD => Some(Self::ComposerSetReasoning),
@@ -1756,6 +1759,7 @@ impl BrowserOperation {
             Self::SessionCreate => BROWSER_SESSION_CREATE_METHOD,
             Self::SessionOpen => BROWSER_SESSION_OPEN_METHOD,
             Self::SessionArchive => BROWSER_SESSION_ARCHIVE_METHOD,
+            Self::SessionArchiveStatus => BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
             Self::SessionInspect => BROWSER_SESSION_INSPECT_METHOD,
             Self::MessageAppend => BROWSER_MESSAGE_APPEND_METHOD,
             Self::ComposerSetReasoning => BROWSER_COMPOSER_SET_REASONING_METHOD,
@@ -1769,7 +1773,10 @@ impl BrowserOperation {
     fn is_mutation(self) -> bool {
         !matches!(
             self,
-            Self::SpaceInspect | Self::SessionInspect | Self::DispatchStatus
+            Self::SpaceInspect
+                | Self::SessionArchiveStatus
+                | Self::SessionInspect
+                | Self::DispatchStatus
         )
     }
 
@@ -1781,6 +1788,7 @@ impl BrowserOperation {
             Self::SessionCreate => "session.create",
             Self::SessionOpen => "session.open",
             Self::SessionArchive => "session.archive",
+            Self::SessionArchiveStatus => "session.inspect",
             Self::SessionInspect => "session.inspect",
             Self::MessageAppend => "message.append",
             Self::ComposerSetReasoning => "composer.set_reasoning",
@@ -1924,6 +1932,9 @@ fn browser_delivery_state_from_postcondition(
                 && evidence.canonical_url_observed
         }
         BrowserOperation::SessionArchive => {
+            evidence.stable_resource_ref_observed && evidence.lifecycle_observed
+        }
+        BrowserOperation::SessionArchiveStatus => {
             evidence.stable_resource_ref_observed && evidence.lifecycle_observed
         }
         BrowserOperation::MessageAppend => {
@@ -4329,6 +4340,114 @@ fn browser_operation_call_with_controls(
             operation,
             caller_webchat_control_grants,
         ),
+        BrowserOperation::SessionArchiveStatus => {
+            let expected_generation = params
+                .get("expected_generation")
+                .and_then(Value::as_i64)
+                .unwrap();
+            let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
+            {
+                let Ok(guard) = store.lock() else {
+                    return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+                };
+                let session = match guard.browser_resource(session_ref) {
+                    Ok(Some(resource)) if resource.kind == "session" => resource,
+                    Ok(Some(_)) => {
+                        return json!({"ok": false, "code": "browser_resource_kind_mismatch"});
+                    }
+                    Ok(None) => {
+                        return json!({"ok": false, "code": "browser_resource_not_found"});
+                    }
+                    Err(error) => return browser_store_error(error),
+                };
+                if session.provider != "chatgpt" {
+                    return json!({
+                        "ok": false,
+                        "code": "unsupported",
+                        "operation": operation.method(),
+                    });
+                }
+                if session.observation_generation != expected_generation {
+                    return json!({"ok": false, "code": "stale_capability_generation"});
+                }
+                let decision = match browser_resource_actuation_decision(
+                    &guard,
+                    operation.capability_operation(),
+                    &session,
+                    caller_webchat_control_grants,
+                    Some(expected_generation),
+                ) {
+                    Ok(decision) => decision,
+                    Err(error) => return browser_store_error(error),
+                };
+                match decision {
+                    (true, None) => {}
+                    (false, Some(reason)) => {
+                        return json!({
+                            "ok": false,
+                            "code": reason,
+                            "actuation_available": false,
+                        });
+                    }
+                    _ => {
+                        return json!({
+                            "ok": false,
+                            "code": "capability_unknown",
+                            "actuation_available": false,
+                        });
+                    }
+                }
+            }
+            let evidence = match browser_actuator {
+                Some(actuator) => {
+                    match actuator.actuate(operation.method(), params, expected_generation, None) {
+                        Ok(evidence) => evidence,
+                        Err(error) => return browser_store_error(error),
+                    }
+                }
+                None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+            };
+            if evidence.observed_generation != expected_generation {
+                return json!({"ok": false, "code": "stale_capability_generation"});
+            }
+            let is_archived = evidence
+                .result
+                .as_ref()
+                .and_then(|result| result.get("is_archived"))
+                .and_then(Value::as_bool);
+            if evidence.browser_online
+                && evidence.resource_available
+                && !evidence.rejected
+                && evidence.stable_resource_ref_observed
+                && evidence.lifecycle_observed
+                && is_archived.is_some()
+            {
+                return json!({
+                    "ok": true,
+                    "operation": operation.method(),
+                    "session_ref": session_ref,
+                    "expected_generation": expected_generation,
+                    "archive_state": if is_archived == Some(true) { "archived" } else { "active" },
+                    "is_archived": is_archived,
+                    "read_only": true,
+                });
+            }
+            let reason = browser_evidence_machine_reason(&evidence)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "browser_archive_status_unknown".to_owned());
+            json!({
+                "ok": false,
+                "code": "archive_status_unknown",
+                "reason": reason,
+                "operation": operation.method(),
+                "session_ref": session_ref,
+                "expected_generation": expected_generation,
+                "archive_state": "unknown",
+                "is_archived": Value::Null,
+                "read_only": true,
+            })
+        }
         BrowserOperation::SessionCreate => browser_session_create(
             store,
             params,
@@ -4495,6 +4614,7 @@ fn validate_browser_operation_params(
         BrowserOperation::SessionArchive => {
             &["session_ref", "expected_generation", "idempotency_key"]
         }
+        BrowserOperation::SessionArchiveStatus => &["session_ref", "expected_generation"],
         BrowserOperation::SessionInspect => &["session_ref"],
         BrowserOperation::MessageAppend => &[
             "session_ref",
@@ -4589,6 +4709,10 @@ fn validate_browser_operation_params(
             browser_required_string(params, "session_ref", 96)?;
             browser_required_generation(params)?;
             browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::SessionArchiveStatus => {
+            browser_required_string(params, "session_ref", 96)?;
+            browser_required_generation(params)?;
         }
         BrowserOperation::SessionInspect => {
             browser_required_string(params, "session_ref", 96)?;
@@ -4743,6 +4867,7 @@ fn browser_operation_actuation_decision(
             resource
         }
         BrowserOperation::SpaceInspect
+        | BrowserOperation::SessionArchiveStatus
         | BrowserOperation::SessionInspect
         | BrowserOperation::DispatchStatus => {
             return Err("browser_operation_not_mutating".to_owned());
@@ -4852,6 +4977,7 @@ fn browser_operation_mutation_scope(
             browser_operation_resource(store, &dispatch.target_session_ref, "session")?
         }
         BrowserOperation::SpaceInspect
+        | BrowserOperation::SessionArchiveStatus
         | BrowserOperation::SessionInspect
         | BrowserOperation::DispatchStatus => {
             return Err("browser_operation_not_mutating".to_owned());
@@ -9619,6 +9745,105 @@ mod tests {
         );
         assert_eq!(archived["ok"], true);
         assert_eq!(archived["delivery_state"], "applied");
+
+        struct SessionArchiveStatusActuator {
+            expected_session_ref: String,
+            archived: Option<bool>,
+        }
+        impl BrowserActuator for SessionArchiveStatusActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, "herdr_mcp.browser_session.archive_status");
+                assert_eq!(expected_generation, 7);
+                assert!(dispatch_id.is_none());
+                assert_eq!(params["session_ref"], self.expected_session_ref);
+                assert!(params.get("idempotency_key").is_none());
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: self.archived.is_some(),
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                    result: Some(match self.archived {
+                        Some(is_archived) => json!({"is_archived": is_archived}),
+                        None => json!({"error": "browser_archive_status_readback_unavailable"}),
+                    }),
+                })
+            }
+        }
+
+        for (provider_state, expected_state) in [(Some(true), "archived"), (Some(false), "active")]
+        {
+            let status = browser_operation_call_with_grant(
+                &store,
+                "herdr_mcp.browser_session.archive_status",
+                &json!({
+                    "session_ref": session_ref,
+                    "expected_generation": 7,
+                }),
+                true,
+                Some(&SessionArchiveStatusActuator {
+                    expected_session_ref: session_ref.clone(),
+                    archived: provider_state,
+                }),
+            );
+            assert_eq!(status["ok"], true);
+            assert_eq!(status["archive_state"], expected_state);
+            assert_eq!(status["is_archived"], provider_state.unwrap());
+            assert_eq!(status["read_only"], true);
+        }
+
+        let unknown = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.archive_status",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 7,
+            }),
+            true,
+            Some(&SessionArchiveStatusActuator {
+                expected_session_ref: session_ref.clone(),
+                archived: None,
+            }),
+        );
+        assert_eq!(unknown["ok"], false);
+        assert_eq!(unknown["code"], "archive_status_unknown");
+        assert_eq!(
+            unknown["reason"],
+            "browser_archive_status_readback_unavailable"
+        );
+        assert_eq!(unknown["archive_state"], "unknown");
+
+        let ungranted = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.archive_status",
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": 7,
+            }),
+            false,
+            Some(&SessionArchiveStatusActuator {
+                expected_session_ref: session_ref.clone(),
+                archived: Some(true),
+            }),
+        );
+        assert_eq!(ungranted["ok"], false);
+        assert_eq!(ungranted["code"], "caller_grant_missing");
     }
 
     #[test]

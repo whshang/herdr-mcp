@@ -136,6 +136,7 @@ The private method `herdr_mcp.browser_endpoint.inspect` additionally exposes the
 | `browser_dispatch.submit` (plain message) | `herdr-mcp webchat send` | supported |
 | `browser_dispatch.status` | `herdr-mcp webchat dispatch-status` | supported (read-only) |
 | `browser_session.archive` | `herdr-mcp webchat archive` | supported |
+| `browser_session.archive_status` | `herdr-mcp webchat archive-status` | supported (read-only provider reconciliation) |
 | `browser_session.open` | `herdr-mcp webchat open` | supported |
 | `browser_dispatch.stop` | — | supported private method, no CLI wrapper |
 | `browser_message.append` | — | not supported |

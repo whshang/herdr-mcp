@@ -136,6 +136,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `browser_dispatch.submit`（通常メッセージ） | `herdr-mcp webchat send` | 対応 |
 | `browser_dispatch.status` | `herdr-mcp webchat dispatch-status` | 対応（読み取り専用） |
 | `browser_session.archive` | `herdr-mcp webchat archive` | 対応 |
+| `browser_session.archive_status` | `herdr-mcp webchat archive-status` | 対応（読み取り専用の provider archive 状態照合） |
 | `browser_session.open` | `herdr-mcp webchat open` | 対応 |
 | `browser_dispatch.stop` | — | 対応する私有メソッド、CLI ラッパーなし |
 | `browser_message.append` | — | 非対応 |

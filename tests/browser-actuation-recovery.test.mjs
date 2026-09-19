@@ -1120,6 +1120,7 @@ function selfArchiveHarness(overrides = {}) {
     conversationId: "conv-self-archive",
     archiveAvailable: true,
     archiveVerifies: true,
+    providerArchived: false,
     archiveClickThrows: false,
     onArchiveClick: null,
     verifyGate: null,
@@ -1161,13 +1162,16 @@ function selfArchiveHarness(overrides = {}) {
         ? { click: () => {
             ctx.clicks.push(Date.now());
             if (typeof ctx.onArchiveClick === "function") ctx.onArchiveClick();
+            if (ctx.archiveVerifies) ctx.providerArchived = true;
             if (ctx.archiveClickThrows) throw new Error("archive click failed after dispatch");
           } }
         : null;
     };
     const fetchChatGptConversation = async () => {
-      if (ctx.verifyGate) await ctx.verifyGate;
-      return ctx.archiveVerifies ? { ok: true, body: { is_archived: true } } : { ok: false };
+      if (ctx.verifyGate && ctx.clicks.length > 0) await ctx.verifyGate;
+      return ctx.archiveVerifies
+        ? { ok: true, body: { is_archived: ctx.providerArchived === true } }
+        : { ok: false };
     };
     const wait = (ms) => { Date.advance(ms); return Promise.resolve(); };
     const browserRejectedEvidence = (evidence, reason) => ({
@@ -1180,6 +1184,7 @@ function selfArchiveHarness(overrides = {}) {
     ${segment}
     return {
       performChatGptSessionArchive,
+      performChatGptSessionArchiveStatus,
       drain: drainPendingSelfArchives,
       pendingCount: () => readPendingSelfArchives().length,
       setGeneration: (value) => { registeredBrowserGeneration = value; },
@@ -1188,6 +1193,60 @@ function selfArchiveHarness(overrides = {}) {
   `)(ctx, sessionStorage, () => 0, dateShim);
   return { ctx, api, storage, writeState };
 }
+
+test("user archive status reads provider state without clicking Archive | Given an active then archived conversation | When status is read | Then state changes and click count stays zero", async () => {
+  const { ctx, api } = selfArchiveHarness();
+  const command = {
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7 },
+  };
+  const evidence = () => ({ observed_generation: 7 });
+
+  const active = await api.performChatGptSessionArchiveStatus(command, evidence());
+  assert.equal(active.command_accepted, true);
+  assert.equal(active.lifecycle_observed, true);
+  assert.equal(active.result?.is_archived, false);
+  assert.equal(active.result?.archive_state, "active");
+  assert.equal(ctx.clicks.length, 0);
+
+  ctx.providerArchived = true;
+  const archived = await api.performChatGptSessionArchiveStatus(command, evidence());
+  assert.equal(archived.command_accepted, true);
+  assert.equal(archived.lifecycle_observed, true);
+  assert.equal(archived.result?.is_archived, true);
+  assert.equal(archived.result?.archive_state, "archived");
+  assert.equal(ctx.clicks.length, 0);
+});
+
+test("user archive status stays unknown on readback failure and never clicks | Given provider readback unavailable | When status is read | Then lifecycle is unconfirmed", async () => {
+  const { ctx, api } = selfArchiveHarness({ archiveVerifies: false });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive_status",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7 },
+  };
+  const result = await api.performChatGptSessionArchiveStatus(command, { observed_generation: 7 });
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.lifecycle_observed, false);
+  assert.equal(result.result?.error, "browser_archive_status_readback_unavailable");
+  assert.equal(ctx.clicks.length, 0);
+});
+
+test("user re-archive of an already archived conversation confirms lifecycle without a second click | Given provider state already archived | When archive runs | Then it is applied readback-only", async () => {
+  const { ctx, api } = selfArchiveHarness({ providerArchived: true, turnInProgress: false });
+  const command = {
+    operation: "herdr_mcp.browser_session.archive",
+    expected_generation: 7,
+    params: { session_ref: ctx.sessionRef, expected_generation: 7, idempotency_key: "archive-known-1" },
+  };
+  const result = await api.performChatGptSessionArchive(command, { observed_generation: 7 });
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.lifecycle_observed, true);
+  assert.equal(result.result?.is_archived, true);
+  assert.equal(result.result?.already_archived, true);
+  assert.equal(ctx.clicks.length, 0);
+});
 
 test("deferred self-archive waits for idle, dedupes idempotently, and fails closed on generation drift", async () => {
   const sessionRef = "br_self_archive";
