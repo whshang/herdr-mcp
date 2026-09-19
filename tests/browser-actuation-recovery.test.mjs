@@ -1573,7 +1573,7 @@ test("ChatGPT session.open can restore a disposable view from a local canonical 
 
 test("user archive reconciliation uses bounded temporary views | Given the exact session tab is closed | When archive or archive-status restores the canonical URL | Then mutation is visible while read-only status uses and closes an inactive temporary tab", () => {
   const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
-  const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);
+  const end = backgroundSource.indexOf('const evidence = response?.evidence', start);
   assert.ok(start >= 0 && end > start, "archive target routing block must remain extractable");
   const segment = backgroundSource.slice(start, end);
   assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive"/);
@@ -1586,6 +1586,11 @@ test("user archive reconciliation uses bounded temporary views | Given the exact
   );
   assert.match(segment, /temporaryArchiveStatusTabId = createdTab\.id/);
   assert.match(segment, /chrome\.tabs\.remove\(temporaryArchiveStatusTabId\)/);
+  assert.match(segment, /let actuationSessionRef = sessionRef/);
+  assert.match(segment, /for \(const \[candidateRef, candidateTarget\] of browserSessionTargets\.entries\(\)\)/);
+  assert.match(segment, /candidateTarget\?\.convKey === canonicalInfo\.convKey/);
+  assert.match(segment, /actuationSessionRef = candidateRef/);
+  assert.match(segment, /params: actuationParams/);
   assert.match(segment, /browserSessionTargets\.get\(sessionRef\)/);
   assert.match(segment, /Date\.now\(\) \+ 8000/);
   assert.match(segment, /createdTab\?\.id/);
