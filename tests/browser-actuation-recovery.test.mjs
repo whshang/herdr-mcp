@@ -938,6 +938,110 @@ test("user can stop a live answer | Given an explicit visible stop control while
   assert.equal(result.generation_stopped, true);
 });
 
+test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then the mutation is attempted once and remains uncertain", async () => {
+  const start = wakeSource.indexOf("  async function submitBrowserActuationOnce()");
+  const end = wakeSource.indexOf("  // ---- Submission ----", start);
+  assert.ok(start >= 0 && end > start, "bounded Browser Actuation submit helper must remain extractable");
+  const helperSource = wakeSource.slice(start, end);
+
+  async function run({ busy = false, ack = false } = {}) {
+    const ctx = { busy, ack, clicks: 0 };
+    ctx.button = {
+      disabled: false,
+      click() { ctx.clicks += 1; },
+    };
+    const submitOnce = new Function("ctx", `
+      const isComposerGenerating = () => ctx.busy;
+      const ADAPTER = { getInputEl: () => ({ innerText: "next turn" }) };
+      const wait = async () => {};
+      const findSendButton = () => ctx.button;
+      const isSendButton = (button) => Boolean(button) && button.disabled !== true;
+      const captureSubmitAckBaseline = () => ({});
+      const waitForSubmitAck = async () => ctx.ack;
+      ${helperSource}
+      return submitBrowserActuationOnce;
+    `)(ctx);
+    return { result: await submitOnce(), clicks: ctx.clicks };
+  }
+
+  const delayed = await run({ ack: false });
+  assert.equal(delayed.clicks, 1);
+  assert.equal(delayed.result.ok, false);
+  assert.equal(delayed.result.attempted, true);
+  assert.equal(delayed.result.uncertain, true);
+
+  const accepted = await run({ ack: true });
+  assert.equal(accepted.clicks, 1);
+  assert.equal(accepted.result.ok, true);
+  assert.equal(accepted.result.attempted, true);
+
+  const busy = await run({ busy: true });
+  assert.equal(busy.clicks, 0);
+  assert.equal(busy.result.ok, false);
+  assert.equal(busy.result.attempted, false);
+});
+
+test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit attempt cannot be proven | When Browser Actuation returns | Then it is uncertain with a bounded readback instead of a retryable rejection", async () => {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
+  assert.ok(commandStart >= 0 && commandEnd > commandStart);
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const ctx = { snapshotTimeouts: [], wakeArgs: null };
+
+  const act = new Function("ctx", `
+    const ADAPTER = {
+      name: "chatgpt",
+      getConversationKey: () => "https://chatgpt.com/c/current",
+      getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
+      getInputEl: () => ({}),
+      inputHasContent: () => false,
+      getMessageSnapshot: () => ({}),
+    };
+    const chatGptConversationId = () => "current";
+    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = "https://chatgpt.com/c/current";
+    const providerCanonicalConversationObserved = () => true;
+    const document = { hidden: false };
+    const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
+    const isTurnInProgress = () => false;
+    const runtimeAlive = () => true;
+    const wait = async () => {};
+    const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
+    const fetchChatGptConversationSnapshot = async (timeoutMs) => {
+      ctx.snapshotTimeouts.push(timeoutMs);
+      return { ok: false };
+    };
+    const performWake = async (args) => {
+      ctx.wakeArgs = args;
+      return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
+    };
+    const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    ${evidenceSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)(ctx);
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    params: { message: "next turn", required_apps: [] },
+  });
+
+  assert.equal(ctx.wakeArgs.browserActuation, true);
+  assert.deepEqual(ctx.snapshotTimeouts, [1200]);
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.rejected, false);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.generation_owner, null);
+});
+
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);

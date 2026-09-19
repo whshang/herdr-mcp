@@ -1052,7 +1052,7 @@ ok(controlCenterSource.includes('const EXPANDED_WORKSPACES_KEY = "herdrControlEx
 ok(chatGptAdapterSource.includes("getStopButtonCandidates()")
     && chatGptAdapterSource.includes('button[data-testid="stop-button"]')
     && !wakeSource.includes('document.querySelectorAll("button, [role=button]").filter')
-    && wakeSource.includes('data.manual === true ? 1200 : 15000')
+    && wakeSource.includes('data.manual === true ? 1200 : (boundedBrowserActuation ? 1500 : 15000)')
     && wakeSource.includes('busy_reason: composerBusyReason() || "unknown"'),
   "manual Continue scopes composer busy detection to explicit composer stop controls and fails fast when truly busy");
 const wakeHandlerStart = wakeSource.indexOf('if (msg?.type === "h2w_wake")');
