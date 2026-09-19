@@ -139,11 +139,11 @@ ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";
-ok(browserActuationSendSource.includes("chrome.tabs.sendMessage")
+ok(browserActuationSendSource.includes("sendTabMessageWithTimeout(tabId, message, 18000)")
     && !browserActuationSendSource.includes("chrome.tabs.reload")
     && !browserActuationSendSource.includes("sendChatGptTabMessage")
     && backgroundSource.includes("const response = await sendBrowserActuationTabMessage(target.tabId"),
-  "browser actuation is one strict attempt and cannot inherit handoff reload recovery");
+  "browser actuation is one bounded strict attempt and cannot inherit handoff reload recovery");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")

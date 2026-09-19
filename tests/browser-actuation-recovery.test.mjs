@@ -1137,6 +1137,39 @@ test("user receives exact content rejection reasons | Given browser controls rej
   }
 });
 
+test("user keeps shared browser control responsive | Given one stale content view never answers | When Herdr sends a browser actuation command | Then one tab message times out without reload or resend", async () => {
+  const start = backgroundSource.indexOf("async function sendTabMessageWithTimeout(");
+  const end = backgroundSource.indexOf("async function sendHandoffTabMessage(", start);
+  assert.ok(start >= 0 && end > start, "bounded tab-message helpers must remain extractable");
+  const helperSource = backgroundSource.slice(start, end);
+  const ctx = { sends: 0, reloads: 0 };
+  const send = new Function("ctx", `
+    const chrome = {
+      tabs: {
+        sendMessage: () => {
+          ctx.sends += 1;
+          return new Promise(() => {});
+        },
+        reload: async () => { ctx.reloads += 1; },
+      },
+    };
+    const setTimeout = (fn) => { fn(); return 1; };
+    const clearTimeout = () => {};
+    const waitForTabComplete = async () => null;
+    const missingReceiverError = () => false;
+    const sleep = async () => {};
+    ${helperSource}
+    return sendBrowserActuationTabMessage;
+  `)(ctx);
+
+  await assert.rejects(
+    () => send(41, { type: "h2w_browser_actuation" }),
+    /browser-actuation-content-timeout/,
+  );
+  assert.equal(ctx.sends, 1);
+  assert.equal(ctx.reloads, 0);
+});
+
 test("adapter capability reprobe advances observation generation on snapshot change", () => {
   assert.match(backgroundSource, /const browserCapabilitySnapshots = new Map\(\)/);
   assert.match(backgroundSource, /getBrowserObservationGeneration\(provider, capabilities\)/);
@@ -1166,9 +1199,12 @@ test("user resumes an exact ChatGPT session | Given service-worker target cache 
   );
   assert.match(segment, /browserSessionTargets\.set\(sessionRefOpen/);
   assert.match(segment, /stable_resource_ref_observed === true/);
+  assert.match(segment, /sendChatGptTabMessage\(targetOpen\.tabId/);
+  assert.match(segment, /\}, 2000\)/);
+  assert.doesNotMatch(segment, /sendBrowserActuationTabMessage\(targetOpen\.tabId/);
   assert.match(segment, /chrome\.tabs\.update.*active:\s*true.*autoDiscardable:\s*false/);
   assert.match(segment, /protectBoundTab/);
-  assert.doesNotMatch(segment, /insertMainWorld|performWake|tabs\.reload|executeScript/);
+  assert.doesNotMatch(segment, /insertMainWorld|performWake|executeScript/);
   assert.match(segment, /observedGenerationOpen/);
   assert.match(segment, /providerOpen !== "chatgpt"/);
 });

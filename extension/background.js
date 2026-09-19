@@ -2675,9 +2675,27 @@ function missingReceiverError(error) {
   return /receiving end does not exist|could not establish connection/i.test(text);
 }
 
-async function sendChatGptTabMessage(tabId, message) {
+async function sendTabMessageWithTimeout(tabId, message, timeoutMs = 0) {
+  if (!(Number(timeoutMs) > 0)) return chrome.tabs.sendMessage(tabId, message);
+  let timer = null;
   try {
-    return await chrome.tabs.sendMessage(tabId, message);
+    return await Promise.race([
+      chrome.tabs.sendMessage(tabId, message),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("browser-actuation-content-timeout")),
+          Number(timeoutMs),
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function sendChatGptTabMessage(tabId, message, responseTimeoutMs = 0) {
+  try {
+    return await sendTabMessageWithTimeout(tabId, message, responseTimeoutMs);
   } catch (first) {
     if (!missingReceiverError(first)) throw first;
     // ChatGPT is manifest-managed. Re-injecting the whole classic-script bundle
@@ -2689,7 +2707,7 @@ async function sendChatGptTabMessage(tabId, message) {
     let lastError = first;
     for (let attempt = 0; attempt < 20; attempt += 1) {
       try {
-        return await chrome.tabs.sendMessage(tabId, message);
+        return await sendTabMessageWithTimeout(tabId, message, responseTimeoutMs);
       } catch (error) {
         lastError = error;
         if (!missingReceiverError(error)) throw error;
@@ -2701,10 +2719,10 @@ async function sendChatGptTabMessage(tabId, message) {
 }
 
 async function sendBrowserActuationTabMessage(tabId, message) {
-  // Browser dispatch is a single fenced Alpha 4/5 attempt. Missing receivers,
-  // reload recovery, and stale-view reconciliation belong to beta.1, so this
-  // path must never reuse the handoff helper's reload/retry behavior.
-  return chrome.tabs.sendMessage(tabId, message);
+  // Browser dispatch stays a single fenced mutation attempt. Bound the content
+  // response so one stale view cannot block the shared push queue past the
+  // runtime actuation deadline; never reload or resend a submit/stop command.
+  return sendTabMessageWithTimeout(tabId, message, 18000);
 }
 
 async function sendHandoffTabMessage(tabId, site, message) {
@@ -3619,7 +3637,7 @@ async function handleBrowserActuation(command) {
       await protectBoundTab(targetOpen.tabId);
     } catch (_) {}
     try {
-      const response = await sendBrowserActuationTabMessage(targetOpen.tabId, {
+      const response = await sendChatGptTabMessage(targetOpen.tabId, {
         type: "h2w_browser_actuation",
         command: {
           operation,
@@ -3627,7 +3645,7 @@ async function handleBrowserActuation(command) {
           params,
           expectedConvKey: targetOpen.convKey,
         },
-      });
+      }, 2000);
       const evidence = response?.evidence && typeof response.evidence === "object"
         ? contentActuationEvidenceWithReason(
             response.evidence,
