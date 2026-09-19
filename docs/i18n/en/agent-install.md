@@ -31,7 +31,7 @@ Check `herdr` first. If it is missing, install the official stable build:
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-On Windows use `install.ps1`; verify `herdr --version` and `herdr api schema`. Windows remains a Candidate platform until physical qualification is complete. Release/UAT must use the exact candidate artifact being qualified; do not substitute an older stable binary or an ad-hoc source build.
+On Windows use `install.ps1`; verify `herdr --version` and `herdr api schema`. Windows is Candidate; UAT must use the exact candidate artifact, never an older binary or ad-hoc source build.
 
 Download the **Latest stable** platform binary from <https://github.com/whshang/herdr-mcp/releases>, place it on the user `PATH` (normally `~/.local/bin/herdr-mcp`), then run:
 
