@@ -8,7 +8,7 @@ use crate::progressive_skills::{
     BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD, BROWSER_ENDPOINT_LIST_METHOD,
     BROWSER_HANDOFF_PREPARE_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
     BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_OPEN_METHOD,
-    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    BROWSER_SOURCE_RESOLVE_METHOD, WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::state_store::BrowserDeliveryState;
 use serde_json::{Map, Value, json};
@@ -134,15 +134,15 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             idempotency_key,
             work_chain_id,
         } => {
-            let grant = BrowserGrant {
-                endpoint_ref: endpoint_ref.clone(),
-                provider: provider.clone(),
-                account_ref: account_ref.clone(),
-            };
             let mut params = Map::new();
-            if let Some(source_url) = source_url {
+            let grant = if let Some(source_url) = source_url {
+                let grant = grant_for_source_url(&source_url)?;
                 params.insert("source_url".to_owned(), json!(source_url));
+                grant
             } else {
+                let endpoint_ref = endpoint_ref.expect("direct create requires endpoint_ref");
+                let provider = provider.expect("direct create requires provider");
+                let account_ref = account_ref.expect("direct create requires account_ref");
                 params.insert("endpoint_ref".to_owned(), json!(endpoint_ref));
                 params.insert("provider".to_owned(), json!(provider));
                 params.insert("account_ref".to_owned(), json!(account_ref));
@@ -155,7 +155,12 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
                     "expected_generation".to_owned(),
                     json!(expected_generation.expect("direct create requires expected_generation")),
                 );
-            }
+                BrowserGrant {
+                    endpoint_ref,
+                    provider,
+                    account_ref,
+                }
+            };
             params.insert("message".to_owned(), json!(message));
             params.insert("idempotency_key".to_owned(), json!(idempotency_key));
             insert_optional(&mut params, "work_chain_id", work_chain_id);
@@ -440,6 +445,32 @@ struct BrowserGrant {
     account_ref: String,
 }
 
+fn grant_for_source_url(source_url: &str) -> Result<BrowserGrant, String> {
+    let result = call_private_trusted_read(
+        BROWSER_SOURCE_RESOLVE_METHOD,
+        json!({"source_url": source_url}),
+    )?;
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "cannot resolve WebChat source route: {}",
+            compact_json(&result)
+        ));
+    }
+    browser_grant_from_source_result(&result)
+}
+
+fn browser_grant_from_source_result(result: &Value) -> Result<BrowserGrant, String> {
+    let route = result
+        .get("route")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "browser source resolution returned no route".to_owned())?;
+    Ok(BrowserGrant {
+        endpoint_ref: required_json_string(route, "endpoint_ref")?.to_owned(),
+        provider: required_json_string(route, "provider")?.to_owned(),
+        account_ref: required_json_string(route, "account_ref")?.to_owned(),
+    })
+}
+
 fn grant_for_resource(resource_ref: &str) -> Result<BrowserGrant, String> {
     let mut current_ref = resource_ref.to_owned();
     let mut expected_endpoint: Option<String> = None;
@@ -496,6 +527,19 @@ fn call_private(
     params: Value,
     webchat_grant: Option<&BrowserGrant>,
 ) -> Result<Value, String> {
+    call_private_with_context(method, params, webchat_grant, false)
+}
+
+fn call_private_trusted_read(method: &str, params: Value) -> Result<Value, String> {
+    call_private_with_context(method, params, None, true)
+}
+
+fn call_private_with_context(
+    method: &str,
+    params: Value,
+    webchat_grant: Option<&BrowserGrant>,
+    trusted_local_read: bool,
+) -> Result<Value, String> {
     if !params.is_object() {
         return Err("local private call params must be an object".to_owned());
     }
@@ -519,18 +563,18 @@ fn call_private(
     .as_object()
     .cloned()
     .ok_or_else(|| "cannot construct local private call".to_owned())?;
-    let trace = webchat_grant.map(|grant| {
-        json!({
-            "webchat_control_grants": [{
+    let mut trace = Map::new();
+    if let Some(grant) = webchat_grant {
+        trace.insert(
+            "webchat_control_grants".to_owned(),
+            json!([{
                 "endpoint_ref": grant.endpoint_ref,
                 "provider": grant.provider,
                 "account_ref": grant.account_ref,
-            }]
-        })
-        .as_object()
-        .cloned()
-        .expect("grant trace is an object")
-    });
+            }]),
+        );
+    }
+    let trace = (!trace.is_empty()).then_some(trace);
     let request = RuntimeRequest {
         workstation_id: "local-agent-cli".to_owned(),
         request_id: local_request_id(),
@@ -549,7 +593,12 @@ fn call_private(
         .enable_all()
         .build()
         .map_err(|error| format!("cannot create local CLI runtime: {error}"))?;
-    match runtime.block_on(transport.dispatch_request(request)) {
+    let result = if trusted_local_read {
+        runtime.block_on(transport.dispatch_trusted_local_read_request(request))
+    } else {
+        runtime.block_on(transport.dispatch_request(request))
+    };
+    match result {
         RuntimeToolResult::Success { result } => decode_tool_result(result),
         RuntimeToolResult::Failure {
             code,
@@ -724,6 +773,29 @@ mod tests {
         });
         assert_eq!(trace["webchat_control_grants"][0]["provider"], "chatgpt");
         assert!(trace.get("bearer_token").is_none());
+    }
+
+    #[test]
+    fn user_source_route_result_builds_the_latest_exact_grant() {
+        let result = json!({
+            "ok": true,
+            "route": {
+                "session_ref": "br_session_b",
+                "endpoint_ref": "bep_b",
+                "provider": "chatgpt",
+                "account_ref": "br_account_b",
+                "space_ref": "br_space_b",
+                "expected_generation": 22,
+            }
+        });
+        assert_eq!(
+            browser_grant_from_source_result(&result).unwrap(),
+            BrowserGrant {
+                endpoint_ref: "bep_b".to_owned(),
+                provider: "chatgpt".to_owned(),
+                account_ref: "br_account_b".to_owned(),
+            }
+        );
     }
 
     const HANDOFF_SOURCE_URL: &str =

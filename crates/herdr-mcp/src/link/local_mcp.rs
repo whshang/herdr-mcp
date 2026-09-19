@@ -193,6 +193,14 @@ struct AbortEntry {
     cancel_tx: watch::Sender<bool>,
 }
 
+struct RoutedDispatchContext {
+    force_trusted_ipc: bool,
+    webchat_grants_header: Option<String>,
+    page_assist_grants_header: Option<String>,
+    authorization_header: Option<String>,
+    browser_caller_session_header: Option<String>,
+}
+
 pub struct LocalMcpTransport {
     endpoint: Url,
     bearer_token: String,
@@ -767,23 +775,21 @@ impl LocalMcpTransport {
         &self,
         body: String,
         rpc_id: String,
-        webchat_grants_header: Option<String>,
-        page_assist_grants_header: Option<String>,
-        authorization_header: Option<String>,
-        browser_caller_session_header: Option<String>,
+        context: RoutedDispatchContext,
     ) -> RuntimeToolResult {
-        if webchat_grants_header.is_some()
-            || page_assist_grants_header.is_some()
-            || authorization_header.is_some()
-            || browser_caller_session_header.is_some()
+        if context.force_trusted_ipc
+            || context.webchat_grants_header.is_some()
+            || context.page_assist_grants_header.is_some()
+            || context.authorization_header.is_some()
+            || context.browser_caller_session_header.is_some()
         {
             self.dispatch_trusted_ipc(
                 body,
                 rpc_id,
-                webchat_grants_header.as_deref(),
-                page_assist_grants_header.as_deref(),
-                authorization_header.as_deref(),
-                browser_caller_session_header.as_deref(),
+                context.webchat_grants_header.as_deref(),
+                context.page_assist_grants_header.as_deref(),
+                context.authorization_header.as_deref(),
+                context.browser_caller_session_header.as_deref(),
             )
             .await
         } else {
@@ -792,6 +798,23 @@ impl LocalMcpTransport {
     }
 
     async fn dispatch_inner(&self, request: RuntimeRequest) -> RuntimeToolResult {
+        self.dispatch_inner_with_trust(request, false).await
+    }
+
+    /// Local CLI-only read path. This is intentionally not part of the routed
+    /// transport trait, so remote requests cannot select trusted IPC.
+    pub async fn dispatch_trusted_local_read_request(
+        &self,
+        request: RuntimeRequest,
+    ) -> RuntimeToolResult {
+        self.dispatch_inner_with_trust(request, true).await
+    }
+
+    async fn dispatch_inner_with_trust(
+        &self,
+        request: RuntimeRequest,
+        force_trusted_ipc: bool,
+    ) -> RuntimeToolResult {
         if request.request_id.is_empty() {
             return self.failure(code::BAD_REQUEST, false, "invalid tool request frame", None);
         }
@@ -920,10 +943,13 @@ impl LocalMcpTransport {
             result = self.dispatch_routed(
                 body,
                 rpc_id,
-                webchat_grants_header,
-                page_assist_grants_header,
-                authorization_header,
-                browser_caller_session_header,
+                RoutedDispatchContext {
+                    force_trusted_ipc,
+                    webchat_grants_header,
+                    page_assist_grants_header,
+                    authorization_header,
+                    browser_caller_session_header,
+                },
             ) => result,
         };
 

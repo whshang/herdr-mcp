@@ -2614,6 +2614,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
+            trusted_local_ipc: blocking_state.trusted_extension_ipc,
         };
         mcp::handle(&blocking_request, &context)
     })
