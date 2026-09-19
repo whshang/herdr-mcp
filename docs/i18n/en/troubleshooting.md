@@ -296,13 +296,12 @@ Content disappearing without confirmed delivery is the actual reliability failur
 Use **Handoff** in the in-page HUD. If it is unavailable or disabled, verify:
 
 - the current site/conversation type supports handoff;
-- a workspace is bound;
-- the workspace has no active working agent;
+- if a workspace is bound, it has no active working agent;
 - no transfer is already active.
 
 The current scope may be **Auto on or Auto off**. Where handoff is supported, the target conversation inherits the source Auto state and source automatic wakes pause during transfer.
 
-Handoff must create the packet, create the new conversation, verify the seed, and only then move the binding. If the transfer is recoverable/uncertain, keep the old binding as the safety anchor instead of manually unbinding it.
+Handoff must create the packet, create the new conversation, and verify the seed before cutover. If a workspace binding exists, only then switch or migrate that binding. If the transfer is recoverable/uncertain, keep any existing binding as the safety anchor instead of manually unbinding it.
 
 ## Symptom: z.ai / DeepSeek stops after printing a JSON tool call
 
