@@ -1137,6 +1137,39 @@ test("user receives exact content rejection reasons | Given browser controls rej
   }
 });
 
+test("user keeps shared browser control responsive | Given one stale content view never answers | When Herdr sends a browser actuation command | Then one tab message times out without reload or resend", async () => {
+  const start = backgroundSource.indexOf("async function sendTabMessageWithTimeout(");
+  const end = backgroundSource.indexOf("async function sendHandoffTabMessage(", start);
+  assert.ok(start >= 0 && end > start, "bounded tab-message helpers must remain extractable");
+  const helperSource = backgroundSource.slice(start, end);
+  const ctx = { sends: 0, reloads: 0 };
+  const send = new Function("ctx", `
+    const chrome = {
+      tabs: {
+        sendMessage: () => {
+          ctx.sends += 1;
+          return new Promise(() => {});
+        },
+        reload: async () => { ctx.reloads += 1; },
+      },
+    };
+    const setTimeout = (fn) => { fn(); return 1; };
+    const clearTimeout = () => {};
+    const waitForTabComplete = async () => null;
+    const missingReceiverError = () => false;
+    const sleep = async () => {};
+    ${helperSource}
+    return sendBrowserActuationTabMessage;
+  `)(ctx);
+
+  await assert.rejects(
+    () => send(41, { type: "h2w_browser_actuation" }),
+    /browser-actuation-content-timeout/,
+  );
+  assert.equal(ctx.sends, 1);
+  assert.equal(ctx.reloads, 0);
+});
+
 test("adapter capability reprobe advances observation generation on snapshot change", () => {
   assert.match(backgroundSource, /const browserCapabilitySnapshots = new Map\(\)/);
   assert.match(backgroundSource, /getBrowserObservationGeneration\(provider, capabilities\)/);
@@ -1149,7 +1182,7 @@ test("adapter capability reprobe advances observation generation on snapshot cha
   assert.match(backgroundSource, /browserCapabilitySnapshots\.set\(provider, snapshot\)/);
 });
 
-test("background session.open recovers unique target via recoverBrowserSessionTarget and activates without message insert", () => {
+test("user resumes an exact ChatGPT session | Given service-worker target cache is lost | When session.open has a canonical locator | Then Herdr reuses that view before broad probing and caches the verified target", () => {
   const start = backgroundSource.indexOf('if (operation === "herdr_mcp.browser_session.open")');
   assert.ok(start >= 0, "session.open branch must exist in handleBrowserActuation");
   const segment = backgroundSource.slice(start, backgroundSource.indexOf("\n  const sessionRef = String(params.session_ref", start));
@@ -1157,14 +1190,22 @@ test("background session.open recovers unique target via recoverBrowserSessionTa
   assert.match(segment, /findBrowserSessionTargetByCanonicalIdentity/);
   assert.match(segment, /recovered\.ambiguous/);
   assert.ok(
+    segment.indexOf("findBrowserSessionTargetByCanonicalIdentity") < segment.indexOf("recoverBrowserSessionTarget"),
+    "session.open must reuse the durable canonical locator before broad identity probing",
+  );
+  assert.ok(
     segment.indexOf("findBrowserSessionTargetByCanonicalIdentity") < segment.indexOf("chrome.tabs.create"),
     "session.open must try canonical-identity tab reuse before creating a new view",
   );
+  assert.match(segment, /browserSessionTargets\.set\(sessionRefOpen/);
+  assert.match(segment, /stable_resource_ref_observed === true/);
+  assert.match(segment, /sendChatGptTabMessage\(targetOpen\.tabId/);
+  assert.match(segment, /\}, 2000\)/);
+  assert.doesNotMatch(segment, /sendBrowserActuationTabMessage\(targetOpen\.tabId/);
   assert.match(segment, /chrome\.tabs\.update.*active:\s*true.*autoDiscardable:\s*false/);
   assert.match(segment, /protectBoundTab/);
-  assert.doesNotMatch(segment, /insertMainWorld|performWake|tabs\.reload|executeScript/);
-  // Must fail closed on missing/duplicate/stale/provider mismatch.
-  assert.match(segment, /observedGeneration/);
+  assert.doesNotMatch(segment, /insertMainWorld|performWake|executeScript/);
+  assert.match(segment, /observedGenerationOpen/);
   assert.match(segment, /providerOpen !== "chatgpt"/);
 });
 
