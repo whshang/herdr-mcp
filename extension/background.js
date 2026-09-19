@@ -794,7 +794,16 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
   // during upgrade; old extension binaries remain server-compatible separately.
-  try { await chrome.storage.local.remove(["autoAllow", "token"]); } catch (e) {}
+  try {
+    await chrome.storage.local.remove([
+      "autoAllow",
+      "token",
+      "jevJudgeMode",
+      "jevJudgeThreshold",
+      "llmJudgePromptTemplate",
+      "llmJudgeSkipKeywords",
+    ]);
+  } catch (e) {}
   await syncExperimentalContentScripts();
   resolveConfigReady();
 })();
