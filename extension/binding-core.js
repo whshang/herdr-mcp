@@ -500,57 +500,28 @@ export function assistantNudgeFingerprint(text) {
   return `${t.length}:${(h >>> 0).toString(16)}`;
 }
 
-/** Default judge prompt (shown pre-filled in Options). Placeholder: {content} */
-export const LEGACY_DEFAULT_LLM_JUDGE_PROMPT =
-  "判断下面这段对话里助手是否已经做完用户要求的全部任务。"
-  + "若已全部做完，只回复：好的"
-  + "若还有下一步/未完成/待验证，只回复：继续，按你的建议推进"
-  + "不要解释、不要加其它字。对话：\n{content}";
-
-export const DEFAULT_LLM_JUDGE_PROMPT =
+/** Built-in judge protocol. This is product policy, not a user setting. */
+const DEFAULT_LLM_JUDGE_PROMPT =
   "判断下面这段对话里助手是否已经做完用户要求的全部任务。"
   + "若已全部做完，只回复：好的。"
   + "若还有下一步/未完成/待验证，只回复：继续，按你的建议推进。"
   + "不要解释、不要加其它字。对话：\n{content}";
 
-/** Default no-send keywords (shown pre-filled in Options, one per line). */
-export const DEFAULT_LLM_SKIP_KEYWORDS = ["好的", "done", "ok", "completed", "finished"];
-
-export const DEFAULT_LLM_SKIP_KEYWORDS_TEXT = DEFAULT_LLM_SKIP_KEYWORDS.join("\n");
+/** Built-in terminal tokens for the fixed judge protocol. */
+const DEFAULT_LLM_DONE_TOKENS = ["好的", "done", "ok", "completed", "finished"];
 
 /**
- * Parse skip-keyword textarea: one per line, or comma / Chinese comma separated.
- * Empty input falls back to built-in list (safety net).
- * @param {string|string[]|null|undefined} raw
- * @returns {string[]}
- */
-export function parseLlmSkipKeywords(raw) {
-  if (Array.isArray(raw)) {
-    const list = raw.map((s) => String(s || "").trim()).filter(Boolean);
-    return list.length ? list : [...DEFAULT_LLM_SKIP_KEYWORDS];
-  }
-  const t = String(raw || "").trim();
-  if (!t) return [...DEFAULT_LLM_SKIP_KEYWORDS];
-  const list = t
-    .split(/[\n,，;；]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return list.length ? list : [...DEFAULT_LLM_SKIP_KEYWORDS];
-}
-
-/**
- * Whether a judge reply matches a no-send (done) keyword.
+ * Whether a judge reply matches a built-in terminal token.
  * Whole-reply match after stripping trailing punctuation; ASCII case-insensitive.
  */
-export function llmReplyMatchesSkipKeyword(reply, keywords) {
+function llmReplyMatchesDoneToken(reply) {
   const t = String(reply || "").trim()
     .replace(/^["「『]+|["」』]+$/g, "")
     .replace(/^```\w*\n?|\n?```$/g, "")
     .trim();
   if (!t) return false;
   const core = t.replace(/[.!！。…\s]+$/u, "").trim();
-  const list = parseLlmSkipKeywords(keywords);
-  for (const kw of list) {
+  for (const kw of DEFAULT_LLM_DONE_TOKENS) {
     const k = String(kw).trim();
     if (!k) continue;
     if (/^[a-z0-9_-]+$/i.test(k)) {
@@ -564,7 +535,7 @@ export function llmReplyMatchesSkipKeyword(reply, keywords) {
 }
 
 /**
- * Whether LLM post-turn judge is configured (all three required; template may be empty → built-in).
+ * Whether the OpenAI-compatible semantic/planning provider is configured.
  * @param {{ llmJudgeBaseUrl?: string, llmJudgeApiKey?: string, llmJudgeModel?: string }} cfg
  */
 export function isLlmJudgeConfigured(cfg) {
@@ -576,28 +547,59 @@ export function isLlmJudgeConfigured(cfg) {
 }
 
 /**
+ * Strict provider Base URL validation for settings-time feedback.
+ * Never silently rewrites malformed input; suggestion is display-only.
+ */
+export function validateApiBaseUrl(rawUrl) {
+  const raw = String(rawUrl || "").trim();
+  if (!raw) return { ok: false, reason: "empty", suggestion: "" };
+  let url;
+  try {
+    url = new URL(raw);
+  } catch (_) {
+    return { ok: false, reason: "invalid_url", suggestion: "" };
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { ok: false, reason: "invalid_url", suggestion: "" };
+  }
+  if (!url.hostname || url.username || url.password || url.search || url.hash) {
+    return { ok: false, reason: "invalid_url", suggestion: "" };
+  }
+  if (/\/{2,}/.test(url.pathname)) {
+    const suggested = new URL(url.toString());
+    suggested.pathname = suggested.pathname.replace(/\/{2,}/g, "/");
+    return {
+      ok: false,
+      reason: "duplicate_path_slash",
+      suggestion: suggested.toString().replace(/\/$/, ""),
+    };
+  }
+  return { ok: true, value: raw.replace(/\/+$/, ""), reason: null, suggestion: "" };
+}
+
+/**
  * Build OpenAI-compatible chat/completions URL from a base like
  * https://host/v1 or https://host/v1/chat/completions
  */
 export function llmJudgeCompletionsUrl(baseUrl) {
-  const b = String(baseUrl || "").trim().replace(/\/+$/, "");
-  if (!b) return "";
+  const checked = validateApiBaseUrl(baseUrl);
+  if (!checked.ok) return "";
+  const b = checked.value;
   if (/\/chat\/completions$/i.test(b)) return b;
   if (/\/v1$/i.test(b)) return `${b}/chat/completions`;
   return `${b}/v1/chat/completions`;
 }
 
 /**
- * Fill {content} (and optional {user}/{assistant}) into the judge prompt.
+ * Build the fixed judge protocol message.
  */
-export function buildLlmJudgeUserMessage(template, parts) {
-  const tpl = String(template || "").trim() || DEFAULT_LLM_JUDGE_PROMPT;
+export function buildLlmJudgeUserMessage(parts) {
   const user = String(parts?.userText || "").trim().slice(0, 1500);
   const assistant = String(parts?.assistantText || "").trim().slice(0, 6000);
   const content = user
     ? `用户:\n${user}\n\n助手:\n${assistant}`
     : assistant;
-  return tpl
+  return DEFAULT_LLM_JUDGE_PROMPT
     .replaceAll("{content}", content)
     .replaceAll("{user}", user)
     .replaceAll("{assistant}", assistant);
@@ -637,19 +639,13 @@ export function shouldAutoContinueWithoutLlm(userText, assistantText, configured
 
 /**
  * Interpret a tiny judge-model reply.
- * - Matches no-send keywords → done (do not wake)
+ * - Matches a built-in terminal token → done (do not wake)
  * - Looks like continue / unfinished → wake with the model reply text itself
  *
  * @param {string} text
- * @param {{ skipKeywords?: string|string[] }|string|null} [opts]
  * @returns {{ done: boolean, cont: boolean, nudgeText: string, raw: string }}
  */
-export function interpretLlmJudgeReply(text, opts = null) {
-  const options = typeof opts === "string" || opts == null
-    ? { skipKeywords: typeof opts === "string" ? undefined : undefined }
-    : opts;
-  // Legacy: second arg was continueFallback string — ignore it; always use model text.
-  const skipRaw = options && typeof options === "object" ? options.skipKeywords : undefined;
+export function interpretLlmJudgeReply(text) {
   const raw = String(text || "").trim();
   if (!raw) return { done: false, cont: false, nudgeText: "", raw };
   const t = raw.replace(/^["「『]+|["」』]+$/g, "").replace(/^```\w*\n?|\n?```$/g, "").trim();
@@ -657,13 +653,13 @@ export function interpretLlmJudgeReply(text, opts = null) {
 
   const wantsContinue = /继续|推进|没(有)?做完|未完成|下一步|还没/u.test(t) || /^continue\b/i.test(t);
   // Mixed "好的，没有完成。继续。" → continue with model text.
-  if (wantsContinue && /继续|推进|没(有)?做完|未完成/.test(t) && !llmReplyMatchesSkipKeyword(t, skipRaw)) {
+  if (wantsContinue && /继续|推进|没(有)?做完|未完成/.test(t) && !llmReplyMatchesDoneToken(t)) {
     return { done: false, cont: true, nudgeText, raw: t };
   }
   if (wantsContinue && /继续/.test(t) && /好的|没(有)?做完|未完成/.test(t)) {
     return { done: false, cont: true, nudgeText, raw: t };
   }
-  if (llmReplyMatchesSkipKeyword(t, skipRaw)) {
+  if (llmReplyMatchesDoneToken(t)) {
     return { done: true, cont: false, nudgeText: "", raw: t };
   }
   if (wantsContinue) {

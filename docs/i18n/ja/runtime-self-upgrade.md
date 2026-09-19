@@ -54,7 +54,7 @@ runtime の切り替え != Connector の切り替え
 
 ## DEV / PROD は generation 上の provenance プレーン
 
-v0.4.3+ では、同じ generation の仕組みの上に明示的なソース開発プレーンを追加します。3 つ目の恒久的な runtime 環境を作るものではありません。
+現在の runtime は、同じ generation の仕組みの上に明示的なソース開発プレーンを提供します。3 つ目の恒久的な runtime 環境を作るものではありません。
 
 ```text
 PROD

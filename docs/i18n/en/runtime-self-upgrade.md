@@ -54,7 +54,7 @@ runtime switch != Connector switch
 
 ## DEV / PROD is a provenance plane over generations
 
-v0.4.3+ adds an explicit source-development plane on top of the same generation machinery. It does not create a third permanent runtime environment:
+Current runtimes expose an explicit source-development plane on top of the same generation machinery. It does not create a third permanent runtime environment:
 
 ```text
 PROD

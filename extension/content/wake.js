@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.101";
+const H2W_CONTENT_VERSION = "0.1.103";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -1296,7 +1296,7 @@ const H2W_CONTENT_VERSION = "0.1.101";
     const values = [el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent]
       .map((value) => String(value || "").trim().replace(/\s+/g, " "))
       .filter(Boolean);
-    return values.some((value) => /^(?:stop|stop generating|stop streaming|停止|停止生成|停止流式)$/i.test(value));
+    return values.some((value) => /^(?:stop|stop generating|stop streaming|stop response|停止|停止生成|停止流式|停止回答)$/i.test(value));
   }
 
   function stopButtons() {
@@ -1938,7 +1938,7 @@ const H2W_CONTENT_VERSION = "0.1.101";
         if (!ADAPTER.elementVisible(button) || button?.disabled === true) return false;
         return button?.getAttribute?.("aria-disabled") !== "true";
       });
-      if (!stopButton || !isTurnInProgress()) {
+      if (!stopButton) {
         return browserRejectedEvidence(evidence, "browser_stop_control_unavailable");
       }
       stopButton.click();
@@ -4256,7 +4256,6 @@ const H2W_CONTENT_VERSION = "0.1.101";
     const should = CONTEXT_PRESSURE.shouldAutoRollover({
       pressure,
       runtimeHealth: safety.streaming || safety.toolRunning ? "working" : "healthy",
-      bound: hud.bound,
       canHandoff: hud.can_handoff,
       projectConversation: Boolean(hud.can_handoff),
       quiescent: !safety.composerBusy && !safety.streaming && !safety.toolRunning && !safety.permissionCardActive,
@@ -4977,11 +4976,9 @@ const H2W_CONTENT_VERSION = "0.1.101";
         ? hudText("handoff_blocked_working", { count: workingCount })
         : transferBusy
           ? hudText("handoff_blocked_transfer_busy")
-          : hudCache?.bound !== true
-            ? hudText("handoff_blocked_unbound")
-            : hudCache?.can_handoff !== true
-              ? hudText("handoff_blocked_unavailable")
-              : hudText("handoff_hint");
+          : hudCache?.can_handoff !== true
+            ? hudText("handoff_blocked_unavailable")
+            : hudText("handoff_hint");
   }
 
   function showHudToast(text, kind = "") {

@@ -45,7 +45,7 @@ On macOS, `reinstall` is the product repair/replacement path. On Linux, runtime 
 
 ## Source-development runtime: DEV / PROD
 
-v0.4.3+ has one explicit path for dogfooding herdr-mcp source without losing a stable recovery source:
+Current runtimes have one explicit path for dogfooding herdr-mcp source without losing a stable recovery source:
 
 ```bash
 herdr-mcp dev status
@@ -99,7 +99,7 @@ Static evidence is kept in a bounded capability inventory under the herdr-mcp co
 
 ### Dynamic planning advice for the Web planner
 
-v0.4.3+ keeps the workstation Runtime Execution Contract at 18 tools and does not add a dedicated planning tool. The public Edge contract has 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
+The current workstation Runtime Execution Contract is epoch 4 / 18 tools and does not add a dedicated planning tool. The first-party public Edge contract is epoch 7 / 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
 
 ```text
 herdr_call(
@@ -120,7 +120,7 @@ The Web planner can then choose direct execution, reuse an existing Agent, creat
 
 ### Fresh GitHub PR / Auto-merge status
 
-v0.4.5 adds another read-only local method through the existing `herdr_call` tool without changing the 18-tool workstation contract:
+The runtime also exposes another read-only local method through the existing `herdr_call` tool without changing the 18-tool workstation contract:
 
 ```text
 herdr_call(

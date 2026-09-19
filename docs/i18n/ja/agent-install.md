@@ -31,7 +31,7 @@
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-Windows では `install.ps1` を使い、`herdr --version` と `herdr api schema` を検証します。Windows UAT は対応する PR CI の `windows-uat` を使います。0.4.8 やソースビルドは使いません。
+Windows では `install.ps1` を使い、`herdr --version` と `herdr api schema` を検証します。Windows は Candidate のままで、UAT は exact candidate artifact を使い、旧 binary や一時的な source build で代用しません。
 
 <https://github.com/whshang/herdr-mcp/releases> から **Latest stable** のプラットフォームバイナリをダウンロードし、ユーザーの `PATH`（通常は `~/.local/bin/herdr-mcp`）に置いてから、次を実行します。
 

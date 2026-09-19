@@ -18,5 +18,6 @@ Current active WIP is limited to work that still has an unresolved implementatio
 - Current stage/status SSOT: [`v1.0-status.md`](v1.0-status.md).
 - Active beta.2 acceptance/design boundary: [`v1.0-beta2-webchat-orchestration.md`](v1.0-beta2-webchat-orchestration.md).
 - Active compile/memory/resource plan: [`v1.0-performance-resource-plan.md`](v1.0-performance-resource-plan.md).
+- Active browser-extension package/Store closeout: [`browser-extension-development-and-store-release.md`](browser-extension-development-and-store-release.md). Historical pre-1.0 Store rollout detail lives under [`../history/architecture/browser-extension-development-and-store-release-20260829.md`](../history/architecture/browser-extension-development-and-store-release-20260829.md).
 - Completed alpha.1–alpha.9 and beta.1 implementation records: [`../history/architecture/`](../history/architecture/).
 - Mainline convergence / branch-retirement closeout: [`../history/architecture/v1.0-mainline-convergence-closeout-20260913-14.md`](../history/architecture/v1.0-mainline-convergence-closeout-20260913-14.md).

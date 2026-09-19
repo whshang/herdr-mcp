@@ -56,6 +56,42 @@ function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) 
   return { find };
 }
 
+function claudeCanonicalIdentityRecoveryHarness(tabRecords) {
+  const chrome = {
+    tabs: {
+      async query() {
+        return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
+      },
+    },
+  };
+  const activeH2WTabUrls = () => ["https://claude.ai/*"];
+  const browserTabScopes = new Map(tabRecords
+    .filter((record) => record.scope)
+    .map((record) => [record.id, record.scope]));
+  const browserConversationInfo = (provider, rawUrl) => {
+    if (provider !== "claude") return null;
+    const match = String(rawUrl || "").match(
+      /^https:\/\/claude\.ai\/chat\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i,
+    );
+    if (!match) return null;
+    const conversationId = match[1].toLowerCase();
+    return {
+      site: "claude",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey: `https://claude.ai/chat/${conversationId}`,
+    };
+  };
+  const find = new Function(
+    "chrome",
+    "activeH2WTabUrls",
+    "browserConversationInfo",
+    "browserTabScopes",
+    `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
+  )(chrome, activeH2WTabUrls, browserConversationInfo, browserTabScopes);
+  return { find };
+}
+
 function recoveryHarness(tabRecords) {
   const browserSessionTargets = new Map();
   const chrome = {
@@ -852,6 +888,56 @@ test("user Given unavailable browser actuation When the content script rejects i
   }
 });
 
+test("user can stop a live answer | Given an explicit visible stop control while the generic turn probe lags | When stop is requested | Then Herdr clicks once and verifies the stopped postcondition", async () => {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
+  assert.ok(commandStart >= 0 && commandEnd > commandStart);
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const ctx = { clicked: false };
+  const act = new Function("ctx", `
+    const stopButton = {
+      disabled: false,
+      getAttribute: (name) => name === "aria-disabled" ? "false" : null,
+      click: () => { ctx.clicked = true; },
+    };
+    const ADAPTER = {
+      name: "chatgpt",
+      getConversationKey: () => "conv-current",
+      getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
+      getStopButtonCandidates: () => ctx.clicked ? [] : [stopButton],
+      elementVisible: () => true,
+    };
+    const chatGptConversationId = () => "current";
+    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = "conv-current";
+    const providerCanonicalConversationObserved = () => true;
+    const document = { hidden: false };
+    const isTurnInProgress = () => false;
+    const wait = async () => {};
+    ${evidenceSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)(ctx);
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.stop",
+    expected_generation: 17,
+    params: {},
+  });
+  assert.equal(ctx.clicked, true);
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.generation_owner, 17);
+  assert.equal(result.generation_status_observed, true);
+  assert.equal(result.generation_stopped, true);
+});
+
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
@@ -1573,7 +1659,7 @@ test("ChatGPT session.open can restore a disposable view from a local canonical 
 
 test("user archive reconciliation uses bounded temporary views | Given the exact session tab is closed | When archive or archive-status restores the canonical URL | Then mutation is visible while read-only status uses and closes an inactive temporary tab", () => {
   const start = backgroundSource.indexOf('const sessionRef = String(params.session_ref || "")');
-  const end = backgroundSource.indexOf('const response = await sendBrowserActuationTabMessage(target.tabId', start);
+  const end = backgroundSource.indexOf('const evidence = response?.evidence', start);
   assert.ok(start >= 0 && end > start, "archive target routing block must remain extractable");
   const segment = backgroundSource.slice(start, end);
   assert.match(segment, /operation === "herdr_mcp\.browser_session\.archive"/);
@@ -1586,9 +1672,40 @@ test("user archive reconciliation uses bounded temporary views | Given the exact
   );
   assert.match(segment, /temporaryArchiveStatusTabId = createdTab\.id/);
   assert.match(segment, /chrome\.tabs\.remove\(temporaryArchiveStatusTabId\)/);
+  assert.match(segment, /let actuationSessionRef = sessionRef/);
+  assert.match(segment, /for \(const \[candidateRef, candidateTarget\] of browserSessionTargets\.entries\(\)\)/);
+  assert.match(segment, /candidateTarget\?\.convKey === canonicalInfo\.convKey/);
+  assert.match(segment, /actuationSessionRef = candidateRef/);
+  assert.match(segment, /params: actuationParams/);
   assert.match(segment, /browserSessionTargets\.get\(sessionRef\)/);
   assert.match(segment, /Date\.now\(\) \+ 8000/);
   assert.match(segment, /createdTab\?\.id/);
+});
+
+test("user recovers a Claude dispatch target | Given one canonical Claude tab after service-worker target loss | When background performs canonical recovery | Then the unique tab is restored and duplicate views stay ambiguous", async () => {
+  const canonical = "https://claude.ai/chat/46ea4d77-ef82-4ef6-a8f0-46c27f7593d0";
+  const scope = {
+    provider: "claude",
+    observationGeneration: 17,
+    accountRef: "br_claude_account",
+    spaceRef: null,
+  };
+  const unique = claudeCanonicalIdentityRecoveryHarness([
+    { id: 71, url: canonical, scope },
+  ]);
+  const recovered = await unique.find("claude", canonical, 17);
+  assert.equal(recovered.ambiguous, false);
+  assert.equal(recovered.target?.tabId, 71);
+  assert.equal(recovered.target?.provider, "claude");
+  assert.equal(recovered.target?.convKey, canonical);
+
+  const duplicate = claudeCanonicalIdentityRecoveryHarness([
+    { id: 71, url: canonical, scope },
+    { id: 72, url: canonical, scope },
+  ]);
+  const ambiguous = await duplicate.find("claude", canonical, 17);
+  assert.equal(ambiguous.target, null);
+  assert.equal(ambiguous.ambiguous, true);
 });
 
 test("browser dispatch evicts a stale cached target before exact recovery", () => {
@@ -1601,7 +1718,13 @@ test("browser dispatch evicts a stale cached target before exact recovery", () =
   assert.match(segment, /browserSessionTargets\.delete\(sessionRef\);\s*target = null;/);
   const staleEviction = segment.indexOf("browserSessionTargets.delete(sessionRef)");
   const recovery = segment.indexOf("recoverBrowserSessionTarget(sessionRef, expectedGeneration)", staleEviction);
+  const canonicalRecovery = segment.indexOf(
+    "findBrowserSessionTargetByCanonicalIdentity(",
+    recovery,
+  );
   assert.ok(staleEviction >= 0 && recovery > staleEviction, "stale cached target must be evicted before one exact recovery");
+  assert.ok(canonicalRecovery > recovery, "canonical recovery must remain a bounded fallback after exact session-ref recovery");
+  assert.match(segment, /browserSessionTargets\.set\(sessionRef, target\)/);
   assert.match(segment, /live\?\.convKey !== target\.convKey/);
 });
 

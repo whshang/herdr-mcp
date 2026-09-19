@@ -115,13 +115,13 @@ If the local journal is unavailable or live Rust resolve fails, a new ChatGPT ha
 
 This preserves continuity without making the dying source page responsible for the only recoverable copy of working state.
 
-### Future target: Continuity 2.0
+### 1.0 Work Memory and continuity compaction
 
-`v0.4.2` solves the first durability problem: keep recording working turns so a dead tab, extension reload, runtime restart, or conversation rollover does not erase the only recoverable context. Continuity 2.0 is a formal post-`v0.4.2` roadmap target for a different problem: keeping recovery context small even when one work chain spans days, hundreds of turns, or longer. It is not part of the `v0.4.2` scope and is not assigned to a concrete release number yet; its release assignment remains a separate post-`v0.4.2` planning decision.
+The 1.0 runtime extends the Continuity Journal with Project Work Memory and verified rolling checkpoints. Finalized raw turns remain durable continuity evidence, while `work_memory.checkpoint.put` writes a compact structured checkpoint under checkpoint-revision CAS and requires a real message/evidence anchor from the same Work Memory partition.
 
-Continuity 2.0 will incrementally compact older raw turns into rolling semantic checkpoints that preserve objectives, completed work, decisions, constraints, active files/branches/commits, pending work, next actions, and literal anchors. Resume should then consume the latest verified checkpoint plus a recent raw tail rather than replaying the full long conversation. Old raw bodies may be reclaimed only after a replacement checkpoint has been generated and verified. Browser memory, long-DOM cost, and main-thread/render pressure also become rollover inputs alongside model context pressure.
+`work_memory.resume` resolves the exact `project_ref + repo_id + work_chain_id` partition and returns the latest verified checkpoint together with a bounded recent raw tail and local evidence. This keeps long-running recovery bounded without creating a second task-state authority. Browser handoff continues to reuse the same `continuity_id`; provider-native Memory is never the recovery authority.
 
-The implementation order remains `Reliability Kernel → Continuity 2.0`. The Reliability Kernel provides operation identity, idempotency, delivery phases, and uncertain-result reconciliation for checkpoint generation, ACK, and raw-journal retention. The detailed design remains in [Phase 8 of the Rust Native Rearchitecture document](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20).
+Older raw bodies may be reclaimed only after replacement checkpoint evidence has been generated and verified. Browser memory, long-DOM cost, main-thread/render pressure, and model context pressure can inform rollover, but they do not change Work Memory authority or replay safety. Reliability-kernel generation, idempotency, delivery, and uncertain-result rules protect checkpoint mutations. The original design provenance remains in [Phase 8 of the Rust Native Rearchitecture document](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20) and the [1.0 Alpha 2 Work Memory design](../../history/architecture/v1.0-alpha2-work-memory.md).
 
 ## Manual and automatic control
 
@@ -246,7 +246,7 @@ current assistant turn ends
 queued content? ── yes ──► merge and send the next user message
        │ no
        ▼
-then consider generic LLM auto-continue / idle nudge
+then consider semantic Auto: Jev -> LLM -> bounded script fallback
 ```
 
 This priority is deliberate: **an explicit next-turn user instruction outranks the model deciding for itself whether to continue.**
@@ -280,17 +280,32 @@ Herdr tool permission cards are the one exception that does not follow Auto: a s
 
 Where supported, these use conversation-scoped Auto.
 
-z.ai and DeepSeek Auto only performs Herdr progress/settled wake behavior. ChatGPT-specific stale-view recovery, permission-card handling, end-of-turn LLM judgement and automatic rollover are not treated as generic capabilities.
+z.ai and DeepSeek Auto only performs Herdr progress/settled wake behavior. ChatGPT-specific stale-view recovery, permission-card handling, end-of-turn semantic judgement and automatic rollover are not treated as generic capabilities.
 
-## End-of-turn LLM judgement
+## End-of-turn semantic judgement
 
 A ChatGPT reply can be syntactically finished while semantically unfinished: for example, it may say that tests still need to run or that the next step is to inspect Git.
 
-An optional small model can answer one narrow question: **does this turn clearly need to continue?**
+For ordinary Auto, the decision path is fixed and progressive:
 
-It is not a second planner. It does not choose implementation strategy. If configured and the judgement says continue, the extension submits a bounded continuation message.
+```text
+deterministic safety / scope gates
+        |
+        v
+TypeSafe Jev / System One, when configured
+        |
+        v uncertain / unavailable
+OpenAI-compatible LLM judge, when configured
+        |
+        v ambiguous / unavailable
+bounded mechanical script fallback
+```
 
-Without the small model, automatic turn judgement does not silently fall back to broad keyword guessing. Manual controls remain available.
+Jev answers the narrow semantic question first; a clear high-confidence continue/done result is final for ordinary Auto. The LLM judge handles cases Jev cannot settle. The script fallback is deliberately less accurate and exists so Auto still has basic behavior when neither provider is configured or both semantic stages are unavailable. Script heuristics never override a Jev/LLM result.
+
+Users configure only each provider's endpoint, model and API key. Semantic policy, probability boundaries, judge prompts and completion tokens are product-owned rather than user settings.
+
+Goal-aware automation keeps a stronger boundary. Jev can provide one bounded five-signal semantic prior — `can_continue`, `needs_human`, `waiting_external`, `task_completed`, `needs_handoff` — to the existing LLM Goal Supervisor. Those probabilities are advisory only. Work Memory/TODO evidence and deterministic runtime guards remain authoritative for completion, waiting, handoff, human boundaries and uncertain delivery.
 
 ## Recovery is evidence-first
 
@@ -365,7 +380,7 @@ The extension uses conservative pressure signals:
 - a persisted monotonic message-count floor;
 - reserved headroom for Project/system/tool payloads not visible in the page.
 
-High pressure only makes rollover eligible. Automatic handoff still requires a safe boundary: Project Auto on, bound workspace not working, no stream/tool/permission card, no unsent manual draft, no uncertain delivery and no other handoff in progress.
+High pressure only makes rollover eligible. Automatic handoff still requires a safe boundary: Project Auto on, any bound workspace not working, no stream/tool/permission card, no unsent manual draft, no uncertain delivery and no other handoff in progress. Handoff itself does not require a workspace binding; durable continuity plus the current supported conversation identity is sufficient.
 
 ## Fail-closed handoff
 

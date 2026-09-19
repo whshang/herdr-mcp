@@ -23,14 +23,14 @@ ChatGPT の composer 横の Queue はブラウザ操作のプリミティブで�
 | チャネル | 用途 | Chromium identity |
 | --- | --- | --- |
 | **STORE** | 一般ユーザーの既定 | 固定の Chrome Web Store identity。ストア経由で更新される |
-| **STANDALONE** | v0.4.3+ の GitHub / 手動による独立配布 | 固定の非 Store identity。インストールディレクトリを移動しても ID は変わらない |
+| **STANDALONE** | GitHub / 手動による独立配布 | 固定の非 Store identity。インストールディレクトリを移動しても ID は変わらない |
 | **DEV** | ソース開発 | repo/worktree の `extension/` から Load unpacked。ID はパスから派生する |
 
-stable v0.4.2 の Native Host ownership は STORE / DEV のみです。STANDALONE には、その契約を実際に実装した v0.4.3+ runtime が必要です。パス派生の DEV ビルドが standalone を装ってはいけません。
+現在の runtime は STORE / STANDALONE / DEV の Native Host ownership をサポートします。STANDALONE は固定の非 Store identity を使い、パス派生の DEV ビルドが standalone を装ってはいけません。古い runtime では利用できる channel が少ない場合があるため、ownership を切り替える前にインストール済み runtime を確認してください。
 
 既定では[公式の Herdr Chrome Web Store 拡張](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp)を使います。STORE 配布が適切でなく、インストール済み runtime が明示的に対応している場合にだけ STANDALONE を使ってください。DEV はソース開発専用です。
 
-v0.4.3+ の runtime は、ソースツリーを clone せずに GitHub リポジトリから Load unpacked 用の STANDALONE コピーを生成できます。
+現在の runtime は、ソースツリーを clone せずに GitHub リポジトリから Load unpacked 用の STANDALONE コピーを生成できます。
 
 ```bash
 herdr-mcp extension standalone install
@@ -42,7 +42,7 @@ herdr-mcp native-host use standalone
 `--path` を提供する runtime は、Chrome に見せる Load unpacked パスを明示的に選べます。
 
 ```bash
-herdr-mcp extension standalone install --ref extension-v0.1.91 --path ~/Documents/herdr-mcp/extension
+herdr-mcp extension standalone install --ref <release-tag-or-commit> --path ~/Documents/herdr-mcp/extension
 ```
 
 `--path` は省略可能で、既定は `~/Documents/herdr-mcp/extension` です。カスタムパスはユーザーの HOME 配下に解決されなければなりません。管理対象コピーは常に `~/.config/herdr-mcp/extensions/standalone/current` に置かれ、選択したパスはそこへの安定したシンボリックリンクであるため、`--path` を変更しても standalone 拡張の identity は変わりません。明示的に指定されたパスがすでに使われている場合は上書きせず fail closed します。既定パスの衝突はそのまま残し、インストーラーは管理対象パスへフォールバックします。自動化が `chrome://extensions` → Developer mode → Load unpacked で選択すべき正確なディレクトリを必要とするときは、`herdr-mcp extension standalone status` を実行し、その `chrome.load_unpacked_path` 値を使ってください。今後の更新も同じパスを再利用します。この値は最後のインストールが記録した Chrome 向けパスで、`~/.config` state から読まれるため、macOS の権限で `~/Documents` を検査できない場合でも安定しています。`user_visible_path.status` はそのエイリアス検査を `unverified` として報告しますが、`chrome.load_unpacked_path` は変わりません。
@@ -100,11 +100,13 @@ herdr-mcp Rust runtime
 5. 状態、Pinned Target、手動操作を確認している間は Auto をオフのままにします。
 6. 無人で長時間動く作業が本当に必要なときにだけ、スコープ付きの Continuity 自動化を有効にします。
 
+semantic Auto の Provider 設定は意図的に小さく保たれています。TypeSafe/Jev と OpenAI 互換 LLM judge は、それぞれ endpoint、model、API key だけを公開します。通常の Auto は Jev -> LLM -> bounded script fallback の固定順序で動き、Goal-aware Auto では Jev を既存 LLM Goal Supervisor の advisory semantic prior として利用できます。どちらの API がなくても script fallback が基本 Auto を維持し、Work Memory/TODO evidence と deterministic safety guard は引き続き authoritative です。semantic policy、Jev の判定境界、judge prompt、completion token は製品側で管理し、ユーザー設定にはしません。
+
 z.ai / DeepSeek の JSON → MCP 連携は実験的で、既定では無効です。Herdr の実験的設定で明示的に有効にしてください。
 
 ## リリースとメンテナンスの境界
 
-STORE / STANDALONE / DEV の identity は共存できますが、管理対象の Native Messaging manifest の active owner は一つだけです。`contracts/browser-extension-store.json` は Store identity の機械可読な SSOT です。v0.4.3 は Standalone に `contracts/browser-extension-standalone.json` を使い、DEV はパス派生のままです。
+STORE / STANDALONE / DEV の identity は共存できますが、管理対象の Native Messaging manifest の active owner は一つだけです。`contracts/browser-extension-store.json` は Store identity の機械可読な SSOT で、`contracts/browser-extension-standalone.json` は Standalone の SSOT です。DEV はパス派生のままです。
 
 `native-host use store` / `use standalone` / `use dev` の後は、すでに開いている対応ページを更新してください。拡張のバージョンは Rust runtime とは独立に進化します。Native Host の identity / channel 契約が新しくなる場合にだけ、対応する runtime 能力が必要です。
 

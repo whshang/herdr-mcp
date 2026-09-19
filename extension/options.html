@@ -27,6 +27,8 @@
     .switch-row .hint { grid-column:2; }
     .experimental { border-color:#d8e8dd; background:linear-gradient(180deg,#fff,#fbfefc); }
     .badge { display:inline-block; margin-left:7px; padding:1px 7px; border-radius:999px; background:#fff3d9; color:#8a5a00; font-size:10px; font-weight:700; vertical-align:2px; }
+    details.advanced { margin-top:14px; border-top:1px solid #edf1ee; padding-top:10px; }
+    details.advanced summary { cursor:pointer; color:var(--muted); font-weight:650; }
     .actions { display:flex; gap:8px; flex-wrap:wrap; }
     #status { margin-top: 12px; font-size: 13px; padding:10px 12px; border-radius:8px; background:#f8faf9; }
     #status:empty { display:none; }
@@ -113,27 +115,41 @@
   </section>
 
   <section class="card">
-    <h2 id="title_llm">Post-turn LLM judge</h2>
+    <h2 id="title_llm">Automation planning model</h2>
     <div class="hint" id="hint_llm_sec"></div>
-
-    <label id="lab_llm_url">Judge API base URL</label>
-    <input type="text" id="llmJudgeBaseUrl" placeholder="https://example.com/v1">
-    <div class="hint" id="hint_llm_url"></div>
 
     <label id="lab_llm_key">Judge API key (Bearer)</label>
     <input type="password" id="llmJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
     <div class="hint" id="hint_llm_key"></div>
 
-    <label id="lab_llm_model">Judge model</label>
-    <input type="text" id="llmJudgeModel" placeholder="e.g. small-fast-model">
+    <details class="advanced">
+      <summary id="llm_advanced_summary">Advanced LLM judge settings</summary>
+      <label id="lab_llm_url">Judge API base URL</label>
+      <input type="text" id="llmJudgeBaseUrl" placeholder="https://example.com/v1">
+      <div class="hint" id="hint_llm_url"></div>
 
-    <label id="lab_llm_prompt">Judge prompt template</label>
-    <textarea id="llmJudgePromptTemplate"></textarea>
-    <div class="hint" id="hint_llm_prompt"></div>
+      <label id="lab_llm_model">Judge model</label>
+      <input type="text" id="llmJudgeModel" placeholder="e.g. small-fast-model">
+    </details>
+  </section>
 
-    <label id="lab_llm_skip">No-send keywords (done tokens)</label>
-    <textarea id="llmJudgeSkipKeywords" style="height:72px"></textarea>
-    <div class="hint" id="hint_llm_skip"></div>
+  <section class="card experimental">
+    <h2 id="title_jev">Smart Auto Continue</h2>
+    <div class="hint" id="hint_jev_sec"></div>
+
+    <label id="lab_jev_key">TypeSafe API key (Bearer)</label>
+    <input type="password" id="jevJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
+    <div class="hint" id="hint_jev_key"></div>
+
+    <details class="advanced">
+      <summary id="jev_advanced_summary">Advanced TypeSafe settings</summary>
+      <label id="lab_jev_url">TypeSafe API base URL</label>
+      <input type="text" id="jevJudgeBaseUrl" placeholder="https://api.typesafe.ai/v1">
+      <div class="hint" id="hint_jev_url"></div>
+
+      <label id="lab_jev_model">Jev model</label>
+      <input type="text" id="jevJudgeModel" placeholder="jev-latest">
+    </details>
   </section>
 
   <section class="card">
@@ -151,6 +167,7 @@
       <button class="primary" id="save">Save</button>
       <button id="test">Test connection</button>
       <button id="testLlm">Test LLM judge</button>
+      <button id="testJev">Test Jev judge</button>
     </div>
     <div id="status"></div>
   </section>

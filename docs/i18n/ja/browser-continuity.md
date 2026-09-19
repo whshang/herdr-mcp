@@ -115,13 +115,13 @@ continuity id は conversation をまたぐ一つの安定した work chain を�
 
 これにより、消えゆく source ページを、作業状態の唯一の復旧可能なコピーの責任者にすることなく、continuity を保てます。
 
-### 将来の目標：Continuity 2.0
+### 1.0 Work Memory と continuity compaction
 
-`v0.4.2` は最初の耐久性問題を解決します。作業中の turn を記録し続けることで、タブの消失、拡張のリロード、runtime の再起動、conversation の rollover があっても、唯一の復旧可能な context を消さないようにします。Continuity 2.0 は、別の問題に対する正式な post-`v0.4.2` の roadmap ターゲットです。一つの work chain が数日、数百 turn、あるいはそれ以上に及んでも、復旧 context を小さく保つことです。これは `v0.4.2` のスコープには含まれず、具体的な Release 番号もまだ割り当てられていません。その Release への割り当ては、独立した post-`v0.4.2` の計画判断として残ります。
+1.0 runtime は Continuity Journal の上に Project Work Memory と verified rolling checkpoint を実装しています。finalized raw turn は durable な continuity evidence として残り、`work_memory.checkpoint.put` は checkpoint revision CAS の下で compact な structured checkpoint を書き込み、同じ Work Memory partition に属する実在の message/evidence anchor を要求します。
 
-Continuity 2.0 は、古い raw turn を増分的に rolling semantic checkpoint へ圧縮し、目標、完了した作業、決定、制約、active なファイル/ブランチ/commit、pending な作業、次のアクション、literal anchor を保持します。resume は完全な長い conversation を再生するのではなく、最新の検証済み checkpoint と最近の raw tail を消費するようになります。古い raw body を回収できるのは、置き換えとなる checkpoint が生成され検証された後だけです。ブラウザメモリ、長い DOM のコスト、main-thread/render の負荷も、model context pressure と並ぶ rollover の入力になります。
+`work_memory.resume` は正確な `project_ref + repo_id + work_chain_id` partition を解決し、最新の verified checkpoint、bounded recent raw tail、ローカル evidence を返します。これにより長期 work chain の復旧 context を bounded に保ちながら、task-state authority は一つのままです。browser handoff は同じ `continuity_id` を引き続き再利用し、Provider 固有の Memory は復旧 authority になりません。
 
-実装順序は `Reliability Kernel → Continuity 2.0` のままです。Reliability Kernel は、checkpoint の生成、ACK、raw journal の保持に関する操作 identity、idempotency、delivery phase、不確実な結果の reconciliation を提供します。詳細な設計は [Rust Native Rearchitecture ドキュメントの Phase 8](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20) にあります。
+古い raw body を回収できるのは、replacement checkpoint の evidence が生成・検証された後だけです。browser memory、長い DOM のコスト、main-thread/render の負荷、model context pressure は rollover 判断に利用できますが、Work Memory authority や replay safety は変更しません。checkpoint mutation は Reliability Kernel の generation、idempotency、delivery、uncertain-result rules に引き続き保護されます。元の設計 provenance は [Rust Native Rearchitecture Phase 8](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20) と [1.0 Alpha 2 Work Memory design](../../history/architecture/v1.0-alpha2-work-memory.md) に保持されています。
 
 ## 手動制御と自動制御
 
@@ -246,7 +246,7 @@ current assistant turn ends
 queued content? ── yes ──► merge and send the next user message
        │ no
        ▼
-then consider generic LLM auto-continue / idle nudge
+then consider semantic Auto: Jev -> LLM -> bounded script fallback
 ```
 
 この優先順位は意図的です。**明示的な次 turn のユーザー指示は、続けるかどうかをモデル自身が決めることより優先されます。**
@@ -280,17 +280,32 @@ Herdr tool の permission card は、Auto に従わない唯一の例外です�
 
 サポートされている場合、これらは conversation スコープの Auto を使います。
 
-z.ai と DeepSeek の Auto は Herdr の progress/settled wake 挙動だけを行います。ChatGPT 固有の stale-view 復旧、permission-card の扱い、turn 終了時の LLM 判断、自動 rollover は、汎用の能力として扱われません。
+z.ai と DeepSeek の Auto は Herdr の progress/settled wake 挙動だけを行います。ChatGPT 固有の stale-view 復旧、permission-card の扱い、turn 終了時の意味判定、自動 rollover は、汎用の能力として扱われません。
 
-## turn 終了時の LLM 判断
+## turn 終了時の意味判定
 
 ChatGPT の返信は、構文的には終わっていても意味的には未完了であることがあります。たとえば、まだテストを実行する必要がある、次の手順は Git を inspect することだ、といった内容です。
 
-任意の小モデルが、一つの狭い問いに答えます。**この turn は明らかに続ける必要があるか？**
+通常の Auto は、次の固定された段階的な順序で判断します：
 
-それは第二の planner ではありません。実装戦略も選びません。設定されていて、判断が続行を示した場合、拡張は有界な continuation メッセージを submit します。
+```text
+deterministic safety / scope gates
+        |
+        v
+TypeSafe Jev / System One（設定済みの場合）
+        |
+        v uncertain / unavailable
+OpenAI-compatible LLM judge（設定済みの場合）
+        |
+        v ambiguous / unavailable
+bounded mechanical script fallback
+```
 
-小モデルが無い場合、自動 turn 判断が広範なキーワード推測へ黙ってフォールバックすることはありません。手動のコントロールは引き続き利用できます。
+Jev は最初に狭い意味判定を行い、通常の Auto では高信頼の continue/done を最終結果として扱います。Jev が確定できない場合のみ LLM に進み、LLM も確定できない場合のみ精度の低い機械的な script fallback を使います。この fallback により Jev/LLM API を持たないユーザーでも基本 Auto を利用できますが、script が Jev/LLM の結果を上書きすることはありません。
+
+ユーザーが設定するのは各 Provider の endpoint、model、API key だけです。semantic policy、probability boundary、judge prompt、completion token は製品側で管理され、ユーザー設定ではありません。
+
+Goal-aware automation ではさらに強い境界を維持します。Jev は既存の LLM Goal Supervisor に、`can_continue`、`needs_human`、`waiting_external`、`task_completed`、`needs_handoff` の 5 つの有界 semantic prior を一度に提供できます。これらの確率は advisory にすぎず、完了・待機・handoff・人間の判断境界・uncertain delivery については Work Memory/TODO evidence と deterministic runtime guard が引き続き authoritative です。
 
 ## 復旧は evidence-first
 
@@ -365,7 +380,7 @@ HTTP 429 は逆の種類のシグナルです。**429 は backoff 専用で、Re
 - 永続化された単調増加の message-count floor。
 - ページに可視でない Project/system/tool payload 用に確保された余裕。
 
-高 pressure は rollover を対象にするだけです。自動 handoff には依然として安全な境界が必要です。Project の Auto オン、binding された workspace が working でないこと、stream/tool/permission card が無いこと、未送信の手動ドラフトが無いこと、不確実な delivery が無いこと、他に進行中の handoff が無いことです。
+高 pressure は rollover を対象にするだけです。自動 handoff には依然として安全な境界が必要です。Project の Auto オン、binding された workspace が存在する場合は working でないこと、stream/tool/permission card が無いこと、未送信の手動ドラフトが無いこと、不確実な delivery が無いこと、他に進行中の handoff が無いことです。handoff 自体は workspace binding を必要とせず、durable continuity と現在の対応 conversation identity があれば開始できます。
 
 ## fail-closed な handoff
 

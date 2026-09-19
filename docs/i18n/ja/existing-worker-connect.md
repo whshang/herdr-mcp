@@ -6,7 +6,7 @@ Herdr の fleet は、一つの公開 Worker/Connector と、その背後にあ�
 
 Herdr 0.9.1 には、マルチマシン TUI 用の独自の保存済み SSH マシン層と、ネイティブの `herdr --machine <label-or-id> <command>` 転送もあります。この層は、同じ物理コンピュータ上であってもこの Edge fleet と共存できますが、`device_id` ルーティングを置き換えるものではありません。identity、ルーティング、フェイルオーバーの規則は [Herdr 0.9.1 のマルチマシンとデュアルパス制御](multi-machine-control.md)を参照してください。
 
-> v0.4.8 は macOS と x86_64 Linux/Debian で安全な新規デバイス pairing をサポートします。macOS は最終的なデバイス資格情報を Keychain に保持します。Linux は `0700` のディレクトリと `0600` の通常の資格情報ファイルを使う、ユーザー専用の資格情報ストアを使います。Windows の pairing は引き続き利用できず、fail closed です。
+> 現在の 1.0 コードは macOS、ネイティブ Linux、Windows で安全な新規デバイス pairing をサポートします。macOS は最終的なデバイス資格情報を Keychain に保持し、Linux は `0700` のディレクトリと `0600` の通常ファイルを使うユーザー専用 credential store を使用し、Windows は current-user の Windows Credential Manager を使用します。Windows はプラットフォーム対応表の実機 qualification が完了するまで Candidate のままです。
 
 ## ChatGPT から fleet を見る
 

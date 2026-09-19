@@ -14,7 +14,6 @@ import {
   pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
   assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
-  DEFAULT_LLM_JUDGE_PROMPT, LEGACY_DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   conversationInfoFromSupportedUrl,
 } from "./binding-core.js";
 import {
@@ -30,6 +29,12 @@ import {
   goalLedgerFromCheckpoint, mergeGoalCheckpoint, normalizeGoalLedger,
   planTransportRecovery, resolveAuthoritativeWorkMemoryLocator, supervise,
 } from "./goal-supervisor-core.js";
+import {
+  DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_THRESHOLD,
+  buildJevGoalSemanticRequest, buildJevPendingWorkRequest, decideJevAutoPolicy,
+  interpretJevGoalSemanticAnswer, interpretJevPendingWorkAnswer,
+  isJevJudgeConfigured, jevSystemOneUrl,
+} from "./jev-judge-core.js";
 import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
 } from "./artifact-capture-gate.js";
@@ -53,7 +58,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.101";
+const H2W_SCRIPT_VERSION = "0.1.103";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -372,7 +377,7 @@ function hudLabels() {
     "manual_continue_hint", "manual_status_hint", "manual_judge_hint",
     "manual_disabled_auto", "manual_disabled_busy",
     "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_failed_source_preserved", "handoff_llm_required", "handoff_copy_prompt", "handoff_copy_prompt_hint", "handoff_prompt_copied", "handoff_prompt_copy_failed",
-    "handoff_blocked_unbound", "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
+    "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
     "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
@@ -415,12 +420,17 @@ let CFG = {
   progressTemplate: "",
   manualContinueMessage: "",
   idleNudgeEnabled: true,
-  // Post-turn LLM judge (OpenAI-compatible). Defaults empty — fill in Options.
+  // OpenAI-compatible semantic/planning provider. Ordinary Auto reaches it
+  // after Jev uncertainty/unavailability; Goal Supervisor also uses it for
+  // bounded structured decisions. Users configure endpoint/model/key only.
   llmJudgeBaseUrl: "",
   llmJudgeApiKey: "",
   llmJudgeModel: "",
-  llmJudgePromptTemplate: "",
-  llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+  // Optional TypeSafe Jev semantic gate. Presence of a complete provider
+  // configuration enables it automatically; users do not choose policy modes.
+  jevJudgeBaseUrl: DEFAULT_JEV_BASE_URL,
+  jevJudgeApiKey: "",
+  jevJudgeModel: DEFAULT_JEV_MODEL,
   // Experimental Web AI origins stay opt-in until their compatibility/UAT gate passes.
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
@@ -490,6 +500,10 @@ async function hasHostPermission(pattern) {
 
 async function hasLlmHostPermission(cfg) {
   return hasHostPermission(hostPermissionPatternForUrl(cfg?.llmJudgeBaseUrl));
+}
+
+async function hasJevHostPermission(cfg) {
+  return hasHostPermission(hostPermissionPatternForUrl(cfg?.jevJudgeBaseUrl));
 }
 
 async function reloadOpenTabsAfterExperimentalRegistration(site, matches) {
@@ -725,9 +739,18 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   await detectOrLoadLocale();
   let stored = {};
   try {
-    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
+    // The four semantic-policy keys below are migration tombstones only. They
+    // are read so upgrades can erase historical user policy, never to restore
+    // Retired user-programmable semantic-policy controls are removed on startup.
+    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", "jevJudgeMode", "jevJudgeThreshold", "llmJudgePromptTemplate", "llmJudgeSkipKeywords", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
+    delete CFG.jevJudgeMode;
+    delete CFG.jevJudgeThreshold;
+    delete CFG.llmJudgePromptTemplate;
+    delete CFG.llmJudgeSkipKeywords;
+    CFG.jevJudgeBaseUrl = String(CFG.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim() || DEFAULT_JEV_BASE_URL;
+    CFG.jevJudgeModel = String(CFG.jevJudgeModel || DEFAULT_JEV_MODEL).trim() || DEFAULT_JEV_MODEL;
     delete CFG[PROJECT_AUTOMATION_STORAGE_KEY];
     delete CFG[CONVERSATION_AUTOMATION_STORAGE_KEY];
     PROJECT_AUTOMATION = sanitizeProjectAutomation(stored[PROJECT_AUTOMATION_STORAGE_KEY]);
@@ -735,14 +758,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   } catch (e) {}
   if (!String(CFG.wakeTemplate || "").trim()) CFG.wakeTemplate = defaultWakeTemplate();
   if (!String(CFG.progressTemplate || "").trim()) CFG.progressTemplate = defaultProgressTemplate();
-  if (!String(CFG.llmJudgePromptTemplate || "").trim()) {
-    CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
-  }
   const patch = {};
-  if (String(CFG.llmJudgePromptTemplate || "").trim() === LEGACY_DEFAULT_LLM_JUDGE_PROMPT) {
-    CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
-    patch.llmJudgePromptTemplate = CFG.llmJudgePromptTemplate;
-  }
   if (![AUTOMATION_MODE_MANUAL, AUTOMATION_MODE_PROJECT].includes(stored.automationMode)) {
     // Upgrade compatibility: preserve the old global user's intent only as a
     // permission to use per-Project automation. No Project is auto-enabled by
@@ -781,8 +797,18 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   }
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
-  // during upgrade; old extension binaries remain server-compatible separately.
-  try { await chrome.storage.local.remove(["autoAllow", "token"]); } catch (e) {}
+  // during upgrade. The semantic-policy names are retired migration tombstones:
+  // 0.1.103 also erases them so hidden legacy settings cannot survive an update.
+  try {
+    await chrome.storage.local.remove([
+      "autoAllow",
+      "token",
+      "jevJudgeMode",
+      "jevJudgeThreshold",
+      "llmJudgePromptTemplate",
+      "llmJudgeSkipKeywords",
+    ]);
+  } catch (e) {}
   await syncExperimentalContentScripts();
   resolveConfigReady();
 })();
@@ -3625,12 +3651,14 @@ async function handleBrowserActuation(command) {
     return;
   }
   const sessionRef = String(params.session_ref || "");
+  let actuationSessionRef = sessionRef;
   let temporaryArchiveStatusTabId = null;
   const closeTemporaryArchiveStatusTab = async () => {
     if (!temporaryArchiveStatusTabId) return;
-    const cached = browserSessionTargets.get(sessionRef);
-    if (cached?.tabId === temporaryArchiveStatusTabId) {
-      browserSessionTargets.delete(sessionRef);
+    for (const [cachedRef, cached] of browserSessionTargets.entries()) {
+      if (cached?.tabId === temporaryArchiveStatusTabId) {
+        browserSessionTargets.delete(cachedRef);
+      }
     }
     try { await chrome.tabs.remove(temporaryArchiveStatusTabId); } catch (_) {}
     temporaryArchiveStatusTabId = null;
@@ -3664,6 +3692,33 @@ async function handleBrowserActuation(command) {
       );
       return;
     }
+    if (!target) {
+      const providerRecovery = String(params.provider || "");
+      const canonicalUrlRecovery = String(params.canonical_url || "");
+      if (providerRecovery && canonicalUrlRecovery) {
+        const canonical = browserConversationInfo(providerRecovery, canonicalUrlRecovery);
+        if (canonical?.conversation_id) {
+          const existing = await findBrowserSessionTargetByCanonicalIdentity(
+            providerRecovery,
+            canonicalUrlRecovery,
+            expectedGeneration,
+          );
+          if (existing.ambiguous) {
+            await postBrowserActuationEvidence(
+              actuationId,
+              unavailableBrowserActuationEvidence(
+                expectedGeneration,
+                "browser_session_target_ambiguous",
+                recovered.observedGeneration,
+              ),
+            );
+            return;
+          }
+          target = existing.target;
+          if (target) browserSessionTargets.set(sessionRef, target);
+        }
+      }
+    }
     if (!target && (
       operation === "herdr_mcp.browser_session.archive"
       || operation === "herdr_mcp.browser_session.archive_status"
@@ -3687,6 +3742,16 @@ async function handleBrowserActuation(command) {
           return;
         }
         target = existing.target;
+        if (target && operation === "herdr_mcp.browser_session.archive_status") {
+          for (const [candidateRef, candidateTarget] of browserSessionTargets.entries()) {
+            if (candidateTarget?.tabId === target.tabId
+                && candidateTarget?.convKey === target.convKey
+                && candidateTarget?.observationGeneration === expectedGeneration) {
+              actuationSessionRef = candidateRef;
+              break;
+            }
+          }
+        }
         if (!target) {
           let createdTab = null;
           try {
@@ -3702,7 +3767,22 @@ async function handleBrowserActuation(command) {
             const deadline = Date.now() + 8000;
             do {
               target = browserSessionTargets.get(sessionRef) || null;
-              if (target?.tabId === createdTab.id) break;
+              if (target?.tabId === createdTab.id) {
+                actuationSessionRef = sessionRef;
+                break;
+              }
+              if (operation === "herdr_mcp.browser_session.archive_status") {
+                for (const [candidateRef, candidateTarget] of browserSessionTargets.entries()) {
+                  if (candidateTarget?.tabId === createdTab.id
+                      && candidateTarget?.convKey === canonicalInfo.convKey
+                      && candidateTarget?.observationGeneration === expectedGeneration) {
+                    target = candidateTarget;
+                    actuationSessionRef = candidateRef;
+                    break;
+                  }
+                }
+                if (target) break;
+              }
               target = null;
               await new Promise((resolve) => setTimeout(resolve, 200));
             } while (Date.now() < deadline);
@@ -3750,12 +3830,16 @@ async function handleBrowserActuation(command) {
     return;
   }
   try {
+    const actuationParams = operation === "herdr_mcp.browser_session.archive_status"
+        && actuationSessionRef !== sessionRef
+      ? { ...params, session_ref: actuationSessionRef }
+      : params;
     const response = await sendBrowserActuationTabMessage(target.tabId, {
       type: "h2w_browser_actuation",
       command: {
         operation,
         expected_generation: expectedGeneration,
-        params,
+        params: actuationParams,
         expectedConvKey: target.convKey,
       },
     });
@@ -4027,6 +4111,7 @@ const lastTurnEndedPayload = new Map(); // convKey -> last h2w_turn_ended payloa
 const LLM_JUDGE_TIMEOUT_MS = 60000;
 const LLM_JUDGE_MAX_ATTEMPTS = 2;
 const MANUAL_LLM_JUDGE_TIMEOUT_MS = 15000;
+const JEV_JUDGE_TIMEOUT_MS = 15000;
 
 /**
  * One-shot OpenAI-compatible chat/completions call to judge if the turn is done.
@@ -4080,7 +4165,7 @@ async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null, ti
   if (!isLlmJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
   if (!await hasLlmHostPermission(cfg)) return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
   const url = llmJudgeCompletionsUrl(cfg.llmJudgeBaseUrl);
-  const prompt = buildLlmJudgeUserMessage(cfg.llmJudgePromptTemplate, { userText, assistantText });
+  const prompt = buildLlmJudgeUserMessage({ userText, assistantText });
   const body = {
     model: String(cfg.llmJudgeModel).trim(),
     messages: [{ role: "user", content: prompt }],
@@ -4137,6 +4222,105 @@ async function fetchLlmJudge(
     await new Promise((r) => setTimeout(r, 800));
   }
   return last;
+}
+
+async function fetchJevJudgeOnce(
+  userText,
+  assistantText,
+  cfgOverride = null,
+  timeoutMs = JEV_JUDGE_TIMEOUT_MS,
+) {
+  const cfg = cfgOverride || CFG;
+  if (!isJevJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
+  if (!await hasJevHostPermission(cfg)) {
+    return { ok: false, reason: "permission", error: "Jev endpoint site access is not granted" };
+  }
+  let url;
+  try {
+    url = jevSystemOneUrl(cfg.jevJudgeBaseUrl);
+  } catch (_) {
+    return { ok: false, reason: "invalid_url" };
+  }
+  const body = buildJevPendingWorkRequest(
+    userText,
+    assistantText,
+    String(cfg.jevJudgeModel || DEFAULT_JEV_MODEL).trim(),
+  );
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${String(cfg.jevJudgeApiKey || "").trim()}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || JEV_JUDGE_TIMEOUT_MS, 60000))),
+    });
+    if (!resp.ok) {
+      return {
+        ok: false,
+        reason: "http",
+        status: resp.status,
+        error: (await resp.text().catch(() => "")).slice(0, 200),
+      };
+    }
+    const parsed = await resp.json();
+    return interpretJevPendingWorkAnswer(parsed, DEFAULT_JEV_THRESHOLD);
+  } catch (error) {
+    const name = error?.name || "";
+    if (name === "TimeoutError" || name === "AbortError") {
+      return { ok: false, reason: "timeout", error: `timed out after ${timeoutMs}ms` };
+    }
+    return { ok: false, reason: "network", error: error?.message || String(error) };
+  }
+}
+
+async function fetchJevGoalSemanticPrior(
+  state,
+  cfgOverride = null,
+  timeoutMs = JEV_JUDGE_TIMEOUT_MS,
+) {
+  const cfg = cfgOverride || CFG;
+  if (!isJevJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
+  if (!await hasJevHostPermission(cfg)) {
+    return { ok: false, reason: "permission", error: "Jev endpoint site access is not granted" };
+  }
+  let url;
+  try {
+    url = jevSystemOneUrl(cfg.jevJudgeBaseUrl);
+  } catch (_) {
+    return { ok: false, reason: "invalid_url" };
+  }
+  const body = buildJevGoalSemanticRequest(
+    state,
+    String(cfg.jevJudgeModel || DEFAULT_JEV_MODEL).trim(),
+  );
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${String(cfg.jevJudgeApiKey || "").trim()}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || JEV_JUDGE_TIMEOUT_MS, 60000))),
+    });
+    if (!resp.ok) {
+      return {
+        ok: false,
+        reason: "http",
+        status: resp.status,
+        error: (await resp.text().catch(() => "")).slice(0, 200),
+      };
+    }
+    return interpretJevGoalSemanticAnswer(await resp.json(), DEFAULT_JEV_THRESHOLD);
+  } catch (error) {
+    const name = error?.name || "";
+    if (name === "TimeoutError" || name === "AbortError") {
+      return { ok: false, reason: "timeout", error: `timed out after ${timeoutMs}ms` };
+    }
+    return { ok: false, reason: "network", error: error?.message || String(error) };
+  }
 }
 
 async function fetchLlmHandoffOnce(prompt) {
@@ -4338,7 +4522,8 @@ function scheduleIdleNudgeRetry(convKey, delayMs) {
 }
 
 async function retryIdleNudge(convKey) {
-  if (!automationScopeForConversation(convKey).enabled) return;  const cooldownSec = paceIntervalSec();
+  if (!automationScopeForConversation(convKey).enabled) return;
+  const cooldownSec = paceIntervalSec();
   if (cooldownSec <= 0) return;
   const bindings = await loadBindings();
   const primary = primaryBindingForConv(bindings, convKey);
@@ -4364,7 +4549,8 @@ async function retryIdleNudge(convKey) {
     scheduleIdleNudgeRetry(convKey, 5000);
     return;
   }
-  if (!looksLikeSubstantiveReply(payload.assistantText)) {
+  const semanticJudgeConfigured = isJevJudgeConfigured(CFG) || isLlmJudgeConfigured(CFG);
+  if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(payload.assistantText)) {
     callLog(`llm-judge retry skip: not substantive ${convKey}`);
     return;
   }
@@ -4521,7 +4707,14 @@ async function persistGoalCheckpoint({
  * Cross-boundary WAIT_EXTERNAL continuity comes ONLY from an authoritative
  * resume — there is no in-memory surrogate for the ledger.
  */
-function derivedSupervisorLedger(binding, { authoredTurns = [], assistantText = "", checkpoint = null, goal = null, now = Date.now() } = {}) {
+function derivedSupervisorLedger(binding, {
+  authoredTurns = [],
+  assistantText = "",
+  checkpoint = null,
+  goal = null,
+  semanticPrior = null,
+  now = Date.now(),
+} = {}) {
   if (goal) {
     // Authoritative: restored from Work Memory resume; no re-derivation needed.
     return normalizeGoalLedger({
@@ -4531,8 +4724,23 @@ function derivedSupervisorLedger(binding, { authoredTurns = [], assistantText = 
       updated_at: now,
     });
   }
-  const declaredRemaining = assistantText && assistantDeclaresPendingWork(assistantText)
-    ? [{ id: "w1", title: localizedText("supervisor_declared_remaining", null, "work the WebChat said is still unfinished"), kind: "unknown" }]
+  const semantic = semanticPrior?.ok ? semanticPrior.probabilities || {} : null;
+  const jevRunnable = Boolean(
+    semantic
+    && Number(semantic.can_continue) >= DEFAULT_JEV_THRESHOLD
+    && Number(semantic.task_completed) < DEFAULT_JEV_THRESHOLD
+    && Number(semantic.needs_human) < DEFAULT_JEV_THRESHOLD
+    && Number(semantic.waiting_external) < DEFAULT_JEV_THRESHOLD,
+  );
+  const scriptRunnable = !semantic
+    && assistantText
+    && assistantDeclaresPendingWork(assistantText);
+  const declaredRemaining = (jevRunnable || scriptRunnable)
+    ? [{
+      id: "w1",
+      title: localizedText("supervisor_declared_remaining", null, "work the WebChat said is still unfinished"),
+      kind: "unknown",
+    }]
     : [];
   return deriveGoalLedger({
     continuityId: binding?.continuity_id || null,
@@ -4730,11 +4938,28 @@ async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
     authoritative = await authoritativeGoalAndRevision(search.locator);
   }
 
+  const authoritativeGoal = authoritative?.goal || null;
+  const semanticPrior = isJevJudgeConfigured(CFG)
+    ? await fetchJevGoalSemanticPrior({
+      objective: authoritativeGoal?.objective || userText,
+      userText,
+      assistantText: String(turn.assistantText || ""),
+      openTodos: Array.isArray(authoritativeGoal?.todos)
+        ? authoritativeGoal.todos
+          .filter((todo) => todo?.status !== "done" && todo?.status !== "superseded")
+          .map((todo) => String(todo?.title || "").trim())
+          .filter(Boolean)
+        : [],
+      boundary: String(boundaryEvent?.type || boundaryEvent?.boundary || ""),
+    })
+    : { ok: false, reason: "not_configured" };
+
   const ledger = derivedSupervisorLedger(primary, {
     authoredTurns,
     assistantText: String(turn.assistantText || ""),
     checkpoint: turn.checkpoint || null,
-    goal: authoritative?.goal || null,
+    goal: authoritativeGoal,
+    semanticPrior,
   });
   if (!ledger.objective) return { owned: false, status: "no_goal", locator: search.ok ? "derived" : search.reason };
 
@@ -4768,6 +4993,7 @@ async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
     authoredTurns,
     evidence: projection.evidence,
     runtime: projection.runtime,
+    semanticPrior,
     adapter,
     now: Date.now(),
     carry: supervisorCarry(convKey),
@@ -4834,7 +5060,7 @@ async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
   };
 }
 
-/** Post-turn nudge: LLM judge plus strong assistant self-declared pending work. */
+/** Final deterministic fallback when semantic judges are unavailable/ambiguous. */
 async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs, cause = "llm_not_configured") {
   const nudgeText = autoGoalContinueMessage();
   if (!shouldAutoContinueWithoutLlm(userText, assistantText, nudgeText)) {
@@ -4863,6 +5089,43 @@ async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, c
   }
   lastJudgedAssistantFp.set(convKey, fp);
   return rememberIdleNudge(convKey, { nudged: true, reason: "fallback_continue", cause, assistant_fp: fp, send: nudgeText });
+}
+
+async function sendSemanticContinue(convKey, b, fp, cooldownMs, {
+  reason,
+  status,
+  output,
+  nudgeText = autoGoalContinueMessage(),
+  meta = {},
+} = {}) {
+  lastIdleNudgeAt.set(convKey, Date.now());
+  setActionBadge("!", "#dc2626", 8000);
+  const wakeResult = await routeWake(b, {
+    status,
+    output,
+    working_count: 0,
+    pane: b.pane,
+    agent: b.agent,
+  }, nudgeText);
+  if (!wakeResult?.ok) {
+    scheduleIdleNudgeRetry(convKey, cooldownMs);
+    return rememberIdleNudge(convKey, {
+      nudged: false,
+      reason: "wake_failed",
+      assistant_fp: fp,
+      send: nudgeText,
+      error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
+      ...meta,
+    });
+  }
+  lastJudgedAssistantFp.set(convKey, fp);
+  return rememberIdleNudge(convKey, {
+    nudged: true,
+    reason,
+    assistant_fp: fp,
+    send: nudgeText,
+    ...meta,
+  });
 }
 
 async function maybeIdleNudge(msg) {
@@ -4912,6 +5175,7 @@ async function maybeIdleNudgeInner(msg) {
   if (!String(assistantText).trim()) {
     return rememberIdleNudge(convKey, { nudged: false, reason: "empty_assistant" });
   }
+  const semanticJudgeConfigured = isJevJudgeConfigured(CFG) || isLlmJudgeConfigured(CFG);
 
   if (b.tabId) {
     try {
@@ -4921,16 +5185,16 @@ async function maybeIdleNudgeInner(msg) {
         return rememberIdleNudge(convKey, { nudged: false, reason: "still_generating" });
       }
       if (snap?.assistantText) assistantText = snap.assistantText;
-      if (!looksLikeSubstantiveReply(assistantText)) {
+      if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(assistantText)) {
         return rememberIdleNudge(convKey, { nudged: false, reason: "not_substantive" });
       }
     } catch (e) {
-      callLog(`llm-judge live snapshot failed ${convKey}:`, e.message);
-      if (!looksLikeSubstantiveReply(assistantText)) {
+      callLog(`semantic judge live snapshot failed ${convKey}:`, e.message);
+      if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(assistantText)) {
         return rememberIdleNudge(convKey, { nudged: false, reason: "not_substantive" });
       }
     }
-  } else if (!looksLikeSubstantiveReply(assistantText)) {
+  } else if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(assistantText)) {
     return rememberIdleNudge(convKey, { nudged: false, reason: "not_substantive" });
   }
 
@@ -4988,12 +5252,75 @@ async function maybeIdleNudgeInner(msg) {
     });
   }
 
-  if (!isLlmJudgeConfigured(CFG)) {
-    return autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs);
+  const jevConfigured = isJevJudgeConfigured(CFG);
+  const llmConfigured = isLlmJudgeConfigured(CFG);
+  const continueText = autoGoalContinueMessage();
+
+  if (jevConfigured) {
+    const jev = await fetchJevJudgeOnce(userText, assistantText);
+    const policy = decideJevAutoPolicy(jev);
+    const jevMeta = {
+      jev_probability: jev?.ok ? jev.probability : null,
+      jev_signal: jev?.ok ? jev.signal : "unavailable",
+      jev_reason: jev?.ok ? null : jev?.reason || "unknown",
+    };
+    if (policy.action === "continue") {
+      return sendSemanticContinue(convKey, b, fp, cooldownMs, {
+        reason: "jev_continue",
+        status: "jev_continue_nudge",
+        output: `Jev continue p=${Number(jev.probability).toFixed(3)}`,
+        nudgeText: continueText,
+        meta: jevMeta,
+      });
+    }
+    if (policy.action === "stop") {
+      lastJudgedAssistantFp.set(convKey, fp);
+      clearIdleNudgeRetry(convKey);
+      return rememberIdleNudge(convKey, {
+        nudged: false,
+        reason: policy.reason,
+        assistant_fp: fp,
+        ...jevMeta,
+      });
+    }
+    callLog(`jev fallback ${convKey}: ${policy.reason}`);
   }
 
-  const judged = await fetchLlmJudge(userText, assistantText);
-  if (!judged.ok) {
+  if (llmConfigured) {
+    const judged = await fetchLlmJudge(userText, assistantText);
+    if (judged.ok) {
+      const verdict = interpretLlmJudgeReply(judged.content);
+      if (verdict.done) {
+        lastJudgedAssistantFp.set(convKey, fp);
+        clearIdleNudgeRetry(convKey);
+        return rememberIdleNudge(convKey, {
+          nudged: false,
+          reason: "llm_done",
+          raw: verdict.raw,
+          assistant_fp: fp,
+        });
+      }
+      if (verdict.cont && verdict.nudgeText) {
+        return sendSemanticContinue(convKey, b, fp, cooldownMs, {
+          reason: "llm_continue",
+          status: "llm_continue_nudge",
+          output: `llm-judge continue; raw=${verdict.raw.slice(0, 80)}`,
+          nudgeText: verdict.nudgeText,
+          meta: { raw: verdict.raw },
+        });
+      }
+      callLog(`llm fallback ${convKey}: ambiguous`);
+      return autoContinueWithoutLlm(
+        convKey,
+        b,
+        userText,
+        assistantText,
+        fp,
+        cooldownMs,
+        "llm_ambiguous",
+      );
+    }
+    callLog(`llm fallback ${convKey}: ${judged.reason}`);
     return autoContinueWithoutLlm(
       convKey,
       b,
@@ -5004,59 +5331,16 @@ async function maybeIdleNudgeInner(msg) {
       `llm_${judged.reason}`,
     );
   }
-  let verdict = interpretLlmJudgeReply(judged.content, {
-    skipKeywords: CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-  });
-  if (assistantDeclaresPendingWork(assistantText) && !verdict.cont) {
-    verdict = {
-      done: false,
-      cont: true,
-      nudgeText: localizedText(
-        "default_auto_continue_nudge",
-        null,
-        "Continue with the unfinished work you identified.",
-      ),
-      raw: `${verdict.raw || ""} [assistant_pending_override]`.trim(),
-    };
-  }
-  if (verdict.done) {
-    lastJudgedAssistantFp.set(convKey, fp);
-    clearIdleNudgeRetry(convKey);
-    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_done", raw: verdict.raw, assistant_fp: fp });
-  }
-  if (!verdict.cont || !verdict.nudgeText) {
-    scheduleIdleNudgeRetry(convKey, 30000);
-    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_ambiguous", raw: verdict.raw, assistant_fp: fp });
-  }
 
-  lastIdleNudgeAt.set(convKey, Date.now());
-  setActionBadge("!", "#dc2626", 8000);
-  const wakeResult = await routeWake(b, {
-    status: "llm_continue_nudge",
-    output: `llm-judge continue; raw=${verdict.raw.slice(0, 80)}`,
-    working_count: 0,
-    pane: b.pane,
-    agent: b.agent,
-  }, verdict.nudgeText);
-  if (!wakeResult?.ok) {
-    scheduleIdleNudgeRetry(convKey, cooldownMs);
-    return rememberIdleNudge(convKey, {
-      nudged: false,
-      reason: "wake_failed",
-      raw: verdict.raw,
-      assistant_fp: fp,
-      send: verdict.nudgeText,
-      error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
-    });
-  }
-  lastJudgedAssistantFp.set(convKey, fp);
-  return rememberIdleNudge(convKey, {
-    nudged: true,
-    reason: "llm_continue",
-    raw: verdict.raw,
-    assistant_fp: fp,
-    send: verdict.nudgeText,
-  });
+  return autoContinueWithoutLlm(
+    convKey,
+    b,
+    userText,
+    assistantText,
+    fp,
+    cooldownMs,
+    jevConfigured ? "jev_fallback_no_llm" : "semantic_judge_not_configured",
+  );
 }
 
 function paceIntervalSec() {
@@ -5197,7 +5481,13 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
   if (activeTransferFromSource(handoffs, bindingDeliveryConvKey(b) || b?.convKey || "")) {
     return { ok: false, reason: "handoff_active" };
   }
-  const isLlmNudge = ["llm_continue_nudge", "auto_continue_fallback_nudge", "supervisor_continue", "supervisor_answer"].includes(extra.status);
+  const isLlmNudge = [
+    "llm_continue_nudge",
+    "auto_continue_fallback_nudge",
+    "jev_continue_nudge",
+    "supervisor_continue",
+    "supervisor_answer",
+  ].includes(extra.status);
   const rawText = String(template || "").trim();
 
   if (isLlmNudge) {
@@ -5417,9 +5707,7 @@ async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
       status: judged.status || null,
     });
   }
-  const verdict = interpretLlmJudgeReply(judged.content, {
-    skipKeywords: CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-  });
+  const verdict = interpretLlmJudgeReply(judged.content);
   if (verdict.done) {
     return rememberIdleNudge(convKey, { ok: true, continued: false, nudged: false, reason: "llm_done", raw: verdict.raw });
   }
@@ -6269,7 +6557,6 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   }
   const bindings = await loadBindings();
   const session = bindingsForConv(bindings, convInfo.convKey);
-  if (!session.length) return { ok: false, error: "binding_required" };
   if (trigger !== "manual") {
     const projectBindings = session.filter((binding) => isProjectScopedBinding(binding));
     if (projectBindings.length) {
@@ -7230,7 +7517,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         continuity_id: session.map((b) => b.continuity_id).find(Boolean) || transfer?.continuity_id || null,
         can_handoff: Boolean(
           convInfo?.manual_handoff_available
-          && session.length > 0
           && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
         ),
         handoff: transferView,
@@ -7277,14 +7563,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         incoming.manualContinueMessage = String(incoming.manualContinueMessage || "").trim().slice(0, 4000)
           || defaultManualContinueMessage();
       }
+      // Retired semantic-policy inputs are ignored even when a stale Options
+      // page or older content script submits them during an extension update.
+      delete incoming.jevJudgeMode;
+      delete incoming.jevJudgeThreshold;
+      delete incoming.llmJudgePromptTemplate;
+      delete incoming.llmJudgeSkipKeywords;
+      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeBaseUrl")) {
+        incoming.jevJudgeBaseUrl = String(incoming.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim()
+          || DEFAULT_JEV_BASE_URL;
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeModel")) {
+        incoming.jevJudgeModel = String(incoming.jevJudgeModel || DEFAULT_JEV_MODEL).trim()
+          || DEFAULT_JEV_MODEL;
+      }
       delete incoming.enabled;
       delete incoming.idleNudgeEnabled;
       CFG = { ...CFG, ...incoming };
       CFG.enabled = false;
       CFG.idleNudgeEnabled = false;
       delete CFG.idleNudgeCooldownSec;
+      delete CFG.jevJudgeMode;
+      delete CFG.jevJudgeThreshold;
+      delete CFG.llmJudgePromptTemplate;
+      delete CFG.llmJudgeSkipKeywords;
       await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
-      try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token"]); } catch (e) {}
+      try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token", "jevJudgeMode", "jevJudgeThreshold", "llmJudgePromptTemplate", "llmJudgeSkipKeywords"]); } catch (e) {}
       await syncExperimentalContentScripts();
       void rebuildStreams();
       sendResponse({ ok: true });
@@ -7364,15 +7668,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
         return;
       }
-      const verdict = interpretLlmJudgeReply(judged.content, {
-        skipKeywords: form.llmJudgeSkipKeywords || CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-      });
+      const verdict = interpretLlmJudgeReply(judged.content);
       sendResponse({
         ok: true,
         content: judged.content,
         done: verdict.done,
         cont: verdict.cont,
         nudgeText: verdict.nudgeText,
+      });
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_test_jev") {
+    void (async () => {
+      const form = { ...(msg.config || {}) };
+      const judged = await fetchJevJudgeOnce(
+        form.userText || "继续验证",
+        form.assistantText || "实现已经完成。下一步我会继续跑生产验证。",
+        form,
+      );
+      if (!judged.ok) {
+        sendResponse({
+          ok: false,
+          reason: judged.reason,
+          status: judged.status || null,
+          error: judged.error || "",
+        });
+        return;
+      }
+      sendResponse({
+        ok: true,
+        probability: judged.probability,
+        signal: judged.signal,
+        threshold: judged.threshold,
+        model: judged.model,
+        usage: judged.usage || null,
       });
     })();
     return true;

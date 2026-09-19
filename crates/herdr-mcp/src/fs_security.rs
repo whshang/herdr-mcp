@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn empty_managed_roots_hint_is_actionable_without_a_coding_agent() {
-        // v0.4.6 #2: when the live snapshot exposes no managed git roots, the
+        // When the live snapshot exposes no managed Git roots, the
         // hint must explicitly direct the user to open/create a Herdr workspace
         // or pane inside the intended Git repository, keep it available, then
         // retry — and must not imply a coding agent is required.

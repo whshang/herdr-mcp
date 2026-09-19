@@ -1468,6 +1468,12 @@ fn work_memory_call(
                     Ok(value) => value,
                     Err(error) => return error,
                 };
+            if through_message_id.is_none() && through_evidence_id.is_none() {
+                return json!({
+                    "ok": false,
+                    "code": "work_memory_checkpoint_anchor_required",
+                });
+            }
             let created_at = match work_memory_required_i64(params, "created_at") {
                 Ok(value) => value,
                 Err(error) => return error,
@@ -2060,6 +2066,14 @@ fn browser_dispatch_submit(
         Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
         Err(error) => return browser_store_error(error),
     };
+    let actuation_locator = match store_guard.browser_resource_locator(session_ref) {
+        Ok(Some(locator)) if locator.observation_generation == expected_generation => {
+            Some(locator.canonical_url)
+        }
+        Ok(_) => None,
+        Err(error) => return browser_store_error(error),
+    };
+    let actuation_provider = session.provider.clone();
     let reservation = store_guard.reserve_browser_dispatch(BrowserDispatchReserveInput {
         endpoint_ref: &session.endpoint_ref,
         provider: &session.provider,
@@ -2116,11 +2130,18 @@ fn browser_dispatch_submit(
         return browser_store_error(error);
     }
 
+    let mut actuation_params = params.clone();
+    if let Some(object) = actuation_params.as_object_mut() {
+        object.insert("provider".to_owned(), json!(actuation_provider));
+        if let Some(canonical_url) = actuation_locator {
+            object.insert("canonical_url".to_owned(), json!(canonical_url));
+        }
+    }
     drop(store_guard);
     let evidence = match actuator {
         Some(actuator) => match actuator.actuate(
             BrowserOperation::DispatchSubmit.method(),
-            params,
+            &actuation_params,
             expected_generation,
             Some(&reserved.dispatch_id),
         ) {
@@ -7455,12 +7476,59 @@ mod tests {
             "crates/herdr-mcp/src/mcp.rs"
         );
 
-        let checkpoint = work_memory_call(
+        let missing_anchor = work_memory_call(
             &store,
             "work_memory.checkpoint.put",
             &json!({
                 "continuity_id": "wm:mcp",
                 "expected_checkpoint_revision": 0,
+                "summary": "must fail before StateStore",
+                "checkpoint_json": "{\"goal\":\"missing-anchor\"}",
+                "created_at": 117,
+            }),
+        );
+        assert_eq!(missing_anchor["ok"], false);
+        assert_eq!(
+            missing_anchor["code"],
+            "work_memory_checkpoint_anchor_required"
+        );
+
+        let message_only = work_memory_call(
+            &store,
+            "work_memory.checkpoint.put",
+            &json!({
+                "continuity_id": "wm:mcp",
+                "expected_checkpoint_revision": 0,
+                "summary": "message anchored",
+                "checkpoint_json": "{\"goal\":\"message-only\"}",
+                "through_message_id": message_ids[1],
+                "created_at": 118,
+            }),
+        );
+        assert_eq!(message_only["ok"], true);
+        assert_eq!(message_only["checkpoint"]["revision"], 1);
+
+        let evidence_only = work_memory_call(
+            &store,
+            "work_memory.checkpoint.put",
+            &json!({
+                "continuity_id": "wm:mcp",
+                "expected_checkpoint_revision": 1,
+                "summary": "evidence anchored",
+                "checkpoint_json": "{\"goal\":\"evidence-only\"}",
+                "through_evidence_id": evidence["evidence_id"],
+                "created_at": 119,
+            }),
+        );
+        assert_eq!(evidence_only["ok"], true);
+        assert_eq!(evidence_only["checkpoint"]["revision"], 2);
+
+        let checkpoint = work_memory_call(
+            &store,
+            "work_memory.checkpoint.put",
+            &json!({
+                "continuity_id": "wm:mcp",
+                "expected_checkpoint_revision": 2,
                 "summary": "MCP checkpoint\nready for handoff",
                 "checkpoint_json": "{\n\t\"goal\": \"alpha2\"\n}",
                 "through_message_id": message_ids[1],
@@ -7469,7 +7537,7 @@ mod tests {
             }),
         );
         assert_eq!(checkpoint["ok"], true);
-        assert_eq!(checkpoint["checkpoint"]["revision"], 1);
+        assert_eq!(checkpoint["checkpoint"]["revision"], 3);
         assert_eq!(checkpoint["checkpoint"]["verified"], true);
 
         let resumed = work_memory_call(
@@ -9172,11 +9240,17 @@ mod tests {
         impl BrowserActuator for CountingActuator {
             fn actuate(
                 &self,
-                _operation: &str,
-                _params: &Value,
+                operation: &str,
+                params: &Value,
                 expected_generation: i64,
                 _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::DispatchSubmit.method());
+                assert_eq!(params["provider"], "chatgpt");
+                assert_eq!(
+                    params["canonical_url"],
+                    "https://chatgpt.com/c/restart-session-hidden"
+                );
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(BrowserPostconditionEvidence {
                     observed_generation: expected_generation,
@@ -9262,6 +9336,14 @@ mod tests {
                         observation_generation: 7,
                         observed_at: 13,
                     })
+                    .unwrap();
+                guard
+                    .upsert_browser_resource_locator(
+                        &session.resource_ref,
+                        "https://chatgpt.com/c/restart-session-hidden",
+                        7,
+                        13,
+                    )
                     .unwrap();
                 guard
                     .set_browser_endpoint_consent(BrowserEndpointConsentInput {

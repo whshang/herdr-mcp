@@ -25,6 +25,34 @@ import {
   supervise,
 } from "../extension/goal-supervisor-core.js";
 
+test("user keeps Goal evidence authoritative | Given a Jev semantic prior | When bounded supervisor input is built | Then the probabilities are advisory and visible to the LLM supervisor", () => {
+  const input = buildSupervisorInput({
+    ledger: deriveGoalLedger({
+      objective: "finish release",
+      todoHints: ["verify CI"],
+      now: 10_000,
+    }),
+    runtime: { generation_settled: true, browser_online: true },
+    semanticPrior: {
+      ok: true,
+      probabilities: {
+        can_continue: 0.22,
+        needs_human: 0.08,
+        waiting_external: 0.91,
+        task_completed: 0.11,
+        needs_handoff: 0.05,
+      },
+    },
+    boundary: { boundary: "turn_settled", reason: "assistant_settled" },
+    now: 10_000,
+  });
+  const prior = input.sections.find((section) => section.name === "semantic_prior");
+  assert.ok(prior);
+  assert.match(prior.body, /source=jev/);
+  assert.match(prior.body, /advisory_only=true/);
+  assert.match(prior.body, /waiting_external=0\.910/);
+});
+
 // Real domain fakes: nothing is mocked except the provider transport itself.
 function adapterFor(responses) {
   const calls = [];
@@ -411,7 +439,7 @@ test("user keeps working across a long conversation and is not rolled over early
   const atThreshold = await supervise({
     ledger: ledger(),
     boundaryEvent: { type: "context_threshold", reason: "estimated_text_tokens:81000" },
-    runtime: { ...healthyRuntime, context_state: "rollover_required" },
+    runtime: { ...healthyRuntime, context_state: "rollover_required", bound: false },
     adapter: adapterFor([proposal]).adapter,
     now: 10_000,
   });
