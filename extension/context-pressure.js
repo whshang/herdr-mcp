@@ -316,7 +316,7 @@
     const state = String(pressure.state || "");
     if (![CONTINUITY_STATES.ROLLOVER_REQUIRED, CONTINUITY_STATES.HIGH_RISK].includes(state)) return false;
     if (String(input.runtimeHealth || "healthy") !== "healthy") return false;
-    if (!input.bound || !input.canHandoff || !input.projectConversation) return false;
+    if (!input.canHandoff || !input.projectConversation) return false;
     if (!input.quiescent || input.deliveryUncertain || input.mutationPending) return false;
     if (isActiveHandoffStatus(input.handoffStatus)) return false;
     const now = positiveInt(input.now) || Date.now();

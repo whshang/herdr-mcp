@@ -1082,7 +1082,7 @@ export function guardSupervisorDecision(decision, { runtime = {}, ledger = null,
     case "HANDOFF": {
       if (r.handoff_active) return denied("handoff_in_flight", "WAIT_EXTERNAL");
       if (r.delivery_uncertain || r.mutation_pending) return denied("handoff_unsafe_while_uncertain", "ASK_HUMAN");
-      if (!r.bound || !r.handoff_capable) return denied("handoff_not_available", "ASK_HUMAN");
+      if (!r.handoff_capable) return denied("handoff_not_available", "ASK_HUMAN");
       if (!r.protocol_conversation) return denied("handoff_requires_project_conversation", "ASK_HUMAN");
       const threshold = policy.handoffStates || DEFAULT_SUPERVISOR_POLICY.handoffStates;
       if (!threshold.includes(r.context_state)) {

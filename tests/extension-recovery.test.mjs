@@ -806,7 +806,7 @@ test("context pressure persists metadata only and proactive rollover is fail-clo
   const base = {
     pressure: pressure.evaluateContextPressure({ messageCount: 50 }),
     runtimeHealth: "healthy",
-    bound: true,
+    bound: false,
     canHandoff: true,
     projectConversation: true,
     quiescent: true,

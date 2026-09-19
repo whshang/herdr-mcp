@@ -380,7 +380,7 @@ The extension uses conservative pressure signals:
 - a persisted monotonic message-count floor;
 - reserved headroom for Project/system/tool payloads not visible in the page.
 
-High pressure only makes rollover eligible. Automatic handoff still requires a safe boundary: Project Auto on, bound workspace not working, no stream/tool/permission card, no unsent manual draft, no uncertain delivery and no other handoff in progress.
+High pressure only makes rollover eligible. Automatic handoff still requires a safe boundary: Project Auto on, any bound workspace not working, no stream/tool/permission card, no unsent manual draft, no uncertain delivery and no other handoff in progress. Handoff itself does not require a workspace binding; durable continuity plus the current supported conversation identity is sufficient.
 
 ## Fail-closed handoff
 

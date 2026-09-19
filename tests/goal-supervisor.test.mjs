@@ -439,7 +439,7 @@ test("user keeps working across a long conversation and is not rolled over early
   const atThreshold = await supervise({
     ledger: ledger(),
     boundaryEvent: { type: "context_threshold", reason: "estimated_text_tokens:81000" },
-    runtime: { ...healthyRuntime, context_state: "rollover_required" },
+    runtime: { ...healthyRuntime, context_state: "rollover_required", bound: false },
     adapter: adapterFor([proposal]).adapter,
     now: 10_000,
   });

@@ -2039,6 +2039,28 @@ console.log("\n[ChatGPT pre-conversation Project binding]");
   await projectUnbindP;
   ok(!storage.herdrWakeBindings[projectStoreKey], "Project binding can be removed from any conversation in that Project");
 
+  const transferCountBeforeUnboundHandoff = Object.keys(storage.herdrConversationTransfers || {}).length;
+  let resolveUnboundHud;
+  const unboundHudP = new Promise((r) => { resolveUnboundHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_SOURCE }, { tab: { id: 365, url: PROJECT_SOURCE_URL } }, (r) => resolveUnboundHud(r));
+  const unboundHud = await unboundHudP;
+  ok(unboundHud?.bound === false
+      && unboundHud?.manual_handoff_available === true
+      && unboundHud?.can_handoff === true,
+    "an unbound ChatGPT Project conversation keeps handoff available", JSON.stringify(unboundHud));
+
+  let resolveUnboundHandoff;
+  const unboundHandoffP = new Promise((r) => { resolveUnboundHandoff = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 365, trigger: "manual" },
+    { tab: { id: 365, url: PROJECT_SOURCE_URL } }, (r) => resolveUnboundHandoff(r));
+  const unboundHandoff = await unboundHandoffP;
+  ok(unboundHandoff?.ok === false
+      && unboundHandoff?.error === "continuity_unavailable"
+      && unboundHandoff?.source_preserved === true
+      && Object.keys(storage.herdrConversationTransfers || {}).length === transferCountBeforeUnboundHandoff,
+    "unbound Project handoff reaches the continuity safety gate instead of requiring a workspace binding",
+    JSON.stringify(unboundHandoff));
+
   const rootKey = "https://chatgpt.com";
   installContentScript(367, `${rootKey}/`, rootKey);
   tabs.get(367).active = true;

@@ -4256,7 +4256,6 @@ const H2W_CONTENT_VERSION = "0.1.103";
     const should = CONTEXT_PRESSURE.shouldAutoRollover({
       pressure,
       runtimeHealth: safety.streaming || safety.toolRunning ? "working" : "healthy",
-      bound: hud.bound,
       canHandoff: hud.can_handoff,
       projectConversation: Boolean(hud.can_handoff),
       quiescent: !safety.composerBusy && !safety.streaming && !safety.toolRunning && !safety.permissionCardActive,
@@ -4977,11 +4976,9 @@ const H2W_CONTENT_VERSION = "0.1.103";
         ? hudText("handoff_blocked_working", { count: workingCount })
         : transferBusy
           ? hudText("handoff_blocked_transfer_busy")
-          : hudCache?.bound !== true
-            ? hudText("handoff_blocked_unbound")
-            : hudCache?.can_handoff !== true
-              ? hudText("handoff_blocked_unavailable")
-              : hudText("handoff_hint");
+          : hudCache?.can_handoff !== true
+            ? hudText("handoff_blocked_unavailable")
+            : hudText("handoff_hint");
   }
 
   function showHudToast(text, kind = "") {

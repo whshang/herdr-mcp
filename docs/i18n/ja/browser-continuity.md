@@ -380,7 +380,7 @@ HTTP 429 は逆の種類のシグナルです。**429 は backoff 専用で、Re
 - 永続化された単調増加の message-count floor。
 - ページに可視でない Project/system/tool payload 用に確保された余裕。
 
-高 pressure は rollover を対象にするだけです。自動 handoff には依然として安全な境界が必要です。Project の Auto オン、binding された workspace が working でないこと、stream/tool/permission card が無いこと、未送信の手動ドラフトが無いこと、不確実な delivery が無いこと、他に進行中の handoff が無いことです。
+高 pressure は rollover を対象にするだけです。自動 handoff には依然として安全な境界が必要です。Project の Auto オン、binding された workspace が存在する場合は working でないこと、stream/tool/permission card が無いこと、未送信の手動ドラフトが無いこと、不確実な delivery が無いこと、他に進行中の handoff が無いことです。handoff 自体は workspace binding を必要とせず、durable continuity と現在の対応 conversation identity があれば開始できます。
 
 ## fail-closed な handoff
 

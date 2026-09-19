@@ -448,12 +448,13 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
 达到高压力只代表**可以考虑接力**，不代表立即切会话。自动接力还必须满足：
 
 - 当前 ChatGPT Project `自动 开`；
-- 已绑定 workspace；
-- workspace 不在 working；
+- 如存在已绑定 workspace，则它不在 working；
 - 页面无 streaming / tool / 权限卡；
 - 没有人工未发送草稿；
 - 没有 delivery uncertainty；
 - 没有另一条 handoff 正在进行。
+
+handoff 本身不要求 workspace binding；只要当前页面是受支持的具体会话，并且可以解析到 durable continuity，就可以接力。
 
 ## handoff 的 fail-closed 流程
 

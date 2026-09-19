@@ -377,7 +377,7 @@ function hudLabels() {
     "manual_continue_hint", "manual_status_hint", "manual_judge_hint",
     "manual_disabled_auto", "manual_disabled_busy",
     "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_failed_source_preserved", "handoff_llm_required", "handoff_copy_prompt", "handoff_copy_prompt_hint", "handoff_prompt_copied", "handoff_prompt_copy_failed",
-    "handoff_blocked_unbound", "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
+    "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
     "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
@@ -6499,7 +6499,6 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   }
   const bindings = await loadBindings();
   const session = bindingsForConv(bindings, convInfo.convKey);
-  if (!session.length) return { ok: false, error: "binding_required" };
   if (trigger !== "manual") {
     const projectBindings = session.filter((binding) => isProjectScopedBinding(binding));
     if (projectBindings.length) {
@@ -7460,7 +7459,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         continuity_id: session.map((b) => b.continuity_id).find(Boolean) || transfer?.continuity_id || null,
         can_handoff: Boolean(
           convInfo?.manual_handoff_available
-          && session.length > 0
           && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
         ),
         handoff: transferView,
