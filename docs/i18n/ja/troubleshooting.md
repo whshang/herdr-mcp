@@ -296,13 +296,12 @@ Queue は意図的に **即時送信ではありません**。assistant の turn
 ページ内 HUD の **Handoff** を使ってください。利用できない、または無効になっている場合は次を確認してください：
 
 - 現在のサイト/conversation タイプが handoff をサポートしている。
-- workspace が binding されている。
-- workspace に active な working agent がいない。
+- workspace が binding されている場合、active な working agent がいない。
 - すでに active な transfer がない。
 
 現在の scope は **Auto オン または Auto オフ** のいずれでもかまいません。handoff がサポートされる場合、対象の conversation は source の Auto 状態を継承し、transfer 中は source の自動 wake が一時停止します。
 
-Handoff は packet を作成し、新しい conversation を作成し、seed を検証し、その後にのみ binding を移動しなければなりません。transfer が復旧可能/不確実な場合は、手動で unbind するのではなく、古い binding を安全アンカーとして保持してください。
+Handoff は packet を作成し、新しい conversation を作成し、seed を検証してから cutover します。workspace binding が存在する場合だけ、その後に binding を切り替えるか移動します。transfer が復旧可能/不確実な場合は、既存の binding を手動で unbind せず、安全アンカーとして保持してください。
 
 ## 症状：z.ai / DeepSeek が JSON tool call を出力した後に止まる
 

@@ -284,12 +284,11 @@ Control Center 的`发送指令`会走本地可信控制链真实执行；`调�
 直接使用页面 **HUD 的“接力”**。如果入口不可用或被禁用，再确认：
 
 - 当前站点/会话类型支持 handoff；
-- workspace 已绑定；
 - 当前作用域可以是 `自动 开` 或 `自动 关`；目标会话会继承源会话 Auto 状态；
-- workspace 没有仍处于 `working` 的 Agent；
+- 如存在已绑定 workspace，它没有仍处于 `working` 的 Agent；
 - 没有已经进行中的 transfer。
 
-接力必须先生成 packet、建立新 conversation、确认 seed 存在，最后才迁移 binding。如果停在“恢复接力”，不要手工解绑旧 conversation；旧 binding 在 cutover 完成前是安全锚点。
+接力必须先生成 packet、建立新 conversation、确认 seed 存在，再执行 cutover。如存在 workspace binding，只能在这之后切换或迁移 binding。如果停在“恢复接力”，不要手工解绑已有 binding；它在 cutover 完成前是安全锚点。
 
 ## 症状：z.ai / DeepSeek 输出 JSON tool call 后停住
 
