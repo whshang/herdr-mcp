@@ -45,7 +45,7 @@ export interface Env {
   DEFAULT_WORKSTATION_ID?: string;
   /**
    * Optional worker-wide semantic route pool as one JSON secret. Every route
-   * uses the same name/capability/protocol/url/model/api_key object schema as
+   * uses the same name/protocol/url/model/api_key object schema as
    * workstation config.json. Credentials stay at Edge and are never returned.
    */
   HERDR_SEMANTIC_ROUTES?: string;

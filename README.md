@@ -176,9 +176,9 @@ The browser extension is optional for the core ChatGPT → MCP → workstation c
 
 For ChatGPT Auto, deterministic browser/runtime safety gates stay authoritative. Ordinary post-turn semantic judgment uses a fixed progressive chain: **typed evaluation routes (Jev) → chat routes (LLM) → bounded script fallback**. Goal-aware automation additionally gives the existing LLM Goal Supervisor one bounded Jev semantic prior, while Work Memory/TODO evidence remains the completion authority. The extension stores no semantic-provider endpoint, model, or API key; it asks the local Herdr Runtime for typed evaluation or chat and keeps semantic policy, probability boundaries, judge prompts, and completion tokens product-owned.
 
-The native runtime owns one provider-neutral semantic route pool shared by browser Auto, planning Skill/method relevance, and Work Memory relevance. Configuration has exactly two layers: mode-`0600` `~/.config/herdr-mcp/config.json` for one workstation, and the authenticated Cloudflare Worker route pool for all enrolled workstations. A local route always wins for the capability it provides; Worker routes are used only when the local config has no route for that capability. The extension never stores provider configuration and the runtime does not read semantic provider values from shell or process environment. Existing `config.toml` is migrated once to `config.json` and retained only as `config.toml.migrated`.
+The native runtime owns one provider-neutral semantic route pool shared by browser Auto, planning Skill/method relevance, and Work Memory relevance. Configuration has exactly two layers: mode-`0600` `~/.config/herdr-mcp/config.json` for one workstation, and the authenticated Cloudflare Worker route pool for all enrolled workstations. Local typed/chat routes take precedence over Worker routes for the same derived mode. The extension never stores provider configuration and the runtime does not read semantic provider values from shell or process environment. The `config.toml` used by released 0.4.x runtimes is migrated once to `config.json` and retained only as `config.toml.migrated`; unreleased 1.0 semantic TOML sections are intentionally not a migration format.
 
-Every route is a provider-neutral object with an arbitrary `name`, a `capability` (`evaluate` or `chat`), a wire `protocol` (`jev`, `evaluation-v4`, or `openai-chat`), and explicit `url`, `model`, and `api_key`. TypeSafe and OpenRouter therefore share the same `jev` adapter; Vercel uses the standard `evaluation-v4` adapter; OpenAI-compatible LLMs share `openai-chat`. Typed Jev routes and chat/LLM routes use the same rotating-start, bounded-attempt, deadline, cooldown, and failover executor.
+Every route is a provider-neutral object with an arbitrary `name`, one wire `protocol` (`jev`, `evaluation-v4`, or `openai-chat`), and explicit `url`, `model`, and `api_key`. The protocol determines the route mode: `jev` and `evaluation-v4` are typed evaluation routes, while `openai-chat` is a chat route. TypeSafe and OpenRouter therefore share the same `jev` adapter; Vercel uses the standard `evaluation-v4` adapter; OpenAI-compatible LLMs share `openai-chat`. Typed Jev routes and chat/LLM routes use the same rotating-start, bounded-attempt, deadline, cooldown, and failover executor.
 
 Example `config.json` fragment:
 
@@ -188,7 +188,6 @@ Example `config.json` fragment:
     "routes": [
       {
         "name": "fast_primary",
-        "capability": "evaluate",
         "protocol": "jev",
         "url": "https://api.typesafe.ai/v1/systemone",
         "model": "jev-latest",
@@ -196,7 +195,6 @@ Example `config.json` fragment:
       },
       {
         "name": "fast_backup",
-        "capability": "evaluate",
         "protocol": "jev",
         "url": "https://openrouter.ai/api/alpha/decisions",
         "model": "~typesafe/jev-latest",
@@ -204,7 +202,6 @@ Example `config.json` fragment:
       },
       {
         "name": "fast_gateway",
-        "capability": "evaluate",
         "protocol": "evaluation-v4",
         "url": "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
         "model": "typesafe-ai/jev",
@@ -212,7 +209,6 @@ Example `config.json` fragment:
       },
       {
         "name": "chat_primary",
-        "capability": "chat",
         "protocol": "openai-chat",
         "url": "https://example-provider.invalid/v1/chat/completions",
         "model": "<model>",

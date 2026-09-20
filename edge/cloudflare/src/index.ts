@@ -94,12 +94,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-type SemanticCapability = "evaluate" | "chat";
 type SemanticProtocol = "jev" | "evaluation-v4" | "openai-chat";
 
 type EdgeSemanticRoute = {
   name: string;
-  capability: SemanticCapability;
   protocol: SemanticProtocol;
   url: string;
   model: string;
@@ -117,16 +115,16 @@ const SEMANTIC_CHAT_BUDGET_MS = 15_000;
 let semanticRouteCursor = 0;
 const semanticRouteCooldowns = new Map<string, number>();
 
-function semanticCapability(value: unknown): SemanticCapability | null {
-  return value === "evaluate" || value === "chat" ? value : null;
-}
-
 function semanticProtocol(value: unknown): SemanticProtocol | null {
   return value === "jev"
     || value === "evaluation-v4"
     || value === "openai-chat"
     ? value
     : null;
+}
+
+function semanticModeForProtocol(protocol: SemanticProtocol): "evaluate" | "chat" {
+  return protocol === "openai-chat" ? "chat" : "evaluate";
 }
 
 function validSemanticValue(value: unknown, max: number): value is string {
@@ -165,18 +163,13 @@ function semanticRoutes(env: Env): { ok: true; routes: EdgeSemanticRoute[] } | {
     const routes: EdgeSemanticRoute[] = [];
     for (const value of parsed) {
       if (!isRecord(value)) return { ok: false };
-      const allowed = new Set(["name", "capability", "protocol", "url", "model", "api_key"]);
+      const allowed = new Set(["name", "protocol", "url", "model", "api_key"]);
       if (Object.keys(value).some((key) => !allowed.has(key))) return { ok: false };
       const name = typeof value.name === "string" ? value.name.trim() : "";
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || names.has(name)) return { ok: false };
 
-      const capability = semanticCapability(value.capability);
       const protocol = semanticProtocol(value.protocol);
-      if (!capability || !protocol) return { ok: false };
-      if (
-        (capability === "evaluate" && protocol === "openai-chat")
-        || (capability === "chat" && protocol !== "openai-chat")
-      ) return { ok: false };
+      if (!protocol) return { ok: false };
 
       const rawUrl = value.url;
       const model = value.model;
@@ -190,7 +183,7 @@ function semanticRoutes(env: Env): { ok: true; routes: EdgeSemanticRoute[] } | {
       const url = semanticUrl(rawUrl);
       if (!url) return { ok: false };
       names.add(name);
-      routes.push({ name, capability, protocol, url, model, apiKey });
+      routes.push({ name, protocol, url, model, apiKey });
     }
     return { ok: true, routes };
   } catch {
@@ -203,7 +196,7 @@ function semanticQuestionsForRoute(
   questions: Record<string, unknown>,
 ): Record<string, unknown> | null {
   const converted: Record<string, unknown> = {};
-  if (route.capability !== "evaluate") return null;
+  if (semanticModeForProtocol(route.protocol) !== "evaluate") return null;
   for (const [id, raw] of Object.entries(questions)) {
     if (!isRecord(raw)) return null;
     const type = raw.type;
@@ -306,8 +299,7 @@ async function callSemanticChatRoute(
   timeoutMs: number,
 ): Promise<SemanticRouteResult> {
   if (
-    route.capability !== "chat"
-    || route.protocol !== "openai-chat"
+    route.protocol !== "openai-chat"
     || !Array.isArray(messages)
     || messages.length < 1
     || messages.length > 32
@@ -400,8 +392,8 @@ async function handleSemanticProxy(
   }
   const routes = configured.routes;
   if (request.method === "GET") {
-    const evaluateAvailable = routes.some((route) => route.capability === "evaluate");
-    const chatAvailable = routes.some((route) => route.capability === "chat");
+    const evaluateAvailable = routes.some((route) => semanticModeForProtocol(route.protocol) === "evaluate");
+    const chatAvailable = routes.some((route) => semanticModeForProtocol(route.protocol) === "chat");
     return noStoreJsonResponse({
       ok: true,
       available: evaluateAvailable || chatAvailable,
@@ -409,7 +401,6 @@ async function handleSemanticProxy(
       chat_available: chatAvailable,
       routes: routes.map((route) => ({
         name: route.name,
-        capability: route.capability,
         protocol: route.protocol,
         model: route.model,
       })),
@@ -447,7 +438,7 @@ async function handleSemanticProxy(
     return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
   }
 
-  const eligibleRoutes = routes.filter((route) => route.capability === mode);
+  const eligibleRoutes = routes.filter((route) => semanticModeForProtocol(route.protocol) === mode);
   if (eligibleRoutes.length === 0) {
     return noStoreJsonResponse({ ok: false, code: "semantic_provider_unavailable" }, 503);
   }

@@ -160,7 +160,6 @@ async function pair(env, name) {
 test("user keeps Worker semantic credentials at Edge | Given an enrolled device and Worker-wide route pool | When semantic evaluation is requested | Then authentication is required and credentials never return", async () => {
   const routes = [{
     name: "edge_fast",
-    capability: "evaluate",
     protocol: "jev",
     url: "https://api.typesafe.ai/v1/systemone",
     model: "jev-edge",
@@ -199,7 +198,6 @@ test("user keeps Worker semantic credentials at Edge | Given an enrolled device 
     chat_available: false,
     routes: [{
       name: "edge_fast",
-      capability: "evaluate",
       protocol: "jev",
       model: "jev-edge",
     }],
@@ -255,7 +253,6 @@ test("user keeps semantic failover bounded | Given two independent route credent
   const routes = [
     {
       name: "direct-a",
-      capability: "evaluate",
       protocol: "jev",
       url: "https://typesafe.example/systemone",
       model: "jev-a",
@@ -263,7 +260,6 @@ test("user keeps semantic failover bounded | Given two independent route credent
     },
     {
       name: "openrouter-b",
-      capability: "evaluate",
       protocol: "jev",
       url: "https://openrouter.example/api/alpha/decisions",
       model: "~typesafe/jev-latest",
@@ -293,8 +289,8 @@ test("user keeps semantic failover bounded | Given two independent route credent
   const statusPayload = await status.json();
   assert.equal(statusPayload.available, true);
   assert.deepEqual(
-    statusPayload.routes.map(({ name, capability, protocol, model }) => ({ name, capability, protocol, model })),
-    routes.map(({ name, capability, protocol, model }) => ({ name, capability, protocol, model })),
+    statusPayload.routes.map(({ name, protocol, model }) => ({ name, protocol, model })),
+    routes.map(({ name, protocol, model }) => ({ name, protocol, model })),
   );
   assert.equal(JSON.stringify(statusPayload).includes("route-secret"), false);
 
@@ -341,7 +337,6 @@ test("user uses one semantic route schema for chat | Given a Worker-wide openai-
   const h = makeEnv({
     HERDR_SEMANTIC_ROUTES: JSON.stringify([{
       name: "chat_primary",
-      capability: "chat",
       protocol: "openai-chat",
       url: "https://chat.example/v1/chat/completions",
       model: "chat-model",
@@ -362,7 +357,6 @@ test("user uses one semantic route schema for chat | Given a Worker-wide openai-
     chat_available: true,
     routes: [{
       name: "chat_primary",
-      capability: "chat",
       protocol: "openai-chat",
       model: "chat-model",
     }],
@@ -413,7 +407,6 @@ test("user receives normalized Vercel evaluation | Given an evaluation-v4 Jev ro
   const h = makeEnv({
     HERDR_SEMANTIC_ROUTES: JSON.stringify([{
       name: "fast_gateway",
-      capability: "evaluate",
       protocol: "evaluation-v4",
       url: "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
       model: "typesafe-ai/jev",

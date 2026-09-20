@@ -57,7 +57,6 @@ pub struct SemanticConfig {
 #[serde(deny_unknown_fields)]
 pub struct SemanticRouteConfig {
     pub name: String,
-    pub capability: String,
     pub protocol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -144,7 +143,6 @@ impl std::fmt::Debug for SemanticRouteConfig {
         formatter
             .debug_struct("SemanticRouteConfig")
             .field("name", &self.name)
-            .field("capability", &self.capability)
             .field("protocol", &self.protocol)
             .field("url", &self.url)
             .field("model", &self.model)
@@ -378,14 +376,10 @@ fn parse_legacy_toml(content: &str, instance: &InstanceId) -> Result<Config, Str
             continue;
         }
         if line.starts_with("[[") && line.ends_with("]]") {
-            section = line[2..line.len() - 2].trim();
-            if section != "semantic.route" {
-                return Err(format!(
-                    "line {line_number}: unknown array section [[{section}]]"
-                ));
-            }
-            config.semantic.routes.push(SemanticRouteConfig::default());
-            continue;
+            let section = line[2..line.len() - 2].trim();
+            return Err(format!(
+                "line {line_number}: unknown array section [[{section}]]"
+            ));
         }
         if line.starts_with('[') && line.ends_with(']') {
             section = line[1..line.len() - 1].trim();
@@ -438,34 +432,6 @@ fn parse_legacy_toml(content: &str, instance: &InstanceId) -> Result<Config, Str
             ("edge", "device_id") => {
                 config.edge_device_id = Some(normalize_device_id(unquote(value))?)
             }
-            ("semantic.route", key) => {
-                let route = config.semantic.routes.last_mut().ok_or_else(|| {
-                    format!("line {line_number}: semantic route section is missing")
-                })?;
-                match key {
-                    "name" => route.name = parse_semantic_value(value, line_number, "name", 64)?,
-                    "capability" => {
-                        route.capability =
-                            parse_semantic_value(value, line_number, "capability", 32)?
-                    }
-                    "protocol" => {
-                        route.protocol = parse_semantic_value(value, line_number, "protocol", 64)?
-                    }
-                    "url" => {
-                        route.url = Some(parse_semantic_value(value, line_number, "url", 2048)?)
-                    }
-                    "model" => {
-                        route.model = Some(parse_semantic_value(value, line_number, "model", 256)?)
-                    }
-                    "api_key" => {
-                        route.api_key =
-                            Some(parse_semantic_value(value, line_number, "api_key", 4096)?)
-                    }
-                    _ => {
-                        return Err(format!("line {line_number}: unknown key {section}.{key}"));
-                    }
-                }
-            }
             ("", _) => return Err(format!("line {line_number}: keys must be inside a section")),
             _ => return Err(format!("line {line_number}: unknown key {section}.{key}")),
         }
@@ -482,28 +448,15 @@ fn validate_config(config: &Config) -> Result<(), String> {
         if !route_names.insert(route.name.as_str()) {
             return Err(format!("duplicate semantic route '{}'", route.name));
         }
-        if !matches!(route.capability.as_str(), "evaluate" | "chat")
-            || !matches!(
-                route.protocol.as_str(),
-                "jev" | "evaluation-v4" | "openai-chat"
-            )
-            || route.url.is_none()
+        if !matches!(
+            route.protocol.as_str(),
+            "jev" | "evaluation-v4" | "openai-chat"
+        ) || route.url.is_none()
             || route.model.is_none()
             || route.api_key.is_none()
         {
             return Err(format!(
-                "semantic.route.{} must define valid capability, protocol, url, model, and api_key",
-                route.name
-            ));
-        }
-        let protocol_matches_capability = match route.capability.as_str() {
-            "evaluate" => matches!(route.protocol.as_str(), "jev" | "evaluation-v4"),
-            "chat" => route.protocol == "openai-chat",
-            _ => false,
-        };
-        if !protocol_matches_capability {
-            return Err(format!(
-                "semantic.route.{} capability/protocol mismatch",
+                "semantic.route.{} must define valid protocol, url, model, and api_key",
                 route.name
             ));
         }
@@ -527,25 +480,6 @@ fn validate_semantic_route_name(value: &str, line_number: usize) -> Result<(), S
         });
     }
     Ok(())
-}
-
-fn parse_semantic_value(
-    value: &str,
-    line_number: usize,
-    key: &str,
-    max_len: usize,
-) -> Result<String, String> {
-    let value = unquote(value).trim();
-    if value.is_empty()
-        || value.len() > max_len
-        || value.chars().any(char::is_control)
-        || value.contains('"')
-    {
-        return Err(format!(
-            "line {line_number}: semantic route {key} is invalid"
-        ));
-    }
-    Ok(value.to_owned())
 }
 
 fn normalize_edge_origin_field(value: &str, field_name: &str) -> Result<String, String> {
@@ -673,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_supported_config() {
+    fn parses_supported_legacy_config() {
         let config = parse(
             r#"
             [runtime]
@@ -689,22 +623,6 @@ mod tests {
             [edge]
             public_origin = "https://herdr.example.com"
             device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
-
-            [[semantic.route]]
-            name = "fast_a"
-            capability = "evaluate"
-            protocol = "jev"
-            url = "https://api.typesafe.ai/v1/systemone"
-            model = "jev-latest"
-            api_key = "test-key"
-
-            [[semantic.route]]
-            name = "fast_b"
-            capability = "evaluate"
-            protocol = "jev"
-            url = "https://openrouter.ai/api/alpha/decisions"
-            model = "~typesafe/jev-latest"
-            api_key = "backup-key"
             "#,
         )
         .unwrap();
@@ -726,39 +644,7 @@ mod tests {
             config.edge_device_id.as_deref(),
             Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
         );
-        assert_eq!(
-            config.edge_link_keychain_service().as_deref(),
-            Some("herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
-        );
-        assert_eq!(
-            config.edge_ws_url().unwrap().as_deref(),
-            Some("wss://herdr.example.com/ws")
-        );
-        assert_eq!(config.semantic.routes.len(), 2);
-        assert_eq!(config.semantic.routes[0].name, "fast_a");
-        assert_eq!(config.semantic.routes[0].capability, "evaluate");
-        assert_eq!(config.semantic.routes[0].protocol, "jev");
-        assert_eq!(
-            config.semantic.routes[0].api_key.as_deref(),
-            Some("test-key")
-        );
-        assert_eq!(
-            config.semantic.routes[0].url.as_deref(),
-            Some("https://api.typesafe.ai/v1/systemone")
-        );
-        assert_eq!(
-            config.semantic.routes[0].model.as_deref(),
-            Some("jev-latest")
-        );
-        assert_eq!(config.semantic.routes[1].name, "fast_b");
-        assert_eq!(
-            config.semantic.routes[1].url.as_deref(),
-            Some("https://openrouter.ai/api/alpha/decisions")
-        );
-        assert_eq!(
-            config.semantic.routes[1].api_key.as_deref(),
-            Some("backup-key")
-        );
+        assert!(config.semantic.routes.is_empty());
     }
 
     #[test]
@@ -793,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_or_invalid_config() {
+    fn rejects_unknown_or_invalid_legacy_config() {
         assert!(parse("port = 1").is_err());
         assert!(parse("[runtime]\nport = 0").is_err());
         assert!(parse("[update]\nchannel = \"nightly\"").is_err());
@@ -804,25 +690,7 @@ mod tests {
         assert!(upstream_err.contains("edge.link_upstream_origin must use https://"));
         assert!(parse("[edge]\ndevice_id = \"dev_bad\"").is_err());
         assert!(parse("[unknown]\nvalue = 1").is_err());
-        assert!(
-            parse("[[semantic.route]]\nname = \"bad name\"\ncapability = \"evaluate\"").is_err()
-        );
-        assert!(parse(
-            "[[semantic.route]]\nname = \"route1\"\ncapability = \"evaluate\"\nprotocol = \"jev\"\nurl = \"https://openrouter.ai/api/alpha/decisions\"\nmodel = \"~typesafe/jev-latest\""
-        )
-        .is_err());
-        assert!(parse(
-            "[[semantic.route]]\nname = \"route1\"\ncapability = \"evaluate\"\nprotocol = \"jev\"\nurl = \"https://openrouter.ai/api/alpha/decisions\"\nmodel = \"~typesafe/jev-latest\"\napi_key = \"key\"\napi_key_env = \"SHOULD_FAIL\""
-        )
-        .is_err());
-        assert!(parse(
-            "[[semantic.route]]\nname = \"route1\"\ncapability = \"evaluate\"\nprotocol = \"jev\"\nurl = \"https://api.typesafe.ai/v1/systemone\"\nmodel = \"jev-latest\"\napi_key = \"key\"\n[[semantic.route]]\nname = \"route1\"\ncapability = \"chat\"\nprotocol = \"openai-chat\"\nurl = \"https://chat.example/v1/chat/completions\"\nmodel = \"chat\"\napi_key = \"key\""
-        )
-        .is_err());
-        assert!(parse(
-            "[[semantic.route]]\nname = \"route1\"\ncapability = \"chat\"\nprotocol = \"jev\"\nurl = \"https://api.typesafe.ai/v1/systemone\"\nmodel = \"jev-latest\"\napi_key = \"key\""
-        )
-        .is_err());
+        assert!(parse("[[semantic.route]]\nname = \"fast\"").is_err());
     }
 
     #[test]
@@ -838,7 +706,6 @@ mod tests {
             semantic: SemanticConfig {
                 routes: vec![SemanticRouteConfig {
                     name: "fast_a".to_owned(),
-                    capability: "evaluate".to_owned(),
                     protocol: "jev".to_owned(),
                     url: Some("https://api.typesafe.ai/v1/systemone".to_owned()),
                     model: Some("jev-latest".to_owned()),
@@ -858,7 +725,6 @@ mod tests {
             semantic: SemanticConfig {
                 routes: vec![SemanticRouteConfig {
                     name: "fast_a".to_owned(),
-                    capability: "evaluate".to_owned(),
                     protocol: "jev".to_owned(),
                     url: Some("https://api.typesafe.ai/v1/systemone".to_owned()),
                     model: Some("jev-latest".to_owned()),
@@ -887,7 +753,12 @@ mod tests {
             .is_err()
         );
         assert!(parse_json(
-            r#"{"semantic":{"routes":[{"name":"fast","capability":"chat","protocol":"jev","url":"https://example.com","model":"m","api_key":"k"}]}}"#,
+            r#"{"semantic":{"routes":[{"name":"fast","protocol":"invalid","url":"https://example.com","model":"m","api_key":"k"}]}}"#,
+            &InstanceId::default_instance()
+        )
+        .is_err());
+        assert!(parse_json(
+            r#"{"semantic":{"routes":[{"name":"fast","capability":"evaluate","protocol":"jev","url":"https://example.com","model":"m","api_key":"k"}]}}"#,
             &InstanceId::default_instance()
         )
         .is_err());
@@ -910,14 +781,6 @@ port = 9000
 
 [edge]
 public_origin = "https://herdr.example.com"
-
-[[semantic.route]]
-name = "fast"
-capability = "evaluate"
-protocol = "jev"
-url = "https://api.typesafe.ai/v1/systemone"
-model = "jev-latest"
-api_key = "secret"
 "#,
         )
         .unwrap();
@@ -929,7 +792,7 @@ api_key = "secret"
         assert!(root.join("config.toml.migrated").is_file());
         let migrated = fs::read_to_string(&json_path).unwrap();
         assert!(migrated.starts_with("{\n"));
-        assert!(migrated.contains("\"api_key\": \"secret\""));
+        assert!(config.semantic.routes.is_empty());
         #[cfg(unix)]
         assert_eq!(
             fs::metadata(&json_path).unwrap().permissions().mode() & 0o777,

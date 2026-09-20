@@ -100,7 +100,7 @@ herdr-mcp Rust runtime
 5. 保持 Auto 关闭，先核对状态、Pinned Target 与人工操作；
 6. 只有需要长时间无人值守时再按作用域开启 Continuity 自动化。
 
-语义 Auto 不在浏览器扩展里配置 Provider 凭证或 endpoint。扩展只调用本机 Herdr Runtime；Runtime 的 Provider 配置只有两层：单机使用 mode-`0600` 的 `config.json`，全局使用已认证 Cloudflare Worker 的共享 route pool，同一 typed/chat 能力有本机 route 时优先本机。两层都使用统一的 `name / capability / protocol / url / model / api_key` route JSON 对象，shell/process environment 不承担 Provider 配置。普通 Auto 固定按 typed evaluation route（Jev）-> chat route（LLM）-> 有界脚本兜底；Goal 模式可把 Jev 作为现有 LLM Goal Supervisor 的 advisory semantic prior。Jev 与 LLM route 共用轮换、总 deadline、冷却和有界错误转移。旧 `config.toml` 首次读取时会迁移为 JSON。没有语义 Provider 时脚本兜底仍提供基础 Auto；Work Memory/TODO evidence 与确定性安全门继续保持权威。
+语义 Auto 不在浏览器扩展里配置 Provider 凭证或 endpoint。扩展只调用本机 Herdr Runtime；Runtime 的 Provider 配置只有两层：单机使用 mode-`0600` 的 `config.json`，全局使用已认证 Cloudflare Worker 的共享 route pool，同一 typed/chat 能力有本机 route 时优先本机。两层都使用统一的 `name / protocol / url / model / api_key` route JSON 对象；`jev` 与 `evaluation-v4` 自动归为 typed evaluation，`openai-chat` 自动归为 chat；shell/process environment 不承担 Provider 配置。普通 Auto 固定按 typed evaluation route（Jev）-> chat route（LLM）-> 有界脚本兜底；Goal 模式可把 Jev 作为现有 LLM Goal Supervisor 的 advisory semantic prior。Jev 与 LLM route 共用轮换、总 deadline、冷却和有界错误转移。旧 `config.toml` 首次读取时会迁移为 JSON。没有语义 Provider 时脚本兜底仍提供基础 Auto；Work Memory/TODO evidence 与确定性安全门继续保持权威。
 
 z.ai / DeepSeek 的 JSON → MCP 属于实验性集成，默认关闭，需要在 Herdr 设置的实验性功能中显式开启。
 

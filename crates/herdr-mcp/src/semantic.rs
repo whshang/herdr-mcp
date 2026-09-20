@@ -887,9 +887,6 @@ impl HttpSemanticProvider {
         route: crate::config::SemanticRouteConfig,
         allow_inline_secret: bool,
     ) -> Option<Self> {
-        if route.capability != "evaluate" {
-            return None;
-        }
         let protocol = SemanticProtocol::parse(&route.protocol)?;
         if !matches!(
             protocol,
@@ -1018,7 +1015,7 @@ impl OpenAiChatProvider {
         route: crate::config::SemanticRouteConfig,
         allow_inline_secret: bool,
     ) -> Option<Self> {
-        if route.capability != "chat" || route.protocol != "openai-chat" {
+        if route.protocol != "openai-chat" {
             return None;
         }
         if !allow_inline_secret {
@@ -1614,7 +1611,6 @@ mod tests {
     "routes": [
       {
         "name": "fast_a",
-        "capability": "evaluate",
         "protocol": "jev",
         "url": "https://api.typesafe.ai/v1/systemone",
         "model": "jev-latest",
@@ -1622,7 +1618,6 @@ mod tests {
       },
       {
         "name": "chat_a",
-        "capability": "chat",
         "protocol": "openai-chat",
         "url": "https://chat.example/v1/chat/completions",
         "model": "chat-model",
@@ -1697,7 +1692,6 @@ mod tests {
     "routes": [
       {
         "name": "fast_a",
-        "capability": "evaluate",
         "protocol": "jev",
         "url": "https://api.typesafe.ai/v1/systemone",
         "model": "jev-latest",
@@ -1705,7 +1699,6 @@ mod tests {
       },
       {
         "name": "chat_a",
-        "capability": "chat",
         "protocol": "openai-chat",
         "url": "https://chat.example/v1/chat/completions",
         "model": "chat-model",

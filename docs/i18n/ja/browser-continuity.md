@@ -303,7 +303,7 @@ bounded mechanical script fallback
 
 Jev は最初に狭い意味判定を行い、通常の Auto では高信頼の continue/done を最終結果として扱います。Jev が確定できない場合のみ LLM に進み、LLM も確定できない場合のみ精度の低い機械的な script fallback を使います。この fallback により Jev/LLM API を持たないユーザーでも基本 Auto を利用できますが、script が Jev/LLM の結果を上書きすることはありません。
 
-ブラウザ拡張は Provider の endpoint、model、API key を設定せず、ローカル Herdr Runtime の統一 semantic service だけを呼び出します。Provider 設定は 2 層だけで、単一マシンでは mode-`0600` の `config.json`、全体共有では認証済み Cloudflare Worker route pool を使います。同じ typed/chat capability にローカル route があればローカルを優先します。両方の層で `name / capability / protocol / url / model / api_key` の共通 route JSON object を使い、shell/process environment は Provider 設定には使いません。Jev と LLM route は同じ rotation、deadline、cooldown、bounded failover を共有します。
+ブラウザ拡張は Provider の endpoint、model、API key を設定せず、ローカル Herdr Runtime の統一 semantic service だけを呼び出します。Provider 設定は 2 層だけで、単一マシンでは mode-`0600` の `config.json`、全体共有では認証済み Cloudflare Worker route pool を使います。同じ typed/chat capability にローカル route があればローカルを優先します。両方の層で `name / protocol / url / model / api_key` の共通 route JSON object を使い、`jev` と `evaluation-v4` は typed evaluation、`openai-chat` は chat として protocol から自動判定します。shell/process environment は Provider 設定には使いません。Jev と LLM route は同じ rotation、deadline、cooldown、bounded failover を共有します。
 
 Goal-aware automation ではさらに強い境界を維持します。Jev は既存の LLM Goal Supervisor に、`can_continue`、`needs_human`、`waiting_external`、`task_completed`、`needs_handoff` の 5 つの有界 semantic prior を一度に提供できます。これらの確率は advisory にすぎず、完了・待機・handoff・人間の判断境界・uncertain delivery については Work Memory/TODO evidence と deterministic runtime guard が引き続き authoritative です。
 
