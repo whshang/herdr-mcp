@@ -164,7 +164,7 @@ herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.c
 
 核心 ChatGPT → MCP → 开发机连接不依赖浏览器扩展。需要长对话连续工作、排队下一轮消息、Browser Control Center 或支持的 ChatGPT artifact 捕获时再安装。
 
-ChatGPT Auto 的确定性浏览器/runtime 安全门始终保持权威。普通回合结束后的语义判断采用固定渐进链：**已配置时 Jev/System One → 已配置时 OpenAI-compatible LLM judge → 有界脚本兜底**。Goal 模式还会把 Jev 的五信号结果作为现有 LLM Goal Supervisor 的 advisory prior；Work Memory/TODO evidence 仍是完成权威。用户只配置各 Provider 的 endpoint、model、API key；语义策略、概率边界、judge prompt 与 completion token 均由产品内置。
+ChatGPT Auto 的确定性浏览器/runtime 安全门始终保持权威。普通回合结束后的语义判断采用固定渐进链：**typed evaluation route（Jev）→ chat route（LLM）→ 有界脚本兜底**。Goal 模式还会把 Jev 的五信号结果作为现有 LLM Goal Supervisor 的 advisory prior；Work Memory/TODO evidence 仍是完成权威。浏览器扩展不保存 Provider endpoint、model 或 API key，只调用本机 Herdr Runtime 的统一语义能力。Provider 配置只有两层：单机使用 mode-`0600` 的 `~/.config/herdr-mcp/config.toml` 中任意命名的 `[semantic.route.<name>]`，全局使用 Cloudflare Worker 的共享 route pool；同一能力有本机 route 时始终优先本机。每条 route 都显式配置 `transport`、`base_url`、`model` 和 `api_key`，多个健康 route 共用轮换、冷却和有界串行错误转移。
 
 如果在 macOS 使用 STANDALONE 通道，`herdr-mcp doctor` 还会检查 Google Chrome 是否真的从受管 `~/.config/herdr-mcp/extensions/standalone/current` 路径加载固定 Herdr standalone ID。出现 `standalone-extension-load state=drift` 表示 Chrome 仍在使用另一份 Load unpacked 目录；按 `doctor` 输出的 `expected` 路径重新加载 Herdr 扩展即可。
 

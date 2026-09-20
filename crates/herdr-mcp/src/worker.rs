@@ -2688,6 +2688,170 @@ fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), Stri
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn semantic_proxy_configured() -> bool {
+    let Ok(paths) = RuntimePaths::discover() else {
+        return false;
+    };
+    let Ok(config) = Config::load_for_instance(&paths.config_file, &paths.instance) else {
+        return false;
+    };
+    config.link_upstream_origin().is_some() && config.edge_device_id.is_some()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub(crate) fn semantic_proxy_configured() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SemanticProxyCapabilities {
+    pub evaluate: bool,
+    pub chat: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn semantic_proxy_capabilities() -> SemanticProxyCapabilities {
+    if !semantic_proxy_configured() {
+        return SemanticProxyCapabilities::default();
+    }
+    let Ok(paths) = RuntimePaths::discover() else {
+        return SemanticProxyCapabilities::default();
+    };
+    let Ok(config) = Config::load_for_instance(&paths.config_file, &paths.instance) else {
+        return SemanticProxyCapabilities::default();
+    };
+    let Ok(identity) = resolve_enrolled_device_identity(&paths, &config) else {
+        return SemanticProxyCapabilities::default();
+    };
+    let Ok(mut headers) = bearer_headers(&identity.credential) else {
+        return SemanticProxyCapabilities::default();
+    };
+    let Ok(workstation) = HeaderValue::from_str(&identity.workstation_id) else {
+        return SemanticProxyCapabilities::default();
+    };
+    headers.insert("x-herdr-workstation", workstation);
+    let Ok(client) = client_for_origin(&identity.edge_origin) else {
+        return SemanticProxyCapabilities::default();
+    };
+    let Ok(url) = endpoint(&identity.edge_origin, "/semantic/status") else {
+        return SemanticProxyCapabilities::default();
+    };
+    let Ok(response) = client
+        .get(url)
+        .headers(headers)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+    else {
+        return SemanticProxyCapabilities::default();
+    };
+    if !response.status().is_success() {
+        return SemanticProxyCapabilities::default();
+    }
+    let Ok(payload) = response.json::<Value>() else {
+        return SemanticProxyCapabilities::default();
+    };
+    let legacy_available = payload
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    SemanticProxyCapabilities {
+        evaluate: payload
+            .get("evaluate_available")
+            .and_then(Value::as_bool)
+            .unwrap_or(legacy_available),
+        chat: payload
+            .get("chat_available")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub(crate) fn semantic_proxy_capabilities() -> SemanticProxyCapabilities {
+    SemanticProxyCapabilities::default()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn semantic_proxy_request(
+    payload: &Value,
+    timeout: std::time::Duration,
+) -> Result<Value, String> {
+    semantic_proxy_request_to("/semantic/systemone", payload, timeout, |payload| {
+        payload.get("model").and_then(Value::as_str).is_some()
+            && payload.get("answers").and_then(Value::as_object).is_some()
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn semantic_proxy_chat_request(
+    payload: &Value,
+    timeout: std::time::Duration,
+) -> Result<Value, String> {
+    semantic_proxy_request_to("/semantic/chat", payload, timeout, |payload| {
+        payload.get("model").and_then(Value::as_str).is_some()
+            && payload.get("content").and_then(Value::as_str).is_some()
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn semantic_proxy_request_to(
+    path: &str,
+    payload: &Value,
+    timeout: std::time::Duration,
+    valid_response: impl FnOnce(&Value) -> bool,
+) -> Result<Value, String> {
+    let paths = RuntimePaths::discover()?;
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_enrolled_device_identity(&paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client_for_origin(&identity.edge_origin)?
+        .post(endpoint(&identity.edge_origin, path)?)
+        .headers(headers)
+        .timeout(timeout)
+        .json(payload)
+        .send()
+        .map_err(|error| format!("semantic proxy request failed: {error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .map_err(|_| format!("semantic proxy returned non-JSON HTTP {status}"))?;
+    if !status.is_success() {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("semantic_proxy_error");
+        return Err(format!(
+            "semantic proxy failed with HTTP {status} code={code}"
+        ));
+    }
+    if !valid_response(&payload) {
+        return Err("semantic proxy returned an invalid response".to_owned());
+    }
+    Ok(payload)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub(crate) fn semantic_proxy_request(
+    _payload: &Value,
+    _timeout: std::time::Duration,
+) -> Result<Value, String> {
+    Err("semantic proxy is unsupported on this platform".to_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub(crate) fn semantic_proxy_chat_request(
+    _payload: &Value,
+    _timeout: std::time::Duration,
+) -> Result<Value, String> {
+    Err("semantic proxy is unsupported on this platform".to_owned())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn client_for_origin(edge_origin: &str) -> Result<Client, String> {
     crate::worker_bootstrap::client_for_edge_origin(edge_origin)
 }

@@ -174,9 +174,35 @@ herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.c
 
 The browser extension is optional for the core ChatGPT → MCP → workstation connection. Install it when you want conversation continuity, queued next-turn messages, Browser Control Center, or supported ChatGPT artifact capture.
 
-For ChatGPT Auto, deterministic browser/runtime safety gates stay authoritative. Ordinary post-turn semantic judgment uses a fixed progressive chain: **Jev/System One when configured → OpenAI-compatible LLM judge when configured → bounded script fallback**. Goal-aware automation additionally gives the existing LLM Goal Supervisor one bounded Jev semantic prior, while Work Memory/TODO evidence remains the completion authority. Users configure only each provider's endpoint, model, and API key; semantic policy, probability boundaries, judge prompts, and completion tokens are product-owned.
+For ChatGPT Auto, deterministic browser/runtime safety gates stay authoritative. Ordinary post-turn semantic judgment uses a fixed progressive chain: **typed evaluation routes (Jev) → chat routes (LLM) → bounded script fallback**. Goal-aware automation additionally gives the existing LLM Goal Supervisor one bounded Jev semantic prior, while Work Memory/TODO evidence remains the completion authority. The extension stores no semantic-provider endpoint, model, or API key; it asks the local Herdr Runtime for typed evaluation or chat and keeps semantic policy, probability boundaries, judge prompts, and completion tokens product-owned.
 
-The native runtime also has an optional provider-neutral semantic fast path. When `TYPESAFE_API_KEY` is present in the runtime environment, TypeSafe/Jev can provide bounded advisory judgments for planning Skill/method relevance and Work Memory result relevance. If the key is absent, the provider is unavailable, or a request fails, the existing deterministic behavior is unchanged. Semantic results never own permissions, delivery state, generation fencing, account identity, idempotency, cleanup safety, or task completion. Future fast judgment models plug into the same `SemanticProvider` boundary rather than changing tool-specific business logic.
+The native runtime owns one provider-neutral semantic route pool shared by browser Auto, planning Skill/method relevance, and Work Memory relevance. Configuration has exactly two layers: mode-`0600` `~/.config/herdr-mcp/config.toml` for one workstation, and the authenticated Cloudflare Worker route pool for all enrolled workstations. A local route always wins for the capability it provides; Worker routes are used only when the local config has no route for that capability. The extension never stores provider configuration and the runtime does not read semantic provider values from shell or process environment.
+
+Each `[semantic.route.<name>]` name is an arbitrary local label. Every route explicitly carries `transport`, `base_url`, `model`, and `api_key`; no provider URL or model is implied by the route name. Supported transports currently include `typesafe-systemone`, `openrouter-decisions`, `vercel-evaluation`, and `openai-chat`. Typed Jev routes and chat/LLM routes share the same rotating-start, bounded-attempt, deadline, cooldown, and failover policy. Missing providers, timeout, HTTP failure, malformed output, or uncertainty preserve the existing deterministic behavior, and semantic results never own permissions, delivery state, generation fencing, account identity, idempotency, cleanup safety, or task completion.
+
+Example:
+
+```toml
+[semantic.route.fast_primary]
+transport = "typesafe-systemone"
+base_url = "https://api.typesafe.ai/v1"
+model = "jev-latest"
+api_key = "<key>"
+
+[semantic.route.fast_backup]
+transport = "openrouter-decisions"
+base_url = "https://openrouter.ai/api"
+model = "~typesafe/jev-latest"
+api_key = "<key>"
+
+[semantic.route.chat_primary]
+transport = "openai-chat"
+base_url = "https://example-provider.invalid/v1"
+model = "<model>"
+api_key = "<key>"
+```
+
+Cloudflare uses the same route fields in the single Worker-wide `HERDR_SEMANTIC_ROUTES` JSON secret. Provider credentials never appear in status/capability responses.
 
 If you use the macOS STANDALONE channel, `herdr-mcp doctor` also checks whether Google Chrome is actually loading the fixed Herdr standalone ID from the managed `~/.config/herdr-mcp/extensions/standalone/current` path. A `standalone-extension-load state=drift` warning means Chrome is still using another Load-unpacked directory; reload the Herdr extension from the `expected` path shown by `doctor`.
 

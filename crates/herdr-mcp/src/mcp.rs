@@ -1118,7 +1118,7 @@ fn work_memory_search_page_json(
 }
 
 fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Value {
-    let service = SemanticService::from_env();
+    let service = SemanticService::from_config();
     let capability = service.capability_json();
     if hits.is_empty() {
         return json!({

@@ -115,44 +115,6 @@
   </section>
 
   <section class="card">
-    <h2 id="title_llm">Automation planning model</h2>
-    <div class="hint" id="hint_llm_sec"></div>
-
-    <label id="lab_llm_key">Judge API key (Bearer)</label>
-    <input type="password" id="llmJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
-    <div class="hint" id="hint_llm_key"></div>
-
-    <details class="advanced">
-      <summary id="llm_advanced_summary">Advanced LLM judge settings</summary>
-      <label id="lab_llm_url">Judge API base URL</label>
-      <input type="text" id="llmJudgeBaseUrl" placeholder="https://example.com/v1">
-      <div class="hint" id="hint_llm_url"></div>
-
-      <label id="lab_llm_model">Judge model</label>
-      <input type="text" id="llmJudgeModel" placeholder="e.g. small-fast-model">
-    </details>
-  </section>
-
-  <section class="card experimental">
-    <h2 id="title_jev">Smart Auto Continue</h2>
-    <div class="hint" id="hint_jev_sec"></div>
-
-    <label id="lab_jev_key">TypeSafe API key (Bearer)</label>
-    <input type="password" id="jevJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
-    <div class="hint" id="hint_jev_key"></div>
-
-    <details class="advanced">
-      <summary id="jev_advanced_summary">Advanced TypeSafe settings</summary>
-      <label id="lab_jev_url">TypeSafe API base URL</label>
-      <input type="text" id="jevJudgeBaseUrl" placeholder="https://api.typesafe.ai/v1">
-      <div class="hint" id="hint_jev_url"></div>
-
-      <label id="lab_jev_model">Jev model</label>
-      <input type="text" id="jevJudgeModel" placeholder="jev-latest">
-    </details>
-  </section>
-
-  <section class="card">
     <h2 id="title_page_assist">Page Assist</h2>
     <div class="hint" id="hint_page_assist">Explicit per-origin permissions for generic page inspection and interaction.</div>
     <label id="lab_page_assist_origins">Allowed origins (one per line, e.g. https://example.com)</label>
@@ -166,8 +128,6 @@
     <div class="actions">
       <button class="primary" id="save">Save</button>
       <button id="test">Test connection</button>
-      <button id="testLlm">Test LLM judge</button>
-      <button id="testJev">Test Jev judge</button>
     </div>
     <div id="status"></div>
   </section>

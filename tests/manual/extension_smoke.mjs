@@ -18,7 +18,7 @@ import {
   decideWake, decideWorkspaceWake, reconcileWorkspaceWakeKind, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   progressOutputFingerprint,
   isIdleNudgeText, looksLikeSubstantiveReply, isHerdrWakeComposerText,
-  interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
+  interpretLlmJudgeReply, buildLlmJudgeUserMessage,
   assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
   conversationInfoFromSupportedUrl,
 } from "../../extension/binding-core.js";
@@ -252,7 +252,7 @@ ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes('performWake({ template: "继续", autoAllow: false, recovery: true })')
     && wakeSource.includes("(assistantChanged || curLen > lastAsstLen)"),
   "ChatGPT explicit transport failures stop faking progress and use one bounded reload followed by at most one safe Continue");
-const semanticAutoStart = backgroundSource.indexOf("const jevConfigured = isJevJudgeConfigured(CFG)");
+const semanticAutoStart = backgroundSource.indexOf("const jevConfigured = semanticCapabilities.evaluate_available;");
 const semanticAutoEnd = backgroundSource.indexOf("function paceIntervalSec()", semanticAutoStart);
 const semanticAutoSource = backgroundSource.slice(semanticAutoStart, semanticAutoEnd);
 ok(semanticAutoStart >= 0
@@ -1693,11 +1693,17 @@ console.log("\n[progress / nudge config]");
 ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 120000, { progressTickSec: 120 }), "progress tick at 120s interval");
 
 console.log("\n[llmJudge]");
-ok(isLlmJudgeConfigured({ llmJudgeBaseUrl: "https://x/v1", llmJudgeApiKey: "k", llmJudgeModel: "m" }), "configured when three set");
-ok(!isLlmJudgeConfigured({ llmJudgeBaseUrl: "", llmJudgeApiKey: "k", llmJudgeModel: "m" }), "empty url = off");
-ok(llmJudgeCompletionsUrl("https://x/v1") === "https://x/v1/chat/completions", "url append completions");
-ok(llmJudgeCompletionsUrl("https://x//v1") === "", "mistyped duplicate path slash is rejected instead of silently normalized");
-ok(llmJudgeCompletionsUrl("https://x/v1/chat/completions") === "https://x/v1/chat/completions", "url already full");
+const retiredProviderCredentialReferences = backgroundSource
+  .split("\n")
+  .filter((line) => /(?:llmJudgeApiKey|jevJudgeApiKey)/.test(line));
+const providerCredentialReferencesAreMigrationOnly = retiredProviderCredentialReferences.every((line) =>
+  /^\s*delete (?:CFG|incoming)\.(?:llmJudgeApiKey|jevJudgeApiKey);\s*$/.test(line)
+  || /^\s*"(?:llmJudgeApiKey|jevJudgeApiKey)",?\s*$/.test(line)
+);
+ok(backgroundSource.includes("/extension/semantic/chat")
+    && backgroundSource.includes("/extension/semantic/evaluate")
+    && providerCredentialReferencesAreMigrationOnly,
+  "browser semantic judges use Runtime IPC and keep provider credentials out of the extension");
 ok(buildLlmJudgeUserMessage({ assistantText: "hello" }).includes("hello"), "built-in judge prompt fills content");
 ok(interpretLlmJudgeReply("好的").done === true, "好的 → done");
 ok(interpretLlmJudgeReply("继续").cont === true, "继续 → continue");

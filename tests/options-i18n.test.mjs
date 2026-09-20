@@ -8,9 +8,6 @@ const optionsJs = readFileSync(new URL("../extension/options.js", import.meta.ur
 
 test("Simplified Chinese Options copy avoids legacy mixed-language prose", () => {
   assert.equal(zh.options_title, "Herdr · 设置");
-  assert.equal(zh.label_llm_url, "判定服务地址");
-  assert.equal(zh.label_llm_key, "判定接口密钥");
-  assert.equal(zh.placeholder_llm_model, "填写模型名称");
 
   const optionKeys = [
     "hint_url",
@@ -20,9 +17,6 @@ test("Simplified Chinese Options copy avoids legacy mixed-language prose", () =>
     "label_progress_template",
     "hint_progress_template",
     "hint_idle_nudge",
-    "hint_llm_section",
-    "llm_need_config",
-    "llm_timeout",
     "hint_automation_mode",
     "hint_experimental_section",
     "hint_experimental_zai",
@@ -67,8 +61,16 @@ test("Simplified Chinese editable automation prompts use Chinese prose", () => {
   }
 });
 
-test("user sees only provider parameters | Given retired semantic policy controls | When Options and locale copy are inspected | Then prompt skip mode and threshold controls stay absent", () => {
+test("user configures semantic providers outside the extension | Given Runtime owns LLM and Jev routing | When Options is inspected | Then no provider credential controls remain", () => {
   for (const retired of [
+    "llmJudgeBaseUrl",
+    "llmJudgeApiKey",
+    "llmJudgeModel",
+    "jevJudgeBaseUrl",
+    "jevJudgeApiKey",
+    "jevJudgeModel",
+    "testLlm",
+    "testJev",
     "llmJudgePromptTemplate",
     "llmJudgeSkipKeywords",
     "jevJudgeMode",
@@ -76,22 +78,18 @@ test("user sees only provider parameters | Given retired semantic policy control
   ]) {
     assert.doesNotMatch(optionsHtml, new RegExp(`id="${retired}"`));
   }
-  for (const retiredKey of [
-    "label_llm_prompt",
-    "hint_llm_prompt",
-    "label_llm_skip",
-    "hint_llm_skip",
-    "label_jev_mode",
-    "jev_mode_shadow",
-    "jev_mode_assist",
-    "label_jev_threshold",
-    "default_llm_judge_prompt",
+  for (const retired of [
+    "llmJudgeBaseUrl",
+    "llmJudgeApiKey",
+    "llmJudgeModel",
+    "jevJudgeBaseUrl",
+    "jevJudgeApiKey",
+    "jevJudgeModel",
+    "h2w_test_llm",
+    "h2w_test_jev",
   ]) {
-    assert.equal(Object.prototype.hasOwnProperty.call(zh, retiredKey), false);
+    assert.doesNotMatch(optionsJs, new RegExp(retired));
   }
-  assert.match(zh.hint_idle_nudge, /Jev/);
-  assert.match(zh.hint_idle_nudge, /LLM judge/);
-  assert.match(zh.hint_jev_section, /0\.70/);
 });
 
 test("Options waits for locale before showing fallback English copy", () => {
@@ -100,20 +98,13 @@ test("Options waits for locale before showing fallback English copy", () => {
   assert.match(optionsJs, /classList\.remove\("i18n-pending"\)/);
 });
 
-test("LLM test booleans are localized instead of rendering true/false", () => {
-  assert.equal(zh.boolean_yes, "是");
-  assert.equal(zh.boolean_no, "否");
-  assert.match(optionsJs, /t\(resp\.done \? "boolean_yes" : "boolean_no"\)/);
-  assert.match(optionsJs, /t\(resp\.cont \? "boolean_yes" : "boolean_no"\)/);
-});
-
 test("Options requests optional host access only from explicit user settings", () => {
   assert.match(optionsJs, /chrome\.permissions\?\.request/);
   assert.match(optionsJs, /https:\/\/chat\.z\.ai\/\*/);
   assert.match(optionsJs, /https:\/\/chat\.deepseek\.com\/\*/);
   assert.match(optionsJs, /https:\/\/gemini\.google\.com\/\*/);
   assert.match(optionsJs, /removeHostPermissions/);
+  assert.doesNotMatch(optionsJs, /llmJudge|jevJudge/);
   assert.equal(typeof zh.host_permission_denied, "string");
   assert.equal(typeof zh.host_permission_invalid_url, "string");
-  assert.equal(typeof zh.hud_reason_llm_permission, "string");
 });

@@ -40,6 +40,34 @@ pub struct Config {
     pub edge_public_origin: Option<String>,
     pub edge_link_upstream_origin: Option<String>,
     pub edge_device_id: Option<String>,
+    pub semantic: SemanticConfig,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct SemanticConfig {
+    pub routes: Vec<SemanticRouteConfig>,
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct SemanticRouteConfig {
+    pub name: String,
+    pub transport: String,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for SemanticRouteConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SemanticRouteConfig")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -52,6 +80,7 @@ impl Default for Config {
             edge_public_origin: None,
             edge_link_upstream_origin: None,
             edge_device_id: None,
+            semantic: SemanticConfig::default(),
         }
     }
 }
@@ -113,7 +142,30 @@ impl Config {
                 rendered.push_str(&format!("device_id = \"{device_id}\"\n"));
             }
         }
+        for route in &self.semantic.routes {
+            rendered.push_str(&format!("\n[semantic.route.{}]\n", route.name));
+            rendered.push_str(&format!("transport = \"{}\"\n", route.transport));
+            if let Some(base_url) = &route.base_url {
+                rendered.push_str(&format!("base_url = \"{base_url}\"\n"));
+            }
+            if let Some(model) = &route.model {
+                rendered.push_str(&format!("model = \"{model}\"\n"));
+            }
+            if let Some(api_key) = &route.api_key {
+                rendered.push_str(&format!("api_key = \"{api_key}\"\n"));
+            }
+        }
         rendered
+    }
+
+    pub fn render_redacted(&self) -> String {
+        let mut redacted = self.clone();
+        for route in &mut redacted.semantic.routes {
+            if route.api_key.is_some() {
+                route.api_key = Some("[REDACTED]".to_owned());
+            }
+        }
+        redacted.render()
     }
 
     pub fn set_edge_public_origin(&mut self, origin: &str) -> Result<(), String> {
@@ -178,7 +230,27 @@ fn parse(content: &str) -> Result<Config, String> {
             section = line[1..line.len() - 1].trim();
             match section {
                 "runtime" | "dev" | "update" | "edge" => continue,
-                _ => return Err(format!("line {line_number}: unknown section [{section}]")),
+                _ => {
+                    let Some(route_name) = section.strip_prefix("semantic.route.") else {
+                        return Err(format!("line {line_number}: unknown section [{section}]"));
+                    };
+                    validate_semantic_route_name(route_name, line_number)?;
+                    if config
+                        .semantic
+                        .routes
+                        .iter()
+                        .any(|route| route.name == route_name)
+                    {
+                        return Err(format!(
+                            "line {line_number}: duplicate semantic route '{route_name}'"
+                        ));
+                    }
+                    config.semantic.routes.push(SemanticRouteConfig {
+                        name: route_name.to_owned(),
+                        ..SemanticRouteConfig::default()
+                    });
+                    continue;
+                }
             }
         }
 
@@ -225,12 +297,88 @@ fn parse(content: &str) -> Result<Config, String> {
             ("edge", "device_id") => {
                 config.edge_device_id = Some(normalize_device_id(unquote(value))?)
             }
+            (section, key) if section.starts_with("semantic.route.") => {
+                let route_name = section.trim_start_matches("semantic.route.");
+                let route = config
+                    .semantic
+                    .routes
+                    .iter_mut()
+                    .find(|route| route.name == route_name)
+                    .ok_or_else(|| {
+                        format!("line {line_number}: semantic route section is missing")
+                    })?;
+                match key {
+                    "transport" => {
+                        route.transport = parse_semantic_value(value, line_number, "transport", 64)?
+                    }
+                    "base_url" => {
+                        route.base_url =
+                            Some(parse_semantic_value(value, line_number, "base_url", 2048)?)
+                    }
+                    "model" => {
+                        route.model = Some(parse_semantic_value(value, line_number, "model", 256)?)
+                    }
+                    "api_key" => {
+                        route.api_key =
+                            Some(parse_semantic_value(value, line_number, "api_key", 4096)?)
+                    }
+                    _ => {
+                        return Err(format!("line {line_number}: unknown key {section}.{key}"));
+                    }
+                }
+            }
             ("", _) => return Err(format!("line {line_number}: keys must be inside a section")),
             _ => return Err(format!("line {line_number}: unknown key {section}.{key}")),
         }
     }
 
+    for route in &config.semantic.routes {
+        if route.transport.is_empty()
+            || route.base_url.is_none()
+            || route.model.is_none()
+            || route.api_key.is_none()
+        {
+            return Err(format!(
+                "semantic.route.{} must define transport, base_url, model, and api_key",
+                route.name
+            ));
+        }
+    }
+
     Ok(config)
+}
+
+fn validate_semantic_route_name(value: &str, line_number: usize) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(format!(
+            "line {line_number}: semantic route name must use only letters, digits, '_' or '-'"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_semantic_value(
+    value: &str,
+    line_number: usize,
+    key: &str,
+    max_len: usize,
+) -> Result<String, String> {
+    let value = unquote(value).trim();
+    if value.is_empty()
+        || value.len() > max_len
+        || value.chars().any(char::is_control)
+        || value.contains('"')
+    {
+        return Err(format!(
+            "line {line_number}: semantic route {key} is invalid"
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn normalize_edge_origin_field(value: &str, field_name: &str) -> Result<String, String> {
@@ -370,6 +518,18 @@ mod tests {
             [edge]
             public_origin = "https://herdr.example.com"
             device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+            [semantic.route.fast_a]
+            transport = "typesafe-systemone"
+            base_url = "https://api.typesafe.ai/v1"
+            model = "jev-latest"
+            api_key = "test-key"
+
+            [semantic.route.fast_b]
+            transport = "openrouter-decisions"
+            base_url = "https://openrouter.ai/api"
+            model = "~typesafe/jev-latest"
+            api_key = "backup-key"
             "#,
         )
         .unwrap();
@@ -398,6 +558,30 @@ mod tests {
         assert_eq!(
             config.edge_ws_url().unwrap().as_deref(),
             Some("wss://herdr.example.com/ws")
+        );
+        assert_eq!(config.semantic.routes.len(), 2);
+        assert_eq!(config.semantic.routes[0].name, "fast_a");
+        assert_eq!(config.semantic.routes[0].transport, "typesafe-systemone");
+        assert_eq!(
+            config.semantic.routes[0].api_key.as_deref(),
+            Some("test-key")
+        );
+        assert_eq!(
+            config.semantic.routes[0].base_url.as_deref(),
+            Some("https://api.typesafe.ai/v1")
+        );
+        assert_eq!(
+            config.semantic.routes[0].model.as_deref(),
+            Some("jev-latest")
+        );
+        assert_eq!(config.semantic.routes[1].name, "fast_b");
+        assert_eq!(
+            config.semantic.routes[1].base_url.as_deref(),
+            Some("https://openrouter.ai/api")
+        );
+        assert_eq!(
+            config.semantic.routes[1].api_key.as_deref(),
+            Some("backup-key")
         );
     }
 
@@ -444,6 +628,19 @@ mod tests {
         assert!(upstream_err.contains("edge.link_upstream_origin must use https://"));
         assert!(parse("[edge]\ndevice_id = \"dev_bad\"").is_err());
         assert!(parse("[unknown]\nvalue = 1").is_err());
+        assert!(parse("[semantic.route.bad name]\ntransport = \"typesafe-systemone\"").is_err());
+        assert!(parse(
+            "[semantic.route.route1]\ntransport = \"openrouter-decisions\"\nbase_url = \"https://openrouter.ai/api\"\nmodel = \"~typesafe/jev-latest\""
+        )
+        .is_err());
+        assert!(parse(
+            "[semantic.route.route1]\ntransport = \"openrouter-decisions\"\nbase_url = \"https://openrouter.ai/api\"\nmodel = \"~typesafe/jev-latest\"\napi_key = \"key\"\napi_key_env = \"SHOULD_FAIL\""
+        )
+        .is_err());
+        assert!(parse(
+            "[semantic.route.route1]\ntransport = \"typesafe-systemone\"\n[semantic.route.route1]\ntransport = \"openrouter-decisions\""
+        )
+        .is_err());
     }
 
     #[test]
@@ -456,8 +653,41 @@ mod tests {
             edge_public_origin: Some("https://herdr.example.com".to_owned()),
             edge_link_upstream_origin: Some("https://backend.workers.dev".to_owned()),
             edge_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            semantic: SemanticConfig {
+                routes: vec![SemanticRouteConfig {
+                    name: "fast_a".to_owned(),
+                    transport: "typesafe-systemone".to_owned(),
+                    base_url: Some("https://api.typesafe.ai/v1".to_owned()),
+                    model: Some("jev-latest".to_owned()),
+                    api_key: Some("test-key".to_owned()),
+                }],
+            },
         };
         assert_eq!(parse(&config.render()).unwrap(), config);
+    }
+
+    #[test]
+    fn semantic_secret_is_redacted_from_human_output_and_debug() {
+        let config = Config {
+            semantic: SemanticConfig {
+                routes: vec![SemanticRouteConfig {
+                    name: "fast_a".to_owned(),
+                    transport: "typesafe-systemone".to_owned(),
+                    base_url: Some("https://api.typesafe.ai/v1".to_owned()),
+                    model: Some("jev-latest".to_owned()),
+                    api_key: Some("super-secret-key".to_owned()),
+                }],
+            },
+            ..Config::default()
+        };
+
+        let rendered = config.render_redacted();
+        assert!(rendered.contains("api_key = \"[REDACTED]\""));
+        assert!(!rendered.contains("super-secret-key"));
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret-key"));
     }
 
     #[test]

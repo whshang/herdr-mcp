@@ -100,7 +100,7 @@ herdr-mcp Rust runtime
 5. 状態、Pinned Target、手動操作を確認している間は Auto をオフのままにします。
 6. 無人で長時間動く作業が本当に必要なときにだけ、スコープ付きの Continuity 自動化を有効にします。
 
-semantic Auto の Provider 設定は意図的に小さく保たれています。TypeSafe/Jev と OpenAI 互換 LLM judge は、それぞれ endpoint、model、API key だけを公開します。通常の Auto は Jev -> LLM -> bounded script fallback の固定順序で動き、Goal-aware Auto では Jev を既存 LLM Goal Supervisor の advisory semantic prior として利用できます。どちらの API がなくても script fallback が基本 Auto を維持し、Work Memory/TODO evidence と deterministic safety guard は引き続き authoritative です。semantic policy、Jev の判定境界、judge prompt、completion token は製品側で管理し、ユーザー設定にはしません。
+semantic Auto の Provider credential / endpoint はブラウザ拡張では設定しません。拡張はローカル Herdr Runtime だけを呼び出します。Runtime の Provider 設定は、単一マシン用の mode-`0600` `config.toml` と、登録済みワークステーション全体で共有する認証済み Cloudflare Worker route pool の 2 層だけです。同じ typed/chat capability にローカル route があればローカルを優先します。任意名の `[semantic.route.<name>]` は `transport`、`base_url`、`model`、`api_key` をすべて明示し、shell/process environment は Provider 設定には使いません。通常の Auto は typed evaluation route（Jev）-> chat route（LLM）-> bounded script fallback の固定順序で動き、Jev と LLM は同じ rotation、deadline、cooldown、bounded failover を共有します。semantic provider がなくても script fallback が基本 Auto を維持し、Work Memory/TODO evidence と deterministic safety guard は引き続き authoritative です。
 
 z.ai / DeepSeek の JSON → MCP 連携は実験的で、既定では無効です。Herdr の実験的設定で明示的に有効にしてください。
 

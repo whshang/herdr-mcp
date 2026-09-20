@@ -260,7 +260,7 @@ fn project_snapshot(
     );
     output.insert(
         "semantic_judgment".to_owned(),
-        crate::semantic::SemanticService::from_env().capability_json(),
+        crate::semantic::SemanticService::from_config().capability_json(),
     );
     if source == SnapshotSource::Lists {
         output.insert(

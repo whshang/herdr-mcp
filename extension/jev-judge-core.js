@@ -1,8 +1,6 @@
 // Jev semantic gate — pure request/response helpers.
-// Provider transport lives in background.js. Users configure only endpoint/model/key.
+// Provider/model selection lives in the Herdr Runtime semantic provider pool.
 
-export const DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai/v1";
-export const DEFAULT_JEV_MODEL = "jev-latest";
 export const DEFAULT_JEV_THRESHOLD = 0.70;
 
 export function normalizeJevJudgeThreshold(value) {
@@ -11,37 +9,18 @@ export function normalizeJevJudgeThreshold(value) {
   return n;
 }
 
-export function isJevJudgeConfigured(cfg) {
-  return Boolean(String(cfg?.jevJudgeBaseUrl || "").trim())
-    && Boolean(String(cfg?.jevJudgeApiKey || "").trim())
-    && Boolean(String(cfg?.jevJudgeModel || "").trim());
-}
-
-export function jevSystemOneUrl(rawBaseUrl) {
-  const raw = String(rawBaseUrl || "").trim();
-  if (!raw) return "";
-  const parsed = new URL(raw);
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid_url");
-  const path = parsed.pathname.replace(/\/+$/, "");
-  parsed.pathname = /\/systemone$/i.test(path) ? path : `${path}/systemone`;
-  parsed.search = "";
-  parsed.hash = "";
-  return parsed.toString();
-}
-
 function boundedText(value, maxChars) {
   const text = String(value || "").trim();
   if (text.length <= maxChars) return text;
   return text.slice(-maxChars);
 }
 
-export function buildJevPendingWorkRequest(userText, assistantText, model = DEFAULT_JEV_MODEL) {
+export function buildJevPendingWorkRequest(userText, assistantText) {
   return {
     state: {
       user_request: boundedText(userText, 6000),
       assistant_latest_response: boundedText(assistantText, 12000),
     },
-    model: String(model || DEFAULT_JEV_MODEL).trim() || DEFAULT_JEV_MODEL,
     questions: {
       has_unfinished_work: {
         type: "noul",
@@ -70,7 +49,7 @@ export function buildJevGoalSemanticRequest({
   openTodos = [],
   boundary = "",
   runtimeSummary = "",
-} = {}, model = DEFAULT_JEV_MODEL) {
+} = {}) {
   return {
     state: {
       objective: boundedText(objective, 4000),
@@ -82,27 +61,46 @@ export function buildJevGoalSemanticRequest({
       boundary: boundedText(boundary, 80),
       runtime_summary: boundedText(runtimeSummary, 1200),
     },
-    model: String(model || DEFAULT_JEV_MODEL).trim() || DEFAULT_JEV_MODEL,
     questions: {
       can_continue: {
         type: "noul",
         instructions: "Can the assistant autonomously continue useful work toward the current objective right now without a new human decision or unavailable external event?",
+        criteria: {
+          true: "Useful work can continue safely now using available tools, evidence, and already-granted authority.",
+          false: "Safe progress requires a human decision, unavailable external event, or information the assistant does not currently have.",
+        },
       },
       needs_human: {
         type: "noul",
         instructions: "Does the next safe step require a human decision, approval, subjective preference, credential, payment, publication, deletion, or other human-owned action?",
+        criteria: {
+          true: "A human-owned decision, approval, credential, payment, publication, deletion, or subjective choice is required before safe progress.",
+          false: "No new human-owned decision or action is required for the assistant's next safe step.",
+        },
       },
       waiting_external: {
         type: "noul",
         instructions: "Is progress currently blocked waiting for an external system, running agent, CI/job, provider, or other event that the assistant should not replace with another Continue message?",
+        criteria: {
+          true: "Progress is blocked on an external system, running job/agent, provider response, or other event that has not completed yet.",
+          false: "No unresolved external event currently blocks useful progress.",
+        },
       },
       task_completed: {
         type: "noul",
         instructions: "Does the latest state appear to have completed the requested objective with no concrete work remaining? This is only a semantic hint, not evidence that TODOs are actually closed.",
+        criteria: {
+          true: "The requested objective appears complete and the latest state identifies no concrete remaining work.",
+          false: "Concrete requested work remains, or completion cannot yet be established from the supplied state.",
+        },
       },
       needs_handoff: {
         type: "noul",
         instructions: "Does the latest state indicate that continuing the same objective requires handing off to a fresh conversation because of context pressure or an explicit planned continuity transfer?",
+        criteria: {
+          true: "Continuing the same objective requires a fresh conversation because of context pressure or an explicit continuity transfer.",
+          false: "The objective can continue in the current conversation without a continuity handoff.",
+        },
       },
     },
   };

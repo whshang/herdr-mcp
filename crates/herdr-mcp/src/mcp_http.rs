@@ -593,6 +593,18 @@ fn candidate_router(state: AppState) -> Router {
             post(post_extension_browser_actuation),
         )
         .route(
+            "/extension/semantic/status",
+            get(get_extension_semantic_status),
+        )
+        .route(
+            "/extension/semantic/evaluate",
+            post(post_extension_semantic_evaluate),
+        )
+        .route(
+            "/extension/semantic/chat",
+            post(post_extension_semantic_chat),
+        )
+        .route(
             "/extension/continuity/turn",
             post(post_extension_continuity_turn),
         )
@@ -602,6 +614,65 @@ fn candidate_router(state: AppState) -> Router {
         )
         .route("/health", get(health))
         .with_state(state)
+}
+
+async fn get_extension_semantic_status(State(state): State<AppState>) -> Response {
+    if !state.trusted_extension_ipc {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"ok": false, "code": "trusted_extension_ipc_required"}),
+        );
+    }
+    match tokio::task::spawn_blocking(crate::semantic::extension_status_json).await {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(_) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"ok": false, "code": "semantic_task_failed"}),
+        ),
+    }
+}
+
+async fn post_extension_semantic_evaluate(State(state): State<AppState>, body: Bytes) -> Response {
+    extension_semantic_call(state, body, crate::semantic::extension_evaluate_json).await
+}
+
+async fn post_extension_semantic_chat(State(state): State<AppState>, body: Bytes) -> Response {
+    extension_semantic_call(state, body, crate::semantic::extension_chat_json).await
+}
+
+async fn extension_semantic_call(
+    state: AppState,
+    body: Bytes,
+    operation: fn(&Value) -> Value,
+) -> Response {
+    if !state.trusted_extension_ipc {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"ok": false, "code": "trusted_extension_ipc_required"}),
+        );
+    }
+    if body.len() > 96 * 1024 {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!({"ok": false, "code": "semantic_request_too_large"}),
+        );
+    }
+    let payload = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(object)) => Value::Object(object),
+        _ => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "code": "invalid_request"}),
+            );
+        }
+    };
+    match tokio::task::spawn_blocking(move || operation(&payload)).await {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(_) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"ok": false, "code": "semantic_task_failed"}),
+        ),
+    }
 }
 
 async fn post_extension_browser_registry(State(state): State<AppState>, body: Bytes) -> Response {

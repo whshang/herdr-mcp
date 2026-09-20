@@ -43,4 +43,10 @@ export interface Env {
   LINK_STALE_AFTER_MS?: string;
   /** Default workstation target when a request does not carry an explicit id. */
   DEFAULT_WORKSTATION_ID?: string;
+  /**
+   * Optional worker-wide semantic route pool as one JSON secret. Every route
+   * explicitly carries transport, base_url, model and api_key. Credentials
+   * stay at Edge and are never returned to enrolled workstations.
+   */
+  HERDR_SEMANTIC_ROUTES?: string;
 }
