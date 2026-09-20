@@ -3142,7 +3142,7 @@ async function findBrowserSessionTargetByCanonicalIdentity(provider, canonicalUr
   try {
     const candidates = await chrome.tabs.query({ url: activeH2WTabUrls() });
     for (const tab of candidates) {
-      if (!tab?.id || tab.status !== "complete") continue;
+      if (!tab?.id) continue;
       const live = browserConversationInfo(provider, tab.url || "");
       // ChatGPT Project URLs can carry a cosmetic slug. Compare the normalized
       // conversation key, not the raw URL, so `/g/g-p-<id>/c/<id>` and

@@ -99,6 +99,79 @@ class ClaudeAdapter extends BaseAdapter {
     return out;
   }
 
+  getTranscriptMessageRef(element, role) {
+    if (!element || (role !== "user" && role !== "assistant")) return null;
+    const sessionId = this.getSessionIdentity();
+    if (!sessionId) return null;
+    const row = element.closest?.('[data-testid="transcript-row"]') || null;
+    const article = element.closest?.('[role="article"]') || null;
+    if (!row || !article) return null;
+
+    const rowIndexRaw = String(row.getAttribute?.("data-index") || "");
+    const rsIndexRaw = String(row.getAttribute?.("data-rs-index") || "");
+    const perfRole = String(row.getAttribute?.("data-perf-row") || "");
+    const articlePosRaw = String(article.getAttribute?.("aria-posinset") || "");
+    const expectedPerfRole = role === "user" ? "human" : "assistant";
+    if (!/^(0|[1-9]\d*)$/.test(rowIndexRaw)
+        || rowIndexRaw !== rsIndexRaw
+        || perfRole !== expectedPerfRole
+        || !/^[1-9]\d*$/.test(articlePosRaw)) {
+      return null;
+    }
+    const rowIndex = Number(rowIndexRaw);
+    const articlePos = Number(articlePosRaw);
+    if (!Number.isSafeInteger(rowIndex)
+        || !Number.isSafeInteger(articlePos)
+        || articlePos !== rowIndex + 1) {
+      return null;
+    }
+    return `claude-dom-v1:${sessionId}:${role}:${rowIndex}`;
+  }
+
+  getResultSettlementSnapshot(acceptedUserMessageRef) {
+    const sessionId = this.getSessionIdentity();
+    if (!sessionId || typeof acceptedUserMessageRef !== "string") return null;
+    const match = acceptedUserMessageRef.match(
+      /^claude-dom-v1:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):user:(0|[1-9]\d*)$/i,
+    );
+    if (!match || match[1].toLowerCase() !== sessionId) return null;
+    const userIndex = Number(match[2]);
+    if (!Number.isSafeInteger(userIndex)) return null;
+    const rows = [...document.querySelectorAll('[data-testid="transcript-row"]')];
+    const userRow = rows.find((row) => String(row.getAttribute?.("data-index") || "") === String(userIndex));
+    const assistantRow = rows.find((row) => (
+      String(row.getAttribute?.("data-index") || "") === String(userIndex + 1)
+    ));
+    if (!userRow || !assistantRow) return null;
+    const userElement = userRow.querySelector?.(
+      '[data-testid="user-message"], [data-testid="human-message"], .font-user-message',
+    ) || null;
+    const assistantElement = assistantRow.querySelector?.(
+      '[data-testid="assistant-message"], .font-claude-response, .font-claude-message',
+    ) || null;
+    if (!userElement || !assistantElement
+        || !this.elementVisible(userElement)
+        || !this.elementVisible(assistantElement)) {
+      return null;
+    }
+    const userMessageRef = this.getTranscriptMessageRef(userElement, "user");
+    const assistantMessageRef = this.getTranscriptMessageRef(assistantElement, "assistant");
+    if (userMessageRef !== acceptedUserMessageRef || !assistantMessageRef) return null;
+    if (assistantRow.getAttribute?.("data-perf-row-streaming") === "true") return null;
+    const assistantText = String(
+      assistantElement.innerText || assistantElement.textContent || "",
+    ).replace(/\s+/g, " ").trim();
+    if (!assistantText) return null;
+    return {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: assistantMessageRef,
+      userMessageId: userMessageRef,
+      text: assistantText,
+    };
+  }
+
   getMessageSnapshot(role) {
     const selectors = role === "user"
       ? ['[data-testid="user-message"]', '[data-testid="human-message"]', '.font-user-message']
@@ -117,10 +190,12 @@ class ClaudeAdapter extends BaseAdapter {
     }
     const element = nodes.at(-1) || null;
     if (!element) return { messageId: null, text: "", count: 0 };
+    const messageId = element.getAttribute?.("data-message-id")
+      || element.getAttribute?.("data-message-uuid")
+      || this.getTranscriptMessageRef(element, role)
+      || null;
     return {
-      messageId: element.getAttribute?.("data-message-id")
-        || element.getAttribute?.("data-message-uuid")
-        || null,
+      messageId,
       text: String(element.innerText || element.textContent || "").replace(/\s+/g, " ").trim(),
       count: nodes.length,
     };

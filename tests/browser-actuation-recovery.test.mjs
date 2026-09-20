@@ -1844,6 +1844,14 @@ test("user recovers a Claude dispatch target | Given one canonical Claude tab af
   assert.equal(recovered.target?.provider, "claude");
   assert.equal(recovered.target?.convKey, canonical);
 
+  const loading = claudeCanonicalIdentityRecoveryHarness([
+    { id: 73, url: canonical, status: "loading", scope },
+  ]);
+  const recoveredLoading = await loading.find("claude", canonical, 17);
+  assert.equal(recoveredLoading.ambiguous, false);
+  assert.equal(recoveredLoading.target?.tabId, 73);
+  assert.equal(recoveredLoading.target?.convKey, canonical);
+
   const duplicate = claudeCanonicalIdentityRecoveryHarness([
     { id: 71, url: canonical, scope },
     { id: 72, url: canonical, scope },
