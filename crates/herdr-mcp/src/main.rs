@@ -83,8 +83,9 @@ mod updater_store;
 mod windows_service_manager;
 mod workstation_profile;
 // The stable PATH link is a Unix ownership primitive shared by launchd and
-// systemd-user installations.
-#[cfg(any(unix, test))]
+// systemd-user installations; on Windows it is a stable `%USERPROFILE%` user
+// entry plus current-user PATH registration owned by the same module.
+#[cfg(any(unix, windows, test))]
 mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
