@@ -14,6 +14,8 @@ use url::Url;
 pub const DEFAULT_DECISION_THRESHOLD: f64 = 0.70;
 pub const EDGE_SEMANTIC_PROVIDER_ID: &str = "edge-semantic";
 
+/// Vercel AI Gateway requires this protocol version header before evaluating the request.
+const VERCEL_GATEWAY_PROTOCOL_VERSION: &str = "0.0.1";
 /// Measured decision-route latency is 1.1-1.4s median with a ~2.6s tail, so a single
 /// attempt is given 4s. The pool keeps a separate 10s budget so one slow route cannot
 /// spend the failover allowance of the routes behind it.
@@ -967,6 +969,10 @@ impl SemanticProvider for HttpSemanticProvider {
             }
             SemanticProtocol::DecisionVercel => {
                 builder = builder
+                    .header(
+                        "ai-gateway-protocol-version",
+                        VERCEL_GATEWAY_PROTOCOL_VERSION,
+                    )
                     .header("ai-evaluation-model-specification-version", "4")
                     .header("ai-model-id", &self.model);
                 json!({
