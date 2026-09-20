@@ -117,15 +117,6 @@ const initialLocaleReadGate = new Promise((resolve) => { releaseInitialLocaleRea
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
   const url = String(input || "");
-  if (url === "https://llm.test/v1/chat/completions" && llmHandoffResponder) {
-    const body = JSON.parse(init?.body || "{}");
-    llmHandoffRequests.push(body);
-    const content = llmHandoffResponder(body);
-    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  }
   if (url.startsWith("chrome-extension://test-ext/")) {
     const rel = url.slice("chrome-extension://test-ext/".length);
     return new Response(readFileSync(path.join(EXT, rel), "utf8"), {
@@ -346,6 +337,61 @@ globalThis.chrome = {
             target: body.target,
             op_id: body.action === "agent_prompt" ? "op:prompt:test" : null,
           }),
+        });
+        return;
+      }
+      if (message.path === "/extension/semantic/status") {
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            available: Boolean(llmHandoffResponder),
+            evaluate_available: false,
+            chat_available: Boolean(llmHandoffResponder),
+            providers: [],
+            chat_providers: llmHandoffResponder ? ["test-runtime-chat"] : [],
+            policy: "advisory_only",
+            fallback: "existing_behavior",
+          }),
+        });
+        return;
+      }
+      if (message.path === "/extension/semantic/chat") {
+        const body = JSON.parse(message.body || "{}");
+        llmHandoffRequests.push(body);
+        if (!llmHandoffResponder) {
+          callback({
+            ok: true,
+            transport: "ipc",
+            status: 503,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, code: "not_configured" }),
+          });
+          return;
+        }
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            ok: true,
+            provider: "test-runtime-chat",
+            model: "handoff-test",
+            content: llmHandoffResponder(body),
+          }),
+        });
+        return;
+      }
+      if (message.path === "/extension/semantic/evaluate") {
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 503,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: false, code: "not_configured" }),
         });
         return;
       }
@@ -2306,8 +2352,8 @@ console.log("\n[project handoff]");
       "<<<END_HERDR_HANDOFF_V1>>>",
     ].join("\n");
   };
-  let resolveFallbackConfig;
-  const fallbackConfigP = new Promise((r) => { resolveFallbackConfig = r; });
+  let resolveLegacyProviderConfig;
+  const legacyProviderConfigP = new Promise((r) => { resolveLegacyProviderConfig = r; });
   onMsg({
     type: "h2w_set_config",
     config: {
@@ -2315,8 +2361,20 @@ console.log("\n[project handoff]");
       llmJudgeApiKey: "test-key",
       llmJudgeModel: "handoff-test",
     },
-  }, {}, (r) => resolveFallbackConfig(r));
-  await fallbackConfigP;
+  }, {}, (r) => resolveLegacyProviderConfig(r));
+  const legacyProviderConfig = await legacyProviderConfigP;
+  let resolveLiveConfig;
+  const liveConfigP = new Promise((r) => { resolveLiveConfig = r; });
+  onMsg({ type: "h2w_get_config" }, {}, (r) => resolveLiveConfig(r));
+  const liveConfig = await liveConfigP;
+  ok(legacyProviderConfig?.ok === true
+      && storage.llmJudgeBaseUrl === undefined
+      && storage.llmJudgeApiKey === undefined
+      && storage.llmJudgeModel === undefined
+      && liveConfig?.llmJudgeBaseUrl === undefined
+      && liveConfig?.llmJudgeApiKey === undefined
+      && liveConfig?.llmJudgeModel === undefined,
+    "legacy extension provider settings are discarded instead of persisting credentials");
   mockContinuityPersistenceEnabled = true;
   mockContinuityChains.add(continuityId);
 
@@ -3094,16 +3152,10 @@ console.log("\n[project hard-limit handoff LLM fallback]");
   projectNavigationReadyAfter = 0;
   projectNavigationPollCount = 0;
   llmHandoffRequests.length = 0;
+  llmHandoffResponder = null;
 
-  let resolveConfig;
-  const configP = new Promise((r) => { resolveConfig = r; });
-  onMsg({ type: "h2w_set_config", config: {
-    llmJudgeBaseUrl: "https://llm.test/v1",
-    llmJudgeApiKey: "test-key",
-    llmJudgeModel: "handoff-test",
-  } }, {}, (r) => resolveConfig(r));
-  const configured = await configP;
-  ok(configured?.ok === true, "fallback LLM can be configured through the existing Options config path");
+  ok(llmHandoffResponder === null,
+    "browser fallback LLM starts unavailable until Runtime semantic capability is enabled");
 
   let primaryPromptCount = 0;
   const fallbackTabId = 470;
@@ -3173,20 +3225,12 @@ console.log("\n[project hard-limit handoff LLM fallback]");
   ok(primaryPromptCount === 0,
     "hard-limit detection does not send an impossible web-model summary prompt");
   ok(llmHandoffRequests.length === 0,
-    "hard-limit ChatGPT handoff does not invoke the configured fallback LLM");
+    "hard-limit ChatGPT handoff does not invoke the Runtime fallback LLM");
   ok(storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE
       && storage.herdrWakeBindings[sourceKey]?.continuity_id === continuityId,
     "failed hard-limit handoff preserves the source binding", JSON.stringify(storage.herdrWakeBindings[sourceKey]));
 
   llmHandoffResponder = null;
-  let resolveClearConfig;
-  const clearConfigP = new Promise((r) => { resolveClearConfig = r; });
-  onMsg({ type: "h2w_set_config", config: {
-    llmJudgeBaseUrl: "",
-    llmJudgeApiKey: "",
-    llmJudgeModel: "",
-  } }, {}, (r) => resolveClearConfig(r));
-  await clearConfigP;
 }
 
 console.log("\n[page-assist injection idempotency]");

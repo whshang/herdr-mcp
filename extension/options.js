@@ -1,19 +1,12 @@
 // options.js — settings + locale
 import { detectOrLoadLocale, setLocale, getLocale, t, onLocaleReady } from "./i18n.js";
-import {
-  validateApiBaseUrl,
-} from "./binding-core.js";
-import {
-  DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL,
-} from "./jev-judge-core.js";
 import { nativeHostFailure } from "./native-host-diagnostics.js";
 
 const $ = (id) => document.getElementById(id);
 const KEYS = [
   "herdrMcpUrl", "wakeTemplate", "progressTickSec", "progressFallbackSec",
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
-  "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
-  "jevJudgeBaseUrl", "jevJudgeApiKey", "jevJudgeModel",
+  "idleNudgeEnabled",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled",
   "pageAssistOrigins",
 ];
@@ -38,12 +31,6 @@ function configuredHostPermissionOrigins(config) {
   if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
   if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
   if (config.experimentalGrokEnabled === true) origins.push("https://grok.com/*");
-  const llmOrigin = hostPermissionPatternForUrl(config.llmJudgeBaseUrl);
-  if (llmOrigin) origins.push(llmOrigin);
-  if (String(config.jevJudgeApiKey || "").trim()) {
-    const jevOrigin = hostPermissionPatternForUrl(config.jevJudgeBaseUrl);
-    if (jevOrigin) origins.push(jevOrigin);
-  }
   for (const origin of config.pageAssistOrigins || []) {
     const pattern = hostPermissionPatternForUrl(origin);
     if (pattern) origins.push(pattern);
@@ -68,17 +55,6 @@ function runtimeMessage(message) {
       resolve({ resp, error: chrome.runtime.lastError?.message || "" });
     });
   });
-}
-
-function validateProviderBaseUrl(rawUrl) {
-  const checked = validateApiBaseUrl(rawUrl);
-  if (checked.ok) return checked;
-  if (checked.reason === "duplicate_path_slash" && checked.suggestion) {
-    setStatus(`${t("save_failed")}: ${t("api_base_url_duplicate_slash", { suggestion: checked.suggestion })}`, "err");
-  } else {
-    setStatus(`${t("save_failed")}: ${t("host_permission_invalid_url")}`, "err");
-  }
-  return checked;
 }
 
 /** Seconds: empty/invalid → fallback; <=0 → 0 (off); cap 86400. */
@@ -113,22 +89,6 @@ function applyI18n() {
   $("hint_fallback").textContent = t("hint_fallback");
   $("lab_progress").textContent = t("label_progress_template");
   $("hint_progress").textContent = t("hint_progress_template");
-  $("title_llm").textContent = t("label_llm_section");
-  $("hint_llm_sec").textContent = t("hint_llm_section");
-  $("lab_llm_url").textContent = t("label_llm_url");
-  $("hint_llm_url").textContent = t("hint_llm_url");
-  $("lab_llm_key").textContent = t("label_llm_key");
-  $("hint_llm_key").textContent = t("hint_llm_key");
-  $("lab_llm_model").textContent = t("label_llm_model");
-  $("title_jev").textContent = t("label_jev_section");
-  $("hint_jev_sec").textContent = t("hint_jev_section");
-  $("llm_advanced_summary").textContent = t("llm_advanced_summary");
-  $("jev_advanced_summary").textContent = t("jev_advanced_summary");
-  $("lab_jev_url").textContent = t("label_jev_url");
-  $("hint_jev_url").textContent = t("hint_jev_url");
-  $("lab_jev_key").textContent = t("label_jev_key");
-  $("hint_jev_key").textContent = t("hint_jev_key");
-  $("lab_jev_model").textContent = t("label_jev_model");
   $("lab_automation_mode").textContent = t("label_automation_mode");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
   $("title_experimental").textContent = t("label_experimental_section");
@@ -146,14 +106,8 @@ function applyI18n() {
   $("hint_page_assist").textContent = t("options_page_assist_hint");
   $("lab_page_assist_origins").textContent = t("label_page_assist_origins");
   $("hint_page_assist_origins").textContent = t("hint_page_assist_origins");
-  $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
-  $("llmJudgeModel").placeholder = t("placeholder_llm_model");
-  $("jevJudgeApiKey").placeholder = t("placeholder_jev_key");
-  $("jevJudgeModel").placeholder = DEFAULT_JEV_MODEL;
   $("save").textContent = t("save");
   $("test").textContent = t("test");
-  $("testLlm").textContent = t("test_llm");
-  $("testJev").textContent = t("test_jev");
   $("uiLocale").value = getLocale();
   document.documentElement.classList.remove("i18n-pending");
 }
@@ -173,12 +127,6 @@ async function loadForm() {
   $("manualContinueMessage").value = (cfg.manualContinueMessage && String(cfg.manualContinueMessage).trim())
     ? cfg.manualContinueMessage
     : t("manual_continue_message");
-  $("llmJudgeBaseUrl").value = cfg.llmJudgeBaseUrl || "";
-  $("llmJudgeApiKey").value = cfg.llmJudgeApiKey || "";
-  $("llmJudgeModel").value = cfg.llmJudgeModel || "";
-  $("jevJudgeBaseUrl").value = cfg.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL;
-  $("jevJudgeApiKey").value = cfg.jevJudgeApiKey || "";
-  $("jevJudgeModel").value = cfg.jevJudgeModel || DEFAULT_JEV_MODEL;
   $("automationMode").checked = cfg.automationMode === "project_auto"
     || (cfg.automationMode == null && cfg.enabled === true);
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
@@ -235,21 +183,6 @@ $("save").addEventListener("click", async () => {
       return;
     }
   }
-  const llmBase = $("llmJudgeBaseUrl").value.trim();
-  const llmKey = $("llmJudgeApiKey").value.trim();
-  const llmModel = $("llmJudgeModel").value.trim();
-  if (llmKey) {
-    if (!llmBase || !llmModel) {
-      setStatus(`${t("save_failed")}: ${t("llm_need_config")}`, "err");
-      return;
-    }
-    if (!validateProviderBaseUrl(llmBase).ok) return;
-  }
-  const jevBase = $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL;
-  const jevKey = $("jevJudgeApiKey").value.trim();
-  const jevModel = $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL;
-  if (jevKey && !validateProviderBaseUrl(jevBase).ok) return;
-
   const config = {
     herdrMcpUrl: $("url").value.trim(),
     wakeTemplate: $("template").value,
@@ -258,12 +191,6 @@ $("save").addEventListener("click", async () => {
     progressTemplate: $("progressTemplate").value,
     manualContinueMessage: $("manualContinueMessage").value.trim() || t("manual_continue_message"),
     automationMode: $("automationMode").checked ? "project_auto" : "manual",
-    llmJudgeBaseUrl: llmBase,
-    llmJudgeApiKey: llmKey,
-    llmJudgeModel: llmModel,
-    jevJudgeBaseUrl: jevBase,
-    jevJudgeApiKey: jevKey,
-    jevJudgeModel: jevModel,
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
@@ -330,128 +257,6 @@ $("test").addEventListener("click", () => {
       : (localError || `HTTP ${resp?.status || "?"}`);
     setConnectionFailure(`✖ ${t("unreachable_detail", { msg: detail })}`);
   });
-});
-
-$("testLlm").addEventListener("click", async () => {
-  const base = $("llmJudgeBaseUrl").value.trim();
-  const key = $("llmJudgeApiKey").value.trim();
-  const model = $("llmJudgeModel").value.trim();
-  if (!base || !key || !model) {
-    setStatus(t("llm_need_config"), "err");
-    return;
-  }
-  if (!validateProviderBaseUrl(base).ok) return;
-  let origin;
-  try {
-    origin = hostPermissionPatternForUrl(base);
-  } catch (_) {
-    setStatus(`✖ ${t("host_permission_invalid_url")}`, "err");
-    return;
-  }
-  let granted = false;
-  try { granted = await requestHostPermissions([origin]); } catch (_) { granted = false; }
-  if (!granted) {
-    setStatus(`✖ ${t("host_permission_denied")}`, "err");
-    return;
-  }
-  const ephemeralOrigins = loadedHostPermissionOrigins.includes(origin) ? [] : [origin];
-  const btn = $("testLlm");
-  btn.disabled = true;
-  setStatus(t("testing"), "");
-  const { resp, error } = await runtimeMessage({
-    type: "h2w_test_llm",
-    config: {
-      llmJudgeBaseUrl: base,
-      llmJudgeApiKey: key,
-      llmJudgeModel: model,
-    },
-  });
-  btn.disabled = false;
-  if (ephemeralOrigins.length) await removeHostPermissions(ephemeralOrigins);
-  if (error) {
-    setStatus(`✖ ${error}`, "err");
-    return;
-  }
-  if (!resp?.ok) {
-    if (resp?.reason === "timeout") setStatus(`✖ ${t("llm_timeout")}`, "err");
-    else if (resp?.reason === "permission") setStatus(`✖ ${t("host_permission_denied")}`, "err");
-    else if (resp?.reason === "http") {
-      setStatus(`✖ ${t("llm_test_http_error", {
-        status: resp.status || "?",
-        detail: resp.error ? `: ${resp.error}` : "",
-      })}`, "err");
-    } else {
-      setStatus(`✖ ${t("llm_test_failed", { error: resp?.error || resp?.reason || "?" })}`, "err");
-    }
-    return;
-  }
-  const send = resp.cont ? t("llm_test_send", { send: JSON.stringify(resp.nudgeText) }) : "";
-  setStatus(`✓ ${t("llm_test_result", {
-    raw: JSON.stringify(resp.content),
-    done: t(resp.done ? "boolean_yes" : "boolean_no"),
-    cont: t(resp.cont ? "boolean_yes" : "boolean_no"),
-    send,
-  })}`, "ok");
-});
-
-$("testJev").addEventListener("click", async () => {
-  const base = $("jevJudgeBaseUrl").value.trim() || DEFAULT_JEV_BASE_URL;
-  const key = $("jevJudgeApiKey").value.trim();
-  const model = $("jevJudgeModel").value.trim() || DEFAULT_JEV_MODEL;
-  if (!base || !key || !model) {
-    setStatus(t("jev_need_config"), "err");
-    return;
-  }
-  if (!validateProviderBaseUrl(base).ok) return;
-  let origin;
-  try {
-    origin = hostPermissionPatternForUrl(base);
-  } catch (_) {
-    setStatus("✖ " + t("host_permission_invalid_url"), "err");
-    return;
-  }
-  let granted = false;
-  try { granted = await requestHostPermissions([origin]); } catch (_) { granted = false; }
-  if (!granted) {
-    setStatus("✖ " + t("host_permission_denied"), "err");
-    return;
-  }
-  const ephemeralOrigins = loadedHostPermissionOrigins.includes(origin) ? [] : [origin];
-  const btn = $("testJev");
-  btn.disabled = true;
-  setStatus(t("testing"), "");
-  const { resp, error } = await runtimeMessage({
-    type: "h2w_test_jev",
-    config: {
-      jevJudgeBaseUrl: base,
-      jevJudgeApiKey: key,
-      jevJudgeModel: model,
-    },
-  });
-  btn.disabled = false;
-  if (ephemeralOrigins.length) await removeHostPermissions(ephemeralOrigins);
-  if (error) {
-    setStatus("✖ " + error, "err");
-    return;
-  }
-  if (!resp?.ok) {
-    if (resp?.reason === "timeout") setStatus("✖ " + t("jev_timeout"), "err");
-    else if (resp?.reason === "permission") setStatus("✖ " + t("host_permission_denied"), "err");
-    else if (resp?.reason === "http") {
-      setStatus("✖ " + t("jev_test_http_error", {
-        status: resp.status || "?",
-        detail: resp.error ? ": " + resp.error : "",
-      }), "err");
-    } else {
-      setStatus("✖ " + t("jev_test_failed", { error: resp?.error || resp?.reason || "?" }), "err");
-    }
-    return;
-  }
-  setStatus("✓ " + t("jev_test_result", {
-    probability: Number(resp.probability).toFixed(3),
-    signal: t("jev_signal_" + (resp.signal || "unknown")),
-    threshold: Number(resp.threshold).toFixed(2),
-  }), "ok");
 });
 
 onLocaleReady(async () => {

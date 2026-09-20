@@ -92,6 +92,8 @@ mod worker;
 mod worker_bootstrap;
 mod workstation;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{any::Any, panic, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -212,10 +214,13 @@ fn run() -> Result<ExitCode, String> {
                 cli::ConfigCommand::Show => {
                     let config =
                         config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-                    print!("{}", config.render());
+                    print!("{}", config.render_redacted());
                 }
                 cli::ConfigCommand::Init { edge_origin } => {
-                    if paths.config_file.exists() {
+                    let legacy_config = paths.config_file.with_file_name("config.toml");
+                    if paths.config_file.exists() || legacy_config.exists() {
+                        let _ =
+                            config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
                         return Err(format!(
                             "config already exists: {}",
                             paths.config_file.display()
@@ -238,6 +243,17 @@ fn run() -> Result<ExitCode, String> {
                             paths.config_file.display()
                         )
                     })?;
+                    #[cfg(unix)]
+                    std::fs::set_permissions(
+                        &paths.config_file,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "cannot secure config {}: {error}",
+                            paths.config_file.display()
+                        )
+                    })?;
                     println!("created {}", paths.config_file.display());
                 }
                 cli::ConfigCommand::SetEdgeOrigin { edge_origin } => {
@@ -253,6 +269,17 @@ fn run() -> Result<ExitCode, String> {
                     std::fs::write(&paths.config_file, config.render()).map_err(|error| {
                         format!(
                             "cannot write config {}: {error}",
+                            paths.config_file.display()
+                        )
+                    })?;
+                    #[cfg(unix)]
+                    std::fs::set_permissions(
+                        &paths.config_file,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "cannot secure config {}: {error}",
                             paths.config_file.display()
                         )
                     })?;

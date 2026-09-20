@@ -22,7 +22,7 @@ impl RuntimePaths {
                     .map(|path| PathBuf::from(path).join(instance.config_leaf()))
             })
             .unwrap_or_else(|| home.join(".config").join(instance.config_leaf()));
-        let config_file = config_dir.join("config.toml");
+        let config_file = config_dir.join("config.json");
         let dev_state_dir = env::var_os("HERDR_MCP_DEV_STATE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config").join("herdr-mcp-dev"));

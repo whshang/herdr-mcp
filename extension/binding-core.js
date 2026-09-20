@@ -535,62 +535,6 @@ function llmReplyMatchesDoneToken(reply) {
 }
 
 /**
- * Whether the OpenAI-compatible semantic/planning provider is configured.
- * @param {{ llmJudgeBaseUrl?: string, llmJudgeApiKey?: string, llmJudgeModel?: string }} cfg
- */
-export function isLlmJudgeConfigured(cfg) {
-  return Boolean(
-    String(cfg?.llmJudgeBaseUrl || "").trim()
-    && String(cfg?.llmJudgeApiKey || "").trim()
-    && String(cfg?.llmJudgeModel || "").trim(),
-  );
-}
-
-/**
- * Strict provider Base URL validation for settings-time feedback.
- * Never silently rewrites malformed input; suggestion is display-only.
- */
-export function validateApiBaseUrl(rawUrl) {
-  const raw = String(rawUrl || "").trim();
-  if (!raw) return { ok: false, reason: "empty", suggestion: "" };
-  let url;
-  try {
-    url = new URL(raw);
-  } catch (_) {
-    return { ok: false, reason: "invalid_url", suggestion: "" };
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    return { ok: false, reason: "invalid_url", suggestion: "" };
-  }
-  if (!url.hostname || url.username || url.password || url.search || url.hash) {
-    return { ok: false, reason: "invalid_url", suggestion: "" };
-  }
-  if (/\/{2,}/.test(url.pathname)) {
-    const suggested = new URL(url.toString());
-    suggested.pathname = suggested.pathname.replace(/\/{2,}/g, "/");
-    return {
-      ok: false,
-      reason: "duplicate_path_slash",
-      suggestion: suggested.toString().replace(/\/$/, ""),
-    };
-  }
-  return { ok: true, value: raw.replace(/\/+$/, ""), reason: null, suggestion: "" };
-}
-
-/**
- * Build OpenAI-compatible chat/completions URL from a base like
- * https://host/v1 or https://host/v1/chat/completions
- */
-export function llmJudgeCompletionsUrl(baseUrl) {
-  const checked = validateApiBaseUrl(baseUrl);
-  if (!checked.ok) return "";
-  const b = checked.value;
-  if (/\/chat\/completions$/i.test(b)) return b;
-  if (/\/v1$/i.test(b)) return `${b}/chat/completions`;
-  return `${b}/v1/chat/completions`;
-}
-
-/**
  * Build the fixed judge protocol message.
  */
 export function buildLlmJudgeUserMessage(parts) {

@@ -12,7 +12,7 @@ import {
   decideWorkspaceWake, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId,
   reconcileWorkspaceWakeKind, reconcileWorkspaceCatalogBindings,
   pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
-  isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
+  isIdleNudgeText, looksLikeSubstantiveReply, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
   assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
   conversationInfoFromSupportedUrl,
 } from "./binding-core.js";
@@ -30,10 +30,9 @@ import {
   planTransportRecovery, resolveAuthoritativeWorkMemoryLocator, supervise,
 } from "./goal-supervisor-core.js";
 import {
-  DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_THRESHOLD,
+  DEFAULT_JEV_THRESHOLD,
   buildJevGoalSemanticRequest, buildJevPendingWorkRequest, decideJevAutoPolicy,
   interpretJevGoalSemanticAnswer, interpretJevPendingWorkAnswer,
-  isJevJudgeConfigured, jevSystemOneUrl,
 } from "./jev-judge-core.js";
 import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
@@ -420,17 +419,6 @@ let CFG = {
   progressTemplate: "",
   manualContinueMessage: "",
   idleNudgeEnabled: true,
-  // OpenAI-compatible semantic/planning provider. Ordinary Auto reaches it
-  // after Jev uncertainty/unavailability; Goal Supervisor also uses it for
-  // bounded structured decisions. Users configure endpoint/model/key only.
-  llmJudgeBaseUrl: "",
-  llmJudgeApiKey: "",
-  llmJudgeModel: "",
-  // Optional TypeSafe Jev semantic gate. Presence of a complete provider
-  // configuration enables it automatically; users do not choose policy modes.
-  jevJudgeBaseUrl: DEFAULT_JEV_BASE_URL,
-  jevJudgeApiKey: "",
-  jevJudgeModel: DEFAULT_JEV_MODEL,
   // Experimental Web AI origins stay opt-in until their compatibility/UAT gate passes.
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
@@ -496,14 +484,6 @@ async function hasHostPermission(pattern) {
   } catch (_) {
     return false;
   }
-}
-
-async function hasLlmHostPermission(cfg) {
-  return hasHostPermission(hostPermissionPatternForUrl(cfg?.llmJudgeBaseUrl));
-}
-
-async function hasJevHostPermission(cfg) {
-  return hasHostPermission(hostPermissionPatternForUrl(cfg?.jevJudgeBaseUrl));
 }
 
 async function reloadOpenTabsAfterExperimentalRegistration(site, matches) {
@@ -742,15 +722,34 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     // The four semantic-policy keys below are migration tombstones only. They
     // are read so upgrades can erase historical user policy, never to restore
     // Retired user-programmable semantic-policy controls are removed on startup.
-    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", "jevJudgeMode", "jevJudgeThreshold", "llmJudgePromptTemplate", "llmJudgeSkipKeywords", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
+    const keys = [
+      ...Object.keys(CFG),
+      "idleNudgeCooldownSec",
+      "jevJudgeMode",
+      "jevJudgeThreshold",
+      "llmJudgePromptTemplate",
+      "llmJudgeSkipKeywords",
+      "llmJudgeBaseUrl",
+      "llmJudgeApiKey",
+      "llmJudgeModel",
+      "jevJudgeBaseUrl",
+      "jevJudgeApiKey",
+      "jevJudgeModel",
+      PROJECT_AUTOMATION_STORAGE_KEY,
+      CONVERSATION_AUTOMATION_STORAGE_KEY,
+    ];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
     delete CFG.jevJudgeMode;
     delete CFG.jevJudgeThreshold;
     delete CFG.llmJudgePromptTemplate;
     delete CFG.llmJudgeSkipKeywords;
-    CFG.jevJudgeBaseUrl = String(CFG.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim() || DEFAULT_JEV_BASE_URL;
-    CFG.jevJudgeModel = String(CFG.jevJudgeModel || DEFAULT_JEV_MODEL).trim() || DEFAULT_JEV_MODEL;
+    delete CFG.llmJudgeBaseUrl;
+    delete CFG.llmJudgeApiKey;
+    delete CFG.llmJudgeModel;
+    delete CFG.jevJudgeBaseUrl;
+    delete CFG.jevJudgeApiKey;
+    delete CFG.jevJudgeModel;
     delete CFG[PROJECT_AUTOMATION_STORAGE_KEY];
     delete CFG[CONVERSATION_AUTOMATION_STORAGE_KEY];
     PROJECT_AUTOMATION = sanitizeProjectAutomation(stored[PROJECT_AUTOMATION_STORAGE_KEY]);
@@ -797,9 +796,16 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   }
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
-  // during upgrade. The semantic-policy names are retired migration tombstones:
-  // 0.1.103 also erases them so hidden legacy settings cannot survive an update.
+  // during upgrade. Semantic provider credentials are owned by Runtime/Edge;
+  // browser copies and their optional host permissions are migration tombstones.
   try {
+    const retiredProviderOrigins = [
+      hostPermissionPatternForUrl(stored.llmJudgeBaseUrl),
+      hostPermissionPatternForUrl(stored.jevJudgeBaseUrl),
+    ].filter(Boolean);
+    if (retiredProviderOrigins.length && chrome.permissions?.remove) {
+      try { await chrome.permissions.remove({ origins: [...new Set(retiredProviderOrigins)] }); } catch (_) {}
+    }
     await chrome.storage.local.remove([
       "autoAllow",
       "token",
@@ -807,6 +813,12 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       "jevJudgeThreshold",
       "llmJudgePromptTemplate",
       "llmJudgeSkipKeywords",
+      "llmJudgeBaseUrl",
+      "llmJudgeApiKey",
+      "llmJudgeModel",
+      "jevJudgeBaseUrl",
+      "jevJudgeApiKey",
+      "jevJudgeModel",
     ]);
   } catch (e) {}
   await syncExperimentalContentScripts();
@@ -4141,9 +4153,110 @@ const idleNudgeRetryTimers = new Map(); // convKey -> timeout id
 const lastTurnEndedPayload = new Map(); // convKey -> last h2w_turn_ended payload (for cooldown retry)
 
 const LLM_JUDGE_TIMEOUT_MS = 60000;
-const LLM_JUDGE_MAX_ATTEMPTS = 2;
 const MANUAL_LLM_JUDGE_TIMEOUT_MS = 15000;
 const JEV_JUDGE_TIMEOUT_MS = 15000;
+const SEMANTIC_CAPABILITY_TTL_MS = 30000;
+let semanticCapabilityCache = null;
+let semanticCapabilityCheckedAt = 0;
+
+function semanticRuntimeUrl(path) {
+  return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}${path}`;
+}
+
+function semanticFailure(payload, status = 0) {
+  const code = String(payload?.code || "provider_unavailable");
+  const httpStatus = /^http_(\d+)$/.test(code) ? Number(code.slice(5)) : Number(status) || 0;
+  return {
+    ok: false,
+    reason: code === "not_configured"
+      ? "not_configured"
+      : code === "timeout"
+        ? "timeout"
+        : code === "invalid_request"
+          ? "bad_request"
+          : httpStatus
+            ? "http"
+            : "provider_unavailable",
+    status: httpStatus || null,
+    error: code,
+  };
+}
+
+async function runtimeSemanticCapabilities({ refresh = false } = {}) {
+  const now = Date.now();
+  if (!refresh && semanticCapabilityCache && now - semanticCapabilityCheckedAt < SEMANTIC_CAPABILITY_TTL_MS) {
+    return semanticCapabilityCache;
+  }
+  try {
+    const resp = await localHerdrFetch(semanticRuntimeUrl("/extension/semantic/status"), {
+      nativeTimeoutMs: 5000,
+    });
+    if (!resp?.ok) throw new Error(`HTTP ${resp?.status || "?"}`);
+    const value = await resp.json();
+    semanticCapabilityCache = {
+      available: value?.available === true,
+      evaluate_available: value?.evaluate_available === true,
+      chat_available: value?.chat_available === true,
+      providers: Array.isArray(value?.providers) ? value.providers : [],
+      chat_providers: Array.isArray(value?.chat_providers) ? value.chat_providers : [],
+    };
+  } catch (_) {
+    semanticCapabilityCache = {
+      available: false,
+      evaluate_available: false,
+      chat_available: false,
+      providers: [],
+      chat_providers: [],
+    };
+  }
+  semanticCapabilityCheckedAt = now;
+  return semanticCapabilityCache;
+}
+
+async function runtimeSemanticEvaluate(payload, { timeoutMs = JEV_JUDGE_TIMEOUT_MS } = {}) {
+  try {
+    const resp = await localHerdrFetch(semanticRuntimeUrl("/extension/semantic/evaluate"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      nativeTimeoutMs: Math.max(3000, Math.min(Number(timeoutMs) || JEV_JUDGE_TIMEOUT_MS, 60000) + 2000),
+    });
+    const value = await resp.json().catch(() => ({}));
+    if (!resp.ok || value?.ok !== true) return semanticFailure(value, resp.status);
+    semanticCapabilityCache = {
+      ...(semanticCapabilityCache || {}),
+      available: true,
+      evaluate_available: true,
+    };
+    semanticCapabilityCheckedAt = Date.now();
+    return value;
+  } catch (error) {
+    return { ok: false, reason: "network", status: null, error: error?.message || String(error) };
+  }
+}
+
+async function runtimeSemanticChat(messages, { timeoutMs = LLM_JUDGE_TIMEOUT_MS } = {}) {
+  const boundedTimeout = Math.max(1000, Math.min(Number(timeoutMs) || LLM_JUDGE_TIMEOUT_MS, 60000));
+  try {
+    const resp = await localHerdrFetch(semanticRuntimeUrl("/extension/semantic/chat"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages, timeout_ms: boundedTimeout }),
+      nativeTimeoutMs: boundedTimeout + 2000,
+    });
+    const value = await resp.json().catch(() => ({}));
+    if (!resp.ok || value?.ok !== true) return semanticFailure(value, resp.status);
+    semanticCapabilityCache = {
+      ...(semanticCapabilityCache || {}),
+      available: true,
+      chat_available: true,
+    };
+    semanticCapabilityCheckedAt = Date.now();
+    return value;
+  } catch (error) {
+    return { ok: false, reason: "network", status: null, error: error?.message || String(error) };
+  }
+}
 
 /**
  * One-shot OpenAI-compatible chat/completions call to judge if the turn is done.
@@ -4159,76 +4272,12 @@ const JEV_JUDGE_TIMEOUT_MS = 15000;
  * @param {Array<{role:string,content:string}>} messages
  */
 async function llmJudgeChatOnce(messages, { timeoutMs = LLM_JUDGE_TIMEOUT_MS } = {}) {
-  if (!isLlmJudgeConfigured(CFG)) return { ok: false, reason: "not_configured" };
-  if (!await hasLlmHostPermission(CFG)) return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
-  const body = {
-    model: String(CFG.llmJudgeModel).trim(),
-    messages,
-    temperature: 0,
-    stream: false,
-    response_format: { type: "json_object" },
-  };
-  try {
-    const resp = await fetch(llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${String(CFG.llmJudgeApiKey).trim()}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || LLM_JUDGE_TIMEOUT_MS, 60000))),
-    });
-    if (!resp.ok) {
-      return { ok: false, reason: "http", status: resp.status, error: (await resp.text().catch(() => "")).slice(0, 200) };
-    }
-    const parsed = await resp.json();
-    const content = parsed?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || !content.trim()) return { ok: false, reason: "bad_response" };
-    return { ok: true, content };
-  } catch (e) {
-    const name = e?.name || "";
-    if (name === "TimeoutError" || name === "AbortError") return { ok: false, reason: "timeout", error: e.message };
-    return { ok: false, reason: "network", error: e.message };
-  }
+  return runtimeSemanticChat(messages, { timeoutMs });
 }
 
-async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null, timeoutMs = LLM_JUDGE_TIMEOUT_MS) {
-  const cfg = cfgOverride || CFG;
-  if (!isLlmJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
-  if (!await hasLlmHostPermission(cfg)) return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
-  const url = llmJudgeCompletionsUrl(cfg.llmJudgeBaseUrl);
+async function fetchLlmJudgeOnce(userText, assistantText, _cfgOverride = null, timeoutMs = LLM_JUDGE_TIMEOUT_MS) {
   const prompt = buildLlmJudgeUserMessage({ userText, assistantText });
-  const body = {
-    model: String(cfg.llmJudgeModel).trim(),
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0,
-    stream: false,
-  };
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${String(cfg.llmJudgeApiKey).trim()}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => "");
-      return { ok: false, reason: "http", status: resp.status, error: errText.slice(0, 200) };
-    }
-    const j = await resp.json();
-    const content = j?.choices?.[0]?.message?.content;
-    if (typeof content !== "string") return { ok: false, reason: "bad_response" };
-    return { ok: true, content };
-  } catch (e) {
-    const name = e?.name || "";
-    if (name === "TimeoutError" || name === "AbortError") {
-      return { ok: false, reason: "timeout", error: `timed out after ${timeoutMs}ms` };
-    }
-    return { ok: false, reason: "network", error: e.message };
-  }
+  return runtimeSemanticChat([{ role: "user", content: prompt }], { timeoutMs });
 }
 
 /**
@@ -4242,154 +4291,45 @@ async function fetchLlmJudge(
   userText,
   assistantText,
   cfgOverride = null,
-  { timeoutMs = LLM_JUDGE_TIMEOUT_MS, maxAttempts = LLM_JUDGE_MAX_ATTEMPTS } = {},
+  { timeoutMs = LLM_JUDGE_TIMEOUT_MS } = {},
 ) {
-  let last = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    last = await fetchLlmJudgeOnce(userText, assistantText, cfgOverride, timeoutMs);
-    if (last.ok) return last;
-    const retryable = last.reason === "timeout" || last.reason === "network";
-    if (!retryable || attempt >= maxAttempts) break;
-    callLog(`llm-judge retry ${attempt}/${maxAttempts - 1} after ${last.reason}`);
-    await new Promise((r) => setTimeout(r, 800));
-  }
-  return last;
+  return fetchLlmJudgeOnce(userText, assistantText, cfgOverride, timeoutMs);
 }
 
 async function fetchJevJudgeOnce(
   userText,
   assistantText,
-  cfgOverride = null,
+  _cfgOverride = null,
   timeoutMs = JEV_JUDGE_TIMEOUT_MS,
 ) {
-  const cfg = cfgOverride || CFG;
-  if (!isJevJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
-  if (!await hasJevHostPermission(cfg)) {
-    return { ok: false, reason: "permission", error: "Jev endpoint site access is not granted" };
-  }
-  let url;
-  try {
-    url = jevSystemOneUrl(cfg.jevJudgeBaseUrl);
-  } catch (_) {
-    return { ok: false, reason: "invalid_url" };
-  }
-  const body = buildJevPendingWorkRequest(
-    userText,
-    assistantText,
-    String(cfg.jevJudgeModel || DEFAULT_JEV_MODEL).trim(),
+  const request = buildJevPendingWorkRequest(userText, assistantText);
+  const parsed = await runtimeSemanticEvaluate(
+    { state: request.state, questions: request.questions },
+    { timeoutMs },
   );
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${String(cfg.jevJudgeApiKey || "").trim()}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || JEV_JUDGE_TIMEOUT_MS, 60000))),
-    });
-    if (!resp.ok) {
-      return {
-        ok: false,
-        reason: "http",
-        status: resp.status,
-        error: (await resp.text().catch(() => "")).slice(0, 200),
-      };
-    }
-    const parsed = await resp.json();
-    return interpretJevPendingWorkAnswer(parsed, DEFAULT_JEV_THRESHOLD);
-  } catch (error) {
-    const name = error?.name || "";
-    if (name === "TimeoutError" || name === "AbortError") {
-      return { ok: false, reason: "timeout", error: `timed out after ${timeoutMs}ms` };
-    }
-    return { ok: false, reason: "network", error: error?.message || String(error) };
-  }
+  if (!parsed.ok) return parsed;
+  return interpretJevPendingWorkAnswer(parsed, DEFAULT_JEV_THRESHOLD);
 }
 
 async function fetchJevGoalSemanticPrior(
   state,
-  cfgOverride = null,
+  _cfgOverride = null,
   timeoutMs = JEV_JUDGE_TIMEOUT_MS,
 ) {
-  const cfg = cfgOverride || CFG;
-  if (!isJevJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
-  if (!await hasJevHostPermission(cfg)) {
-    return { ok: false, reason: "permission", error: "Jev endpoint site access is not granted" };
-  }
-  let url;
-  try {
-    url = jevSystemOneUrl(cfg.jevJudgeBaseUrl);
-  } catch (_) {
-    return { ok: false, reason: "invalid_url" };
-  }
-  const body = buildJevGoalSemanticRequest(
-    state,
-    String(cfg.jevJudgeModel || DEFAULT_JEV_MODEL).trim(),
+  const request = buildJevGoalSemanticRequest(state);
+  const parsed = await runtimeSemanticEvaluate(
+    { state: request.state, questions: request.questions },
+    { timeoutMs },
   );
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${String(cfg.jevJudgeApiKey || "").trim()}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(Math.max(1000, Math.min(Number(timeoutMs) || JEV_JUDGE_TIMEOUT_MS, 60000))),
-    });
-    if (!resp.ok) {
-      return {
-        ok: false,
-        reason: "http",
-        status: resp.status,
-        error: (await resp.text().catch(() => "")).slice(0, 200),
-      };
-    }
-    return interpretJevGoalSemanticAnswer(await resp.json(), DEFAULT_JEV_THRESHOLD);
-  } catch (error) {
-    const name = error?.name || "";
-    if (name === "TimeoutError" || name === "AbortError") {
-      return { ok: false, reason: "timeout", error: `timed out after ${timeoutMs}ms` };
-    }
-    return { ok: false, reason: "network", error: error?.message || String(error) };
-  }
+  if (!parsed.ok) return parsed;
+  return interpretJevGoalSemanticAnswer(parsed, DEFAULT_JEV_THRESHOLD);
 }
 
 async function fetchLlmHandoffOnce(prompt) {
-  if (!isLlmJudgeConfigured(CFG)) return { ok: false, reason: "not_configured" };
-  if (!await hasLlmHostPermission(CFG)) {
-    return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
-  }
-  const url = llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl);
-  const body = {
-    model: String(CFG.llmJudgeModel).trim(),
-    messages: [{ role: "user", content: String(prompt || "") }],
-    temperature: 0,
-    stream: false,
-  };
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${String(CFG.llmJudgeApiKey).trim()}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(LLM_JUDGE_TIMEOUT_MS),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => "");
-      return { ok: false, reason: "http", status: resp.status, error: errText.slice(0, 200) };
-    }
-    const json = await resp.json();
-    const content = json?.choices?.[0]?.message?.content;
-    if (typeof content !== "string") return { ok: false, reason: "bad_response" };
-    return { ok: true, content };
-  } catch (error) {
-    const name = error?.name || "";
-    if (name === "TimeoutError" || name === "AbortError") return { ok: false, reason: "timeout" };
-    return { ok: false, reason: "network", error: String(error?.message || error) };
-  }
+  return runtimeSemanticChat(
+    [{ role: "user", content: String(prompt || "") }],
+    { timeoutMs: LLM_JUDGE_TIMEOUT_MS },
+  );
 }
 
 function transcriptBeforeSubmittedHandoff(transcript, transferId) {
@@ -4403,7 +4343,7 @@ function transcriptBeforeSubmittedHandoff(transcript, transferId) {
 }
 
 function scheduleHandoffSummaryFallback(transferId, delayMs = HANDOFF_PRIMARY_SUMMARY_GRACE_MS) {
-  if (!isLlmJudgeConfigured(CFG) || !transferId) return false;
+  if (!transferId) return false;
   try {
     chrome.alarms.create(`${HANDOFF_FALLBACK_ALARM_PREFIX}${transferId}`, { when: Date.now() + delayMs });
     return true;
@@ -4421,7 +4361,10 @@ async function summarizeHandoffWithFallbackLlm(transferId, { snapshot = null, re
   if (transfer.status !== "summary_requested") {
     return { ok: true, pending: handoffStatusIsActive(transfer.status), superseded: true, handoff: handoffView(transfer) };
   }
-  if (!isLlmJudgeConfigured(CFG)) return { ok: false, error: "handoff_fallback_llm_not_configured" };
+  const semanticCapabilities = await runtimeSemanticCapabilities();
+  if (!semanticCapabilities.chat_available) {
+    return { ok: false, error: "handoff_fallback_llm_not_configured" };
+  }
 
   let sourceSnapshot = snapshot;
   if (!sourceSnapshot && transfer.source_tab_id && await tabStillExists(transfer.source_tab_id)) {
@@ -4581,7 +4524,8 @@ async function retryIdleNudge(convKey) {
     scheduleIdleNudgeRetry(convKey, 5000);
     return;
   }
-  const semanticJudgeConfigured = isJevJudgeConfigured(CFG) || isLlmJudgeConfigured(CFG);
+  const semanticCapabilities = await runtimeSemanticCapabilities();
+  const semanticJudgeConfigured = semanticCapabilities.evaluate_available || semanticCapabilities.chat_available;
   if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(payload.assistantText)) {
     callLog(`llm-judge retry skip: not substantive ${convKey}`);
     return;
@@ -4935,7 +4879,8 @@ function applySupervisorOutcome(convKey, binding, result, assistantText = "") {
 async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
   if (!convKey) return { owned: false, status: "no_conv" };
   if (!automationScopeForConversation(convKey).enabled) return { owned: false, status: "disabled" };
-  if (!isLlmJudgeConfigured(CFG)) return { owned: false, status: "llm_not_configured" };
+  const semanticCapabilities = await runtimeSemanticCapabilities();
+  if (!semanticCapabilities.chat_available) return { owned: false, status: "llm_not_configured" };
 
   const bindings = await loadBindings();
   const primary = primaryBindingForConv(bindings, convKey);
@@ -4971,7 +4916,7 @@ async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
   }
 
   const authoritativeGoal = authoritative?.goal || null;
-  const semanticPrior = isJevJudgeConfigured(CFG)
+  const semanticPrior = semanticCapabilities.evaluate_available
     ? await fetchJevGoalSemanticPrior({
       objective: authoritativeGoal?.objective || userText,
       userText,
@@ -5012,7 +4957,7 @@ async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
 
   const projection = await supervisorRuntimeProjection(convKey, primary, options.runtime || {});
   const adapter = createBoundedSupervisorAdapter({
-    isConfigured: () => isLlmJudgeConfigured(CFG),
+    isConfigured: () => semanticCapabilities.chat_available,
     request: (payload) => llmJudgeChatOnce([
       { role: "system", content: payload.system },
       { role: "user", content: payload.user },
@@ -5207,7 +5152,8 @@ async function maybeIdleNudgeInner(msg) {
   if (!String(assistantText).trim()) {
     return rememberIdleNudge(convKey, { nudged: false, reason: "empty_assistant" });
   }
-  const semanticJudgeConfigured = isJevJudgeConfigured(CFG) || isLlmJudgeConfigured(CFG);
+  const semanticCapabilities = await runtimeSemanticCapabilities();
+  const semanticJudgeConfigured = semanticCapabilities.evaluate_available || semanticCapabilities.chat_available;
 
   if (b.tabId) {
     try {
@@ -5284,8 +5230,8 @@ async function maybeIdleNudgeInner(msg) {
     });
   }
 
-  const jevConfigured = isJevJudgeConfigured(CFG);
-  const llmConfigured = isLlmJudgeConfigured(CFG);
+  const jevConfigured = semanticCapabilities.evaluate_available;
+  const llmConfigured = semanticCapabilities.chat_available;
   const continueText = autoGoalContinueMessage();
 
   if (jevConfigured) {
@@ -5718,7 +5664,8 @@ async function manualHerdrStatusContinue(_tabId, convKey) {
 }
 
 async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
-  if (!isLlmJudgeConfigured(CFG)) {
+  const semanticCapabilities = await runtimeSemanticCapabilities();
+  if (!semanticCapabilities.chat_available) {
     return rememberIdleNudge(convKey, { ok: false, nudged: false, reason: "llm_not_configured", error: "llm_not_configured" });
   }
   const assistant = String(assistantText || "").trim();
@@ -6421,7 +6368,7 @@ async function acceptImmediateHandoffSummary(transfer, result) {
     return { ok: true, pending: true, handoff: handoffView(transfer) };
   }
   if (disposition.kind !== "packet") {
-    if (isLlmJudgeConfigured(CFG)) {
+    if ((await runtimeSemanticCapabilities()).chat_available) {
       const fallback = await summarizeHandoffWithFallbackLlm(transfer.id, { reason: "primary_packet_invalid" });
       if (fallback.ok) return fallback;
     }
@@ -6479,7 +6426,7 @@ async function resumeSummaryRequested(transfer) {
     scheduleHandoffSummaryFallback(transfer.id, HANDOFF_GENERATING_RECHECK_MS);
     return { ok: true, pending: true, handoff: handoffView(transfer) };
   }
-  if (snapshot?.handoffBlocked || isLlmJudgeConfigured(CFG)) {
+  if (snapshot?.handoffBlocked || (await runtimeSemanticCapabilities()).chat_available) {
     const fallback = await summarizeHandoffWithFallbackLlm(transfer.id, {
       snapshot,
       reason: snapshot?.handoffBlockReason || "manual_resume_timeout",
@@ -6777,14 +6724,14 @@ async function startHandoffForTab(tabId, trigger = "manual") {
       template: prompt,
     });
   } catch (e) {
-    if (isLlmJudgeConfigured(CFG)) {
+    if ((await runtimeSemanticCapabilities()).chat_available) {
       return failWithHandoffFallback(transferId, { snapshot: sourceSnapshot, reason: "summary_prompt_failed" });
     }
     await markTransfer(transferId, { status: "failed", error: `summary_prompt_failed:${e.message}` });
     return { ok: false, error: "summary_prompt_failed" };
   }
   if (!result?.ok || result?.handoffBlocked) {
-    if (result?.handoffBlocked || isLlmJudgeConfigured(CFG)) {
+    if (result?.handoffBlocked || (await runtimeSemanticCapabilities()).chat_available) {
       return failWithHandoffFallback(transferId, {
         snapshot: sourceSnapshot,
         reason: result?.handoffBlockReason || result?.error || result?.blocked || "summary_prompt_not_submitted",
@@ -6824,7 +6771,7 @@ async function handleHandoffTurnEnded(msg) {
     };
   }
   if (disposition.kind !== "packet") {
-    if (isLlmJudgeConfigured(CFG)) {
+    if ((await runtimeSemanticCapabilities()).chat_available) {
       const fallback = await summarizeHandoffWithFallbackLlm(transfer.id, { reason: "primary_packet_invalid" });
       if (fallback.ok) return { handled: true, ...fallback };
     }
@@ -7504,10 +7451,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return total + (Array.isArray(workspace?.panes) ? workspace.panes.length : 0);
       }, 0);
       const boundWorkingCount = liveSession.reduce((total, binding) => total + Number(bindingView(binding)?.working_count || 0), 0);
-      let llmHost = "";
-      try {
-        llmHost = CFG.llmJudgeBaseUrl ? new URL(llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl)).host : "";
-      } catch (_) { llmHost = ""; }
+      const semanticCapabilities = await runtimeSemanticCapabilities();
       const last = convKey ? (lastIdleNudgeResult.get(convKey) || null) : null;
       sendResponse({
         ok: true,
@@ -7530,9 +7474,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         idleNudgeEnabled: automation.enabled,
         progressTickSec: paceIntervalSec() || Number(CFG.progressTickSec) || 0,
         progressFallbackSec: Number(CFG.progressFallbackSec) || 0,
-        llmConfigured: isLlmJudgeConfigured(CFG),
-        llmModel: String(CFG.llmJudgeModel || "").trim(),
-        llmHost,
+        llmConfigured: semanticCapabilities.chat_available,
+        llmModel: semanticCapabilities.chat_providers.join(", "),
+        llmHost: semanticCapabilities.chat_available ? "runtime" : "",
         bound: session.length > 0,
         workspace_label: labels.length ? labels.join(", ") : null,
         active_workspace_label: labels[0] || null,
@@ -7601,14 +7545,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       delete incoming.jevJudgeThreshold;
       delete incoming.llmJudgePromptTemplate;
       delete incoming.llmJudgeSkipKeywords;
-      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeBaseUrl")) {
-        incoming.jevJudgeBaseUrl = String(incoming.jevJudgeBaseUrl || DEFAULT_JEV_BASE_URL).trim()
-          || DEFAULT_JEV_BASE_URL;
-      }
-      if (Object.prototype.hasOwnProperty.call(incoming, "jevJudgeModel")) {
-        incoming.jevJudgeModel = String(incoming.jevJudgeModel || DEFAULT_JEV_MODEL).trim()
-          || DEFAULT_JEV_MODEL;
-      }
+      delete incoming.llmJudgeBaseUrl;
+      delete incoming.llmJudgeApiKey;
+      delete incoming.llmJudgeModel;
+      delete incoming.jevJudgeBaseUrl;
+      delete incoming.jevJudgeApiKey;
+      delete incoming.jevJudgeModel;
       delete incoming.enabled;
       delete incoming.idleNudgeEnabled;
       CFG = { ...CFG, ...incoming };
@@ -7619,8 +7561,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       delete CFG.jevJudgeThreshold;
       delete CFG.llmJudgePromptTemplate;
       delete CFG.llmJudgeSkipKeywords;
+      delete CFG.llmJudgeBaseUrl;
+      delete CFG.llmJudgeApiKey;
+      delete CFG.llmJudgeModel;
+      delete CFG.jevJudgeBaseUrl;
+      delete CFG.jevJudgeApiKey;
+      delete CFG.jevJudgeModel;
       await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
-      try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token", "jevJudgeMode", "jevJudgeThreshold", "llmJudgePromptTemplate", "llmJudgeSkipKeywords"]); } catch (e) {}
+      try {
+        await chrome.storage.local.remove([
+          "idleNudgeCooldownSec",
+          "autoAllow",
+          "token",
+          "jevJudgeMode",
+          "jevJudgeThreshold",
+          "llmJudgePromptTemplate",
+          "llmJudgeSkipKeywords",
+          "llmJudgeBaseUrl",
+          "llmJudgeApiKey",
+          "llmJudgeModel",
+          "jevJudgeBaseUrl",
+          "jevJudgeApiKey",
+          "jevJudgeModel",
+        ]);
+      } catch (e) {}
       await syncExperimentalContentScripts();
       void rebuildStreams();
       sendResponse({ ok: true });
@@ -7683,62 +7647,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
-  if (msg?.type === "h2w_test_llm") {
-    void (async () => {
-      const form = msg.config || {};
-      const judged = await fetchLlmJudge(
-        form.userText || "继续验证",
-        form.assistantText || "助手已跑完部分验证，下一步还要跑 Convex pytest。",
-        form,
-      );
-      if (!judged.ok) {
-        sendResponse({
-          ok: false,
-          reason: judged.reason,
-          status: judged.status || null,
-          error: judged.error || "",
-        });
-        return;
-      }
-      const verdict = interpretLlmJudgeReply(judged.content);
-      sendResponse({
-        ok: true,
-        content: judged.content,
-        done: verdict.done,
-        cont: verdict.cont,
-        nudgeText: verdict.nudgeText,
-      });
-    })();
-    return true;
-  }
-  if (msg?.type === "h2w_test_jev") {
-    void (async () => {
-      const form = { ...(msg.config || {}) };
-      const judged = await fetchJevJudgeOnce(
-        form.userText || "继续验证",
-        form.assistantText || "实现已经完成。下一步我会继续跑生产验证。",
-        form,
-      );
-      if (!judged.ok) {
-        sendResponse({
-          ok: false,
-          reason: judged.reason,
-          status: judged.status || null,
-          error: judged.error || "",
-        });
-        return;
-      }
-      sendResponse({
-        ok: true,
-        probability: judged.probability,
-        signal: judged.signal,
-        threshold: judged.threshold,
-        model: judged.model,
-        usage: judged.usage || null,
-      });
-    })();
-    return true;
-  }
   if (msg?.type === "h2w_state") {
     void (async () => {
       let bindings = await loadBindings();
@@ -7772,6 +7680,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const transfers = await loadHandoffTransfers();
       const transfer = convInfo?.convKey ? latestTransferForConversation(transfers, convInfo.convKey) : null;
       const automation = automationScopeForConversation(convInfo?.convKey || "");
+      const semanticCapabilities = await runtimeSemanticCapabilities();
       sendResponse({
         convInfo,
         browserEndpoint: browserEndpointView(browserEndpoint),
@@ -7800,7 +7709,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           progressTickSec: CFG.progressTickSec,
           progressFallbackSec: CFG.progressFallbackSec,
           idleNudgeEnabled: automation.enabled,
-          llmJudgeConfigured: isLlmJudgeConfigured(CFG),
+          llmJudgeConfigured: semanticCapabilities.chat_available,
+          semanticEvaluateConfigured: semanticCapabilities.evaluate_available,
         },
       });
     })();

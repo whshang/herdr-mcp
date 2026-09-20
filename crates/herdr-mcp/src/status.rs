@@ -1030,7 +1030,7 @@ fn format_edge_configured_layer(edge: &Option<EdgeConfigView>, config: &Config) 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EdgeConfigSource {
-    ConfigToml,
+    ConfigFile,
     LinkProdPlist,
     LinkPlist,
     LinkCandidatePlist,
@@ -1040,7 +1040,7 @@ enum EdgeConfigSource {
 impl EdgeConfigSource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::ConfigToml => "config-toml",
+            Self::ConfigFile => "config-file",
             Self::LinkProdPlist => "link-prod-plist",
             Self::LinkPlist => "link-plist",
             Self::LinkCandidatePlist => "link-candidate-plist",
@@ -1107,7 +1107,7 @@ fn resolve_edge_config(config: &Config) -> Option<EdgeConfigView> {
         None
     });
 
-    // If [edge].public_origin is configured in config.toml, it is the authoritative public identity
+    // If [edge].public_origin is configured in config.json, it is the authoritative public identity
     if let Some(public_origin) = config.edge_public_origin.as_deref()
         && let Ok(parsed) = url::Url::parse(public_origin)
         && let Some(host) = parsed.host_str()
@@ -1116,7 +1116,7 @@ fn resolve_edge_config(config: &Config) -> Option<EdgeConfigView> {
             host: host.to_owned(),
             origin: public_origin.to_owned(),
             plist: plist_info.as_ref().map(|(p, _, _, _)| p.clone()),
-            source: EdgeConfigSource::ConfigToml,
+            source: EdgeConfigSource::ConfigFile,
             label: plist_info.as_ref().map(|(_, l, _, _)| l.clone()),
         });
     }
@@ -1973,7 +1973,7 @@ mod tests {
             plist: Some(PathBuf::from(
                 "/Users/test/Library/LaunchAgents/dev.herdr-mcp.link-prod.plist",
             )),
-            source: EdgeConfigSource::ConfigToml,
+            source: EdgeConfigSource::ConfigFile,
             label: Some("dev.herdr-mcp.link-prod".to_owned()),
         };
         let config = Config {

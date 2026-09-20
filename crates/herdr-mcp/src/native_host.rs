@@ -82,6 +82,9 @@ const ALLOWED_PROXY_PATHS: &[&str] = &[
     "/extension/fleet",
     "/extension/browser/registry",
     "/extension/browser/actuation",
+    "/extension/semantic/status",
+    "/extension/semantic/evaluate",
+    "/extension/semantic/chat",
     "/extension/continuity/turn",
     "/extension/continuity/resolve",
 ];

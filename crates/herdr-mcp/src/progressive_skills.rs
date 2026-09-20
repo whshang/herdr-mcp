@@ -1209,7 +1209,7 @@ impl ProgressiveSkillService {
                 } else {
                     "deterministic_tool_explicit"
                 },
-                "capability": SemanticService::from_env().capability_json(),
+                "capability": SemanticService::from_config().capability_json(),
             })),
             "context_resolution": {
                 "level": "required_before_prior_or_ambiguous_project_discussion",
@@ -1255,7 +1255,7 @@ impl ProgressiveSkillService {
         const MAX_METHODS: usize = 48;
         const TOP_ROUTES: usize = 6;
 
-        let service = SemanticService::from_env();
+        let service = SemanticService::from_config();
         let capability = service.capability_json();
         if !service.configured() {
             return json!({

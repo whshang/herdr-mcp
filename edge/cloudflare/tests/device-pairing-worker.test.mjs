@@ -157,6 +157,308 @@ async function pair(env, name) {
   return consume.json();
 }
 
+test("user keeps Worker semantic credentials at Edge | Given an enrolled device and Worker-wide route pool | When semantic evaluation is requested | Then authentication is required and credentials never return", async () => {
+  const routes = [{
+    name: "edge_fast",
+    protocol: "decision",
+    url: "https://api.typesafe.ai/v1/systemone",
+    model: "jev-edge",
+    api_key: "edge-typesafe-secret",
+  }];
+  const h = makeEnv({
+    HERDR_SEMANTIC_ROUTES: JSON.stringify(routes),
+  });
+  const paired = await pair(h.env, "semantic-edge");
+  const body = {
+    state: "The task edits Rust code.",
+    questions: {
+      edit: {
+        type: "noul",
+        instructions: "Does this task require source edits?",
+        criteria: { true: "Source edits required", false: "No source edits required" },
+      },
+    },
+  };
+
+  const denied = await worker.fetch(
+    postAsWorkstation("/semantic/systemone", body, paired.workstation_id, "wrong-device-secret"),
+    h.env,
+  );
+  assert.equal(denied.status, 401);
+
+  const status = await worker.fetch(
+    get("/semantic/status", paired.device_secret, paired.workstation_id),
+    h.env,
+  );
+  assert.equal(status.status, 200);
+  assert.deepEqual(await status.json(), {
+    ok: true,
+    available: true,
+    evaluate_available: true,
+    chat_available: false,
+    routes: [{
+      name: "edge_fast",
+      protocol: "decision",
+      model: "jev-edge",
+    }],
+  });
+
+  const unavailableStatus = await worker.fetch(
+    get("/semantic/status", paired.device_secret, paired.workstation_id),
+    { ...h.env, HERDR_SEMANTIC_ROUTES: undefined },
+  );
+  assert.equal(unavailableStatus.status, 200);
+  assert.deepEqual(await unavailableStatus.json(), {
+    ok: true,
+    available: false,
+    evaluate_available: false,
+    chat_available: false,
+    routes: [],
+  });
+
+  const originalFetch = globalThis.fetch;
+  let upstreamAuthorization = "";
+  let upstreamBody = null;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request ? input.url : String(input);
+    assert.equal(url, "https://api.typesafe.ai/v1/systemone");
+    upstreamAuthorization = new Headers(init.headers).get("authorization") ?? "";
+    upstreamBody = JSON.parse(String(init.body));
+    return new Response(JSON.stringify({
+      model: "jev-edge",
+      answers: { edit: { type: "noul", noul: 0.94 } },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      postAsWorkstation("/semantic/systemone", body, paired.workstation_id, paired.device_secret),
+      h.env,
+    );
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.answers.edit.noul, 0.94);
+    assert.equal(upstreamAuthorization, "Bearer edge-typesafe-secret");
+    assert.equal(upstreamBody.model, "jev-edge");
+    assert.equal(JSON.stringify(payload).includes("edge-typesafe-secret"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("user keeps semantic failover bounded | Given two independent route credentials and a rate-limited first route | When semantic evaluation runs | Then the next route succeeds without leaking either secret", async () => {
+  const routes = [
+    {
+      name: "direct-a",
+      protocol: "decision",
+      url: "https://typesafe.example/systemone",
+      model: "jev-a",
+      api_key: "route-secret-a",
+    },
+    {
+      name: "openrouter-b",
+      protocol: "decision",
+      url: "https://openrouter.example/api/alpha/decisions",
+      model: "~typesafe/jev-latest",
+      api_key: "route-secret-b",
+    },
+  ];
+  const h = makeEnv({
+    HERDR_SEMANTIC_ROUTES: JSON.stringify(routes),
+  });
+  const paired = await pair(h.env, "semantic-routes");
+  const body = {
+    state: "Choose a useful route.",
+    questions: {
+      useful: {
+        type: "noul",
+        instructions: "Is this useful?",
+        criteria: { true: "Useful", false: "Not useful" },
+      },
+    },
+  };
+
+  const status = await worker.fetch(
+    get("/semantic/status", paired.device_secret, paired.workstation_id),
+    h.env,
+  );
+  assert.equal(status.status, 200);
+  const statusPayload = await status.json();
+  assert.equal(statusPayload.available, true);
+  assert.deepEqual(
+    statusPayload.routes.map(({ name, protocol, model }) => ({ name, protocol, model })),
+    routes.map(({ name, protocol, model }) => ({ name, protocol, model })),
+  );
+  assert.equal(JSON.stringify(statusPayload).includes("route-secret"), false);
+
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = input instanceof Request ? input.url : String(input);
+    const authorization = new Headers(init.headers).get("authorization") ?? "";
+    const requestBody = JSON.parse(String(init.body));
+    calls.push({ url, authorization, requestBody });
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({ error: "rate limited" }), { status: 429 });
+    }
+    return new Response(JSON.stringify({
+      model: "jev-fallback",
+      answers: { useful: { type: "noul", noul: 0.92 } },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      postAsWorkstation("/semantic/systemone", body, paired.workstation_id, paired.device_secret),
+      h.env,
+    );
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.answers.useful.noul, 0.92);
+    assert.equal(calls.length, 2);
+    assert.notEqual(calls[0].authorization, calls[1].authorization);
+    assert.deepEqual(
+      new Set(calls.map((call) => call.authorization)),
+      new Set(["Bearer route-secret-a", "Bearer route-secret-b"]),
+    );
+    assert.equal(JSON.stringify(payload).includes("route-secret"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("user uses one semantic route schema for chat | Given a Worker-wide openai-chat route | When semantic chat is requested | Then the configured URL model credential and content are used", async () => {
+  const h = makeEnv({
+    HERDR_SEMANTIC_ROUTES: JSON.stringify([{
+      name: "chat_primary",
+      protocol: "openai-chat",
+      url: "https://chat.example/v1/chat/completions",
+      model: "chat-model",
+      api_key: "chat-secret",
+    }]),
+  });
+  const paired = await pair(h.env, "semantic-chat");
+
+  const status = await worker.fetch(
+    get("/semantic/status", paired.device_secret, paired.workstation_id),
+    h.env,
+  );
+  assert.equal(status.status, 200);
+  assert.deepEqual(await status.json(), {
+    ok: true,
+    available: true,
+    evaluate_available: false,
+    chat_available: true,
+    routes: [{
+      name: "chat_primary",
+      protocol: "openai-chat",
+      model: "chat-model",
+    }],
+  });
+
+  const originalFetch = globalThis.fetch;
+  let upstreamUrl = "";
+  let upstreamAuthorization = "";
+  let upstreamBody;
+  globalThis.fetch = async (input, init = {}) => {
+    upstreamUrl = input instanceof Request ? input.url : String(input);
+    upstreamAuthorization = new Headers(init.headers).get("authorization") ?? "";
+    upstreamBody = JSON.parse(String(init.body));
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: "continue" } }],
+      usage: { total_tokens: 7 },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      postAsWorkstation(
+        "/semantic/chat",
+        { messages: [{ role: "user", content: "continue?" }] },
+        paired.workstation_id,
+        paired.device_secret,
+      ),
+      h.env,
+    );
+    assert.equal(response.status, 200);
+    assert.equal(upstreamUrl, "https://chat.example/v1/chat/completions");
+    assert.equal(upstreamAuthorization, "Bearer chat-secret");
+    assert.equal(upstreamBody.model, "chat-model");
+    assert.deepEqual(await response.json(), {
+      model: "chat-model",
+      content: "continue",
+      usage: { total_tokens: 7 },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("user receives normalized Vercel evaluation | Given a decision-vercel Jev route | When a Noul question is evaluated | Then boolean wire output is normalized to Noul", async () => {
+  const h = makeEnv({
+    HERDR_SEMANTIC_ROUTES: JSON.stringify([{
+      name: "fast_gateway",
+      protocol: "decision-vercel",
+      url: "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
+      model: "typesafe-ai/jev",
+      api_key: "vercel-secret",
+    }]),
+  });
+  const paired = await pair(h.env, "semantic-vercel");
+  const body = {
+    state: "The task is complete.",
+    questions: {
+      done: {
+        type: "noul",
+        instructions: "Is the task complete?",
+        criteria: { true: "Complete", false: "Incomplete" },
+      },
+    },
+  };
+
+  const originalFetch = globalThis.fetch;
+  let upstreamHeaders;
+  let upstreamBody;
+  globalThis.fetch = async (_input, init = {}) => {
+    upstreamHeaders = new Headers(init.headers);
+    upstreamBody = JSON.parse(String(init.body));
+    return new Response(JSON.stringify({
+      answers: { done: { type: "boolean", probability: 0.91 } },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      postAsWorkstation("/semantic/systemone", body, paired.workstation_id, paired.device_secret),
+      h.env,
+    );
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(upstreamHeaders.get("authorization"), "Bearer vercel-secret");
+    assert.equal(upstreamHeaders.get("ai-evaluation-model-specification-version"), "4");
+    assert.equal(upstreamHeaders.get("ai-model-id"), "typesafe-ai/jev");
+    assert.equal(upstreamBody.questions.done.type, "boolean");
+    assert.deepEqual(payload, {
+      model: "typesafe-ai/jev",
+      answers: { done: { type: "noul", noul: 0.91 } },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("health and info expose the same explicit first-party public contract identity", async () => {
   for (const [edgeEnv, expectedEpoch] of [
     ["dev", 7],

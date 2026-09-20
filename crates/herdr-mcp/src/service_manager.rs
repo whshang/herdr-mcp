@@ -2616,10 +2616,6 @@ mod macos {
         if existing.env.get("HERDR_MCP_TCC_BROKER").map(String::as_str) != Some("1") {
             return Ok(None);
         }
-        if !crate::semantic::service_environment_matches_user_shell(&existing.env, &paths.home) {
-            return Ok(None);
-        }
-
         if !loaded() || !healthy() {
             return Ok(None);
         }
@@ -3258,10 +3254,6 @@ mod macos {
                 out.insert(key.to_owned(), value.clone());
             }
         }
-        out.extend(crate::semantic::service_environment_with_user_shell(
-            inherited,
-            &paths.home,
-        ));
         let token = inherited
             .get("HERDR_MCP_TOKEN")
             .filter(|value| !value.is_empty())
