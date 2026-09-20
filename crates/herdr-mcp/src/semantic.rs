@@ -14,7 +14,11 @@ use url::Url;
 pub const DEFAULT_DECISION_THRESHOLD: f64 = 0.70;
 pub const EDGE_SEMANTIC_PROVIDER_ID: &str = "edge-semantic";
 
-const PROVIDER_TIMEOUT: Duration = Duration::from_secs(3);
+/// Measured decision-route latency is 1.1-1.4s median with a ~2.6s tail, so a single
+/// attempt is given 4s. The pool keeps a separate 10s budget so one slow route cannot
+/// spend the failover allowance of the routes behind it.
+const DECISION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+const DECISION_POOL_BUDGET: Duration = Duration::from_secs(10);
 const SEMANTIC_ATTEMPT_LIMIT: usize = 3;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 const MAX_QUESTIONS: usize = 32;
@@ -448,15 +452,37 @@ fn clear_route_cooldown(id: &str) {
     }
 }
 
+/// Timeout allowance for one route pool run: `attempt` caps a single route call,
+/// `total` caps the whole failover sequence.
+#[derive(Debug, Clone, Copy)]
+struct RouteBudget {
+    attempt: Duration,
+    total: Duration,
+}
+
+impl RouteBudget {
+    fn split(attempt: Duration, total: Duration) -> Self {
+        Self { attempt, total }
+    }
+
+    /// One caller-owned allowance that a single route may spend in full.
+    fn single(total: Duration) -> Self {
+        Self {
+            attempt: total,
+            total,
+        }
+    }
+}
+
 fn execute_route_pool<T>(
     route_count: usize,
     cursor: &AtomicUsize,
-    timeout: Duration,
+    budget: RouteBudget,
     mut route_id: impl FnMut(usize) -> String,
     mut call: impl FnMut(usize, Duration) -> Result<T, SemanticError>,
 ) -> Result<T, SemanticError> {
     let start = cursor.fetch_add(1, Ordering::Relaxed) % route_count;
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + budget.total;
     let mut last = SemanticError::new("provider_unavailable");
     let mut attempted = false;
     let mut attempts = 0;
@@ -477,7 +503,7 @@ fn execute_route_pool<T>(
         }
         attempted = true;
         attempts += 1;
-        match call(index, remaining) {
+        match call(index, remaining.min(budget.attempt)) {
             Ok(response) => {
                 clear_route_cooldown(&id);
                 return Ok(response);
@@ -556,7 +582,7 @@ impl SemanticService {
         execute_route_pool(
             self.providers.len(),
             &ROUTE_CURSOR,
-            PROVIDER_TIMEOUT,
+            RouteBudget::split(DECISION_ATTEMPT_TIMEOUT, DECISION_POOL_BUDGET),
             |index| self.providers[index].id().to_owned(),
             |index, remaining| self.providers[index].evaluate(request, remaining),
         )
@@ -579,7 +605,7 @@ impl SemanticService {
         execute_route_pool(
             self.chat_providers.len(),
             &CHAT_ROUTE_CURSOR,
-            timeout,
+            RouteBudget::single(timeout),
             |index| self.chat_providers[index].id().to_owned(),
             |index, remaining| self.chat_providers[index].chat(messages, remaining),
         )
@@ -876,7 +902,7 @@ impl HttpSemanticProvider {
             endpoint: semantic_endpoint_url(&url)?,
             model,
             client: Client::builder()
-                .timeout(PROVIDER_TIMEOUT)
+                .timeout(DECISION_ATTEMPT_TIMEOUT)
                 .build()
                 .map_err(|_| SemanticError::new("client_unavailable"))?,
         })
@@ -1400,7 +1426,7 @@ mod tests {
             "jev-test".to_owned(),
         )
         .unwrap()
-        .evaluate(&request, PROVIDER_TIMEOUT)
+        .evaluate(&request, DECISION_ATTEMPT_TIMEOUT)
         .unwrap();
 
         assert_eq!(
@@ -1793,6 +1819,53 @@ mod tests {
                 Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
                 None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
             }
+        }
+    }
+
+    #[test]
+    fn a_slow_route_leaves_failover_budget_for_the_routes_behind_it() {
+        let _guard = crate::test_env::lock();
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
+        let cursor = AtomicUsize::new(0);
+        let budget = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200));
+        let mut granted = Vec::new();
+
+        let served = execute_route_pool(
+            3,
+            &cursor,
+            budget,
+            |index| format!("budget-test-{index}"),
+            |index, allowance| {
+                granted.push(allowance);
+                if index == 0 {
+                    thread::sleep(Duration::from_millis(60));
+                    Err(SemanticError::new("timeout"))
+                } else {
+                    Ok(index)
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(served, 1);
+        assert_eq!(granted.len(), 2);
+        assert!(granted.iter().all(|allowance| *allowance <= budget.attempt));
+
+        cursor.store(0, Ordering::Relaxed);
+        let after_timeout = execute_route_pool(
+            3,
+            &cursor,
+            budget,
+            |index| format!("budget-test-{index}"),
+            |index, _| Ok(index),
+        )
+        .unwrap();
+        assert_eq!(after_timeout, 1);
+
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
         }
     }
 
