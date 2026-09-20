@@ -7494,6 +7494,18 @@ mod tests {
     fn work_memory_private_methods_share_state_store_and_provider_qualify_messages() {
         use std::sync::{Arc, Mutex};
 
+        let _env_guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-work-memory-private-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let mut message_ids = Vec::new();
         for (provider, account_ref) in [("chatgpt", "account-a"), ("gemini", "account-b")] {
@@ -7691,13 +7703,34 @@ mod tests {
         assert_eq!(searched["ok"], true);
         assert_eq!(searched["hits"].as_array().unwrap().len(), 1);
         assert_eq!(searched["hits"][0]["source_kind"], "evidence");
+        assert_eq!(searched["semantic_ranking"]["used"], false);
         assert_eq!(searched["coverage"]["result_completeness"], "complete");
         assert_eq!(searched["coverage"]["source_verification"], "unverified");
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
     }
 
     #[test]
     fn work_memory_search_cursor_freezes_boundary_and_rejects_tampering() {
         use std::sync::{Arc, Mutex};
+
+        let _env_guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-work-memory-cursor-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let bound = work_memory_call(
@@ -7742,6 +7775,7 @@ mod tests {
         );
         assert_eq!(first["ok"], true);
         assert_eq!(first["hits"].as_array().unwrap().len(), 2);
+        assert_eq!(first["semantic_ranking"]["used"], false);
         assert_eq!(first["coverage"]["result_completeness"], "complete");
         assert_eq!(first["coverage"]["display_truncated"], true);
         let cursor = first["cursor"].as_str().unwrap().to_owned();
@@ -7819,6 +7853,14 @@ mod tests {
         let tampered_result =
             work_memory_call(&store, "work_memory.search", &json!({"cursor": tampered}));
         assert_eq!(tampered_result["code"], "work_memory_cursor_invalid");
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
     }
 
     #[test]
@@ -8428,6 +8470,18 @@ mod tests {
         };
         use std::sync::{Arc, Mutex};
 
+        let _env_guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-browser-dispatch-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let session_ref = {
             let mut guard = store.lock().unwrap();
@@ -8849,6 +8903,7 @@ mod tests {
         assert_eq!(evidence_search["ok"], true);
         assert_eq!(evidence_search["hits"].as_array().unwrap().len(), 1);
         assert_eq!(evidence_search["hits"][0]["source_kind"], "evidence");
+        assert_eq!(evidence_search["semantic_ranking"]["used"], false);
         assert!(
             !evidence_search
                 .to_string()
@@ -9106,6 +9161,14 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
     }
 
     #[test]
