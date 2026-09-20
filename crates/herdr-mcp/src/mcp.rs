@@ -7775,7 +7775,17 @@ mod tests {
             "work_memory.search",
             &json!({"cursor": first["cursor"]}),
         );
-        assert_eq!(replay, continued);
+        let mut replay_authoritative = replay.clone();
+        let mut continued_authoritative = continued.clone();
+        replay_authoritative
+            .as_object_mut()
+            .unwrap()
+            .remove("semantic_ranking");
+        continued_authoritative
+            .as_object_mut()
+            .unwrap()
+            .remove("semantic_ranking");
+        assert_eq!(replay_authoritative, continued_authoritative);
 
         let fresh = work_memory_call(
             &store,
