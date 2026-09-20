@@ -211,7 +211,7 @@ herdr-mcp webchat dispatch-status DISPATCH_ID
 | `dispatch.result.settled` / `assistant_message_ref` / `evidence_id` | Durable settlement evidence for the turn |
 | `replayed` | `true` when the runtime returned an already-recorded dispatch for the same idempotency key |
 
-Resuming after a timeout is **not** resending. Read `dispatch-status` for the same `dispatch_id`; if the state is `uncertain`, re-observe the session (`herdr-mcp webchat inspect SESSION_REF`) and the live page before deciding anything. `browser_offline` / `resource_unavailable` mean the target is not currently reachable — wait and re-observe, and never change the idempotency key just to probe liveness.
+Resuming after a timeout is **not** resending. Read `dispatch-status` for the same `dispatch_id`; if the state is `uncertain`, re-observe the session (`herdr-mcp webchat inspect SESSION_REF`) and the live page before deciding anything. `browser_offline` / `resource_unavailable` mean the target is not currently reachable — wait and re-observe, and never change the idempotency key just to probe liveness. For `browser_session.create`, a temporary `resource_unavailable` may re-actuate with that same key only when the returned evidence explicitly proves `message_submitted=false` and `retry_safe=true`; Runtime persists that reservation as `not_applied`. `uncertain` stays reconciliation-only, and `source_session_unavailable` never retargets automatically.
 
 Stopping a running turn is a separate private operation (`herdr_mcp.browser_dispatch.stop`) with no CLI wrapper today. If you need it and only have the CLI, report that boundary instead of faking a stop.
 

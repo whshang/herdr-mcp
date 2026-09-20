@@ -211,7 +211,7 @@ herdr-mcp webchat dispatch-status DISPATCH_ID
 | `dispatch.result.settled` / `assistant_message_ref` / `evidence_id` | 该轮次的持久 settlement 证据 |
 | `replayed` | 同一 idempotency key 命中已记录 dispatch 时为 `true` |
 
-超时后的“继续”**不是**重发。用同一个 `dispatch_id` 读 `dispatch-status`；若状态为 `uncertain`，先重新观测会话（`herdr-mcp webchat inspect SESSION_REF`）与真实页面，再决定任何事。`browser_offline` / `resource_unavailable` 表示目标当前不可达——等待并重新观测，绝不要为了探测存活而更换 idempotency key。
+超时后的“继续”**不是**重发。用同一个 `dispatch_id` 读 `dispatch-status`；若状态为 `uncertain`，先重新观测会话（`herdr-mcp webchat inspect SESSION_REF`）与真实页面，再决定任何事。`browser_offline` / `resource_unavailable` 表示目标当前不可达——等待并重新观测，绝不要为了探测存活而更换 idempotency key。对 `browser_session.create`，只有返回证据明确证明 `message_submitted=false` 且 `retry_safe=true` 的临时 `resource_unavailable`，才允许在重新观测后用同一个 key 再次 actuation；Runtime 会把这条 reservation 持久化为 `not_applied`。`uncertain` 仍只允许 reconciliation，`source_session_unavailable` 也不会自动改目标。
 
 停止正在运行的轮次是另一个私有操作（`herdr_mcp.browser_dispatch.stop`），当前没有 CLI 包装。需要它而手上只有 CLI 时，请如实说明这个边界，不要伪造一个“已停止”。
 
