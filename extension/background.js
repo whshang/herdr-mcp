@@ -5302,6 +5302,9 @@ async function maybeIdleNudgeInner(msg) {
       jev_probability: jev?.ok ? jev.probability : null,
       jev_signal: jev?.ok ? jev.signal : "unavailable",
       jev_reason: jev?.ok ? null : jev?.reason || "unknown",
+      jev_handoff_boundary_stable: jev?.ok ? jev.handoffBoundaryStable : null,
+      jev_useful_work_remaining: jev?.ok ? jev.usefulWorkRemaining : null,
+      jev_handoff_advisory_only: true,
     };
     if (policy.action === "continue") {
       return sendSemanticContinue(convKey, b, fp, cooldownMs, {
