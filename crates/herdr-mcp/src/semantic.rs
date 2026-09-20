@@ -20,6 +20,7 @@ pub const TYPESAFE_PROVIDER_ID: &str = "typesafe-jev";
 const TYPESAFE_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 const TYPESAFE_BASE_URL_ENV: &str = "TYPESAFE_BASE_URL";
 const TYPESAFE_MODEL_ENV: &str = "TYPESAFE_MODEL";
+#[cfg(any(target_os = "macos", test))]
 const PROVIDER_ENV_KEYS: [&str; 3] = [
     TYPESAFE_API_KEY_ENV,
     TYPESAFE_BASE_URL_ENV,
@@ -313,6 +314,7 @@ impl SemanticService {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn service_environment(inherited: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     PROVIDER_ENV_KEYS
         .into_iter()
