@@ -211,7 +211,7 @@ herdr-mcp webchat dispatch-status DISPATCH_ID
 | `dispatch.result.settled` / `assistant_message_ref` / `evidence_id` | そのターンの永続的な settlement 証拠 |
 | `replayed` | 同じ idempotency key で記録済み dispatch を返した場合 `true` |
 
-タイムアウト後の「再開」は再送**ではありません**。同じ `dispatch_id` で `dispatch-status` を読み、`uncertain` なら `herdr-mcp webchat inspect SESSION_REF` と実際のページを再観測してから判断します。`browser_offline` / `resource_unavailable` は対象が現在到達不能という意味です。待って再観測し、生存確認のために idempotency key を変えないでください。
+タイムアウト後の「再開」は再送**ではありません**。同じ `dispatch_id` で `dispatch-status` を読み、`uncertain` なら `herdr-mcp webchat inspect SESSION_REF` と実際のページを再観測してから判断します。`browser_offline` / `resource_unavailable` は対象が現在到達不能という意味です。待って再観測し、生存確認のために idempotency key を変えないでください。`browser_session.create` では、返された証拠が `message_submitted=false` かつ `retry_safe=true` を明示的に証明する一時的な `resource_unavailable` に限り、再観測後に同じ key で再 actuation できます。Runtime はその reservation を `not_applied` として永続化します。`uncertain` は reconciliation 専用のままで、`source_session_unavailable` が自動的に別の対象へ切り替わることもありません。
 
 実行中ターンの停止は別の私有操作（`herdr_mcp.browser_dispatch.stop`）で、現在 CLI ラッパーはありません。CLI しか無い場合はその境界を正直に報告し、停止したふりをしないでください。
 
