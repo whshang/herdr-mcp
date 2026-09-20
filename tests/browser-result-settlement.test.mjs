@@ -299,7 +299,7 @@ function providerObservationHarness({
   };
 }
 
-test("provider DOM settlement requires a stable exact Claude candidate before durable result writeback", async () => {
+test("user gets durable Claude settlement | Given one exact accepted user ref | When the same finalized assistant candidate is observed twice | Then the durable result is written once", async () => {
   const h = providerObservationHarness();
   assert.equal(await h.observe(), false);
   assert.equal(h.sent.length, 0);
@@ -318,7 +318,7 @@ test("provider DOM settlement requires a stable exact Claude candidate before du
   }]);
 });
 
-test("provider DOM settlement never reports a candidate bound to another accepted user ref", async () => {
+test("user never gets a mismatched Claude settlement | Given one accepted user ref | When the assistant candidate is bound to another user ref | Then no durable result is reported", async () => {
   const h = providerObservationHarness({
     candidate: {
       ok: true,

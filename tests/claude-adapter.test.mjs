@@ -125,7 +125,7 @@ test("Claude adapter uses bounded semantic composer, message, and generation sel
   );
 });
 
-test("Claude adapter derives scoped transcript refs and exact adjacent settlement evidence", () => {
+test("user gets scoped Claude transcript identity | Given stable transcript row metadata | When user and adjacent assistant snapshots are read | Then refs stay session role and ordinal scoped", () => {
   const h = harness();
   const makeTranscriptMessage = ({ role, index, text, streaming = false, rsIndex = index }) => {
     const article = element({ attrs: {
