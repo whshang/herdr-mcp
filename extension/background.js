@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.108";
+const H2W_SCRIPT_VERSION = "0.1.109";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -3205,9 +3205,11 @@ async function closeArchivedChatGptTabAfterProjectHome({
 async function findBrowserSessionTargetByCanonicalIdentity(provider, canonicalUrl, expectedGeneration) {
   const canonicalInfo = browserConversationInfo(provider, canonicalUrl);
   if (!canonicalInfo?.conversation_id) return { target: null, ambiguous: false };
+  const canonicalPattern = hostPermissionPatternForUrl(canonicalInfo.convKey || canonicalUrl);
+  if (!canonicalPattern) return { target: null, ambiguous: false };
   let exactTarget = null;
   try {
-    const candidates = await chrome.tabs.query({ url: await activeH2WTabUrls() });
+    const candidates = await chrome.tabs.query({ url: [canonicalPattern] });
     for (const tab of candidates) {
       if (!tab?.id) continue;
       const live = browserConversationInfo(provider, tab.url || "");

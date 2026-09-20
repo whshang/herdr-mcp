@@ -34,37 +34,41 @@ assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "regist
 const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
 
 function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) {
+  const queryArgs = [];
   const chrome = {
     tabs: {
-      async query() {
+      async query(args) {
+        queryArgs.push(args);
         return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
       },
     },
   };
-  const activeH2WTabUrls = () => ["https://chatgpt.com/*"];
+  const hostPermissionPatternForUrl = (rawUrl) => new URL(rawUrl).origin + "/*";
   const browserTabScopes = scopeRecords;
   const browserConversationInfo = (provider, rawUrl) => provider === "chatgpt"
     ? chatGptConversationInfo(rawUrl)
     : null;
   const find = new Function(
     "chrome",
-    "activeH2WTabUrls",
+    "hostPermissionPatternForUrl",
     "browserConversationInfo",
     "browserTabScopes",
     `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
-  )(chrome, activeH2WTabUrls, browserConversationInfo, browserTabScopes);
-  return { find };
+  )(chrome, hostPermissionPatternForUrl, browserConversationInfo, browserTabScopes);
+  return { find, queryArgs };
 }
 
 function claudeCanonicalIdentityRecoveryHarness(tabRecords) {
+  const queryArgs = [];
   const chrome = {
     tabs: {
-      async query() {
+      async query(args) {
+        queryArgs.push(args);
         return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
       },
     },
   };
-  const activeH2WTabUrls = () => ["https://claude.ai/*"];
+  const hostPermissionPatternForUrl = (rawUrl) => new URL(rawUrl).origin + "/*";
   const browserTabScopes = new Map(tabRecords
     .filter((record) => record.scope)
     .map((record) => [record.id, record.scope]));
@@ -84,12 +88,47 @@ function claudeCanonicalIdentityRecoveryHarness(tabRecords) {
   };
   const find = new Function(
     "chrome",
-    "activeH2WTabUrls",
+    "hostPermissionPatternForUrl",
     "browserConversationInfo",
     "browserTabScopes",
     `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
-  )(chrome, activeH2WTabUrls, browserConversationInfo, browserTabScopes);
-  return { find };
+  )(chrome, hostPermissionPatternForUrl, browserConversationInfo, browserTabScopes);
+  return { find, queryArgs };
+}
+
+function grokCanonicalIdentityRecoveryHarness(tabRecords) {
+  const queryArgs = [];
+  const chrome = {
+    tabs: {
+      async query(args) {
+        queryArgs.push(args);
+        return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
+      },
+    },
+  };
+  const hostPermissionPatternForUrl = (rawUrl) => new URL(rawUrl).origin + "/*";
+  const browserTabScopes = new Map();
+  const browserConversationInfo = (provider, rawUrl) => {
+    if (provider !== "grok") return null;
+    const url = new URL(String(rawUrl || ""));
+    const match = url.pathname.match(/^\/c\/([0-9a-f-]{36})\/?$/i);
+    if (!match) return null;
+    const conversationId = match[1].toLowerCase();
+    return {
+      site: "grok",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey: url.origin + "/c/" + conversationId,
+    };
+  };
+  const find = new Function(
+    "chrome",
+    "hostPermissionPatternForUrl",
+    "browserConversationInfo",
+    "browserTabScopes",
+    `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
+  )(chrome, hostPermissionPatternForUrl, browserConversationInfo, browserTabScopes);
+  return { find, queryArgs };
 }
 
 function recoveryHarness(tabRecords) {
@@ -295,6 +334,17 @@ test("canonical ChatGPT session recovery reuses one slugged Project alias instea
   assert.equal(result.target?.projectId, projectId);
   assert.equal(result.target?.convKey, canonical);
   assert.equal(result.target?.observationGeneration, 17);
+});
+
+test("user recovers a Grok direct session | Given service-worker target cache is lost | When canonical recovery runs | Then only the Grok origin is queried and the exact existing tab is reused", async () => {
+  const url = "https://grok.com/c/5fe91b62-b7f0-4e7a-8e4d-fac53208475b";
+  const harness = grokCanonicalIdentityRecoveryHarness([{ id: 81, url }]);
+  const result = await harness.find("grok", url, 7);
+  assert.equal(result.ambiguous, false);
+  assert.equal(result.target?.provider, "grok");
+  assert.equal(result.target?.tabId, 81);
+  assert.equal(result.target?.convKey, url);
+  assert.deepEqual(harness.queryArgs, [{ url: ["https://grok.com/*"] }]);
 });
 
 test("canonical ChatGPT session recovery fails closed when slugged and unslugged aliases are both open", async () => {
