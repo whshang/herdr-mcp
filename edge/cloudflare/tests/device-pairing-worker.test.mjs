@@ -157,7 +157,7 @@ async function pair(env, name) {
   return consume.json();
 }
 
-test("semantic proxy keeps worker-wide route credentials at Edge and requires enrolled-device auth", async () => {
+test("user keeps Worker semantic credentials at Edge | Given an enrolled device and Worker-wide route pool | When semantic evaluation is requested | Then authentication is required and credentials never return", async () => {
   const routes = [{
     name: "edge_fast",
     capability: "evaluate",
@@ -251,7 +251,7 @@ test("semantic proxy keeps worker-wide route credentials at Edge and requires en
   }
 });
 
-test("semantic route pool fails over across independent credentials without leaking either secret", async () => {
+test("user keeps semantic failover bounded | Given two independent route credentials and a rate-limited first route | When semantic evaluation runs | Then the next route succeeds without leaking either secret", async () => {
   const routes = [
     {
       name: "direct-a",
@@ -337,7 +337,7 @@ test("semantic route pool fails over across independent credentials without leak
   }
 });
 
-test("semantic route pool serves chat through the same worker-wide schema", async () => {
+test("user uses one semantic route schema for chat | Given a Worker-wide openai-chat route | When semantic chat is requested | Then the configured URL model credential and content are used", async () => {
   const h = makeEnv({
     HERDR_SEMANTIC_ROUTES: JSON.stringify([{
       name: "chat_primary",
@@ -409,7 +409,7 @@ test("semantic route pool serves chat through the same worker-wide schema", asyn
   }
 });
 
-test("vercel evaluation route converts Jev noul to boolean and normalizes the answer", async () => {
+test("user receives normalized Vercel evaluation | Given an evaluation-v4 Jev route | When a Noul question is evaluated | Then boolean wire output is normalized to Noul", async () => {
   const h = makeEnv({
     HERDR_SEMANTIC_ROUTES: JSON.stringify([{
       name: "fast_gateway",
