@@ -83,10 +83,10 @@ const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-mod
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
-ok(manifest.version === "0.1.103", "manifest version stays aligned with the browser product build");
+ok(manifest.version === "0.1.104", "manifest version stays aligned with the browser product build");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.103"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.103"'), "content version matches manifest");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.104"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.104"'), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
@@ -133,9 +133,14 @@ ok(!/\beval\s*\(/.test(pageAssistSource)
   "Page Assist content code does not expose script evaluation, cookies/storage, or XPath control");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
-    && backgroundSource.includes('grok: "https://grok.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
-  "experimental content-script registration, including Gemini and Grok, requires an explicitly granted site permission");
+  "experimental content-script registration requires an explicitly granted site permission");
+ok(backgroundSource.includes("SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS")
+    && backgroundSource.includes('grok: "https://grok.com/*"')
+    && backgroundSource.includes('id: "herdr-supported-grok"')
+    && backgroundSource.includes('RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS = ["herdr-experimental-grok"]')
+    && !manifest.host_permissions?.includes("https://grok.com/*"),
+  "supported Grok stays dynamically registered behind revocable optional site access");
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";
@@ -915,13 +920,14 @@ ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
 ok(optionsHtml.includes('id="experimentalZAiEnabled"')
     && optionsHtml.includes('id="experimentalDeepSeekEnabled"')
     && optionsHtml.includes('id="experimentalGeminiEnabled"')
-    && optionsHtml.includes('id="experimentalGrokEnabled"')
-    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled"')
+    && !optionsHtml.includes('id="experimentalGrokEnabled"')
+    && optionsHtml.includes('id="grokSiteAccess"')
+    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled"')
     && optionsSource.includes('experimentalZAiEnabled: $("experimentalZAiEnabled").checked')
     && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked')
     && optionsSource.includes('experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked')
-    && optionsSource.includes('experimentalGrokEnabled: $("experimentalGrokEnabled").checked'),
-  "Options exposes separate experimental z.ai, DeepSeek, Gemini, and Grok switches");
+    && optionsSource.includes('chrome.permissions?.contains?.({ origins: ["https://grok.com/*"] })'),
+  "Options separates supported Grok site access from experimental provider switches");
 ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md")
     && optionsSource.includes("setConnectionFailure")
     && [enLocale, zhLocale, jaLocale].every((locale) => locale.open_github_setup_guide),
@@ -929,21 +935,22 @@ ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/a
 ok(backgroundSource.includes('experimentalZAiEnabled: false')
     && backgroundSource.includes('experimentalDeepSeekEnabled: false')
     && backgroundSource.includes('experimentalGeminiEnabled: false')
-    && backgroundSource.includes('experimentalGrokEnabled: true')
     && backgroundSource.includes('site: "gemini"')
     && backgroundSource.includes('matches: ["https://gemini.google.com/*"]')
     && backgroundSource.includes('"content/injector/gemini.js"')
     && backgroundSource.includes('site: "grok"')
+    && backgroundSource.includes('id: "herdr-supported-grok"')
     && backgroundSource.includes('matches: ["https://grok.com/*"]')
     && backgroundSource.includes('"content/injector/grok.js"')
     && backgroundSource.includes('error: "experimental-site-disabled"')
+    && backgroundSource.includes('error: "site-access-disabled"')
     && wakeSource.includes("experimentalZAiEnabled")
     && wakeSource.includes("experimentalDeepSeekEnabled")
     && wakeSource.includes("experimentalGeminiEnabled")
-    && wakeSource.includes("experimentalGrokEnabled")
+    && !wakeSource.includes("experimentalGrokEnabled")
     && jsonBridgeSource.includes("experimentalZAiEnabled")
     && jsonBridgeSource.includes("experimentalDeepSeekEnabled"),
-  "experimental site integrations fail closed in background/content while Gemini and Grok stay outside JSON bridge");
+  "experimental integrations stay fail-closed while supported Grok remains outside the JSON bridge");
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation has no separate legacy user preference");

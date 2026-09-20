@@ -7,7 +7,7 @@ const KEYS = [
   "herdrMcpUrl", "wakeTemplate", "progressTickSec", "progressFallbackSec",
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled",
-  "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled", "experimentalGrokEnabled",
+  "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
   "pageAssistOrigins",
 ];
 let loadedHostPermissionOrigins = [];
@@ -30,7 +30,7 @@ function configuredHostPermissionOrigins(config) {
   if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
   if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
   if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
-  if (config.experimentalGrokEnabled === true) origins.push("https://grok.com/*");
+  if (config.grokSiteAccess === true) origins.push("https://grok.com/*");
   for (const origin of config.pageAssistOrigins || []) {
     const pattern = hostPermissionPatternForUrl(origin);
     if (pattern) origins.push(pattern);
@@ -91,6 +91,10 @@ function applyI18n() {
   $("hint_progress").textContent = t("hint_progress_template");
   $("lab_automation_mode").textContent = t("label_automation_mode");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
+  $("title_supported_webchat").textContent = t("label_supported_webchat_section");
+  $("hint_supported_webchat").textContent = t("hint_supported_webchat_section");
+  $("lab_grok_site_access").textContent = t("label_grok_site_access");
+  $("hint_grok_site_access").textContent = t("hint_grok_site_access");
   $("title_experimental").textContent = t("label_experimental_section");
   $("experimental_badge").textContent = t("experimental_badge");
   $("hint_experimental").textContent = t("hint_experimental_section");
@@ -100,8 +104,6 @@ function applyI18n() {
   $("hint_experimental_deepseek").textContent = t("hint_experimental_deepseek");
   $("lab_experimental_gemini").textContent = t("label_experimental_gemini");
   $("hint_experimental_gemini").textContent = t("hint_experimental_gemini");
-  $("lab_experimental_grok").textContent = t("label_experimental_grok");
-  $("hint_experimental_grok").textContent = t("hint_experimental_grok");
   $("title_page_assist").textContent = t("options_page_assist_section");
   $("hint_page_assist").textContent = t("options_page_assist_hint");
   $("lab_page_assist_origins").textContent = t("label_page_assist_origins");
@@ -132,10 +134,12 @@ async function loadForm() {
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
   $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
-  $("experimentalGrokEnabled").checked = cfg.experimentalGrokEnabled === true;
+  let grokSiteAccess = false;
+  try { grokSiteAccess = await chrome.permissions?.contains?.({ origins: ["https://grok.com/*"] }) === true; } catch (_) {}
+  $("grokSiteAccess").checked = grokSiteAccess;
   const pa = cfg.pageAssistOrigins;
   $("pageAssistOrigins").value = Array.isArray(pa) ? pa.join("\n") : (pa || "");
-  try { loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg); } catch (_) { loadedHostPermissionOrigins = []; }
+  try { loadedHostPermissionOrigins = configuredHostPermissionOrigins({ ...cfg, grokSiteAccess }); } catch (_) { loadedHostPermissionOrigins = []; }
 }
 
 function setupGuideUrl() {
@@ -194,13 +198,12 @@ $("save").addEventListener("click", async () => {
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
-    experimentalGrokEnabled: $("experimentalGrokEnabled").checked,
     pageAssistOrigins: cleanPa,
     uiLocale: getLocale(),
   };
   let nextPermissionOrigins;
   try {
-    nextPermissionOrigins = configuredHostPermissionOrigins(config);
+    nextPermissionOrigins = configuredHostPermissionOrigins({ ...config, grokSiteAccess: $("grokSiteAccess").checked });
   } catch (_) {
     setStatus(`${t("save_failed")}: ${t("host_permission_invalid_url")}`, "err");
     return;

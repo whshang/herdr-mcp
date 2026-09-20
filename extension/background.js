@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.103";
+const H2W_SCRIPT_VERSION = "0.1.104";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -66,14 +66,14 @@ const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
   deepseek: "*://chat.deepseek.com/*",
   gemini: "*://gemini.google.com/*",
-  grok: "*://grok.com/*",
 };
 const EXPERIMENTAL_SITE_PERMISSION_PATTERNS = {
   "z.ai": "https://chat.z.ai/*",
   deepseek: "https://chat.deepseek.com/*",
   gemini: "https://gemini.google.com/*",
-  grok: "https://grok.com/*",
 };
+const SUPPORTED_OPTIONAL_TAB_URLS = { grok: "*://grok.com/*" };
+const SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS = { grok: "https://grok.com/*" };
 const EXPERIMENTAL_CONTENT_SCRIPTS = [
   {
     id: "herdr-experimental-zai",
@@ -113,8 +113,10 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
     runAt: "document_idle",
     persistAcrossSessions: true,
   },
+];
+const SUPPORTED_OPTIONAL_CONTENT_SCRIPTS = [
   {
-    id: "herdr-experimental-grok",
+    id: "herdr-supported-grok",
     site: "grok",
     matches: ["https://grok.com/*"],
     js: [
@@ -126,6 +128,8 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
     persistAcrossSessions: true,
   },
 ];
+const RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS = ["herdr-experimental-grok"];
+const supportedOptionalSiteAccess = { grok: false };
 const PUSH_CONNECT_MS = 5000;
 // The Rust push endpoint emits an SSE heartbeat every 15s. A Native Messaging
 // stream that stays open but delivers no bytes across this wider window is
@@ -420,13 +424,11 @@ let CFG = {
   manualContinueMessage: "",
   idleNudgeEnabled: true,
   // Experimental Web AI origins stay opt-in until their compatibility/UAT gate
-  // passes. Grok became a 1.0-supported WebChat surface and is enabled by
-  // default; the switch above is a revocable off-ramp. z.ai, DeepSeek and
-  // Gemini stay opt-in and are not part of the 1.0 acceptance boundary.
+  // passes. Grok is a supported 1.0 WebChat surface whose authority is the
+  // revocable Chrome site permission, not extension configuration.
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
   experimentalGeminiEnabled: false,
-  experimentalGrokEnabled: true,
   pageAssistOrigins: [],
 };
 let PROJECT_AUTOMATION = {};
@@ -458,14 +460,20 @@ function experimentalSiteEnabled(site) {
   if (site === "z.ai") return CFG.experimentalZAiEnabled === true;
   if (site === "deepseek") return CFG.experimentalDeepSeekEnabled === true;
   if (site === "gemini") return CFG.experimentalGeminiEnabled === true;
-  if (site === "grok") return CFG.experimentalGrokEnabled === true;
   return true;
+}
+
+function supportedOptionalSiteEnabled(site) {
+  return supportedOptionalSiteAccess[site] === true;
 }
 
 function activeH2WTabUrls() {
   const urls = [...CORE_TAB_URLS];
   for (const [site, pattern] of Object.entries(EXPERIMENTAL_TAB_URLS)) {
     if (experimentalSiteEnabled(site)) urls.push(pattern);
+  }
+  for (const [site, pattern] of Object.entries(SUPPORTED_OPTIONAL_TAB_URLS)) {
+    if (supportedOptionalSiteEnabled(site)) urls.push(pattern);
   }
   return urls;
 }
@@ -489,13 +497,13 @@ async function hasHostPermission(pattern) {
   }
 }
 
-async function reloadOpenTabsAfterExperimentalRegistration(site, matches) {
+async function reloadOpenTabsAfterDynamicRegistration(site, matches) {
   if (!chrome.tabs?.query || !chrome.tabs?.reload || !Array.isArray(matches) || matches.length === 0) return;
   let tabs = [];
   try {
     tabs = await chrome.tabs.query({ url: matches });
   } catch (error) {
-    callLog(`experimental content script recovery scan failed for ${site}:`, error?.message || String(error));
+    callLog(`dynamic content script recovery scan failed for ${site}:`, error?.message || String(error));
     return;
   }
   for (const tab of tabs) {
@@ -505,7 +513,7 @@ async function reloadOpenTabsAfterExperimentalRegistration(site, matches) {
       await chrome.tabs.reload(tab.id);
     } catch (error) {
       reloadedTabs.delete(tab.id);
-      callLog(`experimental content script recovery reload failed for ${site}:`, error?.message || String(error));
+      callLog(`dynamic content script recovery reload failed for ${site}:`, error?.message || String(error));
     }
   }
 }
@@ -540,8 +548,54 @@ async function syncExperimentalContentScripts() {
       callLog(`experimental content script sync failed for ${site}:`, error?.message || String(error));
       continue;
     }
-    if (newlyRegistered) await reloadOpenTabsAfterExperimentalRegistration(site, registration.matches);
+    if (newlyRegistered) await reloadOpenTabsAfterDynamicRegistration(site, registration.matches);
   }
+}
+
+async function syncSupportedOptionalContentScripts() {
+  if (!chrome.scripting?.getRegisteredContentScripts
+    || !chrome.scripting?.registerContentScripts
+    || !chrome.scripting?.unregisterContentScripts) return;
+  const ids = [
+    ...SUPPORTED_OPTIONAL_CONTENT_SCRIPTS.map((spec) => spec.id),
+    ...RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS,
+  ];
+  let current = [];
+  try { current = await chrome.scripting.getRegisteredContentScripts({ ids }); } catch (_) { return; }
+  const registered = new Set(current.map((item) => item.id));
+  for (const retiredId of RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS) {
+    if (!registered.has(retiredId)) continue;
+    try { await chrome.scripting.unregisterContentScripts({ ids: [retiredId] }); } catch (_) {}
+  }
+  for (const spec of SUPPORTED_OPTIONAL_CONTENT_SCRIPTS) {
+    const { site, ...registration } = spec;
+    const permitted = await hasHostPermission(SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS[site]);
+    supportedOptionalSiteAccess[site] = permitted;
+    if (!permitted) {
+      if (registered.has(spec.id)) {
+        try { await chrome.scripting.unregisterContentScripts({ ids: [spec.id] }); } catch (_) {}
+      }
+      continue;
+    }
+    let newlyRegistered = false;
+    try {
+      if (registered.has(spec.id) && chrome.scripting?.updateContentScripts) {
+        await chrome.scripting.updateContentScripts([registration]);
+      } else if (!registered.has(spec.id)) {
+        await chrome.scripting.registerContentScripts([registration]);
+        newlyRegistered = true;
+      }
+    } catch (error) {
+      callLog(`supported content script sync failed for ${site}:`, error?.message || String(error));
+      continue;
+    }
+    if (newlyRegistered) await reloadOpenTabsAfterDynamicRegistration(site, registration.matches);
+  }
+}
+
+async function syncDynamicContentScripts() {
+  await syncExperimentalContentScripts();
+  await syncSupportedOptionalContentScripts();
 }
 
 function conversationAutomationSiteForConversation(convKey) {
@@ -722,11 +776,12 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   await detectOrLoadLocale();
   let stored = {};
   try {
-    // The four semantic-policy keys below are migration tombstones only. They
-    // are read so upgrades can erase historical user policy, never to restore
-    // Retired user-programmable semantic-policy controls are removed on startup.
+    // Retired semantic-policy and Grok experimental keys are migration
+    // tombstones only. They are read so upgrades can erase old browser-owned
+    // state, never to restore it as active configuration.
     const keys = [
       ...Object.keys(CFG),
+      "experimentalGrokEnabled",
       "idleNudgeCooldownSec",
       "jevJudgeMode",
       "jevJudgeThreshold",
@@ -743,6 +798,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     ];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
+    delete CFG.experimentalGrokEnabled;
     delete CFG.jevJudgeMode;
     delete CFG.jevJudgeThreshold;
     delete CFG.llmJudgePromptTemplate;
@@ -797,6 +853,12 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       }
     } catch (e) {}
   }
+  // Preserve an explicit legacy Grok opt-out when it can be distinguished.
+  // Missing/true legacy state never grants host access; supported Grok access
+  // is owned solely by Chrome's revocable optional site permission.
+  if (stored.experimentalGrokEnabled === false && chrome.permissions?.remove) {
+    try { await chrome.permissions.remove({ origins: [SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok] }); } catch (_) {}
+  }
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
   // during upgrade. Semantic provider credentials are owned by Runtime/Edge;
@@ -812,6 +874,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     await chrome.storage.local.remove([
       "autoAllow",
       "token",
+      "experimentalGrokEnabled",
       "jevJudgeMode",
       "jevJudgeThreshold",
       "llmJudgePromptTemplate",
@@ -824,9 +887,16 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       "jevJudgeModel",
     ]);
   } catch (e) {}
-  await syncExperimentalContentScripts();
+  await syncDynamicContentScripts();
   resolveConfigReady();
 })();
+
+if (chrome.permissions?.onAdded?.addListener) {
+  chrome.permissions.onAdded.addListener(() => { void syncSupportedOptionalContentScripts(); });
+}
+if (chrome.permissions?.onRemoved?.addListener) {
+  chrome.permissions.onRemoved.addListener(() => { void syncSupportedOptionalContentScripts(); });
+}
 
 // ---- Toolbar badge (replaces the ambiguous in-page status dot) ----
 // Semantics: bound agent working → amber "…"; wake succeeded → green "✓" for 4s;
@@ -4262,16 +4332,15 @@ async function runtimeSemanticChat(messages, { timeoutMs = LLM_JUDGE_TIMEOUT_MS 
 }
 
 /**
- * One-shot OpenAI-compatible chat/completions call to judge if the turn is done.
- * Secrets stay in chrome.storage only — never logged.
+ * One-shot semantic chat request to judge if the turn is done.
+ * Provider routing and credentials stay in the Herdr Runtime semantic service.
  * @param {string} userText
  * @param {string} assistantText
- * @param {object|null} [cfgOverride] — Options test may pass form values before Save.
+ * @param {object|null} [cfgOverride] — Retained call-shape compatibility; ignored.
  */
 /**
- * One bounded OpenAI-compatible chat/completions call for Auto judgements and
- * supervisor decisions. Reuses CFG's provider/model/key and the existing
- * host-permission boundary — no provider, model or endpoint is hardcoded here.
+ * One bounded Runtime semantic chat request for Auto judgements and supervisor
+ * decisions. The extension owns only the bounded prompt/policy projection.
  * @param {Array<{role:string,content:string}>} messages
  */
 async function llmJudgeChatOnce(messages, { timeoutMs = LLM_JUDGE_TIMEOUT_MS } = {}) {
@@ -4284,10 +4353,8 @@ async function fetchLlmJudgeOnce(userText, assistantText, _cfgOverride = null, t
 }
 
 /**
- * Supervisor transport. It reuses the SAME configured provider/model/key and
- * host-permission boundary as the existing Auto judge: no provider, model, key
- * or endpoint is hardcoded here, and the payload is the bounded supervisor
- * projection produced by goal-supervisor-core.js.
+ * Supervisor transport. Runtime owns provider/model/key/endpoint selection;
+ * this layer sends only the bounded projection from goal-supervisor-core.js.
  */
 
 async function fetchLlmJudge(
@@ -7101,8 +7168,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await configReady;
       const rawRegisteringSite = String(msg.site || "").trim();
       const registeringSite = rawRegisteringSite === "claude.ai" ? "claude" : rawRegisteringSite;
-      if (["z.ai", "deepseek", "gemini", "grok"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
+      if (["z.ai", "deepseek", "gemini"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
         sendResponse({ ok: false, error: "experimental-site-disabled" });
+        return;
+      }
+      if (registeringSite === "grok" && !supportedOptionalSiteEnabled("grok")) {
+        sendResponse({ ok: false, error: "site-access-disabled" });
         return;
       }
       const bindings = await loadBindings();
@@ -7554,6 +7625,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       delete incoming.jevJudgeBaseUrl;
       delete incoming.jevJudgeApiKey;
       delete incoming.jevJudgeModel;
+      if (incoming.experimentalGrokEnabled === false && chrome.permissions?.remove) {
+        try { await chrome.permissions.remove({ origins: [SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok] }); } catch (_) {}
+      }
+      delete incoming.experimentalGrokEnabled;
       delete incoming.enabled;
       delete incoming.idleNudgeEnabled;
       CFG = { ...CFG, ...incoming };
@@ -7576,6 +7651,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           "idleNudgeCooldownSec",
           "autoAllow",
           "token",
+          "experimentalGrokEnabled",
           "jevJudgeMode",
           "jevJudgeThreshold",
           "llmJudgePromptTemplate",
@@ -7588,7 +7664,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           "jevJudgeModel",
         ]);
       } catch (e) {}
-      await syncExperimentalContentScripts();
+      await syncDynamicContentScripts();
       void rebuildStreams();
       sendResponse({ ok: true });
       // The initiating Options/content-script request must not wait for every

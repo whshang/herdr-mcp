@@ -60,8 +60,15 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", chatgptPerfScriptVersion: "8", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true, experimentalGrokEnabled: true };
 const listeners = {
   onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
-  onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [],
+  onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [], onPermissionAdded: [], onPermissionRemoved: [],
 };
+const grantedOrigins = new Set([
+  "https://chat.z.ai/*",
+  "https://chat.deepseek.com/*",
+  "https://gemini.google.com/*",
+  "https://grok.com/*",
+  "https://example.com/*",
+]);
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
 let nextTabId = 500;
@@ -263,9 +270,20 @@ function targetListener(tab) {
 
 globalThis.chrome = {
   permissions: {
-    async contains() { return true; },
-    async request() { return true; },
-    async remove() { return true; },
+    async contains({ origins = [] } = {}) { return origins.every((origin) => grantedOrigins.has(origin)); },
+    async request({ origins = [] } = {}) {
+      for (const origin of origins) grantedOrigins.add(origin);
+      for (const fn of listeners.onPermissionAdded) fn({ origins });
+      return true;
+    },
+    async remove({ origins = [] } = {}) {
+      let changed = false;
+      for (const origin of origins) changed = grantedOrigins.delete(origin) || changed;
+      if (changed) for (const fn of listeners.onPermissionRemoved) fn({ origins });
+      return changed;
+    },
+    onAdded: { addListener: (fn) => listeners.onPermissionAdded.push(fn) },
+    onRemoved: { addListener: (fn) => listeners.onPermissionRemoved.push(fn) },
   },
   runtime: {
     id: "test-ext",
@@ -714,7 +732,7 @@ globalThis.chrome = {
         && registeredContentScripts.has("herdr-experimental-gemini")) {
         tab.listener = targetListener(tab);
       } else if (tab?.url?.startsWith("https://grok.com/")
-        && registeredContentScripts.has("herdr-experimental-grok")) {
+        && registeredContentScripts.has("herdr-supported-grok")) {
         tab.listener = targetListener(tab);
       } else if (tab?.url?.startsWith("https://claude.ai/")) {
         tab.listener = targetListener(tab);
@@ -898,7 +916,7 @@ const browserRegister = browserRegistryRequests[0] || {};
 const browserRegisterRetry = browserRegistryRequests[1] || {};
 ok(browserRegister.operation === "endpoint.register"
     && !Object.prototype.hasOwnProperty.call(browserRegister, "browser_family")
-    && browserRegister.extension_version === "0.1.103"
+    && browserRegister.extension_version === "0.1.104"
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
   "browser endpoint registration carries one opaque profile seed and leaves browser product identity to the native host",
   JSON.stringify(browserRegister));
@@ -1084,11 +1102,11 @@ console.log("\n[Claude listener-less recovery]");
     JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
 }
 
-console.log("\n[Grok optional-origin registration and recovery]");
+console.log("\n[Grok supported optional-origin registration and recovery]");
 {
-  ok(await waitForTest(() => registeredContentScripts.has("herdr-experimental-grok")),
-    "Grok opt-in registers one dynamic content script after explicit site permission");
-  const script = registeredContentScripts.get("herdr-experimental-grok") || {};
+  ok(await waitForTest(() => registeredContentScripts.has("herdr-supported-grok")),
+    "supported Grok registers one dynamic content script when site permission exists");
+  const script = registeredContentScripts.get("herdr-supported-grok") || {};
   ok(script.matches?.[0] === "https://grok.com/*"
       && script.js?.includes("content/injector/grok.js")
       && script.js?.includes("content/wake.js")
@@ -1096,12 +1114,9 @@ console.log("\n[Grok optional-origin registration and recovery]");
     "Grok dynamic script is exact-origin scoped and does not inherit the JSON bridge",
     JSON.stringify(script));
 
-  const disabled = await dispatchMessage({
-    type: "h2w_set_config",
-    config: { experimentalGrokEnabled: false },
-  });
-  ok(disabled?.ok === true && !registeredContentScripts.has("herdr-experimental-grok"),
-    "disabling Grok unregisters its dynamic content script");
+  await chrome.permissions.remove({ origins: ["https://grok.com/*"] });
+  ok(await waitForTest(() => !registeredContentScripts.has("herdr-supported-grok")),
+    "revoking Grok site access unregisters its dynamic content script");
   const blocked = await dispatchMessage({
     type: "h2w_register",
     site: "grok",
@@ -1109,19 +1124,16 @@ console.log("\n[Grok optional-origin registration and recovery]");
     url: GROK_CHAT_URL,
     accountNativeIdentity: `grok-account-sha256:${"e".repeat(64)}`,
   }, { tab: { id: 905, url: GROK_CHAT_URL } });
-  ok(blocked?.ok === false && blocked?.error === "experimental-site-disabled",
-    "disabled Grok registration fails closed before Browser Registry mutation",
+  ok(blocked?.ok === false && blocked?.error === "site-access-disabled",
+    "Grok registration fails closed without supported site access",
     JSON.stringify(blocked));
 
   const fallbackTabId = 906;
   tabs.set(fallbackTabId, { id: fallbackTabId, url: GROK_CHAT_URL, status: "complete", listener: null });
   const reloadsBeforeEnable = reloadCalls.length;
-  const enabled = await dispatchMessage({
-    type: "h2w_set_config",
-    config: { experimentalGrokEnabled: true },
-  });
-  ok(enabled?.ok === true && registeredContentScripts.has("herdr-experimental-grok"),
-    "re-enabling Grok re-registers the dynamic content script");
+  await chrome.permissions.request({ origins: ["https://grok.com/*"] });
+  ok(await waitForTest(() => registeredContentScripts.has("herdr-supported-grok")),
+    "granting Grok site access re-registers the dynamic content script");
   ok(reloadCalls.slice(reloadsBeforeEnable).some((call) => call.tabId === fallbackTabId),
     "first Grok dynamic-script registration reloads an already-open complete Grok tab once",
     JSON.stringify(reloadCalls.slice(reloadsBeforeEnable)));
