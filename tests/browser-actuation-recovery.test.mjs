@@ -142,6 +142,7 @@ function recoveryHarness(tabRecords) {
         assert.equal(message?.type, "h2w_get_convkey");
         const record = tabRecords.find((item) => item.id === tabId);
         if (!record || record.error) throw new Error("missing content listener");
+        if (record.hang) return new Promise(() => {});
         return record.live;
       },
     },
@@ -157,13 +158,25 @@ function recoveryHarness(tabRecords) {
       convKey: `https://chatgpt.com/c/${match[1]}`,
     };
   };
+  const sendTabMessageWithTimeout = async (tabId, message) => {
+    const record = tabRecords.find((item) => item.id === tabId);
+    if (record?.hang) throw new Error("tab_message_timeout");
+    return chrome.tabs.sendMessage(tabId, message);
+  };
   const recover = new Function(
     "chrome",
     "activeH2WTabUrls",
     "browserConversationInfoFromSupportedUrl",
     "browserSessionTargets",
+    "sendTabMessageWithTimeout",
     `${recoverySource}; return recoverBrowserSessionTarget;`,
-  )(chrome, activeH2WTabUrls, browserConversationInfoFromSupportedUrl, browserSessionTargets);
+  )(
+    chrome,
+    activeH2WTabUrls,
+    browserConversationInfoFromSupportedUrl,
+    browserSessionTargets,
+    sendTabMessageWithTimeout,
+  );
   return { recover, browserSessionTargets };
 }
 
@@ -710,6 +723,34 @@ test("service-worker recovery reports a newer generation instead of reusing a st
   assert.equal(recovered.ambiguous, false);
   assert.equal(recovered.observedGeneration, 8);
   assert.equal(browserSessionTargets.has(sessionRef), false);
+});
+
+test("user recovers an exact browser session | Given another supported tab never answers identity probing | When service-worker target recovery scans the browser | Then the exact live session is returned without waiting on the stalled tab", async () => {
+  const sessionRef = "br_exact";
+  const generation = 17;
+  const { recover } = recoveryHarness([
+    {
+      id: 71,
+      url: "https://chatgpt.com/c/exact",
+      live: {
+        convKey: "https://chatgpt.com/c/exact",
+        url: "https://chatgpt.com/c/exact",
+        site: "chatgpt",
+        browserSessionRef: sessionRef,
+        browserGeneration: generation,
+      },
+    },
+    {
+      id: 72,
+      url: "https://chatgpt.com/c/unrelated",
+      hang: true,
+    },
+  ]);
+
+  const recovered = await recover(sessionRef, generation);
+  assert.equal(recovered.ambiguous, false);
+  assert.equal(recovered.target?.tabId, 71);
+  assert.equal(recovered.target?.conversationId, "exact");
 });
 
 test("page identity handshake lazily recovers only opaque Browser Registry identity", () => {

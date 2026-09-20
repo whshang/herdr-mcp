@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.110";
+const H2W_SCRIPT_VERSION = "0.1.111";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -3252,7 +3252,11 @@ async function recoverBrowserSessionTarget(sessionRef, expectedGeneration) {
       if (!tab?.id || tab.status !== "complete") continue;
       let live = null;
       try {
-        live = await chrome.tabs.sendMessage(tab.id, { type: "h2w_get_convkey" });
+        live = await sendTabMessageWithTimeout(
+          tab.id,
+          { type: "h2w_get_convkey" },
+          1000,
+        );
       } catch (_) {
         continue;
       }
