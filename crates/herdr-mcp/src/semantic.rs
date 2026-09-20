@@ -775,18 +775,18 @@ fn config_file_allows_secret(path: &Path) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticTransport {
-    TypeSafeSystemOne,
-    OpenRouterDecisions,
-    VercelEvaluation,
+enum SemanticProtocol {
+    Jev,
+    EvaluationV4,
+    OpenAiChat,
 }
 
-impl SemanticTransport {
+impl SemanticProtocol {
     fn parse(value: &str) -> Option<Self> {
         match value {
-            "typesafe-systemone" => Some(Self::TypeSafeSystemOne),
-            "openrouter-decisions" => Some(Self::OpenRouterDecisions),
-            "vercel-evaluation" => Some(Self::VercelEvaluation),
+            "jev" => Some(Self::Jev),
+            "evaluation-v4" => Some(Self::EvaluationV4),
+            "openai-chat" => Some(Self::OpenAiChat),
             _ => None,
         }
     }
@@ -846,7 +846,7 @@ impl SemanticChatProvider for EdgeSemanticChatProvider {
 
 struct HttpSemanticProvider {
     id: String,
-    transport: SemanticTransport,
+    protocol: SemanticProtocol,
     api_key: String,
     endpoint: Url,
     model: String,
@@ -856,9 +856,9 @@ struct HttpSemanticProvider {
 impl HttpSemanticProvider {
     fn new(
         id: String,
-        transport: SemanticTransport,
+        protocol: SemanticProtocol,
         api_key: String,
-        base_url: String,
+        url: String,
         model: String,
     ) -> Result<Self, SemanticError> {
         if !valid_semantic_value(&api_key)
@@ -871,9 +871,9 @@ impl HttpSemanticProvider {
         }
         Ok(Self {
             id,
-            transport,
+            protocol,
             api_key,
-            endpoint: semantic_transport_endpoint_url(transport, &base_url)?,
+            endpoint: semantic_endpoint_url(&url)?,
             model,
             client: Client::builder()
                 .timeout(PROVIDER_TIMEOUT)
@@ -887,11 +887,20 @@ impl HttpSemanticProvider {
         route: crate::config::SemanticRouteConfig,
         allow_inline_secret: bool,
     ) -> Option<Self> {
-        let transport = SemanticTransport::parse(&route.transport)?;
+        if route.capability != "evaluate" {
+            return None;
+        }
+        let protocol = SemanticProtocol::parse(&route.protocol)?;
+        if !matches!(
+            protocol,
+            SemanticProtocol::Jev | SemanticProtocol::EvaluationV4
+        ) {
+            return None;
+        }
         if !allow_inline_secret {
             return None;
         }
-        Self::new(id, transport, route.api_key?, route.base_url?, route.model?).ok()
+        Self::new(id, protocol, route.api_key?, route.url?, route.model?).ok()
     }
 
     fn questions_json(&self, request: &SemanticRequest) -> Map<String, Value> {
@@ -899,10 +908,10 @@ impl HttpSemanticProvider {
             .questions
             .iter()
             .map(|(id, question)| {
-                let value = match self.transport {
-                    SemanticTransport::VercelEvaluation => question.to_vercel_json(),
-                    SemanticTransport::TypeSafeSystemOne
-                    | SemanticTransport::OpenRouterDecisions => question.to_json(),
+                let value = match self.protocol {
+                    SemanticProtocol::EvaluationV4 => question.to_vercel_json(),
+                    SemanticProtocol::Jev => question.to_json(),
+                    SemanticProtocol::OpenAiChat => return (id.clone(), Value::Null),
                 };
                 (id.clone(), value)
             })
@@ -925,15 +934,15 @@ impl SemanticProvider for HttpSemanticProvider {
             .client
             .post(self.endpoint.clone())
             .bearer_auth(&self.api_key);
-        let body = match self.transport {
-            SemanticTransport::TypeSafeSystemOne | SemanticTransport::OpenRouterDecisions => {
+        let body = match self.protocol {
+            SemanticProtocol::Jev => {
                 json!({
                     "state": request.state,
                     "model": self.model,
                     "questions": questions,
                 })
             }
-            SemanticTransport::VercelEvaluation => {
+            SemanticProtocol::EvaluationV4 => {
                 builder = builder
                     .header("ai-evaluation-model-specification-version", "4")
                     .header("ai-model-id", &self.model);
@@ -942,6 +951,7 @@ impl SemanticProvider for HttpSemanticProvider {
                     "questions": questions,
                 })
             }
+            SemanticProtocol::OpenAiChat => return Err(SemanticError::new("route_invalid")),
         };
         let response = builder
             .timeout(timeout)
@@ -963,13 +973,12 @@ impl SemanticProvider for HttpSemanticProvider {
         let payload = response
             .json::<Value>()
             .map_err(|_| SemanticError::new("invalid_response"))?;
-        match self.transport {
-            SemanticTransport::TypeSafeSystemOne | SemanticTransport::OpenRouterDecisions => {
-                parse_response(&self.id, request, payload)
-            }
-            SemanticTransport::VercelEvaluation => {
+        match self.protocol {
+            SemanticProtocol::Jev => parse_response(&self.id, request, payload),
+            SemanticProtocol::EvaluationV4 => {
                 parse_vercel_response(&self.id, &self.model, request, payload)
             }
+            SemanticProtocol::OpenAiChat => Err(SemanticError::new("route_invalid")),
         }
     }
 }
@@ -983,12 +992,7 @@ struct OpenAiChatProvider {
 }
 
 impl OpenAiChatProvider {
-    fn new(
-        id: String,
-        api_key: String,
-        base_url: String,
-        model: String,
-    ) -> Result<Self, SemanticError> {
+    fn new(id: String, api_key: String, url: String, model: String) -> Result<Self, SemanticError> {
         if !valid_semantic_value(&api_key)
             || !valid_semantic_value(&model)
             || model.len() > 256
@@ -1000,7 +1004,7 @@ impl OpenAiChatProvider {
         Ok(Self {
             id,
             api_key,
-            endpoint: openai_chat_endpoint_url(&base_url)?,
+            endpoint: semantic_endpoint_url(&url)?,
             model,
             client: Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -1014,13 +1018,13 @@ impl OpenAiChatProvider {
         route: crate::config::SemanticRouteConfig,
         allow_inline_secret: bool,
     ) -> Option<Self> {
-        if route.transport != "openai-chat" {
+        if route.capability != "chat" || route.protocol != "openai-chat" {
             return None;
         }
         if !allow_inline_secret {
             return None;
         }
-        Self::new(id, route.api_key?, route.base_url?, route.model?).ok()
+        Self::new(id, route.api_key?, route.url?, route.model?).ok()
     }
 }
 
@@ -1100,21 +1104,6 @@ fn local_semantic_chat_providers() -> Vec<Box<dyn SemanticChatProvider>> {
         .collect()
 }
 
-fn semantic_transport_endpoint_url(
-    transport: SemanticTransport,
-    base_url: &str,
-) -> Result<Url, SemanticError> {
-    let mut url = semantic_endpoint_url(base_url)?;
-    let base_path = url.path().trim_end_matches('/').to_owned();
-    let suffix = match transport {
-        SemanticTransport::TypeSafeSystemOne => "/systemone",
-        SemanticTransport::OpenRouterDecisions => "/alpha/decisions",
-        SemanticTransport::VercelEvaluation => "/evaluation-model",
-    };
-    url.set_path(&format!("{base_path}{suffix}"));
-    Ok(url)
-}
-
 fn semantic_endpoint_url(raw: &str) -> Result<Url, SemanticError> {
     let url = Url::parse(raw.trim()).map_err(|_| SemanticError::new("endpoint_invalid"))?;
     if url.username() != ""
@@ -1131,15 +1120,6 @@ fn semantic_endpoint_url(raw: &str) -> Result<Url, SemanticError> {
             .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost"));
     if (!secure && !loopback_http) || url.host_str().is_none() {
         return Err(SemanticError::new("endpoint_invalid"));
-    }
-    Ok(url)
-}
-
-fn openai_chat_endpoint_url(raw: &str) -> Result<Url, SemanticError> {
-    let mut url = semantic_endpoint_url(raw)?;
-    let normalized = url.path().trim_end_matches('/').to_owned();
-    if !normalized.ends_with("/chat/completions") {
-        url.set_path(&format!("{normalized}/chat/completions"));
     }
     Ok(url)
 }
@@ -1417,7 +1397,7 @@ mod tests {
             );
         let response = HttpSemanticProvider::new(
             "route:test".to_owned(),
-            SemanticTransport::TypeSafeSystemOne,
+            SemanticProtocol::Jev,
             "test-key".to_owned(),
             base_url,
             "jev-test".to_owned(),
@@ -1467,7 +1447,7 @@ mod tests {
                 Box::new(
                     HttpSemanticProvider::new(
                         "route-a".to_owned(),
-                        SemanticTransport::TypeSafeSystemOne,
+                        SemanticProtocol::Jev,
                         "key-a".to_owned(),
                         route_a,
                         "jev-a".to_owned(),
@@ -1477,7 +1457,7 @@ mod tests {
                 Box::new(
                     HttpSemanticProvider::new(
                         "route-b".to_owned(),
-                        SemanticTransport::TypeSafeSystemOne,
+                        SemanticProtocol::Jev,
                         "key-b".to_owned(),
                         route_b,
                         "jev-b".to_owned(),
@@ -1515,7 +1495,7 @@ mod tests {
                 Box::new(
                     HttpSemanticProvider::new(
                         "typed-bad".to_owned(),
-                        SemanticTransport::TypeSafeSystemOne,
+                        SemanticProtocol::Jev,
                         "key-a".to_owned(),
                         typed_bad,
                         "jev-bad".to_owned(),
@@ -1525,7 +1505,7 @@ mod tests {
                 Box::new(
                     HttpSemanticProvider::new(
                         "typed-good".to_owned(),
-                        SemanticTransport::TypeSafeSystemOne,
+                        SemanticProtocol::Jev,
                         "key-b".to_owned(),
                         typed_good,
                         "jev-good".to_owned(),
@@ -1619,17 +1599,39 @@ mod tests {
     }
 
     #[test]
-    fn config_toml_is_the_only_local_semantic_configuration_source() {
+    fn config_json_is_the_only_local_semantic_configuration_source() {
         let _guard = crate::test_env::lock();
         let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
         let config_dir =
             std::env::temp_dir().join(format!("herdr-semantic-config-{}", std::process::id()));
         let _ = fs::remove_dir_all(&config_dir);
         fs::create_dir_all(&config_dir).unwrap();
-        let path = config_dir.join("config.toml");
+        let path = config_dir.join("config.json");
         fs::write(
             &path,
-            "[semantic.route.fast_a]\ntransport = \"typesafe-systemone\"\nbase_url = \"https://api.typesafe.ai/v1\"\nmodel = \"jev-latest\"\napi_key = \"file-key\"\n\n[semantic.route.chat_a]\ntransport = \"openai-chat\"\nbase_url = \"https://chat.example/v1\"\nmodel = \"chat-model\"\napi_key = \"chat-key\"\n",
+            r#"{
+  "semantic": {
+    "routes": [
+      {
+        "name": "fast_a",
+        "capability": "evaluate",
+        "protocol": "jev",
+        "url": "https://api.typesafe.ai/v1/systemone",
+        "model": "jev-latest",
+        "api_key": "file-key"
+      },
+      {
+        "name": "chat_a",
+        "capability": "chat",
+        "protocol": "openai-chat",
+        "url": "https://chat.example/v1/chat/completions",
+        "model": "chat-model",
+        "api_key": "chat-key"
+      }
+    ]
+  }
+}
+"#,
         )
         .unwrap();
         #[cfg(unix)]
@@ -1683,10 +1685,36 @@ mod tests {
             std::env::temp_dir().join(format!("herdr-semantic-local-first-{}", std::process::id()));
         let _ = fs::remove_dir_all(&config_dir);
         fs::create_dir_all(&config_dir).unwrap();
-        let path = config_dir.join("config.toml");
+        let path = config_dir.join("config.json");
         fs::write(
             &path,
-            "[edge]\npublic_origin = \"https://edge.example\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n\n[semantic.route.fast_a]\ntransport = \"typesafe-systemone\"\nbase_url = \"https://api.typesafe.ai/v1\"\nmodel = \"jev-latest\"\napi_key = \"local-eval-key\"\n\n[semantic.route.chat_a]\ntransport = \"openai-chat\"\nbase_url = \"https://chat.example/v1\"\nmodel = \"chat-model\"\napi_key = \"local-chat-key\"\n",
+            r#"{
+  "edge": {
+    "public_origin": "https://edge.example",
+    "device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  },
+  "semantic": {
+    "routes": [
+      {
+        "name": "fast_a",
+        "capability": "evaluate",
+        "protocol": "jev",
+        "url": "https://api.typesafe.ai/v1/systemone",
+        "model": "jev-latest",
+        "api_key": "local-eval-key"
+      },
+      {
+        "name": "chat_a",
+        "capability": "chat",
+        "protocol": "openai-chat",
+        "url": "https://chat.example/v1/chat/completions",
+        "model": "chat-model",
+        "api_key": "local-chat-key"
+      }
+    ]
+  }
+}
+"#,
         )
         .unwrap();
         #[cfg(unix)]
@@ -1736,8 +1764,14 @@ mod tests {
         let _ = fs::remove_dir_all(&config_dir);
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("config.toml"),
-            "[edge]\npublic_origin = \"https://edge.example\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+            config_dir.join("config.json"),
+            r#"{
+  "edge": {
+    "public_origin": "https://edge.example",
+    "device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  }
+}
+"#,
         )
         .unwrap();
         unsafe {
@@ -1770,12 +1804,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a live semantic route in config.toml and network access"]
+    #[ignore = "requires a live semantic route in config.json and network access"]
     fn live_configured_semantic_contract_smoke() {
         let service = SemanticService::from_config();
         assert!(
             service.configured(),
-            "config.toml must contain a typed semantic route"
+            "config.json must contain a typed semantic route"
         );
         let response = service
             .evaluate(

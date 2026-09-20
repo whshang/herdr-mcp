@@ -879,7 +879,7 @@ mod tests {
         ));
         RuntimePaths {
             instance: crate::instance::InstanceId::default_instance(),
-            config_file: config_dir.join("config.toml"),
+            config_file: config_dir.join("config.json"),
             dev_state_dir: config_dir.join("dev-state"),
             config_dir,
             herdr_socket: None,

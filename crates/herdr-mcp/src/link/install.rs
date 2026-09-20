@@ -324,14 +324,14 @@ pub(crate) fn inherited_proxy_env() -> BTreeMap<String, String> {
 }
 
 pub(crate) fn configured_edge_ws_url(home: &Path) -> Option<String> {
-    let path = home.join(".config").join("herdr-mcp").join("config.toml");
+    let path = home.join(".config").join("herdr-mcp").join("config.json");
     Config::load_for_instance(&path, &InstanceId::default_instance())
         .ok()
         .and_then(|config| config.edge_ws_url().ok().flatten())
 }
 
 pub(crate) fn configured_edge_device_identity(home: &Path) -> Option<(String, String)> {
-    let path = home.join(".config").join("herdr-mcp").join("config.toml");
+    let path = home.join(".config").join("herdr-mcp").join("config.json");
     let config = Config::load_for_instance(&path, &InstanceId::default_instance()).ok()?;
     let device_id = config.edge_device_id?;
     let service = format!("herdr-edge-link-{device_id}");
@@ -823,8 +823,8 @@ mod tests {
         let config_dir = home.join(".config/herdr-mcp");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("config.toml"),
-            "[edge]\npublic_origin = \"https://custom.example\"\nlink_upstream_origin = \"https://backend.workers.dev\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+            config_dir.join("config.json"),
+            r#"{"edge":{"public_origin":"https://custom.example","link_upstream_origin":"https://backend.workers.dev","device_id":"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}"#,
         )
         .unwrap();
 

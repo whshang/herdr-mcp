@@ -32,7 +32,7 @@
 
 このローカル状態は、Manifest V3 service worker とブラウザページが、Chrome による suspend や再読み込みの後で安全に復旧できるように存在します。publisher は、このローカル状態を受け取る拡張の analytics または telemetry サービスを運用していません。
 
-ユーザーは、拡張を削除するか Chrome でその拡張/サイトデータを消去することで、このローカルに保存された拡張データを削除できます。Semantic provider の route と credential は拡張ストレージに保存されません。単一マシン用の値は mode-`0600` の herdr-mcp `config.toml`、全体共有の fallback 値は認証済み Cloudflare Worker route pool にだけ保存します。
+ユーザーは、拡張を削除するか Chrome でその拡張/サイトデータを消去することで、このローカルに保存された拡張データを削除できます。Semantic provider の route と credential は拡張ストレージに保存されません。単一マシン用の値は mode-`0600` の herdr-mcp `config.json`、全体共有の fallback 値は認証済み Cloudflare Worker route pool にだけ保存します。
 
 ## ネットワークの宛先
 
@@ -71,7 +71,7 @@ Chrome Web Store ポリシーの参照: <https://developer.chrome.com/docs/webst
 
 ## セキュリティ
 
-拡張が開始する公衆ネットワーク接続は、該当する場合に HTTPS/WSS を使用します。拡張と同一コンピュータ上の native program との間の Native Messaging 通信はローカルに留まります。Semantic provider secret は mode-`0600` の単一マシン用 `config.toml` または認証済み Cloudflare Worker の全体共有 route pool にだけ保存し、拡張は active configuration として保持しません。これらの secret はプロジェクトリポジトリや publisher の telemetry に意図的に書き込まれることはありません。
+拡張が開始する公衆ネットワーク接続は、該当する場合に HTTPS/WSS を使用します。拡張と同一コンピュータ上の native program との間の Native Messaging 通信はローカルに留まります。Semantic provider secret は mode-`0600` の単一マシン用 `config.json` または認証済み Cloudflare Worker の全体共有 route pool にだけ保存し、拡張は active configuration として保持しません。これらの secret はプロジェクトリポジトリや publisher の telemetry に意図的に書き込まれることはありません。
 
 ## このポリシーの変更
 

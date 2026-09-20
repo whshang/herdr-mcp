@@ -160,8 +160,9 @@ async function pair(env, name) {
 test("semantic proxy keeps worker-wide route credentials at Edge and requires enrolled-device auth", async () => {
   const routes = [{
     name: "edge_fast",
-    transport: "typesafe-systemone",
-    base_url: "https://api.typesafe.ai/v1",
+    capability: "evaluate",
+    protocol: "jev",
+    url: "https://api.typesafe.ai/v1/systemone",
     model: "jev-edge",
     api_key: "edge-typesafe-secret",
   }];
@@ -198,7 +199,8 @@ test("semantic proxy keeps worker-wide route credentials at Edge and requires en
     chat_available: false,
     routes: [{
       name: "edge_fast",
-      transport: "typesafe-systemone",
+      capability: "evaluate",
+      protocol: "jev",
       model: "jev-edge",
     }],
   });
@@ -253,15 +255,17 @@ test("semantic route pool fails over across independent credentials without leak
   const routes = [
     {
       name: "direct-a",
-      transport: "typesafe-systemone",
-      base_url: "https://typesafe.example",
+      capability: "evaluate",
+      protocol: "jev",
+      url: "https://typesafe.example/systemone",
       model: "jev-a",
       api_key: "route-secret-a",
     },
     {
       name: "openrouter-b",
-      transport: "openrouter-decisions",
-      base_url: "https://openrouter.example/api",
+      capability: "evaluate",
+      protocol: "jev",
+      url: "https://openrouter.example/api/alpha/decisions",
       model: "~typesafe/jev-latest",
       api_key: "route-secret-b",
     },
@@ -289,8 +293,8 @@ test("semantic route pool fails over across independent credentials without leak
   const statusPayload = await status.json();
   assert.equal(statusPayload.available, true);
   assert.deepEqual(
-    statusPayload.routes.map(({ name, transport, model }) => ({ name, transport, model })),
-    routes.map(({ name, transport, model }) => ({ name, transport, model })),
+    statusPayload.routes.map(({ name, capability, protocol, model }) => ({ name, capability, protocol, model })),
+    routes.map(({ name, capability, protocol, model }) => ({ name, capability, protocol, model })),
   );
   assert.equal(JSON.stringify(statusPayload).includes("route-secret"), false);
 
@@ -337,8 +341,9 @@ test("semantic route pool serves chat through the same worker-wide schema", asyn
   const h = makeEnv({
     HERDR_SEMANTIC_ROUTES: JSON.stringify([{
       name: "chat_primary",
-      transport: "openai-chat",
-      base_url: "https://chat.example/v1",
+      capability: "chat",
+      protocol: "openai-chat",
+      url: "https://chat.example/v1/chat/completions",
       model: "chat-model",
       api_key: "chat-secret",
     }]),
@@ -357,7 +362,8 @@ test("semantic route pool serves chat through the same worker-wide schema", asyn
     chat_available: true,
     routes: [{
       name: "chat_primary",
-      transport: "openai-chat",
+      capability: "chat",
+      protocol: "openai-chat",
       model: "chat-model",
     }],
   });
@@ -407,8 +413,9 @@ test("vercel evaluation route converts Jev noul to boolean and normalizes the an
   const h = makeEnv({
     HERDR_SEMANTIC_ROUTES: JSON.stringify([{
       name: "fast_gateway",
-      transport: "vercel-evaluation",
-      base_url: "https://ai-gateway.vercel.sh/v4/ai",
+      capability: "evaluate",
+      protocol: "evaluation-v4",
+      url: "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
       model: "typesafe-ai/jev",
       api_key: "vercel-secret",
     }]),

@@ -32,7 +32,7 @@
 
 这些本地状态用于让 Manifest V3 service worker 或网页被 Chrome 挂起、刷新后能够安全恢复。发布者没有运行一个用于接收这些本地状态的扩展 Analytics / Telemetry 服务。
 
-用户可以通过移除扩展或清除 Chrome 中对应的扩展/站点数据来删除这些本地数据。语义 Provider route 与凭证不存放在扩展配置中：单机值只放在 mode-`0600` 的 herdr-mcp `config.toml`，全局 fallback 值放在已认证 Cloudflare Worker 的共享 route pool。
+用户可以通过移除扩展或清除 Chrome 中对应的扩展/站点数据来删除这些本地数据。语义 Provider route 与凭证不存放在扩展配置中：单机值只放在 mode-`0600` 的 herdr-mcp `config.json`，全局 fallback 值放在已认证 Cloudflare Worker 的共享 route pool。
 
 ## 数据会发往哪里
 
@@ -71,7 +71,7 @@ Chrome Web Store 政策参考：<https://developer.chrome.com/docs/webstore/user
 
 ## 安全
 
-扩展发起的公网连接在适用场景使用 HTTPS/WSS；浏览器扩展与同一台电脑上 native program 之间的 Native Messaging 保持本地。语义 Provider secret 只保存在 mode-`0600` 的单机 `config.toml` 或已认证 Cloudflare Worker 的全局 route pool 中，扩展不把它们作为活动配置保存；这些秘密不会被有意写入项目仓库或发布者 Telemetry。
+扩展发起的公网连接在适用场景使用 HTTPS/WSS；浏览器扩展与同一台电脑上 native program 之间的 Native Messaging 保持本地。语义 Provider secret 只保存在 mode-`0600` 的单机 `config.json` 或已认证 Cloudflare Worker 的全局 route pool 中，扩展不把它们作为活动配置保存；这些秘密不会被有意写入项目仓库或发布者 Telemetry。
 
 ## 政策变更
 

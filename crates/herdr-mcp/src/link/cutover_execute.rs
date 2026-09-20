@@ -978,8 +978,8 @@ mod tests {
         let config_dir = home.join(".config/herdr-mcp");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("config.toml"),
-            "[edge]\npublic_origin = \"https://herdr-mcp.agentforme.cc.cd\"\n",
+            config_dir.join("config.json"),
+            r#"{"edge":{"public_origin":"https://herdr-mcp.agentforme.cc.cd"}}"#,
         )
         .unwrap();
         let program = candidate_program_arguments(&home).unwrap();
@@ -1003,8 +1003,8 @@ mod tests {
         let config_dir = home.join(".config/herdr-mcp");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("config.toml"),
-            "[edge]\npublic_origin = \"https://custom.example\"\nlink_upstream_origin = \"https://backend.workers.dev\"\n",
+            config_dir.join("config.json"),
+            r#"{"edge":{"public_origin":"https://custom.example","link_upstream_origin":"https://backend.workers.dev"}}"#,
         )
         .unwrap();
         let program = candidate_program_arguments(&home).unwrap();

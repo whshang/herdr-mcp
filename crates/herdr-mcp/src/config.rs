@@ -1,13 +1,17 @@
 use crate::instance::InstanceId;
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use url::Url;
 
 pub const DEFAULT_RUNTIME_PORT: u16 = 8772;
 pub const DEFAULT_DEV_PORT: u16 = 8872;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UpdateChannel {
     Stable,
     Preview,
@@ -43,18 +47,96 @@ pub struct Config {
     pub semantic: SemanticConfig,
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SemanticConfig {
     pub routes: Vec<SemanticRouteConfig>,
 }
 
-#[derive(Clone, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticRouteConfig {
     pub name: String,
-    pub transport: String,
-    pub base_url: Option<String>,
+    pub capability: String,
+    pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct JsonConfigInput {
+    runtime: JsonRuntimeInput,
+    dev: JsonDevInput,
+    update: JsonUpdateInput,
+    edge: JsonEdgeInput,
+    semantic: SemanticConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct JsonRuntimeInput {
+    port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct JsonDevInput {
+    port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct JsonUpdateInput {
+    channel: Option<UpdateChannel>,
+    check: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct JsonEdgeInput {
+    public_origin: Option<String>,
+    link_upstream_origin: Option<String>,
+    device_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonConfigOutput<'a> {
+    runtime: JsonRuntimeOutput,
+    dev: JsonDevOutput,
+    update: JsonUpdateOutput,
+    edge: JsonEdgeOutput<'a>,
+    semantic: &'a SemanticConfig,
+}
+
+#[derive(Serialize)]
+struct JsonRuntimeOutput {
+    port: u16,
+}
+
+#[derive(Serialize)]
+struct JsonDevOutput {
+    port: u16,
+}
+
+#[derive(Serialize)]
+struct JsonUpdateOutput {
+    channel: UpdateChannel,
+    check: bool,
+}
+
+#[derive(Serialize)]
+struct JsonEdgeOutput<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_origin: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_upstream_origin: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_id: Option<&'a str>,
 }
 
 impl std::fmt::Debug for SemanticRouteConfig {
@@ -62,8 +144,9 @@ impl std::fmt::Debug for SemanticRouteConfig {
         formatter
             .debug_struct("SemanticRouteConfig")
             .field("name", &self.name)
-            .field("transport", &self.transport)
-            .field("base_url", &self.base_url)
+            .field("capability", &self.capability)
+            .field("protocol", &self.protocol)
+            .field("url", &self.url)
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .finish()
@@ -86,7 +169,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Defaults used when config.toml is absent. Alpha/prerelease binaries keep
+    /// Defaults used when config.json is absent. Alpha/prerelease binaries keep
     /// dogfood on `preview` so discovery still sees current GitHub alphas.
     #[allow(dead_code)]
     pub fn missing_file_default() -> Self {
@@ -112,49 +195,58 @@ impl Config {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::missing_file_default_for_instance(instance));
+                let legacy_path = path.with_file_name("config.toml");
+                let legacy = match fs::read_to_string(&legacy_path) {
+                    Ok(content) => Some(content),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot read legacy config {}: {error}",
+                            legacy_path.display()
+                        ));
+                    }
+                };
+                let Some(legacy) = legacy else {
+                    return Ok(Self::missing_file_default_for_instance(instance));
+                };
+                let config = parse_legacy_toml(&legacy, instance).map_err(|error| {
+                    format!("invalid legacy config {}: {error}", legacy_path.display())
+                })?;
+                write_json_config(path, &config)?;
+                let backup = path.with_file_name("config.toml.migrated");
+                if !backup.exists() {
+                    let _ = fs::rename(&legacy_path, &backup);
+                }
+                return Ok(config);
             }
             Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
         };
-        parse(&content).map_err(|error| format!("invalid config {}: {error}", path.display()))
+        parse_json(&content, instance)
+            .map_err(|error| format!("invalid config {}: {error}", path.display()))
     }
 
     pub fn render(&self) -> String {
-        let mut rendered = format!(
-            "[runtime]\nport = {}\n\n[dev]\nport = {}\n\n[update]\nchannel = \"{}\"\ncheck = {}\n",
-            self.runtime_port,
-            self.dev_port,
-            self.update_channel.as_str(),
-            self.update_check
-        );
-        if self.edge_public_origin.is_some()
-            || self.edge_link_upstream_origin.is_some()
-            || self.edge_device_id.is_some()
-        {
-            rendered.push_str("\n[edge]\n");
-            if let Some(origin) = &self.edge_public_origin {
-                rendered.push_str(&format!("public_origin = \"{origin}\"\n"));
-            }
-            if let Some(upstream) = &self.edge_link_upstream_origin {
-                rendered.push_str(&format!("link_upstream_origin = \"{upstream}\"\n"));
-            }
-            if let Some(device_id) = &self.edge_device_id {
-                rendered.push_str(&format!("device_id = \"{device_id}\"\n"));
-            }
-        }
-        for route in &self.semantic.routes {
-            rendered.push_str(&format!("\n[semantic.route.{}]\n", route.name));
-            rendered.push_str(&format!("transport = \"{}\"\n", route.transport));
-            if let Some(base_url) = &route.base_url {
-                rendered.push_str(&format!("base_url = \"{base_url}\"\n"));
-            }
-            if let Some(model) = &route.model {
-                rendered.push_str(&format!("model = \"{model}\"\n"));
-            }
-            if let Some(api_key) = &route.api_key {
-                rendered.push_str(&format!("api_key = \"{api_key}\"\n"));
-            }
-        }
+        let output = JsonConfigOutput {
+            runtime: JsonRuntimeOutput {
+                port: self.runtime_port,
+            },
+            dev: JsonDevOutput {
+                port: self.dev_port,
+            },
+            update: JsonUpdateOutput {
+                channel: self.update_channel,
+                check: self.update_check,
+            },
+            edge: JsonEdgeOutput {
+                public_origin: self.edge_public_origin.as_deref(),
+                link_upstream_origin: self.edge_link_upstream_origin.as_deref(),
+                device_id: self.edge_device_id.as_deref(),
+            },
+            semantic: &self.semantic,
+        };
+        let mut rendered = serde_json::to_string_pretty(&output)
+            .expect("serializing herdr-mcp config cannot fail");
+        rendered.push('\n');
         rendered
     }
 
@@ -216,8 +308,67 @@ impl Config {
     }
 }
 
-fn parse(content: &str) -> Result<Config, String> {
-    let mut config = Config::default();
+fn parse_json(content: &str, instance: &InstanceId) -> Result<Config, String> {
+    let input: JsonConfigInput =
+        serde_json::from_str(content).map_err(|error| format!("invalid JSON: {error}"))?;
+    let mut config = Config::missing_file_default_for_instance(instance);
+    if let Some(port) = input.runtime.port {
+        if port == 0 {
+            return Err("runtime.port must be greater than zero".to_owned());
+        }
+        config.runtime_port = port;
+    }
+    if let Some(port) = input.dev.port {
+        if port == 0 {
+            return Err("dev.port must be greater than zero".to_owned());
+        }
+        config.dev_port = port;
+    }
+    if let Some(channel) = input.update.channel {
+        config.update_channel = channel;
+    }
+    if let Some(check) = input.update.check {
+        config.update_check = check;
+    }
+    if let Some(origin) = input.edge.public_origin {
+        config.edge_public_origin = Some(normalize_edge_public_origin(&origin)?);
+    }
+    if let Some(origin) = input.edge.link_upstream_origin {
+        config.edge_link_upstream_origin = Some(normalize_edge_origin_field(
+            &origin,
+            "edge.link_upstream_origin",
+        )?);
+    }
+    if let Some(device_id) = input.edge.device_id {
+        config.edge_device_id = Some(normalize_device_id(&device_id)?);
+    }
+    config.semantic = input.semantic;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn write_json_config(path: &Path, config: &Config) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "cannot create config directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, config.render())
+        .map_err(|error| format!("cannot write config {}: {error}", temp.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("cannot secure config {}: {error}", temp.display()))?;
+    fs::rename(&temp, path)
+        .map_err(|error| format!("cannot activate config {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn parse_legacy_toml(content: &str, instance: &InstanceId) -> Result<Config, String> {
+    let mut config = Config::missing_file_default_for_instance(instance);
     let mut section = "";
 
     for (index, raw_line) in content.lines().enumerate() {
@@ -226,31 +377,21 @@ fn parse(content: &str) -> Result<Config, String> {
         if line.is_empty() {
             continue;
         }
+        if line.starts_with("[[") && line.ends_with("]]") {
+            section = line[2..line.len() - 2].trim();
+            if section != "semantic.route" {
+                return Err(format!(
+                    "line {line_number}: unknown array section [[{section}]]"
+                ));
+            }
+            config.semantic.routes.push(SemanticRouteConfig::default());
+            continue;
+        }
         if line.starts_with('[') && line.ends_with(']') {
             section = line[1..line.len() - 1].trim();
             match section {
                 "runtime" | "dev" | "update" | "edge" => continue,
-                _ => {
-                    let Some(route_name) = section.strip_prefix("semantic.route.") else {
-                        return Err(format!("line {line_number}: unknown section [{section}]"));
-                    };
-                    validate_semantic_route_name(route_name, line_number)?;
-                    if config
-                        .semantic
-                        .routes
-                        .iter()
-                        .any(|route| route.name == route_name)
-                    {
-                        return Err(format!(
-                            "line {line_number}: duplicate semantic route '{route_name}'"
-                        ));
-                    }
-                    config.semantic.routes.push(SemanticRouteConfig {
-                        name: route_name.to_owned(),
-                        ..SemanticRouteConfig::default()
-                    });
-                    continue;
-                }
+                _ => return Err(format!("line {line_number}: unknown section [{section}]")),
             }
         }
 
@@ -297,23 +438,21 @@ fn parse(content: &str) -> Result<Config, String> {
             ("edge", "device_id") => {
                 config.edge_device_id = Some(normalize_device_id(unquote(value))?)
             }
-            (section, key) if section.starts_with("semantic.route.") => {
-                let route_name = section.trim_start_matches("semantic.route.");
-                let route = config
-                    .semantic
-                    .routes
-                    .iter_mut()
-                    .find(|route| route.name == route_name)
-                    .ok_or_else(|| {
-                        format!("line {line_number}: semantic route section is missing")
-                    })?;
+            ("semantic.route", key) => {
+                let route = config.semantic.routes.last_mut().ok_or_else(|| {
+                    format!("line {line_number}: semantic route section is missing")
+                })?;
                 match key {
-                    "transport" => {
-                        route.transport = parse_semantic_value(value, line_number, "transport", 64)?
+                    "name" => route.name = parse_semantic_value(value, line_number, "name", 64)?,
+                    "capability" => {
+                        route.capability =
+                            parse_semantic_value(value, line_number, "capability", 32)?
                     }
-                    "base_url" => {
-                        route.base_url =
-                            Some(parse_semantic_value(value, line_number, "base_url", 2048)?)
+                    "protocol" => {
+                        route.protocol = parse_semantic_value(value, line_number, "protocol", 64)?
+                    }
+                    "url" => {
+                        route.url = Some(parse_semantic_value(value, line_number, "url", 2048)?)
                     }
                     "model" => {
                         route.model = Some(parse_semantic_value(value, line_number, "model", 256)?)
@@ -332,20 +471,44 @@ fn parse(content: &str) -> Result<Config, String> {
         }
     }
 
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<(), String> {
+    let mut route_names = std::collections::BTreeSet::new();
     for route in &config.semantic.routes {
-        if route.transport.is_empty()
-            || route.base_url.is_none()
+        validate_semantic_route_name(&route.name, 0)?;
+        if !route_names.insert(route.name.as_str()) {
+            return Err(format!("duplicate semantic route '{}'", route.name));
+        }
+        if !matches!(route.capability.as_str(), "evaluate" | "chat")
+            || !matches!(
+                route.protocol.as_str(),
+                "jev" | "evaluation-v4" | "openai-chat"
+            )
+            || route.url.is_none()
             || route.model.is_none()
             || route.api_key.is_none()
         {
             return Err(format!(
-                "semantic.route.{} must define transport, base_url, model, and api_key",
+                "semantic.route.{} must define valid capability, protocol, url, model, and api_key",
+                route.name
+            ));
+        }
+        let protocol_matches_capability = match route.capability.as_str() {
+            "evaluate" => matches!(route.protocol.as_str(), "jev" | "evaluation-v4"),
+            "chat" => route.protocol == "openai-chat",
+            _ => false,
+        };
+        if !protocol_matches_capability {
+            return Err(format!(
+                "semantic.route.{} capability/protocol mismatch",
                 route.name
             ));
         }
     }
-
-    Ok(config)
+    Ok(())
 }
 
 fn validate_semantic_route_name(value: &str, line_number: usize) -> Result<(), String> {
@@ -355,9 +518,13 @@ fn validate_semantic_route_name(value: &str, line_number: usize) -> Result<(), S
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        return Err(format!(
-            "line {line_number}: semantic route name must use only letters, digits, '_' or '-'"
-        ));
+        return Err(if line_number == 0 {
+            "semantic route name must use only letters, digits, '_' or '-'".to_owned()
+        } else {
+            format!(
+                "line {line_number}: semantic route name must use only letters, digits, '_' or '-'"
+            )
+        });
     }
     Ok(())
 }
@@ -471,6 +638,10 @@ fn binary_is_prerelease() -> bool {
 mod tests {
     use super::*;
 
+    fn parse(content: &str) -> Result<Config, String> {
+        parse_legacy_toml(content, &InstanceId::default_instance())
+    }
+
     #[test]
     fn defaults_are_product_defaults() {
         assert_eq!(Config::default().runtime_port, 8772);
@@ -519,15 +690,19 @@ mod tests {
             public_origin = "https://herdr.example.com"
             device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
-            [semantic.route.fast_a]
-            transport = "typesafe-systemone"
-            base_url = "https://api.typesafe.ai/v1"
+            [[semantic.route]]
+            name = "fast_a"
+            capability = "evaluate"
+            protocol = "jev"
+            url = "https://api.typesafe.ai/v1/systemone"
             model = "jev-latest"
             api_key = "test-key"
 
-            [semantic.route.fast_b]
-            transport = "openrouter-decisions"
-            base_url = "https://openrouter.ai/api"
+            [[semantic.route]]
+            name = "fast_b"
+            capability = "evaluate"
+            protocol = "jev"
+            url = "https://openrouter.ai/api/alpha/decisions"
             model = "~typesafe/jev-latest"
             api_key = "backup-key"
             "#,
@@ -561,14 +736,15 @@ mod tests {
         );
         assert_eq!(config.semantic.routes.len(), 2);
         assert_eq!(config.semantic.routes[0].name, "fast_a");
-        assert_eq!(config.semantic.routes[0].transport, "typesafe-systemone");
+        assert_eq!(config.semantic.routes[0].capability, "evaluate");
+        assert_eq!(config.semantic.routes[0].protocol, "jev");
         assert_eq!(
             config.semantic.routes[0].api_key.as_deref(),
             Some("test-key")
         );
         assert_eq!(
-            config.semantic.routes[0].base_url.as_deref(),
-            Some("https://api.typesafe.ai/v1")
+            config.semantic.routes[0].url.as_deref(),
+            Some("https://api.typesafe.ai/v1/systemone")
         );
         assert_eq!(
             config.semantic.routes[0].model.as_deref(),
@@ -576,8 +752,8 @@ mod tests {
         );
         assert_eq!(config.semantic.routes[1].name, "fast_b");
         assert_eq!(
-            config.semantic.routes[1].base_url.as_deref(),
-            Some("https://openrouter.ai/api")
+            config.semantic.routes[1].url.as_deref(),
+            Some("https://openrouter.ai/api/alpha/decisions")
         );
         assert_eq!(
             config.semantic.routes[1].api_key.as_deref(),
@@ -628,17 +804,23 @@ mod tests {
         assert!(upstream_err.contains("edge.link_upstream_origin must use https://"));
         assert!(parse("[edge]\ndevice_id = \"dev_bad\"").is_err());
         assert!(parse("[unknown]\nvalue = 1").is_err());
-        assert!(parse("[semantic.route.bad name]\ntransport = \"typesafe-systemone\"").is_err());
+        assert!(
+            parse("[[semantic.route]]\nname = \"bad name\"\ncapability = \"evaluate\"").is_err()
+        );
         assert!(parse(
-            "[semantic.route.route1]\ntransport = \"openrouter-decisions\"\nbase_url = \"https://openrouter.ai/api\"\nmodel = \"~typesafe/jev-latest\""
+            "[[semantic.route]]\nname = \"route1\"\ncapability = \"evaluate\"\nprotocol = \"jev\"\nurl = \"https://openrouter.ai/api/alpha/decisions\"\nmodel = \"~typesafe/jev-latest\""
         )
         .is_err());
         assert!(parse(
-            "[semantic.route.route1]\ntransport = \"openrouter-decisions\"\nbase_url = \"https://openrouter.ai/api\"\nmodel = \"~typesafe/jev-latest\"\napi_key = \"key\"\napi_key_env = \"SHOULD_FAIL\""
+            "[[semantic.route]]\nname = \"route1\"\ncapability = \"evaluate\"\nprotocol = \"jev\"\nurl = \"https://openrouter.ai/api/alpha/decisions\"\nmodel = \"~typesafe/jev-latest\"\napi_key = \"key\"\napi_key_env = \"SHOULD_FAIL\""
         )
         .is_err());
         assert!(parse(
-            "[semantic.route.route1]\ntransport = \"typesafe-systemone\"\n[semantic.route.route1]\ntransport = \"openrouter-decisions\""
+            "[[semantic.route]]\nname = \"route1\"\ncapability = \"evaluate\"\nprotocol = \"jev\"\nurl = \"https://api.typesafe.ai/v1/systemone\"\nmodel = \"jev-latest\"\napi_key = \"key\"\n[[semantic.route]]\nname = \"route1\"\ncapability = \"chat\"\nprotocol = \"openai-chat\"\nurl = \"https://chat.example/v1/chat/completions\"\nmodel = \"chat\"\napi_key = \"key\""
+        )
+        .is_err());
+        assert!(parse(
+            "[[semantic.route]]\nname = \"route1\"\ncapability = \"chat\"\nprotocol = \"jev\"\nurl = \"https://api.typesafe.ai/v1/systemone\"\nmodel = \"jev-latest\"\napi_key = \"key\""
         )
         .is_err());
     }
@@ -656,14 +838,18 @@ mod tests {
             semantic: SemanticConfig {
                 routes: vec![SemanticRouteConfig {
                     name: "fast_a".to_owned(),
-                    transport: "typesafe-systemone".to_owned(),
-                    base_url: Some("https://api.typesafe.ai/v1".to_owned()),
+                    capability: "evaluate".to_owned(),
+                    protocol: "jev".to_owned(),
+                    url: Some("https://api.typesafe.ai/v1/systemone".to_owned()),
                     model: Some("jev-latest".to_owned()),
                     api_key: Some("test-key".to_owned()),
                 }],
             },
         };
-        assert_eq!(parse(&config.render()).unwrap(), config);
+        assert_eq!(
+            parse_json(&config.render(), &InstanceId::default_instance()).unwrap(),
+            config
+        );
     }
 
     #[test]
@@ -672,8 +858,9 @@ mod tests {
             semantic: SemanticConfig {
                 routes: vec![SemanticRouteConfig {
                     name: "fast_a".to_owned(),
-                    transport: "typesafe-systemone".to_owned(),
-                    base_url: Some("https://api.typesafe.ai/v1".to_owned()),
+                    capability: "evaluate".to_owned(),
+                    protocol: "jev".to_owned(),
+                    url: Some("https://api.typesafe.ai/v1/systemone".to_owned()),
                     model: Some("jev-latest".to_owned()),
                     api_key: Some("super-secret-key".to_owned()),
                 }],
@@ -682,12 +869,74 @@ mod tests {
         };
 
         let rendered = config.render_redacted();
-        assert!(rendered.contains("api_key = \"[REDACTED]\""));
+        assert!(rendered.contains("\"api_key\": \"[REDACTED]\""));
         assert!(!rendered.contains("super-secret-key"));
 
         let debug = format!("{config:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("super-secret-key"));
+    }
+
+    #[test]
+    fn json_rejects_unknown_fields_and_invalid_route_protocols() {
+        assert!(
+            parse_json(
+                r#"{"runtime":{"port":8772,"unknown":true}}"#,
+                &InstanceId::default_instance()
+            )
+            .is_err()
+        );
+        assert!(parse_json(
+            r#"{"semantic":{"routes":[{"name":"fast","capability":"chat","protocol":"jev","url":"https://example.com","model":"m","api_key":"k"}]}}"#,
+            &InstanceId::default_instance()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn load_migrates_legacy_toml_once_to_json() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-config-json-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let json_path = root.join("config.json");
+        let legacy_path = root.join("config.toml");
+        fs::write(
+            &legacy_path,
+            r#"[runtime]
+port = 9000
+
+[edge]
+public_origin = "https://herdr.example.com"
+
+[[semantic.route]]
+name = "fast"
+capability = "evaluate"
+protocol = "jev"
+url = "https://api.typesafe.ai/v1/systemone"
+model = "jev-latest"
+api_key = "secret"
+"#,
+        )
+        .unwrap();
+
+        let config =
+            Config::load_for_instance(&json_path, &InstanceId::default_instance()).unwrap();
+        assert_eq!(config.runtime_port, 9000);
+        assert!(json_path.is_file());
+        assert!(root.join("config.toml.migrated").is_file());
+        let migrated = fs::read_to_string(&json_path).unwrap();
+        assert!(migrated.starts_with("{\n"));
+        assert!(migrated.contains("\"api_key\": \"secret\""));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&json_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -612,7 +612,7 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         "absent"
     };
 
-    let config_path = home.join(".config").join("herdr-mcp").join("config.toml");
+    let config_path = home.join(".config").join("herdr-mcp").join("config.json");
     let config = Config::load_for_instance(&config_path, &InstanceId::default_instance()).ok();
     let edge_public_origin = config.as_ref().and_then(|c| c.edge_public_origin.clone());
     let link_upstream_origin = config

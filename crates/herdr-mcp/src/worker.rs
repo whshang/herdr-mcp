@@ -2662,7 +2662,7 @@ fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), Stri
     })?;
     let temp = paths
         .config_file
-        .with_extension(format!("toml.tmp-{}", std::process::id()));
+        .with_extension(format!("json.tmp-{}", std::process::id()));
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -3754,7 +3754,7 @@ mod tests {
             now_ms()
         ));
         fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("config.toml");
+        let config_path = dir.join("config.json");
         let paths = crate::paths::RuntimePaths {
             config_dir: dir.clone(),
             config_file: config_path.clone(),
@@ -3840,7 +3840,7 @@ mod tests {
             now_ms()
         ));
         fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("config.toml");
+        let config_path = dir.join("config.json");
         let paths = crate::paths::RuntimePaths {
             config_dir: dir.clone(),
             config_file: config_path.clone(),
@@ -3903,7 +3903,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         // Config file carries the OLD device binding before the transaction.
-        let config_path = dir.join("config.toml");
+        let config_path = dir.join("config.json");
         let previous_config = Config {
             edge_public_origin: Some("https://old.example".to_owned()),
             edge_device_id: Some(OLD_DEVICE_ID.to_owned()),
@@ -4055,7 +4055,7 @@ mod tests {
         ));
         let paths = crate::paths::RuntimePaths {
             config_dir: dir.clone(),
-            config_file: dir.join("config.toml"),
+            config_file: dir.join("config.json"),
             dev_state_dir: dir.join("dev-state"),
             herdr_socket: None,
             instance: InstanceId::default_instance(),
@@ -4132,7 +4132,7 @@ mod tests {
         ));
         let paths = crate::paths::RuntimePaths {
             config_dir: dir.clone(),
-            config_file: dir.join("config.toml"),
+            config_file: dir.join("config.json"),
             dev_state_dir: dir.join("dev-state"),
             herdr_socket: None,
             instance: InstanceId::default_instance(),
@@ -4235,7 +4235,7 @@ mod tests {
             now_ms()
         ));
         fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("config.toml");
+        let config_path = dir.join("config.json");
         let paths = crate::paths::RuntimePaths {
             config_dir: dir.clone(),
             config_file: config_path.clone(),

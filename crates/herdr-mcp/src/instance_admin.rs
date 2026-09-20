@@ -163,7 +163,7 @@ fn inventory_row(
         (false, false, true) => "loaded_without_artifacts",
         (false, false, false) => "absent",
     };
-    let config_file = config_dir.join("config.toml");
+    let config_file = config_dir.join("config.json");
     let port = if config_present {
         Config::load_for_instance(&config_file, &id)
             .ok()
@@ -288,8 +288,8 @@ mod tests {
         ));
         fs::create_dir_all(home.join(".config/herdr-mcp")).unwrap();
         fs::write(
-            home.join(".config/herdr-mcp/config.toml"),
-            b"[runtime]\nport = 8772\n",
+            home.join(".config/herdr-mcp/config.json"),
+            br#"{"runtime":{"port":8772}}"#,
         )
         .unwrap();
         fs::create_dir_all(home.join(".config/herdr-mcp-uat043")).unwrap();

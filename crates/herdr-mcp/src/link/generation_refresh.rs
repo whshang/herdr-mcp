@@ -1097,13 +1097,13 @@ mod tests {
         std::fs::write(generation.join("herdr-mcp"), b"test-binary").unwrap();
         symlink("generations/rust-testconnect01", runtime.join("current")).unwrap();
         std::fs::write(
-            config_dir.join("config.toml"),
-            "[edge]\npublic_origin = \"https://edge.example\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+            config_dir.join("config.json"),
+            r#"{"edge":{"public_origin":"https://edge.example","device_id":"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}"#,
         )
         .unwrap();
         let paths = RuntimePaths {
             instance: crate::instance::InstanceId::default_instance(),
-            config_file: config_dir.join("config.toml"),
+            config_file: config_dir.join("config.json"),
             config_dir: config_dir.clone(),
             dev_state_dir: home.join(".config/herdr-mcp-dev"),
             herdr_socket: None,
@@ -1197,8 +1197,8 @@ mod tests {
         let config_dir = root.join(".config/herdr-mcp");
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
-            config_dir.join("config.toml"),
-            "[edge]\npublic_origin = \"https://edge.example\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+            config_dir.join("config.json"),
+            r#"{"edge":{"public_origin":"https://edge.example","device_id":"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}"#,
         )
         .unwrap();
         let plist_path = root.join("link-prod.plist");
@@ -1349,8 +1349,8 @@ mod tests {
         let config_dir = root.join(".config/herdr-mcp");
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
-            config_dir.join("config.toml"),
-            "[edge]\npublic_origin = \"https://edge.example\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+            config_dir.join("config.json"),
+            r#"{"edge":{"public_origin":"https://edge.example","device_id":"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}"#,
         )
         .unwrap();
         let plist_path = root.join("link-prod.plist");
@@ -1426,8 +1426,8 @@ mod tests {
         let config_dir = root.join(".config/herdr-mcp");
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
-            config_dir.join("config.toml"),
-            "[edge]\npublic_origin = \"https://custom.example\"\nlink_upstream_origin = \"https://backend.workers.dev\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+            config_dir.join("config.json"),
+            r#"{"edge":{"public_origin":"https://custom.example","link_upstream_origin":"https://backend.workers.dev","device_id":"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"}}"#,
         )
         .unwrap();
         let plist_path = root.join("link-prod.plist");

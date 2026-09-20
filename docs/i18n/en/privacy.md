@@ -32,7 +32,7 @@ The extension uses `chrome.storage.local` to keep settings and continuity state 
 
 This local state exists so the Manifest V3 service worker and browser pages can recover safely after Chrome suspends or reloads them. The publisher does not operate an extension analytics or telemetry service that receives this local state.
 
-Users can remove this locally stored extension data by removing the extension or clearing its extension/site data in Chrome. Semantic-provider routes and credentials stay outside extension storage: workstation-specific values live only in mode-`0600` herdr-mcp `config.toml`, while fleet-wide fallback values live in the authenticated Cloudflare Worker route pool.
+Users can remove this locally stored extension data by removing the extension or clearing its extension/site data in Chrome. Semantic-provider routes and credentials stay outside extension storage: workstation-specific values live only in mode-`0600` herdr-mcp `config.json`, while fleet-wide fallback values live in the authenticated Cloudflare Worker route pool.
 
 ## Network destinations
 
@@ -71,7 +71,7 @@ Chrome Web Store policy reference: <https://developer.chrome.com/docs/webstore/u
 
 ## Security
 
-Public network connections initiated by the extension use HTTPS/WSS where applicable. Native Messaging traffic between the extension and the native program on the same computer remains local. Semantic-provider secrets live only in mode-`0600` workstation `config.toml` or the authenticated Cloudflare Worker-wide route pool; the extension does not retain them as active configuration, and they are not intentionally written to project repositories or publisher telemetry.
+Public network connections initiated by the extension use HTTPS/WSS where applicable. Native Messaging traffic between the extension and the native program on the same computer remains local. Semantic-provider secrets live only in mode-`0600` workstation `config.json` or the authenticated Cloudflare Worker-wide route pool; the extension does not retain them as active configuration, and they are not intentionally written to project repositories or publisher telemetry.
 
 ## Changes to this policy
 

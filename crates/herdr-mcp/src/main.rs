@@ -217,7 +217,10 @@ fn run() -> Result<ExitCode, String> {
                     print!("{}", config.render_redacted());
                 }
                 cli::ConfigCommand::Init { edge_origin } => {
-                    if paths.config_file.exists() {
+                    let legacy_config = paths.config_file.with_file_name("config.toml");
+                    if paths.config_file.exists() || legacy_config.exists() {
+                        let _ =
+                            config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
                         return Err(format!(
                             "config already exists: {}",
                             paths.config_file.display()

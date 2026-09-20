@@ -2271,7 +2271,7 @@ mod tests {
             ))
             .unwrap(),
             config_dir: root.to_path_buf(),
-            config_file: root.join("config.toml"),
+            config_file: root.join("config.json"),
             dev_state_dir: root.join("dev-state"),
             herdr_socket: Some(root.join("herdr.sock")),
         }
@@ -3133,7 +3133,7 @@ mod tests {
         let paths = RuntimePaths {
             instance: crate::instance::InstanceId::default_instance(),
             config_dir: root.clone(),
-            config_file: root.join("config.toml"),
+            config_file: root.join("config.json"),
             dev_state_dir: root.join("dev"),
             herdr_socket: None,
         };

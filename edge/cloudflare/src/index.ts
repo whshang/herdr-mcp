@@ -94,16 +94,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-type SemanticTransport =
-  | "typesafe-systemone"
-  | "openrouter-decisions"
-  | "vercel-evaluation"
-  | "openai-chat";
+type SemanticCapability = "evaluate" | "chat";
+type SemanticProtocol = "jev" | "evaluation-v4" | "openai-chat";
 
 type EdgeSemanticRoute = {
   name: string;
-  transport: SemanticTransport;
-  endpoint: string;
+  capability: SemanticCapability;
+  protocol: SemanticProtocol;
+  url: string;
   model: string;
   apiKey: string;
 };
@@ -119,10 +117,13 @@ const SEMANTIC_CHAT_BUDGET_MS = 15_000;
 let semanticRouteCursor = 0;
 const semanticRouteCooldowns = new Map<string, number>();
 
-function semanticTransport(value: unknown): SemanticTransport | null {
-  return value === "typesafe-systemone"
-    || value === "openrouter-decisions"
-    || value === "vercel-evaluation"
+function semanticCapability(value: unknown): SemanticCapability | null {
+  return value === "evaluate" || value === "chat" ? value : null;
+}
+
+function semanticProtocol(value: unknown): SemanticProtocol | null {
+  return value === "jev"
+    || value === "evaluation-v4"
     || value === "openai-chat"
     ? value
     : null;
@@ -135,7 +136,7 @@ function validSemanticValue(value: unknown, max: number): value is string {
     && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
-function semanticBaseUrl(value: string): URL | null {
+function semanticUrl(value: string): string | null {
   try {
     const url = new URL(value);
     if (
@@ -145,25 +146,10 @@ function semanticBaseUrl(value: string): URL | null {
       || url.search
       || url.hash
     ) return null;
-    url.pathname = url.pathname.replace(/\/$/, "");
-    return url;
+    return url.toString();
   } catch {
     return null;
   }
-}
-
-function semanticRouteEndpoint(transport: SemanticTransport, rawBaseUrl: string): string | null {
-  const url = semanticBaseUrl(rawBaseUrl);
-  if (!url) return null;
-  const suffix = transport === "typesafe-systemone"
-    ? "/systemone"
-    : transport === "openrouter-decisions"
-      ? "/alpha/decisions"
-      : transport === "vercel-evaluation"
-        ? "/evaluation-model"
-        : "/chat/completions";
-  if (!url.pathname.endsWith(suffix)) url.pathname += suffix;
-  return url.toString();
 }
 
 function semanticRoutes(env: Env): { ok: true; routes: EdgeSemanticRoute[] } | { ok: false } {
@@ -179,24 +165,32 @@ function semanticRoutes(env: Env): { ok: true; routes: EdgeSemanticRoute[] } | {
     const routes: EdgeSemanticRoute[] = [];
     for (const value of parsed) {
       if (!isRecord(value)) return { ok: false };
-      const allowed = new Set(["name", "transport", "base_url", "model", "api_key"]);
+      const allowed = new Set(["name", "capability", "protocol", "url", "model", "api_key"]);
       if (Object.keys(value).some((key) => !allowed.has(key))) return { ok: false };
       const name = typeof value.name === "string" ? value.name.trim() : "";
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || names.has(name)) return { ok: false };
-      const transport = semanticTransport(value.transport);
-      if (!transport) return { ok: false };
-      const baseUrl = value.base_url;
+
+      const capability = semanticCapability(value.capability);
+      const protocol = semanticProtocol(value.protocol);
+      if (!capability || !protocol) return { ok: false };
+      if (
+        (capability === "evaluate" && protocol === "openai-chat")
+        || (capability === "chat" && protocol !== "openai-chat")
+      ) return { ok: false };
+
+      const rawUrl = value.url;
       const model = value.model;
       const apiKey = value.api_key;
       if (
-        !validSemanticValue(baseUrl, 2048)
+        !validSemanticValue(rawUrl, 2048)
         || !validSemanticValue(model, 256)
         || !validSemanticValue(apiKey, 4096)
       ) return { ok: false };
-      const endpoint = semanticRouteEndpoint(transport, baseUrl);
-      if (!endpoint) return { ok: false };
+
+      const url = semanticUrl(rawUrl);
+      if (!url) return { ok: false };
       names.add(name);
-      routes.push({ name, transport, endpoint, model, apiKey });
+      routes.push({ name, capability, protocol, url, model, apiKey });
     }
     return { ok: true, routes };
   } catch {
@@ -209,12 +203,12 @@ function semanticQuestionsForRoute(
   questions: Record<string, unknown>,
 ): Record<string, unknown> | null {
   const converted: Record<string, unknown> = {};
-  if (route.transport === "openai-chat") return null;
+  if (route.capability !== "evaluate") return null;
   for (const [id, raw] of Object.entries(questions)) {
     if (!isRecord(raw)) return null;
     const type = raw.type;
     if (type !== "noul" && type !== "choice" && type !== "score") return null;
-    if (route.transport === "vercel-evaluation" && type === "noul") {
+    if (route.protocol === "evaluation-v4" && type === "noul") {
       converted[id] = { ...raw, type: "boolean" };
     } else {
       converted[id] = raw;
@@ -228,7 +222,7 @@ function normalizeSemanticPayload(
   raw: unknown,
 ): Record<string, unknown> | null {
   if (!isRecord(raw) || !isRecord(raw.answers)) return null;
-  if (route.transport !== "vercel-evaluation") {
+  if (route.protocol !== "evaluation-v4") {
     if (typeof raw.model !== "string") return null;
     return raw;
   }
@@ -269,7 +263,7 @@ async function callSemanticRoute(
     "content-type": "application/json",
   };
   let body: Record<string, unknown>;
-  if (route.transport === "vercel-evaluation") {
+  if (route.protocol === "evaluation-v4") {
     headers["ai-evaluation-model-specification-version"] = "4";
     headers["ai-model-id"] = route.model;
     body = { state, questions: routeQuestions };
@@ -278,7 +272,7 @@ async function callSemanticRoute(
   }
 
   try {
-    const upstream = await fetch(route.endpoint, {
+    const upstream = await fetch(route.url, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -311,7 +305,13 @@ async function callSemanticChatRoute(
   messages: unknown,
   timeoutMs: number,
 ): Promise<SemanticRouteResult> {
-  if (route.transport !== "openai-chat" || !Array.isArray(messages) || messages.length < 1 || messages.length > 32) {
+  if (
+    route.capability !== "chat"
+    || route.protocol !== "openai-chat"
+    || !Array.isArray(messages)
+    || messages.length < 1
+    || messages.length > 32
+  ) {
     return { ok: false, fatal: true, code: "semantic_request_invalid" };
   }
   for (const message of messages) {
@@ -325,7 +325,7 @@ async function callSemanticChatRoute(
     }
   }
   try {
-    const upstream = await fetch(route.endpoint, {
+    const upstream = await fetch(route.url, {
       method: "POST",
       headers: {
         authorization: "Bearer " + route.apiKey,
@@ -400,8 +400,8 @@ async function handleSemanticProxy(
   }
   const routes = configured.routes;
   if (request.method === "GET") {
-    const evaluateAvailable = routes.some((route) => route.transport !== "openai-chat");
-    const chatAvailable = routes.some((route) => route.transport === "openai-chat");
+    const evaluateAvailable = routes.some((route) => route.capability === "evaluate");
+    const chatAvailable = routes.some((route) => route.capability === "chat");
     return noStoreJsonResponse({
       ok: true,
       available: evaluateAvailable || chatAvailable,
@@ -409,7 +409,8 @@ async function handleSemanticProxy(
       chat_available: chatAvailable,
       routes: routes.map((route) => ({
         name: route.name,
-        transport: route.transport,
+        capability: route.capability,
+        protocol: route.protocol,
         model: route.model,
       })),
     });
@@ -446,9 +447,7 @@ async function handleSemanticProxy(
     return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
   }
 
-  const eligibleRoutes = routes.filter((route) =>
-    mode === "chat" ? route.transport === "openai-chat" : route.transport !== "openai-chat"
-  );
+  const eligibleRoutes = routes.filter((route) => route.capability === mode);
   if (eligibleRoutes.length === 0) {
     return noStoreJsonResponse({ ok: false, code: "semantic_provider_unavailable" }, 503);
   }
