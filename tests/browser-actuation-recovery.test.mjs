@@ -133,10 +133,19 @@ function grokCanonicalIdentityRecoveryHarness(tabRecords) {
 
 function recoveryHarness(tabRecords) {
   const browserSessionTargets = new Map();
+  const queryArgs = [];
   const chrome = {
     tabs: {
-      async query() {
-        return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
+      async query(args = {}) {
+        queryArgs.push(args);
+        const patterns = Array.isArray(args.url) ? args.url : args.url ? [args.url] : [];
+        return tabRecords
+          .filter(({ url }) => {
+            if (!patterns.length) return true;
+            const host = new URL(url).host;
+            return patterns.some((pattern) => String(pattern).includes(host));
+          })
+          .map(({ id, url, status = "complete" }) => ({ id, url, status }));
       },
       async sendMessage(tabId, message) {
         assert.equal(message?.type, "h2w_get_convkey");
@@ -147,15 +156,37 @@ function recoveryHarness(tabRecords) {
       },
     },
   };
-  const activeH2WTabUrls = () => ["https://chatgpt.com/*"];
+  const activeH2WTabUrlsForProvider = async (provider) => {
+    if (provider === "claude") return ["https://claude.ai/*"];
+    if (provider === "grok") return ["https://grok.com/*"];
+    return ["https://chatgpt.com/*"];
+  };
   const browserConversationInfoFromSupportedUrl = (rawUrl) => {
-    const match = String(rawUrl || "").match(/^https:\/\/chatgpt\.com\/c\/([^/?#]+)/);
+    const url = new URL(String(rawUrl || ""));
+    const match = url.pathname.match(/^\/c\/([^/?#]+)/);
+    if (url.hostname === "chatgpt.com" && match) {
+      return {
+        site: "chatgpt",
+        conversation_id: match[1],
+        project_id: null,
+        convKey: `https://chatgpt.com/c/${match[1]}`,
+      };
+    }
+    const claudeMatch = url.pathname.match(/^\/chat\/([^/?#]+)/);
+    if (url.hostname === "claude.ai" && claudeMatch) {
+      return {
+        site: "claude",
+        conversation_id: claudeMatch[1],
+        project_id: null,
+        convKey: `https://claude.ai/chat/${claudeMatch[1]}`,
+      };
+    }
     if (!match) return null;
     return {
-      site: "chatgpt",
+      site: "grok",
       conversation_id: match[1],
       project_id: null,
-      convKey: `https://chatgpt.com/c/${match[1]}`,
+      convKey: `https://grok.com/c/${match[1]}`,
     };
   };
   const sendTabMessageWithTimeout = async (tabId, message) => {
@@ -165,19 +196,19 @@ function recoveryHarness(tabRecords) {
   };
   const recover = new Function(
     "chrome",
-    "activeH2WTabUrls",
+    "activeH2WTabUrlsForProvider",
     "browserConversationInfoFromSupportedUrl",
     "browserSessionTargets",
     "sendTabMessageWithTimeout",
     `${recoverySource}; return recoverBrowserSessionTarget;`,
   )(
     chrome,
-    activeH2WTabUrls,
+    activeH2WTabUrlsForProvider,
     browserConversationInfoFromSupportedUrl,
     browserSessionTargets,
     sendTabMessageWithTimeout,
   );
-  return { recover, browserSessionTargets };
+  return { recover, browserSessionTargets, queryArgs };
 }
 
 function createAnchorHarness({ tabs = [], scopes = [], targets = [], recovered = null } = {}) {
@@ -751,6 +782,36 @@ test("user recovers an exact browser session | Given another supported tab never
   assert.equal(recovered.ambiguous, false);
   assert.equal(recovered.target?.tabId, 71);
   assert.equal(recovered.target?.conversationId, "exact");
+});
+
+test("user recovers the requested provider session | Given an unrelated provider tab is stalled | When exact service-worker recovery runs | Then only the requested provider origin is scanned", async () => {
+  const sessionRef = "br_claude_exact";
+  const generation = 19;
+  const { recover, queryArgs } = recoveryHarness([
+    {
+      id: 81,
+      url: "https://chatgpt.com/c/stalled",
+      hang: true,
+    },
+    {
+      id: 82,
+      url: "https://claude.ai/chat/claude-exact",
+      live: {
+        convKey: "https://claude.ai/chat/claude-exact",
+        url: "https://claude.ai/chat/claude-exact",
+        site: "claude",
+        browserSessionRef: sessionRef,
+        browserGeneration: generation,
+      },
+    },
+  ]);
+
+  const recovered = await recover(sessionRef, generation, "claude");
+  assert.equal(recovered.ambiguous, false);
+  assert.equal(recovered.target?.provider, "claude");
+  assert.equal(recovered.target?.tabId, 82);
+  assert.equal(recovered.target?.conversationId, "claude-exact");
+  assert.deepEqual(queryArgs, [{ url: ["https://claude.ai/*"] }]);
 });
 
 test("page identity handshake lazily recovers only opaque Browser Registry identity", () => {
@@ -1961,13 +2022,17 @@ test("browser dispatch evicts a stale cached target before exact recovery", () =
   assert.match(segment, /cachedLive\?\.convKey === target\.convKey/);
   assert.match(segment, /browserSessionTargets\.delete\(sessionRef\);\s*target = null;/);
   const staleEviction = segment.indexOf("browserSessionTargets.delete(sessionRef)");
-  const recovery = segment.indexOf("recoverBrowserSessionTarget(sessionRef, expectedGeneration)", staleEviction);
+  const recovery = segment.indexOf("recoverBrowserSessionTarget(", staleEviction);
   const canonicalRecovery = segment.indexOf(
     "findBrowserSessionTargetByCanonicalIdentity(",
     recovery,
   );
   assert.ok(staleEviction >= 0 && recovery > staleEviction, "stale cached target must be evicted before one exact recovery");
   assert.ok(canonicalRecovery > recovery, "canonical recovery must remain a bounded fallback after exact session-ref recovery");
+  assert.match(
+    segment,
+    /recoverBrowserSessionTarget\(\s*sessionRef,\s*expectedGeneration,\s*String\(params\.provider \|\| ""\),\s*\)/,
+  );
   assert.match(segment, /browserSessionTargets\.set\(sessionRef, target\)/);
   assert.match(segment, /live\?\.convKey !== target\.convKey/);
 });
@@ -2197,12 +2262,13 @@ function createActuationBranchHarness({
       },
     },
   };
-  const activeH2WTabUrls = () => ["https://chatgpt.com/*"];
+  const activeH2WTabUrlsForProvider = async () => ["https://chatgpt.com/*"];
   const browserConversationInfo = (provider, url) => provider === "chatgpt" ? chatGptConversationInfo(url) : null;
   const browserConversationInfoFromSupportedUrl = (rawUrl) => {
     const info = chatGptConversationInfo(rawUrl);
     return info ? { ...info } : null;
   };
+  const sendTabMessageWithTimeout = async (tabId, message) => chrome.tabs.sendMessage(tabId, message);
   const unavailable = (expectedGeneration, reason, observedGeneration = expectedGeneration) => ({
     observed_generation: Math.max(1, Number(observedGeneration) || Number(expectedGeneration) || 1),
     command_accepted: false, browser_online: false, resource_available: false, rejected: false,
@@ -2263,8 +2329,9 @@ function createActuationBranchHarness({
   };
 
   const actuate = new Function(
-    "chrome", "browserTabScopes", "browserSessionTargets", "activeH2WTabUrls",
+    "chrome", "browserTabScopes", "browserSessionTargets", "activeH2WTabUrlsForProvider",
     "browserConversationInfo", "browserConversationInfoFromSupportedUrl",
+    "sendTabMessageWithTimeout",
     "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
     "unavailableBrowserActuationEvidence", "Date", "setTimeout",
     `async function __actuate(command) {\n` +
@@ -2273,8 +2340,9 @@ function createActuationBranchHarness({
     `const expectedGeneration = Number(command?.expected_generation || 0);\n` +
     `const params = command?.params && typeof command.params === "object" ? command.params : {};\n` +
     `${contentActuationEvidenceWithReasonSource}\n${recoverBrowserSessionTargetSource}\n${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
-  )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrls,
+  )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrlsForProvider,
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
+    sendTabMessageWithTimeout,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
     unavailable, dateShim, setTimeoutShim);
 

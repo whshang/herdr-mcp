@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.111";
+const H2W_SCRIPT_VERSION = "0.1.112";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -472,6 +472,17 @@ async function activeH2WTabUrls() {
     if (permissionPattern && await hasHostPermission(permissionPattern)) urls.push(pattern);
   }
   return urls;
+}
+
+async function activeH2WTabUrlsForProvider(provider) {
+  const urls = await activeH2WTabUrls();
+  const pattern = provider === "chatgpt"
+    ? "*://chatgpt.com/*"
+    : provider === "claude"
+      ? "*://claude.ai/*"
+      : EXPERIMENTAL_TAB_URLS[provider] || SUPPORTED_OPTIONAL_TAB_URLS[provider] || null;
+  if (!pattern) return urls;
+  return urls.includes(pattern) ? [pattern] : [];
 }
 
 function hostPermissionPatternForUrl(rawUrl) {
@@ -3243,11 +3254,13 @@ async function findBrowserSessionTargetByCanonicalIdentity(provider, canonicalUr
   return { target: exactTarget, ambiguous: false };
 }
 
-async function recoverBrowserSessionTarget(sessionRef, expectedGeneration) {
+async function recoverBrowserSessionTarget(sessionRef, expectedGeneration, provider = null) {
   let observedGeneration = expectedGeneration;
   let exactTarget = null;
   try {
-    const candidates = await chrome.tabs.query({ url: await activeH2WTabUrls() });
+    const candidates = await chrome.tabs.query({
+      url: await activeH2WTabUrlsForProvider(provider),
+    });
     for (const tab of candidates) {
       if (!tab?.id || tab.status !== "complete") continue;
       let live = null;
@@ -3316,7 +3329,11 @@ async function resolveBrowserCreateAnchorWindow({
       target = null;
     }
     if (!target) {
-      const recovered = await recoverBrowserSessionTarget(sourceSessionRef, expectedGeneration);
+      const recovered = await recoverBrowserSessionTarget(
+        sourceSessionRef,
+        expectedGeneration,
+        provider,
+      );
       if (!recovered.ambiguous && recovered.target) {
         target = recovered.target;
       }
@@ -3727,7 +3744,11 @@ async function handleBrowserActuation(command) {
       }
     }
     if (!targetOpen) {
-      const recovered = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration);
+      const recovered = await recoverBrowserSessionTarget(
+        sessionRefOpen,
+        expectedGeneration,
+        providerOpen,
+      );
       observedGenerationOpen = recovered.observedGeneration;
       targetOpen = recovered.target;
       if (!targetOpen && recovered.ambiguous) {
@@ -3854,7 +3875,11 @@ async function handleBrowserActuation(command) {
     }
   }
   if (!target) {
-    const recovered = await recoverBrowserSessionTarget(sessionRef, expectedGeneration);
+    const recovered = await recoverBrowserSessionTarget(
+      sessionRef,
+      expectedGeneration,
+      String(params.provider || ""),
+    );
     target = recovered.target;
     if (!target && recovered.ambiguous) {
       await postBrowserActuationEvidence(
