@@ -233,6 +233,108 @@ function observationHarness({
   return { observe, sent, assignments, tick: () => callback(), advance: (ms = 5000) => { now += ms; }, navigate: () => { route = "chatgpt:/c/other"; }, probes: () => probes };
 }
 
+function providerObservationHarness({
+  candidate = null,
+  acceptedUserMessageRef =
+    "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:2",
+  inProgress = false,
+} = {}) {
+  let now = 10000;
+  const route = "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174000";
+  const sent = [];
+  const assignments = new Map([["br_worker", {
+    generation: 7,
+    acceptedUserMessageRef,
+    reportedAssistantRef: null,
+    unmatchedGraceUntil: null,
+  }]]);
+  const domCandidate = candidate || {
+    ok: true,
+    currentNodeRole: "assistant",
+    finished: true,
+    messageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:3",
+    userMessageId: acceptedUserMessageRef,
+    text: "final Claude answer",
+  };
+  const observe = new Function(
+    "registeredBrowserSessionRef",
+    "registeredBrowserGeneration",
+    "registeredConvKey",
+    "acceptedDispatchAssignments",
+    "sendBg",
+    "ADAPTER",
+    "fetchChatGptConversationSnapshot",
+    "chatGptDomTurnSequence",
+    "isTurnInProgress",
+    "Date",
+    `${settlementSource}; return observeBrowserResultSettlement;`,
+  )(
+    "br_worker",
+    7,
+    route,
+    assignments,
+    async (payload) => {
+      sent.push(payload);
+      return { ok: true };
+    },
+    {
+      name: "claude",
+      getConversationKey: () => route,
+      getResultSettlementSnapshot: () => domCandidate,
+    },
+    async () => {
+      throw new Error("Claude settlement must not fetch ChatGPT snapshots");
+    },
+    () => {
+      throw new Error("Claude settlement must not use ChatGPT DOM turn parsing");
+    },
+    () => inProgress,
+    { now: () => now },
+  );
+  return {
+    observe,
+    sent,
+    assignments,
+    advance: (ms = 1000) => { now += ms; },
+  };
+}
+
+test("provider DOM settlement requires a stable exact Claude candidate before durable result writeback", async () => {
+  const h = providerObservationHarness();
+  assert.equal(await h.observe(), false);
+  assert.equal(h.sent.length, 0);
+  h.advance(1000);
+  assert.equal(await h.observe(), true);
+  assert.deepEqual(h.sent, [{
+    type: "h2w_browser_result",
+    provider: "claude",
+    session_ref: "br_worker",
+    generation: 7,
+    accepted_user_message_ref:
+      "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:2",
+    assistant_message_ref:
+      "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:3",
+    assistant_text: "final Claude answer",
+  }]);
+});
+
+test("provider DOM settlement never reports a candidate bound to another accepted user ref", async () => {
+  const h = providerObservationHarness({
+    candidate: {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:3",
+      userMessageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+      text: "wrong turn",
+    },
+  });
+  assert.equal(await h.observe(), false);
+  h.advance(1000);
+  assert.equal(await h.observe(), false);
+  assert.equal(h.sent.length, 0);
+});
+
 const completedWorkerSnapshot = {
   ok: true, currentNodeRole: "assistant", finished: true,
   messageId: "assistant-1", userMessageId: "user-1", text: "worker answer",

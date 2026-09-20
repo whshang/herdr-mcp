@@ -125,6 +125,77 @@ test("Claude adapter uses bounded semantic composer, message, and generation sel
   );
 });
 
+test("Claude adapter derives scoped transcript refs and exact adjacent settlement evidence", () => {
+  const h = harness();
+  const makeTranscriptMessage = ({ role, index, text, streaming = false, rsIndex = index }) => {
+    const article = element({ attrs: {
+      "aria-posinset": String(index + 1),
+      "aria-setsize": "4",
+    } });
+    const row = element({ attrs: {
+      "data-testid": "transcript-row",
+      "data-index": String(index),
+      "data-rs-index": String(rsIndex),
+      "data-perf-row": role === "user" ? "human" : "assistant",
+      "data-perf-row-streaming": streaming ? "true" : "false",
+    } });
+    const message = element({ text });
+    message.closest = (selector) => {
+      if (selector === '[data-testid="transcript-row"]') return row;
+      if (selector === '[role="article"]') return article;
+      return null;
+    };
+    row.querySelector = (selector) => {
+      if (role === "user" && selector.includes('data-testid="user-message"')) return message;
+      if (role === "assistant" && selector.includes('data-testid="assistant-message"')) return message;
+      return null;
+    };
+    return { article, row, message };
+  };
+
+  const user = makeTranscriptMessage({ role: "user", index: 2, text: "accepted prompt" });
+  const assistant = makeTranscriptMessage({ role: "assistant", index: 3, text: "final answer" });
+  h.set('[data-testid="user-message"]', user.message);
+  h.set('.font-claude-response', assistant.message);
+  h.set('[data-testid="transcript-row"]', [user.row, assistant.row]);
+
+  const acceptedRef = "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:2";
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("user"))),
+    { messageId: acceptedRef, text: "accepted prompt", count: 1 },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("assistant"))),
+    {
+      messageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:3",
+      text: "final answer",
+      count: 1,
+    },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getResultSettlementSnapshot(acceptedRef))),
+    {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: "claude-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:3",
+      userMessageId: acceptedRef,
+      text: "final answer",
+    },
+  );
+
+  const mismatched = makeTranscriptMessage({
+    role: "user",
+    index: 2,
+    rsIndex: 9,
+    text: "untrusted prompt",
+  });
+  h.set('[data-testid="user-message"]', mismatched.message);
+  assert.equal(h.adapter.getMessageSnapshot("user").messageId, null);
+  h.set('[data-testid="transcript-row"]', [mismatched.row, assistant.row]);
+  assert.equal(h.adapter.getResultSettlementSnapshot(acceptedRef), null);
+});
+
 test("Claude adapter hashes current-account email before returning native identity", async () => {
   const h = harness();
   const expected = createHash("sha256")

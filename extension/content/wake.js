@@ -2315,6 +2315,30 @@ const H2W_CONTENT_VERSION = "0.1.103";
     };
   }
 
+  function providerDomResultCandidate(pending) {
+    if (ADAPTER.name === "chatgpt") return chatGptDomResultCandidate(pending);
+    if (!pending?.acceptedUserMessageRef
+        || isTurnInProgress()
+        || typeof ADAPTER.getResultSettlementSnapshot !== "function") {
+      return null;
+    }
+    try {
+      const candidate = ADAPTER.getResultSettlementSnapshot(pending.acceptedUserMessageRef);
+      if (!candidate?.ok
+          || candidate.finished !== true
+          || candidate.userMessageId !== pending.acceptedUserMessageRef
+          || typeof candidate.messageId !== "string"
+          || !candidate.messageId
+          || typeof candidate.text !== "string"
+          || !candidate.text.trim()) {
+        return null;
+      }
+      return candidate;
+    } catch (_) {
+      return null;
+    }
+  }
+
   // Browser workers need no native pane binding, automation, or tab focus.
   // The existing route timer probes only a proven assignment. Transient errors
   // back off without dropping it. A newly-created session gets a bounded grace
@@ -2326,7 +2350,10 @@ const H2W_CONTENT_VERSION = "0.1.103";
     const sessionRef = registeredBrowserSessionRef;
     const registrationGeneration = registeredBrowserGeneration;
     const pending = acceptedDispatchAssignments.get(sessionRef);
-    if (ADAPTER.name !== "chatgpt" || !sessionRef || !registrationGeneration
+    const usesChatGptSnapshot = ADAPTER.name === "chatgpt";
+    const supportsDomSettlement = typeof ADAPTER.getResultSettlementSnapshot === "function";
+    if ((!usesChatGptSnapshot && !supportsDomSettlement)
+        || !sessionRef || !registrationGeneration
         || !convKey || convKey !== registeredConvKey || !pending || pending.reportedAssistantRef) return false;
     if (!browserResultProbeState || browserResultProbeState.pending !== pending
         || browserResultProbeState.sessionRef !== sessionRef) {
@@ -2337,13 +2364,13 @@ const H2W_CONTENT_VERSION = "0.1.103";
     probe.inFlight = true;
     probe.nextAt = Date.now() + probe.retryMs;
     try {
-      const server = await fetchChatGptConversationSnapshot();
+      const server = usesChatGptSnapshot ? await fetchChatGptConversationSnapshot() : null;
       if (ADAPTER.getConversationKey() !== convKey || registeredConvKey !== convKey
           || registeredBrowserSessionRef !== sessionRef || registeredBrowserGeneration !== registrationGeneration
           || acceptedDispatchAssignments.get(sessionRef) !== pending) return false;
       let settledSnapshot = server;
-      if (!server?.ok) {
-        const domCandidate = chatGptDomResultCandidate(pending);
+      if (!usesChatGptSnapshot || !server?.ok) {
+        const domCandidate = providerDomResultCandidate(pending);
         if (!domCandidate) {
           probe.domCandidate = null;
           probe.retryMs = Math.min(probe.retryMs * 2, 60000);
