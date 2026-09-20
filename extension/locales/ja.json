@@ -405,7 +405,7 @@
   "label_page_assist_origins": "許可する origin（1 行に 1 つ）",
   "hint_page_assist_origins": "保存時に、ここで指定した正確な HTTP/HTTPS origin だけのブラウザー権限を要求します。origin を削除して再保存すると対応する権限も削除します。",
   "label_experimental_grok": "grok.com 統合を有効にする",
-  "hint_experimental_grok": "既定はオフです。grok.com の権限だけを要求し、Grok HUD、継続性、ブラウザ dispatch adapter を有効にします。変更後は開いている Grok タブを再読み込みしてください。",
+  "hint_experimental_grok": "既定で有効（1.0 対応の WebChat surface）。grok.com の権限を要求し、Grok HUD、継続性、ブラウザ dispatch adapter を有効にします。オフにするとその要求を取り下げます。変更後は開いている Grok タブを再読み込みしてください。",
   "open_github_setup_guide": "Herdr の GitHub セットアップガイドを開く",
   "host_permission_denied": "サイトアクセスが許可されていません。Herdr は明示的に有効化したサイトまたはエンドポイントだけを要求します。",
   "host_permission_invalid_url": "設定するエンドポイントは http:// または https:// を使用してください。",

@@ -929,7 +929,7 @@ ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/a
 ok(backgroundSource.includes('experimentalZAiEnabled: false')
     && backgroundSource.includes('experimentalDeepSeekEnabled: false')
     && backgroundSource.includes('experimentalGeminiEnabled: false')
-    && backgroundSource.includes('experimentalGrokEnabled: false')
+    && backgroundSource.includes('experimentalGrokEnabled: true')
     && backgroundSource.includes('site: "gemini"')
     && backgroundSource.includes('matches: ["https://gemini.google.com/*"]')
     && backgroundSource.includes('"content/injector/gemini.js"')
