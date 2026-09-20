@@ -181,6 +181,31 @@ test("Grok adapter hashes same-origin session userId before returning native ide
   assert.equal(await h.adapter.getAccountNativeIdentity(), null);
 });
 
+test("Grok adapter reports one exact settled result for the accepted user turn", () => {
+  const h = harness();
+  const userContainer = element({ attrs: { id: "response-11111111-2222-4333-8444-555555555555" } });
+  const assistantContainer = element({ attrs: { id: "response-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } });
+  const user = element({ text: "prompt", parentElement: userContainer });
+  const assistant = element({ text: "answer", parentElement: assistantContainer });
+  h.set('[data-testid="user-message"]', user);
+  h.set('[data-testid="assistant-message"]', assistant);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getResultSettlementSnapshot(
+      "11111111-2222-4333-8444-555555555555-user",
+    ))),
+    {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-assistant",
+      userMessageId: "11111111-2222-4333-8444-555555555555-user",
+      text: "answer",
+    },
+  );
+  assert.equal(h.adapter.getResultSettlementSnapshot("different-user"), null);
+});
+
 test("Grok must reuse provider-neutral account and single-attempt browser actuation paths", () => {
   const accountStart = wakeSource.indexOf("async function browserAccountNativeIdentity()");
   const accountEnd = wakeSource.indexOf("async function registerCurrentConversation", accountStart);

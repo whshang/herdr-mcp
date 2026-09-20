@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.104";
+const H2W_SCRIPT_VERSION = "0.1.105";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -921,13 +921,11 @@ function browserConversationInfoFromSupportedUrl(rawUrl) {
   if (core) return core;
   const claude = claudeConversationInfo(rawUrl);
   if (claude) return claude;
+  const grok = grokConversationInfo(rawUrl);
+  if (grok) return grok;
   if (experimentalSiteEnabled("gemini")) {
     const gemini = geminiConversationInfo(rawUrl);
     if (gemini) return gemini;
-  }
-  if (experimentalSiteEnabled("grok")) {
-    const grok = grokConversationInfo(rawUrl);
-    if (grok) return grok;
   }
   return null;
 }

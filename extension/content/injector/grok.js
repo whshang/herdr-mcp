@@ -168,6 +168,26 @@ class GrokAdapter extends BaseAdapter {
     return this.getMessageSnapshot(role).text;
   }
 
+  getResultSettlementSnapshot(acceptedUserMessageRef) {
+    if (typeof acceptedUserMessageRef !== "string" || !acceptedUserMessageRef) return null;
+    if (this.isGenerationInProgress()) return null;
+    const user = this.getMessageSnapshot("user");
+    const assistant = this.getMessageSnapshot("assistant");
+    if (user.messageId !== acceptedUserMessageRef
+        || !assistant.messageId
+        || !assistant.text) {
+      return null;
+    }
+    return {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: assistant.messageId,
+      userMessageId: user.messageId,
+      text: assistant.text,
+    };
+  }
+
   isGenerationInProgress() {
     if (this.getStopButtonCandidates().length > 0) return true;
     return [...document.querySelectorAll('[aria-busy="true"]')]
