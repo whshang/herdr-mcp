@@ -21,6 +21,7 @@ use crate::progressive_skills::{
     WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
+use crate::semantic::{SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
@@ -30,7 +31,7 @@ use crate::state_store::{
     BrowserSessionReservationInput, BrowserSessionReservationRecord, ContinuitySearchInput,
     OperationReservation, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
     WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemorySearchBoundary,
-    WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
+    WorkMemorySearchHit, WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
     validate_browser_lane_id, validate_browser_work_chain_id,
 };
 use crate::tcc_broker;
@@ -1067,6 +1068,7 @@ fn work_memory_search_page_json(
     page_size: usize,
     page: WorkMemorySearchPage,
 ) -> Value {
+    let semantic_ranking = work_memory_semantic_ranking(query, &page.hits);
     let display_excerpt_truncated = page.hits.iter().any(|hit| hit.excerpt.contains('…'));
     let coverage = work_memory_coverage(
         page.boundary.checkpoint_revision,
@@ -1109,8 +1111,93 @@ fn work_memory_search_page_json(
             "source_id": hit.source_id,
             "excerpt": hit.excerpt,
         })).collect::<Vec<_>>(),
+        "semantic_ranking": semantic_ranking,
         "cursor": next_cursor,
         "coverage": coverage,
+    })
+}
+
+fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Value {
+    let service = SemanticService::from_env();
+    let capability = service.capability_json();
+    if hits.is_empty() {
+        return json!({
+            "attempted": false,
+            "used": false,
+            "reason": "no_hits",
+            "capability": capability,
+        });
+    }
+    if !service.configured() {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "reason": "not_configured",
+            "capability": capability,
+        });
+    }
+
+    let mut request = SemanticRequest::new(json!({
+        "query": query,
+        "hits": hits.iter().map(|hit| json!({
+            "source_kind": hit.source_kind,
+            "source_id": hit.source_id,
+            "excerpt": hit.excerpt,
+        })).collect::<Vec<_>>(),
+    }));
+    for index in 0..hits.len() {
+        request = request.ask(
+            format!("hit_{index}"),
+            SemanticQuestion::noul(
+                format!("Is `hits[{index}]` directly relevant evidence for answering `query`?"),
+                "The hit directly helps answer the query",
+                "The hit is tangential or unrelated",
+            ),
+        );
+    }
+    let response = match service.evaluate(&request) {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "reason": error.code(),
+                "capability": capability,
+            });
+        }
+    };
+
+    let mut ranked = hits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, hit)| {
+            response
+                .answer(&format!("hit_{index}"))
+                .and_then(SemanticAnswer::noul_probability)
+                .map(|relevance| {
+                    json!({
+                        "source_kind": hit.source_kind,
+                        "source_id": hit.source_id,
+                        "relevance": relevance,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right["relevance"]
+            .as_f64()
+            .partial_cmp(&left["relevance"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    json!({
+        "attempted": true,
+        "used": true,
+        "provider": response.provider,
+        "model": response.model,
+        "ranked": ranked,
+        "preserves_hit_order": true,
+        "authority": "advisory_only",
+        "capability": capability,
     })
 }
 
