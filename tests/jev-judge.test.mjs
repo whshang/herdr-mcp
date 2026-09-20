@@ -17,8 +17,14 @@ test("user gets one narrow Jev question | Given a settled turn | When the semant
     "Implementation is done. Next: I will run the production verification.",
   );
   assert.equal(Object.prototype.hasOwnProperty.call(request, "model"), false);
-  assert.deepEqual(Object.keys(request.questions), ["has_unfinished_work"]);
+  assert.deepEqual(Object.keys(request.questions), [
+    "has_unfinished_work",
+    "handoff_boundary_stable",
+    "useful_work_remaining",
+  ]);
   assert.equal(request.questions.has_unfinished_work.type, "noul");
+  assert.equal(request.questions.handoff_boundary_stable.type, "noul");
+  assert.equal(request.questions.useful_work_remaining.type, "noul");
   assert.match(request.questions.has_unfinished_work.instructions, /assistant itself can continue/i);
   assert.match(request.questions.has_unfinished_work.criteria.false, /requires a user\/external decision/i);
 });
@@ -30,6 +36,18 @@ test("user gets the calibrated fixed Jev boundary | Given continue done and midd
   assert.equal(interpretJevPendingWorkAnswer(answer(0.30)).signal, "done");
   assert.equal(interpretJevPendingWorkAnswer(answer(0.55)).signal, "uncertain");
   assert.equal(interpretJevPendingWorkAnswer(answer(2)).ok, false);
+
+  const advisory = interpretJevPendingWorkAnswer({
+    model: "jev-latest",
+    answers: {
+      has_unfinished_work: { type: "noul", noul: 0.55 },
+      handoff_boundary_stable: { type: "noul", noul: 0.82 },
+      useful_work_remaining: { type: "noul", noul: 0.64 },
+    },
+  });
+  assert.equal(advisory.handoffBoundaryStable, 0.82);
+  assert.equal(advisory.usefulWorkRemaining, 0.64);
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.55)).handoffBoundaryStable, null);
 });
 
 test("user gets Jev first and fallback only on uncertainty or outage | Given explicit Jev outcomes | When Auto selects the semantic stage | Then continue and done are final while uncertain or unavailable fall through", () => {
