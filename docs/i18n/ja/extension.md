@@ -102,6 +102,8 @@ herdr-mcp Rust runtime
 
 semantic Auto の Provider credential / endpoint はブラウザ拡張では設定しません。拡張はローカル Herdr Runtime だけを呼び出します。Runtime の Provider 設定は、単一マシン用の mode-`0600` `config.json` と、登録済みワークステーション全体で共有する認証済み Cloudflare Worker route pool の 2 層だけです。同じ typed/chat capability にローカル route があればローカルを優先します。両方の層で `name / protocol / url / model / api_key` の共通 route JSON object を使い、`decision` と `decision-vercel` は typed evaluation、`openai-chat` は chat として protocol から自動判定します。shell/process environment は Provider 設定には使いません。通常の Auto は typed evaluation route（Jev）-> chat route（LLM）-> bounded script fallback の固定順序で動き、Jev と LLM は同じ rotation、deadline、cooldown、bounded failover を共有します。旧 `config.toml` は初回読み込み時に JSON へ移行します。semantic provider がなくても script fallback が基本 Auto を維持し、Work Memory/TODO evidence と deterministic safety guard は引き続き authoritative です。
 
+1.0 のブラウザ対応は ChatGPT、Claude、Grok の 3 つの WebChat surface を対象にします。ChatGPT は会話 `create`、dispatch、archive、self-handoff までを含む最も広い surface を持ち、Claude と Grok はサインイン済みセッションの dispatch、settled result、reload recovery に対応します。Gemini はオプトインの実験的位置づけのままで、1.0 の受け入れ境界には含みません。
+
 z.ai / DeepSeek の JSON → MCP 連携は実験的で、既定では無効です。Herdr の実験的設定で明示的に有効にしてください。
 
 ## リリースとメンテナンスの境界

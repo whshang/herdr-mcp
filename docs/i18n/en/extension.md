@@ -102,6 +102,8 @@ The browser owns interaction and visualization; Native Host is the trusted local
 
 For semantic Auto, the extension has no provider credential or endpoint settings. It calls the local Herdr Runtime, which owns one semantic route pool with exactly two configuration layers: mode-`0600` `config.json` for the workstation and the authenticated Cloudflare Worker route pool shared across enrolled workstations. Local routes take precedence for each typed/chat capability. Both layers use the same `name / protocol / url / model / api_key` route object schema; `decision` and `decision-vercel` imply typed evaluation, while `openai-chat` implies chat; shell/process environment is not a semantic-provider configuration source. Ordinary Auto uses typed evaluation routes (Jev) -> chat routes (LLM) -> bounded script fallback; Goal-aware Auto can use Jev as an advisory semantic prior for the existing LLM Goal Supervisor. Typed and chat routes share the same bounded rotation, deadline, cooldown, and failover policy. Existing `config.toml` migrates once to JSON. The script fallback keeps basic Auto available without a semantic provider, while Work Memory/TODO evidence and deterministic safety guards remain authoritative.
 
+1.0 browser support covers three WebChat surfaces: ChatGPT, Claude, and Grok. ChatGPT has the widest surface — conversation `create`, dispatch, archive, and self-handoff — while Claude and Grok support signed-in session dispatch, settled results, and reload recovery. Gemini stays opt-in experimental and is outside the 1.0 acceptance boundary.
+
 The z.ai / DeepSeek JSON → MCP integrations are experimental and disabled by default; enable them explicitly in Herdr experimental settings.
 
 ## Release and maintenance boundary
