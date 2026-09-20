@@ -141,7 +141,7 @@ test("Grok adapter uses bounded semantic composer, turn, and generation selector
   );
 });
 
-test("Grok adapter recovers stable role-scoped turn ids from response ancestors", () => {
+test("Grok adapter keeps synthetic turn refs stable across response-wrapper replacement", () => {
   const h = harness();
   const userContainer = element({ attrs: { id: "response-11111111-2222-4333-8444-555555555555" } });
   const assistantContainer = element({ attrs: { id: "response-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } });
@@ -153,7 +153,7 @@ test("Grok adapter recovers stable role-scoped turn ids from response ancestors"
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("user"))),
     {
-      messageId: "11111111-2222-4333-8444-555555555555-user",
+      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
       text: "prompt",
       count: 1,
     },
@@ -161,10 +161,27 @@ test("Grok adapter recovers stable role-scoped turn ids from response ancestors"
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("assistant"))),
     {
-      messageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-assistant",
+      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:0",
       text: "answer",
       count: 1,
     },
+  );
+
+  h.set('[data-testid="user-message"]', element({
+    text: "prompt",
+    parentElement: element({ attrs: { id: "response-bbbbbbbb-cccc-4ddd-8eee-ffffffffffff" } }),
+  }));
+  h.set('[data-testid="assistant-message"]', element({
+    text: "answer",
+    parentElement: element({ attrs: { id: "response-22222222-3333-4444-8555-666666666666" } }),
+  }));
+  assert.equal(
+    h.adapter.getMessageSnapshot("user").messageId,
+    "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+  );
+  assert.equal(
+    h.adapter.getMessageSnapshot("assistant").messageId,
+    "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:0",
   );
 });
 
@@ -192,14 +209,14 @@ test("Grok adapter reports one exact settled result for the accepted user turn",
 
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.adapter.getResultSettlementSnapshot(
-      "11111111-2222-4333-8444-555555555555-user",
+      "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
     ))),
     {
       ok: true,
       currentNodeRole: "assistant",
       finished: true,
-      messageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-assistant",
-      userMessageId: "11111111-2222-4333-8444-555555555555-user",
+      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:0",
+      userMessageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
       text: "answer",
     },
   );

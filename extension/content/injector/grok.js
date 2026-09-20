@@ -144,17 +144,10 @@ class GrokAdapter extends BaseAdapter {
       || element.getAttribute?.("data-message-uuid")
       || null;
     if (!messageId) {
-      let ancestor = element.parentElement || null;
-      for (let depth = 0; ancestor && depth < 8; depth += 1) {
-        const ancestorId = String(ancestor.getAttribute?.("id") || "");
-        const match = ancestorId.match(
-          /^response-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i,
-        );
-        if (match) {
-          messageId = `${match[1].toLowerCase()}-${role}`;
-          break;
-        }
-        ancestor = ancestor.parentElement || null;
+      const sessionId = this.getSessionIdentity();
+      const ordinal = nodes.indexOf(element);
+      if (sessionId && ordinal >= 0) {
+        messageId = `grok-dom-v1:${sessionId}:${role}:${ordinal}`;
       }
     }
     return {
