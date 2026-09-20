@@ -419,11 +419,14 @@ let CFG = {
   progressTemplate: "",
   manualContinueMessage: "",
   idleNudgeEnabled: true,
-  // Experimental Web AI origins stay opt-in until their compatibility/UAT gate passes.
+  // Experimental Web AI origins stay opt-in until their compatibility/UAT gate
+  // passes. Grok became a 1.0-supported WebChat surface and is enabled by
+  // default; the switch above is a revocable off-ramp. z.ai, DeepSeek and
+  // Gemini stay opt-in and are not part of the 1.0 acceptance boundary.
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
   experimentalGeminiEnabled: false,
-  experimentalGrokEnabled: false,
+  experimentalGrokEnabled: true,
   pageAssistOrigins: [],
 };
 let PROJECT_AUTOMATION = {};

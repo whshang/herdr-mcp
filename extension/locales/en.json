@@ -405,7 +405,7 @@
   "label_page_assist_origins": "Allowed origins (one per line)",
   "hint_page_assist_origins": "Saving requests browser access only for these exact HTTP/HTTPS origins. Remove an origin and save again to remove its permission.",
   "label_experimental_grok": "Enable grok.com integration",
-  "hint_experimental_grok": "Off by default. Requests access only to grok.com and enables the Grok HUD, continuity, and browser dispatch adapter. Reload existing Grok tabs after changing this switch.",
+  "hint_experimental_grok": "On by default as a 1.0-supported WebChat surface. Requests access to grok.com and enables the Grok HUD, continuity, and browser dispatch adapter; turning it off revokes that request. Reload existing Grok tabs after changing this switch.",
   "open_github_setup_guide": "Open the Herdr GitHub setup guide",
   "host_permission_denied": "Site access was not granted. Herdr only requests access to sites or endpoints you explicitly enable.",
   "host_permission_invalid_url": "The configured endpoint must use http:// or https://.",
