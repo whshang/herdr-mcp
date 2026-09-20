@@ -1978,6 +1978,22 @@ fn browser_resource_unavailable_reason(
         .unwrap_or_else(|| "browser_actuation_reason_missing".to_owned()))
 }
 
+fn browser_session_create_retry_safe_not_applied(evidence: &BrowserPostconditionEvidence) -> bool {
+    !evidence.command_accepted
+        && evidence
+            .result
+            .as_ref()
+            .and_then(|result| result.get("message_submitted"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        && evidence
+            .result
+            .as_ref()
+            .and_then(|result| result.get("retry_safe"))
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
 fn browser_delivery_state_from_postcondition(
     operation: BrowserOperation,
     params: &Value,
@@ -3855,7 +3871,7 @@ fn browser_session_create(
             "browser_actuator_unavailable",
         ),
     };
-    let delivery_state = match browser_delivery_state_from_postcondition(
+    let observed_delivery_state = match browser_delivery_state_from_postcondition(
         BrowserOperation::SessionCreate,
         params,
         expected_generation,
@@ -3864,13 +3880,21 @@ fn browser_session_create(
         Ok(state) => state,
         Err(error) => return browser_store_error(error),
     };
-    let unavailable_reason = if delivery_state == BrowserDeliveryState::ResourceUnavailable {
+    let unavailable_reason = if observed_delivery_state == BrowserDeliveryState::ResourceUnavailable
+    {
         match browser_resource_unavailable_reason(&evidence) {
             Ok(reason) => Some(reason),
             Err(error) => return browser_store_error(error),
         }
     } else {
         None
+    };
+    let delivery_state = if observed_delivery_state == BrowserDeliveryState::ResourceUnavailable
+        && browser_session_create_retry_safe_not_applied(&evidence)
+    {
+        BrowserDeliveryState::NotApplied
+    } else {
+        observed_delivery_state
     };
     let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
         Ok(value) => value,
@@ -3913,7 +3937,7 @@ fn browser_session_create(
     }
     json!({
         "ok": false,
-        "code": unavailable_reason.as_deref().unwrap_or_else(|| delivery_state.as_str()),
+        "code": unavailable_reason.as_deref().unwrap_or_else(|| observed_delivery_state.as_str()),
         "reason": unavailable_reason,
         "operation": BrowserOperation::SessionCreate.method(),
         "reservation_ref": updated.reservation_ref,
@@ -3921,6 +3945,7 @@ fn browser_session_create(
         "delivery_state": updated.delivery_state,
         "replayed": replayed,
         "reconciled": false,
+        "delivery_evidence": evidence.result,
     })
 }
 
@@ -11007,6 +11032,41 @@ mod tests {
             }
         }
 
+        struct RetrySafeThenAppliedActuator {
+            inner: SessionCreateActuator,
+            calls: AtomicUsize,
+        }
+
+        impl BrowserActuator for RetrySafeThenAppliedActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::SessionCreate.method());
+                assert_eq!(dispatch_id, params["reservation_ref"].as_str());
+                let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    let mut evidence =
+                        BrowserPostconditionEvidence::resource_unavailable_with_reason(
+                            expected_generation,
+                            "browser_create_scope_unavailable",
+                        );
+                    evidence.result = Some(json!({
+                        "error": "browser_create_scope_unavailable",
+                        "phase": "scope_handshake",
+                        "message_submitted": false,
+                        "retry_safe": true
+                    }));
+                    return Ok(evidence);
+                }
+                self.inner.materialize(params, expected_generation);
+                Ok(SessionCreateActuator::applied_evidence(expected_generation))
+            }
+        }
+
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let (endpoint_ref, account_ref, source_url) = {
             let mut guard = store.lock().unwrap();
@@ -11149,6 +11209,71 @@ mod tests {
             materialized_but_partial: false,
             reconcile_pending_polls: 0,
         };
+        let retry_safe = RetrySafeThenAppliedActuator {
+            inner: SessionCreateActuator {
+                store: store.clone(),
+                calls: AtomicUsize::new(0),
+                reconcile_calls: AtomicUsize::new(0),
+                materialize_on_actuate: false,
+                materialize_on_reconcile_poll: None,
+                delayed: false,
+                materialized_but_partial: false,
+                reconcile_pending_polls: 0,
+            },
+            calls: AtomicUsize::new(0),
+        };
+        let retry_safe_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker retry safe",
+            "message": "retry only after proven no delivery",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-retry-safe-1"
+        });
+        let retry_safe_first = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &retry_safe_params,
+            true,
+            Some(&retry_safe),
+        );
+        assert_eq!(retry_safe_first["ok"], false);
+        assert_eq!(retry_safe_first["code"], "browser_create_scope_unavailable");
+        assert_eq!(retry_safe_first["delivery_state"], "not_applied");
+        assert_eq!(
+            retry_safe_first["delivery_evidence"]["message_submitted"],
+            false
+        );
+        assert_eq!(retry_safe_first["delivery_evidence"]["retry_safe"], true);
+        assert_eq!(retry_safe.calls.load(Ordering::SeqCst), 1);
+
+        // Re-observing the same intent uses the same reservation/idempotency key.
+        // Because the first attempt proved no delivery, the existing NotApplied
+        // state may re-actuate exactly once instead of becoming a terminal replay.
+        let retry_safe_second = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &retry_safe_params,
+            true,
+            Some(&retry_safe),
+        );
+        assert_eq!(retry_safe_second["ok"], true);
+        assert_eq!(retry_safe_second["replayed"], true);
+        assert_eq!(retry_safe_second["delivery_state"], "applied");
+        assert_eq!(retry_safe.calls.load(Ordering::SeqCst), 2);
+
+        let retry_safe_applied_replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &retry_safe_params,
+            true,
+            Some(&retry_safe),
+        );
+        assert_eq!(retry_safe_applied_replay["ok"], true);
+        assert_eq!(retry_safe_applied_replay["replayed"], true);
+        assert_eq!(retry_safe.calls.load(Ordering::SeqCst), 2);
+
         for (params, expected_code) in [
             (
                 json!({

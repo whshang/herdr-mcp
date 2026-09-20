@@ -3492,11 +3492,15 @@ async function handleBrowserActuation(command) {
       return;
     }
     let scope = null;
+    let lastObservedScope = null;
+    let identityProbeResponded = false;
+    let identityProbeFailed = false;
     const scopeDeadline = Date.now() + 8000;
     let nextProbeAt = 0;
     let probeInFlight = false;
     do {
       scope = browserTabScopes.get(createdTab.id) || null;
+      if (scope) lastObservedScope = scope;
       if (scope
           && scope.provider === providerCreate
           && scope.accountRef === accountRefCreate
@@ -3517,7 +3521,12 @@ async function handleBrowserActuation(command) {
         probeInFlight = true;
         nextProbeAt = now + 500;
         void chrome.tabs.sendMessage(createdTab.id, { type: "h2w_get_convkey" })
-          .catch(() => {})
+          .then(() => {
+            identityProbeResponded = true;
+          })
+          .catch(() => {
+            identityProbeFailed = true;
+          })
           .finally(() => {
             probeInFlight = false;
           });
@@ -3525,11 +3534,60 @@ async function handleBrowserActuation(command) {
       await new Promise((resolve) => setTimeout(resolve, 200));
     } while (Date.now() < scopeDeadline);
     if (!scope) {
+      const observedScope = lastObservedScope
+        ? {
+            provider: String(lastObservedScope.provider || ""),
+            account_ref: String(lastObservedScope.accountRef || ""),
+            space_ref: String(lastObservedScope.spaceRef || ""),
+            observation_generation: Number(lastObservedScope.observationGeneration || 0),
+          }
+        : null;
+      let scopeFailure = "scope_missing";
+      if (lastObservedScope) {
+        if (lastObservedScope.provider !== providerCreate) scopeFailure = "provider_mismatch";
+        else if (lastObservedScope.accountRef !== accountRefCreate) scopeFailure = "account_mismatch";
+        else if (spaceRefCreate ? lastObservedScope.spaceRef !== spaceRefCreate : !!lastObservedScope.spaceRef) {
+          scopeFailure = "space_mismatch";
+        } else if (lastObservedScope.observationGeneration !== expectedGeneration) {
+          scopeFailure = "generation_mismatch";
+        }
+      } else if (identityProbeResponded) {
+        scopeFailure = "registry_handshake_delay";
+      } else if (identityProbeFailed) {
+        scopeFailure = "content_script_unavailable";
+      }
+      let tabClosed = false;
+      let tabCleanupVerified = false;
+      try {
+        await chrome.tabs.remove(createdTab.id);
+        tabClosed = true;
+      } catch (_) {}
+      try {
+        await chrome.tabs.get(createdTab.id);
+      } catch (_) {
+        tabCleanupVerified = true;
+      }
       await postBrowserActuationEvidence(
         actuationId,
         {
           ...unavailableBrowserActuationEvidence(expectedGeneration, "browser_create_scope_unavailable"),
-          result: { error: "browser_create_scope_unavailable" },
+          browser_online: true,
+          result: {
+            error: "browser_create_scope_unavailable",
+            phase: "scope_handshake",
+            expected: {
+              account_ref: accountRefCreate,
+              space_ref: spaceRefCreate || null,
+              observation_generation: expectedGeneration,
+            },
+            observed_scope: observedScope,
+            scope_failure: scopeFailure,
+            tab_opened: true,
+            tab_closed: tabClosed,
+            tab_cleanup_verified: tabCleanupVerified,
+            message_submitted: false,
+            retry_safe: true,
+          },
         },
       );
       return;
