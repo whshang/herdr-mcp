@@ -83,10 +83,10 @@ const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-mod
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
-ok(manifest.version === "0.1.107", "manifest version stays aligned with the browser product build");
+ok(manifest.version === "0.1.108", "manifest version stays aligned with the browser product build");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.107"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.107"'), "content version matches manifest");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.108"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.108"'), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
@@ -139,8 +139,10 @@ ok(backgroundSource.includes("SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('grok: "https://grok.com/*"')
     && backgroundSource.includes('id: "herdr-supported-grok"')
     && backgroundSource.includes('RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS = ["herdr-experimental-grok"]')
+    && backgroundSource.includes("await hasHostPermission(permissionPattern)")
+    && !backgroundSource.includes("supportedOptionalSiteAccess")
     && !manifest.host_permissions?.includes("https://grok.com/*"),
-  "supported Grok stays dynamically registered behind revocable optional site access");
+  "supported Grok uses revocable Chrome site permission as the single runtime authority");
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";

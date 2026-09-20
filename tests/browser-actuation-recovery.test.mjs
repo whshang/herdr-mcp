@@ -33,17 +33,6 @@ const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteW
 assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "registration helper must remain extractable");
 const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
 
-test("browser actuation waits for optional-site configuration before target recovery", () => {
-  const start = backgroundSource.indexOf("async function handleBrowserActuation(command)");
-  const end = backgroundSource.indexOf("\nchrome.runtime.onMessage.addListener", start);
-  assert.ok(start >= 0 && end > start, "browser actuation handler must remain extractable");
-  const source = backgroundSource.slice(start, end);
-  const readyAt = source.indexOf("await configReady;");
-  const recoveryAt = source.indexOf("recoverBrowserSessionTarget(");
-  assert.ok(readyAt >= 0, "browser actuation must wait for configReady");
-  assert.ok(recoveryAt > readyAt, "optional-site configuration must be ready before target recovery");
-});
-
 function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) {
   const chrome = {
     tabs: {

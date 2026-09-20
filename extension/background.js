@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.107";
+const H2W_SCRIPT_VERSION = "0.1.108";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -129,7 +129,6 @@ const SUPPORTED_OPTIONAL_CONTENT_SCRIPTS = [
   },
 ];
 const RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS = ["herdr-experimental-grok"];
-const supportedOptionalSiteAccess = { grok: false };
 const PUSH_CONNECT_MS = 5000;
 // The Rust push endpoint emits an SSE heartbeat every 15s. A Native Messaging
 // stream that stays open but delivers no bytes across this wider window is
@@ -463,17 +462,14 @@ function experimentalSiteEnabled(site) {
   return true;
 }
 
-function supportedOptionalSiteEnabled(site) {
-  return supportedOptionalSiteAccess[site] === true;
-}
-
-function activeH2WTabUrls() {
+async function activeH2WTabUrls() {
   const urls = [...CORE_TAB_URLS];
   for (const [site, pattern] of Object.entries(EXPERIMENTAL_TAB_URLS)) {
     if (experimentalSiteEnabled(site)) urls.push(pattern);
   }
   for (const [site, pattern] of Object.entries(SUPPORTED_OPTIONAL_TAB_URLS)) {
-    if (supportedOptionalSiteEnabled(site)) urls.push(pattern);
+    const permissionPattern = SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS[site];
+    if (permissionPattern && await hasHostPermission(permissionPattern)) urls.push(pattern);
   }
   return urls;
 }
@@ -570,7 +566,6 @@ async function syncSupportedOptionalContentScripts() {
   for (const spec of SUPPORTED_OPTIONAL_CONTENT_SCRIPTS) {
     const { site, ...registration } = spec;
     const permitted = await hasHostPermission(SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS[site]);
-    supportedOptionalSiteAccess[site] = permitted;
     if (!permitted) {
       if (registered.has(spec.id)) {
         try { await chrome.scripting.unregisterContentScripts({ ids: [spec.id] }); } catch (_) {}
@@ -763,7 +758,8 @@ function inheritedAutomationStorageForTransfer(transfer, targetConvKey) {
 
 async function notifyAutomationChanged() {
   try {
-    const groups = await Promise.all(activeH2WTabUrls().map((url) => chrome.tabs.query({ url })));
+    const urls = await activeH2WTabUrls();
+    const groups = await Promise.all(urls.map((url) => chrome.tabs.query({ url })));
     const tabs = [...new Map(groups.flat().filter((tab) => tab?.id).map((tab) => [tab.id, tab])).values()];
     await Promise.allSettled(tabs.map((tab) => (
       chrome.tabs.sendMessage(tab.id, { type: "h2w_automation_changed" })
@@ -1103,7 +1099,7 @@ void chrome.storage.local.get(CHATGPT_PERF_VERSION_STORAGE_KEY).then((state) => 
 // ---- Content-script version synchronization ----
 async function sweepStaleTabs(force = false) {
   try {
-    const tabs = await chrome.tabs.query({ url: activeH2WTabUrls() });
+    const tabs = await chrome.tabs.query({ url: await activeH2WTabUrls() });
     for (const t of tabs) {
       if (t.status !== "complete" || reloadedTabs.has(t.id)) continue;
       if (!force && tabVersions.get(t.id) === H2W_SCRIPT_VERSION) continue;
@@ -3211,7 +3207,7 @@ async function findBrowserSessionTargetByCanonicalIdentity(provider, canonicalUr
   if (!canonicalInfo?.conversation_id) return { target: null, ambiguous: false };
   let exactTarget = null;
   try {
-    const candidates = await chrome.tabs.query({ url: activeH2WTabUrls() });
+    const candidates = await chrome.tabs.query({ url: await activeH2WTabUrls() });
     for (const tab of candidates) {
       if (!tab?.id) continue;
       const live = browserConversationInfo(provider, tab.url || "");
@@ -3249,7 +3245,7 @@ async function recoverBrowserSessionTarget(sessionRef, expectedGeneration) {
   let observedGeneration = expectedGeneration;
   let exactTarget = null;
   try {
-    const candidates = await chrome.tabs.query({ url: activeH2WTabUrls() });
+    const candidates = await chrome.tabs.query({ url: await activeH2WTabUrls() });
     for (const tab of candidates) {
       if (!tab?.id || tab.status !== "complete") continue;
       let live = null;
@@ -3399,10 +3395,6 @@ async function handleBrowserActuation(command) {
     }).catch(() => {});
     return;
   }
-  // Optional supported sites are restored from Chrome permissions during
-  // startup. A native actuation can be the event that wakes an MV3 worker, so
-  // target recovery must not read the in-memory site-access projection early.
-  await configReady;
   if (operation === "herdr_mcp.page_assist") {
     let result;
     try {
@@ -7232,7 +7224,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "experimental-site-disabled" });
         return;
       }
-      if (registeringSite === "grok" && !supportedOptionalSiteEnabled("grok")) {
+      if (registeringSite === "grok"
+          && !await hasHostPermission(SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok)) {
         sendResponse({ ok: false, error: "site-access-disabled" });
         return;
       }
