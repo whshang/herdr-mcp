@@ -776,16 +776,16 @@ fn config_file_allows_secret(path: &Path) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticProtocol {
-    Jev,
-    EvaluationV4,
+    Decision,
+    DecisionVercel,
     OpenAiChat,
 }
 
 impl SemanticProtocol {
     fn parse(value: &str) -> Option<Self> {
         match value {
-            "jev" => Some(Self::Jev),
-            "evaluation-v4" => Some(Self::EvaluationV4),
+            "decision" => Some(Self::Decision),
+            "decision-vercel" => Some(Self::DecisionVercel),
             "openai-chat" => Some(Self::OpenAiChat),
             _ => None,
         }
@@ -890,7 +890,7 @@ impl HttpSemanticProvider {
         let protocol = SemanticProtocol::parse(&route.protocol)?;
         if !matches!(
             protocol,
-            SemanticProtocol::Jev | SemanticProtocol::EvaluationV4
+            SemanticProtocol::Decision | SemanticProtocol::DecisionVercel
         ) {
             return None;
         }
@@ -906,8 +906,8 @@ impl HttpSemanticProvider {
             .iter()
             .map(|(id, question)| {
                 let value = match self.protocol {
-                    SemanticProtocol::EvaluationV4 => question.to_vercel_json(),
-                    SemanticProtocol::Jev => question.to_json(),
+                    SemanticProtocol::DecisionVercel => question.to_vercel_json(),
+                    SemanticProtocol::Decision => question.to_json(),
                     SemanticProtocol::OpenAiChat => return (id.clone(), Value::Null),
                 };
                 (id.clone(), value)
@@ -932,14 +932,14 @@ impl SemanticProvider for HttpSemanticProvider {
             .post(self.endpoint.clone())
             .bearer_auth(&self.api_key);
         let body = match self.protocol {
-            SemanticProtocol::Jev => {
+            SemanticProtocol::Decision => {
                 json!({
                     "state": request.state,
                     "model": self.model,
                     "questions": questions,
                 })
             }
-            SemanticProtocol::EvaluationV4 => {
+            SemanticProtocol::DecisionVercel => {
                 builder = builder
                     .header("ai-evaluation-model-specification-version", "4")
                     .header("ai-model-id", &self.model);
@@ -971,8 +971,8 @@ impl SemanticProvider for HttpSemanticProvider {
             .json::<Value>()
             .map_err(|_| SemanticError::new("invalid_response"))?;
         match self.protocol {
-            SemanticProtocol::Jev => parse_response(&self.id, request, payload),
-            SemanticProtocol::EvaluationV4 => {
+            SemanticProtocol::Decision => parse_response(&self.id, request, payload),
+            SemanticProtocol::DecisionVercel => {
                 parse_vercel_response(&self.id, &self.model, request, payload)
             }
             SemanticProtocol::OpenAiChat => Err(SemanticError::new("route_invalid")),
@@ -1394,7 +1394,7 @@ mod tests {
             );
         let response = HttpSemanticProvider::new(
             "route:test".to_owned(),
-            SemanticProtocol::Jev,
+            SemanticProtocol::Decision,
             "test-key".to_owned(),
             base_url,
             "jev-test".to_owned(),
@@ -1444,7 +1444,7 @@ mod tests {
                 Box::new(
                     HttpSemanticProvider::new(
                         "route-a".to_owned(),
-                        SemanticProtocol::Jev,
+                        SemanticProtocol::Decision,
                         "key-a".to_owned(),
                         route_a,
                         "jev-a".to_owned(),
@@ -1454,7 +1454,7 @@ mod tests {
                 Box::new(
                     HttpSemanticProvider::new(
                         "route-b".to_owned(),
-                        SemanticProtocol::Jev,
+                        SemanticProtocol::Decision,
                         "key-b".to_owned(),
                         route_b,
                         "jev-b".to_owned(),
@@ -1492,7 +1492,7 @@ mod tests {
                 Box::new(
                     HttpSemanticProvider::new(
                         "typed-bad".to_owned(),
-                        SemanticProtocol::Jev,
+                        SemanticProtocol::Decision,
                         "key-a".to_owned(),
                         typed_bad,
                         "jev-bad".to_owned(),
@@ -1502,7 +1502,7 @@ mod tests {
                 Box::new(
                     HttpSemanticProvider::new(
                         "typed-good".to_owned(),
-                        SemanticProtocol::Jev,
+                        SemanticProtocol::Decision,
                         "key-b".to_owned(),
                         typed_good,
                         "jev-good".to_owned(),
@@ -1611,7 +1611,7 @@ mod tests {
     "routes": [
       {
         "name": "fast_a",
-        "protocol": "jev",
+        "protocol": "decision",
         "url": "https://api.typesafe.ai/v1/systemone",
         "model": "jev-latest",
         "api_key": "file-key"
@@ -1692,7 +1692,7 @@ mod tests {
     "routes": [
       {
         "name": "fast_a",
-        "protocol": "jev",
+        "protocol": "decision",
         "url": "https://api.typesafe.ai/v1/systemone",
         "model": "jev-latest",
         "api_key": "local-eval-key"

@@ -178,7 +178,7 @@ For ChatGPT Auto, deterministic browser/runtime safety gates stay authoritative.
 
 The native runtime owns one provider-neutral semantic route pool shared by browser Auto, planning Skill/method relevance, and Work Memory relevance. Configuration has exactly two layers: mode-`0600` `~/.config/herdr-mcp/config.json` for one workstation, and the authenticated Cloudflare Worker route pool for all enrolled workstations. Local typed/chat routes take precedence over Worker routes for the same derived mode. The extension never stores provider configuration and the runtime does not read semantic provider values from shell or process environment. The `config.toml` used by released 0.4.x runtimes is migrated once to `config.json` and retained only as `config.toml.migrated`; unreleased 1.0 semantic TOML sections are intentionally not a migration format.
 
-Every route is a provider-neutral object with an arbitrary `name`, one wire `protocol` (`jev`, `evaluation-v4`, or `openai-chat`), and explicit `url`, `model`, and `api_key`. The protocol determines the route mode: `jev` and `evaluation-v4` are typed evaluation routes, while `openai-chat` is a chat route. TypeSafe and OpenRouter therefore share the same `jev` adapter; Vercel uses the standard `evaluation-v4` adapter; OpenAI-compatible LLMs share `openai-chat`. Typed Jev routes and chat/LLM routes use the same rotating-start, bounded-attempt, deadline, cooldown, and failover executor.
+Every route is a provider-neutral object with an arbitrary `name`, one wire `protocol` (`decision`, `decision-vercel`, or `openai-chat`), and explicit `url`, `model`, and `api_key`. The protocol determines the route mode: `decision` and `decision-vercel` are typed evaluation routes, while `openai-chat` is a chat route. TypeSafe and OpenRouter therefore share the provider-neutral `decision` adapter; Vercel AI Gateway uses its vendor-specific Evaluation v4 wire through `decision-vercel`; OpenAI-compatible LLMs share `openai-chat`. Typed Jev routes and chat/LLM routes use the same rotating-start, bounded-attempt, deadline, cooldown, and failover executor.
 
 Example `config.json` fragment:
 
@@ -188,21 +188,21 @@ Example `config.json` fragment:
     "routes": [
       {
         "name": "fast_primary",
-        "protocol": "jev",
+        "protocol": "decision",
         "url": "https://api.typesafe.ai/v1/systemone",
         "model": "jev-latest",
         "api_key": "<key>"
       },
       {
         "name": "fast_backup",
-        "protocol": "jev",
+        "protocol": "decision",
         "url": "https://openrouter.ai/api/alpha/decisions",
         "model": "~typesafe/jev-latest",
         "api_key": "<key>"
       },
       {
         "name": "fast_gateway",
-        "protocol": "evaluation-v4",
+        "protocol": "decision-vercel",
         "url": "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
         "model": "typesafe-ai/jev",
         "api_key": "<key>"

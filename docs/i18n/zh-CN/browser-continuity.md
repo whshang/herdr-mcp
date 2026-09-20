@@ -348,7 +348,7 @@ z.ai / DeepSeek 的 Auto 只负责 Herdr progress / settled 回推；ChatGPT 专
 
 Jev 先回答窄化的语义问题；普通 Auto 中，高置信度的 continue/done 结果直接生效。Jev 无法确定时才交给 LLM；LLM 仍无法明确判断时才退到精度较低的机械脚本。脚本的作用是保证没有 Jev/LLM API 的用户仍有基础 Auto，不能反向推翻 Jev/LLM 已经作出的判断。
 
-浏览器扩展不配置 Provider endpoint、model 或 API key，只调用本机 Herdr Runtime 的统一语义服务。Provider 配置只有两层：单机使用 mode-`0600` 的 `config.json`，全局使用已认证 Cloudflare Worker 的共享 route pool；同一 typed/chat 能力有本机 route 时优先本机。两层都使用统一的 `name / protocol / url / model / api_key` route JSON 对象；`jev` 与 `evaluation-v4` 自动归为 typed evaluation，`openai-chat` 自动归为 chat；shell/process environment 不作为 Provider 配置来源。Jev 与 LLM route 共用轮换、总 deadline、冷却和有界错误转移。
+浏览器扩展不配置 Provider endpoint、model 或 API key，只调用本机 Herdr Runtime 的统一语义服务。Provider 配置只有两层：单机使用 mode-`0600` 的 `config.json`，全局使用已认证 Cloudflare Worker 的共享 route pool；同一 typed/chat 能力有本机 route 时优先本机。两层都使用统一的 `name / protocol / url / model / api_key` route JSON 对象；`decision` 与 `decision-vercel` 自动归为 typed evaluation，`openai-chat` 自动归为 chat；shell/process environment 不作为 Provider 配置来源。Jev 与 LLM route 共用轮换、总 deadline、冷却和有界错误转移。
 
 Goal 模式使用更强的边界。Jev 可以一次向现有 LLM Goal Supervisor 提供五个有界语义 prior：`can_continue`、`needs_human`、`waiting_external`、`task_completed`、`needs_handoff`。这些概率只用于辅助判断；Work Memory/TODO evidence 与确定性的 runtime guard 仍是完成、等待、接力、人工边界和 uncertain delivery 的权威。
 

@@ -160,7 +160,7 @@ async function pair(env, name) {
 test("user keeps Worker semantic credentials at Edge | Given an enrolled device and Worker-wide route pool | When semantic evaluation is requested | Then authentication is required and credentials never return", async () => {
   const routes = [{
     name: "edge_fast",
-    protocol: "jev",
+    protocol: "decision",
     url: "https://api.typesafe.ai/v1/systemone",
     model: "jev-edge",
     api_key: "edge-typesafe-secret",
@@ -198,7 +198,7 @@ test("user keeps Worker semantic credentials at Edge | Given an enrolled device 
     chat_available: false,
     routes: [{
       name: "edge_fast",
-      protocol: "jev",
+      protocol: "decision",
       model: "jev-edge",
     }],
   });
@@ -253,14 +253,14 @@ test("user keeps semantic failover bounded | Given two independent route credent
   const routes = [
     {
       name: "direct-a",
-      protocol: "jev",
+      protocol: "decision",
       url: "https://typesafe.example/systemone",
       model: "jev-a",
       api_key: "route-secret-a",
     },
     {
       name: "openrouter-b",
-      protocol: "jev",
+      protocol: "decision",
       url: "https://openrouter.example/api/alpha/decisions",
       model: "~typesafe/jev-latest",
       api_key: "route-secret-b",
@@ -403,11 +403,11 @@ test("user uses one semantic route schema for chat | Given a Worker-wide openai-
   }
 });
 
-test("user receives normalized Vercel evaluation | Given an evaluation-v4 Jev route | When a Noul question is evaluated | Then boolean wire output is normalized to Noul", async () => {
+test("user receives normalized Vercel evaluation | Given a decision-vercel Jev route | When a Noul question is evaluated | Then boolean wire output is normalized to Noul", async () => {
   const h = makeEnv({
     HERDR_SEMANTIC_ROUTES: JSON.stringify([{
       name: "fast_gateway",
-      protocol: "evaluation-v4",
+      protocol: "decision-vercel",
       url: "https://ai-gateway.vercel.sh/v4/ai/evaluation-model",
       model: "typesafe-ai/jev",
       api_key: "vercel-secret",

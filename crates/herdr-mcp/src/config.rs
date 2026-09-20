@@ -450,7 +450,7 @@ fn validate_config(config: &Config) -> Result<(), String> {
         }
         if !matches!(
             route.protocol.as_str(),
-            "jev" | "evaluation-v4" | "openai-chat"
+            "decision" | "decision-vercel" | "openai-chat"
         ) || route.url.is_none()
             || route.model.is_none()
             || route.api_key.is_none()
@@ -706,7 +706,7 @@ mod tests {
             semantic: SemanticConfig {
                 routes: vec![SemanticRouteConfig {
                     name: "fast_a".to_owned(),
-                    protocol: "jev".to_owned(),
+                    protocol: "decision".to_owned(),
                     url: Some("https://api.typesafe.ai/v1/systemone".to_owned()),
                     model: Some("jev-latest".to_owned()),
                     api_key: Some("test-key".to_owned()),
@@ -725,7 +725,7 @@ mod tests {
             semantic: SemanticConfig {
                 routes: vec![SemanticRouteConfig {
                     name: "fast_a".to_owned(),
-                    protocol: "jev".to_owned(),
+                    protocol: "decision".to_owned(),
                     url: Some("https://api.typesafe.ai/v1/systemone".to_owned()),
                     model: Some("jev-latest".to_owned()),
                     api_key: Some("super-secret-key".to_owned()),
@@ -758,7 +758,7 @@ mod tests {
         )
         .is_err());
         assert!(parse_json(
-            r#"{"semantic":{"routes":[{"name":"fast","capability":"evaluate","protocol":"jev","url":"https://example.com","model":"m","api_key":"k"}]}}"#,
+            r#"{"semantic":{"routes":[{"name":"fast","capability":"evaluate","protocol":"decision","url":"https://example.com","model":"m","api_key":"k"}]}}"#,
             &InstanceId::default_instance()
         )
         .is_err());

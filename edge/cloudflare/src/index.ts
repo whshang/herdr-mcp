@@ -94,7 +94,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-type SemanticProtocol = "jev" | "evaluation-v4" | "openai-chat";
+type SemanticProtocol = "decision" | "decision-vercel" | "openai-chat";
 
 type EdgeSemanticRoute = {
   name: string;
@@ -116,8 +116,8 @@ let semanticRouteCursor = 0;
 const semanticRouteCooldowns = new Map<string, number>();
 
 function semanticProtocol(value: unknown): SemanticProtocol | null {
-  return value === "jev"
-    || value === "evaluation-v4"
+  return value === "decision"
+    || value === "decision-vercel"
     || value === "openai-chat"
     ? value
     : null;
@@ -201,7 +201,7 @@ function semanticQuestionsForRoute(
     if (!isRecord(raw)) return null;
     const type = raw.type;
     if (type !== "noul" && type !== "choice" && type !== "score") return null;
-    if (route.protocol === "evaluation-v4" && type === "noul") {
+    if (route.protocol === "decision-vercel" && type === "noul") {
       converted[id] = { ...raw, type: "boolean" };
     } else {
       converted[id] = raw;
@@ -215,7 +215,7 @@ function normalizeSemanticPayload(
   raw: unknown,
 ): Record<string, unknown> | null {
   if (!isRecord(raw) || !isRecord(raw.answers)) return null;
-  if (route.protocol !== "evaluation-v4") {
+  if (route.protocol !== "decision-vercel") {
     if (typeof raw.model !== "string") return null;
     return raw;
   }
@@ -256,7 +256,7 @@ async function callSemanticRoute(
     "content-type": "application/json",
   };
   let body: Record<string, unknown>;
-  if (route.protocol === "evaluation-v4") {
+  if (route.protocol === "decision-vercel") {
     headers["ai-evaluation-model-specification-version"] = "4";
     headers["ai-model-id"] = route.model;
     body = { state, questions: routeQuestions };
