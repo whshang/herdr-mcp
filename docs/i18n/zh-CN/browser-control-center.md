@@ -18,7 +18,7 @@
 |---|---|---|
 | HUD / Continuity | 当前网页在干嘛、Herdr 在干嘛，以及是否开启 Auto 或发送三个预置会话动作 | 支持的 Web AI 页面内 |
 | Control Center | 当前标签页属于哪个 Project / conversation、绑了什么、本机现场怎样、人工明确目标是谁 | Chrome Side Panel |
-| Options | timing / 语言 / 集成开关等低频配置是什么 | Control Center 的“设置” |
+| 设置 | 使用哪种语言、开放哪些站点，以及是否需要高级连续工作参数 | Control Center 的“设置” |
 
 HUD **不是第二个控制面板**：没有抽屉、workspace picker、binding 编辑、timing 表单，也没有本地 Herdr mutation 控件；它显示网页状态、Herdr 状态、一个紧凑的绑定徽标（`🔗N`）、Auto、三个预置推进动作和“手动接力”，因为这些操作都直接作用于当前网页会话。pane / Agent 明细只在 Control Center 展示。
 

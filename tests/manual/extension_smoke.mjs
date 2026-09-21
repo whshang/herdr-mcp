@@ -85,9 +85,10 @@ const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
 const hudStateViewSource = readFileSync(path.join(EXT, "content", "hud", "state-view.js"), "utf8");
 const hudRendererSource = readFileSync(path.join(EXT, "content", "hud", "renderer.js"), "utf8");
-ok(manifest.version === "0.1.116", "manifest version stays aligned with the browser product build");
+ok(manifest.version === "0.1.118", "manifest version stays aligned with the browser product build");
+ok(manifest.permissions?.includes("activeTab"), "Control Center can identify the user-invoked active WebChat tab before optional site access is granted");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.116"'), "background version matches manifest");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.118"'), "background version matches manifest");
 ok(backgroundSource.includes('routeAgentTaskInboxWake')
     && backgroundSource.includes('/extension/agent/tasks')
     && backgroundSource.includes('taskAttentionStateMap')
@@ -101,7 +102,7 @@ ok(wakeSource.includes('tasks: hud?.task_summary || null')
     && hudRendererSource.includes('tasks.blocked')
     && hudRendererSource.includes('tasks.uncertain'),
   "HUD renders durable task running/completed/blocked/uncertain counters from the Runtime inbox");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.116"'), "content version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.118"'), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
@@ -902,14 +903,10 @@ ok(
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
   "zh Auto-off tooltip keeps safe HUD actions available and states permission-card independence",
 );
-ok(zhLocale.label_automation_mode === "允许 ChatGPT 项目使用共享 Auto"
-    && zhLocale.label_automation_mode.includes("共享 Auto")
-    && zhLocale.hint_automation_mode.includes("全局能力门")
-    && zhLocale.hint_automation_mode.includes("普通 ChatGPT")
-    && zhLocale.hint_automation_mode.includes("实验")
-    && zhLocale.hint_automation_mode.includes("z.ai")
-    && zhLocale.hint_automation_mode.includes("DeepSeek"),
-  "zh Options distinguishes the Project Auto gate from default-off experimental sites");
+ok(zhLocale.label_automation_mode === "允许 ChatGPT 项目使用 Auto"
+    && zhLocale.hint_automation_mode.includes("HUD")
+    && zhLocale.hint_experimental_section.includes("默认关闭"),
+  "zh Settings keeps Project Auto explicit and experimental sites default-off");
 for (const obsolete of ["hud_wake_on", "hud_wake_off", "hud_nudge_on", "hud_nudge_off", "hud_llm", "hud_llm_off"]) {
   ok(!(obsolete in zhLocale), `obsolete HUD locale key removed: ${obsolete}`);
 }
