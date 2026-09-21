@@ -1067,8 +1067,8 @@ fn work_memory_search_page_json(
     query: &str,
     page_size: usize,
     page: WorkMemorySearchPage,
+    semantic_ranking: Value,
 ) -> Value {
-    let semantic_ranking = work_memory_semantic_ranking(query, &page.hits);
     let display_excerpt_truncated = page.hits.iter().any(|hit| hit.excerpt.contains('…'));
     let coverage = work_memory_coverage(
         page.boundary.checkpoint_revision,
@@ -1117,9 +1117,45 @@ fn work_memory_search_page_json(
     })
 }
 
-fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Value {
-    let service = SemanticService::from_config();
-    let capability = service.capability_json();
+fn work_memory_relaxed_semantic_candidates(
+    store: &StateStore,
+    semantic: &SemanticService,
+    query: &str,
+    page: &WorkMemorySearchPage,
+    page_size: usize,
+) -> Vec<WorkMemorySearchHit> {
+    if page.hits.len() >= page_size || !semantic.configured() {
+        return Vec::new();
+    }
+    store
+        .work_memory_relaxed_candidates(
+            query,
+            &page.boundary,
+            page_size.saturating_sub(page.hits.len()),
+        )
+        .unwrap_or_default()
+}
+
+fn work_memory_page_semantic_ranking(
+    store: &StateStore,
+    semantic: &SemanticService,
+    query: &str,
+    page: &WorkMemorySearchPage,
+    page_size: usize,
+) -> Value {
+    let mut candidates = page.hits.clone();
+    candidates.extend(work_memory_relaxed_semantic_candidates(
+        store, semantic, query, page, page_size,
+    ));
+    work_memory_semantic_ranking(semantic, query, &candidates)
+}
+
+fn work_memory_semantic_ranking(
+    semantic: &SemanticService,
+    query: &str,
+    hits: &[WorkMemorySearchHit],
+) -> Value {
+    let capability = semantic.capability_json();
     if hits.is_empty() {
         return json!({
             "attempted": false,
@@ -1128,7 +1164,7 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
             "capability": capability,
         });
     }
-    if !service.configured() {
+    if !semantic.configured() {
         return json!({
             "attempted": true,
             "used": false,
@@ -1143,6 +1179,7 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
             "source_kind": hit.source_kind,
             "source_id": hit.source_id,
             "excerpt": hit.excerpt,
+            "match_kind": if hit.strict_match { "strict" } else { "relaxed" },
         })).collect::<Vec<_>>(),
     }));
     for index in 0..hits.len() {
@@ -1155,7 +1192,15 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
             ),
         );
     }
-    let response = match service.evaluate(&request) {
+    request = request.ask(
+        "evidence_sufficient",
+        SemanticQuestion::noul(
+            "Taken together, are these frozen hits sufficient evidence to answer the query without further retrieval?",
+            "The frozen hits are sufficient to answer the query",
+            "More retrieval is useful before answering the query",
+        ),
+    );
+    let response = match semantic.evaluate(&request) {
         Ok(response) => response,
         Err(error) => {
             return json!({
@@ -1178,6 +1223,8 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
                     json!({
                         "source_kind": hit.source_kind,
                         "source_id": hit.source_id,
+                        "excerpt": hit.excerpt,
+                        "match_kind": if hit.strict_match { "strict" } else { "relaxed" },
                         "relevance": relevance,
                     })
                 })
@@ -1195,6 +1242,10 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
         "provider": response.provider,
         "model": response.model,
         "ranked": ranked,
+        "relaxed_candidate_count": hits.iter().filter(|hit| !hit.strict_match).count(),
+        "evidence_sufficient": response
+            .answer("evidence_sufficient")
+            .and_then(SemanticAnswer::noul_probability),
         "preserves_hit_order": true,
         "authority": "advisory_only",
         "capability": capability,
@@ -1741,14 +1792,25 @@ fn work_memory_call(
                         expected_boundary: Some(&boundary),
                     },
                 ) {
-                    Ok(Some(page)) => work_memory_search_page_json(
-                        &cursor.project_ref,
-                        &cursor.repo_id,
-                        &cursor.work_chain_id,
-                        &cursor.query,
-                        page_size,
-                        page,
-                    ),
+                    Ok(Some(page)) => {
+                        let semantic = SemanticService::from_config();
+                        let semantic_ranking = work_memory_page_semantic_ranking(
+                            &store,
+                            &semantic,
+                            &cursor.query,
+                            &page,
+                            page_size,
+                        );
+                        work_memory_search_page_json(
+                            &cursor.project_ref,
+                            &cursor.repo_id,
+                            &cursor.work_chain_id,
+                            &cursor.query,
+                            page_size,
+                            page,
+                            semantic_ranking,
+                        )
+                    }
                     Ok(None) => {
                         json!({"ok": false, "code": "work_memory_cursor_partition_mismatch"})
                     }
@@ -1789,14 +1851,20 @@ fn work_memory_call(
                     expected_boundary: None,
                 },
             ) {
-                Ok(Some(page)) => work_memory_search_page_json(
-                    project_ref,
-                    repo_id,
-                    work_chain_id,
-                    query,
-                    limit,
-                    page,
-                ),
+                Ok(Some(page)) => {
+                    let semantic = SemanticService::from_config();
+                    let semantic_ranking =
+                        work_memory_page_semantic_ranking(&store, &semantic, query, &page, limit);
+                    work_memory_search_page_json(
+                        project_ref,
+                        repo_id,
+                        work_chain_id,
+                        query,
+                        limit,
+                        page,
+                        semantic_ranking,
+                    )
+                }
                 Ok(None) => json!({"ok": false, "code": "work_memory_not_found"}),
                 Err(error) => work_memory_store_error(error),
             }
@@ -1976,6 +2044,22 @@ fn browser_resource_unavailable_reason(
 ) -> Result<String, String> {
     Ok(browser_evidence_machine_reason(evidence)?
         .unwrap_or_else(|| "browser_actuation_reason_missing".to_owned()))
+}
+
+fn browser_session_create_retry_safe_not_applied(evidence: &BrowserPostconditionEvidence) -> bool {
+    !evidence.command_accepted
+        && evidence
+            .result
+            .as_ref()
+            .and_then(|result| result.get("message_submitted"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        && evidence
+            .result
+            .as_ref()
+            .and_then(|result| result.get("retry_safe"))
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 fn browser_delivery_state_from_postcondition(
@@ -3855,7 +3939,7 @@ fn browser_session_create(
             "browser_actuator_unavailable",
         ),
     };
-    let delivery_state = match browser_delivery_state_from_postcondition(
+    let observed_delivery_state = match browser_delivery_state_from_postcondition(
         BrowserOperation::SessionCreate,
         params,
         expected_generation,
@@ -3864,13 +3948,21 @@ fn browser_session_create(
         Ok(state) => state,
         Err(error) => return browser_store_error(error),
     };
-    let unavailable_reason = if delivery_state == BrowserDeliveryState::ResourceUnavailable {
+    let unavailable_reason = if observed_delivery_state == BrowserDeliveryState::ResourceUnavailable
+    {
         match browser_resource_unavailable_reason(&evidence) {
             Ok(reason) => Some(reason),
             Err(error) => return browser_store_error(error),
         }
     } else {
         None
+    };
+    let delivery_state = if observed_delivery_state == BrowserDeliveryState::ResourceUnavailable
+        && browser_session_create_retry_safe_not_applied(&evidence)
+    {
+        BrowserDeliveryState::NotApplied
+    } else {
+        observed_delivery_state
     };
     let accepted_user_message_ref = match browser_evidence_accepted_user_message_ref(&evidence) {
         Ok(value) => value,
@@ -3913,7 +4005,7 @@ fn browser_session_create(
     }
     json!({
         "ok": false,
-        "code": unavailable_reason.as_deref().unwrap_or_else(|| delivery_state.as_str()),
+        "code": unavailable_reason.as_deref().unwrap_or_else(|| observed_delivery_state.as_str()),
         "reason": unavailable_reason,
         "operation": BrowserOperation::SessionCreate.method(),
         "reservation_ref": updated.reservation_ref,
@@ -3921,6 +4013,7 @@ fn browser_session_create(
         "delivery_state": updated.delivery_state,
         "replayed": replayed,
         "reconciled": false,
+        "delivery_evidence": evidence.result,
     })
 }
 
@@ -6216,6 +6309,7 @@ fn page_assist_call(
         "generation",
         "ref",
         "value",
+        "advisory",
     ];
     if let Some(key) = object
         .keys()
@@ -6302,6 +6396,24 @@ fn page_assist_call(
             return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be an integer"});
         }
     };
+    let advisory = match object.get("advisory") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "advisory must be a boolean when provided"
+            });
+        }
+    };
+    if advisory && action != "inspect" {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": "advisory is supported only for inspect"
+        });
+    }
     let bounded_string = |key: &str, max_chars: usize| -> Result<String, Value> {
         match object.get(key).and_then(Value::as_str) {
             Some(value) if !value.is_empty() && value.chars().count() <= max_chars => {
@@ -6367,7 +6479,13 @@ fn page_assist_call(
     };
     match actuator.actuate("herdr_mcp.page_assist", &bridge_params, 1, None) {
         Ok(evidence) => {
-            if let Some(result) = evidence.result {
+            if let Some(mut result) = evidence.result {
+                if advisory && action == "inspect" {
+                    let page_state_advisory = page_assist_semantic_advisory(&result);
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert("page_state_advisory".to_owned(), page_state_advisory);
+                    }
+                }
                 return result;
             }
             if !evidence.browser_online || !evidence.command_accepted {
@@ -6393,6 +6511,225 @@ fn page_assist_call(
             "delivery_state": "not_delivered",
         }),
     }
+}
+
+fn page_assist_state_features(result: &Value) -> Value {
+    const MAX_TEXT_CHARS: usize = 16_384;
+    const MAX_ELEMENTS: usize = 40;
+
+    let mut visible = String::new();
+    for value in [
+        result.get("title").and_then(Value::as_str),
+        result.get("text").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        visible.extend(value.chars().take(MAX_TEXT_CHARS));
+        visible.push(' ');
+    }
+
+    let mut element_count = 0_u64;
+    let mut button_count = 0_u64;
+    let mut input_count = 0_u64;
+    let mut link_count = 0_u64;
+    for element in result
+        .get("elements")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_ELEMENTS)
+    {
+        element_count += 1;
+        let role = element
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let kind = element
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        button_count += u64::from(role == "button" || kind == "button");
+        input_count += u64::from(
+            matches!(role.as_str(), "textbox" | "searchbox")
+                || matches!(kind.as_str(), "text" | "email" | "search" | "tel" | "url"),
+        );
+        link_count += u64::from(role == "link");
+        if let Some(text) = element.get("text").and_then(Value::as_str) {
+            visible.extend(text.chars().take(120));
+            visible.push(' ');
+        }
+    }
+
+    let text = visible.to_ascii_lowercase();
+    let contains_any = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    let bot_challenge = contains_any(&[
+        "cloudflare",
+        "turnstile",
+        "captcha",
+        "verify you are human",
+        "verify you're human",
+        "checking your browser",
+        "security verification",
+        "just a moment",
+    ]);
+    let login_required = contains_any(&[
+        "sign in",
+        "log in",
+        "login",
+        "authentication required",
+        "session expired",
+    ]);
+    let permission_required = contains_any(&[
+        "permission required",
+        "allow access",
+        "grant access",
+        "authorization required",
+    ]);
+    let rate_limited = contains_any(&[
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        "quota exceeded",
+        "try again later",
+    ]);
+    let error = contains_any(&[
+        "something went wrong",
+        "service unavailable",
+        "temporarily unavailable",
+        "internal server error",
+        "request failed",
+    ]);
+    let has_interactive_controls = button_count + input_count + link_count > 0;
+
+    json!({
+        "signals": {
+            "bot_challenge_language": bot_challenge,
+            "login_required_language": login_required,
+            "permission_required_language": permission_required,
+            "rate_limited_language": rate_limited,
+            "error_language": error,
+            "has_interactive_controls": has_interactive_controls,
+        },
+        "visible_structure": {
+            "element_count": element_count,
+            "button_count": button_count,
+            "input_count": input_count,
+            "link_count": link_count,
+        },
+        "raw_page_text_included": false,
+        "authority": "derived_non_sensitive_features_only",
+    })
+}
+
+fn page_assist_semantic_advisory(result: &Value) -> Value {
+    let service = SemanticService::from_config();
+    let capability = service.capability_json();
+    if !service.configured() {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "reason": "not_configured",
+            "advisory_only": true,
+            "capability": capability,
+        });
+    }
+
+    let request = SemanticRequest::new(page_assist_state_features(result))
+    .ask(
+        "page_state",
+        SemanticQuestion::choice(
+            "Which advisory page state best matches these locally derived non-sensitive page-state signals and structure counts?",
+            std::collections::BTreeMap::from([
+                (
+                    "ready".to_owned(),
+                    Some("The page is ready for the user's intended interaction".to_owned()),
+                ),
+                (
+                    "login_required".to_owned(),
+                    Some("Visible page content requires sign-in or authentication".to_owned()),
+                ),
+                (
+                    "bot_challenge".to_owned(),
+                    Some("Visible content shows an anti-bot challenge such as Cloudflare, Turnstile, CAPTCHA, or verification challenge".to_owned()),
+                ),
+                (
+                    "permission_required".to_owned(),
+                    Some("Visible content requires granting a browser, site, or account permission".to_owned()),
+                ),
+                (
+                    "rate_limited".to_owned(),
+                    Some("Visible content indicates throttling, quota exhaustion, or too many requests".to_owned()),
+                ),
+                (
+                    "error".to_owned(),
+                    Some("Visible content shows a page or service error state".to_owned()),
+                ),
+                (
+                    "unknown".to_owned(),
+                    Some("The bounded visible evidence does not establish another state".to_owned()),
+                ),
+            ]),
+        ),
+    );
+
+    let response = match service.evaluate(&request) {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "reason": error.code(),
+                "advisory_only": true,
+                "capability": capability,
+            });
+        }
+    };
+    let Some((state, probabilities, confidence)) = response
+        .answer("page_state")
+        .and_then(SemanticAnswer::choice_value)
+    else {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "reason": "bad_response",
+            "advisory_only": true,
+            "capability": capability,
+        });
+    };
+    if !matches!(
+        state,
+        "ready"
+            | "login_required"
+            | "bot_challenge"
+            | "permission_required"
+            | "rate_limited"
+            | "error"
+            | "unknown"
+    ) {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "reason": "bad_response",
+            "advisory_only": true,
+            "capability": capability,
+        });
+    }
+
+    json!({
+        "attempted": true,
+        "used": true,
+        "advisory_only": true,
+        "state": state,
+        "probabilities": probabilities,
+        "confidence": confidence,
+        "provider": response.provider,
+        "model": response.model,
+        "capability": capability,
+        "authority": "page-state classification only; action authorization and ref validity remain deterministic",
+    })
 }
 
 fn config_dir() -> std::path::PathBuf {
@@ -6601,6 +6938,39 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn semantic_test_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://127.0.0.1:{}/v1", address.port())
+    }
+
+    fn write_semantic_test_config(config_dir: &std::path::Path, route_name: &str, url: &str) {
+        let path = config_dir.join("config.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"semantic":{{"routes":[{{"name":"{route_name}","protocol":"decision","url":"{url}","model":"jev-test","api_key":"test"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     #[test]
     fn initialize_uses_supported_requested_protocol() {
@@ -7494,6 +7864,18 @@ mod tests {
     fn work_memory_private_methods_share_state_store_and_provider_qualify_messages() {
         use std::sync::{Arc, Mutex};
 
+        let _env_guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-work-memory-private-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let mut message_ids = Vec::new();
         for (provider, account_ref) in [("chatgpt", "account-a"), ("gemini", "account-b")] {
@@ -7691,13 +8073,107 @@ mod tests {
         assert_eq!(searched["ok"], true);
         assert_eq!(searched["hits"].as_array().unwrap().len(), 1);
         assert_eq!(searched["hits"][0]["source_kind"], "evidence");
+        assert_eq!(searched["semantic_ranking"]["used"], false);
         assert_eq!(searched["coverage"]["result_completeness"], "complete");
         assert_eq!(searched["coverage"]["source_verification"], "unverified");
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn work_memory_evidence_sufficient_is_live_advisory_across_semantic_states() {
+        let _guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir =
+            std::env::temp_dir().join(format!("herdr-work-memory-semantic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+        let hits = vec![
+            WorkMemorySearchHit {
+                source_kind: "evidence".to_owned(),
+                source_id: "ev_strict".to_owned(),
+                excerpt: "The release gate was discussed.".to_owned(),
+                strict_match: true,
+            },
+            WorkMemorySearchHit {
+                source_kind: "evidence".to_owned(),
+                source_id: "ev_relaxed".to_owned(),
+                excerpt: "The gate passed after rollout.".to_owned(),
+                strict_match: false,
+            },
+        ];
+
+        let no_config = work_memory_semantic_ranking(
+            &SemanticService::from_config(),
+            "Did the release gate pass?",
+            &hits,
+        );
+        assert_eq!(no_config["used"], false);
+        assert_eq!(no_config["reason"], "not_configured");
+
+        let semantic_url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"hit_0":{"type":"noul","noul":0.20},"hit_1":{"type":"noul","noul":0.93},"evidence_sufficient":{"type":"noul","noul":0.87}}}"#,
+        );
+        write_semantic_test_config(&config_dir, "work-memory-evidence", &semantic_url);
+        let configured = work_memory_semantic_ranking(
+            &SemanticService::from_config(),
+            "Did the release gate pass?",
+            &hits,
+        );
+        assert_eq!(configured["used"], true);
+        assert_eq!(configured["ranked"][0]["source_id"], "ev_relaxed");
+        assert_eq!(configured["ranked"][0]["match_kind"], "relaxed");
+        assert_eq!(
+            configured["ranked"][0]["excerpt"],
+            "The gate passed after rollout."
+        );
+        assert_eq!(configured["relaxed_candidate_count"], 1);
+        assert_eq!(configured["evidence_sufficient"], 0.87);
+        assert_eq!(configured["preserves_hit_order"], true);
+        assert_eq!(configured["authority"], "advisory_only");
+
+        write_semantic_test_config(&config_dir, "work-memory-evidence", "http://127.0.0.1:1/v1");
+        let provider_error = work_memory_semantic_ranking(
+            &SemanticService::from_config(),
+            "Did the release gate pass?",
+            &hits,
+        );
+        assert_eq!(provider_error["used"], false);
+        assert_ne!(provider_error["reason"], "not_configured");
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
     }
 
     #[test]
     fn work_memory_search_cursor_freezes_boundary_and_rejects_tampering() {
         use std::sync::{Arc, Mutex};
+
+        let _env_guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-work-memory-cursor-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
 
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let bound = work_memory_call(
@@ -7742,6 +8218,7 @@ mod tests {
         );
         assert_eq!(first["ok"], true);
         assert_eq!(first["hits"].as_array().unwrap().len(), 2);
+        assert_eq!(first["semantic_ranking"]["used"], false);
         assert_eq!(first["coverage"]["result_completeness"], "complete");
         assert_eq!(first["coverage"]["display_truncated"], true);
         let cursor = first["cursor"].as_str().unwrap().to_owned();
@@ -7819,6 +8296,14 @@ mod tests {
         let tampered_result =
             work_memory_call(&store, "work_memory.search", &json!({"cursor": tampered}));
         assert_eq!(tampered_result["code"], "work_memory_cursor_invalid");
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
     }
 
     #[test]
@@ -8428,6 +8913,18 @@ mod tests {
         };
         use std::sync::{Arc, Mutex};
 
+        let _env_guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-browser-dispatch-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let session_ref = {
             let mut guard = store.lock().unwrap();
@@ -8849,6 +9346,7 @@ mod tests {
         assert_eq!(evidence_search["ok"], true);
         assert_eq!(evidence_search["hits"].as_array().unwrap().len(), 1);
         assert_eq!(evidence_search["hits"][0]["source_kind"], "evidence");
+        assert_eq!(evidence_search["semantic_ranking"]["used"], false);
         assert!(
             !evidence_search
                 .to_string()
@@ -9106,6 +9604,14 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
     }
 
     #[test]
@@ -11007,6 +11513,41 @@ mod tests {
             }
         }
 
+        struct RetrySafeThenAppliedActuator {
+            inner: SessionCreateActuator,
+            calls: AtomicUsize,
+        }
+
+        impl BrowserActuator for RetrySafeThenAppliedActuator {
+            fn actuate(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BrowserOperation::SessionCreate.method());
+                assert_eq!(dispatch_id, params["reservation_ref"].as_str());
+                let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    let mut evidence =
+                        BrowserPostconditionEvidence::resource_unavailable_with_reason(
+                            expected_generation,
+                            "browser_create_scope_unavailable",
+                        );
+                    evidence.result = Some(json!({
+                        "error": "browser_create_scope_unavailable",
+                        "phase": "scope_handshake",
+                        "message_submitted": false,
+                        "retry_safe": true
+                    }));
+                    return Ok(evidence);
+                }
+                self.inner.materialize(params, expected_generation);
+                Ok(SessionCreateActuator::applied_evidence(expected_generation))
+            }
+        }
+
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let (endpoint_ref, account_ref, source_url) = {
             let mut guard = store.lock().unwrap();
@@ -11149,6 +11690,71 @@ mod tests {
             materialized_but_partial: false,
             reconcile_pending_polls: 0,
         };
+        let retry_safe = RetrySafeThenAppliedActuator {
+            inner: SessionCreateActuator {
+                store: store.clone(),
+                calls: AtomicUsize::new(0),
+                reconcile_calls: AtomicUsize::new(0),
+                materialize_on_actuate: false,
+                materialize_on_reconcile_poll: None,
+                delayed: false,
+                materialized_but_partial: false,
+                reconcile_pending_polls: 0,
+            },
+            calls: AtomicUsize::new(0),
+        };
+        let retry_safe_params = json!({
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+            "display_label": "Worker retry safe",
+            "message": "retry only after proven no delivery",
+            "expected_generation": 7,
+            "idempotency_key": "session-create-retry-safe-1"
+        });
+        let retry_safe_first = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &retry_safe_params,
+            true,
+            Some(&retry_safe),
+        );
+        assert_eq!(retry_safe_first["ok"], false);
+        assert_eq!(retry_safe_first["code"], "browser_create_scope_unavailable");
+        assert_eq!(retry_safe_first["delivery_state"], "not_applied");
+        assert_eq!(
+            retry_safe_first["delivery_evidence"]["message_submitted"],
+            false
+        );
+        assert_eq!(retry_safe_first["delivery_evidence"]["retry_safe"], true);
+        assert_eq!(retry_safe.calls.load(Ordering::SeqCst), 1);
+
+        // Re-observing the same intent uses the same reservation/idempotency key.
+        // Because the first attempt proved no delivery, the existing NotApplied
+        // state may re-actuate exactly once instead of becoming a terminal replay.
+        let retry_safe_second = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &retry_safe_params,
+            true,
+            Some(&retry_safe),
+        );
+        assert_eq!(retry_safe_second["ok"], true);
+        assert_eq!(retry_safe_second["replayed"], true);
+        assert_eq!(retry_safe_second["delivery_state"], "applied");
+        assert_eq!(retry_safe.calls.load(Ordering::SeqCst), 2);
+
+        let retry_safe_applied_replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.create",
+            &retry_safe_params,
+            true,
+            Some(&retry_safe),
+        );
+        assert_eq!(retry_safe_applied_replay["ok"], true);
+        assert_eq!(retry_safe_applied_replay["replayed"], true);
+        assert_eq!(retry_safe.calls.load(Ordering::SeqCst), 2);
+
         for (params, expected_code) in [
             (
                 json!({
@@ -12368,6 +12974,123 @@ mod tests {
         assert_eq!(allowed["generation"], "pa:test");
         assert_eq!(allowed["text"], "visible page text");
     }
+    #[test]
+    fn page_assist_advisory_is_optional_and_no_config_preserves_inspect_result() {
+        let _guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-page-assist-semantic-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+
+        struct ResultActuator;
+        impl BrowserActuator for ResultActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "generation": "pa:test",
+                    "title": "Just a moment",
+                    "text": "Checking your browser with Cloudflare Turnstile. account secret@example.com token sk-test-1234567890"
+                }));
+                Ok(evidence)
+            }
+        }
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let result = page_assist_call(
+            &json!({
+                "endpoint_ref": "bep_test",
+                "action": "inspect",
+                "target_origin": "https://example.com",
+                "advisory": true
+            }),
+            &grants,
+            Some(&ResultActuator),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["text"],
+            "Checking your browser with Cloudflare Turnstile. account secret@example.com token sk-test-1234567890"
+        );
+        let features = page_assist_state_features(&result);
+        assert_eq!(features["signals"]["bot_challenge_language"], true);
+        let feature_json = features.to_string();
+        assert!(!feature_json.contains("secret@example.com"));
+        assert!(!feature_json.contains("sk-test-1234567890"));
+        assert_eq!(result["page_state_advisory"]["used"], false);
+        assert_eq!(result["page_state_advisory"]["reason"], "not_configured");
+        assert_eq!(result["page_state_advisory"]["advisory_only"], true);
+
+        let semantic_url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"page_state":{"type":"choice","choice":"bot_challenge","probabilities":{"ready":0.01,"login_required":0.01,"bot_challenge":0.94,"permission_required":0.01,"rate_limited":0.01,"error":0.01,"unknown":0.01},"confidence":0.94}}}"#,
+        );
+        write_semantic_test_config(&config_dir, "page-state-advisory", &semantic_url);
+        let configured = page_assist_call(
+            &json!({
+                "endpoint_ref": "bep_test",
+                "action": "inspect",
+                "target_origin": "https://example.com",
+                "advisory": true
+            }),
+            &grants,
+            Some(&ResultActuator),
+        );
+        assert_eq!(configured["ok"], true);
+        assert_eq!(
+            configured["text"],
+            "Checking your browser with Cloudflare Turnstile. account secret@example.com token sk-test-1234567890"
+        );
+        assert_eq!(configured["page_state_advisory"]["used"], true);
+        assert_eq!(configured["page_state_advisory"]["state"], "bot_challenge");
+
+        write_semantic_test_config(&config_dir, "page-state-advisory", "http://127.0.0.1:1/v1");
+        let provider_error = page_assist_call(
+            &json!({
+                "endpoint_ref": "bep_test",
+                "action": "inspect",
+                "target_origin": "https://example.com",
+                "advisory": true
+            }),
+            &grants,
+            Some(&ResultActuator),
+        );
+        assert_eq!(provider_error["ok"], true);
+        assert_eq!(
+            provider_error["text"],
+            "Checking your browser with Cloudflare Turnstile. account secret@example.com token sk-test-1234567890"
+        );
+        assert_eq!(provider_error["page_state_advisory"]["used"], false);
+        assert_ne!(
+            provider_error["page_state_advisory"]["reason"],
+            "not_configured"
+        );
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+    }
+
     #[test]
     fn browser_session_open_uses_local_locator_and_replays_idempotently() {
         use crate::state_store::{

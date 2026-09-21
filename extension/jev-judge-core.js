@@ -30,6 +30,22 @@ export function buildJevPendingWorkRequest(userText, assistantText) {
           false: "The requested work is complete, the response only offers optional future help, or the remaining action requires a user/external decision or input before the assistant can continue.",
         },
       },
+      handoff_boundary_stable: {
+        type: "noul",
+        instructions: "Is the latest settled turn a stable boundary where a continuity handoff could preserve the work cleanly if deterministic context-pressure gates later require one?",
+        criteria: {
+          true: "The latest response ends at a coherent work boundary with state and next work understandable from the bounded transcript.",
+          false: "The response is mid-step, ambiguous, or lacks enough state to make a clean continuity boundary.",
+        },
+      },
+      useful_work_remaining: {
+        type: "noul",
+        instructions: "Is there substantial useful work that can still be completed in the current conversation before a handoff becomes necessary?",
+        criteria: {
+          true: "Meaningful work remains that can continue in the current conversation.",
+          false: "Little useful work remains here, or the work is complete or blocked on a human/external event.",
+        },
+      },
     },
   };
 }
@@ -132,11 +148,17 @@ export function interpretJevPendingWorkAnswer(payload, threshold = DEFAULT_JEV_T
     return { ok: false, reason: "bad_response", probability: null, signal: "unknown" };
   }
   const t = normalizeJevJudgeThreshold(threshold);
+  const optionalNoul = (key) => {
+    const value = Number(payload?.answers?.[key]?.noul);
+    return Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+  };
   return {
     ok: true,
     probability: p,
     threshold: t,
     signal: p >= t ? "continue" : p <= 1 - t ? "done" : "uncertain",
+    handoffBoundaryStable: optionalNoul("handoff_boundary_stable"),
+    usefulWorkRemaining: optionalNoul("useful_work_remaining"),
     model: typeof payload?.model === "string" ? payload.model : null,
     usage: payload?.usage && typeof payload.usage === "object" ? payload.usage : null,
   };
