@@ -17,11 +17,13 @@ const postStart = backgroundSource.indexOf("async function postBrowserDispatchRe
 const postEnd = backgroundSource.indexOf("\nasync function observeBrowserConversation({", postStart);
 assert.ok(postStart >= 0 && postEnd > postStart, "background settlement post must remain extractable");
 const postSource = backgroundSource.slice(postStart, postEnd);
+const TEST_DISPATCH_ID = `bd_${"a".repeat(64)}`;
 
 function settlementHarness({ sessionRef = "br_session_1", generation = 7, accepted = null, sends = [] } = {}) {
   const acceptedDispatchAssignments = new Map();
   if (accepted) {
     acceptedDispatchAssignments.set(sessionRef, {
+      dispatchId: TEST_DISPATCH_ID,
       generation,
       acceptedUserMessageRef: accepted,
       reportedAssistantRef: null,
@@ -46,7 +48,7 @@ function settlementHarness({ sessionRef = "br_session_1", generation = 7, accept
 }
 
 test("finalized turn reports exact provider/session/generation/user/assistant identity and text", async () => {
-  const { report, sent } = settlementHarness({ sessionRef: "br_abc", generation: 7 });
+  const { report, sent } = settlementHarness({ sessionRef: "br_abc", generation: 7, accepted: "user-msg-1" });
   const ok = await report({
     ok: true,
     finished: true,
@@ -57,6 +59,7 @@ test("finalized turn reports exact provider/session/generation/user/assistant id
   assert.equal(ok, true);
   assert.deepEqual(sent, [{
     type: "h2w_browser_result",
+    dispatch_id: TEST_DISPATCH_ID,
     provider: "chatgpt",
     session_ref: "br_abc",
     generation: 7,
@@ -113,7 +116,7 @@ test("accepted dispatch identity is the fallback when a snapshot omits the user 
 });
 
 test("repeated settlement for one assistant message is locally idempotent", async () => {
-  const { report, sent } = settlementHarness({ sessionRef: "br_abc", generation: 7 });
+  const { report, sent } = settlementHarness({ sessionRef: "br_abc", generation: 7, accepted: "user-1" });
   const snapshot = {
     ok: true,
     finished: true,
@@ -142,6 +145,7 @@ test("background posts trusted result settlement through the existing registry I
     `${postSource}; return postBrowserDispatchResult;`,
   )(postBrowserRegistry);
   const result = await post({
+    dispatch_id: TEST_DISPATCH_ID,
     provider: "chatgpt",
     session_ref: "br_abc",
     expected_generation: 7,
@@ -151,6 +155,7 @@ test("background posts trusted result settlement through the existing registry I
   });
   assert.deepEqual(calls, [{
     operation: "dispatch.result",
+    dispatch_id: TEST_DISPATCH_ID,
     provider: "chatgpt",
     session_ref: "br_abc",
     expected_generation: 7,
@@ -189,6 +194,7 @@ function observationHarness({
   const sent = [];
   const assignments = new Map();
   if (accepted) assignments.set("br_worker", {
+    dispatchId: TEST_DISPATCH_ID,
     generation: 7,
     acceptedUserMessageRef: "user-1",
     reportedAssistantRef: null,
@@ -243,6 +249,7 @@ function providerObservationHarness({
   const route = "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174000";
   const sent = [];
   const assignments = new Map([["br_worker", {
+    dispatchId: TEST_DISPATCH_ID,
     generation: 7,
     acceptedUserMessageRef,
     reportedAssistantRef: null,
@@ -307,6 +314,7 @@ test("user gets durable Claude settlement | Given one exact accepted user ref | 
   assert.equal(await h.observe(), true);
   assert.deepEqual(h.sent, [{
     type: "h2w_browser_result",
+    dispatch_id: TEST_DISPATCH_ID,
     provider: "claude",
     session_ref: "br_worker",
     generation: 7,
@@ -382,7 +390,7 @@ test("accepted worker result retries a failed acknowledgement and throttles prob
 });
 
 test("reopened worker recovers exact finalized result without an in-memory assignment", async () => {
-  const h = observationHarness({ accepted: false, recovered: { generation: 6, accepted_user_message_ref: "user-1" }, snapshots: [completedWorkerSnapshot] });
+  const h = observationHarness({ accepted: false, recovered: { dispatch_id: TEST_DISPATCH_ID, generation: 6, accepted_user_message_ref: "user-1" }, snapshots: [completedWorkerSnapshot] });
   assert.equal(await h.observe(), true);
   assert.equal(h.sent[0].session_ref, "br_worker");
   assert.equal(h.sent[0].generation, 6);
@@ -509,21 +517,25 @@ test("late accepted-dispatch observation preserves an already reported assistant
     "registeredBrowserSessionRef",
     "expectedGeneration",
     "acceptedUserMessageRef",
+    "dispatchId",
     "creatingSession",
     `${wakeSource.slice(start, end)}; return acceptedDispatchAssignments.get(registeredBrowserSessionRef);`,
   );
   const assignments = new Map([["br_worker", {
+    dispatchId: TEST_DISPATCH_ID,
     generation: 7,
     acceptedUserMessageRef: "user-1",
     reportedAssistantRef: "assistant-1",
   }]]);
-  assert.deepEqual(apply(assignments, "br_worker", 7, "user-1", false), {
+  assert.deepEqual(apply(assignments, "br_worker", 7, "user-1", TEST_DISPATCH_ID, false), {
+    dispatchId: TEST_DISPATCH_ID,
     generation: 7,
     acceptedUserMessageRef: "user-1",
     reportedAssistantRef: "assistant-1",
     unmatchedGraceUntil: null,
   });
-  assert.deepEqual(apply(assignments, "br_worker", 7, "user-2", false), {
+  assert.deepEqual(apply(assignments, "br_worker", 7, "user-2", TEST_DISPATCH_ID, false), {
+    dispatchId: TEST_DISPATCH_ID,
     generation: 7,
     acceptedUserMessageRef: "user-2",
     reportedAssistantRef: null,
@@ -548,7 +560,7 @@ test("an older result ACK preserves a newer accepted worker assignment", async (
   let resolve;
   const h = settlementHarness({ sessionRef: "br_worker", generation: 7, accepted: "user-1", sends: [() => new Promise((done) => { resolve = done; })] });
   const report = h.report(completedWorkerSnapshot);
-  const newer = { generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null };
+  const newer = { dispatchId: `bd_${"b".repeat(64)}`, generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null };
   h.acceptedDispatchAssignments.set("br_worker", newer);
   resolve({ ok: true });
   assert.equal(await report, true);
@@ -563,7 +575,7 @@ test("ordinary registered pages with no assignment perform no provider probes", 
 });
 
 test("recovered assignment survives more than three transient result failures", async () => {
-  const h = observationHarness({ accepted: false, recovered: { generation: 6, accepted_user_message_ref: "user-1" }, snapshots: Array(5).fill(completedWorkerSnapshot), sends: [...Array(4).fill({ ok: false, error: "browser-registry-http-503" }), { ok: true }] });
+  const h = observationHarness({ accepted: false, recovered: { dispatch_id: TEST_DISPATCH_ID, generation: 6, accepted_user_message_ref: "user-1" }, snapshots: Array(5).fill(completedWorkerSnapshot), sends: [...Array(4).fill({ ok: false, error: "browser-registry-http-503" }), { ok: true }] });
   for (let i = 0; i < 4; i += 1) { assert.equal(await h.observe(), false); h.advance(60000); }
   assert.equal(await h.observe(), true);
   assert.equal(h.sent.length, 5);
@@ -599,7 +611,7 @@ test("persistent identity rejection stops retries but a new assignment can proce
   for (let i = 0; i < 10; i += 1) { await h.observe(); h.advance(60000); }
   assert.equal(h.probes(), 3);
   assert.equal(h.sent.length, 3);
-  h.assignments.set("br_worker", { generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null });
+  h.assignments.set("br_worker", { dispatchId: `bd_${"b".repeat(64)}`, generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null });
   assert.equal(await h.observe(), true);
   assert.equal(h.sent.length, 4);
 });

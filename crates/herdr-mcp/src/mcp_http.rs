@@ -49,6 +49,7 @@ const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
 // can turn a durable reservation/dispatch into an ambiguous gateway timeout.
 const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(22);
 const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
+const BROWSER_ACTUATION_ENDPOINT_PARAM: &str = "__herdr_browser_endpoint_ref";
 // The extension polls for browser actuation on the shared SSE heartbeat. Keep
 // the liveness window above that 15s cadence so an idle healthy stream is not
 // classified offline between polls.
@@ -87,6 +88,7 @@ struct BrowserActuationState {
     pending: HashMap<String, PendingBrowserActuation>,
     completions: HashMap<String, BrowserPostconditionEvidence>,
     last_extension_poll: Option<Instant>,
+    last_endpoint_polls: HashMap<String, Instant>,
 }
 
 struct PendingBrowserActuation {
@@ -135,21 +137,40 @@ impl BrowserActuationBroker {
         }
     }
 
-    fn take_next_for_extension(&self) -> Option<Value> {
+    fn note_poll(state: &mut BrowserActuationState, endpoint_ref: Option<&str>) {
+        let now = Instant::now();
+        state.last_extension_poll = Some(now);
+        if let Some(endpoint_ref) = endpoint_ref.filter(|value| !value.is_empty()) {
+            state
+                .last_endpoint_polls
+                .insert(endpoint_ref.to_owned(), now);
+        }
+        state.last_endpoint_polls.retain(|_, seen| {
+            seen.elapsed() <= BROWSER_EXTENSION_LIVE_WINDOW + BROWSER_EXTENSION_LIVE_WINDOW
+        });
+    }
+
+    fn take_next_for_extension(&self, endpoint_ref: Option<&str>) -> Option<Value> {
         let Ok(mut state) = self.inner.0.lock() else {
             return None;
         };
         self.prune_expired(&mut state);
-        state.last_extension_poll = Some(Instant::now());
-        state.queued.pop_front()
+        Self::note_poll(&mut state, endpoint_ref);
+        let position = state.queued.iter().position(|command| {
+            command
+                .get("target_endpoint_ref")
+                .and_then(Value::as_str)
+                .is_none_or(|target| endpoint_ref == Some(target))
+        })?;
+        state.queued.remove(position)
     }
 
-    fn note_extension_poll(&self) {
+    fn note_extension_poll(&self, endpoint_ref: Option<&str>) {
         let Ok(mut state) = self.inner.0.lock() else {
             return;
         };
         self.prune_expired(&mut state);
-        state.last_extension_poll = Some(Instant::now());
+        Self::note_poll(&mut state, endpoint_ref);
     }
 
     fn complete(
@@ -170,7 +191,13 @@ impl BrowserActuationBroker {
         Ok(())
     }
 
-    fn extension_live(state: &BrowserActuationState) -> bool {
+    fn extension_live(state: &BrowserActuationState, endpoint_ref: Option<&str>) -> bool {
+        if let Some(endpoint_ref) = endpoint_ref {
+            return state
+                .last_endpoint_polls
+                .get(endpoint_ref)
+                .is_some_and(|seen| seen.elapsed() <= BROWSER_EXTENSION_LIVE_WINDOW);
+        }
         state
             .last_extension_poll
             .is_some_and(|seen| seen.elapsed() <= BROWSER_EXTENSION_LIVE_WINDOW)
@@ -185,6 +212,13 @@ impl BrowserActuator for BrowserActuationBroker {
         expected_generation: i64,
         dispatch_id: Option<&str>,
     ) -> Result<BrowserPostconditionEvidence, String> {
+        let target_endpoint_ref = params
+            .get(BROWSER_ACTUATION_ENDPOINT_PARAM)
+            .and_then(Value::as_str);
+        let mut command_params = params.clone();
+        if let Some(object) = command_params.as_object_mut() {
+            object.remove(BROWSER_ACTUATION_ENDPOINT_PARAM);
+        }
         let actuation_id = format!(
             "ba_{:016x}",
             NEXT_BROWSER_ACTUATION.fetch_add(1, Ordering::Relaxed)
@@ -194,7 +228,7 @@ impl BrowserActuator for BrowserActuationBroker {
             .lock()
             .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
         self.prune_expired(&mut state);
-        if !Self::extension_live(&state) {
+        if !Self::extension_live(&state, target_endpoint_ref) {
             return Ok(BrowserPostconditionEvidence {
                 observed_generation: expected_generation,
                 command_accepted: false,
@@ -225,9 +259,11 @@ impl BrowserActuator for BrowserActuationBroker {
         state.queued.push_back(json!({
             "protocol": "herdr-browser-actuation/v1",
             "actuation_id": actuation_id,
+            "dispatch_id": dispatch_id,
             "operation": operation,
             "expected_generation": expected_generation,
-            "params": params,
+            "target_endpoint_ref": target_endpoint_ref,
+            "params": command_params,
         }));
         ready.notify_all();
 
@@ -277,6 +313,28 @@ impl BrowserActuator for BrowserActuationBroker {
                 .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
             state = waited.0;
         }
+    }
+
+    fn actuate_for_endpoint(
+        &self,
+        operation: &str,
+        params: &Value,
+        expected_generation: i64,
+        endpoint_ref: Option<&str>,
+        dispatch_id: Option<&str>,
+    ) -> Result<BrowserPostconditionEvidence, String> {
+        let mut routed_params = params.clone();
+        if let Some(endpoint_ref) = endpoint_ref {
+            crate::state_store::validate_browser_endpoint_ref(endpoint_ref)?;
+            let Some(object) = routed_params.as_object_mut() else {
+                return Err("browser_actuation_params_invalid".to_owned());
+            };
+            object.insert(
+                BROWSER_ACTUATION_ENDPOINT_PARAM.to_owned(),
+                json!(endpoint_ref),
+            );
+        }
+        self.actuate(operation, &routed_params, expected_generation, dispatch_id)
     }
 
     fn reconcile_dispatch(
@@ -1116,6 +1174,7 @@ fn extension_browser_resource_observe(
     Ok(json!({
         "ok": true,
         "pending_dispatch": pending_dispatch.map(|dispatch| json!({
+            "dispatch_id": dispatch.dispatch_id,
             "accepted_user_message_ref": dispatch.accepted_user_message_ref,
             "generation": dispatch.expected_generation,
         })),
@@ -1324,6 +1383,7 @@ fn extension_browser_dispatch_result(
         payload,
         &[
             "operation",
+            "dispatch_id",
             "provider",
             "session_ref",
             "expected_generation",
@@ -1333,6 +1393,7 @@ fn extension_browser_dispatch_result(
             "observed_at",
         ],
     )?;
+    let dispatch_id = browser_registry_string(payload, "dispatch_id", 96)?;
     let provider = browser_registry_string(payload, "provider", 32)?;
     let session_ref = browser_registry_string(payload, "session_ref", 96)?;
     let expected_generation = browser_registry_positive_i64(payload, "expected_generation")?;
@@ -1345,15 +1406,18 @@ fn extension_browser_dispatch_result(
         .state_store
         .lock()
         .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
-    let record = store.settle_browser_dispatch_result(BrowserDispatchResultInput {
-        provider,
-        session_ref,
-        expected_generation,
-        accepted_user_message_ref,
-        assistant_message_ref,
-        assistant_text,
-        observed_at,
-    })?;
+    let record = store.settle_browser_dispatch_result_for_dispatch(
+        dispatch_id,
+        BrowserDispatchResultInput {
+            provider,
+            session_ref,
+            expected_generation,
+            accepted_user_message_ref,
+            assistant_message_ref,
+            assistant_text,
+            observed_at,
+        },
+    )?;
     Ok(json!({
         "ok": true,
         "dispatch_id": record.dispatch.dispatch_id,
@@ -1755,6 +1819,7 @@ struct PushStreamState {
     last_heartbeat: Instant,
     browser_actuation: BrowserActuationBroker,
     trusted_extension_ipc: bool,
+    browser_endpoint_ref: Option<String>,
 }
 
 async fn push_state(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1849,11 +1914,29 @@ async fn push_events(
         pane: query.get("pane").filter(|v| !v.is_empty()).cloned(),
         workspace: query.get("workspace").filter(|v| !v.is_empty()).cloned(),
     };
+    let browser_endpoint_ref = if state.trusted_extension_ipc {
+        match query
+            .get("browser_endpoint_ref")
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => {
+                if crate::state_store::validate_browser_endpoint_ref(value).is_err() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                Some(value.to_owned())
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     push_events_response(
         state.cache,
         filters,
         state.browser_actuation,
         state.trusted_extension_ipc,
+        browser_endpoint_ref,
     )
 }
 
@@ -1955,6 +2038,7 @@ fn push_events_response(
     filters: PushFilters,
     browser_actuation: BrowserActuationBroker,
     trusted_extension_ipc: bool,
+    browser_endpoint_ref: Option<String>,
 ) -> Response {
     // Subscribe before reading the initial digest so an event racing this setup
     // cannot be missed. At worst an already-included event causes one harmless
@@ -1981,6 +2065,7 @@ fn push_events_response(
         last_heartbeat: Instant::now(),
         browser_actuation,
         trusted_extension_ipc,
+        browser_endpoint_ref,
     };
     let events = stream::unfold(state, |mut state| async move {
         if state.first {
@@ -1990,7 +2075,9 @@ fn push_events_response(
                 // Treat that initial hello request as live immediately instead
                 // of forcing browser mutations to wait for the first 15s
                 // heartbeat before the broker records a poll.
-                state.browser_actuation.note_extension_poll();
+                state
+                    .browser_actuation
+                    .note_extension_poll(state.browser_endpoint_ref.as_deref());
             }
             let digest = state.cache.digest_since(u64::MAX);
             let all_agents = push_agent_views(&digest.agents);
@@ -2039,8 +2126,13 @@ fn push_events_response(
                 // liveness on every stream poll/heartbeat so an idle healthy stream
                 // cannot age past BROWSER_EXTENSION_LIVE_WINDOW and be misclassified
                 // as browser_offline between mutations.
-                state.browser_actuation.note_extension_poll();
-                if let Some(command) = state.browser_actuation.take_next_for_extension() {
+                state
+                    .browser_actuation
+                    .note_extension_poll(state.browser_endpoint_ref.as_deref());
+                if let Some(command) = state
+                    .browser_actuation
+                    .take_next_for_extension(state.browser_endpoint_ref.as_deref())
+                {
                     body.push_str(&sse_event("browser_actuation", &command));
                 }
             }
@@ -3962,7 +4054,7 @@ mod tests {
         let mut extension_state = test_state(&root);
         extension_state.trusted_extension_ipc = true;
         let store = extension_state.state_store.clone();
-        let session_ref = {
+        let (session_ref, dispatch_id) = {
             let mut guard = store.lock().unwrap();
             let endpoint = guard
                 .register_browser_endpoint(BrowserEndpointRegistrationInput {
@@ -4072,7 +4164,7 @@ mod tests {
                     18,
                 )
                 .unwrap();
-            session.resource_ref
+            (session.resource_ref, dispatch.dispatch_id)
         };
 
         let pending = store
@@ -4098,6 +4190,7 @@ mod tests {
         };
         let payload = json!({
             "operation": "dispatch.result",
+            "dispatch_id": dispatch_id,
             "provider": "chatgpt",
             "session_ref": session_ref,
             "expected_generation": 7,
@@ -4137,6 +4230,7 @@ mod tests {
 
         let unknown = json!({
             "operation": "dispatch.result",
+            "dispatch_id": dispatch_id,
             "provider": "chatgpt",
             "session_ref": session_ref,
             "expected_generation": 7,
@@ -4161,14 +4255,76 @@ mod tests {
             let mut state = lock.lock().unwrap();
             state.last_extension_poll =
                 Some(Instant::now() - BROWSER_EXTENSION_LIVE_WINDOW - Duration::from_secs(1));
-            assert!(!BrowserActuationBroker::extension_live(&state));
+            assert!(!BrowserActuationBroker::extension_live(&state, None));
         }
 
-        broker.note_extension_poll();
+        broker.note_extension_poll(None);
 
         let (lock, _) = &*broker.inner;
         let state = lock.lock().unwrap();
-        assert!(BrowserActuationBroker::extension_live(&state));
+        assert!(BrowserActuationBroker::extension_live(&state, None));
+    }
+
+    #[tokio::test]
+    async fn browser_actuation_is_consumed_only_by_the_target_endpoint() {
+        let broker =
+            BrowserActuationBroker::with_durations(Duration::from_secs(1), Duration::from_secs(1));
+        let endpoint_a = format!("bep_{}", "a".repeat(64));
+        let endpoint_b = format!("bep_{}", "b".repeat(64));
+        broker.note_extension_poll(Some(&endpoint_a));
+        broker.note_extension_poll(Some(&endpoint_b));
+
+        let task_broker = broker.clone();
+        let task_endpoint = endpoint_a.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            task_broker.actuate_for_endpoint(
+                "herdr_mcp.browser_dispatch.submit",
+                &json!({"session_ref":"br_test","message":"hello"}),
+                7,
+                Some(&task_endpoint),
+                None,
+            )
+        });
+        loop {
+            if !broker.inner.0.lock().unwrap().queued.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        assert!(
+            broker.take_next_for_extension(Some(&endpoint_b)).is_none(),
+            "a different browser endpoint must not consume the command"
+        );
+        let command = broker
+            .take_next_for_extension(Some(&endpoint_a))
+            .expect("target endpoint must receive its command");
+        assert_eq!(command["target_endpoint_ref"], endpoint_a);
+        let actuation_id = command["actuation_id"].as_str().unwrap().to_owned();
+        broker
+            .complete(
+                &actuation_id,
+                BrowserPostconditionEvidence {
+                    observed_generation: 7,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(7),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: None,
+                },
+            )
+            .unwrap();
+        assert!(task.await.unwrap().unwrap().accepted_message_observed);
     }
 
     #[tokio::test]
@@ -4213,7 +4369,7 @@ mod tests {
         let mut extension_state = test_state(&root.join("extension"));
         extension_state.trusted_extension_ipc = true;
         let broker = extension_state.browser_actuation.clone();
-        assert!(broker.take_next_for_extension().is_none());
+        assert!(broker.take_next_for_extension(None).is_none());
         let broker_for_task = broker.clone();
         let task = tokio::task::spawn_blocking(move || {
             broker_for_task.actuate(
@@ -4224,7 +4380,7 @@ mod tests {
             )
         });
         let command = loop {
-            if let Some(command) = broker.take_next_for_extension() {
+            if let Some(command) = broker.take_next_for_extension(None) {
                 break command;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4255,7 +4411,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(250),
         );
-        assert!(broker.take_next_for_extension().is_none());
+        assert!(broker.take_next_for_extension(None).is_none());
         let dispatch_id = format!("bd_{}", "a".repeat(64));
         let expected_dispatch_id = dispatch_id.clone();
         let broker_for_task = broker.clone();
@@ -4268,7 +4424,7 @@ mod tests {
             )
         });
         let command = loop {
-            if let Some(command) = broker.take_next_for_extension() {
+            if let Some(command) = broker.take_next_for_extension(None) {
                 break command;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -4323,7 +4479,7 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(10),
         );
-        assert!(broker.take_next_for_extension().is_none());
+        assert!(broker.take_next_for_extension(None).is_none());
         let dispatch_id = format!("bd_{}", "b".repeat(64));
         let expected_dispatch_id = dispatch_id.clone();
         let broker_for_task = broker.clone();
@@ -4336,7 +4492,7 @@ mod tests {
             )
         });
         let command = loop {
-            if let Some(command) = broker.take_next_for_extension() {
+            if let Some(command) = broker.take_next_for_extension(None) {
                 break command;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -4767,6 +4923,7 @@ mod tests {
             last_heartbeat: Instant::now(),
             browser_actuation: BrowserActuationBroker::default(),
             trusted_extension_ipc: false,
+            browser_endpoint_ref: None,
         };
         let working = json!({
             "agent":"pi","pane":"w1:p1","status":"working","workspace":"w1"
@@ -4846,9 +5003,10 @@ mod tests {
         let response = extension.clone().oneshot(state_request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
+        let endpoint_ref = format!("bep_{}", "a".repeat(64));
         let events_request = Request::builder()
             .method(Method::GET)
-            .uri("/push/events")
+            .uri(format!("/push/events?browser_endpoint_ref={endpoint_ref}"))
             .body(Body::empty())
             .unwrap();
         let response = extension.oneshot(events_request).await.unwrap();
@@ -4866,7 +5024,10 @@ mod tests {
         assert!(text.contains("herdr-mcp-push/v1"));
         assert!(text.contains("\"boot_id\":"));
         let state = browser_actuation.inner.0.lock().unwrap();
-        assert!(BrowserActuationBroker::extension_live(&state));
+        assert!(BrowserActuationBroker::extension_live(
+            &state,
+            Some(&endpoint_ref)
+        ));
         std::fs::remove_dir_all(root).ok();
     }
 

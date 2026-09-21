@@ -34,37 +34,41 @@ assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "regist
 const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
 
 function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) {
+  const queryArgs = [];
   const chrome = {
     tabs: {
-      async query() {
+      async query(args) {
+        queryArgs.push(args);
         return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
       },
     },
   };
-  const activeH2WTabUrls = () => ["https://chatgpt.com/*"];
+  const hostPermissionPatternForUrl = (rawUrl) => new URL(rawUrl).origin + "/*";
   const browserTabScopes = scopeRecords;
   const browserConversationInfo = (provider, rawUrl) => provider === "chatgpt"
     ? chatGptConversationInfo(rawUrl)
     : null;
   const find = new Function(
     "chrome",
-    "activeH2WTabUrls",
+    "hostPermissionPatternForUrl",
     "browserConversationInfo",
     "browserTabScopes",
     `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
-  )(chrome, activeH2WTabUrls, browserConversationInfo, browserTabScopes);
-  return { find };
+  )(chrome, hostPermissionPatternForUrl, browserConversationInfo, browserTabScopes);
+  return { find, queryArgs };
 }
 
 function claudeCanonicalIdentityRecoveryHarness(tabRecords) {
+  const queryArgs = [];
   const chrome = {
     tabs: {
-      async query() {
+      async query(args) {
+        queryArgs.push(args);
         return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
       },
     },
   };
-  const activeH2WTabUrls = () => ["https://claude.ai/*"];
+  const hostPermissionPatternForUrl = (rawUrl) => new URL(rawUrl).origin + "/*";
   const browserTabScopes = new Map(tabRecords
     .filter((record) => record.scope)
     .map((record) => [record.id, record.scope]));
@@ -84,48 +88,127 @@ function claudeCanonicalIdentityRecoveryHarness(tabRecords) {
   };
   const find = new Function(
     "chrome",
-    "activeH2WTabUrls",
+    "hostPermissionPatternForUrl",
     "browserConversationInfo",
     "browserTabScopes",
     `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
-  )(chrome, activeH2WTabUrls, browserConversationInfo, browserTabScopes);
-  return { find };
+  )(chrome, hostPermissionPatternForUrl, browserConversationInfo, browserTabScopes);
+  return { find, queryArgs };
+}
+
+function grokCanonicalIdentityRecoveryHarness(tabRecords) {
+  const queryArgs = [];
+  const chrome = {
+    tabs: {
+      async query(args) {
+        queryArgs.push(args);
+        return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
+      },
+    },
+  };
+  const hostPermissionPatternForUrl = (rawUrl) => new URL(rawUrl).origin + "/*";
+  const browserTabScopes = new Map();
+  const browserConversationInfo = (provider, rawUrl) => {
+    if (provider !== "grok") return null;
+    const url = new URL(String(rawUrl || ""));
+    const match = url.pathname.match(/^\/c\/([0-9a-f-]{36})\/?$/i);
+    if (!match) return null;
+    const conversationId = match[1].toLowerCase();
+    return {
+      site: "grok",
+      conversation_id: conversationId,
+      project_id: null,
+      convKey: url.origin + "/c/" + conversationId,
+    };
+  };
+  const find = new Function(
+    "chrome",
+    "hostPermissionPatternForUrl",
+    "browserConversationInfo",
+    "browserTabScopes",
+    `${canonicalRecoverySource}; return findBrowserSessionTargetByCanonicalIdentity;`,
+  )(chrome, hostPermissionPatternForUrl, browserConversationInfo, browserTabScopes);
+  return { find, queryArgs };
 }
 
 function recoveryHarness(tabRecords) {
   const browserSessionTargets = new Map();
+  const queryArgs = [];
   const chrome = {
     tabs: {
-      async query() {
-        return tabRecords.map(({ id, url, status = "complete" }) => ({ id, url, status }));
+      async query(args = {}) {
+        queryArgs.push(args);
+        const patterns = Array.isArray(args.url) ? args.url : args.url ? [args.url] : [];
+        return tabRecords
+          .filter(({ url }) => {
+            if (!patterns.length) return true;
+            const host = new URL(url).host;
+            return patterns.some((pattern) => String(pattern).includes(host));
+          })
+          .map(({ id, url, status = "complete" }) => ({ id, url, status }));
       },
       async sendMessage(tabId, message) {
         assert.equal(message?.type, "h2w_get_convkey");
         const record = tabRecords.find((item) => item.id === tabId);
         if (!record || record.error) throw new Error("missing content listener");
+        if (record.hang) return new Promise(() => {});
         return record.live;
       },
     },
   };
-  const activeH2WTabUrls = () => ["https://chatgpt.com/*"];
+  const activeH2WTabUrlsForProvider = async (provider) => {
+    if (provider === "claude") return ["https://claude.ai/*"];
+    if (provider === "grok") return ["https://grok.com/*"];
+    return ["https://chatgpt.com/*"];
+  };
   const browserConversationInfoFromSupportedUrl = (rawUrl) => {
-    const match = String(rawUrl || "").match(/^https:\/\/chatgpt\.com\/c\/([^/?#]+)/);
+    const url = new URL(String(rawUrl || ""));
+    const match = url.pathname.match(/^\/c\/([^/?#]+)/);
+    if (url.hostname === "chatgpt.com" && match) {
+      return {
+        site: "chatgpt",
+        conversation_id: match[1],
+        project_id: null,
+        convKey: `https://chatgpt.com/c/${match[1]}`,
+      };
+    }
+    const claudeMatch = url.pathname.match(/^\/chat\/([^/?#]+)/);
+    if (url.hostname === "claude.ai" && claudeMatch) {
+      return {
+        site: "claude",
+        conversation_id: claudeMatch[1],
+        project_id: null,
+        convKey: `https://claude.ai/chat/${claudeMatch[1]}`,
+      };
+    }
     if (!match) return null;
     return {
-      site: "chatgpt",
+      site: "grok",
       conversation_id: match[1],
       project_id: null,
-      convKey: `https://chatgpt.com/c/${match[1]}`,
+      convKey: `https://grok.com/c/${match[1]}`,
     };
+  };
+  const sendTabMessageWithTimeout = async (tabId, message) => {
+    const record = tabRecords.find((item) => item.id === tabId);
+    if (record?.hang) throw new Error("tab_message_timeout");
+    return chrome.tabs.sendMessage(tabId, message);
   };
   const recover = new Function(
     "chrome",
-    "activeH2WTabUrls",
+    "activeH2WTabUrlsForProvider",
     "browserConversationInfoFromSupportedUrl",
     "browserSessionTargets",
+    "sendTabMessageWithTimeout",
     `${recoverySource}; return recoverBrowserSessionTarget;`,
-  )(chrome, activeH2WTabUrls, browserConversationInfoFromSupportedUrl, browserSessionTargets);
-  return { recover, browserSessionTargets };
+  )(
+    chrome,
+    activeH2WTabUrlsForProvider,
+    browserConversationInfoFromSupportedUrl,
+    browserSessionTargets,
+    sendTabMessageWithTimeout,
+  );
+  return { recover, browserSessionTargets, queryArgs };
 }
 
 function createAnchorHarness({ tabs = [], scopes = [], targets = [], recovered = null } = {}) {
@@ -295,6 +378,17 @@ test("canonical ChatGPT session recovery reuses one slugged Project alias instea
   assert.equal(result.target?.projectId, projectId);
   assert.equal(result.target?.convKey, canonical);
   assert.equal(result.target?.observationGeneration, 17);
+});
+
+test("user recovers a Grok direct session | Given service-worker target cache is lost | When canonical recovery runs | Then only the Grok origin is queried and the exact existing tab is reused", async () => {
+  const url = "https://grok.com/c/5fe91b62-b7f0-4e7a-8e4d-fac53208475b";
+  const harness = grokCanonicalIdentityRecoveryHarness([{ id: 81, url }]);
+  const result = await harness.find("grok", url, 7);
+  assert.equal(result.ambiguous, false);
+  assert.equal(result.target?.provider, "grok");
+  assert.equal(result.target?.tabId, 81);
+  assert.equal(result.target?.convKey, url);
+  assert.deepEqual(harness.queryArgs, [{ url: ["https://grok.com/*"] }]);
 });
 
 test("canonical ChatGPT session recovery fails closed when slugged and unslugged aliases are both open", async () => {
@@ -660,6 +754,64 @@ test("service-worker recovery reports a newer generation instead of reusing a st
   assert.equal(recovered.ambiguous, false);
   assert.equal(recovered.observedGeneration, 8);
   assert.equal(browserSessionTargets.has(sessionRef), false);
+});
+
+test("user recovers an exact browser session | Given another supported tab never answers identity probing | When service-worker target recovery scans the browser | Then the exact live session is returned without waiting on the stalled tab", async () => {
+  const sessionRef = "br_exact";
+  const generation = 17;
+  const { recover } = recoveryHarness([
+    {
+      id: 71,
+      url: "https://chatgpt.com/c/exact",
+      live: {
+        convKey: "https://chatgpt.com/c/exact",
+        url: "https://chatgpt.com/c/exact",
+        site: "chatgpt",
+        browserSessionRef: sessionRef,
+        browserGeneration: generation,
+      },
+    },
+    {
+      id: 72,
+      url: "https://chatgpt.com/c/unrelated",
+      hang: true,
+    },
+  ]);
+
+  const recovered = await recover(sessionRef, generation);
+  assert.equal(recovered.ambiguous, false);
+  assert.equal(recovered.target?.tabId, 71);
+  assert.equal(recovered.target?.conversationId, "exact");
+});
+
+test("user recovers the requested provider session | Given an unrelated provider tab is stalled | When exact service-worker recovery runs | Then only the requested provider origin is scanned", async () => {
+  const sessionRef = "br_claude_exact";
+  const generation = 19;
+  const { recover, queryArgs } = recoveryHarness([
+    {
+      id: 81,
+      url: "https://chatgpt.com/c/stalled",
+      hang: true,
+    },
+    {
+      id: 82,
+      url: "https://claude.ai/chat/claude-exact",
+      live: {
+        convKey: "https://claude.ai/chat/claude-exact",
+        url: "https://claude.ai/chat/claude-exact",
+        site: "claude",
+        browserSessionRef: sessionRef,
+        browserGeneration: generation,
+      },
+    },
+  ]);
+
+  const recovered = await recover(sessionRef, generation, "claude");
+  assert.equal(recovered.ambiguous, false);
+  assert.equal(recovered.target?.provider, "claude");
+  assert.equal(recovered.target?.tabId, 82);
+  assert.equal(recovered.target?.conversationId, "claude-exact");
+  assert.deepEqual(queryArgs, [{ url: ["https://claude.ai/*"] }]);
 });
 
 test("page identity handshake lazily recovers only opaque Browser Registry identity", () => {
@@ -1870,13 +2022,17 @@ test("browser dispatch evicts a stale cached target before exact recovery", () =
   assert.match(segment, /cachedLive\?\.convKey === target\.convKey/);
   assert.match(segment, /browserSessionTargets\.delete\(sessionRef\);\s*target = null;/);
   const staleEviction = segment.indexOf("browserSessionTargets.delete(sessionRef)");
-  const recovery = segment.indexOf("recoverBrowserSessionTarget(sessionRef, expectedGeneration)", staleEviction);
+  const recovery = segment.indexOf("recoverBrowserSessionTarget(", staleEviction);
   const canonicalRecovery = segment.indexOf(
     "findBrowserSessionTargetByCanonicalIdentity(",
     recovery,
   );
   assert.ok(staleEviction >= 0 && recovery > staleEviction, "stale cached target must be evicted before one exact recovery");
   assert.ok(canonicalRecovery > recovery, "canonical recovery must remain a bounded fallback after exact session-ref recovery");
+  assert.match(
+    segment,
+    /recoverBrowserSessionTarget\(\s*sessionRef,\s*expectedGeneration,\s*String\(params\.provider \|\| ""\),\s*\)/,
+  );
   assert.match(segment, /browserSessionTargets\.set\(sessionRef, target\)/);
   assert.match(segment, /live\?\.convKey !== target\.convKey/);
 });
@@ -2106,12 +2262,13 @@ function createActuationBranchHarness({
       },
     },
   };
-  const activeH2WTabUrls = () => ["https://chatgpt.com/*"];
+  const activeH2WTabUrlsForProvider = async () => ["https://chatgpt.com/*"];
   const browserConversationInfo = (provider, url) => provider === "chatgpt" ? chatGptConversationInfo(url) : null;
   const browserConversationInfoFromSupportedUrl = (rawUrl) => {
     const info = chatGptConversationInfo(rawUrl);
     return info ? { ...info } : null;
   };
+  const sendTabMessageWithTimeout = async (tabId, message) => chrome.tabs.sendMessage(tabId, message);
   const unavailable = (expectedGeneration, reason, observedGeneration = expectedGeneration) => ({
     observed_generation: Math.max(1, Number(observedGeneration) || Number(expectedGeneration) || 1),
     command_accepted: false, browser_online: false, resource_available: false, rejected: false,
@@ -2172,18 +2329,21 @@ function createActuationBranchHarness({
   };
 
   const actuate = new Function(
-    "chrome", "browserTabScopes", "browserSessionTargets", "activeH2WTabUrls",
+    "chrome", "browserTabScopes", "browserSessionTargets", "activeH2WTabUrlsForProvider",
     "browserConversationInfo", "browserConversationInfoFromSupportedUrl",
+    "sendTabMessageWithTimeout",
     "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
     "unavailableBrowserActuationEvidence", "Date", "setTimeout",
     `async function __actuate(command) {\n` +
     `const actuationId = String(command?.actuation_id || "");\n` +
+    `const dispatchId = String(command?.dispatch_id || "");\n` +
     `const operation = String(command?.operation || "");\n` +
     `const expectedGeneration = Number(command?.expected_generation || 0);\n` +
     `const params = command?.params && typeof command.params === "object" ? command.params : {};\n` +
     `${contentActuationEvidenceWithReasonSource}\n${recoverBrowserSessionTargetSource}\n${createAnchorSource2}\n${createBranchSource}\n}\nreturn __actuate;`,
-  )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrls,
+  )(chrome, browserTabScopes, browserSessionTargets, activeH2WTabUrlsForProvider,
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
+    sendTabMessageWithTimeout,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
     unavailable, dateShim, setTimeoutShim);
 

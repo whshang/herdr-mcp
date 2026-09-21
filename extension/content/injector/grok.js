@@ -144,17 +144,10 @@ class GrokAdapter extends BaseAdapter {
       || element.getAttribute?.("data-message-uuid")
       || null;
     if (!messageId) {
-      let ancestor = element.parentElement || null;
-      for (let depth = 0; ancestor && depth < 8; depth += 1) {
-        const ancestorId = String(ancestor.getAttribute?.("id") || "");
-        const match = ancestorId.match(
-          /^response-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i,
-        );
-        if (match) {
-          messageId = `${match[1].toLowerCase()}-${role}`;
-          break;
-        }
-        ancestor = ancestor.parentElement || null;
+      const sessionId = this.getSessionIdentity();
+      const ordinal = nodes.indexOf(element);
+      if (sessionId && ordinal >= 0) {
+        messageId = `grok-dom-v1:${sessionId}:${role}:${ordinal}`;
       }
     }
     return {
@@ -166,6 +159,95 @@ class GrokAdapter extends BaseAdapter {
 
   getLastMessageText(role) {
     return this.getMessageSnapshot(role).text;
+  }
+
+  getResultSettlementSnapshot(acceptedUserMessageRef) {
+    if (typeof acceptedUserMessageRef !== "string" || !acceptedUserMessageRef) return null;
+    const sessionId = this.getSessionIdentity();
+    const syntheticPrefix = sessionId
+      ? `grok-dom-v1:${sessionId}:user:`
+      : null;
+    if (syntheticPrefix && acceptedUserMessageRef.startsWith(syntheticPrefix)) {
+      const ordinalText = acceptedUserMessageRef.slice(syntheticPrefix.length);
+      if (!/^\d+$/.test(ordinalText)) return null;
+      const userOrdinal = Number(ordinalText);
+      const users = [...document.querySelectorAll('[data-testid="user-message"]')]
+        .filter((element) => this.elementVisible(element));
+      const acceptedUser = users[userOrdinal] || null;
+      if (!acceptedUser) return null;
+
+      const transcript = [
+        ...document.querySelectorAll(
+          '[data-testid="user-message"], [data-testid="assistant-message"]',
+        ),
+      ].filter((element) => this.elementVisible(element));
+      const acceptedIndex = transcript.indexOf(acceptedUser);
+      if (acceptedIndex < 0) return null;
+
+      let assistantElement = null;
+      let hasLaterUser = false;
+      for (let index = acceptedIndex + 1; index < transcript.length; index += 1) {
+        const element = transcript[index];
+        const testId = element.getAttribute?.("data-testid");
+        if (testId === "user-message") {
+          hasLaterUser = true;
+          break;
+        }
+        if (testId === "assistant-message") {
+          const text = String(element.innerText || element.textContent || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (text) {
+            assistantElement = element;
+            break;
+          }
+        }
+      }
+      if (!assistantElement) return null;
+      if (!hasLaterUser) {
+        hasLaterUser = transcript
+          .slice(acceptedIndex + 1)
+          .some((element) => element.getAttribute?.("data-testid") === "user-message");
+      }
+      if (!hasLaterUser && this.isGenerationInProgress()) return null;
+
+      const assistants = [...document.querySelectorAll('[data-testid="assistant-message"]')]
+        .filter((element) => this.elementVisible(element));
+      const assistantOrdinal = assistants.indexOf(assistantElement);
+      if (assistantOrdinal < 0) return null;
+      const assistantMessageId = assistantElement.getAttribute?.("data-message-id")
+        || assistantElement.getAttribute?.("data-message-uuid")
+        || `grok-dom-v1:${sessionId}:assistant:${assistantOrdinal}`;
+      const assistantText = String(
+        assistantElement.innerText || assistantElement.textContent || "",
+      ).replace(/\s+/g, " ").trim();
+      if (!assistantMessageId || !assistantText) return null;
+      return {
+        ok: true,
+        currentNodeRole: "assistant",
+        finished: true,
+        messageId: assistantMessageId,
+        userMessageId: acceptedUserMessageRef,
+        text: assistantText,
+      };
+    }
+
+    if (this.isGenerationInProgress()) return null;
+    const user = this.getMessageSnapshot("user");
+    const assistant = this.getMessageSnapshot("assistant");
+    if (user.messageId !== acceptedUserMessageRef
+        || !assistant.messageId
+        || !assistant.text) {
+      return null;
+    }
+    return {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: assistant.messageId,
+      userMessageId: user.messageId,
+      text: assistant.text,
+    };
   }
 
   isGenerationInProgress() {

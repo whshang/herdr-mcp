@@ -141,7 +141,7 @@ test("Grok adapter uses bounded semantic composer, turn, and generation selector
   );
 });
 
-test("Grok adapter recovers stable role-scoped turn ids from response ancestors", () => {
+test("user keeps stable Grok turn identity | Given response wrappers are replaced | When the adapter snapshots the same transcript positions | Then synthetic refs stay stable", () => {
   const h = harness();
   const userContainer = element({ attrs: { id: "response-11111111-2222-4333-8444-555555555555" } });
   const assistantContainer = element({ attrs: { id: "response-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } });
@@ -153,7 +153,7 @@ test("Grok adapter recovers stable role-scoped turn ids from response ancestors"
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("user"))),
     {
-      messageId: "11111111-2222-4333-8444-555555555555-user",
+      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
       text: "prompt",
       count: 1,
     },
@@ -161,10 +161,27 @@ test("Grok adapter recovers stable role-scoped turn ids from response ancestors"
   assert.deepEqual(
     JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("assistant"))),
     {
-      messageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-assistant",
+      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:0",
       text: "answer",
       count: 1,
     },
+  );
+
+  h.set('[data-testid="user-message"]', element({
+    text: "prompt",
+    parentElement: element({ attrs: { id: "response-bbbbbbbb-cccc-4ddd-8eee-ffffffffffff" } }),
+  }));
+  h.set('[data-testid="assistant-message"]', element({
+    text: "answer",
+    parentElement: element({ attrs: { id: "response-22222222-3333-4444-8555-666666666666" } }),
+  }));
+  assert.equal(
+    h.adapter.getMessageSnapshot("user").messageId,
+    "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+  );
+  assert.equal(
+    h.adapter.getMessageSnapshot("assistant").messageId,
+    "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:0",
   );
 });
 
@@ -179,6 +196,80 @@ test("Grok adapter hashes same-origin session userId before returning native ide
 
   h.setSessionPayload({ status: "authenticated", session: { userId: "not-a-uuid" } });
   assert.equal(await h.adapter.getAccountNativeIdentity(), null);
+});
+
+test("user gets one exact Grok settled result | Given one accepted user turn | When the matching assistant result finishes | Then settlement links the exact user and assistant refs", () => {
+  const h = harness();
+  const userContainer = element({ attrs: { id: "response-11111111-2222-4333-8444-555555555555" } });
+  const assistantContainer = element({ attrs: { id: "response-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } });
+  const user = element({
+    text: "prompt",
+    attrs: { "data-testid": "user-message" },
+    parentElement: userContainer,
+  });
+  const assistant = element({
+    text: "answer",
+    attrs: { "data-testid": "assistant-message" },
+    parentElement: assistantContainer,
+  });
+  h.set('[data-testid="user-message"]', user);
+  h.set('[data-testid="assistant-message"]', assistant);
+  h.set('[data-testid="user-message"], [data-testid="assistant-message"]', [user, assistant]);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getResultSettlementSnapshot(
+      "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+    ))),
+    {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:0",
+      userMessageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+      text: "answer",
+    },
+  );
+  assert.equal(h.adapter.getResultSettlementSnapshot("different-user"), null);
+});
+
+test("user recovers an older Grok settled result | Given a newer turn is already rendered | When settlement checks the accepted historical turn | Then it returns the matching historical assistant", () => {
+  const h = harness();
+  const acceptedUser = element({
+    text: "accepted prompt",
+    attrs: { "data-testid": "user-message" },
+  });
+  const acceptedAssistant = element({
+    text: "accepted answer",
+    attrs: { "data-testid": "assistant-message" },
+  });
+  const newerUser = element({
+    text: "newer prompt",
+    attrs: { "data-testid": "user-message" },
+  });
+  const newerAssistant = element({
+    text: "newer answer",
+    attrs: { "data-testid": "assistant-message" },
+  });
+  h.set('[data-testid="user-message"]', [acceptedUser, newerUser]);
+  h.set('[data-testid="assistant-message"]', [acceptedAssistant, newerAssistant]);
+  h.set(
+    '[data-testid="user-message"], [data-testid="assistant-message"]',
+    [acceptedUser, acceptedAssistant, newerUser, newerAssistant],
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getResultSettlementSnapshot(
+      "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+    ))),
+    {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:0",
+      userMessageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:0",
+      text: "accepted answer",
+    },
+  );
 });
 
 test("Grok must reuse provider-neutral account and single-attempt browser actuation paths", () => {

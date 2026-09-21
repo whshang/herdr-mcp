@@ -103,6 +103,9 @@ test("Options requests optional host access only from explicit user settings", (
   assert.match(optionsJs, /https:\/\/chat\.z\.ai\/\*/);
   assert.match(optionsJs, /https:\/\/chat\.deepseek\.com\/\*/);
   assert.match(optionsJs, /https:\/\/gemini\.google\.com\/\*/);
+  assert.match(optionsJs, /https:\/\/grok\.com\/\*/);
+  assert.match(optionsHtml, /id="grokSiteAccess"/);
+  assert.doesNotMatch(optionsHtml, /id="experimentalGrokEnabled"/);
   assert.match(optionsJs, /removeHostPermissions/);
   assert.doesNotMatch(optionsJs, /llmJudge|jevJudge/);
   assert.equal(typeof zh.host_permission_denied, "string");
