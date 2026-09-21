@@ -945,7 +945,7 @@ test("terminal stale session reservations do not block ordinary browser identity
   assert.doesNotMatch(segment, /browser_session_materialization_conflict[\s\S]*reservationRef:\s*null/);
 });
 
-test("Claude registration waits for a delayed Project breadcrumb before choosing the Browser Registry parent", async () => {
+test("user keeps one Claude Browser Registry session across reload | Given the Project breadcrumb renders after the chat route | When registration resolves the provider scope | Then it waits for the Project identity before choosing the parent", async () => {
   const project = {
     id: "01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
     name: "herdr-mcp",

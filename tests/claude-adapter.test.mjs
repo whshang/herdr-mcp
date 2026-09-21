@@ -97,7 +97,7 @@ test("Claude adapter exposes only concrete /chat UUID session identity", () => {
   assert.equal(h.adapter.getConversationKey(), null);
 });
 
-test("Claude adapter accepts only one visible chat-header Project breadcrumb", () => {
+test("user keeps Claude Project identity exact | Given sidebar Project links and one visible chat-header breadcrumb | When the adapter resolves Project identity | Then only the chat-header Project is accepted", () => {
   const h = harness();
   const projectLink = element({
     text: "herdr-mcp",
