@@ -195,6 +195,27 @@ When dispatching:
 
 Planning order is therefore: deterministic `fs/git/exec` first → inspect live worker/capability/resource evidence → let the Web planner decide whether delegation or parallelism is worthwhile → use a compatible worker when selected → use DSH headless only as a bounded fallback when native worker evidence is unavailable or unsuitable → interactive `dsh-tui` only when a human operator wants to take over. The Web planner keeps architecture/IA/cross-file orchestration. Recheck DSH after upgrades because it is still a fast-moving developer preview.
 
+### 3A. Consume semantic decisions at Parent orchestration boundaries
+
+Treat the existing semantic/Jev private methods as an advisory layer inside the normal Parent loop. Do not bolt Jev onto each `herdr_fs_*`, `herdr_git`, `herdr_exec*`, `herdr_inspect`, or mutation call. Facts and mutations remain deterministic; a semantic result may only classify or order what the Parent should inspect or verify next.
+
+Use this main path for delegated development work:
+
+```text
+plan -> deterministic execute/dispatch -> observe deterministic task facts
+     -> attention advice -> deterministic observation/validation
+     -> closeout advice when useful -> deterministic cleanup.preview
+     -> optional cleanup advice -> deterministic resource reclamation
+```
+
+- **Plan boundary:** for non-trivial routing/delegation choices, consume `herdr_mcp.planning.advise` once. Explicit deterministic-tool choices and capability rejection remain authoritative.
+- **Observe/attention boundary:** submit Agent work fire-and-forget and retain its task/dispatch correlation. Prefer durable task/dispatch/terminal/inbox facts when the installed runtime advertises them. If that capability is absent, keep using `herdr_since`/inspect plus deterministic task/process evidence; never create a second task ledger. When new bounded child facts can change the next action, call `herdr_mcp.agent.attention.advise` once for up to the frozen child set. `continue_unobserved` means continue independent Parent work without a wait/poll loop; `verify_completion` enters deterministic change projection and validation; `needs_human` surfaces the real human boundary without inventing input; `blocked_external` preserves blocker evidence; `investigate_drift` permits read-only inspect/read evidence only. Semantic terminal guesses never replace actual terminal/task/process facts.
+- **Validation boundary:** freeze the validation candidates from deterministic changed-file/symbol/status evidence, then call `herdr_mcp.validation.advise` once to choose the most informative relevant check to run first. Run every required deterministic gate afterward. A semantic answer cannot add a non-frozen check, remove a required check, mark a gate passed, rerun CI, or merge.
+- **Closeout boundary:** after deterministic validation evidence exists, use `herdr_mcp.agent.closeout.advise` only when bounded recent Agent output still helps classify whether the child is working, claiming completion, waiting for a human, or externally blocked. It does not create terminal truth or reclaim authority.
+- **Cleanup boundary:** call `herdr_mcp.cleanup.preview` with `advisory=true` for task-owned resources. Semantic cleanup triage may rank the next inspection, while `safe_to_delete`, reasons, reachability, open-PR references, dirty state, live occupancy, and the actual close/remove/delete operations remain deterministic. Re-check immediately before mutation and verify task-owned resources are gone afterward.
+
+Missing semantic configuration, route exhaustion, provider error/timeout, or malformed semantic output must leave this same Parent workflow usable. Fall back to the existing deterministic order and evidence; never block a Herdr operation merely because semantic advice is unavailable. Keep semantic input bounded and structured, combine related questions into one request at the boundary, and avoid provider RTT loops.
+
 ## 4. Runtime and contract model
 
 Keep these lifetimes separate:

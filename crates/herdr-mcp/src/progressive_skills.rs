@@ -1125,6 +1125,7 @@ impl ProgressiveSkillService {
                     "shared_runtime_state": "optional boolean"
                 }
             },
+            "orchestration_consumption": parent_orchestration_consumption(),
             "github_status": {
                 "method": GITHUB_STATUS_METHOD,
                 "effect": "read_only_fresh_status",
@@ -1292,7 +1293,8 @@ impl ProgressiveSkillService {
                 "parallelism": {
                     "worth_considering": advice.parallelism.worth_considering,
                     "max_useful_lanes": advice.parallelism.max_useful_lanes
-                }
+                },
+                "consumption": parent_orchestration_consumption()
             },
             "requirements_resolution": {
                 "level": "conditional_on_material_ambiguity",
@@ -3007,6 +3009,58 @@ fn inactive_candidate_reject_reason(
     None
 }
 
+fn parent_orchestration_consumption() -> Value {
+    json!({
+        "authority": {
+            "decisions": "semantic advisory only",
+            "facts": "deterministic runtime and repository evidence",
+            "mutations": "deterministic tools and lifecycle gates"
+        },
+        "latency_policy": "at most one semantic evaluation per orchestration boundary; never add a semantic RTT to each low-level fs, git, exec, or inspect call",
+        "durable_task_source": "prefer advertised durable task/dispatch/terminal/inbox facts; when unavailable, keep the existing inspect/since plus deterministic task/process evidence path and do not create a second task ledger",
+        "boundaries": {
+            "plan": {
+                "method": PLANNING_ADVISE_METHOD,
+                "when": "non-trivial routing or delegation choice",
+                "fallback": "existing deterministic direct-tool and capability-filtered planning"
+            },
+            "attention": {
+                "method": AGENT_ATTENTION_ADVISE_METHOD,
+                "when": "new bounded child progress or terminal facts can change parent attention",
+                "states": {
+                    "continue_unobserved": "continue independent parent work; do not wait or poll solely for progress",
+                    "verify_completion": "collect deterministic diff/status/change evidence, then enter validation",
+                    "needs_human": "surface the deterministic human boundary; do not invent input or continue mutation",
+                    "blocked_external": "preserve deterministic blocker evidence and continue only independent work",
+                    "investigate_drift": "use read-only inspect/read evidence before any correction",
+                    "unclear": "use the existing deterministic observation path"
+                },
+                "fallback": "existing deterministic observation path"
+            },
+            "validation": {
+                "method": VALIDATION_ADVISE_METHOD,
+                "when": "deterministic changed-file/symbol evidence has frozen the candidate checks",
+                "effect": "reorder frozen checks only; run the most informative relevant check first, then all required deterministic gates",
+                "fallback": "preserve and run the complete deterministic candidate set"
+            },
+            "closeout": {
+                "method": AGENT_CLOSEOUT_ADVISE_METHOD,
+                "when": "bounded recent child output is still useful after deterministic validation evidence",
+                "effect": "classify working/claims-complete/waiting-user/external-block only; never create terminal or reclaim truth",
+                "fallback": "use deterministic task/process/validation evidence"
+            },
+            "cleanup": {
+                "method": CLEANUP_PREVIEW_METHOD,
+                "params": {"advisory": true},
+                "when": "task-owned resources are eligible for closeout review",
+                "effect": "rank cleanup inspection only; safe_to_delete and reasons remain deterministic",
+                "fallback": "cleanup.preview without semantic advice remains fully usable"
+            }
+        },
+        "semantic_unavailable": "same workflow and required gates remain valid; only advisory ordering/classification is absent"
+    })
+}
+
 fn resource_context_json(raw_snapshot: &Value) -> Value {
     let panes = raw_snapshot
         .get("panes")
@@ -3661,6 +3715,18 @@ mod tests {
             "required_for_planner_created_resources"
         );
         assert_eq!(
+            result["orchestration_policy"]["consumption"]["boundaries"]["attention"]["method"],
+            AGENT_ATTENTION_ADVISE_METHOD
+        );
+        assert_eq!(
+            result["orchestration_policy"]["consumption"]["boundaries"]["validation"]["effect"],
+            "reorder frozen checks only; run the most informative relevant check first, then all required deterministic gates"
+        );
+        assert_eq!(
+            result["orchestration_policy"]["consumption"]["boundaries"]["cleanup"]["params"]["advisory"],
+            true
+        );
+        assert_eq!(
             result["requirements_resolution"]["question_mode"],
             "one_at_a_time"
         );
@@ -3939,6 +4005,34 @@ mod tests {
         assert_eq!(
             bootstrap["request_budget"]["capability_source"],
             "live runtime context is authoritative for JSON-RPC batch, multi-operation arguments, and concurrency"
+        );
+        assert_eq!(
+            bootstrap["orchestration_consumption"]["authority"]["decisions"],
+            "semantic advisory only"
+        );
+        assert_eq!(
+            bootstrap["orchestration_consumption"]["boundaries"]["attention"]["method"],
+            AGENT_ATTENTION_ADVISE_METHOD
+        );
+        assert_eq!(
+            bootstrap["orchestration_consumption"]["boundaries"]["attention"]["states"]["continue_unobserved"],
+            "continue independent parent work; do not wait or poll solely for progress"
+        );
+        assert_eq!(
+            bootstrap["orchestration_consumption"]["boundaries"]["validation"]["method"],
+            VALIDATION_ADVISE_METHOD
+        );
+        assert_eq!(
+            bootstrap["orchestration_consumption"]["boundaries"]["closeout"]["method"],
+            AGENT_CLOSEOUT_ADVISE_METHOD
+        );
+        assert_eq!(
+            bootstrap["orchestration_consumption"]["boundaries"]["cleanup"]["params"]["advisory"],
+            true
+        );
+        assert_eq!(
+            bootstrap["orchestration_consumption"]["semantic_unavailable"],
+            "same workflow and required gates remain valid; only advisory ordering/classification is absent"
         );
 
         let methods = local_method_schemas("work_memory.");
