@@ -929,7 +929,7 @@ const browserRegister = browserRegistryRequests[0] || {};
 const browserRegisterRetry = browserRegistryRequests[1] || {};
 ok(browserRegister.operation === "endpoint.register"
     && !Object.prototype.hasOwnProperty.call(browserRegister, "browser_family")
-    && browserRegister.extension_version === "0.1.116"
+    && browserRegister.extension_version === "0.1.117"
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
   "browser endpoint registration carries one opaque profile seed and leaves browser product identity to the native host",
   JSON.stringify(browserRegister));

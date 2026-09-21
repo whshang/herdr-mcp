@@ -838,6 +838,19 @@ async function mutateWorkspaceBinding(workspaceId) {
   const currentlyBound = pageContextBindingIds().has(String(workspaceId));
   const workspace = (store.get().workspaces || []).find((row) => String(row.workspace_id) === String(workspaceId));
   if (!currentlyBound && !workspace) return;
+
+  if (!currentlyBound && info.site === "grok") {
+    let granted = false;
+    try {
+      granted = await chrome.permissions.request({ origins: ["https://grok.com/*"] });
+    } catch (_) {}
+    if (!granted) {
+      pageContext.error = t("host_permission_denied");
+      renderAll();
+      return;
+    }
+  }
+
   bindingMutationWorkspaceId = String(workspaceId);
   renderAll();
 
