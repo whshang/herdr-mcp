@@ -259,6 +259,7 @@ impl BrowserActuator for BrowserActuationBroker {
         state.queued.push_back(json!({
             "protocol": "herdr-browser-actuation/v1",
             "actuation_id": actuation_id,
+            "dispatch_id": dispatch_id,
             "operation": operation,
             "expected_generation": expected_generation,
             "target_endpoint_ref": target_endpoint_ref,
@@ -1173,6 +1174,7 @@ fn extension_browser_resource_observe(
     Ok(json!({
         "ok": true,
         "pending_dispatch": pending_dispatch.map(|dispatch| json!({
+            "dispatch_id": dispatch.dispatch_id,
             "accepted_user_message_ref": dispatch.accepted_user_message_ref,
             "generation": dispatch.expected_generation,
         })),
@@ -1381,6 +1383,7 @@ fn extension_browser_dispatch_result(
         payload,
         &[
             "operation",
+            "dispatch_id",
             "provider",
             "session_ref",
             "expected_generation",
@@ -1390,6 +1393,7 @@ fn extension_browser_dispatch_result(
             "observed_at",
         ],
     )?;
+    let dispatch_id = browser_registry_string(payload, "dispatch_id", 96)?;
     let provider = browser_registry_string(payload, "provider", 32)?;
     let session_ref = browser_registry_string(payload, "session_ref", 96)?;
     let expected_generation = browser_registry_positive_i64(payload, "expected_generation")?;
@@ -1402,15 +1406,18 @@ fn extension_browser_dispatch_result(
         .state_store
         .lock()
         .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
-    let record = store.settle_browser_dispatch_result(BrowserDispatchResultInput {
-        provider,
-        session_ref,
-        expected_generation,
-        accepted_user_message_ref,
-        assistant_message_ref,
-        assistant_text,
-        observed_at,
-    })?;
+    let record = store.settle_browser_dispatch_result_for_dispatch(
+        dispatch_id,
+        BrowserDispatchResultInput {
+            provider,
+            session_ref,
+            expected_generation,
+            accepted_user_message_ref,
+            assistant_message_ref,
+            assistant_text,
+            observed_at,
+        },
+    )?;
     Ok(json!({
         "ok": true,
         "dispatch_id": record.dispatch.dispatch_id,
@@ -4047,7 +4054,7 @@ mod tests {
         let mut extension_state = test_state(&root);
         extension_state.trusted_extension_ipc = true;
         let store = extension_state.state_store.clone();
-        let session_ref = {
+        let (session_ref, dispatch_id) = {
             let mut guard = store.lock().unwrap();
             let endpoint = guard
                 .register_browser_endpoint(BrowserEndpointRegistrationInput {
@@ -4157,7 +4164,7 @@ mod tests {
                     18,
                 )
                 .unwrap();
-            session.resource_ref
+            (session.resource_ref, dispatch.dispatch_id)
         };
 
         let pending = store
@@ -4183,6 +4190,7 @@ mod tests {
         };
         let payload = json!({
             "operation": "dispatch.result",
+            "dispatch_id": dispatch_id,
             "provider": "chatgpt",
             "session_ref": session_ref,
             "expected_generation": 7,
@@ -4222,6 +4230,7 @@ mod tests {
 
         let unknown = json!({
             "operation": "dispatch.result",
+            "dispatch_id": dispatch_id,
             "provider": "chatgpt",
             "session_ref": session_ref,
             "expected_generation": 7,

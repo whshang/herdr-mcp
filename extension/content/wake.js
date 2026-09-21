@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.113";
+const H2W_CONTENT_VERSION = "0.1.114";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -1912,6 +1912,7 @@ const H2W_CONTENT_VERSION = "0.1.113";
   }
 
   async function performBrowserActuationCommand(command) {
+    const dispatchId = typeof command?.dispatch_id === "string" ? command.dispatch_id : "";
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
     const creatingSession = command?.operation === "herdr_mcp.browser_session.create";
@@ -2166,6 +2167,7 @@ const H2W_CONTENT_VERSION = "0.1.113";
           ? (currentAssignment.reportedAssistantRef || null)
           : null;
         acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
+          dispatchId: /^bd_[0-9a-f]{64}$/.test(dispatchId) ? dispatchId : null,
           generation: expectedGeneration,
           acceptedUserMessageRef,
           reportedAssistantRef,
@@ -2224,12 +2226,14 @@ const H2W_CONTENT_VERSION = "0.1.113";
     const assistantText = String(serverSnapshot.text || "").trim();
     if (!assistantText) return false;
     const pending = acceptedDispatchAssignments.get(sessionRef);
+    if (!/^bd_[0-9a-f]{64}$/.test(String(pending?.dispatchId || ""))) return false;
     if (pending?.reportedAssistantRef === assistantMessageRef
         && pending?.acceptedUserMessageRef === acceptedUserMessageRef) {
       return true;
     }
     const response = await sendBg({
       type: "h2w_browser_result",
+      dispatch_id: pending.dispatchId,
       provider: ADAPTER.name,
       session_ref: sessionRef,
       generation,
@@ -2244,6 +2248,7 @@ const H2W_CONTENT_VERSION = "0.1.113";
       if (!current || (current.generation === generation
           && current.acceptedUserMessageRef === acceptedUserMessageRef)) {
         acceptedDispatchAssignments.set(sessionRef, {
+          dispatchId: pending.dispatchId,
           generation,
           acceptedUserMessageRef: String(acceptedUserMessageRef),
           reportedAssistantRef: assistantMessageRef,
@@ -2258,12 +2263,14 @@ const H2W_CONTENT_VERSION = "0.1.113";
   // Recover only an existing proven assignment, including its original
   // generation. A browser reload must not relabel it with a new generation.
   function restoreBrowserResultAssignment(pending) {
-    if (!registeredBrowserSessionRef || !Number.isSafeInteger(pending?.generation)
+    if (!registeredBrowserSessionRef || !/^bd_[0-9a-f]{64}$/.test(String(pending?.dispatch_id || ""))
+        || !Number.isSafeInteger(pending?.generation)
         || pending.generation < 1 || typeof pending.accepted_user_message_ref !== "string"
         || !pending.accepted_user_message_ref) return;
     const current = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
     if (!current) {
       acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
+        dispatchId: pending.dispatch_id,
         generation: pending.generation,
         acceptedUserMessageRef: pending.accepted_user_message_ref,
         reportedAssistantRef: null,

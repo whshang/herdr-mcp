@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.113";
+const H2W_SCRIPT_VERSION = "0.1.114";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -1961,9 +1961,10 @@ async function postBrowserRegistry(payload) {
 // provider/session/generation/user-message/assistant-message identity plus the
 // assistant text; the runtime matches and fails closed on unknown identity.
 // Requires no physical tab focus.
-async function postBrowserDispatchResult({ provider, session_ref, expected_generation, accepted_user_message_ref, assistant_message_ref, assistant_text }) {
+async function postBrowserDispatchResult({ dispatch_id, provider, session_ref, expected_generation, accepted_user_message_ref, assistant_message_ref, assistant_text }) {
   return postBrowserRegistry({
     operation: "dispatch.result",
+    dispatch_id,
     provider,
     session_ref,
     expected_generation,
@@ -3402,6 +3403,7 @@ async function resolveBrowserCreateAnchorWindow({
 
 async function handleBrowserActuation(command) {
   const actuationId = String(command?.actuation_id || "");
+  const dispatchId = String(command?.dispatch_id || "");
   const operation = String(command?.operation || "");
   const expectedGeneration = Number(command?.expected_generation || 0);
   const params = command?.params && typeof command.params === "object" ? command.params : {};
@@ -3626,6 +3628,7 @@ async function handleBrowserActuation(command) {
       void sendBrowserActuationTabMessage(createdTab.id, {
         type: "h2w_browser_actuation",
         command: {
+          dispatch_id: dispatchId,
           operation,
           expected_generation: expectedGeneration,
           params,
@@ -3807,6 +3810,7 @@ async function handleBrowserActuation(command) {
       const response = await sendChatGptTabMessage(targetOpen.tabId, {
         type: "h2w_browser_actuation",
         command: {
+          dispatch_id: dispatchId,
           operation,
           expected_generation: expectedGeneration,
           params,
@@ -4040,6 +4044,7 @@ async function handleBrowserActuation(command) {
     const response = await sendBrowserActuationTabMessage(target.tabId, {
       type: "h2w_browser_actuation",
       command: {
+        dispatch_id: dispatchId,
         operation,
         expected_generation: expectedGeneration,
         params: actuationParams,
@@ -8282,13 +8287,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_browser_result") {
     void (async () => {
+      const dispatchId = String(msg?.dispatch_id || "").trim();
       const provider = String(msg?.provider || "").trim();
       const sessionRef = String(msg?.session_ref || "").trim();
       const generation = Number(msg?.generation || 0);
       const acceptedUserMessageRef = String(msg?.accepted_user_message_ref || "").trim();
       const assistantMessageRef = String(msg?.assistant_message_ref || "").trim();
       const assistantText = String(msg?.assistant_text || "").trim();
-      if (!provider
+      if (!/^bd_[0-9a-f]{64}$/.test(dispatchId)
+          || !provider
           || !sessionRef
           || !Number.isSafeInteger(generation)
           || generation < 1
@@ -8300,6 +8307,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       try {
         const result = await postBrowserDispatchResult({
+          dispatch_id: dispatchId,
           provider,
           session_ref: sessionRef,
           expected_generation: generation,

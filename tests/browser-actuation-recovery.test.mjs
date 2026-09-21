@@ -2336,6 +2336,7 @@ function createActuationBranchHarness({
     "unavailableBrowserActuationEvidence", "Date", "setTimeout",
     `async function __actuate(command) {\n` +
     `const actuationId = String(command?.actuation_id || "");\n` +
+    `const dispatchId = String(command?.dispatch_id || "");\n` +
     `const operation = String(command?.operation || "");\n` +
     `const expectedGeneration = Number(command?.expected_generation || 0);\n` +
     `const params = command?.params && typeof command.params === "object" ? command.params : {};\n` +

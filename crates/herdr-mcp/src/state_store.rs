@@ -2386,6 +2386,23 @@ impl StateStore {
         &mut self,
         input: BrowserDispatchResultInput<'_>,
     ) -> Result<BrowserDispatchResultRecord, String> {
+        self.settle_browser_dispatch_result_matching(None, input)
+    }
+
+    pub fn settle_browser_dispatch_result_for_dispatch(
+        &mut self,
+        dispatch_id: &str,
+        input: BrowserDispatchResultInput<'_>,
+    ) -> Result<BrowserDispatchResultRecord, String> {
+        validate_browser_dispatch_id(dispatch_id)?;
+        self.settle_browser_dispatch_result_matching(Some(dispatch_id), input)
+    }
+
+    fn settle_browser_dispatch_result_matching(
+        &mut self,
+        dispatch_id: Option<&str>,
+        input: BrowserDispatchResultInput<'_>,
+    ) -> Result<BrowserDispatchResultRecord, String> {
         validate_browser_token(input.provider, 32, "provider")?;
         validate_browser_resource_ref(input.session_ref)?;
         validate_browser_ref_text(
@@ -2404,16 +2421,27 @@ impl StateStore {
             return Err("browser_updated_at_invalid".to_owned());
         }
 
-        let dispatch = match read_browser_dispatch_by_accepted_message(
-            &self.conn,
-            input.provider,
-            input.session_ref,
-            input.accepted_user_message_ref,
-        )? {
-            Some(dispatch) => decode_browser_dispatch(dispatch)?,
-            None => return Err("browser_dispatch_result_unmatched".to_owned()),
+        let dispatch = if let Some(dispatch_id) = dispatch_id {
+            match read_browser_dispatch_by_ref(&self.conn, dispatch_id)? {
+                Some(dispatch) => decode_browser_dispatch(dispatch)?,
+                None => return Err("browser_dispatch_result_unmatched".to_owned()),
+            }
+        } else {
+            match read_browser_dispatch_by_accepted_message(
+                &self.conn,
+                input.provider,
+                input.session_ref,
+                input.accepted_user_message_ref,
+            )? {
+                Some(dispatch) => decode_browser_dispatch(dispatch)?,
+                None => return Err("browser_dispatch_result_unmatched".to_owned()),
+            }
         };
         if dispatch.operation != "browser_dispatch.submit"
+            || dispatch.provider != input.provider
+            || dispatch.target_session_ref != input.session_ref
+            || dispatch.accepted_user_message_ref.as_deref()
+                != Some(input.accepted_user_message_ref)
             || dispatch.delivery_state != BrowserDeliveryState::Applied
             || dispatch.expected_generation != input.expected_generation
             || dispatch.generation_owner != Some(input.expected_generation)
@@ -11277,19 +11305,22 @@ mod tests {
         );
 
         let exact = store
-            .settle_browser_dispatch_result(BrowserDispatchResultInput {
-                provider: "chatgpt",
-                session_ref: &store
-                    .browser_dispatch(&dispatch_id)
-                    .unwrap()
-                    .unwrap()
-                    .target_session_ref,
-                expected_generation: 7,
-                accepted_user_message_ref: "provider-user-1",
-                assistant_message_ref: "provider-assistant-1",
-                assistant_text: "final worker answer",
-                observed_at: 13,
-            })
+            .settle_browser_dispatch_result_for_dispatch(
+                &dispatch_id,
+                BrowserDispatchResultInput {
+                    provider: "chatgpt",
+                    session_ref: &store
+                        .browser_dispatch(&dispatch_id)
+                        .unwrap()
+                        .unwrap()
+                        .target_session_ref,
+                    expected_generation: 7,
+                    accepted_user_message_ref: "provider-user-1",
+                    assistant_message_ref: "provider-assistant-1",
+                    assistant_text: "final worker answer",
+                    observed_at: 13,
+                },
+            )
             .unwrap();
         assert!(!exact.replayed);
         assert_eq!(
