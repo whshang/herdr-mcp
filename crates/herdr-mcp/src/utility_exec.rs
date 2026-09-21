@@ -258,9 +258,8 @@ fn structured_steps(value: &Value) -> Result<Vec<StructuredExecStep>, Value> {
     Ok(steps)
 }
 
-pub(crate) fn start_reusable_pane_session(
+pub(crate) fn start_private_pane_session(
     client: &HerdrClient,
-    snapshot: &Value,
     registry: &ExecRegistry,
     workspace_id: &str,
     effective_root: &Path,
@@ -268,79 +267,91 @@ pub(crate) fn start_reusable_pane_session(
 ) -> Value {
     #[cfg(windows)]
     {
-        let _ = (
-            client,
-            snapshot,
-            registry,
-            workspace_id,
-            effective_root,
-            command,
-        );
+        let _ = (client, registry, workspace_id, effective_root, command);
         return json!({
             "ok": false,
             "code": "unsupported_platform",
-            "message": "reusable utility-pane execution requires the Windows Herdr named-pipe transport, which is still pending",
+            "message": "private pane execution requires the Windows Herdr named-pipe transport, which is still pending",
         });
     }
 
     #[cfg(unix)]
     {
-        // Keep selection, owned-busy waiting, and pane.send_text in one local
-        // critical section. Otherwise two callers can both wait on the same
-        // Herdr-owned session, observe the shell becoming ready, and then send
-        // two launch lines into the canonical pane concurrently.
-        let _submission_guard = UTILITY_SUBMISSION_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (pane_id, created) =
-            match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
-                Ok(value) => value,
-                Err(PrepareError::ControlPlane(message)) => {
-                    return utility_pane_control_plane_error(workspace_id, command, message);
-                }
-                Err(PrepareError::Other { code, message }) => {
-                    let mut result = Map::new();
-                    result.insert("ok".to_owned(), json!(false));
-                    result.insert("code".to_owned(), json!(code));
-                    result.insert("message".to_owned(), json!(message));
-                    result.insert("backend".to_owned(), json!("utility_pane"));
-                    result.insert("workspace".to_owned(), json!(workspace_id));
-                    result.insert("command".to_owned(), json!(command));
-                    result.insert("delivery_state".to_owned(), json!("not_delivered"));
-                    result.insert(
-                        "hint".to_owned(),
-                        json!("failed to prepare canonical utility pane before command delivery"),
-                    );
-                    // Preparation owns the pane, not the command: the command
-                    // was never delivered to a running child.
-                    exec_evidence::insert_control_plane_rejection(&mut result);
-                    return Value::Object(result);
-                }
-            };
-
-        if let Err(result) = ensure_utility_pane_ready(
-            client,
-            registry,
-            workspace_id,
-            &pane_id,
-            command,
-            UTILITY_OWNED_WAIT,
+        let pane = match client.call_with_timeout(
+            "pane.split",
+            json!({
+                "workspace_id": workspace_id,
+                "direction": "right",
+                "cwd": effective_root.to_string_lossy(),
+                "focus": false,
+            }),
+            SPLIT_TIMEOUT,
         ) {
-            return result;
-        }
-
-        let mut result = match registry.start_in_existing_pane(effective_root, command, &pane_id) {
             Ok(value) => value,
-            Err(message) => {
-                return utility_pane_start_failure(workspace_id, &pane_id, command, message);
+            Err(error) => {
+                return private_pane_control_plane_error(
+                    workspace_id,
+                    command,
+                    format!("cannot create private exec pane: {}", error.message),
+                );
             }
         };
-        if let Some(object) = result.as_object_mut() {
-            object.insert("workspace".to_owned(), json!(workspace_id));
-            object.insert("created_utility_pane".to_owned(), json!(created));
+        let Some(pane_id) = extract_pane_id(&pane) else {
+            return private_pane_control_plane_error(
+                workspace_id,
+                command,
+                "pane.split returned no pane id".to_owned(),
+            );
+        };
+        let _ = client.call_with_timeout(
+            "pane.rename",
+            json!({"pane_id": pane_id, "label": "herdr-mcp:exec"}),
+            PRE_SEND_TIMEOUT,
+        );
+        if let Err(error) = client.call_with_timeout(
+            "pane.wait_for_output",
+            json!({
+                "pane_id": pane_id,
+                "source": "recent_unwrapped",
+                "match": {"type": "regex", "value": "[%#$>❯] ?$"},
+                "timeout_ms": 5_000,
+            }),
+            Duration::from_secs(6),
+        ) {
+            let _ = client.call_with_timeout(
+                "pane.close",
+                json!({"pane_id": pane_id}),
+                PRE_SEND_TIMEOUT,
+            );
+            return private_pane_control_plane_error(
+                workspace_id,
+                command,
+                format!(
+                    "private exec pane shell did not become ready: {}",
+                    error.message
+                ),
+            );
         }
-        result
+
+        match registry.start_in_private_pane(effective_root, command, &pane_id) {
+            Ok(mut value) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("workspace".to_owned(), json!(workspace_id));
+                    object.insert("created_exec_pane".to_owned(), json!(true));
+                }
+                value
+            }
+            Err(error) => {
+                if error.stage.proves_nothing_delivered() {
+                    let _ = client.call_with_timeout(
+                        "pane.close",
+                        json!({"pane_id": pane_id}),
+                        PRE_SEND_TIMEOUT,
+                    );
+                }
+                private_pane_start_failure(workspace_id, &pane_id, command, error)
+            }
+        }
     }
 }
 
@@ -726,6 +737,47 @@ fn utility_pane_start_failure(
         );
         exec_evidence::insert_uncertain_start(&mut result);
     }
+    Value::Object(result)
+}
+
+fn private_pane_start_failure(
+    workspace_id: &str,
+    pane_id: &str,
+    command: &str,
+    error: crate::exec_sessions::PaneStartError,
+) -> Value {
+    let mut result = Map::new();
+    result.insert("ok".to_owned(), json!(false));
+    result.insert("code".to_owned(), json!("exec_start_failed"));
+    result.insert("message".to_owned(), json!(error.message));
+    result.insert("backend".to_owned(), json!("private_pane"));
+    result.insert("workspace".to_owned(), json!(workspace_id));
+    result.insert("pane_id".to_owned(), json!(pane_id));
+    result.insert("command".to_owned(), json!(command));
+    if error.stage.proves_nothing_delivered() {
+        result.insert("delivery_state".to_owned(), json!("not_delivered"));
+        exec_evidence::insert_control_plane_rejection(&mut result);
+    } else {
+        result.insert("delivery_state".to_owned(), json!("unknown"));
+        exec_evidence::insert_uncertain_start(&mut result);
+    }
+    Value::Object(result)
+}
+
+fn private_pane_control_plane_error(workspace_id: &str, command: &str, message: String) -> Value {
+    let mut result = Map::new();
+    result.insert("ok".to_owned(), json!(false));
+    result.insert("code".to_owned(), json!("private_pane_unavailable"));
+    result.insert("message".to_owned(), json!(message));
+    result.insert("backend".to_owned(), json!("private_pane"));
+    result.insert("workspace".to_owned(), json!(workspace_id));
+    result.insert("command".to_owned(), json!(command));
+    result.insert("delivery_state".to_owned(), json!("not_delivered"));
+    result.insert(
+        "safe_retry_mode".to_owned(),
+        json!("retry_after_control_plane_recovery"),
+    );
+    exec_evidence::insert_control_plane_rejection(&mut result);
     Value::Object(result)
 }
 
@@ -1331,12 +1383,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reusable_pane_session_reuses_canonical_pane_and_cancel_preserves_it() {
+    fn private_pane_session_never_uses_canonical_utility_and_cancel_reclaims_it() {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixListener;
 
         let base = env::temp_dir().join(format!(
-            "herdr-utility-reuse-{}-{}",
+            "herdr-private-exec-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1349,7 +1401,7 @@ mod tests {
         let methods = Arc::new(Mutex::new(Vec::<String>::new()));
         let server_methods = Arc::clone(&methods);
         let server = thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..5 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Value = serde_json::from_str(
                     &BufReader::new(stream.try_clone().unwrap())
@@ -1362,16 +1414,8 @@ mod tests {
                 let method = request["method"].as_str().unwrap().to_owned();
                 server_methods.lock().unwrap().push(method.clone());
                 let result = match method.as_str() {
-                    "pane.process_info" => json!({
-                        "process_info": {
-                            "shell_pid": 42,
-                            "foreground_process_group_id": 42,
-                            "foreground_processes": [{"pid": 42, "name": "zsh"}],
-                        }
-                    }),
-                    "pane.send_text" => json!({"ok": true}),
-                    "pane.send_keys" => {
-                        assert_eq!(request["params"]["keys"], json!(["C-c"]));
+                    "pane.split" => json!({"pane": {"pane_id": "w1:p9"}}),
+                    "pane.rename" | "pane.wait_for_output" | "pane.send_text" | "pane.close" => {
                         json!({"ok": true})
                     }
                     other => panic!("unexpected Herdr method: {other}"),
@@ -1388,33 +1432,25 @@ mod tests {
         let client = HerdrClient::new(&socket);
         let registry =
             ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
-        let snapshot = json!({
-            "panes": [{
-                "workspace_id": "w1",
-                "pane_id": "w1:p2",
-                "label": UTILITY_LABEL,
-            }]
-        });
-        let result = start_reusable_pane_session(
-            &client,
-            &snapshot,
-            &registry,
-            "w1",
-            Path::new("/tmp"),
-            "sleep 30",
-        );
+        let result =
+            start_private_pane_session(&client, &registry, "w1", Path::new("/tmp"), "sleep 30");
         assert_eq!(result["ok"], true);
-        assert_eq!(result["backend"], "utility_pane");
-        assert_eq!(result["pane_id"], "w1:p2");
-        assert_eq!(result["created_utility_pane"], false);
+        assert_eq!(result["backend"], "private_pane");
+        assert_eq!(result["pane_id"], "w1:p9");
+        assert_eq!(result["created_exec_pane"], true);
 
         let session_id = result["session_id"].as_str().unwrap();
-        let killed = registry.kill(session_id);
-        assert_eq!(killed["ok"], true);
+        assert_eq!(registry.kill(session_id)["ok"], true);
         server.join().unwrap();
         assert_eq!(
             *methods.lock().unwrap(),
-            vec!["pane.process_info", "pane.send_text", "pane.send_keys"],
+            vec![
+                "pane.split",
+                "pane.rename",
+                "pane.wait_for_output",
+                "pane.send_text",
+                "pane.close",
+            ],
         );
         drop(registry);
         fs::remove_dir_all(base).unwrap();

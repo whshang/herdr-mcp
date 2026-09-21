@@ -84,7 +84,7 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /does not by itself make any tool "absolutely safe".*not permission to weaken authorization/s);
     assert.match(r.content, /herdr_git status.*diff.*log.*herdr_exec.*herdr_fs_grep.*compacted/s);
     assert.match(r.content, /counts.*compacted.*summarized `output`/s);
-    assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start`, not the visible utility pane or a blocking `herdr_exec`/);
+    assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start`, not the canonical utility pane or a blocking `herdr_exec`/);
     assert.match(r.content, /herdr_mcp\.exec\.wait/);
     assert.match(r.content, /GitHub Actions artifact downloads.*`herdr_exec_start`/s);
     assert.match(r.content, /destination-file growth.*never start a duplicate transfer/s);

@@ -652,17 +652,38 @@ impl ExecRegistry {
         }))
     }
 
-    /// Start one command in an existing utility pane.
-    ///
-    /// Failures are typed by the stage that produced them, because only the
-    /// stage decides what a caller may claim: a failure before `pane.send_text`
-    /// proves nothing was delivered, while a failure at or after that call
-    /// cannot prove either way.
+    /// Start one command in an existing canonical utility pane.
     pub fn start_in_existing_pane(
         &self,
         cwd: &Path,
         command: &str,
         pane_id: &str,
+    ) -> Result<Value, PaneStartError> {
+        self.start_in_pane(cwd, command, pane_id, false, "utility_pane")
+    }
+
+    /// Start one command in a task-owned pane that is automatically reclaimed
+    /// when the durable session completes or is killed.
+    pub fn start_in_private_pane(
+        &self,
+        cwd: &Path,
+        command: &str,
+        pane_id: &str,
+    ) -> Result<Value, PaneStartError> {
+        self.start_in_pane(cwd, command, pane_id, true, "private_pane")
+    }
+
+    /// Failures are typed by the stage that produced them, because only the
+    /// stage decides what a caller may claim: a failure before `pane.send_text`
+    /// proves nothing was delivered, while a failure at or after that call
+    /// cannot prove either way.
+    fn start_in_pane(
+        &self,
+        cwd: &Path,
+        command: &str,
+        pane_id: &str,
+        close_on_complete: bool,
+        backend: &str,
     ) -> Result<Value, PaneStartError> {
         self.prune();
         if command.is_empty() {
@@ -689,8 +710,15 @@ impl ExecRegistry {
             PANE_RPC_TIMEOUT,
         ) {
             cleanup_pane_files(&script_path, &spool);
+            if close_on_complete {
+                let _ = client.call_with_timeout(
+                    "pane.close",
+                    json!({"pane_id": pane_id}),
+                    PANE_RPC_TIMEOUT,
+                );
+            }
             return Err(PaneStartError::after_send(format!(
-                "cannot start utility pane command: {error}"
+                "cannot start pane command: {error}"
             )));
         }
         let started_at_ms = now_ms();
@@ -707,7 +735,7 @@ impl ExecRegistry {
                 spool,
                 stdout_offset: Mutex::new(0),
                 stderr_offset: Mutex::new(0),
-                close_on_complete: false,
+                close_on_complete,
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
@@ -723,7 +751,7 @@ impl ExecRegistry {
             // The launch line already reached the pane, so the caller must not
             // be told that nothing ran.
             return Err(PaneStartError::after_send(format!(
-                "cannot durably register utility exec session; utility pane was closed before return: {error}"
+                "cannot durably register pane exec session; pane was closed before return: {error}"
             )));
         }
         self.inner
@@ -732,6 +760,7 @@ impl ExecRegistry {
             .map_err(|_| {
                 // The launch line was already delivered before this registry
                 // bookkeeping step.
+                terminate_session(&session, true, None);
                 PaneStartError::after_send("exec registry lock poisoned")
             })?
             .insert(id.clone(), Arc::clone(&session));
@@ -743,7 +772,7 @@ impl ExecRegistry {
             "command": command,
             "started_at": iso_from_ms(started_at_ms),
             "pid": Value::Null,
-            "backend": "utility_pane",
+            "backend": backend,
             "pane_id": pane_id,
             "phase": "started",
             "progress": {
