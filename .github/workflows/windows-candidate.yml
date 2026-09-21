@@ -127,6 +127,37 @@ jobs:
             & schtasks.exe /Query /TN "Herdr MCP Runtime" *> $null
             if ($LASTEXITCODE -eq 0) { throw "legacy scheduled task was unexpectedly created" }
 
+            # Stable per-user CLI + PATH after install: a new PowerShell inherits
+            # the registered user PATH and can resolve `herdr-mcp` without manual
+            # PATH edits. Repeat install must not append duplicate PATH segments.
+            Write-Host "[smoke] user-cli check start"
+            $userCli = Join-Path "$env:USERPROFILE\.local\bin" "herdr-mcp.cmd"
+            if (-not (Test-Path -LiteralPath $userCli -PathType Leaf)) { throw "Windows stable user CLI entry was not created" }
+            $runtimeExe = (Resolve-Path "$env:USERPROFILE\.config\herdr-mcp\runtime\current\herdr-mcp.exe").Path
+            $cmdContent = (Get-Content -LiteralPath $userCli -Raw -ErrorAction Stop)
+            if (-not $cmdContent.Contains($runtimeExe)) { throw "stable user CLI entry does not resolve runtime/current" }
+            Write-Host "[smoke] user-cli entry content ok"
+            # Resolve through the user PATH exactly as a fresh shell inherits it.
+            $userPathDir = "$env:USERPROFILE\.local\bin"
+            # A fresh shell inherits the registered user PATH; simulate that for
+            # `where` by prepending the same directory in-process.
+            $env:Path = "$userPathDir;" + $env:Path
+            $resolved = (& cmd.exe /c where.exe herdr-mcp.cmd 2>&1 | Out-String).Trim()
+            if ($resolved -notlike "*$userPathDir*herdr-mcp.cmd*") { throw "herdr-mcp.cmd is not resolvable through the user PATH" }
+            Write-Host "[smoke] where resolved: $resolved"
+            # Verify idempotency of the PATH registration without triggering a
+            # second full `install` (which re-runs the process stop/start path
+            # while the service is already running). The register_user_path logic
+            # that makes repeat installs not re-append PATH is covered by the
+            # Windows-gated Rust unit tests in user_cli.rs.
+            $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $false)
+            $envPathRaw = $envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $envKey.Close()
+            $segments = ($envPathRaw -split ';' | Where-Object { $_ -ne '' })
+            $segCount = ($segments | Where-Object { $_.TrimEnd('\') -ieq $userPathDir.TrimEnd('\') -or $_.TrimEnd('\') -ieq '%USERPROFILE%\.local\bin' }).Count
+            if ($segCount -ne 1) { throw "user PATH registration is not a single unique segment ($segCount mentions of .local\bin)" }
+            Write-Host "[smoke] user-cli check complete (PATH segCount=$segCount)"
+
             $serverAfterInstall = (& $herdr.FullName status server --json | ConvertFrom-Json)
             if ($serverAfterInstall.running -ne $true) { throw "herdr-mcp install did not auto-start the installed Herdr server" }
             $doctorReady = $false
