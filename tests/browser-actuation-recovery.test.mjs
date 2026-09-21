@@ -10,6 +10,14 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+const projectPageInfoStart = backgroundSource.indexOf("function browserProjectPageInfoFromSupportedUrl(");
+const projectPageInfoEnd = backgroundSource.indexOf("\nfunction browserPageContextInfoFromSupportedUrl", projectPageInfoStart);
+assert.ok(projectPageInfoStart >= 0 && projectPageInfoEnd > projectPageInfoStart, "provider project page helper must remain extractable");
+const projectPageInfoSource = backgroundSource.slice(projectPageInfoStart, projectPageInfoEnd);
+const browserProjectPageInfoFromSupportedUrl = new Function(
+  `${projectPageInfoSource}; return browserProjectPageInfoFromSupportedUrl;`,
+)();
+
 const canonicalRecoveryStart = backgroundSource.indexOf("async function findBrowserSessionTargetByCanonicalIdentity(");
 const recoveryStart = backgroundSource.indexOf("async function recoverBrowserSessionTarget(");
 const recoveryEnd = backgroundSource.indexOf("\nasync function handleBrowserActuation", recoveryStart);
@@ -210,6 +218,45 @@ function recoveryHarness(tabRecords) {
   );
   return { recover, browserSessionTargets, queryArgs };
 }
+
+test("user sees WebChat control on Claude and Grok project homes | Given supported provider project URLs without conversations | When project page identity is parsed | Then project context exists without a conversation key", () => {
+  const claude = browserProjectPageInfoFromSupportedUrl(
+    "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+  );
+  assert.deepEqual(claude, {
+    site: "claude",
+    project_id: "01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+    conversation_id: null,
+    convKey: null,
+    pageKey: "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+  });
+
+  const grok = browserProjectPageInfoFromSupportedUrl(
+    "https://grok.com/project/eacfb5b0-1ce3-4724-8b10-8d323896ffec",
+  );
+  assert.deepEqual(grok, {
+    site: "grok",
+    project_id: "eacfb5b0-1ce3-4724-8b10-8d323896ffec",
+    conversation_id: null,
+    convKey: null,
+    pageKey: "https://grok.com/project/eacfb5b0-1ce3-4724-8b10-8d323896ffec",
+  });
+
+  assert.equal(
+    browserProjectPageInfoFromSupportedUrl(
+      "https://grok.com/project/eacfb5b0-1ce3-4724-8b10-8d323896ffec?chat=cd60accd-c663-4a40-a292-53a192996423",
+    ),
+    null,
+    "a real Grok project chat remains owned by the session parser",
+  );
+  assert.equal(
+    browserProjectPageInfoFromSupportedUrl(
+      "https://claude.ai/chat/ace3312e-1eac-424f-8363-ad0ee0f6b24d",
+    ),
+    null,
+    "a real Claude chat remains owned by the session parser",
+  );
+});
 
 function createAnchorHarness({ tabs = [], scopes = [], targets = [], recovered = null } = {}) {
   const tabMap = new Map(tabs.map((tab) => [tab.id, { ...tab }]));

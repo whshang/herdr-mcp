@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.114";
+const H2W_SCRIPT_VERSION = "0.1.115";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -935,6 +935,38 @@ function browserConversationInfoFromSupportedUrl(rawUrl) {
     if (gemini) return gemini;
   }
   return null;
+}
+
+function browserProjectPageInfoFromSupportedUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    const site = url.origin === "https://claude.ai"
+      ? "claude"
+      : url.origin === "https://grok.com"
+        ? "grok"
+        : null;
+    if (!site) return null;
+    const projectMatch = url.pathname.match(
+      /^\/project\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i,
+    );
+    if (!projectMatch) return null;
+    if (site === "grok" && url.searchParams.has("chat")) return null;
+    const projectId = projectMatch[1].toLowerCase();
+    return {
+      site,
+      project_id: projectId,
+      conversation_id: null,
+      convKey: null,
+      pageKey: `${url.origin}/project/${projectId}`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserPageContextInfoFromSupportedUrl(rawUrl) {
+  return browserConversationInfoFromSupportedUrl(rawUrl)
+    || browserProjectPageInfoFromSupportedUrl(rawUrl);
 }
 
 function enrichConversationInfoWithBrowserScope(tabId, info) {
@@ -7840,8 +7872,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Opening a browser control surface wakes the service worker; restore streams and timers lost to suspension.
       void ensureAlive(bindings, authoritativeState);
       let convInfo = null;
+      let pageInfo = null;
       if (msg.tabId) {
         convInfo = await conversationInfoForTab(msg.tabId);
+        pageInfo = convInfo;
+        if (!pageInfo) {
+          try {
+            const tab = await chrome.tabs.get(msg.tabId);
+            pageInfo = browserPageContextInfoFromSupportedUrl(tab?.url);
+          } catch (_) {}
+        }
       }
       const binding = convInfo ? primaryBindingForConv(bindings, convInfo.convKey) : null;
       const sessionBindings = convInfo
@@ -7857,6 +7897,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const semanticCapabilities = await runtimeSemanticCapabilities();
       sendResponse({
         convInfo,
+        pageInfo,
         browserEndpoint: browserEndpointView(browserEndpoint),
         binding: bindingViewOne,
         sessionBindings,

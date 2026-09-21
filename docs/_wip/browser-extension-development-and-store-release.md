@@ -35,7 +35,7 @@ At the current `main` baseline used to open this closeout lane:
 - final stable 1.0 source is **not frozen yet**;
 - open extension-changing work may advance the manifest version before the final package is qualified.
 
-The semantic-judgment policy is now on `main` at extension 0.1.103. The provider-cleanup closeout lane advances its exact candidate to 0.1.114 for supported Grok optional-site access, direct Chrome-permission authority, provider-scoped bounded recovery, historical-turn Grok settlement recovery, endpoint-affine browser actuation when multiple Extension hosts are online, and dispatch-id-bound durable result settlement. Treat 0.1.114 as a candidate until that lane is merged. Any later extension-changing PR has the same rule.
+The semantic-judgment policy is now on `main` at extension 0.1.103, and the provider-cleanup closeout merged extension 0.1.114 with supported Grok optional-site access, provider-scoped bounded recovery, endpoint-affine browser actuation, and dispatch-id-bound durable result settlement. The current extension-changing lane advances the candidate to 0.1.115 so Claude and Grok project home pages expose project-level Control Center context and WebChat consent without creating a fake conversation session. Treat 0.1.115 as a candidate until this lane is merged. Any later extension-changing PR has the same rule.
 
 The successful package workflow run `35325140968` qualified the 0.1.101 package at source `4e28c285`. That is valid historical evidence for that source, but main has advanced, so it is not the final stable-1.0 package identity.
 

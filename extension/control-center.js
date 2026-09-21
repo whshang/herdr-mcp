@@ -327,7 +327,7 @@ function shortIdentity(value, max = 18) {
 }
 
 function pageContextInfo() {
-  return pageContext.response?.convInfo || null;
+  return pageContext.response?.pageInfo || pageContext.response?.convInfo || null;
 }
 
 function pageContextBindings() {
@@ -382,7 +382,7 @@ function projectInstructionContext(state) {
 function renderPageContext(state) {
   const info = pageContextInfo();
   const bindings = pageContextBindings();
-  const supported = Boolean(info?.convKey);
+  const supported = Boolean(info?.site);
 
   if (pageContext.loading) {
     pageContextCard.hidden = true;
