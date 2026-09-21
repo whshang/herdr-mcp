@@ -240,7 +240,7 @@ mutation 的默认策略始终是：**先重新观察，再决定是否重试。
 
 Agent 长任务的正常控制流是异步 task lifecycle，而不是让 Parent 挂在 Agent 的全局状态上等待。`herdr_prompt` / `herdr_mcp.agent.task.dispatch` 只提交一次并立即返回稳定的 `task_id`（当前与 canonical `dispatch_id` 共用同一身份）和 Runtime `turn_id`；Parent 随后继续其它工作。Runtime 从 Herdr lifecycle event 观察本轮 activity，把 `completed` / `blocked` / `failed` 写入同一 StateStore `operations` ledger 的 durable parent inbox，再由 CLI 或 Browser adapter 唤醒对应 Parent。若提交时目标 Agent 已经在 `working`，先等待上一轮 settle，再观察新的 activity，避免旧 `done/idle` 被误判为新 task 完成。
 
-Jev/Semantic 只在 durable terminal 之后做有界 advisory enrichment：它可以辅助判断 `task_completed`、`needs_followup`、`needs_human`、`needs_handoff`，并辅助多子任务优先级/聚合。terminal 持久化、投递证据、幂等和通知不能依赖 Jev；快速判断没有在短 grace 内返回时，确定性 parent notification 立即继续，语义结果稍后补写 inbox。Herdr 0.9.x 仍没有 native prompt-turn identity，所以 Runtime `turn_id` 是 herdr-mcp 的稳定 turn envelope，`exact_native_turn=false` 明确保留这个边界。
+确定性 task fact 持久化以后，Parent 优先通过 `herdr_mcp.agent.task.inbox(advisory=true)` 观察结果。只有出现未 acknowledge 的 terminal work 时，Runtime 才冻结当前 scope 内最多 16 个 child summary，并对这一批一次调用现有 `agent.attention.advise`；仍在运行的 sibling 可以并入同一请求，fan-out 不会变成每个 child 一次 Jev。inbox fast path 的语义预算为 1.5 秒：`verify_completion` 进入确定性的 change projection / validation，`continue_unobserved` 让独立运行中的 child 继续执行，human/blocker/drift 状态只决定下一步观察方向。Jev 未配置、超时、返回异常或 provider 出错时，durable task fact 与 terminal wake 保持原样，Browser 不再增加第二层 semantic wait 或概率阈值。validation、closeout、cleanup 是后续独立 boundary：validation advice 只能调整已冻结检查的先后顺序，closeout 只做可选的 post-validation 分类，cleanup advice 不能改变 `safe_to_delete` 和资源回收权限。Herdr 0.9.x 仍没有 native prompt-turn identity，所以 Runtime `turn_id` 是 herdr-mcp 的稳定 turn envelope，`exact_native_turn=false` 明确保留这个边界。
 
 ## 控制面毛刺为什么不会轻易拖死整个任务
 

@@ -221,7 +221,7 @@ If the agent finished but ChatGPT did not continue, verify that:
 - the conversation has a stable `browser_session_ref` and is bound to the correct workspace;
 - the relevant Auto scope is enabled;
 - the task is terminal and unacknowledged in `herdr_mcp.agent.task.inbox`;
-- if sibling tasks are still running, Jev may advise aggregation; `blocked` / `failed` or high-priority `needs_human` results wake first. Missing, timed-out, or failed Jev never suppresses the deterministic terminal notification.
+- read the inbox with `advisory=true` when you need Parent guidance. Runtime evaluates at most one frozen attention batch when unacknowledged terminal work exists; `verify_completion` means enter deterministic validation and `continue_unobserved` means leave independent running siblings alone. Jev timeout/error/unconfigured state never suppresses deterministic terminal wake, and the Browser has no second semantic wait loop.
 
 A manual HUD continue action remains an explicit fallback. See [Browser continuity](browser-continuity.md).
 

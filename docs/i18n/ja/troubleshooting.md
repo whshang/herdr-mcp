@@ -221,7 +221,7 @@ Agent が終了したのに ChatGPT が続かない場合は次を確認して�
 - conversation に安定した `browser_session_ref` があり、正しい workspace に binding されている。
 - 該当する Auto scope が有効である。
 - `herdr_mcp.agent.task.inbox` で task が terminal かつ未 acknowledge である。
-- sibling task がまだ running の場合、Jev が集約を助言することがあります。`blocked` / `failed` や高い `needs_human` は優先して wake します。Jev が未設定、timeout、error の場合も deterministic terminal notification は抑止されません。
+- Parent guidance が必要なら inbox を `advisory=true` で読みます。未 acknowledge の terminal work がある場合だけ Runtime が freeze 済み attention batch を最大 1 回評価し、`verify_completion` は deterministic validation へ、`continue_unobserved` は独立して running 中の sibling をそのままにすることを意味します。Jev の timeout/error/未設定は deterministic terminal wake を抑止せず、Browser 側に二重の semantic wait loop はありません。
 
 HUD の手動 continue は明示的な fallback として残ります。詳しくは [Browser continuity](browser-continuity.md) を参照してください。
 
