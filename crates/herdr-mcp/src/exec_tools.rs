@@ -88,9 +88,8 @@ pub fn start(
                 "delivery_state": "not_delivered",
             });
         };
-        utility_exec::start_reusable_pane_session(
+        utility_exec::start_private_pane_session(
             client,
-            snapshot,
             registry,
             workspace_id,
             &managed.real,
