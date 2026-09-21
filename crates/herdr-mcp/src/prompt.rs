@@ -1,6 +1,6 @@
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
-use crate::progressive_skills::agent_closeout_advice;
+use crate::progressive_skills::agent_attention_advice;
 use crate::state_cache::EventCache;
 use crate::state_store::{
     OperationLedgerInput, OperationLedgerRecord, OperationReservation, StateStore,
@@ -19,6 +19,7 @@ const RECORD_LIMIT: usize = 512;
 const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
 const PROMPT_TASK_OPERATION_KIND: &str = "herdr_prompt_task";
 const PROMPT_TASK_TTL_MS: u64 = 7 * 24 * 60 * 60_000;
+const PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS: u64 = 10_000;
 const MAX_REPLAY_JSON_BYTES: usize = 128 * 1024;
 const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WAIT_MS: u64 = 25_000;
@@ -59,7 +60,10 @@ enum PromptTaskLifecycle {
 
 impl PromptTaskLifecycle {
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Blocked | Self::Failed)
+        matches!(
+            self,
+            Self::Completed | Self::Blocked | Self::Failed | Self::DeliveryUncertain
+        )
     }
 
     fn as_str(&self) -> &'static str {
@@ -106,8 +110,6 @@ struct PromptTaskRecord {
     #[serde(default)]
     notification_error: Option<String>,
     acknowledged_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    semantic: Option<Value>,
     created_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -151,7 +153,6 @@ impl PromptTaskRecord {
             "notification_at_ms": self.notification_at_ms,
             "notification_error": self.notification_error,
             "acknowledged": self.acknowledged_at_ms.is_some(),
-            "semantic": self.semantic,
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
         })
@@ -374,7 +375,7 @@ impl PromptRegistry {
             ));
         }
 
-        let record = PromptTaskRecord {
+        let mut record = PromptTaskRecord {
             schema_version: 1,
             task_id: task_id.to_owned(),
             dispatch_id: task_id.to_owned(),
@@ -400,10 +401,12 @@ impl PromptRegistry {
             notification_at_ms: None,
             notification_error: None,
             acknowledged_at_ms: None,
-            semantic: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
+        if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
+            mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
+        }
         self.save_task(&record, Some(fingerprint))?;
         let reconciled = self.reconcile_task(task_id)?;
         Ok(reconciled.or(Some(record)))
@@ -456,76 +459,67 @@ impl PromptRegistry {
         parent_target: Option<&str>,
         parent_session_ref: Option<&str>,
         include_acknowledged: bool,
+        advisory: bool,
         limit: usize,
     ) -> Value {
         self.reconcile_active_tasks();
-        match self.list_tasks(limit.clamp(1, 512)) {
+        match self.list_tasks(512) {
             Ok(tasks) => {
-                let mut terminal = tasks
+                let scoped = tasks
                     .iter()
+                    .filter(|task| {
+                        task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
+                    })
+                    .filter(|task| {
+                        !task.is_terminal()
+                            || include_acknowledged
+                            || task.acknowledged_at_ms.is_none()
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut terminal = scoped
+                    .iter()
+                    .copied()
                     .filter(|task| task.is_terminal())
-                    .filter(|task| {
-                        workspace_id.is_none_or(|workspace_id| {
-                            task.workspace_id.as_deref() == Some(workspace_id)
-                        })
-                    })
-                    .filter(|task| {
-                        parent_target.is_none_or(|parent_target| {
-                            task.parent_target.as_deref() == Some(parent_target)
-                        })
-                    })
-                    .filter(|task| {
-                        parent_session_ref.is_none_or(|parent_session_ref| {
-                            task.parent_session_ref.as_deref() == Some(parent_session_ref)
-                        })
-                    })
-                    .filter(|task| include_acknowledged || task.acknowledged_at_ms.is_none())
                     .cloned()
                     .collect::<Vec<_>>();
                 terminal.sort_by(|left, right| {
-                    semantic_notification_priority(right)
-                        .cmp(&semantic_notification_priority(left))
+                    task_notification_priority(right)
+                        .cmp(&task_notification_priority(left))
                         .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
                 });
                 terminal.truncate(limit.clamp(1, 512));
 
-                let scoped = tasks.iter().filter(|task| {
-                    workspace_id.is_none_or(|workspace_id| {
-                        task.workspace_id.as_deref() == Some(workspace_id)
-                    }) && parent_target.is_none_or(|parent_target| {
-                        task.parent_target.as_deref() == Some(parent_target)
-                    }) && parent_session_ref.is_none_or(|parent_session_ref| {
-                        task.parent_session_ref.as_deref() == Some(parent_session_ref)
-                    })
-                });
                 let mut running = 0_u64;
                 let mut completed = 0_u64;
                 let mut blocked = 0_u64;
                 let mut failed = 0_u64;
-                for task in scoped {
+                let mut uncertain = 0_u64;
+                for task in &scoped {
                     match task.lifecycle {
                         PromptTaskLifecycle::Running
                         | PromptTaskLifecycle::AwaitingActivity
-                        | PromptTaskLifecycle::AwaitingPriorSettle
-                        | PromptTaskLifecycle::DeliveryUncertain => running += 1,
-                        PromptTaskLifecycle::Completed
-                            if include_acknowledged || task.acknowledged_at_ms.is_none() =>
-                        {
-                            completed += 1
-                        }
-                        PromptTaskLifecycle::Blocked
-                            if include_acknowledged || task.acknowledged_at_ms.is_none() =>
-                        {
-                            blocked += 1
-                        }
-                        PromptTaskLifecycle::Failed
-                            if include_acknowledged || task.acknowledged_at_ms.is_none() =>
-                        {
-                            failed += 1
-                        }
-                        _ => {}
+                        | PromptTaskLifecycle::AwaitingPriorSettle => running += 1,
+                        PromptTaskLifecycle::DeliveryUncertain => uncertain += 1,
+                        PromptTaskLifecycle::Completed => completed += 1,
+                        PromptTaskLifecycle::Blocked => blocked += 1,
+                        PromptTaskLifecycle::Failed => failed += 1,
                     }
                 }
+
+                let attention = if advisory && !terminal.is_empty() {
+                    task_attention_advice(scoped.iter().copied())
+                } else {
+                    json!({
+                        "ok": true,
+                        "attempted": false,
+                        "used": false,
+                        "reason": if advisory { "no_pending_terminal" } else { "not_requested" },
+                        "advisory_only": true,
+                        "children": [],
+                    })
+                };
+
                 json!({
                     "ok": true,
                     "summary": {
@@ -533,8 +527,10 @@ impl PromptRegistry {
                         "completed": completed,
                         "blocked": blocked,
                         "failed": failed,
+                        "uncertain": uncertain,
                     },
                     "tasks": terminal.into_iter().map(|task| task.public_json()).collect::<Vec<_>>(),
+                    "attention": attention,
                 })
             }
             Err(error) => json!({
@@ -673,6 +669,7 @@ impl PromptRegistry {
         let _ = thread::Builder::new()
             .name("herdr-mcp-agent-task-tracker".to_owned())
             .spawn(move || {
+                let mut last_timeout_scan = std::time::Instant::now();
                 loop {
                     match cursor.has_changed() {
                         Ok(true) => {
@@ -686,6 +683,14 @@ impl PromptRegistry {
                         Ok(false) => thread::sleep(Duration::from_millis(50)),
                         Err(_) => return,
                     }
+                    if last_timeout_scan.elapsed() >= Duration::from_secs(1) {
+                        let Some(inner) = weak.upgrade() else {
+                            return;
+                        };
+                        let registry = PromptRegistry { inner };
+                        registry.reconcile_activity_timeouts();
+                        last_timeout_scan = std::time::Instant::now();
+                    }
                 }
             });
     }
@@ -694,12 +699,8 @@ impl PromptRegistry {
         let Ok(tasks) = self.list_tasks(512) else {
             return;
         };
-        for mut task in tasks {
+        for task in tasks {
             if task.is_terminal() {
-                self.enrich_terminal_task(&mut task);
-                if let Ok(Some(reloaded)) = self.load_task(&task.task_id) {
-                    task = reloaded;
-                }
                 if task.notification_state == "pending" {
                     self.maybe_notify_parent(&task);
                 }
@@ -709,85 +710,14 @@ impl PromptRegistry {
         }
     }
 
-    fn enrich_terminal_task(&self, task: &mut PromptTaskRecord) {
-        const RECENT_READ_BUDGET: Duration = Duration::from_millis(500);
-        const SEMANTIC_GRACE: Duration = Duration::from_millis(300);
-
-        if !task.is_terminal() || task.semantic.is_some() {
-            return;
-        }
-        let Some(client) = self.inner.client.as_ref().cloned() else {
+    fn reconcile_activity_timeouts(&self) {
+        let Ok(tasks) = self.list_tasks(512) else {
             return;
         };
-
-        // Persist deterministic terminal state first. Readback + Jev run
-        // entirely in the background; the terminal path waits at most one
-        // short grace window for an advisory that is already ready.
-        task.semantic = Some(json!({
-            "ok": true,
-            "attempted": true,
-            "used": false,
-            "reason": "pending",
-            "advisory_only": true,
-        }));
-        task.updated_at_ms = now_ms();
-        let _ = self.save_task(task, None);
-
-        let registry = self.clone();
-        let task_id = task.task_id.clone();
-        let target = task.target.clone();
-        let terminal_status = task.terminal_status.clone();
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let _ = thread::Builder::new()
-            .name("herdr-mcp-agent-task-semantic".to_owned())
-            .spawn(move || {
-                let advice = match client.call_with_timeout(
-                    "agent.read",
-                    json!({
-                        "target": target,
-                        "source": "recent_unwrapped",
-                        "lines": 120,
-                    }),
-                    RECENT_READ_BUDGET,
-                ) {
-                    Ok(value) => match bounded_recent_text(&value, 12_000)
-                        .filter(|value| !value.trim().is_empty())
-                    {
-                        Some(recent_text) => agent_closeout_advice(&json!({
-                            "target": target,
-                            "recent_text": recent_text,
-                            "agent_status": terminal_status,
-                            "process_running": false,
-                        })),
-                        None => json!({
-                            "ok": true,
-                            "attempted": false,
-                            "used": false,
-                            "reason": "recent_text_unavailable",
-                            "advisory_only": true,
-                        }),
-                    },
-                    Err(error) => json!({
-                        "ok": true,
-                        "attempted": false,
-                        "used": false,
-                        "reason": "recent_text_unavailable",
-                        "error_code": error.code,
-                        "advisory_only": true,
-                    }),
-                };
-                if let Ok(Some(mut current)) = registry.load_task(&task_id) {
-                    current.semantic = Some(advice.clone());
-                    current.updated_at_ms = now_ms();
-                    let _ = registry.save_task(&current, None);
-                }
-                let _ = sender.send(advice);
-            });
-
-        if let Ok(advice) = receiver.recv_timeout(SEMANTIC_GRACE) {
-            task.semantic = Some(advice);
-            task.updated_at_ms = now_ms();
-            let _ = self.save_task(task, None);
+        for task in tasks {
+            if task.lifecycle == PromptTaskLifecycle::AwaitingActivity {
+                let _ = self.reconcile_task(&task.task_id);
+            }
         }
     }
 
@@ -811,38 +741,10 @@ impl PromptRegistry {
         let Ok(all_tasks) = self.list_tasks(512) else {
             return;
         };
-        let active_sibling = all_tasks.iter().any(|task| {
-            task.parent_target.as_deref() == Some(parent_target) && !task.is_terminal()
-        });
-        let urgent = all_tasks.iter().any(|task| {
+        let attention = task_attention_advice(all_tasks.iter().filter(|task| {
             task.parent_target.as_deref() == Some(parent_target)
-                && task.notification_state == "pending"
-                && (matches!(
-                    task.lifecycle,
-                    PromptTaskLifecycle::Blocked | PromptTaskLifecycle::Failed
-                ) || semantic_notification_urgent(task))
-        });
-        if active_sibling && !urgent {
-            const COALESCE_GRACE_MS: u64 = 500;
-            let terminal_at = trigger.terminal_at_ms.unwrap_or(trigger.updated_at_ms);
-            let age_ms = now_ms().saturating_sub(terminal_at);
-            if age_ms < COALESCE_GRACE_MS {
-                let delay_ms = COALESCE_GRACE_MS.saturating_sub(age_ms);
-                let registry = self.clone();
-                let task_id = trigger.task_id.clone();
-                let _ = thread::Builder::new()
-                    .name("herdr-mcp-agent-task-coalesce".to_owned())
-                    .spawn(move || {
-                        thread::sleep(Duration::from_millis(delay_ms));
-                        if let Ok(Some(task)) = registry.load_task(&task_id)
-                            && task.notification_state == "pending"
-                        {
-                            registry.maybe_notify_parent(&task);
-                        }
-                    });
-                return;
-            }
-        }
+                && (!task.is_terminal() || task.notification_state == "pending")
+        }));
 
         let mut pending = all_tasks
             .into_iter()
@@ -856,8 +758,8 @@ impl PromptRegistry {
             return;
         }
         pending.sort_by(|left, right| {
-            semantic_notification_priority(right)
-                .cmp(&semantic_notification_priority(left))
+            task_notification_priority(right)
+                .cmp(&task_notification_priority(left))
                 .then_with(|| {
                     left.terminal_cursor
                         .unwrap_or(u64::MAX)
@@ -883,7 +785,9 @@ impl PromptRegistry {
             pending.len()
         )];
         for task in &pending {
-            let semantic = semantic_notification_summary(task);
+            let attention_state = task_attention_state(&attention, &task.task_id)
+                .map(|state| format!(" [attention={state}]"))
+                .unwrap_or_default();
             lines.push(format!(
                 "- {}: {} (child {}, turn {}, terminal_seq {}){}",
                 task.task_id,
@@ -893,11 +797,11 @@ impl PromptRegistry {
                 task.terminal_cursor
                     .map(|cursor| cursor.to_string())
                     .unwrap_or_else(|| "unknown".to_owned()),
-                semantic
+                attention_state
             ));
         }
         lines.push(
-            "Use herdr_mcp.agent.task.inbox or herdr_mcp.agent.task.status for durable details; do not re-dispatch a terminal or delivery-uncertain task blindly."
+            "Attention is advisory. Use durable task facts as authority: verify_completion enters deterministic validation; continue_unobserved leaves independent running children alone. Do not re-dispatch a terminal or delivery-uncertain task blindly."
                 .to_owned(),
         );
         let text = lines.join("\n");
@@ -942,31 +846,42 @@ impl PromptRegistry {
         if task.is_terminal() {
             return Ok(Some(task));
         }
+        let mut changed = false;
+        if task.lifecycle == PromptTaskLifecycle::AwaitingActivity
+            && now_ms().saturating_sub(task.updated_at_ms) >= PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS
+        {
+            changed |= mark_delivery_uncertain(&mut task, now_ms(), "activity_start_timeout");
+        }
+        if task.is_terminal() {
+            if changed {
+                self.save_task(&task, None)?;
+                self.maybe_notify_parent(&task);
+                if let Some(reloaded) = self.load_task(task_id)? {
+                    task = reloaded;
+                }
+            }
+            return Ok(Some(task));
+        }
         let Some(cache) = self.inner.cache.as_ref() else {
             return Ok(Some(task));
         };
         let digest = cache.digest_since(task.last_cursor);
         if digest.cursor.saturating_sub(task.last_cursor) > 2048 {
-            task.lifecycle = PromptTaskLifecycle::DeliveryUncertain;
-        }
-        let mut changed = false;
-        for event in &digest.events {
-            if apply_task_event(&mut task, event) {
-                changed = true;
+            changed |= mark_delivery_uncertain(&mut task, now_ms(), "event_history_gap");
+        } else {
+            for event in &digest.events {
+                if apply_task_event(&mut task, event) {
+                    changed = true;
+                }
             }
         }
         if digest.cursor > task.last_cursor {
             task.last_cursor = digest.cursor;
-            task.updated_at_ms = now_ms();
             changed = true;
         }
         if changed {
             self.save_task(&task, None)?;
             if task.is_terminal() {
-                self.enrich_terminal_task(&mut task);
-                if let Some(reloaded) = self.load_task(task_id)? {
-                    task = reloaded;
-                }
                 self.maybe_notify_parent(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
@@ -1063,96 +978,94 @@ impl PromptRegistry {
     }
 }
 
-fn bounded_recent_text(value: &Value, max_chars: usize) -> Option<String> {
-    fn first_text(value: &Value) -> Option<&str> {
-        if let Some(text) = value.as_str() {
-            return Some(text);
-        }
-        let object = value.as_object()?;
-        for key in ["text", "content", "output", "recent", "recent_unwrapped"] {
-            if let Some(text) = object.get(key).and_then(Value::as_str) {
-                return Some(text);
-            }
-        }
-        for key in ["result", "read", "agent", "data"] {
-            if let Some(text) = object.get(key).and_then(first_text) {
-                return Some(text);
-            }
-        }
-        None
+fn mark_delivery_uncertain(task: &mut PromptTaskRecord, now_ms: u64, reason: &str) -> bool {
+    if task.is_terminal() {
+        return false;
     }
-
-    first_text(value).map(|text| truncate_chars(text, max_chars))
+    task.lifecycle = PromptTaskLifecycle::DeliveryUncertain;
+    task.terminal_status = Some("delivery_uncertain".to_owned());
+    task.terminal_cursor = None;
+    task.terminal_at_ms = Some(now_ms);
+    task.notification_state = "pending".to_owned();
+    task.notification_error = Some(reason.to_owned());
+    task.updated_at_ms = now_ms;
+    true
 }
 
-fn semantic_probability(task: &PromptTaskRecord, key: &str) -> f64 {
-    task.semantic
-        .as_ref()
-        .and_then(|semantic| semantic.get("assessment"))
-        .and_then(|assessment| assessment.get(key))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0)
+fn task_matches_scope(
+    task: &PromptTaskRecord,
+    workspace_id: Option<&str>,
+    parent_target: Option<&str>,
+    parent_session_ref: Option<&str>,
+) -> bool {
+    workspace_id.is_none_or(|workspace_id| task.workspace_id.as_deref() == Some(workspace_id))
+        && parent_target
+            .is_none_or(|parent_target| task.parent_target.as_deref() == Some(parent_target))
+        && parent_session_ref.is_none_or(|parent_session_ref| {
+            task.parent_session_ref.as_deref() == Some(parent_session_ref)
+        })
 }
 
-fn semantic_notification_urgent(task: &PromptTaskRecord) -> bool {
-    let state = task
-        .semantic
-        .as_ref()
-        .and_then(|semantic| semantic.pointer("/assessment/state"))
-        .and_then(Value::as_str);
-    semantic_probability(task, "needs_human") >= 0.70
-        || semantic_probability(task, "needs_followup") >= 0.90
-        || semantic_probability(task, "needs_handoff") >= 0.90
-        || matches!(state, Some("waiting_user" | "blocked_external"))
-}
-
-fn semantic_notification_priority(task: &PromptTaskRecord) -> u32 {
-    let lifecycle: u32 = match task.lifecycle {
+fn task_notification_priority(task: &PromptTaskRecord) -> u32 {
+    match task.lifecycle {
         PromptTaskLifecycle::Failed => 400,
+        PromptTaskLifecycle::DeliveryUncertain => 375,
         PromptTaskLifecycle::Blocked => 350,
         PromptTaskLifecycle::Completed => 100,
         _ => 0,
-    };
-    let needs_human = (semantic_probability(task, "needs_human") * 100.0) as u32;
-    let needs_followup = (semantic_probability(task, "needs_followup") * 80.0) as u32;
-    let needs_handoff = (semantic_probability(task, "needs_handoff") * 60.0) as u32;
-    lifecycle
-        .saturating_add(needs_human)
-        .saturating_add(needs_followup)
-        .saturating_add(needs_handoff)
+    }
 }
 
-fn semantic_notification_summary(task: &PromptTaskRecord) -> String {
-    let Some(assessment) = task
-        .semantic
-        .as_ref()
-        .and_then(|semantic| semantic.get("assessment"))
-    else {
-        return String::new();
-    };
-    let state = assessment
+fn task_attention_advice<'a>(tasks: impl IntoIterator<Item = &'a PromptTaskRecord>) -> Value {
+    let mut tasks = tasks.into_iter().collect::<Vec<_>>();
+    tasks.sort_by(|left, right| {
+        task_notification_priority(right)
+            .cmp(&task_notification_priority(left))
+            .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+    });
+    tasks.truncate(16);
+    if tasks.is_empty() {
+        return json!({
+            "ok": true,
+            "attempted": false,
+            "used": false,
+            "reason": "no_children",
+            "advisory_only": true,
+            "children": [],
+        });
+    }
+
+    let observed_at = now_ms();
+    let children = tasks
+        .into_iter()
+        .map(|task| {
+            json!({
+                "task_id": task.task_id,
+                "agent_id": task.target,
+                "terminal_state": task.lifecycle.as_str(),
+                "age_ms": observed_at.saturating_sub(task.updated_at_ms),
+            })
+        })
+        .collect::<Vec<_>>();
+    agent_attention_advice(&json!({"children": children}))
+}
+
+fn task_attention_state(attention: &Value, task_id: &str) -> Option<String> {
+    let child_id = attention
+        .get("children")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|child| child.get("task_id").and_then(Value::as_str) == Some(task_id))?
+        .get("id")
+        .and_then(Value::as_str)?;
+    attention
+        .get("assessments")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|assessment| assessment.get("id").and_then(Value::as_str) == Some(child_id))?
         .get("state")
         .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let needs_human = assessment
-        .get("needs_human")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let task_completed = assessment
-        .get("task_completed")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let needs_followup = assessment
-        .get("needs_followup")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let needs_handoff = assessment
-        .get("needs_handoff")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    format!(
-        " [semantic state={state}, task_completed={task_completed:.2}, needs_followup={needs_followup:.2}, needs_human={needs_human:.2}, needs_handoff={needs_handoff:.2}]"
-    )
+        .map(str::to_owned)
 }
 
 fn decode_task_record(record: &OperationLedgerRecord) -> Result<PromptTaskRecord, String> {
@@ -1490,6 +1403,10 @@ pub fn task_call_with_parent_session(
                 .get("include_acknowledged")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let advisory = params
+                .get("advisory")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let limit = params
                 .get("limit")
                 .and_then(Value::as_u64)
@@ -1500,6 +1417,7 @@ pub fn task_call_with_parent_session(
                 parent_target,
                 parent_session_ref,
                 include_acknowledged,
+                advisory,
                 limit,
             )
         }
@@ -2612,6 +2530,16 @@ mod tests {
 
     #[test]
     fn task_lifecycle_is_activity_gated_durable_and_acknowledgeable() {
+        let _guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let semantic_config_dir = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-semantic-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &semantic_config_dir);
+        }
         let db_path = env::temp_dir().join(format!(
             "herdr-mcp-agent-task-ledger-{}-{}.sqlite",
             std::process::id(),
@@ -2678,18 +2606,43 @@ mod tests {
         assert_eq!(status["task"]["parent_target"], "parent");
         assert_eq!(status["task"]["turn_correlation"], "runtime_activity_gate");
 
-        let inbox = reopened.task_inbox(None, Some("parent"), None, false, 10);
+        let inbox = reopened.task_inbox(None, Some("parent"), None, false, true, 10);
         assert_eq!(inbox["summary"]["completed"], 1);
         assert_eq!(inbox["tasks"][0]["task_id"], task_id);
+        assert_eq!(inbox["attention"]["attempted"], true);
+        assert_eq!(inbox["attention"]["used"], false);
+        assert_eq!(inbox["attention"]["reason"], "not_configured");
+        assert_eq!(inbox["attention"]["children"][0]["task_id"], task_id);
+        assert!(
+            inbox["attention"]["children"][0]
+                .get("dispatch_id")
+                .is_none()
+        );
+        assert!(inbox["attention"]["children"][0].get("status").is_none());
+        assert_eq!(inbox["attention"]["metrics"]["question_count"], 1);
+        assert_eq!(inbox["attention"]["metrics"]["budget_ms"], 1_500);
+        assert!(
+            inbox["attention"]["metrics"]["state_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes < 1024)
+        );
         assert_eq!(reopened.task_ack(task_id)["ok"], true);
-        let after_ack = reopened.task_inbox(None, Some("parent"), None, false, 10);
+        let after_ack = reopened.task_inbox(None, Some("parent"), None, false, true, 10);
         assert_eq!(after_ack["summary"]["completed"], 0);
         assert!(after_ack["tasks"].as_array().unwrap().is_empty());
+        assert_eq!(after_ack["attention"]["reason"], "no_pending_terminal");
 
         drop(reopened);
         fs::remove_file(&db_path).ok();
         fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
         fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        fs::remove_dir_all(&semantic_config_dir).ok();
     }
 
     #[test]

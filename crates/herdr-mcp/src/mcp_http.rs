@@ -717,9 +717,14 @@ async fn get_extension_agent_tasks(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(50)
         .clamp(1, 512);
-    let value = state
-        .prompt
-        .task_inbox(workspace_id, None, Some(parent_session_ref), false, limit);
+    let value = state.prompt.task_inbox(
+        workspace_id,
+        None,
+        Some(parent_session_ref),
+        false,
+        true,
+        limit,
+    );
     json_response(StatusCode::OK, &value)
 }
 

@@ -16,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -197,6 +198,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "parent_target": {"type": "string", "maxLength": 256},
                     "parent_session_ref": {"type": "string", "maxLength": 256},
                     "include_acknowledged": {"type": "boolean"},
+                    "advisory": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 512},
                 },
                 "required": [],
@@ -1581,6 +1583,14 @@ impl ProgressiveSkillService {
     }
 
     fn agent_attention_advise_method(&self, params: &Value) -> Value {
+        self.agent_attention_advise_with_timeout(params, None)
+    }
+
+    fn agent_attention_advise_with_timeout(
+        &self,
+        params: &Value,
+        timeout: Option<Duration>,
+    ) -> Value {
         if let Err(error) = validate_object_keys(params, &["children"]) {
             return error;
         }
@@ -1671,20 +1681,47 @@ impl ProgressiveSkillService {
                     ));
                 }
             }
-            frozen.push(json!({
-                "id": format!("child_{index}"),
-                "task_id": task_id,
-                "dispatch_id": dispatch_id,
-                "agent_id": agent_id,
-                "terminal_state": terminal_state,
-                "status": status,
-                "recent_text": recent_text,
-                "age_ms": age_ms,
-                "has_running_exec": object.get("has_running_exec").and_then(Value::as_bool),
-                "dirty_worktree": object.get("dirty_worktree").and_then(Value::as_bool),
-                "open_pr": object.get("open_pr").and_then(Value::as_bool),
-            }));
+            let mut frozen_child = Map::new();
+            frozen_child.insert("id".to_owned(), json!(format!("child_{index}")));
+            for (key, value) in [
+                ("task_id", task_id),
+                ("dispatch_id", dispatch_id),
+                ("agent_id", agent_id),
+                ("terminal_state", terminal_state),
+                ("status", status),
+                ("recent_text", recent_text),
+            ] {
+                if let Some(value) = value {
+                    frozen_child.insert(key.to_owned(), json!(value));
+                }
+            }
+            if let Some(age_ms) = age_ms {
+                frozen_child.insert("age_ms".to_owned(), json!(age_ms));
+            }
+            for key in ["has_running_exec", "dirty_worktree", "open_pr"] {
+                if let Some(value) = object.get(key).and_then(Value::as_bool) {
+                    frozen_child.insert(key.to_owned(), json!(value));
+                }
+            }
+            frozen.push(Value::Object(frozen_child));
         }
+
+        let semantic_state = json!({"children": frozen});
+        let state_bytes = serde_json::to_vec(&semantic_state)
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let question_count = children.len() + usize::from(children.len() >= 2);
+        let budget_ms =
+            timeout.map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+        let metrics = |elapsed_ms: u64| {
+            json!({
+                "child_count": children.len(),
+                "state_bytes": state_bytes,
+                "question_count": question_count,
+                "elapsed_ms": elapsed_ms,
+                "budget_ms": budget_ms,
+            })
+        };
 
         let service = SemanticService::from_config();
         let capability = service.capability_json();
@@ -1693,6 +1730,7 @@ impl ProgressiveSkillService {
                 "ok": true, "attempted": true, "used": false,
                 "reason": "not_configured", "advisory_only": true,
                 "children": frozen, "capability": capability,
+                "metrics": metrics(0),
             });
         }
         let categories = BTreeMap::from([
@@ -1703,7 +1741,7 @@ impl ProgressiveSkillService {
             ("investigate_drift".to_owned(), Some("The child appears active but may be drifting from its assigned objective".to_owned())),
             ("unclear".to_owned(), Some("The bounded evidence does not support a clearer classification".to_owned())),
         ]);
-        let mut request = SemanticRequest::new(json!({"children": frozen}));
+        let mut request = SemanticRequest::new(semantic_state);
         for index in 0..children.len() {
             request = request.ask(
                 format!("child_{index}_state"),
@@ -1730,16 +1768,23 @@ impl ProgressiveSkillService {
                 ),
             );
         }
-        let response = match service.evaluate(&request) {
+        let started = Instant::now();
+        let response = match timeout
+            .map(|timeout| service.evaluate_with_timeout(&request, timeout))
+            .unwrap_or_else(|| service.evaluate(&request))
+        {
             Ok(response) => response,
             Err(error) => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 return json!({
                     "ok": true, "attempted": true, "used": false,
                     "reason": error.code(), "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             }
         };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let mut assessments = Vec::new();
         for index in 0..children.len() {
             let key = format!("child_{index}_state");
@@ -1750,6 +1795,7 @@ impl ProgressiveSkillService {
                     "ok": true, "attempted": true, "used": false,
                     "reason": "bad_response", "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             };
             if !categories.contains_key(state) {
@@ -1757,6 +1803,7 @@ impl ProgressiveSkillService {
                     "ok": true, "attempted": true, "used": false,
                     "reason": "bad_response", "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             }
             assessments.push(json!({
@@ -1775,6 +1822,7 @@ impl ProgressiveSkillService {
                     "ok": true, "attempted": true, "used": false,
                     "reason": "bad_response", "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             };
             let selected_index = selected
@@ -1785,6 +1833,7 @@ impl ProgressiveSkillService {
                     "ok": true, "attempted": true, "used": false,
                     "reason": "bad_response", "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             }
         }
@@ -1812,6 +1861,7 @@ impl ProgressiveSkillService {
             "ok": true, "attempted": true, "used": true, "advisory_only": true,
             "children": frozen, "assessments": assessments, "attention_ranking": ranking,
             "provider": response.provider, "model": response.model, "capability": capability,
+            "metrics": metrics(elapsed_ms),
             "authority": "semantic attention triage only; deterministic task, process, terminal, replay, and reclaim facts remain authoritative",
         })
     }
@@ -3116,7 +3166,7 @@ fn parent_orchestration_consumption() -> Value {
             "mutations": "deterministic tools and lifecycle gates"
         },
         "latency_policy": "at most one semantic evaluation per orchestration boundary; never add a semantic RTT to each low-level fs, git, exec, or inspect call",
-        "durable_task_source": "prefer advertised durable task/dispatch/terminal/inbox facts; when unavailable, keep the existing inspect/since plus deterministic task/process evidence path and do not create a second task ledger",
+        "durable_task_source": "prefer herdr_mcp.agent.task.inbox with advisory=true when advertised: deterministic task facts remain authoritative and one bounded existing attention decision is returned for the frozen inbox batch; when unavailable, keep the existing inspect/since plus deterministic task/process evidence path and do not create a second task ledger",
         "boundaries": {
             "plan": {
                 "method": PLANNING_ADVISE_METHOD,
@@ -3125,7 +3175,8 @@ fn parent_orchestration_consumption() -> Value {
             },
             "attention": {
                 "method": AGENT_ATTENTION_ADVISE_METHOD,
-                "when": "new bounded child progress or terminal facts can change parent attention",
+                "preferred_entry": "herdr_mcp.agent.task.inbox(advisory=true)",
+                "when": "a durable inbox batch contains new unacknowledged terminal facts; active siblings may join the same frozen attention evaluation",
                 "states": {
                     "continue_unobserved": "continue independent parent work; do not wait or poll solely for progress",
                     "verify_completion": "collect deterministic diff/status/change evidence, then enter validation",
@@ -3239,8 +3290,9 @@ fn resource_context_json(raw_snapshot: &Value) -> Value {
     })
 }
 
-pub(crate) fn agent_closeout_advice(params: &Value) -> Value {
-    ProgressiveSkillService::new().agent_closeout_advise_method(params)
+pub(crate) fn agent_attention_advice(params: &Value) -> Value {
+    ProgressiveSkillService::new()
+        .agent_attention_advise_with_timeout(params, Some(Duration::from_millis(1_500)))
 }
 
 fn validate_object_keys(params: &Value, allowed: &[&str]) -> Result<(), Value> {

@@ -13,10 +13,12 @@ globalThis.H2W_HUD.renderReadonlyHud = function renderReadonlyHud(element, state
   const completed = Math.max(0, Number(tasks.completed) || 0);
   const blocked = Math.max(0, Number(tasks.blocked) || 0);
   const failed = Math.max(0, Number(tasks.failed) || 0);
+  const uncertain = Math.max(0, Number(tasks.uncertain) || 0);
   if (running) taskParts.push(`${running} ${state.labels?.states?.working || "working"}`);
   if (completed) taskParts.push(`${completed} ${state.labels?.states?.done || "done"}`);
   if (blocked) taskParts.push(`${blocked} ${state.labels?.states?.blocked || "blocked"}`);
   if (failed) taskParts.push(`${failed} failed`);
+  if (uncertain) taskParts.push(`${uncertain} uncertain`);
   element.textContent = `Herdr ● ${label}${taskParts.length ? ` · ${taskParts.join(" · ")}` : ""}`;
   element.title = globalThis.H2W_HUD.renderHudTooltip(state);
 };

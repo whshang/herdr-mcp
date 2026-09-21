@@ -577,6 +577,25 @@ impl SemanticService {
     }
 
     pub fn evaluate(&self, request: &SemanticRequest) -> Result<SemanticResponse, SemanticError> {
+        self.evaluate_with_budget(
+            request,
+            RouteBudget::split(DECISION_ATTEMPT_TIMEOUT, DECISION_POOL_BUDGET),
+        )
+    }
+
+    pub(crate) fn evaluate_with_timeout(
+        &self,
+        request: &SemanticRequest,
+        timeout: Duration,
+    ) -> Result<SemanticResponse, SemanticError> {
+        self.evaluate_with_budget(request, RouteBudget::single(timeout))
+    }
+
+    fn evaluate_with_budget(
+        &self,
+        request: &SemanticRequest,
+        budget: RouteBudget,
+    ) -> Result<SemanticResponse, SemanticError> {
         request.validate()?;
         if self.providers.is_empty() {
             return Err(SemanticError::new("not_configured"));
@@ -584,7 +603,7 @@ impl SemanticService {
         execute_route_pool(
             self.providers.len(),
             &ROUTE_CURSOR,
-            RouteBudget::split(DECISION_ATTEMPT_TIMEOUT, DECISION_POOL_BUDGET),
+            budget,
             |index| self.providers[index].id().to_owned(),
             |index, remaining| self.providers[index].evaluate(request, remaining),
         )

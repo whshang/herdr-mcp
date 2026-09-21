@@ -4369,66 +4369,68 @@ function semanticFailure(payload, status = 0) {
 }
 
 
-function taskSemanticProbability(task, key) {
-  const value = Number(task?.semantic?.assessment?.[key]);
-  return Number.isFinite(value) ? value : 0;
-}
-
-function taskSemanticUrgent(task) {
-  const state = String(task?.semantic?.assessment?.state || "");
-  return taskSemanticProbability(task, "needs_human") >= 0.70
-    || taskSemanticProbability(task, "needs_followup") >= 0.90
-    || taskSemanticProbability(task, "needs_handoff") >= 0.90
-    || ["waiting_user", "blocked_external"].includes(state);
+function taskAttentionStateMap(inbox) {
+  const children = Array.isArray(inbox?.attention?.children) ? inbox.attention.children : [];
+  const assessments = Array.isArray(inbox?.attention?.assessments) ? inbox.attention.assessments : [];
+  const taskById = new Map(
+    children
+      .map((child) => [String(child?.id || ""), String(child?.task_id || "")])
+      .filter(([id, taskId]) => id && taskId),
+  );
+  const states = new Map();
+  for (const assessment of assessments) {
+    const taskId = taskById.get(String(assessment?.id || ""));
+    const state = String(assessment?.state || "");
+    if (taskId && state) states.set(taskId, state);
+  }
+  return states;
 }
 
 function taskInboxDecision(inbox) {
   const tasks = Array.isArray(inbox?.tasks) ? inbox.tasks : [];
   if (!tasks.length) return { matched: false, wake: false, reason: "no_pending_terminal" };
+
   const urgent = tasks.some((task) =>
-    ["blocked", "failed"].includes(String(task?.lifecycle || "")) || taskSemanticUrgent(task));
-  const running = Math.max(0, Number(inbox?.summary?.running) || 0);
-  const semanticReady = tasks.every((task) =>
-    task?.semantic?.used === true && task?.semantic?.assessment && typeof task.semantic.assessment === "object");
-  if (running > 0 && !urgent && semanticReady) {
-    return { matched: true, wake: false, reason: "semantic_aggregate_siblings", urgent: false };
-  }
-  if (running > 0 && !urgent && !semanticReady) {
-    return {
-      matched: true,
-      wake: true,
-      reason: "semantic_pending_fallback",
-      urgent: false,
-    };
-  }
-  return { matched: true, wake: true, reason: urgent ? "urgent_terminal" : "round_terminal", urgent };
+    ["blocked", "failed", "delivery_uncertain"].includes(String(task?.lifecycle || "")));
+  const states = taskAttentionStateMap(inbox);
+  const terminalStates = tasks.map((task) => states.get(String(task?.task_id || ""))).filter(Boolean);
+  const attentionUsed = inbox?.attention?.used === true;
+  const attentionUrgent = terminalStates.some((state) =>
+    ["needs_human", "blocked_external", "investigate_drift", "unclear"].includes(state));
+  const verifyCompletion = terminalStates.includes("verify_completion");
+
+  return {
+    matched: true,
+    wake: true,
+    urgent: urgent || attentionUrgent,
+    reason: urgent
+      ? "urgent_terminal"
+      : attentionUrgent
+        ? "attention_urgent"
+        : verifyCompletion
+          ? "verify_completion"
+          : attentionUsed
+            ? "attention_ready"
+            : "attention_unavailable_fallback",
+  };
 }
 
-function formatTaskSemantic(task) {
-  const assessment = task?.semantic?.assessment;
-  if (!assessment || typeof assessment !== "object") return "";
-  const state = String(assessment.state || "unknown");
-  const completed = Number(assessment.task_completed);
-  const followup = Number(assessment.needs_followup);
-  const human = Number(assessment.needs_human);
-  const handoff = Number(assessment.needs_handoff);
-  const parts = ["state=" + state];
-  if (Number.isFinite(completed)) parts.push("task_completed=" + completed.toFixed(2));
-  if (Number.isFinite(followup)) parts.push("needs_followup=" + followup.toFixed(2));
-  if (Number.isFinite(human)) parts.push("needs_human=" + human.toFixed(2));
-  if (Number.isFinite(handoff)) parts.push("needs_handoff=" + handoff.toFixed(2));
-  return parts.length ? " [" + parts.join(", ") + "]" : "";
+function formatTaskAttention(task, states) {
+  const state = states.get(String(task?.task_id || ""));
+  return state ? " [attention=" + state + "]" : "";
 }
 
 function taskInboxWakeText(inbox) {
   const tasks = Array.isArray(inbox?.tasks) ? inbox.tasks.slice(0, 16) : [];
   const summary = inbox?.summary || {};
+  const states = taskAttentionStateMap(inbox);
   const lines = [
     "Herdr child-task terminal update: " + tasks.length
       + " pending result(s); " + (Number(summary.running) || 0) + " running, "
       + (Number(summary.completed) || 0) + " completed, "
       + (Number(summary.blocked) || 0) + " blocked, "
-      + (Number(summary.failed) || 0) + " failed.",
+      + (Number(summary.failed) || 0) + " failed, "
+      + (Number(summary.uncertain) || 0) + " uncertain.",
   ];
   for (const task of tasks) {
     lines.push(
@@ -4436,10 +4438,14 @@ function taskInboxWakeText(inbox) {
       + " (child " + String(task?.target || "unknown")
       + ", turn " + String(task?.turn_id || "unverified")
       + ", terminal_seq " + String(task?.terminal_seq ?? "unknown") + ")"
-      + formatTaskSemantic(task),
+      + formatTaskAttention(task, states),
     );
   }
-  lines.push("Continue from these durable task results. Do not re-dispatch a terminal or delivery-uncertain task blindly.");
+  lines.push(
+    "Attention is advisory; durable task lifecycle is authoritative. "
+      + "verify_completion enters deterministic validation and continue_unobserved leaves independent running children alone. "
+      + "Do not re-dispatch a terminal or delivery-uncertain task blindly.",
+  );
   return lines.join("\n").slice(0, 12000);
 }
 
@@ -4454,7 +4460,7 @@ async function fetchAgentTaskInbox(binding, { settleRetry = false } = {}) {
       url.searchParams.set("parent_session_ref", parentSessionRef);
       if (workspaceId) url.searchParams.set("workspace_id", workspaceId);
       url.searchParams.set("limit", "64");
-      const response = await localHerdrFetch(url.toString(), { nativeTimeoutMs: 1200 });
+      const response = await localHerdrFetch(url.toString(), { nativeTimeoutMs: 1800 });
       const value = await response.json().catch(() => null);
       if (response.ok && value?.ok === true) {
         if (Array.isArray(value.tasks) && value.tasks.length > 0) return value;
@@ -4489,42 +4495,9 @@ async function ackAgentTask(binding, taskId) {
 }
 
 async function routeAgentTaskInboxWake(binding, { wakeKind = null, settleRetry = false } = {}) {
-  const TASK_SEMANTIC_GRACE_MS = 300;
-  let inbox = await fetchAgentTaskInbox(binding, { settleRetry });
-  let decision = taskInboxDecision(inbox);
+  const inbox = await fetchAgentTaskInbox(binding, { settleRetry });
+  const decision = taskInboxDecision(inbox);
   if (!decision.matched) return { matched: false, wake: false, inbox };
-
-  const semanticPending = () => (Array.isArray(inbox?.tasks) ? inbox.tasks : [])
-    .some((task) => String(task?.semantic?.reason || "") === "pending");
-  if (!decision.urgent && semanticPending()) {
-    await sleep(TASK_SEMANTIC_GRACE_MS);
-    const refreshed = await fetchAgentTaskInbox(binding);
-    if (refreshed?.ok) {
-      inbox = refreshed;
-      decision = taskInboxDecision(inbox);
-    }
-  }
-
-  if (!decision.wake && decision.reason === "semantic_aggregate_siblings") {
-    // Jev may coalesce sibling results, but never indefinitely. Give fan-out a
-    // short window to converge, then fail open to a deterministic partial wake.
-    await sleep(500);
-    const refreshed = await fetchAgentTaskInbox(binding);
-    if (refreshed?.ok) {
-      inbox = refreshed;
-      decision = taskInboxDecision(inbox);
-    }
-    if (!decision.wake && decision.reason === "semantic_aggregate_siblings") {
-      decision = {
-        ...decision,
-        wake: true,
-        reason: "bounded_aggregation_elapsed",
-      };
-    }
-  }
-  if (!decision.wake) {
-    return { matched: true, wake: false, aggregated: true, decision, inbox };
-  }
   if (!automationEnabledForBinding(binding)) {
     return { matched: true, wake: false, disabled: true, decision, inbox };
   }
@@ -4534,6 +4507,7 @@ async function routeAgentTaskInboxWake(binding, { wakeKind = null, settleRetry =
       status: "agent_task_terminal",
       working_count: Number(inbox?.summary?.running) || 0,
       task_summary: inbox?.summary || null,
+      attention_used: inbox?.attention?.used === true,
     },
     taskInboxWakeText(inbox),
     wakeKind,
@@ -4555,7 +4529,7 @@ async function aggregateAgentTaskSummary(bindings = []) {
     unique.set(sessionRef + "::" + workspaceId, binding);
   }
   const inboxes = await Promise.all([...unique.values()].map((binding) => fetchAgentTaskInbox(binding)));
-  const summary = { running: 0, completed: 0, blocked: 0, failed: 0 };
+  const summary = { running: 0, completed: 0, blocked: 0, failed: 0, uncertain: 0 };
   for (const inbox of inboxes) {
     if (!inbox?.ok) continue;
     for (const key of Object.keys(summary)) {
