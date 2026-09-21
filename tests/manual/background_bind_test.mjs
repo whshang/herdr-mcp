@@ -33,6 +33,7 @@ const GEMINI_SPARK_KEY = "https://gemini.google.com/u/1/spark/chat/gemini-recove
 const CLAUDE_CHAT_ID = "123e4567-e89b-12d3-a456-426614174000";
 const CLAUDE_CHAT_URL = `https://claude.ai/chat/${CLAUDE_CHAT_ID}?from=history`;
 const CLAUDE_CHAT_KEY = `https://claude.ai/chat/${CLAUDE_CHAT_ID}`;
+const CLAUDE_NEW_KEY = "https://claude.ai/new";
 const CLAUDE_PROJECT_ID = "523e4567-e89b-42d3-a456-426614174004";
 const CLAUDE_PROJECT_KEY = `https://claude.ai/project/${CLAUDE_PROJECT_ID}`;
 const GROK_CHAT_ID = "223e4567-e89b-12d3-a456-426614174001";
@@ -1731,6 +1732,58 @@ console.log("\n[binding flow]");
   }, {});
   ok(removed?.ok === true && !storage.herdrWakeBindings[projectStoreKey],
     "provider Project binding cleanup removes the exact shared scope",
+    JSON.stringify(removed));
+}
+
+// ---- Scenario 5d: Claude /new pending binding migrates to the real chat ----
+{
+  installContentScript(109, CLAUDE_NEW_KEY, null, "claude");
+  const newState = await dispatchMessage(
+    { type: "h2w_state", tabId: 109 },
+    { tab: { id: 109, url: CLAUDE_NEW_KEY } },
+  );
+  ok(newState?.pageInfo?.site === "claude"
+      && newState?.pageInfo?.is_new_chat_root === true
+      && newState?.bindingKey === CLAUDE_NEW_KEY,
+    "Claude /new exposes bindable page context without fabricating a conversation",
+    JSON.stringify(newState));
+
+  const pending = await dispatchMessage({
+    type: "h2w_bind",
+    tabId: 109,
+    binding_key: CLAUDE_NEW_KEY,
+    workspace_id: "wH",
+    workspace_label: "herdr-mcp (wH)",
+  }, { tab: { id: 109, url: CLAUDE_NEW_KEY } });
+  const pendingKey = `${CLAUDE_NEW_KEY}::wH`;
+  ok(pending?.ok === true
+      && pending.binding_scope === "pending"
+      && storage.herdrWakeBindings[pendingKey]?.tabId === 109,
+    "Claude /new keeps one tab-scoped pending workspace binding",
+    JSON.stringify(pending));
+
+  installContentScript(109, CLAUDE_CHAT_URL, CLAUDE_CHAT_KEY, "claude");
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "claude",
+    convKey: CLAUDE_CHAT_KEY,
+    url: CLAUDE_CHAT_URL,
+  }, { tab: { id: 109, url: CLAUDE_CHAT_URL } });
+  const chatKey = `${CLAUDE_CHAT_KEY}::wH`;
+  ok(registered?.bound === true
+      && !storage.herdrWakeBindings[pendingKey]
+      && storage.herdrWakeBindings[chatKey]?.binding_scope === "conversation"
+      && storage.herdrWakeBindings[chatKey]?.tabId === 109,
+    "Claude first real chat inherits the pending /new binding exactly once",
+    JSON.stringify(registered));
+
+  const removed = await dispatchMessage({
+    type: "h2w_unbind",
+    binding_key: CLAUDE_CHAT_KEY,
+    workspace_id: "wH",
+  }, {});
+  ok(removed?.ok === true && !storage.herdrWakeBindings[chatKey],
+    "Claude migrated /new binding cleans up from the real chat key",
     JSON.stringify(removed));
 }
 

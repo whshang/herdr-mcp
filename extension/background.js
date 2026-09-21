@@ -1001,9 +1001,32 @@ function browserSiteHomeInfoFromSupportedUrl(rawUrl) {
   }
 }
 
+function browserNewChatPageInfoFromSupportedUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.origin !== "https://claude.ai"
+        || !/^\/new\/?$/.test(url.pathname)
+        || url.search
+        || url.hash) {
+      return null;
+    }
+    return {
+      site: "claude",
+      project_id: null,
+      conversation_id: null,
+      convKey: null,
+      pageKey: "https://claude.ai/new",
+      is_new_chat_root: true,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 function browserPageContextInfoFromSupportedUrl(rawUrl) {
   return browserConversationInfoFromSupportedUrl(rawUrl)
     || browserProjectPageInfoFromSupportedUrl(rawUrl)
+    || browserNewChatPageInfoFromSupportedUrl(rawUrl)
     || browserSiteHomeInfoFromSupportedUrl(rawUrl);
 }
 
@@ -1655,17 +1678,21 @@ async function migrateZaiRootConversationState(bindings, targetConvKey, targetUr
   return { migrated: true, bindings };
 }
 
-async function migrateChatGptRootBindingState(bindings, targetConvKey, targetUrl, tabId) {
-  const target = chatGptConversationInfo(targetUrl || targetConvKey);
+async function migratePendingRootBindingState(bindings, target, targetUrl, tabId) {
   if (!target || target.is_new_chat_root || !tabId) return { migrated: false, bindings };
-  const rootKey = new URL(target.url || targetConvKey).origin;
+  const rootKey = target.site === "chatgpt"
+    ? new URL(target.url || target.convKey).origin
+    : target.site === "claude"
+      ? "https://claude.ai/new"
+      : null;
+  if (!rootKey) return { migrated: false, bindings };
   const rootBindings = directBindingsForConv(bindings, rootKey).filter((entry) => (
     entry.binding_scope === "pending"
     && Number(entry.tabId || 0) === Number(tabId)
   ));
   if (!rootBindings.length) return { migrated: false, bindings };
 
-  const targetBindingKey = bindingKeyForConversationInfo(target, targetConvKey);
+  const targetBindingKey = bindingKeyForConversationInfo(target, target.convKey);
   const now = Date.now();
   for (const entry of rootBindings) {
     const ws = entry.workspace_id || normalizeWorkspaceId(entry);
@@ -1688,9 +1715,10 @@ async function migrateChatGptRootBindingState(bindings, targetConvKey, targetUrl
     const next = {
       ...entry,
       convKey: targetBindingKey,
-      site: "chatgpt",
+      site: target.site,
       binding_scope: projectScoped ? "project" : "conversation",
       project_id: target.project_id || null,
+      project_name: target.project_name || null,
       project_key: target.project_key || null,
       active_conv_key: projectScoped && target.conversation_id ? target.convKey : null,
       tabId: projectScoped && !target.conversation_id ? null : tabId,
@@ -1706,7 +1734,7 @@ async function migrateChatGptRootBindingState(bindings, targetConvKey, targetUrl
   }
 
   await chrome.storage.local.set({ herdrWakeBindings: bindings });
-  callLog(`migrated ChatGPT root binding to ${targetBindingKey}`);
+  callLog(`migrated ${target.site} pending binding to ${targetBindingKey}`);
   return { migrated: true, bindings };
 }
 
@@ -7639,10 +7667,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       let matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
       if (!matched.length && sender.tab?.id) {
-        if (pageInfo?.site === "chatgpt") {
-          const migration = await migrateChatGptRootBindingState(
+        if (["chatgpt", "claude"].includes(pageInfo?.site)) {
+          const migration = await migratePendingRootBindingState(
             bindings,
-            String(msg.convKey || ""),
+            pageInfo,
             msg.url || sender.tab?.url || null,
             sender.tab.id,
           );
@@ -8337,7 +8365,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .map((x) => x.continuity_id).find(Boolean)
         || newContinuityId();
       const projectScoped = Boolean(pageInfo?.project_id);
-      const pendingRoot = pageInfo?.site === "chatgpt" && pageInfo?.is_new_chat_root === true;
+      const pendingRoot = pageInfo?.is_new_chat_root === true;
       const hasConversationTarget = Boolean(pageInfo?.conversation_id);
       const deliveryTabId = projectScoped && !hasConversationTarget ? null : tabId;
       const browserScope = tabId ? browserTabScopes.get(tabId) : null;
