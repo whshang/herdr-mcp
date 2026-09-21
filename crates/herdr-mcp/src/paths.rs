@@ -67,6 +67,15 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Resolve the current user's home directory using the project-wide source of
+/// truth (`HOME` on Unix, falling back to Windows `USERPROFILE`). Windows
+/// service/installer code reuses this rather than introducing a second home
+/// resolution.
+#[cfg(target_os = "windows")]
+pub fn user_home() -> Option<PathBuf> {
+    home_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

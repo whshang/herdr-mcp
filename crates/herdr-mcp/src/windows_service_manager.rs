@@ -40,6 +40,7 @@ const LINK_KIND: &str = "link";
 
 #[derive(Debug, Clone)]
 struct WindowsPaths {
+    home: PathBuf,
     config_dir: PathBuf,
     generations_dir: PathBuf,
     current_dir: PathBuf,
@@ -71,6 +72,8 @@ impl WindowsPaths {
         let app_data = env::var_os("APPDATA")
             .map(PathBuf::from)
             .ok_or_else(|| "APPDATA is required for Windows user autostart".to_owned())?;
+        let home = crate::paths::user_home()
+            .ok_or_else(|| "Windows user home directory is required".to_owned())?;
         let startup_shortcut = app_data
             .join("Microsoft")
             .join("Windows")
@@ -79,6 +82,7 @@ impl WindowsPaths {
             .join("Startup")
             .join(format!("Herdr MCP Runtime{suffix}.lnk"));
         Ok(Self {
+            home,
             config_dir: runtime.config_dir.clone(),
             generations_dir: runtime_root.join("generations"),
             current_binary: current_dir.join("herdr-mcp.exe"),
@@ -411,7 +415,26 @@ fn install() -> Result<(), String> {
         "legacy_run_removed": previous_run_value.is_some(),
         "link_reconciled": managed_process_active(&paths.link_process, LINK_KIND)?,
         "runtime_token_printed": false,
+        "user_cli": ensure_windows_user_cli(&paths)?,
     }))
+}
+
+/// Maintain the stable per-user `herdr-mcp` PATH entry after a successful
+/// Windows service install/upgrade. Named instances keep their default entry
+/// (consistent with the Unix ownership contract).
+fn ensure_windows_user_cli(paths: &WindowsPaths) -> Result<String, String> {
+    if paths.instance_name.is_some() {
+        return Ok("skipped".to_owned());
+    }
+    let link = crate::user_cli::ensure_link(&paths.home, &paths.current_binary)?;
+    Ok(format!("{}", link.path.to_string_lossy()))
+}
+
+fn remove_windows_user_cli(paths: &WindowsPaths) -> Result<bool, String> {
+    if paths.instance_name.is_some() {
+        return Ok(false);
+    }
+    crate::user_cli::remove_link_if_owned(&paths.home, &paths.current_binary)
 }
 
 fn uninstall() -> Result<(), String> {
@@ -420,6 +443,7 @@ fn uninstall() -> Result<(), String> {
     stop_managed_process(&paths.runtime_process, RUNTIME_KIND)?;
     remove_autostart_if_owned(&paths)?;
     set_link_enabled(&paths, false)?;
+    let user_cli_removed = remove_windows_user_cli(&paths)?;
     print_json(&json!({
         "ok": true,
         "action": "service_uninstall",
@@ -428,6 +452,7 @@ fn uninstall() -> Result<(), String> {
         "link_disabled": true,
         "credentials_preserved": true,
         "runtime_generations_preserved": true,
+        "user_cli_removed": user_cli_removed,
     }))
 }
 

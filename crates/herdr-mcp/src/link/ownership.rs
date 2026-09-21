@@ -529,7 +529,9 @@ fn launchd_loaded_environment_value(label: &str, key: &str) -> Option<String> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// Collect a JSON ownership + gate report for `herdr-mcp link status`.
@@ -821,7 +823,8 @@ pub fn production_ready_gate_catalog() -> Value {
 }
 
 pub fn status_report() -> Result<Value, String> {
-    let home = home_dir().ok_or_else(|| "HOME is required for link status".to_owned())?;
+    let home =
+        home_dir().ok_or_else(|| "user home directory is required for link status".to_owned())?;
     let config_dir = home.join(".config").join("herdr-mcp");
     Ok(collect_status_report(&home, &config_dir))
 }
@@ -1167,6 +1170,52 @@ environment = {
             failing,
             vec!["health_runtime_not_candidate", "dual_verification_uat"]
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Windows first-worker bootstrap regression: `link status` must resolve a
+    // user home from Windows `USERPROFILE` when Unix `HOME` is absent. On Unix
+    // (where `USERPROFILE` is not a real concept) the normal `HOME` path is
+    // exercised instead, so this test is guarded to the Windows target.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn link_status_resolves_user_home_without_unix_home() {
+        let _guard = crate::test_env::lock();
+        let root = env::temp_dir().join(format!(
+            "herdr-link-status-win-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("config.json"), b"{}").unwrap();
+
+        let previous_home = env::var_os("HOME");
+        let previous_userprofile = env::var_os("USERPROFILE");
+        unsafe {
+            env::remove_var("HOME");
+            env::set_var("USERPROFILE", &home);
+        }
+        let report = status_report();
+        assert!(
+            report.is_ok(),
+            "link status must succeed from USERPROFILE without HOME: {:?}",
+            report.err()
+        );
+        unsafe {
+            match previous_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            match previous_userprofile {
+                Some(value) => env::set_var("USERPROFILE", value),
+                None => env::remove_var("USERPROFILE"),
+            }
+        }
         let _ = fs::remove_dir_all(root);
     }
 }
