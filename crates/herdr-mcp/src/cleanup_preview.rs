@@ -1,3 +1,4 @@
+use crate::semantic::{SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -78,7 +79,7 @@ pub fn preview(params: &Value, snapshot: &Value) -> Value {
     let Some(object) = params.as_object() else {
         return invalid_params("params must be an object");
     };
-    let allowed = ["project_root", "target_ref"]
+    let allowed = ["project_root", "target_ref", "advisory"]
         .into_iter()
         .collect::<BTreeSet<_>>();
     let unknown = object
@@ -114,8 +115,20 @@ pub fn preview(params: &Value, snapshot: &Value) -> Value {
         },
     };
 
+    let advisory = match object.get("advisory") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return invalid_params("advisory must be a boolean when provided"),
+    };
     let github = github_evidence(&root);
-    render_preview(&root, target_ref, snapshot, github)
+    let mut result = render_preview(&root, target_ref, snapshot, github);
+    if advisory && result.get("ok").and_then(Value::as_bool) == Some(true) {
+        let semantic = semantic_cleanup_advisory(&result);
+        if let Some(object) = result.as_object_mut() {
+            object.insert("advisory".to_owned(), semantic);
+        }
+    }
+    result
 }
 
 fn render_preview(
@@ -407,6 +420,204 @@ fn render_preview(
             "fail_closed": true,
             "note": "safe_to_delete is true only when local Git, GitHub, target freshness, and live Herdr resource evidence all satisfy the conservative reclaim checks; re-check immediately before mutation",
         },
+    })
+}
+
+fn semantic_cleanup_advisory(preview: &Value) -> Value {
+    const MAX_ITEMS: usize = 32;
+    let service = SemanticService::from_config();
+    let capability = service.capability_json();
+    if !service.configured() {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "reason": "not_configured",
+            "advisory_only": true,
+            "capability": capability,
+        });
+    }
+
+    let mut items = Vec::new();
+    if let Some(worktrees) = preview.get("worktrees").and_then(Value::as_array) {
+        for worktree in worktrees.iter().take(MAX_ITEMS) {
+            items.push(json!({
+                "kind": "worktree",
+                "label": worktree.get("path").and_then(Value::as_str).unwrap_or_default(),
+                "branch": worktree.get("branch"),
+                "dirty": worktree.get("dirty"),
+                "reachable_from_target": worktree.get("reachable_from_target"),
+                "open_pr_count": worktree.get("open_pr_refs").and_then(Value::as_array).map(Vec::len),
+                "workspace_count": worktree.get("workspace_ids").and_then(Value::as_array).map(Vec::len),
+                "agent_count": worktree.get("agents").and_then(Value::as_array).map(Vec::len),
+                "content_safe": worktree.get("content_safe"),
+                "safe_to_delete": worktree.get("safe_to_delete"),
+                "reasons": worktree.get("reasons"),
+            }));
+        }
+    }
+    if items.len() < MAX_ITEMS {
+        if let Some(branches) = preview.get("branches").and_then(Value::as_array) {
+            for branch in branches.iter().take(MAX_ITEMS - items.len()) {
+                items.push(json!({
+                    "kind": "branch",
+                    "label": branch.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    "reachable_from_target": branch.get("reachable_from_target"),
+                    "open_pr_count": branch.get("open_pr_refs").and_then(Value::as_array).map(Vec::len),
+                    "checked_out_count": branch.get("checked_out_in").and_then(Value::as_array).map(Vec::len),
+                    "remote_ref_fresh": branch.get("remote_ref_fresh"),
+                    "safe_to_delete": branch.get("safe_to_delete"),
+                    "reasons": branch.get("reasons"),
+                }));
+            }
+        }
+    }
+    if items.is_empty() {
+        return json!({
+            "attempted": false,
+            "used": false,
+            "reason": "no_candidates",
+            "advisory_only": true,
+            "capability": capability,
+        });
+    }
+
+    let categories = BTreeMap::from([
+        ("ready_to_cleanup".to_owned(), Some("Deterministic evidence already says cleanup is ready; semantic only prioritizes it".to_owned())),
+        ("needs_one_more_check".to_owned(), Some("One bounded read-only check appears useful before cleanup can be reconsidered".to_owned())),
+        ("active_work".to_owned(), Some("Live workspace, agent, dirty state, or checkout evidence indicates active work".to_owned())),
+        ("external_block".to_owned(), Some("External GitHub, target freshness, or other evidence is unavailable or blocking".to_owned())),
+        ("investigate_history".to_owned(), Some("Reachability or history evidence deserves investigation before any cleanup decision".to_owned())),
+    ]);
+    let mut request = SemanticRequest::new(json!({
+        "target_ref_fresh": preview.get("target_ref_fresh"),
+        "resource_evidence_complete": preview.get("resource_evidence_complete"),
+        "items": items,
+    }));
+    for index in 0..items.len() {
+        request = request.ask(
+            format!("item_{index}_state"),
+            SemanticQuestion::choice(
+                "Which advisory cleanup triage state best describes this frozen item?",
+                categories.clone(),
+            ),
+        );
+    }
+    if items.len() >= 2 {
+        request = request.ask(
+            "next_item",
+            SemanticQuestion::choice(
+                "Which frozen cleanup item deserves the next bounded inspection?",
+                (0..items.len())
+                    .map(|index| {
+                        (
+                            format!("item_{index}"),
+                            Some(format!("Frozen cleanup candidate at index {index}")),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+        );
+    }
+
+    let response = match service.evaluate(&request) {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "reason": error.code(),
+                "advisory_only": true,
+                "capability": capability,
+            });
+        }
+    };
+    let mut assessments = Vec::new();
+    for index in 0..items.len() {
+        let key = format!("item_{index}_state");
+        let Some((state, probabilities, confidence)) =
+            response.answer(&key).and_then(SemanticAnswer::choice_value)
+        else {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "reason": "bad_response",
+                "advisory_only": true,
+                "capability": capability,
+            });
+        };
+        if !categories.contains_key(state) {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "reason": "bad_response",
+                "advisory_only": true,
+                "capability": capability,
+            });
+        }
+        assessments.push(json!({
+            "id": format!("item_{index}"),
+            "state": state,
+            "probabilities": probabilities,
+            "confidence": confidence,
+        }));
+    }
+    if items.len() >= 2 {
+        let Some((selected, _, _)) = response
+            .answer("next_item")
+            .and_then(SemanticAnswer::choice_value)
+        else {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "reason": "bad_response",
+                "advisory_only": true,
+                "capability": capability,
+            });
+        };
+        let selected_index = selected
+            .strip_prefix("item_")
+            .and_then(|value| value.parse::<usize>().ok());
+        if selected_index.is_none_or(|index| index >= items.len()) {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "reason": "bad_response",
+                "advisory_only": true,
+                "capability": capability,
+            });
+        }
+    }
+    let ranking = response
+        .answer("next_item")
+        .and_then(SemanticAnswer::choice_value)
+        .map(|(_, probabilities, _)| {
+            let mut ranked = probabilities
+                .iter()
+                .filter_map(|(id, probability)| {
+                    id.strip_prefix("item_")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .filter(|index| *index < items.len())
+                        .map(|_| (id.clone(), *probability))
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            ranked
+                .into_iter()
+                .map(|(id, probability)| json!({"id": id, "probability": probability}))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "attempted": true,
+        "used": true,
+        "advisory_only": true,
+        "assessments": assessments,
+        "cleanup_ranking": ranking,
+        "provider": response.provider,
+        "model": response.model,
+        "capability": capability,
+        "authority": "semantic cleanup triage only; deterministic safe_to_delete and reasons remain authoritative",
     })
 }
 
@@ -823,6 +1034,39 @@ mod tests {
         ))
     }
 
+    fn semantic_test_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 32 * 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://127.0.0.1:{}/v1", address.port())
+    }
+
+    fn write_semantic_test_config(config_dir: &Path, url: &str) {
+        let path = config_dir.join("config.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"semantic":{{"routes":[{{"name":"test","protocol":"decision","url":"{url}","model":"jev-test","api_key":"test"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     fn git(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
@@ -1048,6 +1292,70 @@ mod tests {
         assert!(records[1].detached);
         assert!(records[1].locked);
         assert!(records[1].prunable);
+    }
+
+    #[test]
+    fn cleanup_semantic_triage_preserves_deterministic_safety_across_semantic_states() {
+        let _guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = temp_root("semantic");
+        fs::create_dir_all(&config_dir).unwrap();
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+
+        let preview = json!({
+            "target_ref_fresh": true,
+            "resource_evidence_complete": true,
+            "worktrees": [{
+                "path": "/repo/wt",
+                "branch": "feature",
+                "dirty": false,
+                "reachable_from_target": true,
+                "open_pr_refs": [],
+                "workspace_ids": [],
+                "agents": [],
+                "content_safe": true,
+                "safe_to_delete": true,
+                "reasons": []
+            }],
+            "branches": []
+        });
+        let safe = preview["worktrees"][0]["safe_to_delete"].clone();
+        let reasons = preview["worktrees"][0]["reasons"].clone();
+
+        let no_config = semantic_cleanup_advisory(&preview);
+        assert_eq!(no_config["used"], false);
+        assert_eq!(no_config["reason"], "not_configured");
+        assert_eq!(preview["worktrees"][0]["safe_to_delete"], safe);
+        assert_eq!(preview["worktrees"][0]["reasons"], reasons);
+
+        let url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"item_0_state":{"type":"choice","choice":"ready_to_cleanup","probabilities":{"ready_to_cleanup":0.92,"needs_one_more_check":0.02,"active_work":0.02,"external_block":0.02,"investigate_history":0.02},"confidence":0.92}}}"#,
+        );
+        write_semantic_test_config(&config_dir, &url);
+        let configured = semantic_cleanup_advisory(&preview);
+        assert_eq!(configured["used"], true);
+        assert_eq!(configured["assessments"][0]["state"], "ready_to_cleanup");
+        assert_eq!(configured["advisory_only"], true);
+        assert_eq!(preview["worktrees"][0]["safe_to_delete"], safe);
+        assert_eq!(preview["worktrees"][0]["reasons"], reasons);
+        assert!(configured.get("safe_to_delete").is_none());
+
+        write_semantic_test_config(&config_dir, "http://127.0.0.1:1/v1");
+        let provider_error = semantic_cleanup_advisory(&preview);
+        assert_eq!(provider_error["used"], false);
+        assert_ne!(provider_error["reason"], "not_configured");
+        assert_eq!(preview["worktrees"][0]["safe_to_delete"], safe);
+        assert_eq!(preview["worktrees"][0]["reasons"], reasons);
+
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        let _ = fs::remove_dir_all(&config_dir);
     }
 
     #[test]
