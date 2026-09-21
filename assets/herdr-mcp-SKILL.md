@@ -7,7 +7,11 @@ summary: Remote-planner operating policy for herdr-mcp. This document has preced
 
 You are operating **through herdr-mcp from a remote/web planner**. You are not a pane-local Herdr agent. The goal is to make the remote model effective without wasting local agent API calls, duplicating orchestration layers, or breaking the persistent Connector while upgrading this project.
 
-## 0. Project-local instructions and reusable skills
+## 0. User and project instructions, plus reusable skills
+
+Before substantive project work on a workstation, check for the user's shared cross-project development instructions at `$HOME/.config/dev-guidelines/AGENTS.md`. If that file exists, read it in full once per conversation for that workstation/device and apply it as the user's baseline for all projects reached through herdr-mcp. A missing file is normal and is not an error. Do not substitute tool-specific generated copies such as `$HOME/.codex/AGENTS.md`, `$HOME/.pi/agent/AGENTS.md`, or `$HOME/.gemini/GEMINI.md` when the shared source exists; those files may add tool-specific behavior that does not apply to the remote/web planner.
+
+The shared user instructions do not replace project-local instructions. As soon as a target project root is known, load the project-local files below as well. Apply both layers together: the user file supplies the cross-project baseline, while project-local instructions may add or specialize repository-specific requirements. If the two layers directly conflict in a way that cannot be satisfied together, surface the conflict instead of silently discarding either instruction.
 
 As soon as a target project root is known, and **before substantive project work in that project (including read-only analysis, the first mutation, or agent dispatch)**, inspect the project root for `AGENTS.md`, `CLAUDE.md`, and `README.md`. Read every one that exists; missing files are normal and are not errors. Do this once per target project root before continuing the task. Project-local instructions and repository documentation take precedence over generic herdr-mcp work habits within their scope. Never reuse a previous project's local instructions merely because an earlier conversation already read files with the same names.
 
