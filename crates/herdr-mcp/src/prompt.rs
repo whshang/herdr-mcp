@@ -2646,6 +2646,64 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_activity_times_out_to_durable_delivery_uncertain_terminal() {
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-timeout-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let registry = PromptRegistry::with_store(store);
+        let idle = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(20),
+        };
+        let task_id = "dispatch:prompt:activity-timeout-test";
+        let mut task = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target: "child",
+                fingerprint: "fingerprint",
+                before: Some(&idle),
+                after: Some(&idle),
+                submitted: Some(true),
+                start_cursor: 200,
+                parent_target: Some("parent"),
+                parent_session_ref: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::AwaitingActivity);
+        task.updated_at_ms = now_ms()
+            .saturating_sub(PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS)
+            .saturating_sub(1);
+        registry.save_task(&task, None).unwrap();
+
+        let reconciled = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(reconciled.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(reconciled.is_terminal());
+        assert_eq!(
+            reconciled.terminal_status.as_deref(),
+            Some("delivery_uncertain")
+        );
+        assert_eq!(
+            reconciled.notification_error.as_deref(),
+            Some("activity_start_timeout")
+        );
+
+        let inbox = registry.task_inbox(None, Some("parent"), None, false, true, 10);
+        assert_eq!(inbox["summary"]["running"], 0);
+        assert_eq!(inbox["summary"]["uncertain"], 1);
+        assert_eq!(inbox["tasks"][0]["lifecycle"], "delivery_uncertain");
+
+        drop(registry);
+        fs::remove_file(&db_path).ok();
+        fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
+        fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn status_wait_timeout_keeps_dispatch_and_delivery_evidence() {
         let socket = temp_socket();
         let client = HerdrClient::new(&socket);
