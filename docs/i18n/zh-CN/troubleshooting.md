@@ -183,7 +183,7 @@ herdr-mcp 对只读路径有若干退化策略：
 
 ### `herdr_prompt`
 
-如果失败发生在提交后的状态等待阶段，Agent 很可能已经收到任务。先 inspect/since 看 Agent 状态和输出，再决定是否再次投递。重复意图应复用 `idempotency_key`。
+正常长任务不应让 Parent 一直等待：`herdr_prompt` 默认提交一次后立即返回 `task_id` / `dispatch_id` / Runtime `turn_id`，Parent 随即继续其它工作；Runtime 通过 `herdr_mcp.agent.task.status` / `herdr_mcp.agent.task.inbox` 持久追踪本轮任务。如果调用者显式使用兼容 `wait`，它等待的是这个 `task_id`，不是 Agent 之前遗留的 `idle/done`。等待超时仍不等于未投递；先看返回的 task/inbox，再决定是否重试。重复意图继续复用 `idempotency_key`。
 
 ### `herdr_exec`
 
@@ -201,19 +201,17 @@ MCP 完成的是：
 ChatGPT → workstation
 ```
 
-Agent 后续完成不会自动创建新的 ChatGPT turn。要实现：
+对由当前 WebChat 派出的 Agent task，Runtime 会先把 terminal 写入 durable parent inbox，再由浏览器扩展读取属于当前 `browser session_ref` 的 inbox 并触发下一轮 WebChat。默认不会要求 Parent 挂住当前 turn 等 Child。
 
-```text
-workstation → ChatGPT
-```
-
-需要浏览器扩展：
+如果 Agent 已结束但 ChatGPT 没继续，请确认：
 
 1. Native Messaging host 正常；
-2. 当前网页 conversation 已绑定正确 workspace；
-3. 相应 Auto scope 已开启，或用 HUD 手动继续/监控。
+2. 当前 conversation 已注册出稳定 `browser_session_ref` 并绑定正确 workspace；
+3. 相应 Auto scope 已开启；
+4. `herdr_mcp.agent.task.inbox` 中该 task 已 terminal 且未 acknowledged；
+5. 若还有 sibling task 正在运行，Jev 可能建议聚合后再唤醒；`blocked` / `failed` 或 `needs_human` 等高优先级结果会优先唤醒。Jev 未配置、超时或报错时，确定性 terminal notification 仍会继续。
 
-详见 [浏览器连续工作](browser-continuity.md)。
+HUD 手动继续仍保留为显式兜底。详见 [浏览器连续工作](browser-continuity.md)。
 
 ## 症状：HUD 显示了错误 workspace 名称
 

@@ -148,6 +148,22 @@ pub struct RuntimeContext<'a> {
     pub trusted_local_ipc: bool,
 }
 
+fn prompt_parent_session_ref(context: &RuntimeContext<'_>) -> Option<String> {
+    let authorization = context.caller_webchat_authorization?;
+    let caller_session = context.caller_browser_session?;
+    context
+        .state_store
+        .lock()
+        .ok()?
+        .resolve_browser_caller_session(
+            &authorization.principal_ref,
+            &caller_session.provider,
+            &caller_session.opaque_session_id,
+        )
+        .ok()
+        .flatten()
+}
+
 pub trait BrowserActuator: Send + Sync {
     fn actuate(
         &self,
@@ -367,6 +383,22 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             } else if method == EXEC_WAIT_METHOD {
                 exec_tools::wait(context.exec, &params)
+            } else if method == prompt::AGENT_TASK_DISPATCH_METHOD {
+                let parent_session_ref = prompt_parent_session_ref(context);
+                prompt::run_with_parent_session(
+                    context.client,
+                    context.prompt,
+                    &params,
+                    parent_session_ref.as_deref(),
+                )
+            } else if method.starts_with("herdr_mcp.agent.task.") {
+                let parent_session_ref = prompt_parent_session_ref(context);
+                prompt::task_call_with_parent_session(
+                    context.prompt,
+                    method,
+                    &params,
+                    parent_session_ref.as_deref(),
+                )
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else {
@@ -436,7 +468,15 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             context.exec,
             &arguments,
         ),
-        "herdr_prompt" => prompt::run(context.client, context.prompt, &arguments),
+        "herdr_prompt" => {
+            let parent_session_ref = prompt_parent_session_ref(context);
+            prompt::run_with_parent_session(
+                context.client,
+                context.prompt,
+                &arguments,
+                parent_session_ref.as_deref(),
+            )
+        }
         "herdr_skill" => context
             .skill
             .fetch_for_runtime(&arguments, &context.cache.snapshot()),

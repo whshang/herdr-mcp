@@ -1083,6 +1083,8 @@ export async function handleMcp(
     }
     const isBrowserPrivateMethod = typeof localMethod === "string"
       && localMethod.startsWith("herdr_mcp.browser_");
+    const isAgentTaskCaller = name === "herdr_prompt"
+      || localMethod === "herdr_mcp.agent.task.dispatch";
     const isPageAssistPrivateMethod = localMethod === "herdr_mcp.page_assist";
     if (isBrowserPrivateMethod || isPageAssistPrivateMethod) {
       if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {
@@ -1220,7 +1222,7 @@ export async function handleMcp(
         .filter((grant) => grant.device_id === initialRouteDeviceId)
         .map((grant) => ({ endpoint_ref: grant.endpoint_ref }))
       : [];
-    const webchatAuthorization = isBrowserPrivateMethod
+    const webchatAuthorization = (isBrowserPrivateMethod || isAgentTaskCaller)
       && deps.client?.connectorId
       && Number.isSafeInteger(deps.client.grantGeneration)
       && Number(deps.client.grantGeneration) > 0
@@ -1230,7 +1232,7 @@ export async function handleMcp(
           grant_generation: Number(deps.client.grantGeneration),
         }
       : null;
-    const browserCallerSession = isBrowserPrivateMethod && openaiSession
+    const browserCallerSession = (isBrowserPrivateMethod || isAgentTaskCaller) && openaiSession
       ? { provider: "chatgpt", opaque_session_id: openaiSession }
       : null;
     const readDedupeKey = opClass === "read"

@@ -549,7 +549,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
         "state",
     )?));
     let exec = ExecRegistry::new_with_client(exec_state_dir, Some(client.clone()))?;
-    let prompt = PromptRegistry::with_store(state_store.clone());
+    let prompt = PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone());
     let skill = SkillService::new();
     crate::schema::prewarm_async();
     // Herdr is a recoverable local dependency. EventCache owns reconnect/backoff,
@@ -650,6 +650,11 @@ fn candidate_router(state: AppState) -> Router {
             "/extension/browser/actuation",
             post(post_extension_browser_actuation),
         )
+        .route("/extension/agent/tasks", get(get_extension_agent_tasks))
+        .route(
+            "/extension/agent/tasks/ack",
+            post(post_extension_agent_task_ack),
+        )
         .route(
             "/extension/semantic/status",
             get(get_extension_semantic_status),
@@ -672,6 +677,108 @@ fn candidate_router(state: AppState) -> Router {
         )
         .route("/health", get(health))
         .with_state(state)
+}
+
+fn valid_extension_task_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
+}
+
+async fn get_extension_agent_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if !state.trusted_extension_ipc {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"ok": false, "code": "trusted_extension_ipc_required"}),
+        );
+    }
+    let Some(parent_session_ref) = query.get("parent_session_ref").map(String::as_str) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "code": "parent_session_ref_required"}),
+        );
+    };
+    if !valid_extension_task_ref(parent_session_ref) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "code": "parent_session_ref_invalid"}),
+        );
+    }
+    let workspace_id = query
+        .get("workspace_id")
+        .map(String::as_str)
+        .filter(|value| valid_extension_task_ref(value));
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 512);
+    let value = state.prompt.task_inbox(
+        workspace_id,
+        None,
+        Some(parent_session_ref),
+        false,
+        true,
+        limit,
+    );
+    json_response(StatusCode::OK, &value)
+}
+
+async fn post_extension_agent_task_ack(State(state): State<AppState>, body: Bytes) -> Response {
+    if !state.trusted_extension_ipc {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"ok": false, "code": "trusted_extension_ipc_required"}),
+        );
+    }
+    if body.len() > 16 * 1024 {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!({"ok": false, "code": "request_too_large"}),
+        );
+    }
+    let value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "code": "invalid_json"}),
+            );
+        }
+    };
+    let Some(task_id) = value.get("task_id").and_then(Value::as_str) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "code": "task_id_required"}),
+        );
+    };
+    let Some(parent_session_ref) = value.get("parent_session_ref").and_then(Value::as_str) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "code": "parent_session_ref_required"}),
+        );
+    };
+    if !valid_extension_task_ref(task_id) || !valid_extension_task_ref(parent_session_ref) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "code": "agent_task_ack_invalid"}),
+        );
+    }
+    let result = state
+        .prompt
+        .task_ack_for_parent_session(task_id, parent_session_ref);
+    let status = if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        StatusCode::OK
+    } else if result.get("code").and_then(Value::as_str) == Some("agent_task_parent_mismatch") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    json_response(status, &result)
 }
 
 async fn get_extension_semantic_status(State(state): State<AppState>) -> Response {

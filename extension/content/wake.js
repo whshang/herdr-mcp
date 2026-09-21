@@ -5508,6 +5508,7 @@ const H2W_CONTENT_VERSION = "0.1.116";
       state,
       recovery: recoveryLabel(hud),
       lastEvent,
+      tasks: hud?.task_summary || null,
     };
     if (globalThis.H2W_HUD?.updateReadonlyHud) {
       globalThis.H2W_HUD.updateReadonlyHud(ui.status, { ...input, labels: hudLabels });
