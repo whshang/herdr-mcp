@@ -256,6 +256,10 @@ response lost
 
 この原則は agent prompt と shell 実行から、ブラウザ handoff と Cloudflare の変更にまで適用されます。
 
+長時間の agent 作業は、Parent を agent のグローバル状態待ちに固定せず、非同期 task lifecycle で扱います。`herdr_prompt` / `herdr_mcp.agent.task.dispatch` は一度だけ submit し、安定した `task_id`（現在は canonical `dispatch_id` と同じ identity）と Runtime `turn_id` を直ちに返します。その後 Parent は別の作業を続けます。Runtime は Herdr lifecycle event を消費し、`completed` / `blocked` / `failed` を既存 StateStore の `operations` ledger に durable parent inbox として保存し、CLI または Browser adapter が所有 Parent を wake します。submit 時点ですでに対象 Agent が `working` なら、まず前の turn の settle を消費し、新しい activity を観測するまで新 task の terminal として帰属しません。
+
+Jev/Semantic は deterministic terminal record が durable になった後だけ advisory enrichment として動きます。`task_completed`、`needs_followup`、`needs_human`、`needs_handoff` や sibling result の優先順位/集約を補助できますが、delivery evidence、idempotency、terminal 永続化、parent notification の権威にはなりません。短い semantic grace 内に結果が返らなければ deterministic notification を直ちに続行し、semantic result は後で inbox を補強できます。Herdr 0.9.x には native prompt-turn identity がないため、安定した Runtime `turn_id` は herdr-mcp の turn envelope であり、`exact_native_turn=false` を明示します。
+
 ## コントロールプレーンの障害は自動的にプロジェクト障害ではない
 
 Herdr の snapshot/pane 制御は、Git リポジトリとは独立に時折失敗することがあります。

@@ -3,6 +3,10 @@ use crate::capability_inventory::{AgentCapabilityRecord, CapabilityInventoryStor
 use crate::capability_resolver::{WorkerCapability, project_capabilities_with_inventory};
 use crate::local_skills::{self, LocalSkillFile, parse_frontmatter, read_file_bounded};
 use crate::paths::RuntimePaths;
+use crate::prompt::{
+    AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
+    AGENT_TASK_STATUS_METHOD,
+};
 use crate::semantic::{
     DEFAULT_DECISION_THRESHOLD, SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService,
 };
@@ -12,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -146,6 +151,69 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "children": {"type": "array", "minItems": 1, "maxItems": 16},
                 },
                 "required": ["children"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": AGENT_TASK_DISPATCH_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "target": {"type": "string", "maxLength": 256},
+                    "text": {"type": "string", "maxLength": 65536},
+                    "parent_target": {"type": "string", "maxLength": 256},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                    "wait": {
+                        "type": "object",
+                        "properties": {
+                            "until": {"type": "array", "items": {"type": "string"}},
+                            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 60000}
+                        }
+                    }
+                },
+                "required": ["target", "text", "parent_target", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": AGENT_TASK_STATUS_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "task_id": {"type": "string", "maxLength": 128},
+                },
+                "required": ["task_id"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": AGENT_TASK_INBOX_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "workspace_id": {"type": "string", "maxLength": 128},
+                    "parent_target": {"type": "string", "maxLength": 256},
+                    "parent_session_ref": {"type": "string", "maxLength": 256},
+                    "include_acknowledged": {"type": "boolean"},
+                    "advisory": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 512},
+                },
+                "required": [],
+                "empty": true,
+            },
+        }),
+        json!({
+            "method": AGENT_TASK_ACK_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "task_id": {"type": "string", "maxLength": 128},
+                },
+                "required": ["task_id"],
                 "empty": false,
             },
         }),
@@ -1217,6 +1285,16 @@ impl ProgressiveSkillService {
         snapshot: &Value,
         inventory: &[AgentCapabilityRecord],
     ) -> Value {
+        self.planning_advise_method_with_inventory_and_semantic(params, snapshot, inventory, None)
+    }
+
+    fn planning_advise_method_with_inventory_and_semantic(
+        &self,
+        params: &Value,
+        snapshot: &Value,
+        inventory: &[AgentCapabilityRecord],
+        semantic_service: Option<&SemanticService>,
+    ) -> Value {
         const KEYS: &[&str] = &[
             "deterministic_tool",
             "task_text",
@@ -1251,7 +1329,22 @@ impl ProgressiveSkillService {
             agent_route_criteria(&initial_advice, &capabilities.workers, &initial_startable);
         let mut semantic = if task.deterministic_tool.is_none() {
             task_text.as_deref().map(|task_text| {
-                self.semantic_planning_advice(task_text, params, &mut task, &agent_route_criteria)
+                if let Some(service) = semantic_service {
+                    self.semantic_planning_advice_with_service(
+                        task_text,
+                        params,
+                        &mut task,
+                        &agent_route_criteria,
+                        service,
+                    )
+                } else {
+                    self.semantic_planning_advice(
+                        task_text,
+                        params,
+                        &mut task,
+                        &agent_route_criteria,
+                    )
+                }
             })
         } else {
             None
@@ -1419,6 +1512,30 @@ impl ProgressiveSkillService {
                 "A human decision or action is needed",
                 "No human decision or action is needed",
             ),
+        )
+        .ask(
+            "task_completed",
+            SemanticQuestion::noul(
+                "Does the bounded recent output indicate that the delegated task objective itself is complete, beyond this turn merely settling?",
+                "The delegated task objective is complete",
+                "The delegated task objective is not yet complete",
+            ),
+        )
+        .ask(
+            "needs_followup",
+            SemanticQuestion::noul(
+                "Does the parent need to perform follow-up work after this settled turn to complete the delegated objective?",
+                "Parent follow-up work is needed",
+                "No parent follow-up work is needed",
+            ),
+        )
+        .ask(
+            "needs_handoff",
+            SemanticQuestion::noul(
+                "Does the bounded recent output indicate that the work should be handed off to another agent, tool, or WebChat session?",
+                "A handoff is needed",
+                "No handoff is needed",
+            ),
         );
 
         let response = match service.evaluate(&request) {
@@ -1473,6 +1590,15 @@ impl ProgressiveSkillService {
                 "needs_human": response
                     .answer("needs_human")
                     .and_then(SemanticAnswer::noul_probability),
+                "task_completed": response
+                    .answer("task_completed")
+                    .and_then(SemanticAnswer::noul_probability),
+                "needs_followup": response
+                    .answer("needs_followup")
+                    .and_then(SemanticAnswer::noul_probability),
+                "needs_handoff": response
+                    .answer("needs_handoff")
+                    .and_then(SemanticAnswer::noul_probability),
             },
             "provider": response.provider,
             "model": response.model,
@@ -1482,6 +1608,14 @@ impl ProgressiveSkillService {
     }
 
     fn agent_attention_advise_method(&self, params: &Value) -> Value {
+        self.agent_attention_advise_with_timeout(params, None)
+    }
+
+    fn agent_attention_advise_with_timeout(
+        &self,
+        params: &Value,
+        timeout: Option<Duration>,
+    ) -> Value {
         if let Err(error) = validate_object_keys(params, &["children"]) {
             return error;
         }
@@ -1572,20 +1706,47 @@ impl ProgressiveSkillService {
                     ));
                 }
             }
-            frozen.push(json!({
-                "id": format!("child_{index}"),
-                "task_id": task_id,
-                "dispatch_id": dispatch_id,
-                "agent_id": agent_id,
-                "terminal_state": terminal_state,
-                "status": status,
-                "recent_text": recent_text,
-                "age_ms": age_ms,
-                "has_running_exec": object.get("has_running_exec").and_then(Value::as_bool),
-                "dirty_worktree": object.get("dirty_worktree").and_then(Value::as_bool),
-                "open_pr": object.get("open_pr").and_then(Value::as_bool),
-            }));
+            let mut frozen_child = Map::new();
+            frozen_child.insert("id".to_owned(), json!(format!("child_{index}")));
+            for (key, value) in [
+                ("task_id", task_id),
+                ("dispatch_id", dispatch_id),
+                ("agent_id", agent_id),
+                ("terminal_state", terminal_state),
+                ("status", status),
+                ("recent_text", recent_text),
+            ] {
+                if let Some(value) = value {
+                    frozen_child.insert(key.to_owned(), json!(value));
+                }
+            }
+            if let Some(age_ms) = age_ms {
+                frozen_child.insert("age_ms".to_owned(), json!(age_ms));
+            }
+            for key in ["has_running_exec", "dirty_worktree", "open_pr"] {
+                if let Some(value) = object.get(key).and_then(Value::as_bool) {
+                    frozen_child.insert(key.to_owned(), json!(value));
+                }
+            }
+            frozen.push(Value::Object(frozen_child));
         }
+
+        let semantic_state = json!({"children": frozen});
+        let state_bytes = serde_json::to_vec(&semantic_state)
+            .map(|value| value.len())
+            .unwrap_or(0);
+        let question_count = children.len() + usize::from(children.len() >= 2);
+        let budget_ms =
+            timeout.map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+        let metrics = |elapsed_ms: u64| {
+            json!({
+                "child_count": children.len(),
+                "state_bytes": state_bytes,
+                "question_count": question_count,
+                "elapsed_ms": elapsed_ms,
+                "budget_ms": budget_ms,
+            })
+        };
 
         let service = SemanticService::from_config();
         let capability = service.capability_json();
@@ -1594,6 +1755,7 @@ impl ProgressiveSkillService {
                 "ok": true, "attempted": true, "used": false,
                 "reason": "not_configured", "advisory_only": true,
                 "children": frozen, "capability": capability,
+                "metrics": metrics(0),
             });
         }
         let categories = BTreeMap::from([
@@ -1604,7 +1766,7 @@ impl ProgressiveSkillService {
             ("investigate_drift".to_owned(), Some("The child appears active but may be drifting from its assigned objective".to_owned())),
             ("unclear".to_owned(), Some("The bounded evidence does not support a clearer classification".to_owned())),
         ]);
-        let mut request = SemanticRequest::new(json!({"children": frozen}));
+        let mut request = SemanticRequest::new(semantic_state);
         for index in 0..children.len() {
             request = request.ask(
                 format!("child_{index}_state"),
@@ -1631,16 +1793,23 @@ impl ProgressiveSkillService {
                 ),
             );
         }
-        let response = match service.evaluate(&request) {
+        let started = Instant::now();
+        let response = match timeout
+            .map(|timeout| service.evaluate_with_timeout(&request, timeout))
+            .unwrap_or_else(|| service.evaluate(&request))
+        {
             Ok(response) => response,
             Err(error) => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 return json!({
                     "ok": true, "attempted": true, "used": false,
                     "reason": error.code(), "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             }
         };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let mut assessments = Vec::new();
         for index in 0..children.len() {
             let key = format!("child_{index}_state");
@@ -1651,6 +1820,7 @@ impl ProgressiveSkillService {
                     "ok": true, "attempted": true, "used": false,
                     "reason": "bad_response", "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             };
             if !categories.contains_key(state) {
@@ -1658,6 +1828,7 @@ impl ProgressiveSkillService {
                     "ok": true, "attempted": true, "used": false,
                     "reason": "bad_response", "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             }
             assessments.push(json!({
@@ -1676,6 +1847,7 @@ impl ProgressiveSkillService {
                     "ok": true, "attempted": true, "used": false,
                     "reason": "bad_response", "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             };
             let selected_index = selected
@@ -1686,6 +1858,7 @@ impl ProgressiveSkillService {
                     "ok": true, "attempted": true, "used": false,
                     "reason": "bad_response", "advisory_only": true,
                     "children": frozen, "capability": capability,
+                    "metrics": metrics(elapsed_ms),
                 });
             }
         }
@@ -1713,6 +1886,7 @@ impl ProgressiveSkillService {
             "ok": true, "attempted": true, "used": true, "advisory_only": true,
             "children": frozen, "assessments": assessments, "attention_ranking": ranking,
             "provider": response.provider, "model": response.model, "capability": capability,
+            "metrics": metrics(elapsed_ms),
             "authority": "semantic attention triage only; deterministic task, process, terminal, replay, and reclaim facts remain authoritative",
         })
     }
@@ -1968,11 +2142,28 @@ impl ProgressiveSkillService {
         task: &mut TaskProfile,
         agent_route_criteria: &BTreeMap<String, Option<String>>,
     ) -> Value {
+        let service = SemanticService::from_config();
+        self.semantic_planning_advice_with_service(
+            task_text,
+            params,
+            task,
+            agent_route_criteria,
+            &service,
+        )
+    }
+
+    fn semantic_planning_advice_with_service(
+        &self,
+        task_text: &str,
+        params: &Value,
+        task: &mut TaskProfile,
+        agent_route_criteria: &BTreeMap<String, Option<String>>,
+        service: &SemanticService,
+    ) -> Value {
         const MAX_SKILLS: usize = 48;
         const MAX_METHODS: usize = 48;
         const TOP_ROUTES: usize = 6;
 
-        let service = SemanticService::from_config();
         let capability = service.capability_json();
         if !service.configured() {
             return json!({
@@ -3017,7 +3208,7 @@ fn parent_orchestration_consumption() -> Value {
             "mutations": "deterministic tools and lifecycle gates"
         },
         "latency_policy": "at most one semantic evaluation per orchestration boundary; never add a semantic RTT to each low-level fs, git, exec, or inspect call",
-        "durable_task_source": "prefer advertised durable task/dispatch/terminal/inbox facts; when unavailable, keep the existing inspect/since plus deterministic task/process evidence path and do not create a second task ledger",
+        "durable_task_source": "prefer herdr_mcp.agent.task.inbox with advisory=true when advertised: deterministic task facts remain authoritative and one bounded existing attention decision is returned for the frozen inbox batch; when unavailable, keep the existing inspect/since plus deterministic task/process evidence path and do not create a second task ledger",
         "boundaries": {
             "plan": {
                 "method": PLANNING_ADVISE_METHOD,
@@ -3026,7 +3217,8 @@ fn parent_orchestration_consumption() -> Value {
             },
             "attention": {
                 "method": AGENT_ATTENTION_ADVISE_METHOD,
-                "when": "new bounded child progress or terminal facts can change parent attention",
+                "preferred_entry": "herdr_mcp.agent.task.inbox(advisory=true)",
+                "when": "a durable inbox batch contains new unacknowledged terminal facts; active siblings may join the same frozen attention evaluation",
                 "states": {
                     "continue_unobserved": "continue independent parent work; do not wait or poll solely for progress",
                     "verify_completion": "collect deterministic diff/status/change evidence, then enter validation",
@@ -3138,6 +3330,11 @@ fn resource_context_json(raw_snapshot: &Value) -> Value {
         "new_lane_requires_task_value": true,
         "cleanup": "planner-owned; no autonomous cleanup daemon",
     })
+}
+
+pub(crate) fn agent_attention_advice(params: &Value) -> Value {
+    ProgressiveSkillService::new()
+        .agent_attention_advise_with_timeout(params, Some(Duration::from_millis(1_500)))
 }
 
 fn validate_object_keys(params: &Value, allowed: &[&str]) -> Result<(), Value> {
@@ -3756,12 +3953,6 @@ mod tests {
 
     #[test]
     fn planning_agent_route_is_advisory_and_falls_back_to_deterministic_candidates() {
-        let _guard = crate::test_env::lock();
-        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
-        let config_dir = temp_root("planning-agent-route");
-        unsafe {
-            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
-        }
         let service = ProgressiveSkillService::new();
         let inventory = vec![
             inventory_record("pi", true, Some(true), Some(true)),
@@ -3780,10 +3971,12 @@ mod tests {
             "ownership_isolated": true
         });
 
-        let no_config = service.planning_advise_method_with_inventory(
+        let no_semantic = SemanticService::test_empty();
+        let no_config = service.planning_advise_method_with_inventory_and_semantic(
             &params,
             &planning_snapshot(),
             &inventory,
+            Some(&no_semantic),
         );
         assert_eq!(no_config["semantic"]["used"], false);
         assert_eq!(no_config["semantic"]["reason"], "not_configured");
@@ -3795,39 +3988,47 @@ mod tests {
         let deterministic_advice = no_config["advice"].clone();
         let deterministic_startable = no_config["startable_candidates"].clone();
 
-        use std::io::{Read, Write};
+        use std::io::{ErrorKind, Read, Write};
         use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 64 * 1024];
-            let _ = stream.read(&mut request);
-            let body = r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"live:worker","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        let config_path = config_dir.join("config.json");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"{{"semantic":{{"routes":[{{"name":"planning-agent-route","protocol":"decision","url":"http://127.0.0.1:{port}/v1","model":"jev-test","api_key":"test"}}]}}}}"#
-            ),
+        fn repeat_semantic_server(body: &'static str) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut request = [0_u8; 64 * 1024];
+                            let _ = stream.read(&mut request);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            port
+        }
+        let port = repeat_semantic_server(
+            r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"live:worker","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#,
+        );
+        let configured_semantic = SemanticService::test_decision_route(
+            "planning-agent-route",
+            &format!("http://127.0.0.1:{port}/v1"),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-
-        let configured = service.planning_advise_method_with_inventory(
+        let configured = service.planning_advise_method_with_inventory_and_semantic(
             &params,
             &planning_snapshot(),
             &inventory,
+            Some(&configured_semantic),
         );
         assert_eq!(configured["semantic"]["used"], true);
         assert_eq!(
@@ -3837,37 +4038,25 @@ mod tests {
         assert_eq!(configured["advice"], deterministic_advice);
         assert_eq!(configured["startable_candidates"], deterministic_startable);
 
-        let invalid_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let invalid_port = invalid_listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (mut stream, _) = invalid_listener.accept().unwrap();
-            let mut request = [0_u8; 64 * 1024];
-            let _ = stream.read(&mut request);
-            let body = r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"start:forbidden","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"{{"semantic":{{"routes":[{{"name":"planning-agent-route-invalid","protocol":"decision","url":"http://127.0.0.1:{invalid_port}/v1","model":"jev-test","api_key":"test"}}]}}}}"#
-            ),
+        let invalid_port = repeat_semantic_server(
+            r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"start:forbidden","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#,
+        );
+        let invalid_semantic = SemanticService::test_decision_route(
+            "planning-agent-route-invalid",
+            &format!("http://127.0.0.1:{invalid_port}/v1"),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let invalid_route = service.planning_advise_method_with_inventory(
+        let invalid_route = service.planning_advise_method_with_inventory_and_semantic(
             &params,
             &planning_snapshot(),
             &inventory,
+            Some(&invalid_semantic),
         );
-        assert_eq!(invalid_route["semantic"]["used"], true);
+        assert_eq!(
+            invalid_route["semantic"]["used"], true,
+            "semantic={}",
+            invalid_route["semantic"]
+        );
         assert!(
             invalid_route["semantic"]["routing"]["agents"]
                 .as_array()
@@ -3880,20 +4069,13 @@ mod tests {
             deterministic_startable
         );
 
-        std::fs::write(
-            &config_path,
-            r#"{"semantic":{"routes":[{"name":"offline","protocol":"decision","url":"http://127.0.0.1:1/v1","model":"jev-test","api_key":"test"}]}}"#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let provider_error = service.planning_advise_method_with_inventory(
+        let offline_semantic =
+            SemanticService::test_decision_route("offline", "http://127.0.0.1:1/v1").unwrap();
+        let provider_error = service.planning_advise_method_with_inventory_and_semantic(
             &params,
             &planning_snapshot(),
             &inventory,
+            Some(&offline_semantic),
         );
         assert_eq!(provider_error["semantic"]["used"], false);
         assert_ne!(provider_error["semantic"]["reason"], "not_configured");
@@ -3902,14 +4084,6 @@ mod tests {
             provider_error["startable_candidates"],
             deterministic_startable
         );
-
-        unsafe {
-            match previous_config {
-                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
-                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&config_dir);
     }
 
     #[test]
@@ -4373,7 +4547,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 16 * 1024];
             let _ = stream.read(&mut request);
-            let body = r#"{"model":"jev-test","answers":{"closeout_state":{"type":"choice","choice":"claims_complete","probabilities":{"working":0.02,"claims_complete":0.9,"waiting_user":0.02,"blocked_external":0.02,"unclear":0.04},"confidence":0.9},"needs_human":{"type":"noul","noul":0.1}}}"#;
+            let body = r#"{"model":"jev-test","answers":{"closeout_state":{"type":"choice","choice":"claims_complete","probabilities":{"working":0.02,"claims_complete":0.9,"waiting_user":0.02,"blocked_external":0.02,"unclear":0.04},"confidence":0.9},"needs_human":{"type":"noul","noul":0.1},"task_completed":{"type":"noul","noul":0.95},"needs_followup":{"type":"noul","noul":0.1},"needs_handoff":{"type":"noul","noul":0.05}}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()

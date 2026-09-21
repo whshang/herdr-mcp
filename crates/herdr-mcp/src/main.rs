@@ -295,6 +295,7 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::AgentSkill(command) => local_agent_skill::run(command),
         cli::Command::Continuity(command) => local_agent_cli::run_continuity(command),
         cli::Command::Memory(command) => local_agent_cli::run_memory(command),
+        cli::Command::Agent(command) => local_agent_cli::run_agent(command),
         cli::Command::WebChat(command) => local_agent_cli::run_webchat(command),
         cli::Command::Dev(command) => dev::run(command),
         cli::Command::ProfileCheck { file } => workstation_profile::check(&file),

@@ -256,6 +256,10 @@ herdr-mcp therefore prefers:
 
 This principle applies from agent prompts and shell execution to browser handoff and Cloudflare changes.
 
+Long-running agent work uses an asynchronous task lifecycle rather than blocking the parent on the agent's global status. `herdr_prompt` / `herdr_mcp.agent.task.dispatch` submits exactly once and immediately returns a stable `task_id` (currently the same canonical identity as `dispatch_id`) plus a Runtime `turn_id`; the parent then continues other work. Runtime consumes Herdr lifecycle events, writes `completed` / `blocked` / `failed` into the existing StateStore `operations` ledger as a durable parent inbox, and lets the CLI or browser adapter wake the owning parent. If the target was already `working` at submission time, Runtime first consumes that prior turn's settle and requires new activity before attributing a terminal state to the new task.
+
+Jev/Semantic runs only after the deterministic terminal record is durable. It may advise on `task_completed`, `needs_followup`, `needs_human`, and `needs_handoff`, and may help prioritize or coalesce sibling results. Delivery evidence, idempotency, terminal persistence, and parent notification do not depend on Jev. If the fast semantic grace expires, deterministic notification proceeds immediately and the advisory result may enrich the inbox later. Herdr 0.9.x still has no native prompt-turn identity, so the stable Runtime `turn_id` is an herdr-mcp turn envelope and `exact_native_turn=false` remains explicit.
+
 ## Control-plane failure is not automatically project failure
 
 Herdr snapshot/pane control can occasionally fail independently of the Git repository.

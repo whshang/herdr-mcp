@@ -282,6 +282,12 @@ Herdr tool の permission card は、Auto に従わない唯一の例外です�
 
 z.ai と DeepSeek の Auto は Herdr の progress/settled wake 挙動だけを行います。ChatGPT 固有の stale-view 復旧、permission-card の扱い、turn 終了時の意味判定、自動 rollover は、汎用の能力として扱われません。
 
+### Agent task の非同期 parent wake
+
+ChatGPT が `herdr_prompt` で長時間のローカル Agent task を dispatch すると、安定した browser session identity がリクエストと一緒に Runtime へ渡ります。Runtime は直ちに `task_id / dispatch_id / turn_id` を返し、その後 terminal result を durable parent inbox に保存します。拡張は Herdr settled event を低コストな trigger として使い続けますが、task ownership、`completed / blocked / failed`、Jev advisory、HUD task counter の権威は session-scoped inbox です。現在の `browser_session_ref` が所有する task だけがその conversation を wake できます。wake 配送が成功した後だけ acknowledge するため、拡張のオフラインや wake 失敗時も durable result は inbox に残ります。
+
+fan-out では Jev の高速結果が集約を助言できます。sibling task がまだ running で、得られた advisory が明確に非緊急なら後続 terminal とまとめて通知できます。`blocked / failed`、`needs_human` などの緊急結果は優先して wake します。Jev が未設定、失敗、短い grace 内に返らない場合は deterministic terminal wake に fail-open し、semantic inference の待機で Parent を再びブロックしません。
+
 ## turn 終了時の意味判定
 
 ChatGPT の返信は、構文的には終わっていても意味的には未完了であることがあります。たとえば、まだテストを実行する必要がある、次の手順は Git を inspect することだ、といった内容です。

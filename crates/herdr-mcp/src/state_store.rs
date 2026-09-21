@@ -612,6 +612,38 @@ pub struct OperationRecord {
     pub expires_at: Option<i64>,
 }
 
+/// Generic durable operation ledger record used by Runtime-owned background
+/// consumers that need to reopen an existing operation by its stable id.
+///
+/// This intentionally reuses the existing `operations` table instead of
+/// introducing a second task database or scheduler authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationLedgerRecord {
+    pub op_id: String,
+    pub kind: String,
+    pub idempotency_key: Option<String>,
+    pub request_hash: Option<String>,
+    pub phase: Option<String>,
+    pub state: Option<String>,
+    pub result_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OperationLedgerInput<'a> {
+    pub op_id: &'a str,
+    pub kind: &'a str,
+    pub idempotency_key: Option<&'a str>,
+    pub request_hash: Option<&'a str>,
+    pub phase: &'a str,
+    pub state: &'a str,
+    pub result_json: &'a str,
+    pub now_ms: i64,
+    pub expires_at: Option<i64>,
+}
+
 /// Result of atomically reserving an operation idempotency slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationReservation {
@@ -1473,6 +1505,113 @@ impl StateStore {
         }
         tx.commit()
             .map_err(|error| format!("cannot commit operation completion: {error}"))
+    }
+
+    pub fn put_operation_ledger(&mut self, input: OperationLedgerInput<'_>) -> Result<(), String> {
+        if input.op_id.is_empty() || input.kind.is_empty() {
+            return Err("operation ledger op_id and kind are required".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin operation ledger update: {error}"))?;
+        tx.execute(
+            "INSERT INTO operations (
+                op_id, kind, idempotency_key, request_hash, phase, state,
+                created_at, updated_at, expires_at, result_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)
+             ON CONFLICT(op_id) DO UPDATE SET
+                phase = excluded.phase,
+                state = excluded.state,
+                updated_at = excluded.updated_at,
+                expires_at = excluded.expires_at,
+                result_json = excluded.result_json",
+            params![
+                input.op_id,
+                input.kind,
+                input.idempotency_key,
+                input.request_hash,
+                input.phase,
+                input.state,
+                input.now_ms,
+                input.expires_at,
+                input.result_json,
+            ],
+        )
+        .map_err(|error| format!("cannot write operation ledger: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit operation ledger update: {error}"))
+    }
+
+    pub fn operation_ledger(&self, op_id: &str) -> Result<Option<OperationLedgerRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT op_id, kind, idempotency_key, request_hash, phase, state,
+                        result_json, created_at, updated_at, expires_at
+                 FROM operations WHERE op_id = ?1",
+                params![op_id],
+                |row| {
+                    Ok(OperationLedgerRecord {
+                        op_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        idempotency_key: row.get(2)?,
+                        request_hash: row.get(3)?,
+                        phase: row.get(4)?,
+                        state: row.get(5)?,
+                        result_json: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        expires_at: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read operation ledger: {error}"))
+    }
+
+    pub fn operation_ledgers(
+        &self,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<OperationLedgerRecord>, String> {
+        let limit = i64::try_from(limit.clamp(1, 1024)).unwrap_or(1024);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT op_id, kind, idempotency_key, request_hash, phase, state,
+                        result_json, created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1
+                   AND (expires_at IS NULL OR expires_at > ?2)
+                 ORDER BY updated_at DESC, op_id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|error| format!("cannot prepare operation ledger list: {error}"))?;
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(params![kind, now_ms, limit], |row| {
+                Ok(OperationLedgerRecord {
+                    op_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    idempotency_key: row.get(2)?,
+                    request_hash: row.get(3)?,
+                    phase: row.get(4)?,
+                    state: row.get(5)?,
+                    result_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    expires_at: row.get(9)?,
+                })
+            })
+            .map_err(|error| format!("cannot query operation ledger list: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode operation ledger list: {error}"))
     }
 
     pub fn append_continuity_turn(

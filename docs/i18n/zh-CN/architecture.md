@@ -238,6 +238,10 @@ operational root 不会伪造 Git 状态：它不是 managed，也没有 clean/d
 
 mutation 的默认策略始终是：**先重新观察，再决定是否重试。** `herdr_prompt` 支持 `idempotency_key`，同一个客户端意图应复用同一个 key。
 
+Agent 长任务的正常控制流是异步 task lifecycle，而不是让 Parent 挂在 Agent 的全局状态上等待。`herdr_prompt` / `herdr_mcp.agent.task.dispatch` 只提交一次并立即返回稳定的 `task_id`（当前与 canonical `dispatch_id` 共用同一身份）和 Runtime `turn_id`；Parent 随后继续其它工作。Runtime 从 Herdr lifecycle event 观察本轮 activity，把 `completed` / `blocked` / `failed` 写入同一 StateStore `operations` ledger 的 durable parent inbox，再由 CLI 或 Browser adapter 唤醒对应 Parent。若提交时目标 Agent 已经在 `working`，先等待上一轮 settle，再观察新的 activity，避免旧 `done/idle` 被误判为新 task 完成。
+
+Jev/Semantic 只在 durable terminal 之后做有界 advisory enrichment：它可以辅助判断 `task_completed`、`needs_followup`、`needs_human`、`needs_handoff`，并辅助多子任务优先级/聚合。terminal 持久化、投递证据、幂等和通知不能依赖 Jev；快速判断没有在短 grace 内返回时，确定性 parent notification 立即继续，语义结果稍后补写 inbox。Herdr 0.9.x 仍没有 native prompt-turn identity，所以 Runtime `turn_id` 是 herdr-mcp 的稳定 turn envelope，`exact_native_turn=false` 明确保留这个边界。
+
 ## 控制面毛刺为什么不会轻易拖死整个任务
 
 Herdr daemon 的 snapshot / event 聚合偶尔可能出现 TaskGroup / ExceptionGroup 类瞬时错误。herdr-mcp 在几个关键位置采用退化路径：

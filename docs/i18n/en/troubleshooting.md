@@ -195,7 +195,7 @@ The rule is **do not blindly retry a mutation**.
 
 ### `herdr_prompt`
 
-If the failure happened during post-submit status waiting, the agent may already have received the prompt. Inspect agent state/output first. Reuse an `idempotency_key` for a repeated intent.
+Normal long-running work should not keep the parent blocked. `herdr_prompt` submits once and immediately returns `task_id` / `dispatch_id` / Runtime `turn_id`, then the parent continues other work while Runtime tracks that exact task through `herdr_mcp.agent.task.status` / `herdr_mcp.agent.task.inbox`. If a caller explicitly uses compatibility `wait`, it waits on this `task_id`, not on a stale global `idle/done` state. A wait timeout still does not mean non-delivery; inspect the returned task/inbox before retrying. Reuse an `idempotency_key` for a repeated intent.
 
 ### `herdr_exec`
 
@@ -213,19 +213,17 @@ MCP provides:
 ChatGPT → workstation
 ```
 
-A local task finishing later does not create a new ChatGPT turn automatically. For:
+For an Agent task dispatched by the current WebChat, Runtime first records the terminal result in the durable parent inbox. The browser extension then reads the inbox scoped to the current `browser session_ref` and can create the next WebChat turn; the parent does not need to keep its original turn blocked while the child works.
 
-```text
-workstation → ChatGPT
-```
+If the agent finished but ChatGPT did not continue, verify that:
 
-use browser continuity:
+- Native Messaging host is healthy;
+- the conversation has a stable `browser_session_ref` and is bound to the correct workspace;
+- the relevant Auto scope is enabled;
+- the task is terminal and unacknowledged in `herdr_mcp.agent.task.inbox`;
+- if sibling tasks are still running, Jev may advise aggregation; `blocked` / `failed` or high-priority `needs_human` results wake first. Missing, timed-out, or failed Jev never suppresses the deterministic terminal notification.
 
-- Native Messaging host is installed;
-- the current conversation is bound to the correct workspace;
-- the relevant Auto scope is enabled, or use a manual HUD action.
-
-See [Browser continuity](browser-continuity.md).
+A manual HUD continue action remains an explicit fallback. See [Browser continuity](browser-continuity.md).
 
 ## Symptom: HUD shows the wrong workspace name
 

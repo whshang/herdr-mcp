@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.114";
+const H2W_SCRIPT_VERSION = "0.1.115";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -4188,6 +4188,12 @@ async function onPushHello(storeKey, data) {
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
   if (d.status === "working" && automationEnabledForBinding(b)) armProgressTimer(storeKey, b);
+  const taskWake = await routeAgentTaskInboxWake(b, { wakeKind: "round" });
+  if (taskWake.matched) {
+    if (taskWake.wake) callLog(`task inbox recovery wake: ws=${ws}`);
+    else if (taskWake.aggregated) callLog(`task inbox recovery retained for aggregation: ws=${ws}`);
+    return;
+  }
   if (d.wake) {
     callLog(`hello recovery wake: ws=${ws} → ${d.status} (settle missed while offline)`);
     await routeWake(b, { status: d.status, output: "", working_count: d.working_count }, CFG.wakeTemplate || defaultWakeTemplate());
@@ -4230,6 +4236,22 @@ async function onPushSettled(storeKey, data) {
   b.status = d.status;
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
+
+  const taskWake = await routeAgentTaskInboxWake(b, {
+    wakeKind: d.kind,
+    settleRetry: true,
+  });
+  if (taskWake.matched) {
+    if (d.kind === "round") clearProgressTimer(storeKey);
+    if (taskWake.wake) {
+      callLog(`task terminal wake: ws=${ws}, pending=${taskWake.inbox?.tasks?.length || 0}`);
+      setActionBadge("✓", "#16a34a", 4000);
+    } else if (taskWake.aggregated) {
+      callLog(`task terminal aggregated: ws=${ws}, running=${taskWake.inbox?.summary?.running || 0}`);
+      setActionBadge("…", "#d97706");
+    }
+    return;
+  }
 
   // Goal-aware WAIT_EXTERNAL wake-up: this is the existing meaningful agent
   // transition, so a supervisor session waiting on the local agent is woken and
@@ -4344,6 +4366,177 @@ function semanticFailure(payload, status = 0) {
     status: httpStatus || null,
     error: code,
   };
+}
+
+
+function taskAttentionStateMap(inbox) {
+  const children = Array.isArray(inbox?.attention?.children) ? inbox.attention.children : [];
+  const assessments = Array.isArray(inbox?.attention?.assessments) ? inbox.attention.assessments : [];
+  const taskById = new Map(
+    children
+      .map((child) => [String(child?.id || ""), String(child?.task_id || "")])
+      .filter(([id, taskId]) => id && taskId),
+  );
+  const states = new Map();
+  for (const assessment of assessments) {
+    const taskId = taskById.get(String(assessment?.id || ""));
+    const state = String(assessment?.state || "");
+    if (taskId && state) states.set(taskId, state);
+  }
+  return states;
+}
+
+function taskInboxDecision(inbox) {
+  const tasks = Array.isArray(inbox?.tasks) ? inbox.tasks : [];
+  if (!tasks.length) return { matched: false, wake: false, reason: "no_pending_terminal" };
+
+  const urgent = tasks.some((task) =>
+    ["blocked", "failed", "delivery_uncertain"].includes(String(task?.lifecycle || "")));
+  const states = taskAttentionStateMap(inbox);
+  const terminalStates = tasks.map((task) => states.get(String(task?.task_id || ""))).filter(Boolean);
+  const attentionUsed = inbox?.attention?.used === true;
+  const attentionUrgent = terminalStates.some((state) =>
+    ["needs_human", "blocked_external", "investigate_drift", "unclear"].includes(state));
+  const verifyCompletion = terminalStates.includes("verify_completion");
+
+  return {
+    matched: true,
+    wake: true,
+    urgent: urgent || attentionUrgent,
+    reason: urgent
+      ? "urgent_terminal"
+      : attentionUrgent
+        ? "attention_urgent"
+        : verifyCompletion
+          ? "verify_completion"
+          : attentionUsed
+            ? "attention_ready"
+            : "attention_unavailable_fallback",
+  };
+}
+
+function formatTaskAttention(task, states) {
+  const state = states.get(String(task?.task_id || ""));
+  return state ? " [attention=" + state + "]" : "";
+}
+
+function taskInboxWakeText(inbox) {
+  const tasks = Array.isArray(inbox?.tasks) ? inbox.tasks.slice(0, 16) : [];
+  const summary = inbox?.summary || {};
+  const states = taskAttentionStateMap(inbox);
+  const lines = [
+    "Herdr child-task terminal update: " + tasks.length
+      + " pending result(s); " + (Number(summary.running) || 0) + " running, "
+      + (Number(summary.completed) || 0) + " completed, "
+      + (Number(summary.blocked) || 0) + " blocked, "
+      + (Number(summary.failed) || 0) + " failed, "
+      + (Number(summary.uncertain) || 0) + " uncertain.",
+  ];
+  for (const task of tasks) {
+    lines.push(
+      "- " + String(task?.task_id || "task") + ": " + String(task?.lifecycle || "unknown")
+      + " (child " + String(task?.target || "unknown")
+      + ", turn " + String(task?.turn_id || "unverified")
+      + ", terminal_seq " + String(task?.terminal_seq ?? "unknown") + ")"
+      + formatTaskAttention(task, states),
+    );
+  }
+  lines.push(
+    "Attention is advisory; durable task lifecycle is authoritative. "
+      + "verify_completion enters deterministic validation and continue_unobserved leaves independent running children alone. "
+      + "Do not re-dispatch a terminal or delivery-uncertain task blindly.",
+  );
+  return lines.join("\n").slice(0, 12000);
+}
+
+async function fetchAgentTaskInbox(binding, { settleRetry = false } = {}) {
+  const parentSessionRef = String(binding?.browser_session_ref || "").trim();
+  if (!parentSessionRef) return null;
+  const workspaceId = String(normalizeWorkspaceId(binding) || "").trim();
+  const attempts = settleRetry ? 4 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const url = new URL(semanticRuntimeUrl("/extension/agent/tasks"));
+      url.searchParams.set("parent_session_ref", parentSessionRef);
+      if (workspaceId) url.searchParams.set("workspace_id", workspaceId);
+      url.searchParams.set("limit", "64");
+      const response = await localHerdrFetch(url.toString(), { nativeTimeoutMs: 1800 });
+      const value = await response.json().catch(() => null);
+      if (response.ok && value?.ok === true) {
+        if (Array.isArray(value.tasks) && value.tasks.length > 0) return value;
+        if (!settleRetry || attempt === attempts - 1) return value;
+      } else if (!settleRetry || attempt === attempts - 1) {
+        return null;
+      }
+    } catch (_) {
+      if (!settleRetry || attempt === attempts - 1) return null;
+    }
+    await sleep(50);
+  }
+  return null;
+}
+
+async function ackAgentTask(binding, taskId) {
+  const parentSessionRef = String(binding?.browser_session_ref || "").trim();
+  const id = String(taskId || "").trim();
+  if (!parentSessionRef || !id) return false;
+  try {
+    const response = await localHerdrFetch(semanticRuntimeUrl("/extension/agent/tasks/ack"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: id, parent_session_ref: parentSessionRef }),
+      nativeTimeoutMs: 1200,
+    });
+    const value = await response.json().catch(() => null);
+    return response.ok && value?.ok === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function routeAgentTaskInboxWake(binding, { wakeKind = null, settleRetry = false } = {}) {
+  const inbox = await fetchAgentTaskInbox(binding, { settleRetry });
+  const decision = taskInboxDecision(inbox);
+  if (!decision.matched) return { matched: false, wake: false, inbox };
+  if (!automationEnabledForBinding(binding)) {
+    return { matched: true, wake: false, disabled: true, decision, inbox };
+  }
+  const routed = await routeWake(
+    binding,
+    {
+      status: "agent_task_terminal",
+      working_count: Number(inbox?.summary?.running) || 0,
+      task_summary: inbox?.summary || null,
+      attention_used: inbox?.attention?.used === true,
+    },
+    taskInboxWakeText(inbox),
+    wakeKind,
+  );
+  if (routed?.ok) {
+    for (const task of Array.isArray(inbox?.tasks) ? inbox.tasks : []) {
+      await ackAgentTask(binding, task?.task_id);
+    }
+  }
+  return { matched: true, wake: Boolean(routed?.ok), decision, inbox, routed };
+}
+
+async function aggregateAgentTaskSummary(bindings = []) {
+  const unique = new Map();
+  for (const binding of bindings) {
+    const sessionRef = String(binding?.browser_session_ref || "").trim();
+    const workspaceId = String(normalizeWorkspaceId(binding) || "").trim();
+    if (!sessionRef) continue;
+    unique.set(sessionRef + "::" + workspaceId, binding);
+  }
+  const inboxes = await Promise.all([...unique.values()].map((binding) => fetchAgentTaskInbox(binding)));
+  const summary = { running: 0, completed: 0, blocked: 0, failed: 0, uncertain: 0 };
+  for (const inbox of inboxes) {
+    if (!inbox?.ok) continue;
+    for (const key of Object.keys(summary)) {
+      summary[key] += Math.max(0, Number(inbox?.summary?.[key]) || 0);
+    }
+  }
+  return summary;
 }
 
 async function runtimeSemanticCapabilities({ refresh = false } = {}) {
@@ -7359,6 +7552,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!b) continue;
           if (browserObservation?.accountRef) b.browser_account_ref = browserObservation.accountRef;
           if (browserObservation?.spaceRef) b.browser_space_ref = browserObservation.spaceRef;
+          if (browserObservation?.sessionRef) b.browser_session_ref = browserObservation.sessionRef;
           if (Number.isSafeInteger(browserObservation?.observationGeneration)
               && browserObservation.observationGeneration > 0) {
             b.browser_generation = browserObservation.observationGeneration;
@@ -7620,6 +7814,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return total + (Array.isArray(workspace?.panes) ? workspace.panes.length : 0);
       }, 0);
       const boundWorkingCount = liveSession.reduce((total, binding) => total + Number(bindingView(binding)?.working_count || 0), 0);
+      const taskSummary = await aggregateAgentTaskSummary(liveSession);
       const semanticCapabilities = await runtimeSemanticCapabilities();
       const last = convKey ? (lastIdleNudgeResult.get(convKey) || null) : null;
       sendResponse({
@@ -7654,6 +7849,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         bound_workspace_count: boundWorkspaceIds.size,
         bound_pane_count: boundPaneCount,
         bound_working_count: boundWorkingCount,
+        task_summary: taskSummary,
         bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),
         bindings: await Promise.all(session.map(async (b) => ({
           ...bindingView(b),
