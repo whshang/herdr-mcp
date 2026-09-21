@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.112";
+const H2W_SCRIPT_VERSION = "0.1.113";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -2964,6 +2964,9 @@ async function runPushStream(ctrl) {
     let stallTimer = null;
     let relayAbort = null;
     try {
+      const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+      const browserEndpointRef = String(endpoint?.endpoint_ref || "").trim();
+      if (!browserEndpointRef) throw new Error("browser-endpoint-unavailable");
       const decoder = new TextDecoder();
       let buf = "";
       const disarmStallWatchdog = () => {
@@ -2991,7 +2994,7 @@ async function runPushStream(ctrl) {
       };
       stream = openLocalHerdrStream({
         baseUrl: CFG.herdrMcpUrl,
-        path: "/push/events",
+        path: `/push/events?browser_endpoint_ref=${encodeURIComponent(browserEndpointRef)}`,
         timeoutMs: PUSH_CONNECT_MS,
         onChunk: (bytes) => {
           armStallWatchdog();

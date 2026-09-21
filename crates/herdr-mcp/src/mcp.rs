@@ -157,6 +157,18 @@ pub trait BrowserActuator: Send + Sync {
         dispatch_id: Option<&str>,
     ) -> Result<BrowserPostconditionEvidence, String>;
 
+    fn actuate_for_endpoint(
+        &self,
+        operation: &str,
+        params: &Value,
+        expected_generation: i64,
+        endpoint_ref: Option<&str>,
+        dispatch_id: Option<&str>,
+    ) -> Result<BrowserPostconditionEvidence, String> {
+        let _ = endpoint_ref;
+        self.actuate(operation, params, expected_generation, dispatch_id)
+    }
+
     fn reconcile_dispatch(
         &self,
         _dispatch_id: &str,
@@ -2188,6 +2200,7 @@ fn browser_dispatch_submit(
         Err(error) => return browser_store_error(error),
     };
     let actuation_provider = session.provider.clone();
+    let actuation_endpoint_ref = session.endpoint_ref.clone();
     let reservation = store_guard.reserve_browser_dispatch(BrowserDispatchReserveInput {
         endpoint_ref: &session.endpoint_ref,
         provider: &session.provider,
@@ -2253,10 +2266,11 @@ fn browser_dispatch_submit(
     }
     drop(store_guard);
     let evidence = match actuator {
-        Some(actuator) => match actuator.actuate(
+        Some(actuator) => match actuator.actuate_for_endpoint(
             BrowserOperation::DispatchSubmit.method(),
             &actuation_params,
             expected_generation,
+            Some(&actuation_endpoint_ref),
             Some(&reserved.dispatch_id),
         ) {
             Ok(evidence) => evidence,
@@ -2391,6 +2405,7 @@ fn browser_dispatch_stop(
     {
         return json!({"ok": false, "code": "browser_dispatch_not_stoppable"});
     }
+    let actuation_endpoint_ref = parent.endpoint_ref.clone();
 
     let reservation = store_guard.reserve_browser_dispatch(BrowserDispatchReserveInput {
         endpoint_ref: &parent.endpoint_ref,
@@ -2455,10 +2470,11 @@ fn browser_dispatch_stop(
     drop(store_guard);
 
     let evidence = match actuator {
-        Some(actuator) => match actuator.actuate(
+        Some(actuator) => match actuator.actuate_for_endpoint(
             BrowserOperation::DispatchStop.method(),
             params,
             expected_generation,
+            Some(&actuation_endpoint_ref),
             Some(&reserved.dispatch_id),
         ) {
             Ok(evidence) => evidence,
@@ -3868,10 +3884,11 @@ fn browser_session_create(
         }
     }
     let evidence = match actuator {
-        Some(actuator) => match actuator.actuate(
+        Some(actuator) => match actuator.actuate_for_endpoint(
             BrowserOperation::SessionCreate.method(),
             &actuation_params,
             expected_generation,
+            Some(&reservation.endpoint_ref),
             Some(&reservation.reservation_ref),
         ) {
             Ok(evidence) => evidence,
@@ -3987,7 +4004,7 @@ fn browser_session_open(
     let now = browser_epoch_ms();
     let expires_at = now.saturating_add(10 * 60 * 1000);
 
-    let (reservation, provider, canonical_url) = {
+    let (reservation, provider, canonical_url, endpoint_ref) = {
         let Ok(mut guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
@@ -4019,7 +4036,12 @@ fn browser_session_open(
             Ok(value) => value,
             Err(error) => return browser_store_error(error),
         };
-        (reservation, session.provider, canonical_url)
+        (
+            reservation,
+            session.provider,
+            canonical_url,
+            session.endpoint_ref,
+        )
     };
 
     match reservation {
@@ -4071,10 +4093,11 @@ fn browser_session_open(
         }
     }
     let evidence = match actuator {
-        Some(actuator) => match actuator.actuate(
+        Some(actuator) => match actuator.actuate_for_endpoint(
             BrowserOperation::SessionOpen.method(),
             &actuation_params,
             expected_generation,
+            Some(&endpoint_ref),
             None,
         ) {
             Ok(evidence) => evidence,
@@ -4491,7 +4514,7 @@ fn browser_operation_call_with_controls(
                 .unwrap();
             let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
             let mut actuation_params = params.clone();
-            {
+            let actuation_endpoint_ref = {
                 let Ok(guard) = store.lock() else {
                     return json!({"ok": false, "code": "browser_operation_store_unavailable"});
                 };
@@ -4557,13 +4580,15 @@ fn browser_operation_call_with_controls(
                         Err(error) => return browser_store_error(error),
                     }
                 }
-            }
+                session.endpoint_ref.clone()
+            };
             let evidence = match browser_actuator {
                 Some(actuator) => {
-                    match actuator.actuate(
+                    match actuator.actuate_for_endpoint(
                         operation.method(),
                         &actuation_params,
                         expected_generation,
+                        Some(&actuation_endpoint_ref),
                         None,
                     ) {
                         Ok(evidence) => evidence,
@@ -4658,6 +4683,7 @@ fn browser_operation_call_with_controls(
                 Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
                 Err(error) => return browser_store_error(error),
             };
+            let actuation_endpoint_ref = session.endpoint_ref.clone();
             if let Some(object) = actuation_params.as_object_mut() {
                 object.insert("provider".to_owned(), json!(session.provider));
                 match guard.browser_resource_locator(session_ref) {
@@ -4673,10 +4699,11 @@ fn browser_operation_call_with_controls(
             }
             drop(guard);
             let evidence = match browser_actuator {
-                Some(actuator) => match actuator.actuate(
+                Some(actuator) => match actuator.actuate_for_endpoint(
                     operation.method(),
                     &actuation_params,
                     expected_generation,
+                    Some(&actuation_endpoint_ref),
                     None,
                 ) {
                     Ok(evidence) => evidence,

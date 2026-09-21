@@ -595,7 +595,8 @@ globalThis.chrome = {
         onMessage: { addListener(fn) { messageListeners.push(fn); } },
         onDisconnect: { addListener(fn) { disconnectListeners.push(fn); } },
         postMessage(message) {
-          if (message?.type === "stream" && message.path === "/push/events") {
+          if (message?.type === "stream"
+              && message.path?.startsWith("/push/events?browser_endpoint_ref=bep_")) {
             queueMicrotask(() => {
               if (disconnected) return;
               for (const fn of messageListeners) fn({ type: "stream_open", status: 200, transport: "ipc" });
@@ -916,7 +917,7 @@ const browserRegister = browserRegistryRequests[0] || {};
 const browserRegisterRetry = browserRegistryRequests[1] || {};
 ok(browserRegister.operation === "endpoint.register"
     && !Object.prototype.hasOwnProperty.call(browserRegister, "browser_family")
-    && browserRegister.extension_version === "0.1.112"
+    && browserRegister.extension_version === "0.1.113"
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
   "browser endpoint registration carries one opaque profile seed and leaves browser product identity to the native host",
   JSON.stringify(browserRegister));

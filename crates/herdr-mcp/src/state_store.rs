@@ -5767,7 +5767,7 @@ fn validate_browser_ref_text(value: &str, max_bytes: usize, field: &str) -> Resu
     Ok(())
 }
 
-fn validate_browser_endpoint_ref(value: &str) -> Result<(), String> {
+pub(crate) fn validate_browser_endpoint_ref(value: &str) -> Result<(), String> {
     if value.len() == 68
         && value.starts_with("bep_")
         && value[4..]
