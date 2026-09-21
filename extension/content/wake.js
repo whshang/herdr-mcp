@@ -2938,6 +2938,26 @@ const H2W_CONTENT_VERSION = "0.1.116";
     return matches[0];
   }
 
+  async function currentAdapterProjectIdentity(convKey) {
+    if (typeof ADAPTER.getProjectIdentity !== "function") return null;
+    let project = ADAPTER.getProjectIdentity();
+    if (project || ADAPTER.name !== "claude") return project;
+
+    // Claude renders the stable /chat/<uuid> route before its chat header.
+    // Give the header breadcrumb one bounded observation window so the same
+    // conversation cannot alternate between account- and Project-parented
+    // Browser Registry sessions across reloads. A real non-Project chat still
+    // registers after the window expires; route drift cancels the observation.
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      await wait(100);
+      if (ADAPTER.getConversationKey() !== convKey) return null;
+      project = ADAPTER.getProjectIdentity();
+      if (project) return project;
+    }
+    return null;
+  }
+
   async function registerCurrentConversation(reason = "startup") {
     if (!runtimeAlive()) return null;
     const registrationAttempt = ++browserRegistrationAttempt;
@@ -2958,9 +2978,7 @@ const H2W_CONTENT_VERSION = "0.1.116";
       } catch (_) {}
     }
     const browserProjects = chatGptProjectRoute ? [] : await chatGptProjectCatalog(accountNativeIdentity);
-    const adapterProject = typeof ADAPTER.getProjectIdentity === "function"
-      ? ADAPTER.getProjectIdentity()
-      : null;
+    const adapterProject = await currentAdapterProjectIdentity(convKey);
     const browserCurrentProject = chatGptProjectRoute
       ? null
       : (ADAPTER.name === "chatgpt"
