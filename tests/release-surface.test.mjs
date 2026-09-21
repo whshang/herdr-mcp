@@ -355,7 +355,12 @@ test("Rust GitHub Release provenance keeps manual qualification attested and tag
     "release provenance action must be pinned to the reviewed v4.2.2 commit",
   );
   assert.match(attest, /release-assets\/herdr-mcp-\*/);
-  assert.match(attest, /release-assets\/release-manifest\.json/);
+  assert.match(attest, /release-assets\/\*manifest\.json/);
+  assert.match(release, /--output "\$PWD\/release-assets\/runtime-manifest\.json"/);
+  assert.match(release, /cp "\$PWD\/release-assets\/runtime-manifest\.json" "\$PWD\/release-assets\/release-manifest\.json"/);
+  assert.match(release, /if \[\[ "\$TAG" == \*-\* \]\]/);
+  assert.match(qualification, /manifest="release-assets\/runtime-manifest\.json"/);
+  assert.match(publish, /manifest="release-assets\/runtime-manifest\.json"/);
   assert.doesNotMatch(release, /pack-extension\.mjs/);
   assert.doesNotMatch(release, /Pack browser extension release zip/);
   assert.match(release, /--repository-id \"\$GITHUB_REPOSITORY_ID\"/);
@@ -414,6 +419,13 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /source_target_mode/);
   assert.match(recovery, /source_manifest_schema/);
   assert.match(recovery, /source_target_matrix/);
+  assert.match(recovery, /contracts\/runtime-exec-v4\.json/);
+  assert.match(recovery, /contracts\/epoch2\.json/);
+  assert.match(recovery, /runtime_manifest = root \/ "runtime-manifest\.json"/);
+  assert.match(recovery, /legacy_manifest = root \/ "release-manifest\.json"/);
+  assert.match(recovery, /manifest_mode = "runtime"/);
+  assert.match(recovery, /manifest_mode = "legacy"/);
+  assert.match(recovery, /release bundle has no runtime-manifest\.json or release-manifest\.json/);
   assert.match(recovery, /source run build matrix does not match tagged source targets/);
   assert.match(recovery, /manifest\.get\(\"schema_version\"\) != source_manifest_schema/);
   assert.match(recovery, /source_manifest_schema == 2/);

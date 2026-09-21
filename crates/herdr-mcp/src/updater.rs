@@ -46,6 +46,8 @@ use std::os::unix::process::CommandExt;
 
 const DEFAULT_RELEASES_API_URL: &str =
     "https://api.github.com/repos/whshang/herdr-mcp/releases?per_page=20";
+const RUNTIME_MANIFEST_NAME: &str = "runtime-manifest.json";
+const LEGACY_MANIFEST_NAME: &str = "release-manifest.json";
 const RELEASES_MAX_BYTES: usize = 1024 * 1024;
 const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 const ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -1452,11 +1454,15 @@ fn fetch_release_plan(
     channel: UpdateChannel,
 ) -> Result<ReleasePlan, String> {
     let client = update_client()?;
-    let manifest_url = match manifest_override
+    let (manifest_url, manifest_name) = match manifest_override
         .map(str::to_owned)
         .or_else(|| env::var("HERDR_MCP_UPDATE_MANIFEST_URL").ok())
     {
-        Some(raw) => parse_update_url(&raw)?,
+        Some(raw) => {
+            let url = parse_update_url(&raw)?;
+            let name = release_manifest_name(&url)?;
+            (url, name)
+        }
         None => discover_default_manifest_url(&client, channel)?,
     };
     let bytes = fetch_bounded(
@@ -1479,16 +1485,24 @@ fn fetch_release_plan(
         ));
     }
     let manifest_sha256 = sha256_bytes(&bytes);
-    verify_artifact_attestation(
-        &client,
-        "release-manifest.json",
-        &manifest_sha256,
-        &plan.identity,
-    )?;
+    verify_artifact_attestation(&client, manifest_name, &manifest_sha256, &plan.identity)?;
     Ok(plan)
 }
 
-fn discover_default_manifest_url(client: &Client, channel: UpdateChannel) -> Result<Url, String> {
+fn release_manifest_name(url: &Url) -> Result<&'static str, String> {
+    match url.path_segments().and_then(Iterator::last) {
+        Some(RUNTIME_MANIFEST_NAME) => Ok(RUNTIME_MANIFEST_NAME),
+        Some(LEGACY_MANIFEST_NAME) => Ok(LEGACY_MANIFEST_NAME),
+        _ => Err(format!(
+            "release manifest URL must end in {RUNTIME_MANIFEST_NAME} or {LEGACY_MANIFEST_NAME}"
+        )),
+    }
+}
+
+fn discover_default_manifest_url(
+    client: &Client,
+    channel: UpdateChannel,
+) -> Result<(Url, &'static str), String> {
     let releases_url = Url::parse(DEFAULT_RELEASES_API_URL)
         .map_err(|_| "default GitHub releases API URL is invalid".to_owned())?;
     let bytes = fetch_bounded(
@@ -1499,15 +1513,27 @@ fn discover_default_manifest_url(client: &Client, channel: UpdateChannel) -> Res
     )?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("GitHub releases index is invalid JSON: {error}"))?;
-    let tag = select_release_tag(&value, channel)?;
-    Url::parse(&format!(
-        "https://github.com/{}/releases/download/{tag}/release-manifest.json",
-        release_trust::RELEASE_REPOSITORY
+    for manifest_name in [RUNTIME_MANIFEST_NAME, LEGACY_MANIFEST_NAME] {
+        if let Some(tag) = select_release_tag(&value, channel, manifest_name)? {
+            let url = Url::parse(&format!(
+                "https://github.com/{}/releases/download/{tag}/{manifest_name}",
+                release_trust::RELEASE_REPOSITORY
+            ))
+            .map_err(|_| "cannot construct discovered release manifest URL".to_owned())?;
+            return Ok((url, manifest_name));
+        }
+    }
+    Err(format!(
+        "GitHub releases index contains no non-draft semver release with {RUNTIME_MANIFEST_NAME} or {LEGACY_MANIFEST_NAME} for update channel {}",
+        channel.as_str()
     ))
-    .map_err(|_| "cannot construct discovered release manifest URL".to_owned())
 }
 
-fn select_release_tag(value: &Value, channel: UpdateChannel) -> Result<String, String> {
+fn select_release_tag(
+    value: &Value,
+    channel: UpdateChannel,
+    manifest_name: &str,
+) -> Result<Option<String>, String> {
     let releases = value
         .as_array()
         .ok_or_else(|| "GitHub releases index must be a JSON array".to_owned())?;
@@ -1538,9 +1564,9 @@ fn select_release_tag(value: &Value, channel: UpdateChannel) -> Result<String, S
             .get("assets")
             .and_then(Value::as_array)
             .is_some_and(|assets| {
-                assets.iter().any(|asset| {
-                    asset.get("name").and_then(Value::as_str) == Some("release-manifest.json")
-                })
+                assets
+                    .iter()
+                    .any(|asset| asset.get("name").and_then(Value::as_str) == Some(manifest_name))
             });
         if !has_manifest {
             continue;
@@ -1552,12 +1578,7 @@ fn select_release_tag(value: &Value, channel: UpdateChannel) -> Result<String, S
             best = Some((version, tag.to_owned()));
         }
     }
-    best.map(|(_, tag)| tag).ok_or_else(|| {
-        format!(
-            "GitHub releases index contains no non-draft semver release with release-manifest.json for update channel {}",
-            channel.as_str()
-        )
-    })
+    Ok(best.map(|(_, tag)| tag))
 }
 
 fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String> {
@@ -2973,40 +2994,61 @@ mod tests {
             }
         ]);
         assert_eq!(
-            select_release_tag(&releases, UpdateChannel::Preview).unwrap(),
-            "v0.4.0-alpha.6"
+            select_release_tag(&releases, UpdateChannel::Preview, LEGACY_MANIFEST_NAME).unwrap(),
+            Some("v0.4.0-alpha.6".to_owned())
         );
         assert_eq!(
-            select_release_tag(&releases, UpdateChannel::Stable).unwrap(),
-            "v0.3.0"
+            select_release_tag(&releases, UpdateChannel::Stable, LEGACY_MANIFEST_NAME).unwrap(),
+            Some("v0.3.0".to_owned())
         );
 
         assert!(
-            select_release_tag(&json!({"tag_name": "v1.0.0"}), UpdateChannel::Preview).is_err()
+            select_release_tag(
+                &json!({"tag_name": "v1.0.0"}),
+                UpdateChannel::Preview,
+                RUNTIME_MANIFEST_NAME
+            )
+            .is_err()
         );
-        assert!(
+        assert_eq!(
             select_release_tag(
                 &json!([{
                     "draft": false,
                     "tag_name": "v1.0.0-alpha.1",
                     "assets": [{"name": "release-manifest.json"}]
                 }]),
-                UpdateChannel::Stable
+                UpdateChannel::Stable,
+                LEGACY_MANIFEST_NAME
             )
-            .unwrap_err()
-            .contains("update channel stable")
+            .unwrap(),
+            None
         );
-        assert!(
+        assert_eq!(
             select_release_tag(
                 &json!([{
                     "draft": false,
                     "tag_name": "v1.0.0",
                     "assets": []
                 }]),
-                UpdateChannel::Preview
+                UpdateChannel::Preview,
+                RUNTIME_MANIFEST_NAME
             )
-            .unwrap_err()
-            .contains("update channel preview")
+            .unwrap(),
+            None
+        );
+        let runtime_release = json!([{
+            "draft": false,
+            "tag_name": "v1.0.0",
+            "assets": [{"name": "runtime-manifest.json"}]
+        }]);
+        assert_eq!(
+            select_release_tag(
+                &runtime_release,
+                UpdateChannel::Stable,
+                RUNTIME_MANIFEST_NAME
+            )
+            .unwrap(),
+            Some("v1.0.0".to_owned())
         );
     }
 

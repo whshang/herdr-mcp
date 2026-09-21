@@ -273,6 +273,20 @@ Remove old generation only after confidence
 - candidate 已 activate：先判断是否 rollback；
 - mutation delivery 不确定：先重新观察，不重复执行发布动作。
 
+## 从现有 v0.4.8 一键升级到 1.0
+
+普通已 enrollment 用户只需要执行一条命令：
+
+```bash
+herdr-mcp update
+```
+
+用户**不需要**手动下载 1.0 binary、不需要自己运行 `update major-apply`、不需要删除或重建 Worker、不需要重新 pair 设备，也不需要重新添加 ChatGPT Connector。已经发布且不可修改的 v0.4.8 updater 会先发现仍保持 schema 5 / Runtime epoch 2 身份的 v0.4.9 migration bridge。bridge 只作为原 update job 的 detached worker 运行，成功路径不会把 v0.4.9 安装成 production service。它会下载并验签兼容的 schema 15 / Runtime Contract epoch 4 最终 Runtime，在精确 v0.4.8 service 仍然是 source 时调用已经验收过的 major migration，然后由新的 Runtime 对已有 Cloudflare Worker 做原地 reconcile。
+
+Worker name 与公网 origin 保持不变；Durable Objects、secrets、已知可选 binding、已 enrollment 设备、OAuth issuer 和 Connector records 都保留。同一次 update job 中可能自动打开 Cloudflare 授权页面。若多个可访问 Cloudflare Account 都存在同名 Worker，则 fail-closed，用户可用非秘密的 `CLOUDFLARE_ACCOUNT_ID` 消歧。如果 v0.4.8 前台 updater 的有界等待先结束，而浏览器授权仍在进行，detached migration 会继续执行；不要求用户再输入第二条 update 命令。
+
+迁移前会保存精确 v0.4.8 binary 与 schema-5 数据库 snapshot 作为 N-1 rollback material。如必须回退，显式使用 `herdr-mcp update major-rollback`。`update major-apply` 继续作为 bridge 内部及维护者恢复/UAT 的底层 primitive，不再是普通 v0.4.8 用户的升级步骤。
+
 ## `herdr-self-update` 适合做什么
 
 `bin/herdr-self-update` 是受监督升级入口，它复用 generation 机制，而不是原地覆盖当前 active runtime。

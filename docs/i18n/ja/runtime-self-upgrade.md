@@ -234,6 +234,20 @@ activate
 - activation 後: rollback を評価する
 - mutation の delivery が不確実: 先に確認し、盲目的に繰り返さない
 
+## 既存 v0.4.8 から 1.0 へのワンコマンドアップグレード
+
+通常の enrolled user が実行するのは 1 コマンドだけです。
+
+```bash
+herdr-mcp update
+```
+
+ユーザーが 1.0 binary を手動ダウンロードしたり、`update major-apply` を直接実行したり、Worker を作り直したり、device を再 pair したり、ChatGPT Connector を追加し直す必要はありません。immutable な v0.4.8 updater は、schema 5 / Runtime epoch 2 の identity を保つ v0.4.9 migration bridge を最初に発見します。bridge は元の update job の detached worker としてだけ動き、成功経路では v0.4.9 を production service として install しません。互換性のある schema 15 / Runtime Contract epoch 4 Runtime を download/attest し、正確な v0.4.8 service が source のまま qualified major migration を実行した後、新 Runtime が既存 Cloudflare Worker を in-place reconcile します。
+
+Worker name と public origin は変わらず、Durable Objects、secrets、既知の optional binding、enrolled devices、OAuth issuer、Connector records を保持します。同じ update job の中で Cloudflare authorization が browser に開く場合があります。複数の accessible Cloudflare account に同名 Worker がある場合は fail-closed し、non-secret の `CLOUDFLARE_ACCOUNT_ID` で明示的に disambiguate できます。v0.4.8 foreground updater の bounded watch が先に終了しても、authorization 中の detached migration は継続するため、2 回目の update command は不要です。
+
+migration 前には exact v0.4.8 binary と schema-5 database snapshot を N-1 rollback material として保存します。必要な場合の recovery command は `herdr-mcp update major-rollback` です。`update major-apply` は bridge 内部および maintainer recovery/UAT 用 primitive として残りますが、通常の v0.4.8 user の手順ではありません。
+
 ## `herdr-self-update`
 
 `bin/herdr-self-update` は generation の仕組みを使用します。

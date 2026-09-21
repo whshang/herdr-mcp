@@ -61,7 +61,11 @@ jobs:
           fi
           source_state_schema="$(git show "${source_digest}:crates/herdr-mcp/src/state_store.rs" | sed -nE 's/^pub const SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' | head -n1)"
           [[ "$source_state_schema" =~ ^[0-9]+$ ]] || { echo "cannot read source state schema" >&2; exit 1; }
-          source_contract="$(git show "${source_digest}:contracts/epoch2.json")"
+          if git cat-file -e "${source_digest}:contracts/runtime-exec-v4.json" 2>/dev/null; then
+            source_contract="$(git show "${source_digest}:contracts/runtime-exec-v4.json")"
+          else
+            source_contract="$(git show "${source_digest}:contracts/epoch2.json")"
+          fi
           source_contract_epoch="$(jq -r '.contract_epoch' <<<"$source_contract")"
           source_contract_hash="$(jq -r '.contract_hash' <<<"$source_contract")"
           source_tool_count="$(jq -r '.tool_count' <<<"$source_contract")"
@@ -155,7 +159,16 @@ jobs:
           from urllib.parse import quote
 
           root = Path("release-assets")
-          manifest_path = root / "release-manifest.json"
+          runtime_manifest = root / "runtime-manifest.json"
+          legacy_manifest = root / "release-manifest.json"
+          if runtime_manifest.is_file():
+              manifest_path = runtime_manifest
+              manifest_mode = "runtime"
+          elif legacy_manifest.is_file():
+              manifest_path = legacy_manifest
+              manifest_mode = "legacy"
+          else:
+              raise SystemExit("release bundle has no runtime-manifest.json or release-manifest.json")
           manifest = json.loads(manifest_path.read_text())
           repo = os.environ["GH_REPO"]
           tag = os.environ["TAG"]
@@ -207,7 +220,16 @@ jobs:
           assets = manifest.get("assets") or []
           if len(assets) != len(targets) or {asset.get("target") for asset in assets} != set(targets):
               raise SystemExit("release manifest targets do not match tagged target contract")
-          expected = {"release-manifest.json"}
+          if manifest_mode == "runtime":
+              expected = {"runtime-manifest.json"}
+              if "-" in tag:
+                  if not legacy_manifest.is_file() or legacy_manifest.read_bytes() != manifest_path.read_bytes():
+                      raise SystemExit("prerelease legacy manifest alias is missing or differs from runtime manifest")
+                  expected.add("release-manifest.json")
+              elif legacy_manifest.exists():
+                  raise SystemExit("stable 1.0+ release must not publish release-manifest.json")
+          else:
+              expected = {"release-manifest.json"}
           for asset in assets:
               target = asset["target"]
               name = asset["name"]

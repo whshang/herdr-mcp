@@ -728,14 +728,14 @@ pub(crate) fn update_existing_worker_for_release(
     let bundle = prepare_edge_bundle(source_commit, target_version)?;
     let (token, refresh_token) = acquire_cloudflare_credential()?;
     let cloudflare = Cloudflare::new(&token)?;
-    let account = select_account(&cloudflare)?;
+    let account = select_existing_worker_account(&cloudflare, &current.worker_name)?;
     let scripts = cloudflare.scripts(&account.id)?;
     if !scripts
         .iter()
         .any(|script| script.name == current.worker_name)
     {
         return Err(format!(
-            "the selected Cloudflare account does not contain the health-proven Herdr Worker '{}'; no mutation was attempted",
+            "the resolved Cloudflare account does not contain the health-proven Herdr Worker '{}'; no mutation was attempted",
             current.worker_name
         ));
     }
@@ -1460,8 +1460,53 @@ where
     Ok(())
 }
 
-fn select_account(cloudflare: &Cloudflare<'_>) -> Result<Account, String> {
-    select_account_for_locale(cloudflare, Locale::En)
+fn select_existing_worker_account(
+    cloudflare: &Cloudflare<'_>,
+    worker_name: &str,
+) -> Result<Account, String> {
+    let accounts = cloudflare.accounts()?;
+    if accounts.is_empty() {
+        return Err("Cloudflare authorization can access no accounts".to_owned());
+    }
+    if let Ok(selected) = std::env::var("CLOUDFLARE_ACCOUNT_ID") {
+        let account = accounts
+            .into_iter()
+            .find(|account| account.id == selected)
+            .ok_or_else(|| {
+                "CLOUDFLARE_ACCOUNT_ID is not accessible with this temporary credential".to_owned()
+            })?;
+        let scripts = cloudflare.scripts(&account.id)?;
+        if scripts.iter().any(|script| script.name == worker_name) {
+            return Ok(account);
+        }
+        return Err(format!(
+            "CLOUDFLARE_ACCOUNT_ID does not contain the health-proven Herdr Worker '{worker_name}'; no mutation was attempted"
+        ));
+    }
+
+    let mut matches = Vec::new();
+    for account in accounts {
+        let scripts = cloudflare.scripts(&account.id)?;
+        if scripts.iter().any(|script| script.name == worker_name) {
+            matches.push(account);
+        }
+    }
+    choose_unique_worker_account(matches, worker_name)
+}
+
+fn choose_unique_worker_account(
+    matches: Vec<Account>,
+    worker_name: &str,
+) -> Result<Account, String> {
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("one account")),
+        0 => Err(format!(
+            "no accessible Cloudflare account contains the health-proven Herdr Worker '{worker_name}'; no mutation was attempted"
+        )),
+        count => Err(format!(
+            "{count} accessible Cloudflare accounts contain Worker '{worker_name}'; set non-secret CLOUDFLARE_ACCOUNT_ID and rerun"
+        )),
+    }
 }
 
 fn select_account_for_locale(
@@ -1560,15 +1605,7 @@ fn prepare_edge_bundle(source_commit: &str, runtime_version: &str) -> Result<Edg
         .user_agent(format!("herdr-mcp-bootstrap/{runtime_version}"))
         .build()
         .map_err(|error| format!("cannot create Edge release download client: {error}"))?;
-    let manifest_url = format!(
-        "https://github.com/{}/releases/download/{tag}/release-manifest.json",
-        release_trust::RELEASE_REPOSITORY
-    );
-    let manifest_bytes = read_http_bounded(
-        client.get(&manifest_url),
-        EDGE_MANIFEST_MAX_BYTES,
-        "release manifest",
-    )?;
+    let manifest_bytes = read_runtime_release_manifest(&client, &tag)?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("release manifest is invalid JSON: {error}"))?;
     let descriptor = parse_edge_release_manifest(&manifest, source_commit, runtime_version)?;
@@ -1696,9 +1733,41 @@ fn read_http_bounded(
     max_bytes: usize,
     label: &str,
 ) -> Result<Vec<u8>, String> {
-    let mut response = request
+    let response = request
         .send()
         .map_err(|error| format!("{label} download failed: {error}"))?;
+    read_http_response_bounded(response, max_bytes, label)
+}
+
+fn read_runtime_release_manifest(
+    client: &reqwest::blocking::Client,
+    tag: &str,
+) -> Result<Vec<u8>, String> {
+    for (index, name) in ["runtime-manifest.json", "release-manifest.json"]
+        .into_iter()
+        .enumerate()
+    {
+        let url = format!(
+            "https://github.com/{}/releases/download/{tag}/{name}",
+            release_trust::RELEASE_REPOSITORY
+        );
+        let response = client
+            .get(&url)
+            .send()
+            .map_err(|error| format!("release manifest download failed: {error}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND && index == 0 {
+            continue;
+        }
+        return read_http_response_bounded(response, EDGE_MANIFEST_MAX_BYTES, "release manifest");
+    }
+    Err("release has neither runtime-manifest.json nor release-manifest.json".to_owned())
+}
+
+fn read_http_response_bounded(
+    mut response: reqwest::blocking::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
     if !response.status().is_success() {
         return Err(format!(
             "{label} download returned HTTP {}",
@@ -3908,6 +3977,39 @@ mod tests {
         assert!(!worker_update_channel_allowed("dev", false));
         assert!(worker_update_channel_allowed("dev", true));
         assert!(!worker_update_channel_allowed("preview", true));
+    }
+
+    #[test]
+    fn worker_update_auto_selects_only_a_unique_health_proven_account() {
+        let account = Account {
+            id: "0123456789abcdef0123456789abcdef".to_owned(),
+            name: "Primary".to_owned(),
+        };
+        assert_eq!(
+            choose_unique_worker_account(vec![account.clone()], "herdr-worker")
+                .unwrap()
+                .id,
+            account.id
+        );
+        assert!(
+            choose_unique_worker_account(Vec::new(), "herdr-worker")
+                .unwrap_err()
+                .contains("no accessible Cloudflare account")
+        );
+        assert!(
+            choose_unique_worker_account(
+                vec![
+                    account.clone(),
+                    Account {
+                        id: "fedcba9876543210fedcba9876543210".to_owned(),
+                        name: "Secondary".to_owned(),
+                    },
+                ],
+                "herdr-worker",
+            )
+            .unwrap_err()
+            .contains("set non-secret CLOUDFLARE_ACCOUNT_ID")
+        );
     }
 
     #[test]
