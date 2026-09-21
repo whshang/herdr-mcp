@@ -828,6 +828,7 @@ pub struct WorkMemorySearchHit {
     pub source_kind: String,
     pub source_id: String,
     pub excerpt: String,
+    pub strict_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2920,6 +2921,7 @@ impl StateStore {
                     source_kind: row.get(0)?,
                     source_id: row.get(1)?,
                     excerpt: row.get(2)?,
+                    strict_match: true,
                 })
             })
             .map_err(|error| format!("cannot query work memory search: {error}"))?;
@@ -3062,6 +3064,7 @@ impl StateStore {
                         source_kind: row.get(0)?,
                         source_id: row.get(1)?,
                         excerpt: row.get(2)?,
+                        strict_match: true,
                     })
                 },
             )
@@ -3104,6 +3107,57 @@ impl StateStore {
             has_more,
             has_portable_source_claims,
         }))
+    }
+
+    pub fn work_memory_relaxed_candidates(
+        &self,
+        query: &str,
+        boundary: &WorkMemorySearchBoundary,
+        limit: usize,
+    ) -> Result<Vec<WorkMemorySearchHit>, String> {
+        let (strict_query, relaxed_query) = work_memory_fts_queries(query)?;
+        if strict_query == relaxed_query {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit.clamp(1, 20)).unwrap_or(20);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_kind, source_id,
+                        snippet(continuity_memory_fts, 3, '', '', '…', 24)
+                 FROM continuity_memory_fts
+                 WHERE continuity_memory_fts MATCH ?1 AND continuity_id = ?2
+                   AND rowid <= ?3
+                   AND rowid NOT IN (
+                       SELECT rowid FROM continuity_memory_fts
+                       WHERE continuity_memory_fts MATCH ?4 AND continuity_id = ?2
+                         AND rowid <= ?3
+                   )
+                 ORDER BY rowid DESC
+                 LIMIT ?5",
+            )
+            .map_err(|error| format!("cannot prepare relaxed work memory candidates: {error}"))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    relaxed_query,
+                    boundary.continuity_id,
+                    boundary.max_fts_rowid,
+                    strict_query,
+                    limit
+                ],
+                |row| {
+                    Ok(WorkMemorySearchHit {
+                        source_kind: row.get(0)?,
+                        source_id: row.get(1)?,
+                        excerpt: row.get(2)?,
+                        strict_match: false,
+                    })
+                },
+            )
+            .map_err(|error| format!("cannot query relaxed work memory candidates: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode relaxed work memory candidates: {error}"))
     }
 
     pub fn register_browser_endpoint(
@@ -6495,20 +6549,28 @@ fn qualified_work_memory_message_id(
 }
 
 fn work_memory_fts_query(query: &str) -> Result<String, String> {
+    work_memory_fts_queries(query).map(|(strict, _)| strict)
+}
+
+fn work_memory_fts_queries(query: &str) -> Result<(String, String), String> {
     let query = query.trim();
     if query.is_empty() || query.len() > 512 || query.chars().any(char::is_control) {
         return Err("work_memory_query_invalid".to_owned());
     }
-    let tokens = query
-        .split_whitespace()
-        .filter(|token| !token.is_empty())
-        .take(16)
-        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
-        .collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    for token in query.split_whitespace().filter(|token| !token.is_empty()) {
+        let token = format!("\"{}\"", token.replace('"', "\"\""));
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+        if tokens.len() == 16 {
+            break;
+        }
+    }
     if tokens.is_empty() {
         return Err("work_memory_query_invalid".to_owned());
     }
-    Ok(tokens.join(" AND "))
+    Ok((tokens.join(" AND "), tokens.join(" OR ")))
 }
 
 fn bounded_continuity_excerpt(text: &str) -> String {
@@ -9385,6 +9447,73 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].source_kind, "evidence");
         assert_eq!(hits[0].source_id, ranked_evidence.evidence_id);
+    }
+
+    #[test]
+    fn work_memory_relaxed_candidates_do_not_change_authoritative_search() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:relaxed",
+                project_ref: "project:relaxed",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: "wc_ffffffffffffffffffffffffffffffff",
+                provider: "chatgpt",
+                account_ref: None,
+                space_ref: None,
+                session_ref: "relaxed-session",
+                bound_at: 1,
+            })
+            .unwrap();
+        let (strict, release_only, gate_only) = {
+            let mut append = |content, created_at| {
+                store
+                    .append_work_memory_evidence(WorkMemoryEvidenceInput {
+                        continuity_id: "wm:relaxed",
+                        kind: "result",
+                        content,
+                        provider: None,
+                        account_ref: None,
+                        space_ref: None,
+                        session_ref: None,
+                        portable_source: None,
+                        created_at,
+                    })
+                    .unwrap()
+            };
+            (
+                append("release gate passed", 2),
+                append("release pending", 3),
+                append("gate timeout", 4),
+            )
+        };
+
+        let page = store
+            .work_memory_search_page(
+                "project:relaxed",
+                "github.com/whshang/herdr-mcp",
+                "wc_ffffffffffffffffffffffffffffffff",
+                "release gate",
+                WorkMemorySearchPageOptions {
+                    limit: 2,
+                    offset: 0,
+                    expected_boundary: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].source_id, strict.evidence_id);
+        assert!(page.hits[0].strict_match);
+        assert!(!page.has_more);
+
+        let relaxed = store
+            .work_memory_relaxed_candidates("release gate", &page.boundary, 2)
+            .unwrap();
+        assert_eq!(relaxed.len(), 2);
+        assert_eq!(relaxed[0].source_id, gate_only.evidence_id);
+        assert_eq!(relaxed[1].source_id, release_only.evidence_id);
+        assert!(relaxed.iter().all(|hit| !hit.strict_match));
     }
 
     #[cfg(unix)]
