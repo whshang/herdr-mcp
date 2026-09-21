@@ -18,7 +18,7 @@
 |---|---|---|
 | HUD / Continuity | このページは何をしていて、Herdr は何をしていて、Auto と 3 つのプリセット会話アクションのどれを実行すべきか | 対応する Web AI ページ内 |
 | Control Center | どの Project / conversation がアクティブタブで、何にバインドされ、ローカルで何が起きていて、どのペインが明示的なターゲットか | Chrome Side Panel |
-| Options | 低頻度の timing / semantic Provider / 言語設定は何を適用すべきか | Control Center の Settings（設定） |
+| Options | 低頻度の timing / 言語 / integration 設定は何を適用すべきか | Control Center の Settings（設定） |
 
 HUD は意図的に**第 2 のコントロールパネルではありません**。no drawer（引き出し）も workspace picker も binding エディタも timing フォームもローカル Herdr mutation コントロールも持ちません。表示するのは Web 状態、Herdr 状態、コンパクトな binding バッジ 1 つ（`🔗N`）、Auto、3 つのプリセット進行アクション、そして Manual handoff です。これらのアクションが現在の Web 会話に対して作用するからです。ペインと Agent の詳細は Control Center 側に留まります。
 

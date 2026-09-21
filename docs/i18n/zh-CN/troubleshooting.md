@@ -209,7 +209,7 @@ ChatGPT → workstation
 2. 当前 conversation 已注册出稳定 `browser_session_ref` 并绑定正确 workspace；
 3. 相应 Auto scope 已开启；
 4. `herdr_mcp.agent.task.inbox` 中该 task 已 terminal 且未 acknowledged；
-5. 若还有 sibling task 正在运行，Jev 可能建议聚合后再唤醒；`blocked` / `failed` 或 `needs_human` 等高优先级结果会优先唤醒。Jev 未配置、超时或报错时，确定性 terminal notification 仍会继续。
+5. 需要 Parent guidance 时用 `advisory=true` 读取 inbox。只有存在未 acknowledge 的 terminal work 时，Runtime 才对冻结的 child batch 最多做一次 attention 判断；`verify_completion` 表示进入确定性 validation，`continue_unobserved` 表示让独立运行的 sibling 继续。Jev 未配置、超时或报错都不会抑制确定性 terminal wake，Browser 也不再有第二层 semantic wait loop。
 
 HUD 手动继续仍保留为显式兜底。详见 [浏览器连续工作](browser-continuity.md)。
 

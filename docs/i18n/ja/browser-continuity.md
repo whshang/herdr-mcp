@@ -286,7 +286,7 @@ z.ai と DeepSeek の Auto は Herdr の progress/settled wake 挙動だけを�
 
 ChatGPT が `herdr_prompt` で長時間のローカル Agent task を dispatch すると、安定した browser session identity がリクエストと一緒に Runtime へ渡ります。Runtime は直ちに `task_id / dispatch_id / turn_id` を返し、その後 terminal result を durable parent inbox に保存します。拡張は Herdr settled event を低コストな trigger として使い続けますが、task ownership、`completed / blocked / failed`、Jev advisory、HUD task counter の権威は session-scoped inbox です。現在の `browser_session_ref` が所有する task だけがその conversation を wake できます。wake 配送が成功した後だけ acknowledge するため、拡張のオフラインや wake 失敗時も durable result は inbox に残ります。
 
-fan-out では Jev の高速結果が集約を助言できます。sibling task がまだ running で、得られた advisory が明確に非緊急なら後続 terminal とまとめて通知できます。`blocked / failed`、`needs_human` などの緊急結果は優先して wake します。Jev が未設定、失敗、短い grace 内に返らない場合は deterministic terminal wake に fail-open し、semantic inference の待機で Parent を再びブロックしません。
+inbox に未 acknowledge の terminal work がある場合、Runtime は scope 内の child summary を最大 16 件 freeze し、active sibling も含めて一度だけ `agent.attention.advise` を評価できます。結果は Parent 向け guidance として inbox に添付され、`verify_completion` は deterministic validation へ、`continue_unobserved` は独立して running 中の sibling をそのままにし、human/blocker/drift state は次の観測方向だけを決めます。terminal fact はそのまま Parent を wake し、Browser は二重の semantic grace 待ちや独自 probability threshold を持ちません。Jev が未設定、遅延、malformed、error の場合も同じ deterministic terminal wake を続行します。
 
 ## turn 終了時の意味判定
 

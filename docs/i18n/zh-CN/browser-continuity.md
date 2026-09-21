@@ -327,7 +327,7 @@ z.ai / DeepSeek 的 Auto 只负责 Herdr progress / settled 回推；ChatGPT 专
 
 ChatGPT 通过 `herdr_prompt` 派出本地 Agent 长任务时，当前 WebChat 的稳定 browser session identity 会跟随请求进入 Runtime。Runtime 立即返回 `task_id / dispatch_id / turn_id`，并把后续 terminal 写入 durable parent inbox。扩展仍以 Herdr settled event 作为低成本触发信号，但真正的任务归属、`completed / blocked / failed`、Jev advisory 和 HUD task counters 都从 session-scoped inbox 读取；只有属于当前 `browser_session_ref` 的 task 才能唤醒当前会话。成功发送 wake 后才 acknowledge 对应 task，扩展离线或 wake 失败时结果继续留在 inbox。
 
-多子任务时，Jev 的快速结果可以建议聚合：如果还有 sibling 在运行且已得到明确非紧急 advisory，可以先保留结果，等后续 terminal 合并通知；`blocked / failed`、`needs_human` 等紧急结果优先唤醒。若 Jev 尚未快速返回、未配置或失败，则 fail-open 到确定性 terminal wake，不会因为语义服务等待而把 Parent 再次卡住。
+当 inbox 出现未 acknowledge 的 terminal work 时，Runtime 可以把当前 scope 内最多 16 个 child summary 连同仍在运行的 sibling 一次冻结，并只做一次 `agent.attention.advise`。结果作为 Parent guidance 附在 inbox 上：`verify_completion` 进入确定性 validation，`continue_unobserved` 让独立运行的 sibling 继续，human/blocker/drift 状态只决定下一步观察方向。terminal fact 本身仍立即触发 Parent wake；Browser 不再增加第二次 semantic grace 等待，也不维护自己的概率阈值。Jev 未配置、超时、返回异常或 provider 失败时，继续走同一条确定性 terminal wake。
 
 ## ChatGPT 回复结束后的语义判断
 
