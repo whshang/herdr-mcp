@@ -141,7 +141,7 @@ test("Grok adapter uses bounded semantic composer, turn, and generation selector
   );
 });
 
-test("Grok adapter keeps synthetic turn refs stable across response-wrapper replacement", () => {
+test("user keeps stable Grok turn identity | Given response wrappers are replaced | When the adapter snapshots the same transcript positions | Then synthetic refs stay stable", () => {
   const h = harness();
   const userContainer = element({ attrs: { id: "response-11111111-2222-4333-8444-555555555555" } });
   const assistantContainer = element({ attrs: { id: "response-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } });
@@ -198,7 +198,7 @@ test("Grok adapter hashes same-origin session userId before returning native ide
   assert.equal(await h.adapter.getAccountNativeIdentity(), null);
 });
 
-test("Grok adapter reports one exact settled result for the accepted user turn", () => {
+test("user gets one exact Grok settled result | Given one accepted user turn | When the matching assistant result finishes | Then settlement links the exact user and assistant refs", () => {
   const h = harness();
   const userContainer = element({ attrs: { id: "response-11111111-2222-4333-8444-555555555555" } });
   const assistantContainer = element({ attrs: { id: "response-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } });
@@ -232,7 +232,7 @@ test("Grok adapter reports one exact settled result for the accepted user turn",
   assert.equal(h.adapter.getResultSettlementSnapshot("different-user"), null);
 });
 
-test("Grok adapter settles the accepted turn after a newer turn is rendered", () => {
+test("user recovers an older Grok settled result | Given a newer turn is already rendered | When settlement checks the accepted historical turn | Then it returns the matching historical assistant", () => {
   const h = harness();
   const acceptedUser = element({
     text: "accepted prompt",
