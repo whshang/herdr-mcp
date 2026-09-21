@@ -455,20 +455,20 @@ fn semantic_cleanup_advisory(preview: &Value) -> Value {
             }));
         }
     }
-    if items.len() < MAX_ITEMS {
-        if let Some(branches) = preview.get("branches").and_then(Value::as_array) {
-            for branch in branches.iter().take(MAX_ITEMS - items.len()) {
-                items.push(json!({
-                    "kind": "branch",
-                    "label": branch.get("name").and_then(Value::as_str).unwrap_or_default(),
-                    "reachable_from_target": branch.get("reachable_from_target"),
-                    "open_pr_count": branch.get("open_pr_refs").and_then(Value::as_array).map(Vec::len),
-                    "checked_out_count": branch.get("checked_out_in").and_then(Value::as_array).map(Vec::len),
-                    "remote_ref_fresh": branch.get("remote_ref_fresh"),
-                    "safe_to_delete": branch.get("safe_to_delete"),
-                    "reasons": branch.get("reasons"),
-                }));
-            }
+    if items.len() < MAX_ITEMS
+        && let Some(branches) = preview.get("branches").and_then(Value::as_array)
+    {
+        for branch in branches.iter().take(MAX_ITEMS - items.len()) {
+            items.push(json!({
+                "kind": "branch",
+                "label": branch.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "reachable_from_target": branch.get("reachable_from_target"),
+                "open_pr_count": branch.get("open_pr_refs").and_then(Value::as_array).map(Vec::len),
+                "checked_out_count": branch.get("checked_out_in").and_then(Value::as_array).map(Vec::len),
+                "remote_ref_fresh": branch.get("remote_ref_fresh"),
+                "safe_to_delete": branch.get("safe_to_delete"),
+                "reasons": branch.get("reasons"),
+            }));
         }
     }
     if items.is_empty() {

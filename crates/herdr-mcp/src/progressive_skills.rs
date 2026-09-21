@@ -3276,10 +3276,14 @@ mod tests {
 
     fn write_semantic_test_config(config_dir: &std::path::Path, url: &str) {
         let path = config_dir.join("config.json");
+        let route_name = config_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("semantic-test");
         std::fs::write(
             &path,
             format!(
-                r#"{{"semantic":{{"routes":[{{"name":"test","protocol":"decision","url":"{url}","model":"jev-test","api_key":"test"}}]}}}}"#
+                r#"{{"semantic":{{"routes":[{{"name":"{route_name}","protocol":"decision","url":"{url}","model":"jev-test","api_key":"test"}}]}}}}"#
             ),
         )
         .unwrap();
