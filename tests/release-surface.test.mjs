@@ -149,7 +149,7 @@ test("pinned Herdr bootstrap supports CI Linux and local macOS", async () => {
   assert.match(gate, /export PATH="\$\{HERDR_INSTALL_DIR\}:\$\{PATH\}"/);
 });
 
-test("Herdr dependency recovery stays internal and is installed on both install and updater paths", async () => {
+test("migration bridge keeps Herdr recovery internal and delegates activation to the final Runtime", async () => {
   const cli = await readFile(join(ROOT, "crates/herdr-mcp/src/cli.rs"), "utf8");
   const supervisor = await readFile(join(ROOT, "crates/herdr-mcp/src/herdr_supervisor.rs"), "utf8");
   const updater = await readFile(join(ROOT, "crates/herdr-mcp/src/updater.rs"), "utf8");
@@ -161,7 +161,10 @@ test("Herdr dependency recovery stays internal and is installed on both install 
   assert.match(supervisor, /KeepAlive/);
   assert.match(supervisor, /ThrottleInterval/);
   assert.doesNotMatch(supervisor, /"StartInterval"/);
-  assert.match(updater, /service_lifecycle::run\(ServiceCommand::Install/);
+  assert.match(updater, /run_major_update_bridge/);
+  assert.match(updater, /&\["update", "major-apply"\]/);
+  assert.match(updater, /&\["worker", "update"\]/);
+  assert.doesNotMatch(updater, /service_lifecycle::run\(ServiceCommand::Install/);
   assert.match(runtimeMeta, /MIGRATED_TOOLS: \[&str; 18\]/);
   assert.doesNotMatch(runtimeMeta, /herdr_supervisor/);
 });
@@ -182,13 +185,15 @@ test("request child lifecycle persists only ownership metadata and reaps confirm
   assert.doesNotMatch(children, /get_args\(/, "persistent child ownership must not record request arguments");
 });
 
-test("service lifecycle keeps Herdr supervisor transactional across install update rollback and uninstall", async () => {
+test("service lifecycle stays authoritative while the migration bridge never installs itself", async () => {
   const main = await readFile(join(ROOT, "crates/herdr-mcp/src/main.rs"), "utf8");
   const updater = await readFile(join(ROOT, "crates/herdr-mcp/src/updater.rs"), "utf8");
   const lifecycle = await readFile(join(ROOT, "crates/herdr-mcp/src/service_lifecycle.rs"), "utf8");
   const supervisor = await readFile(join(ROOT, "crates/herdr-mcp/src/herdr_supervisor.rs"), "utf8");
   assert.match(main, /Command::Service\(command\) => service_lifecycle::run\(command\)/);
-  assert.match(updater, /service_lifecycle::run\(ServiceCommand::Install/);
+  assert.match(updater, /run_external_runtime_command/);
+  assert.match(updater, /&\["update", "major-apply"\]/);
+  assert.doesNotMatch(updater, /service_lifecycle::run\(ServiceCommand::Install/);
   assert.doesNotMatch(updater, /herdr_supervisor::ensure_installed_for_service/);
   assert.match(lifecycle, /fn run_install_lifecycle<Install>\(install: Install\)/);
   assert.match(lifecycle, /Install: FnOnce\(&service_manager::ServiceMutationLease\) -> Result<ExitCode, String>/);

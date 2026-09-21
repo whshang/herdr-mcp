@@ -6,8 +6,6 @@
 //! worker. The worker reuses `service install`, which already owns generation
 //! staging, health verification, automatic rollback, and service evidence.
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::cli::ServiceCommand;
 use crate::cli::UpdateCommand;
 use crate::config::{Config, UpdateChannel};
 use crate::contract;
@@ -42,6 +40,13 @@ use std::os::unix::process::CommandExt;
 
 const DEFAULT_RELEASES_API_URL: &str =
     "https://api.github.com/repos/whshang/herdr-mcp/releases?per_page=20";
+const RUNTIME_MANIFEST_NAME: &str = "runtime-manifest.json";
+const LEGACY_MANIFEST_NAME: &str = "release-manifest.json";
+const MAJOR_TARGET_SCHEMA: i64 = 15;
+const MAJOR_TARGET_CONTRACT_EPOCH: u32 = 4;
+const MAJOR_TARGET_TOOL_COUNT: u32 = 18;
+const MAJOR_TARGET_CONTRACT_HASH: &str =
+    "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135";
 const RELEASES_MAX_BYTES: usize = 1024 * 1024;
 const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 const ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -70,6 +75,18 @@ struct ReleaseAsset {
 struct ReleasePlan {
     version: Version,
     tag: String,
+    identity: ReleaseIdentity,
+    asset: ReleaseAsset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeTransitionPlan {
+    version: Version,
+    tag: String,
+    state_schema: i64,
+    contract_epoch: u32,
+    contract_hash: String,
+    contract_tool_count: u32,
     identity: ReleaseIdentity,
     asset: ReleaseAsset,
 }
@@ -428,10 +445,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = job_id;
-        Err(
-            "native update worker is currently supported on macOS and Linux service managers"
-                .to_owned(),
-        )
+        Err("the v0.4.9 migration bridge is supported on macOS and Linux".to_owned())
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -450,27 +464,27 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
                 job.state
             ));
         }
-        let binary = PathBuf::from(&job.binary_path);
-        if !binary_is_confined(&paths, &binary, job_id) {
+        let bridge_binary = PathBuf::from(&job.binary_path);
+        if !binary_is_confined(&paths, &bridge_binary, job_id) {
             store.update_update_job(
                 job_id,
                 "failed",
-                Some("staged binary escaped update job directory"),
+                Some("staged migration bridge escaped update job directory"),
                 None,
                 now_ms_i64(),
             )?;
-            return Err("staged update binary is outside its job directory".to_owned());
+            return Err("staged migration bridge is outside its job directory".to_owned());
         }
-        verify_staged_file(&binary, &job.sha256)?;
+        verify_staged_file(&bridge_binary, &job.sha256)?;
         probe_candidate_binary(
-            &binary,
+            &bridge_binary,
             &Version::parse(&job.version)
                 .map_err(|_| "durable update job contains an invalid version".to_owned())?,
         )?;
         store.update_update_job(
             job_id,
             "installing",
-            Some("candidate verified; service install and health gate started"),
+            Some("migration bridge verified; locating the final stable Runtime release"),
             None,
             now_ms_i64(),
         )?;
@@ -479,36 +493,485 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             store.update_update_job(
                 job_id,
                 "failed",
-                Some("service uninstall fence blocked update activation"),
+                Some("service uninstall fence blocked major upgrade"),
                 None,
                 now_ms_i64(),
             )?;
-            cleanup_staging(&binary);
+            cleanup_bridge_staging(&bridge_binary, None);
             return Err(error);
         }
 
-        let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
-        let succeeded = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
-        if succeeded {
-            store.update_update_job(
-                job_id,
-                "succeeded",
-                Some("service install committed and health gate passed"),
-                None,
-                now_ms_i64(),
-            )?;
-            cleanup_staging(&binary);
-            Ok(ExitCode::SUCCESS)
-        } else {
-            let detail = match &install {
-                Ok(_) => "service install returned non-zero",
-                Err(_) => "service install failed; service manager rollback policy applied",
-            };
-            store.update_update_job(job_id, "failed", Some(detail), None, now_ms_i64())?;
-            cleanup_staging(&binary);
-            install
+        let result = run_major_update_bridge(&paths, &store, job_id, &bridge_binary);
+        match result {
+            Ok(version) => {
+                store.update_update_job(
+                    job_id,
+                    "succeeded",
+                    Some(&format!(
+                        "Runtime {version}, existing Worker, service and Link verified"
+                    )),
+                    None,
+                    now_ms_i64(),
+                )?;
+                cleanup_bridge_staging(&bridge_binary, None);
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                let detail = if active_runtime_uses_schema_15(&paths) {
+                    format!(
+                        "Runtime major upgrade committed but final reconciliation failed: {error}; rollback remains available with `herdr-mcp update major-rollback`; retry Edge reconciliation with `herdr-mcp worker update`"
+                    )
+                } else {
+                    format!(
+                        "migration bridge failed before a verified 1.0 activation: {error}; the v0.4.8 Runtime remains authoritative"
+                    )
+                };
+                let _ =
+                    store.update_update_job(job_id, "failed", Some(&detail), None, now_ms_i64());
+                cleanup_bridge_staging(&bridge_binary, None);
+                Err(error)
+            }
         }
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_major_update_bridge(
+    paths: &RuntimePaths,
+    store: &UpdateStore,
+    job_id: &str,
+    bridge_binary: &Path,
+) -> Result<String, String> {
+    let plan = fetch_runtime_transition_plan()?;
+    store.update_update_job(
+        job_id,
+        "installing",
+        Some(&format!(
+            "verified release metadata for {}; downloading and attesting the final Runtime",
+            plan.version
+        )),
+        None,
+        now_ms_i64(),
+    )?;
+    let target_binary = stage_runtime_transition(bridge_binary, &plan)?;
+    let result = (|| {
+        probe_runtime_transition_binary(&target_binary, &plan)?;
+        store.update_update_job(
+            job_id,
+            "installing",
+            Some(
+                "final Runtime verified; preserving the exact v0.4.8 binary and schema-5 snapshot before migration",
+            ),
+            None,
+            now_ms_i64(),
+        )?;
+        run_external_runtime_command(
+            &target_binary,
+            &["update", "major-apply"],
+            paths,
+            bridge_binary,
+            "major-apply",
+        )?;
+
+        let active = paths.config_dir.join("runtime/current/herdr-mcp");
+        probe_runtime_transition_binary(&active, &plan).map_err(|error| {
+            format!("major upgrade returned success but runtime/current is not the target: {error}")
+        })?;
+
+        store.update_update_job(
+            job_id,
+            "installing",
+            Some(
+                "Runtime migration succeeded; approve the Cloudflare page opened by Herdr to update the existing Worker in place",
+            ),
+            None,
+            now_ms_i64(),
+        )?;
+        run_external_runtime_command(
+            &active,
+            &["worker", "update"],
+            paths,
+            bridge_binary,
+            "worker-update",
+        )?;
+
+        store.update_update_job(
+            job_id,
+            "installing",
+            Some("Worker reconciled; verifying the active service and production Link"),
+            None,
+            now_ms_i64(),
+        )?;
+        run_external_runtime_command(
+            &active,
+            &["service", "status"],
+            paths,
+            bridge_binary,
+            "service-status",
+        )?;
+        run_external_runtime_command(
+            &active,
+            &["link", "status"],
+            paths,
+            bridge_binary,
+            "link-status",
+        )?;
+        Ok(plan.version.to_string())
+    })();
+    let _ = fs::remove_file(&target_binary);
+    result
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn fetch_runtime_transition_plan() -> Result<RuntimeTransitionPlan, String> {
+    let client = update_client()?;
+    if let Ok(raw) = env::var("HERDR_MCP_RUNTIME_MANIFEST_URL") {
+        let url = parse_update_url(&raw)?;
+        let subject = transition_manifest_subject(&url)?;
+        return fetch_runtime_transition_plan_from_url(&client, url, subject);
+    }
+
+    let releases_url = Url::parse(DEFAULT_RELEASES_API_URL)
+        .map_err(|_| "default GitHub releases API URL is invalid".to_owned())?;
+    let bytes = fetch_bounded(
+        &client,
+        releases_url,
+        RELEASES_MAX_BYTES,
+        "GitHub releases index",
+    )?;
+    let releases: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("GitHub releases index is invalid JSON: {error}"))?;
+    let releases = releases
+        .as_array()
+        .ok_or_else(|| "GitHub releases index must be a JSON array".to_owned())?;
+    let mut candidates = Vec::new();
+    for release in releases {
+        if release.get("draft").and_then(Value::as_bool) != Some(false) {
+            continue;
+        }
+        let Some(tag) = release.get("tag_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(text) = tag.strip_prefix('v') else {
+            continue;
+        };
+        let Ok(version) = Version::parse(text) else {
+            continue;
+        };
+        if !version.pre.is_empty() || version <= Version::parse(env!("CARGO_PKG_VERSION")).unwrap()
+        {
+            continue;
+        }
+        let has_runtime_manifest =
+            release
+                .get("assets")
+                .and_then(Value::as_array)
+                .is_some_and(|assets| {
+                    assets.iter().any(|asset| {
+                        asset.get("name").and_then(Value::as_str) == Some(RUNTIME_MANIFEST_NAME)
+                    })
+                });
+        if has_runtime_manifest {
+            candidates.push((version, tag.to_owned()));
+        }
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, tag) in candidates {
+        let url = Url::parse(&format!(
+            "https://github.com/{}/releases/download/{tag}/{RUNTIME_MANIFEST_NAME}",
+            release_trust::RELEASE_REPOSITORY
+        ))
+        .map_err(|_| "cannot construct Runtime manifest URL".to_owned())?;
+        let bytes = fetch_bounded(
+            &client,
+            url.clone(),
+            MANIFEST_MAX_BYTES,
+            "Runtime release manifest",
+        )?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Runtime release manifest is invalid JSON: {error}"))?;
+        if !runtime_manifest_is_bridge_compatible(&value) {
+            continue;
+        }
+        let plan = parse_runtime_transition_plan(&value, current_target()?)?;
+        let manifest_sha256 = sha256_bytes(&bytes);
+        verify_artifact_attestation(
+            &client,
+            RUNTIME_MANIFEST_NAME,
+            &manifest_sha256,
+            &plan.identity,
+        )?;
+        return Ok(plan);
+    }
+    Err(
+        "no attested stable Runtime release is compatible with the v0.4.8 -> v1.0 migration bridge"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn fetch_runtime_transition_plan_from_url(
+    client: &Client,
+    url: Url,
+    subject: &'static str,
+) -> Result<RuntimeTransitionPlan, String> {
+    let bytes = fetch_bounded(client, url, MANIFEST_MAX_BYTES, "Runtime release manifest")?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Runtime release manifest is invalid JSON: {error}"))?;
+    let plan = parse_runtime_transition_plan(&value, current_target()?)?;
+    let manifest_sha256 = sha256_bytes(&bytes);
+    verify_artifact_attestation(client, subject, &manifest_sha256, &plan.identity)?;
+    Ok(plan)
+}
+
+fn transition_manifest_subject(url: &Url) -> Result<&'static str, String> {
+    match url.path_segments().and_then(Iterator::last) {
+        Some(RUNTIME_MANIFEST_NAME) => Ok(RUNTIME_MANIFEST_NAME),
+        Some(LEGACY_MANIFEST_NAME) => Ok(LEGACY_MANIFEST_NAME),
+        _ => Err(format!(
+            "Runtime manifest override must end in {RUNTIME_MANIFEST_NAME} or {LEGACY_MANIFEST_NAME}"
+        )),
+    }
+}
+
+fn runtime_manifest_is_bridge_compatible(value: &Value) -> bool {
+    value.get("state_schema").and_then(Value::as_i64) == Some(MAJOR_TARGET_SCHEMA)
+        && value.pointer("/contract/epoch").and_then(Value::as_u64)
+            == Some(u64::from(MAJOR_TARGET_CONTRACT_EPOCH))
+        && value.pointer("/contract/hash").and_then(Value::as_str)
+            == Some(MAJOR_TARGET_CONTRACT_HASH)
+        && value
+            .pointer("/contract/tool_count")
+            .and_then(Value::as_u64)
+            == Some(u64::from(MAJOR_TARGET_TOOL_COUNT))
+}
+
+fn parse_runtime_transition_plan(
+    value: &Value,
+    target: &str,
+) -> Result<RuntimeTransitionPlan, String> {
+    if value.get("schema_version").and_then(Value::as_u64)
+        != Some(release_trust::MANIFEST_SCHEMA_VERSION)
+        || value.get("product").and_then(Value::as_str) != Some("herdr-mcp")
+    {
+        return Err("Runtime release manifest identity is invalid".to_owned());
+    }
+    if !runtime_manifest_is_bridge_compatible(value) {
+        return Err("Runtime release is outside the qualified v0.4.8 -> v1.0 bridge".to_owned());
+    }
+    let version_text = value
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Runtime release manifest is missing version".to_owned())?;
+    let version = Version::parse(version_text)
+        .map_err(|_| "Runtime release manifest version is not semver".to_owned())?;
+    if version <= Version::parse(env!("CARGO_PKG_VERSION")).unwrap() {
+        return Err("Runtime transition target is not newer than the migration bridge".to_owned());
+    }
+    let tag = value
+        .get("tag")
+        .and_then(Value::as_str)
+        .filter(|tag| *tag == format!("v{version}"))
+        .ok_or_else(|| "Runtime release manifest tag/version mismatch".to_owned())?
+        .to_owned();
+    let identity = release_trust::parse_manifest_identity(value, &tag)?;
+    let assets = value
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Runtime release manifest is missing assets".to_owned())?;
+    let matches = assets
+        .iter()
+        .filter(|asset| asset.get("target").and_then(Value::as_str) == Some(target))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "Runtime release manifest must contain exactly one asset for target {target}"
+        ));
+    }
+    let asset = matches[0];
+    let name = asset
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| valid_asset_name(name))
+        .ok_or_else(|| "Runtime release asset name is invalid".to_owned())?
+        .to_owned();
+    let size = asset
+        .get("size")
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0 && *size <= BINARY_MAX_BYTES)
+        .ok_or_else(|| "Runtime release asset size is invalid or too large".to_owned())?;
+    let sha256 = asset
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|hash| valid_sha256(hash))
+        .ok_or_else(|| "Runtime release asset sha256 is invalid".to_owned())?
+        .to_owned();
+    let raw_url = asset
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Runtime release asset URL is missing".to_owned())?;
+    let url = parse_update_url(raw_url)?;
+    let expected_url = Url::parse(&format!(
+        "https://github.com/{}/releases/download/{tag}/{name}",
+        identity.repository
+    ))
+    .map_err(|_| "cannot construct expected Runtime release URL".to_owned())?;
+    if url != expected_url {
+        return Err(
+            "Runtime release asset URL does not match trusted repository/tag/name".to_owned(),
+        );
+    }
+    Ok(RuntimeTransitionPlan {
+        version,
+        tag,
+        state_schema: MAJOR_TARGET_SCHEMA,
+        contract_epoch: MAJOR_TARGET_CONTRACT_EPOCH,
+        contract_hash: MAJOR_TARGET_CONTRACT_HASH.to_owned(),
+        contract_tool_count: MAJOR_TARGET_TOOL_COUNT,
+        identity,
+        asset: ReleaseAsset {
+            target: target.to_owned(),
+            name,
+            size,
+            sha256,
+            url,
+        },
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stage_runtime_transition(
+    bridge_binary: &Path,
+    plan: &RuntimeTransitionPlan,
+) -> Result<PathBuf, String> {
+    let job_dir = bridge_binary
+        .parent()
+        .ok_or_else(|| "migration bridge has no update job directory".to_owned())?;
+    let target = job_dir.join("herdr-mcp-major-target");
+    let client = update_client()?;
+    verify_artifact_attestation(
+        &client,
+        &plan.asset.name,
+        &plan.asset.sha256,
+        &plan.identity,
+    )?;
+    let mut progress = UpdateProgress::new(std::io::sink(), false);
+    download_asset(&client, &plan.asset, &target, &mut progress)?;
+    Ok(target)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn probe_runtime_transition_binary(
+    path: &Path,
+    plan: &RuntimeTransitionPlan,
+) -> Result<(), String> {
+    let output = Command::new(path)
+        .arg("version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot execute target Runtime: {error}"))?;
+    if !output.status.success() || output.stdout.len() > 16 * 1024 {
+        return Err("target Runtime version probe failed".to_owned());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let expected_first = format!("herdr-mcp {}", plan.version);
+    let expected_contract = format!(
+        "contract epoch {} / {} tools",
+        plan.contract_epoch, plan.contract_tool_count
+    );
+    let expected_schema = format!("state schema {}", plan.state_schema);
+    if text.lines().next() != Some(expected_first.as_str())
+        || !text.contains(&expected_contract)
+        || !text.contains(&expected_schema)
+    {
+        return Err("target Runtime identity does not match Runtime manifest".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_external_runtime_command(
+    binary: &Path,
+    args: &[&str],
+    paths: &RuntimePaths,
+    bridge_binary: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let job_dir = bridge_binary
+        .parent()
+        .ok_or_else(|| "migration bridge has no update job directory".to_owned())?;
+    let log_path = job_dir.join(format!("{label}.log"));
+    let stdout = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&log_path)
+        .map_err(|error| format!("cannot create {label} log: {error}"))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|error| format!("cannot clone {label} log: {error}"))?;
+    let status = Command::new(binary)
+        .args(args)
+        .env("HERDR_MCP_CONFIG_DIR", &paths.config_dir)
+        .env_remove("HERDR_MCP_EXEC_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()
+        .map_err(|error| format!("cannot run {label}: {error}"))?;
+    let detail = read_bounded_log(&log_path);
+    let _ = fs::remove_file(&log_path);
+    if !status.success() {
+        let status_text = status
+            .code()
+            .map_or_else(|| "signal".to_owned(), |code| code.to_string());
+        if label == "worker-update" {
+            return Err(format!(
+                "worker-update exited with {status_text}; Cloudflare authorization or existing-Worker reconciliation did not complete"
+            ));
+        }
+        return Err(format!(
+            "{label} exited with {status_text}{}",
+            detail
+                .filter(|value| !value.is_empty())
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_bounded_log(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let start = bytes.len().saturating_sub(8 * 1024);
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!compact.is_empty()).then_some(compact)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn active_runtime_uses_schema_15(paths: &RuntimePaths) -> bool {
+    let binary = paths.config_dir.join("runtime/current/herdr-mcp");
+    Command::new(binary)
+        .arg("version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success() && output.stdout.len() <= 16 * 1024)
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("state schema {MAJOR_TARGET_SCHEMA}"))
+        })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn cleanup_bridge_staging(bridge_binary: &Path, target_binary: Option<&Path>) {
+    if let Some(target_binary) = target_binary {
+        let _ = fs::remove_file(target_binary);
+    }
+    cleanup_staging(bridge_binary);
 }
 
 fn load_update_channel() -> Result<UpdateChannel, String> {
@@ -1424,6 +1887,182 @@ mod tests {
                 "url": format!("https://github.com/whshang/herdr-mcp/releases/download/v{version}/herdr-mcp-{version}-{target}")
             }]
         })
+    }
+
+    fn runtime_manifest_for(target: &str, version: &str) -> Value {
+        let name = format!("herdr-mcp-{version}-{target}");
+        let tag = format!("v{version}");
+        json!({
+            "schema_version": release_trust::MANIFEST_SCHEMA_VERSION,
+            "product": "herdr-mcp",
+            "state_schema": MAJOR_TARGET_SCHEMA,
+            "version": version,
+            "tag": tag,
+            "release_identity": {
+                "tag": tag,
+                "source_commit": "c".repeat(40),
+                "source_ref": format!("refs/tags/v{version}"),
+            },
+            "repository_identity": {
+                "repository": release_trust::RELEASE_REPOSITORY,
+                "repository_id": release_trust::RELEASE_REPOSITORY_ID,
+            },
+            "provenance": {
+                "predicate_type": release_trust::SLSA_PROVENANCE_V1,
+                "attestation": release_trust::GITHUB_ARTIFACT_ATTESTATION,
+                "bundle_media_type": release_trust::SIGSTORE_BUNDLE_V03,
+                "workflow": release_trust::RELEASE_WORKFLOW,
+                "workflow_name": release_trust::RELEASE_WORKFLOW_NAME,
+                "issuer": release_trust::RELEASE_ISSUER,
+                "runner_environment": release_trust::RELEASE_RUNNER_ENVIRONMENT,
+            },
+            "contract": {
+                "epoch": MAJOR_TARGET_CONTRACT_EPOCH,
+                "hash": MAJOR_TARGET_CONTRACT_HASH,
+                "tool_count": MAJOR_TARGET_TOOL_COUNT,
+            },
+            "assets": [{
+                "target": target,
+                "name": name,
+                "size": 1234,
+                "sha256": "d".repeat(64),
+                "url": format!("https://github.com/whshang/herdr-mcp/releases/download/v{version}/herdr-mcp-{version}-{target}")
+            }]
+        })
+    }
+
+    #[test]
+    fn migration_bridge_accepts_only_the_qualified_runtime_contract() {
+        let target = current_target().unwrap();
+        let manifest = runtime_manifest_for(target, "1.0.0");
+        assert!(runtime_manifest_is_bridge_compatible(&manifest));
+        let plan = parse_runtime_transition_plan(&manifest, target).unwrap();
+        assert_eq!(plan.version, Version::parse("1.0.0").unwrap());
+        assert_eq!(plan.state_schema, MAJOR_TARGET_SCHEMA);
+        assert_eq!(plan.contract_epoch, MAJOR_TARGET_CONTRACT_EPOCH);
+        assert_eq!(plan.contract_hash, MAJOR_TARGET_CONTRACT_HASH);
+        assert_eq!(plan.contract_tool_count, MAJOR_TARGET_TOOL_COUNT);
+
+        let mut wrong_schema = manifest.clone();
+        wrong_schema["state_schema"] = json!(MAJOR_TARGET_SCHEMA + 1);
+        assert!(!runtime_manifest_is_bridge_compatible(&wrong_schema));
+        assert!(parse_runtime_transition_plan(&wrong_schema, target).is_err());
+
+        let mut wrong_contract = manifest.clone();
+        wrong_contract["contract"]["hash"] = json!("sha256:wrong");
+        assert!(!runtime_manifest_is_bridge_compatible(&wrong_contract));
+        assert!(parse_runtime_transition_plan(&wrong_contract, target).is_err());
+
+        let mut wrong_url = manifest.clone();
+        wrong_url["assets"][0]["url"] = json!("https://example.com/herdr-mcp");
+        assert!(
+            parse_runtime_transition_plan(&wrong_url, target)
+                .unwrap_err()
+                .contains("trusted repository")
+        );
+    }
+
+    #[test]
+    fn migration_bridge_manifest_override_is_subject_pinned() {
+        assert_eq!(
+            transition_manifest_subject(
+                &Url::parse("https://github.com/whshang/herdr-mcp/releases/download/v1.0.0/runtime-manifest.json").unwrap()
+            )
+            .unwrap(),
+            RUNTIME_MANIFEST_NAME
+        );
+        assert_eq!(
+            transition_manifest_subject(
+                &Url::parse("https://github.com/whshang/herdr-mcp/releases/download/v1.0.0/release-manifest.json").unwrap()
+            )
+            .unwrap(),
+            LEGACY_MANIFEST_NAME
+        );
+        assert!(
+            transition_manifest_subject(
+                &Url::parse(
+                    "https://github.com/whshang/herdr-mcp/releases/download/v1.0.0/other.json"
+                )
+                .unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn migration_bridge_probes_final_runtime_identity() {
+        let root = env::temp_dir().join(format!(
+            "herdr-runtime-transition-probe-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("herdr-mcp-target");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'herdr-mcp 1.0.0' 'contract epoch {} / {} tools' 'state schema {}'\n",
+                MAJOR_TARGET_CONTRACT_EPOCH, MAJOR_TARGET_TOOL_COUNT, MAJOR_TARGET_SCHEMA
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let plan = parse_runtime_transition_plan(
+            &runtime_manifest_for(current_target().unwrap(), "1.0.0"),
+            current_target().unwrap(),
+        )
+        .unwrap();
+        probe_runtime_transition_binary(&binary, &plan).unwrap();
+
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf '%s\\n' 'herdr-mcp 1.0.0' 'contract epoch 3 / 18 tools' 'state schema 15'\n",
+        )
+        .unwrap();
+        assert!(probe_runtime_transition_binary(&binary, &plan).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn migration_bridge_never_persists_cloudflare_device_flow_code_in_job_error() {
+        let root = env::temp_dir().join(format!(
+            "herdr-worker-update-log-redaction-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let command = root.join("fake-worker-update");
+        fs::write(
+            &command,
+            "#!/bin/sh\necho 'Verification code: SENSITIVE-CODE' >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        let bridge = root.join("herdr-mcp-candidate");
+        fs::write(&bridge, b"bridge").unwrap();
+        let paths = RuntimePaths {
+            instance: crate::instance::InstanceId::default_instance(),
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            dev_state_dir: root.join("config/dev"),
+            herdr_socket: None,
+        };
+        fs::create_dir_all(&paths.config_dir).unwrap();
+
+        let error = run_external_runtime_command(
+            &command,
+            &["worker", "update"],
+            &paths,
+            &bridge,
+            "worker-update",
+        )
+        .unwrap_err();
+        assert!(error.contains("Cloudflare authorization or existing-Worker reconciliation"));
+        assert!(!error.contains("SENSITIVE-CODE"));
+        assert!(!root.join("worker-update.log").exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

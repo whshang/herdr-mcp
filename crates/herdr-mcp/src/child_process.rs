@@ -446,6 +446,8 @@ mod registry {
 
     fn inspect_process(pid: u32) -> Option<ProcessIdentity> {
         let mut command = Command::new("/bin/ps");
+        // Keep lstart fields stable across workstation locales.
+        command.env("LC_ALL", "C");
         command.args([
             "-p",
             &pid.to_string(),
