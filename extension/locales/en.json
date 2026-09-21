@@ -33,7 +33,7 @@
   "bind_failed": "Bind failed",
   "options_title": "Herdr Browser Settings",
   "label_url": "Local Runtime URL",
-  "hint_url": "Usually keep http://127.0.0.1:8772.",
+  "hint_url": "Usually keep http://127.0.0.1:8772. The extension uses local IPC and does not store the Herdr bearer.",
   "label_locale": "Language",
   "hint_locale": "Uses your system language on first install, then keeps this choice.",
   "label_wake_template": "Completion message template",

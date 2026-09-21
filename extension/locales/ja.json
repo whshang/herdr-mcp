@@ -33,7 +33,7 @@
   "bind_failed": "バインド失敗",
   "options_title": "Herdr ブラウザ設定",
   "label_url": "ローカル Runtime URL",
-  "hint_url": "通常は http://127.0.0.1:8772 のまま使用します。",
+  "hint_url": "通常は http://127.0.0.1:8772 のまま使用します。拡張はローカル IPC を使い、Herdr bearer を保存しません。",
   "label_locale": "言語",
   "hint_locale": "初回はシステム言語を使い、その後はここで選んだ言語を保持します。",
   "label_wake_template": "完了通知テンプレート",

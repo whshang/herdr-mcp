@@ -903,7 +903,7 @@ ok(
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
   "zh Auto-off tooltip keeps safe HUD actions available and states permission-card independence",
 );
-ok(zhLocale.label_automation_mode === "允许 ChatGPT Project 使用 Auto"
+ok(zhLocale.label_automation_mode === "允许 ChatGPT 项目使用 Auto"
     && zhLocale.hint_automation_mode.includes("HUD")
     && zhLocale.hint_experimental_section.includes("默认关闭"),
   "zh Settings keeps Project Auto explicit and experimental sites default-off");

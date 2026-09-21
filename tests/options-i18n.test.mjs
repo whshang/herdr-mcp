@@ -7,7 +7,7 @@ const optionsHtml = readFileSync(new URL("../extension/options.html", import.met
 const optionsJs = readFileSync(new URL("../extension/options.js", import.meta.url), "utf8");
 
 test("Simplified Chinese Options copy avoids legacy mixed-language prose", () => {
-  assert.equal(zh.options_title, "Herdr · 设置");
+  assert.equal(zh.options_title, "Herdr 浏览器设置");
 
   const optionKeys = [
     "hint_url",
