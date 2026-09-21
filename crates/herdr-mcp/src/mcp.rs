@@ -493,6 +493,72 @@ fn chatgpt_conversation_url_ref(raw: &str) -> Option<(String, Option<String>)> {
     }
 }
 
+struct BrowserConversationUrlRef {
+    provider: &'static str,
+    conversation_id: String,
+    project_id: Option<String>,
+}
+
+fn browser_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23].iter().all(|index| bytes[*index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+}
+
+fn browser_conversation_url_ref(raw: &str) -> Option<BrowserConversationUrlRef> {
+    if let Some((conversation_id, project_id)) = chatgpt_conversation_url_ref(raw) {
+        return Some(BrowserConversationUrlRef {
+            provider: "chatgpt",
+            conversation_id,
+            project_id,
+        });
+    }
+
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let segments = parsed
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    match (host.as_str(), segments.as_slice()) {
+        ("claude.ai", ["chat", conversation_id]) if browser_uuid(conversation_id) => {
+            Some(BrowserConversationUrlRef {
+                provider: "claude",
+                conversation_id: conversation_id.to_ascii_lowercase(),
+                project_id: None,
+            })
+        }
+        ("grok.com", ["c", conversation_id]) if browser_uuid(conversation_id) => {
+            Some(BrowserConversationUrlRef {
+                provider: "grok",
+                conversation_id: conversation_id.to_ascii_lowercase(),
+                project_id: None,
+            })
+        }
+        ("grok.com", ["project", project_id]) if browser_uuid(project_id) => {
+            let conversation_id = parsed
+                .query_pairs()
+                .find_map(|(key, value)| (key == "chat").then_some(value.into_owned()))?;
+            if !browser_uuid(&conversation_id) {
+                return None;
+            }
+            Some(BrowserConversationUrlRef {
+                provider: "grok",
+                conversation_id: conversation_id.to_ascii_lowercase(),
+                project_id: Some(project_id.to_ascii_lowercase()),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn continuity_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
@@ -3270,6 +3336,13 @@ fn browser_session_create_params_from_source(
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
     let route = browser_source_route(store, source_url).map_err(browser_store_error)?;
+    if route.provider != "chatgpt" {
+        return Err(json!({
+            "ok": false,
+            "code": "browser_create_source_provider_unavailable",
+            "provider": route.provider,
+        }));
+    }
     let source_session_ref = route.session_ref.clone();
     Ok(Some((
         json!({
@@ -3357,6 +3430,8 @@ fn browser_source_route(
     store: &StateStore,
     source_url: &str,
 ) -> Result<BrowserSourceRoute, String> {
+    let source = browser_conversation_url_ref(source_url)
+        .ok_or_else(|| "browser_source_url_invalid".to_owned())?;
     let session_ref = store
         .browser_latest_session_ref_for_canonical_url(source_url)?
         .ok_or_else(|| "browser_source_session_not_found".to_owned())?;
@@ -3382,7 +3457,7 @@ fn browser_source_route(
     } else {
         return Err("browser_source_scope_missing".to_owned());
     };
-    if session.provider != "chatgpt"
+    if session.provider != source.provider
         || parent.provider != session.provider
         || account.kind != "account"
         || account.provider != session.provider
@@ -3397,8 +3472,8 @@ fn browser_source_route(
         .display_label
         .as_deref()
         .or(session.display_label.as_deref())
-        .unwrap_or("ChatGPT continuation")
-        .to_owned();
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{} continuation", session.provider));
     Ok(BrowserSourceRoute {
         session_ref,
         provider: session.provider.clone(),
@@ -3473,11 +3548,13 @@ fn browser_handoff_prepare(
         Ok(value) => value,
         Err(_) => return json!({"ok": false, "code": "browser_handoff_source_url_invalid"}),
     };
-    let (source_conversation_id, source_project_id) = match chatgpt_conversation_url_ref(source_url)
-    {
+    let source = match browser_conversation_url_ref(source_url) {
         Some(reference) => reference,
         None => return json!({"ok": false, "code": "browser_handoff_source_url_invalid"}),
     };
+    let source_conversation_id = source.conversation_id.clone();
+    let source_project_id = source.project_id.clone();
+    let source_provider = source.provider;
     let requested_objective = match browser_optional_string(params, "objective", 1024) {
         Ok(value) => value,
         Err(_) => return json!({"ok": false, "code": "browser_handoff_objective_invalid"}),
@@ -3491,7 +3568,13 @@ fn browser_handoff_prepare(
         Err(_) => return json!({"ok": false, "code": "browser_handoff_id_invalid"}),
     };
 
-    let (record, persisted_work_chain_id, source_route, source_route_error) = {
+    let (
+        record,
+        persisted_work_chain_id,
+        source_route,
+        source_route_error,
+        source_route_session_ref,
+    ) = {
         let Ok(store) = store.lock() else {
             return json!({"ok": false, "code": "browser_handoff_store_unavailable"});
         };
@@ -3507,32 +3590,42 @@ fn browser_handoff_prepare(
         // Route resolution stays best-effort: a handoff whose source conversation is not
         // currently registered still yields the canonical packet and Copy Prompt. Only the
         // automatic delivery step needs this scope, and it fails closed without it.
-        let (route, route_error) = match browser_source_route(&store, source_url) {
-            Ok(route) => (
-                json!({
-                    "session_ref": route.session_ref,
-                    "provider": route.provider,
-                    "endpoint_ref": route.endpoint_ref,
-                    "account_ref": route.account_ref,
-                    "space_ref": route.space_ref,
-                    "display_label": route.display_label,
-                    "expected_generation": route.expected_generation,
-                }),
-                Value::Null,
-            ),
-            Err(error) => (Value::Null, json!(error)),
+        let (route, route_error, route_session_ref) = match browser_source_route(&store, source_url)
+        {
+            Ok(route) => {
+                let route_session_ref = route.session_ref.clone();
+                (
+                    json!({
+                        "session_ref": route.session_ref,
+                        "provider": route.provider,
+                        "endpoint_ref": route.endpoint_ref,
+                        "account_ref": route.account_ref,
+                        "space_ref": route.space_ref,
+                        "display_label": route.display_label,
+                        "expected_generation": route.expected_generation,
+                    }),
+                    Value::Null,
+                    Some(route_session_ref),
+                )
+            }
+            Err(error) => (Value::Null, json!(error), None),
         };
-        (record, work_chain_id, route, route_error)
+        (record, work_chain_id, route, route_error, route_session_ref)
     };
-    if record
+    let latest_source_ref = record
         .turns
         .last()
-        .map(|turn| turn.conversation_id.as_str())
-        != Some(source_conversation_id.as_str())
-    {
+        .map(|turn| turn.conversation_id.as_str());
+    let matches_native_conversation = latest_source_ref == Some(source_conversation_id.as_str());
+    let matches_registered_session = source_route_session_ref
+        .as_deref()
+        .is_some_and(|session_ref| latest_source_ref == Some(session_ref));
+    if !matches_native_conversation && !matches_registered_session {
         return json!({"ok": false, "code": "browser_handoff_source_continuity_mismatch"});
     }
-    if record.project_id.as_deref().is_some()
+    if matches_native_conversation
+        && source_provider == "chatgpt"
+        && source_project_id.is_some()
         && record.project_id.as_deref() != source_project_id.as_deref()
     {
         return json!({"ok": false, "code": "browser_handoff_source_scope_mismatch"});
@@ -3571,17 +3664,35 @@ fn browser_handoff_prepare(
             "source_url": source_url,
             "message": message,
             "work_chain_id": work_chain_id,
-            "target_context": {
-                "provider": "chatgpt",
+            "source_context": {
+                "provider": source_provider,
                 "project_id": record.project_id,
+            },
+            "target_context": if source_provider == "chatgpt" {
+                json!({
+                    "provider": "chatgpt",
+                    "project_id": record.project_id,
+                })
+            } else {
+                Value::Null
             }
         },
-        "automatic_delivery": {
-            "method": BROWSER_SESSION_CREATE_METHOD,
+        "automatic_delivery": if source_provider == "chatgpt" {
+            json!({
+                "method": BROWSER_SESSION_CREATE_METHOD,
+                "params": {
+                    "source_url": source_url,
+                    "message": message,
+                    "work_chain_id": work_chain_id,
+                }
+            })
+        } else {
+            Value::Null
+        },
+        "existing_session_delivery": {
+            "method": BROWSER_DISPATCH_SUBMIT_METHOD,
             "params": {
-                "source_url": source_url,
                 "message": message,
-                "work_chain_id": work_chain_id,
             }
         },
         "manual_delivery": {

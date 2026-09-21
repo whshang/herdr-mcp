@@ -316,6 +316,7 @@ function applyStaticI18n() {
 function siteLabel(site) {
   if (site === "chatgpt") return "ChatGPT";
   if (site === "claude" || site === "claude.ai") return "Claude";
+  if (site === "grok") return "Grok";
   if (site === "z.ai" || site === "zai") return "z.ai";
   if (site === "deepseek") return "DeepSeek";
   return site || t("cc_page_unknown_site");
@@ -332,6 +333,15 @@ function pageContextInfo() {
 
 function pageContextBindings() {
   return Array.isArray(pageContext.response?.sessionBindings) ? pageContext.response.sessionBindings : [];
+}
+
+function pageContextBindingKey() {
+  const info = pageContextInfo();
+  return pageContext.response?.bindingKey
+    || info?.project_key
+    || info?.pageKey
+    || info?.convKey
+    || null;
 }
 
 function pageContextBindingIds() {
@@ -396,9 +406,11 @@ function renderPageContext(state) {
 
   pageContextCard.hidden = false;
   pageContextTitle.textContent = siteLabel(info.site);
-  pageContextMeta.textContent = bindings.length
-    ? t("cc_page_binding_count", { count: bindings.length })
-    : t("cc_page_unbound");
+  pageContextMeta.textContent = info.is_site_home
+    ? t("cc_page_site_home_meta")
+    : bindings.length
+      ? t("cc_page_binding_count", { count: bindings.length })
+      : t("cc_page_unbound");
   const identity = [];
   if (info.project_id) identity.push(t("cc_page_project_id", { value: shortIdentity(info.project_id, 48) }));
   if (info.conversation_id) identity.push(t("cc_page_conversation_id", { value: shortIdentity(info.conversation_id, 48) }));
@@ -545,7 +557,7 @@ function renderWorkspaceTree(state) {
   }
 
   const fragment = document.createDocumentFragment();
-  const pageSupported = Boolean(pageContextInfo()?.convKey && pageContext.tabId && !pageContext.loading);
+  const pageSupported = Boolean(pageContextBindingKey() && pageContext.tabId && !pageContext.loading);
   const bindingBusy = Boolean(bindingMutationWorkspaceId);
   for (const workspace of workspaces) {
     const workspaceId = String(workspace.workspace_id);
@@ -821,7 +833,8 @@ function renderComposerState() {
 
 async function mutateWorkspaceBinding(workspaceId) {
   const info = pageContextInfo();
-  if (!info?.convKey || !pageContext.tabId || !workspaceId || bindingMutationWorkspaceId) return;
+  const bindingKey = pageContextBindingKey();
+  if (!info?.site || !bindingKey || !pageContext.tabId || !workspaceId || bindingMutationWorkspaceId) return;
   const currentlyBound = pageContextBindingIds().has(String(workspaceId));
   const workspace = (store.get().workspaces || []).find((row) => String(row.workspace_id) === String(workspaceId));
   if (!currentlyBound && !workspace) return;
@@ -829,11 +842,11 @@ async function mutateWorkspaceBinding(workspaceId) {
   renderAll();
 
   const response = currentlyBound
-    ? await bg({ type: "h2w_unbind", convKey: info.convKey, workspace_id: workspaceId })
+    ? await bg({ type: "h2w_unbind", binding_key: bindingKey, workspace_id: workspaceId })
     : await bg({
       type: "h2w_bind",
       tabId: pageContext.tabId,
-      convKey: info.convKey,
+      binding_key: bindingKey,
       workspace_id: workspaceId,
       workspace_label: workspace.label || workspaceId,
       local_project_key: workspace.local_project_key || null,

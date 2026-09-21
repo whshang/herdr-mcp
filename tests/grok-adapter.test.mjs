@@ -93,6 +93,15 @@ test("Grok adapter exposes concrete direct and project chat session identity", (
     project.adapter.getCanonicalConversationUrl(),
     "https://grok.com/project/223e4567-e89b-42d3-a456-426614174001?chat=323e4567-e89b-42d3-a456-426614174002",
   );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(project.adapter.getProjectIdentity())),
+    {
+      id: "223e4567-e89b-42d3-a456-426614174001",
+      name: null,
+      key: "https://grok.com/project/223e4567-e89b-42d3-a456-426614174001",
+    },
+  );
+  assert.equal(h.adapter.getProjectIdentity(), null);
 
   h.location.pathname = "/";
   assert.equal(h.adapter.getConversationKey(), null);

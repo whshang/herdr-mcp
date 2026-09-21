@@ -51,6 +51,16 @@ class GrokAdapter extends BaseAdapter {
     return this.getConversationKey();
   }
 
+  getProjectIdentity() {
+    const identity = this.getConversationIdentity();
+    if (!identity?.projectId) return null;
+    return {
+      id: identity.projectId,
+      name: null,
+      key: `https://grok.com/project/${identity.projectId}`,
+    };
+  }
+
   getInputEl() {
     const selectors = [
       '[data-testid="chat-input"] div.ProseMirror[role="textbox"]',
