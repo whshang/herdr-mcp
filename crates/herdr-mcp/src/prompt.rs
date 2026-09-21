@@ -4,6 +4,7 @@ use crate::state_store::{OperationReservation, StateStore};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,7 @@ const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WAIT_MS: u64 = 25_000;
 const MAX_WAIT_MS: u64 = 60_000;
 const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
+static NEXT_DISPATCH_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct AgentState {
@@ -345,13 +347,20 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         Err(error) => return error,
     };
     let fingerprint = request_fingerprint(target, text, wait.as_ref());
+    let dispatch_id = dispatch_id(idempotency_key, &fingerprint);
     let mut operation_id = None;
 
     if let Some(key) = idempotency_key {
         match registry.begin(key, &fingerprint) {
             Ok(BeginPrompt::Reserved(op_id)) => operation_id = op_id,
-            Ok(BeginPrompt::Replay(result)) => return result,
-            Err(error) => return error,
+            Ok(BeginPrompt::Replay(mut result)) => {
+                insert_dispatch_id(&mut result, &dispatch_id);
+                return result;
+            }
+            Err(mut error) => {
+                insert_dispatch_id(&mut error, &dispatch_id);
+                return error;
+            }
         }
     }
 
@@ -384,8 +393,16 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
             wait.is_some(),
             response,
             idempotency_key.is_none(),
+            &dispatch_id,
         ),
-        Err(error) => prompt_failure(client, target, before.as_ref(), wait.is_some(), error),
+        Err(error) => prompt_failure(
+            client,
+            target,
+            before.as_ref(),
+            wait.is_some(),
+            error,
+            &dispatch_id,
+        ),
     };
 
     if let Some(op_id) = operation_id
@@ -414,6 +431,7 @@ fn prompt_success(
     waited: bool,
     response: Value,
     needs_idempotency_hint: bool,
+    dispatch_id: &str,
 ) -> Value {
     let prompt = response.get("prompt").cloned().unwrap_or(response);
     let status = prompt
@@ -448,6 +466,17 @@ fn prompt_success(
     result.insert("before".to_owned(), state_view(before));
     result.insert("after".to_owned(), state_view(after.as_ref()));
     insert_observation(&mut result, observation);
+    insert_dispatch(
+        &mut result,
+        dispatch_id,
+        dispatch_correlation(
+            before,
+            after.as_ref(),
+            waited,
+            waited,
+            Some(status != "agent_blocked"),
+        ),
+    );
     if !waited {
         result.insert(
             "seq_note".to_owned(),
@@ -470,6 +499,7 @@ fn prompt_failure(
     before: Option<&AgentState>,
     waited: bool,
     error: HerdrError,
+    dispatch_id: &str,
 ) -> Value {
     let after = agent_state_of(client, target);
     let resolve_failure = matches!(
@@ -499,6 +529,11 @@ fn prompt_failure(
         result.insert("before".to_owned(), state_view(before));
         result.insert("after".to_owned(), state_view(after.as_ref()));
         insert_observation(&mut result, observation);
+        insert_dispatch(
+            &mut result,
+            dispatch_id,
+            dispatch_correlation(before, after.as_ref(), true, false, submitted.as_bool()),
+        );
         result.insert("code".to_owned(), json!(error.code));
         result.insert("message".to_owned(), json!(error.message));
         result.insert("retryable".to_owned(), json!(false));
@@ -535,6 +570,11 @@ fn prompt_failure(
         result.insert("before".to_owned(), state_view(before));
         result.insert("after".to_owned(), state_view(after.as_ref()));
         insert_observation(&mut result, observation);
+        insert_dispatch(
+            &mut result,
+            dispatch_id,
+            dispatch_correlation(before, after.as_ref(), waited, false, submitted.as_bool()),
+        );
         result.insert("message".to_owned(), json!(root_message));
         result.insert(
             "error".to_owned(),
@@ -575,6 +615,21 @@ fn prompt_failure(
     result.insert("message".to_owned(), json!(error.message));
     let retryable = definitely_not_delivered(&error);
     result.insert("retryable".to_owned(), json!(retryable));
+    insert_dispatch(
+        &mut result,
+        dispatch_id,
+        dispatch_correlation(
+            before,
+            after.as_ref(),
+            waited,
+            false,
+            if resolve_failure || retryable {
+                Some(false)
+            } else {
+                None
+            },
+        ),
+    );
     if !resolve_failure && !retryable {
         result.insert("delivery_uncertain".to_owned(), json!(true));
         result.insert(
@@ -648,6 +703,138 @@ fn insert_observation(result: &mut Map<String, Value>, observation: Observation)
         json!({"changed": observation.changed, "fresh": observation.fresh}),
     );
     result.insert("state_changed".to_owned(), json!(observation.state_changed));
+}
+
+fn dispatch_id(idempotency_key: Option<&str>, fingerprint: &str) -> String {
+    let digest = if let Some(key) = idempotency_key {
+        stable_digest(&[
+            b"herdr_prompt/dispatch/idempotent",
+            key.as_bytes(),
+            fingerprint.as_bytes(),
+        ])
+    } else {
+        let now = now_ms().to_le_bytes();
+        let nonce = NEXT_DISPATCH_NONCE
+            .fetch_add(1, Ordering::Relaxed)
+            .to_le_bytes();
+        stable_digest(&[
+            b"herdr_prompt/dispatch/ephemeral",
+            fingerprint.as_bytes(),
+            &now,
+            &nonce,
+        ])
+    };
+    format!("dispatch:prompt:{}", &digest[..32])
+}
+
+fn insert_dispatch_id(result: &mut Value, dispatch_id: &str) {
+    if let Some(object) = result.as_object_mut() {
+        object
+            .entry("dispatch_id".to_owned())
+            .or_insert_with(|| json!(dispatch_id));
+    }
+}
+
+fn insert_dispatch(result: &mut Map<String, Value>, dispatch_id: &str, correlation: Value) {
+    result.insert("dispatch_id".to_owned(), json!(dispatch_id));
+    result.insert("dispatch_correlation".to_owned(), correlation);
+}
+
+fn dispatch_correlation(
+    before: Option<&AgentState>,
+    after: Option<&AgentState>,
+    waited: bool,
+    wait_completed: bool,
+    submitted: Option<bool>,
+) -> Value {
+    let before_status = before.and_then(|state| state.agent_status.as_deref());
+    let after_status = after.and_then(|state| state.agent_status.as_deref());
+    let seq_changed = before.zip(after).is_some_and(|(before, after)| {
+        before.state_change_seq.is_some()
+            && after.state_change_seq.is_some()
+            && before.state_change_seq != after.state_change_seq
+    });
+    let active_status_observed =
+        matches!(after_status, Some("working" | "blocked")) && before_status != after_status;
+    let note = "Herdr 0.9.1 exposes lifecycle state, not a native prompt turn id; this metadata uses a post-submit activity gate and never claims exact-turn identity.";
+
+    if submitted == Some(false) {
+        return json!({
+            "mode": "not_submitted",
+            "activity_observed": false,
+            "state": "not_submitted",
+            "terminal": false,
+            "attention_required": before_status == Some("blocked") || after_status == Some("blocked"),
+            "exact_turn": false,
+            "note": note,
+        });
+    }
+
+    if before_status == Some("working") {
+        return json!({
+            "mode": "unverified_preexisting_work",
+            "activity_observed": false,
+            "state": "unverified",
+            "terminal": false,
+            "attention_required": false,
+            "exact_turn": false,
+            "note": note,
+        });
+    }
+
+    if before_status == Some("blocked") {
+        return json!({
+            "mode": "unverified_preexisting_blocked",
+            "activity_observed": false,
+            "state": "unverified",
+            "terminal": false,
+            "attention_required": true,
+            "exact_turn": false,
+            "note": note,
+        });
+    }
+
+    let started_settled = matches!(before_status, Some("idle" | "done"));
+    if !started_settled {
+        return json!({
+            "mode": "unverified_missing_settled_baseline",
+            "activity_observed": false,
+            "state": "unverified",
+            "terminal": false,
+            "attention_required": after_status == Some("blocked"),
+            "exact_turn": false,
+            "note": note,
+        });
+    }
+
+    let activity_observed = seq_changed || active_status_observed || (waited && wait_completed);
+    if !activity_observed {
+        return json!({
+            "mode": "awaiting_activity",
+            "activity_observed": false,
+            "state": "awaiting_activity",
+            "terminal": false,
+            "attention_required": false,
+            "exact_turn": false,
+            "note": note,
+        });
+    }
+
+    let (state, terminal, attention_required) = match after_status {
+        Some("working") => ("working", false, false),
+        Some("blocked") => ("blocked_attention", true, true),
+        Some("idle" | "done") => ("settled", true, false),
+        _ => ("activity_observed", false, false),
+    };
+    json!({
+        "mode": "activity_gated",
+        "activity_observed": true,
+        "state": state,
+        "terminal": terminal,
+        "attention_required": attention_required,
+        "exact_turn": false,
+        "note": note,
+    })
 }
 
 fn inferred_submission(before: Option<&AgentState>, after: Option<&AgentState>) -> Value {
@@ -816,7 +1003,6 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -882,6 +1068,58 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_correlation_requires_new_activity_and_rejects_preexisting_state() {
+        let idle = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(10),
+        };
+        let unchanged = dispatch_correlation(Some(&idle), Some(&idle), false, false, Some(true));
+        assert_eq!(unchanged["mode"], "awaiting_activity");
+        assert_eq!(unchanged["terminal"], false);
+
+        let stale_done = AgentState {
+            agent_status: Some("done".to_owned()),
+            ..idle.clone()
+        };
+        let stale = dispatch_correlation(Some(&idle), Some(&stale_done), false, false, Some(true));
+        assert_eq!(stale["mode"], "awaiting_activity");
+        assert_eq!(stale["terminal"], false);
+
+        let working = AgentState {
+            agent_status: Some("working".to_owned()),
+            state_change_seq: Some(11),
+            ..idle.clone()
+        };
+        let observed = dispatch_correlation(Some(&idle), Some(&working), false, false, Some(true));
+        assert_eq!(observed["state"], "working");
+        assert_eq!(observed["activity_observed"], true);
+
+        let blocked = AgentState {
+            agent_status: Some("blocked".to_owned()),
+            state_change_seq: Some(12),
+            ..idle.clone()
+        };
+        let attention = dispatch_correlation(Some(&idle), Some(&blocked), false, false, Some(true));
+        assert_eq!(attention["state"], "blocked_attention");
+        assert_eq!(attention["terminal"], true);
+
+        let stale_blocked =
+            dispatch_correlation(Some(&blocked), Some(&blocked), false, false, Some(true));
+        assert_eq!(stale_blocked["mode"], "unverified_preexisting_blocked");
+        assert_eq!(stale_blocked["terminal"], false);
+
+        let waited = dispatch_correlation(Some(&idle), Some(&stale_done), true, true, Some(true));
+        assert_eq!(waited["state"], "settled");
+        assert_eq!(waited["terminal"], true);
+
+        let preexisting_work =
+            dispatch_correlation(Some(&working), Some(&stale_done), true, true, Some(true));
+        assert_eq!(preexisting_work["mode"], "unverified_preexisting_work");
+        assert_eq!(preexisting_work["terminal"], false);
+    }
+
+    #[test]
     fn wait_validation_matches_public_contract() {
         assert_eq!(
             parse_wait(Some(
@@ -938,8 +1176,17 @@ mod tests {
         assert_eq!(first["ok"], true);
         assert_eq!(first["submitted"], true);
         assert_eq!(first["resolved_pane"], "w1:p1");
+        assert_eq!(first["dispatch_correlation"]["state"], "working");
+        let dispatch_id = first["dispatch_id"].clone();
+        assert!(
+            dispatch_id
+                .as_str()
+                .unwrap()
+                .starts_with("dispatch:prompt:")
+        );
         let replay = run(&client, &registry, &args);
         assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["dispatch_id"], dispatch_id);
         server.join().unwrap();
         fs::remove_file(socket).unwrap();
     }
@@ -991,6 +1238,7 @@ mod tests {
         assert_eq!(first["ok"], true);
         assert_eq!(first["idempotency_persisted"], true);
         assert!(first["op_id"].as_str().unwrap().starts_with("op:prompt:"));
+        let dispatch_id = first["dispatch_id"].clone();
         server.join().unwrap();
         fs::remove_file(&socket).unwrap();
         drop(first_registry);
@@ -1003,6 +1251,7 @@ mod tests {
         assert_eq!(replay["idempotent_replay"], true);
         assert_eq!(replay["idempotency_persisted"], true);
         assert!(replay["op_id"].as_str().unwrap().starts_with("op:prompt:"));
+        assert_eq!(replay["dispatch_id"], dispatch_id);
 
         let conflict = run(
             &unreachable,
@@ -1020,5 +1269,34 @@ mod tests {
         fs::remove_file(&db_path).ok();
         fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
         fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn status_wait_timeout_keeps_dispatch_and_delivery_evidence() {
+        let socket = temp_socket();
+        let client = HerdrClient::new(&socket);
+        let before = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(40),
+        };
+        let result = prompt_failure(
+            &client,
+            "pi",
+            Some(&before),
+            true,
+            HerdrError {
+                code: "timeout".to_owned(),
+                message: "timed out waiting for agent status".to_owned(),
+            },
+            "dispatch:prompt:test-timeout",
+        );
+        assert_eq!(result["failure_phase"], "post_submission_status_wait");
+        assert_eq!(result["wait"]["completed"], false);
+        assert_eq!(result["dispatch_id"], "dispatch:prompt:test-timeout");
+        assert_eq!(result["dispatch_correlation"]["mode"], "awaiting_activity");
+        assert_eq!(result["dispatch_correlation"]["terminal"], false);
+        assert_eq!(result["submitted"], "unknown");
+        assert_eq!(result["delivery_uncertain"], true);
     }
 }

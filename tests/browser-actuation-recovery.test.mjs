@@ -2068,6 +2068,7 @@ function createActuationBranchHarness({
   const browserSessionTargets = new Map();
   const postCalls = [];
   const actuationMessages = [];
+  const removedTabs = [];
   let nextTabId = 100;
   let identityProbeAttempts = 0;
   const liveScopesByTab = new Map();
@@ -2087,6 +2088,10 @@ function createActuationBranchHarness({
         const tab = { id, url: info.url, windowId: info.windowId ?? null };
         tabs.set(id, tab);
         return { ...tab };
+      },
+      async remove(tabId) {
+        removedTabs.push(tabId);
+        if (!tabs.delete(tabId)) throw new Error(`tab ${tabId} missing`);
       },
       async sendMessage(tabId, message) {
         if (message?.type === "h2w_get_convkey") {
@@ -2189,6 +2194,7 @@ function createActuationBranchHarness({
     browserTabScopes,
     browserSessionTargets,
     tabs,
+    removedTabs,
     liveScopesByTab,
     identityProbeAttempts: () => identityProbeAttempts,
     dateShim,
@@ -2470,6 +2476,16 @@ test("session.create still fails closed when the fresh tab can never be identifi
   assert.ok(failure, "unidentifiable fresh tab must fail closed with resource_available=false");
   assert.equal(failure.evidence.command_accepted, false);
   assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
+  assert.equal(failure.evidence.browser_online, true);
+  assert.equal(failure.evidence.result?.phase, "scope_handshake");
+  assert.equal(failure.evidence.result?.message_submitted, false);
+  assert.equal(failure.evidence.result?.retry_safe, true);
+  assert.equal(failure.evidence.result?.tab_opened, true);
+  assert.equal(failure.evidence.result?.tab_closed, true);
+  assert.equal(failure.evidence.result?.tab_cleanup_verified, true);
+  assert.deepEqual(harness.removedTabs, [100]);
+  assert.equal(harness.tabs.has(100), false);
+  assert.equal(harness.tabs.has(sourceTabId), true, "scope cleanup must not close the user's anchor tab");
 });
 
 test("user still fails closed after source recovery | Given source affinity falls back to an exact Project scope | When the fresh tab never proves that scope | Then no create command is delivered", async () => {
