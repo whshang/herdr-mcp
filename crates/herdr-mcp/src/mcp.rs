@@ -1067,8 +1067,8 @@ fn work_memory_search_page_json(
     query: &str,
     page_size: usize,
     page: WorkMemorySearchPage,
+    semantic_ranking: Value,
 ) -> Value {
-    let semantic_ranking = work_memory_semantic_ranking(query, &page.hits);
     let display_excerpt_truncated = page.hits.iter().any(|hit| hit.excerpt.contains('…'));
     let coverage = work_memory_coverage(
         page.boundary.checkpoint_revision,
@@ -1117,9 +1117,45 @@ fn work_memory_search_page_json(
     })
 }
 
-fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Value {
-    let service = SemanticService::from_config();
-    let capability = service.capability_json();
+fn work_memory_relaxed_semantic_candidates(
+    store: &StateStore,
+    semantic: &SemanticService,
+    query: &str,
+    page: &WorkMemorySearchPage,
+    page_size: usize,
+) -> Vec<WorkMemorySearchHit> {
+    if page.hits.len() >= page_size || !semantic.configured() {
+        return Vec::new();
+    }
+    store
+        .work_memory_relaxed_candidates(
+            query,
+            &page.boundary,
+            page_size.saturating_sub(page.hits.len()),
+        )
+        .unwrap_or_default()
+}
+
+fn work_memory_page_semantic_ranking(
+    store: &StateStore,
+    semantic: &SemanticService,
+    query: &str,
+    page: &WorkMemorySearchPage,
+    page_size: usize,
+) -> Value {
+    let mut candidates = page.hits.clone();
+    candidates.extend(work_memory_relaxed_semantic_candidates(
+        store, semantic, query, page, page_size,
+    ));
+    work_memory_semantic_ranking(semantic, query, &candidates)
+}
+
+fn work_memory_semantic_ranking(
+    semantic: &SemanticService,
+    query: &str,
+    hits: &[WorkMemorySearchHit],
+) -> Value {
+    let capability = semantic.capability_json();
     if hits.is_empty() {
         return json!({
             "attempted": false,
@@ -1128,7 +1164,7 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
             "capability": capability,
         });
     }
-    if !service.configured() {
+    if !semantic.configured() {
         return json!({
             "attempted": true,
             "used": false,
@@ -1143,6 +1179,7 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
             "source_kind": hit.source_kind,
             "source_id": hit.source_id,
             "excerpt": hit.excerpt,
+            "match_kind": if hit.strict_match { "strict" } else { "relaxed" },
         })).collect::<Vec<_>>(),
     }));
     for index in 0..hits.len() {
@@ -1163,7 +1200,7 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
             "More retrieval is useful before answering the query",
         ),
     );
-    let response = match service.evaluate(&request) {
+    let response = match semantic.evaluate(&request) {
         Ok(response) => response,
         Err(error) => {
             return json!({
@@ -1186,6 +1223,8 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
                     json!({
                         "source_kind": hit.source_kind,
                         "source_id": hit.source_id,
+                        "excerpt": hit.excerpt,
+                        "match_kind": if hit.strict_match { "strict" } else { "relaxed" },
                         "relevance": relevance,
                     })
                 })
@@ -1203,6 +1242,7 @@ fn work_memory_semantic_ranking(query: &str, hits: &[WorkMemorySearchHit]) -> Va
         "provider": response.provider,
         "model": response.model,
         "ranked": ranked,
+        "relaxed_candidate_count": hits.iter().filter(|hit| !hit.strict_match).count(),
         "evidence_sufficient": response
             .answer("evidence_sufficient")
             .and_then(SemanticAnswer::noul_probability),
@@ -1752,14 +1792,25 @@ fn work_memory_call(
                         expected_boundary: Some(&boundary),
                     },
                 ) {
-                    Ok(Some(page)) => work_memory_search_page_json(
-                        &cursor.project_ref,
-                        &cursor.repo_id,
-                        &cursor.work_chain_id,
-                        &cursor.query,
-                        page_size,
-                        page,
-                    ),
+                    Ok(Some(page)) => {
+                        let semantic = SemanticService::from_config();
+                        let semantic_ranking = work_memory_page_semantic_ranking(
+                            &store,
+                            &semantic,
+                            &cursor.query,
+                            &page,
+                            page_size,
+                        );
+                        work_memory_search_page_json(
+                            &cursor.project_ref,
+                            &cursor.repo_id,
+                            &cursor.work_chain_id,
+                            &cursor.query,
+                            page_size,
+                            page,
+                            semantic_ranking,
+                        )
+                    }
                     Ok(None) => {
                         json!({"ok": false, "code": "work_memory_cursor_partition_mismatch"})
                     }
@@ -1800,14 +1851,20 @@ fn work_memory_call(
                     expected_boundary: None,
                 },
             ) {
-                Ok(Some(page)) => work_memory_search_page_json(
-                    project_ref,
-                    repo_id,
-                    work_chain_id,
-                    query,
-                    limit,
-                    page,
-                ),
+                Ok(Some(page)) => {
+                    let semantic = SemanticService::from_config();
+                    let semantic_ranking =
+                        work_memory_page_semantic_ranking(&store, &semantic, query, &page, limit);
+                    work_memory_search_page_json(
+                        project_ref,
+                        repo_id,
+                        work_chain_id,
+                        query,
+                        limit,
+                        page,
+                        semantic_ranking,
+                    )
+                }
                 Ok(None) => json!({"ok": false, "code": "work_memory_not_found"}),
                 Err(error) => work_memory_store_error(error),
             }
@@ -8040,29 +8097,56 @@ mod tests {
         unsafe {
             std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
         }
-        let hits = vec![WorkMemorySearchHit {
-            source_kind: "evidence".to_owned(),
-            source_id: "ev_1".to_owned(),
-            excerpt: "The release gate passed.".to_owned(),
-        }];
+        let hits = vec![
+            WorkMemorySearchHit {
+                source_kind: "evidence".to_owned(),
+                source_id: "ev_strict".to_owned(),
+                excerpt: "The release gate was discussed.".to_owned(),
+                strict_match: true,
+            },
+            WorkMemorySearchHit {
+                source_kind: "evidence".to_owned(),
+                source_id: "ev_relaxed".to_owned(),
+                excerpt: "The gate passed after rollout.".to_owned(),
+                strict_match: false,
+            },
+        ];
 
-        let no_config = work_memory_semantic_ranking("Did the release gate pass?", &hits);
+        let no_config = work_memory_semantic_ranking(
+            &SemanticService::from_config(),
+            "Did the release gate pass?",
+            &hits,
+        );
         assert_eq!(no_config["used"], false);
         assert_eq!(no_config["reason"], "not_configured");
 
         let semantic_url = semantic_test_server(
-            r#"{"model":"jev-test","answers":{"hit_0":{"type":"noul","noul":0.93},"evidence_sufficient":{"type":"noul","noul":0.87}}}"#,
+            r#"{"model":"jev-test","answers":{"hit_0":{"type":"noul","noul":0.20},"hit_1":{"type":"noul","noul":0.93},"evidence_sufficient":{"type":"noul","noul":0.87}}}"#,
         );
         write_semantic_test_config(&config_dir, "work-memory-evidence", &semantic_url);
-        let configured = work_memory_semantic_ranking("Did the release gate pass?", &hits);
+        let configured = work_memory_semantic_ranking(
+            &SemanticService::from_config(),
+            "Did the release gate pass?",
+            &hits,
+        );
         assert_eq!(configured["used"], true);
-        assert_eq!(configured["ranked"][0]["source_id"], "ev_1");
+        assert_eq!(configured["ranked"][0]["source_id"], "ev_relaxed");
+        assert_eq!(configured["ranked"][0]["match_kind"], "relaxed");
+        assert_eq!(
+            configured["ranked"][0]["excerpt"],
+            "The gate passed after rollout."
+        );
+        assert_eq!(configured["relaxed_candidate_count"], 1);
         assert_eq!(configured["evidence_sufficient"], 0.87);
         assert_eq!(configured["preserves_hit_order"], true);
         assert_eq!(configured["authority"], "advisory_only");
 
         write_semantic_test_config(&config_dir, "work-memory-evidence", "http://127.0.0.1:1/v1");
-        let provider_error = work_memory_semantic_ranking("Did the release gate pass?", &hits);
+        let provider_error = work_memory_semantic_ranking(
+            &SemanticService::from_config(),
+            "Did the release gate pass?",
+            &hits,
+        );
         assert_eq!(provider_error["used"], false);
         assert_ne!(provider_error["reason"], "not_configured");
 
