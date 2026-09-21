@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.114";
+const H2W_SCRIPT_VERSION = "0.1.115";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -4188,6 +4188,12 @@ async function onPushHello(storeKey, data) {
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
   if (d.status === "working" && automationEnabledForBinding(b)) armProgressTimer(storeKey, b);
+  const taskWake = await routeAgentTaskInboxWake(b, { wakeKind: "round" });
+  if (taskWake.matched) {
+    if (taskWake.wake) callLog(`task inbox recovery wake: ws=${ws}`);
+    else if (taskWake.aggregated) callLog(`task inbox recovery retained for aggregation: ws=${ws}`);
+    return;
+  }
   if (d.wake) {
     callLog(`hello recovery wake: ws=${ws} → ${d.status} (settle missed while offline)`);
     await routeWake(b, { status: d.status, output: "", working_count: d.working_count }, CFG.wakeTemplate || defaultWakeTemplate());
@@ -4230,6 +4236,22 @@ async function onPushSettled(storeKey, data) {
   b.status = d.status;
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
+
+  const taskWake = await routeAgentTaskInboxWake(b, {
+    wakeKind: d.kind,
+    settleRetry: true,
+  });
+  if (taskWake.matched) {
+    if (d.kind === "round") clearProgressTimer(storeKey);
+    if (taskWake.wake) {
+      callLog(`task terminal wake: ws=${ws}, pending=${taskWake.inbox?.tasks?.length || 0}`);
+      setActionBadge("✓", "#16a34a", 4000);
+    } else if (taskWake.aggregated) {
+      callLog(`task terminal aggregated: ws=${ws}, running=${taskWake.inbox?.summary?.running || 0}`);
+      setActionBadge("…", "#d97706");
+    }
+    return;
+  }
 
   // Goal-aware WAIT_EXTERNAL wake-up: this is the existing meaningful agent
   // transition, so a supervisor session waiting on the local agent is woken and
@@ -4344,6 +4366,203 @@ function semanticFailure(payload, status = 0) {
     status: httpStatus || null,
     error: code,
   };
+}
+
+
+function taskSemanticProbability(task, key) {
+  const value = Number(task?.semantic?.assessment?.[key]);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function taskSemanticUrgent(task) {
+  const state = String(task?.semantic?.assessment?.state || "");
+  return taskSemanticProbability(task, "needs_human") >= 0.70
+    || taskSemanticProbability(task, "needs_followup") >= 0.90
+    || taskSemanticProbability(task, "needs_handoff") >= 0.90
+    || ["waiting_user", "blocked_external"].includes(state);
+}
+
+function taskInboxDecision(inbox) {
+  const tasks = Array.isArray(inbox?.tasks) ? inbox.tasks : [];
+  if (!tasks.length) return { matched: false, wake: false, reason: "no_pending_terminal" };
+  const urgent = tasks.some((task) =>
+    ["blocked", "failed"].includes(String(task?.lifecycle || "")) || taskSemanticUrgent(task));
+  const running = Math.max(0, Number(inbox?.summary?.running) || 0);
+  const semanticReady = tasks.every((task) =>
+    task?.semantic?.used === true && task?.semantic?.assessment && typeof task.semantic.assessment === "object");
+  if (running > 0 && !urgent && semanticReady) {
+    return { matched: true, wake: false, reason: "semantic_aggregate_siblings", urgent: false };
+  }
+  if (running > 0 && !urgent && !semanticReady) {
+    return {
+      matched: true,
+      wake: true,
+      reason: "semantic_pending_fallback",
+      urgent: false,
+    };
+  }
+  return { matched: true, wake: true, reason: urgent ? "urgent_terminal" : "round_terminal", urgent };
+}
+
+function formatTaskSemantic(task) {
+  const assessment = task?.semantic?.assessment;
+  if (!assessment || typeof assessment !== "object") return "";
+  const state = String(assessment.state || "unknown");
+  const completed = Number(assessment.task_completed);
+  const followup = Number(assessment.needs_followup);
+  const human = Number(assessment.needs_human);
+  const handoff = Number(assessment.needs_handoff);
+  const parts = ["state=" + state];
+  if (Number.isFinite(completed)) parts.push("task_completed=" + completed.toFixed(2));
+  if (Number.isFinite(followup)) parts.push("needs_followup=" + followup.toFixed(2));
+  if (Number.isFinite(human)) parts.push("needs_human=" + human.toFixed(2));
+  if (Number.isFinite(handoff)) parts.push("needs_handoff=" + handoff.toFixed(2));
+  return parts.length ? " [" + parts.join(", ") + "]" : "";
+}
+
+function taskInboxWakeText(inbox) {
+  const tasks = Array.isArray(inbox?.tasks) ? inbox.tasks.slice(0, 16) : [];
+  const summary = inbox?.summary || {};
+  const lines = [
+    "Herdr child-task terminal update: " + tasks.length
+      + " pending result(s); " + (Number(summary.running) || 0) + " running, "
+      + (Number(summary.completed) || 0) + " completed, "
+      + (Number(summary.blocked) || 0) + " blocked, "
+      + (Number(summary.failed) || 0) + " failed.",
+  ];
+  for (const task of tasks) {
+    lines.push(
+      "- " + String(task?.task_id || "task") + ": " + String(task?.lifecycle || "unknown")
+      + " (child " + String(task?.target || "unknown")
+      + ", turn " + String(task?.turn_id || "unverified")
+      + ", terminal_seq " + String(task?.terminal_seq ?? "unknown") + ")"
+      + formatTaskSemantic(task),
+    );
+  }
+  lines.push("Continue from these durable task results. Do not re-dispatch a terminal or delivery-uncertain task blindly.");
+  return lines.join("\n").slice(0, 12000);
+}
+
+async function fetchAgentTaskInbox(binding, { settleRetry = false } = {}) {
+  const parentSessionRef = String(binding?.browser_session_ref || "").trim();
+  if (!parentSessionRef) return null;
+  const workspaceId = String(normalizeWorkspaceId(binding) || "").trim();
+  const attempts = settleRetry ? 4 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const url = new URL(semanticRuntimeUrl("/extension/agent/tasks"));
+      url.searchParams.set("parent_session_ref", parentSessionRef);
+      if (workspaceId) url.searchParams.set("workspace_id", workspaceId);
+      url.searchParams.set("limit", "64");
+      const response = await localHerdrFetch(url.toString(), { nativeTimeoutMs: 1200 });
+      const value = await response.json().catch(() => null);
+      if (response.ok && value?.ok === true) {
+        if (Array.isArray(value.tasks) && value.tasks.length > 0) return value;
+        if (!settleRetry || attempt === attempts - 1) return value;
+      } else if (!settleRetry || attempt === attempts - 1) {
+        return null;
+      }
+    } catch (_) {
+      if (!settleRetry || attempt === attempts - 1) return null;
+    }
+    await sleep(50);
+  }
+  return null;
+}
+
+async function ackAgentTask(binding, taskId) {
+  const parentSessionRef = String(binding?.browser_session_ref || "").trim();
+  const id = String(taskId || "").trim();
+  if (!parentSessionRef || !id) return false;
+  try {
+    const response = await localHerdrFetch(semanticRuntimeUrl("/extension/agent/tasks/ack"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: id, parent_session_ref: parentSessionRef }),
+      nativeTimeoutMs: 1200,
+    });
+    const value = await response.json().catch(() => null);
+    return response.ok && value?.ok === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function routeAgentTaskInboxWake(binding, { wakeKind = null, settleRetry = false } = {}) {
+  const TASK_SEMANTIC_GRACE_MS = 300;
+  let inbox = await fetchAgentTaskInbox(binding, { settleRetry });
+  let decision = taskInboxDecision(inbox);
+  if (!decision.matched) return { matched: false, wake: false, inbox };
+
+  const semanticPending = () => (Array.isArray(inbox?.tasks) ? inbox.tasks : [])
+    .some((task) => String(task?.semantic?.reason || "") === "pending");
+  if (!decision.urgent && semanticPending()) {
+    await sleep(TASK_SEMANTIC_GRACE_MS);
+    const refreshed = await fetchAgentTaskInbox(binding);
+    if (refreshed?.ok) {
+      inbox = refreshed;
+      decision = taskInboxDecision(inbox);
+    }
+  }
+
+  if (!decision.wake && decision.reason === "semantic_aggregate_siblings") {
+    // Jev may coalesce sibling results, but never indefinitely. Give fan-out a
+    // short window to converge, then fail open to a deterministic partial wake.
+    await sleep(500);
+    const refreshed = await fetchAgentTaskInbox(binding);
+    if (refreshed?.ok) {
+      inbox = refreshed;
+      decision = taskInboxDecision(inbox);
+    }
+    if (!decision.wake && decision.reason === "semantic_aggregate_siblings") {
+      decision = {
+        ...decision,
+        wake: true,
+        reason: "bounded_aggregation_elapsed",
+      };
+    }
+  }
+  if (!decision.wake) {
+    return { matched: true, wake: false, aggregated: true, decision, inbox };
+  }
+  if (!automationEnabledForBinding(binding)) {
+    return { matched: true, wake: false, disabled: true, decision, inbox };
+  }
+  const routed = await routeWake(
+    binding,
+    {
+      status: "agent_task_terminal",
+      working_count: Number(inbox?.summary?.running) || 0,
+      task_summary: inbox?.summary || null,
+    },
+    taskInboxWakeText(inbox),
+    wakeKind,
+  );
+  if (routed?.ok) {
+    for (const task of Array.isArray(inbox?.tasks) ? inbox.tasks : []) {
+      await ackAgentTask(binding, task?.task_id);
+    }
+  }
+  return { matched: true, wake: Boolean(routed?.ok), decision, inbox, routed };
+}
+
+async function aggregateAgentTaskSummary(bindings = []) {
+  const unique = new Map();
+  for (const binding of bindings) {
+    const sessionRef = String(binding?.browser_session_ref || "").trim();
+    const workspaceId = String(normalizeWorkspaceId(binding) || "").trim();
+    if (!sessionRef) continue;
+    unique.set(sessionRef + "::" + workspaceId, binding);
+  }
+  const inboxes = await Promise.all([...unique.values()].map((binding) => fetchAgentTaskInbox(binding)));
+  const summary = { running: 0, completed: 0, blocked: 0, failed: 0 };
+  for (const inbox of inboxes) {
+    if (!inbox?.ok) continue;
+    for (const key of Object.keys(summary)) {
+      summary[key] += Math.max(0, Number(inbox?.summary?.[key]) || 0);
+    }
+  }
+  return summary;
 }
 
 async function runtimeSemanticCapabilities({ refresh = false } = {}) {
@@ -7359,6 +7578,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!b) continue;
           if (browserObservation?.accountRef) b.browser_account_ref = browserObservation.accountRef;
           if (browserObservation?.spaceRef) b.browser_space_ref = browserObservation.spaceRef;
+          if (browserObservation?.sessionRef) b.browser_session_ref = browserObservation.sessionRef;
           if (Number.isSafeInteger(browserObservation?.observationGeneration)
               && browserObservation.observationGeneration > 0) {
             b.browser_generation = browserObservation.observationGeneration;
@@ -7620,6 +7840,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return total + (Array.isArray(workspace?.panes) ? workspace.panes.length : 0);
       }, 0);
       const boundWorkingCount = liveSession.reduce((total, binding) => total + Number(bindingView(binding)?.working_count || 0), 0);
+      const taskSummary = await aggregateAgentTaskSummary(liveSession);
       const semanticCapabilities = await runtimeSemanticCapabilities();
       const last = convKey ? (lastIdleNudgeResult.get(convKey) || null) : null;
       sendResponse({
@@ -7654,6 +7875,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         bound_workspace_count: boundWorkspaceIds.size,
         bound_pane_count: boundPaneCount,
         bound_working_count: boundWorkingCount,
+        task_summary: taskSummary,
         bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),
         bindings: await Promise.all(session.map(async (b) => ({
           ...bindingView(b),

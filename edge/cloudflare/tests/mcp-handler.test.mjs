@@ -1281,6 +1281,34 @@ test("browser and Page Assist private methods require explicit enrolled device s
       endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     }],
   }, "Page Assist receives only endpoint grants for the routed device and no WebChat grant tuple");
+
+  const agentPrompt = await handleMcp(
+    req(6, "tools/call", {
+      name: "herdr_prompt",
+      _meta: { "openai/session": "openai-session-anon-123" },
+      arguments: {
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        target: "pi",
+        text: "do durable child work",
+        idempotency_key: "agent-task-parent-session-test",
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(agentPrompt.body.result.isError, undefined);
+  assert.equal(d.calls.length, 4, "agent prompt forwards once to the selected workstation");
+  assert.deepEqual(d.calls[3].trace, {
+    webchat_authorization: {
+      principal_ref: "connector:conn_auditconnector123",
+      connector_id: "conn_auditconnector123",
+      grant_generation: 7,
+    },
+    browser_caller_session: {
+      provider: "chatgpt",
+      opaque_session_id: "openai-session-anon-123",
+    },
+  }, "agent prompt carries exact caller session provenance without WebChat control grants");
 });
 
 

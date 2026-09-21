@@ -323,6 +323,12 @@ Herdr 工具权限卡是唯一不跟随 Auto 的例外：受支持、明确标�
 
 z.ai / DeepSeek 的 Auto 只负责 Herdr progress / settled 回推；ChatGPT 专属的 stale-view 恢复、权限卡处理、回合结束语义判断和自动 rollover 不会移植过去假装通用。
 
+### Agent task 的异步 parent wake
+
+ChatGPT 通过 `herdr_prompt` 派出本地 Agent 长任务时，当前 WebChat 的稳定 browser session identity 会跟随请求进入 Runtime。Runtime 立即返回 `task_id / dispatch_id / turn_id`，并把后续 terminal 写入 durable parent inbox。扩展仍以 Herdr settled event 作为低成本触发信号，但真正的任务归属、`completed / blocked / failed`、Jev advisory 和 HUD task counters 都从 session-scoped inbox 读取；只有属于当前 `browser_session_ref` 的 task 才能唤醒当前会话。成功发送 wake 后才 acknowledge 对应 task，扩展离线或 wake 失败时结果继续留在 inbox。
+
+多子任务时，Jev 的快速结果可以建议聚合：如果还有 sibling 在运行且已得到明确非紧急 advisory，可以先保留结果，等后续 terminal 合并通知；`blocked / failed`、`needs_human` 等紧急结果优先唤醒。若 Jev 尚未快速返回、未配置或失败，则 fail-open 到确定性 terminal wake，不会因为语义服务等待而把 Parent 再次卡住。
+
 ## ChatGPT 回复结束后的语义判断
 
 有些回复从页面上看已经“结束”，但语义上其实停在半途，比如：

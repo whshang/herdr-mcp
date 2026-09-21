@@ -1,19 +1,24 @@
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
-use crate::state_store::{OperationReservation, StateStore};
+use crate::progressive_skills::agent_closeout_advice;
+use crate::state_cache::EventCache;
+use crate::state_store::{
+    OperationLedgerInput, OperationLedgerRecord, OperationReservation, StateStore,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-#[cfg(test)]
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECORD_TTL_MS: u64 = 10 * 60_000;
 const RECORD_LIMIT: usize = 512;
 const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
+const PROMPT_TASK_OPERATION_KIND: &str = "herdr_prompt_task";
+const PROMPT_TASK_TTL_MS: u64 = 7 * 24 * 60 * 60_000;
 const MAX_REPLAY_JSON_BYTES: usize = 128 * 1024;
 const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WAIT_MS: u64 = 25_000;
@@ -26,6 +31,131 @@ struct AgentState {
     pane_id: Option<String>,
     agent_status: Option<String>,
     state_change_seq: Option<u64>,
+}
+
+struct RegisterTaskInput<'a> {
+    task_id: &'a str,
+    target: &'a str,
+    fingerprint: &'a str,
+    before: Option<&'a AgentState>,
+    after: Option<&'a AgentState>,
+    submitted: Option<bool>,
+    start_cursor: u64,
+    parent_target: Option<&'a str>,
+    parent_session_ref: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PromptTaskLifecycle {
+    AwaitingActivity,
+    AwaitingPriorSettle,
+    Running,
+    Completed,
+    Blocked,
+    Failed,
+    DeliveryUncertain,
+}
+
+impl PromptTaskLifecycle {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Blocked | Self::Failed)
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::AwaitingActivity => "awaiting_activity",
+            Self::AwaitingPriorSettle => "awaiting_prior_settle",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::DeliveryUncertain => "delivery_uncertain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PromptTaskRecord {
+    schema_version: u32,
+    task_id: String,
+    dispatch_id: String,
+    target: String,
+    pane_id: Option<String>,
+    workspace_id: Option<String>,
+    baseline_status: Option<String>,
+    baseline_seq: Option<u64>,
+    start_cursor: u64,
+    last_cursor: u64,
+    lifecycle: PromptTaskLifecycle,
+    activity_observed: bool,
+    prior_settle_observed: bool,
+    turn_id: Option<String>,
+    exact_native_turn: bool,
+    terminal_status: Option<String>,
+    terminal_cursor: Option<u64>,
+    terminal_at_ms: Option<u64>,
+    parent_target: Option<String>,
+    #[serde(default)]
+    parent_session_ref: Option<String>,
+    notification_state: String,
+    #[serde(default)]
+    notification_attempts: u32,
+    #[serde(default)]
+    notification_at_ms: Option<u64>,
+    #[serde(default)]
+    notification_error: Option<String>,
+    acknowledged_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    semantic: Option<Value>,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+}
+
+impl PromptTaskRecord {
+    fn is_terminal(&self) -> bool {
+        self.lifecycle.is_terminal()
+    }
+
+    fn public_json(&self) -> Value {
+        json!({
+            "task_id": self.task_id,
+            "dispatch_id": self.dispatch_id,
+            "target": self.target,
+            "pane_id": self.pane_id,
+            "workspace_id": self.workspace_id,
+            "lifecycle": self.lifecycle.as_str(),
+            "activity_observed": self.activity_observed,
+            "prior_settle_observed": self.prior_settle_observed,
+            "turn_id": self.turn_id,
+            "turn_correlation": if self.activity_observed {
+                "runtime_activity_gate"
+            } else if self.turn_id.is_some() {
+                "runtime_dispatch"
+            } else {
+                "pending"
+            },
+            "exact_native_turn": self.exact_native_turn,
+            "terminal": self.is_terminal(),
+            "terminal_status": self.terminal_status,
+            "terminal_cursor": self.terminal_cursor,
+            "terminal_at_ms": self.terminal_at_ms,
+            "terminal_seq": self.terminal_cursor,
+            "terminal_event_id": self.terminal_cursor.map(|cursor| {
+                format!("terminal:{}:{cursor}", self.task_id)
+            }),
+            "parent_target": self.parent_target,
+            "parent_session_ref": self.parent_session_ref,
+            "notification_state": self.notification_state,
+            "notification_attempts": self.notification_attempts,
+            "notification_at_ms": self.notification_at_ms,
+            "notification_error": self.notification_error,
+            "acknowledged": self.acknowledged_at_ms.is_some(),
+            "semantic": self.semantic,
+            "created_at_ms": self.created_at_ms,
+            "updated_at_ms": self.updated_at_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,13 +171,15 @@ struct PromptRecord {
     state: RecordState,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PromptRegistryInner {
     records: Mutex<HashMap<String, PromptRecord>>,
     store: Option<Arc<Mutex<StateStore>>>,
+    cache: Option<Arc<EventCache>>,
+    client: Option<HerdrClient>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PromptRegistry {
     inner: Arc<PromptRegistryInner>,
 }
@@ -64,13 +196,34 @@ impl PromptRegistry {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn with_store(store: Arc<Mutex<StateStore>>) -> Self {
         Self {
             inner: Arc::new(PromptRegistryInner {
                 records: Mutex::new(HashMap::new()),
                 store: Some(store),
+                cache: None,
+                client: None,
             }),
         }
+    }
+
+    pub fn with_runtime(
+        store: Arc<Mutex<StateStore>>,
+        cache: Arc<EventCache>,
+        client: HerdrClient,
+    ) -> Self {
+        let registry = Self {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                store: Some(store),
+                cache: Some(cache),
+                client: Some(client),
+            }),
+        };
+        registry.reconcile_active_tasks();
+        registry.start_task_tracker();
+        registry
     }
 
     fn begin(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
@@ -152,6 +305,984 @@ impl PromptRegistry {
             );
         }
         Ok(())
+    }
+
+    fn current_task_cursor(&self) -> u64 {
+        self.inner
+            .cache
+            .as_ref()
+            .map(|cache| cache.digest_since(u64::MAX).cursor)
+            .unwrap_or(0)
+    }
+
+    fn register_task(
+        &self,
+        input: RegisterTaskInput<'_>,
+    ) -> Result<Option<PromptTaskRecord>, String> {
+        let RegisterTaskInput {
+            task_id,
+            target,
+            fingerprint,
+            before,
+            after,
+            submitted,
+            start_cursor,
+            parent_target,
+            parent_session_ref,
+        } = input;
+        if submitted == Some(false) || self.inner.store.is_none() {
+            return Ok(None);
+        }
+        if let Some(existing) = self.load_task(task_id)? {
+            return Ok(Some(existing));
+        }
+
+        let now = now_ms();
+        let pane_id = after
+            .and_then(|state| state.pane_id.clone())
+            .or_else(|| before.and_then(|state| state.pane_id.clone()));
+        let workspace_id = pane_id
+            .as_deref()
+            .and_then(|pane_id| self.workspace_for_pane(pane_id));
+        let baseline_status = before.and_then(|state| state.agent_status.clone());
+        let baseline_seq = before.and_then(|state| state.state_change_seq);
+        let mut lifecycle = if baseline_status.as_deref() == Some("working") {
+            PromptTaskLifecycle::AwaitingPriorSettle
+        } else if submitted.is_none() {
+            PromptTaskLifecycle::DeliveryUncertain
+        } else {
+            PromptTaskLifecycle::AwaitingActivity
+        };
+        let mut activity_observed = false;
+        // This is the Runtime-owned turn envelope for this submission. It is
+        // stable immediately, while exact_native_turn remains false until Herdr
+        // exposes a native prompt-turn identity.
+        let mut turn_id = Some(runtime_turn_id(task_id, "dispatch"));
+        let after_status = after.and_then(|state| state.agent_status.as_deref());
+        let after_seq = after.and_then(|state| state.state_change_seq);
+        let seq_advanced = baseline_seq
+            .zip(after_seq)
+            .is_some_and(|(before, after)| before != after);
+        if baseline_status.as_deref() != Some("working")
+            && (after_status == Some("working") || seq_advanced)
+        {
+            lifecycle = PromptTaskLifecycle::Running;
+            activity_observed = true;
+            turn_id = Some(runtime_turn_id(
+                task_id,
+                &format!("seq:{}", after_seq.unwrap_or_default()),
+            ));
+        }
+
+        let record = PromptTaskRecord {
+            schema_version: 1,
+            task_id: task_id.to_owned(),
+            dispatch_id: task_id.to_owned(),
+            target: target.to_owned(),
+            pane_id,
+            workspace_id,
+            baseline_status,
+            baseline_seq,
+            start_cursor,
+            last_cursor: start_cursor,
+            lifecycle,
+            activity_observed,
+            prior_settle_observed: false,
+            turn_id,
+            exact_native_turn: false,
+            terminal_status: None,
+            terminal_cursor: None,
+            terminal_at_ms: None,
+            parent_target: parent_target.map(str::to_owned),
+            parent_session_ref: parent_session_ref.map(str::to_owned),
+            notification_state: "pending".to_owned(),
+            notification_attempts: 0,
+            notification_at_ms: None,
+            notification_error: None,
+            acknowledged_at_ms: None,
+            semantic: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        self.save_task(&record, Some(fingerprint))?;
+        let reconciled = self.reconcile_task(task_id)?;
+        Ok(reconciled.or(Some(record)))
+    }
+
+    pub fn task_status(&self, task_id: &str) -> Value {
+        match self.reconcile_task(task_id) {
+            Ok(Some(task)) => json!({"ok": true, "task": task.public_json()}),
+            Ok(None) => json!({
+                "ok": false,
+                "code": "agent_task_not_found",
+                "task_id": task_id,
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+                "task_id": task_id,
+            }),
+        }
+    }
+
+    pub fn task_status_for_parent_session(&self, task_id: &str, parent_session_ref: &str) -> Value {
+        match self.reconcile_task(task_id) {
+            Ok(Some(task)) if task.parent_session_ref.as_deref() == Some(parent_session_ref) => {
+                json!({"ok": true, "task": task.public_json()})
+            }
+            Ok(Some(_)) => json!({
+                "ok": false,
+                "code": "agent_task_parent_mismatch",
+                "task_id": task_id,
+            }),
+            Ok(None) => json!({
+                "ok": false,
+                "code": "agent_task_not_found",
+                "task_id": task_id,
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+                "task_id": task_id,
+            }),
+        }
+    }
+
+    pub fn task_inbox(
+        &self,
+        workspace_id: Option<&str>,
+        parent_target: Option<&str>,
+        parent_session_ref: Option<&str>,
+        include_acknowledged: bool,
+        limit: usize,
+    ) -> Value {
+        self.reconcile_active_tasks();
+        match self.list_tasks(limit.clamp(1, 512)) {
+            Ok(tasks) => {
+                let mut terminal = tasks
+                    .iter()
+                    .filter(|task| task.is_terminal())
+                    .filter(|task| {
+                        workspace_id.is_none_or(|workspace_id| {
+                            task.workspace_id.as_deref() == Some(workspace_id)
+                        })
+                    })
+                    .filter(|task| {
+                        parent_target.is_none_or(|parent_target| {
+                            task.parent_target.as_deref() == Some(parent_target)
+                        })
+                    })
+                    .filter(|task| {
+                        parent_session_ref.is_none_or(|parent_session_ref| {
+                            task.parent_session_ref.as_deref() == Some(parent_session_ref)
+                        })
+                    })
+                    .filter(|task| include_acknowledged || task.acknowledged_at_ms.is_none())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                terminal.sort_by(|left, right| {
+                    semantic_notification_priority(right)
+                        .cmp(&semantic_notification_priority(left))
+                        .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+                });
+                terminal.truncate(limit.clamp(1, 512));
+
+                let scoped = tasks.iter().filter(|task| {
+                    workspace_id.is_none_or(|workspace_id| {
+                        task.workspace_id.as_deref() == Some(workspace_id)
+                    }) && parent_target.is_none_or(|parent_target| {
+                        task.parent_target.as_deref() == Some(parent_target)
+                    }) && parent_session_ref.is_none_or(|parent_session_ref| {
+                        task.parent_session_ref.as_deref() == Some(parent_session_ref)
+                    })
+                });
+                let mut running = 0_u64;
+                let mut completed = 0_u64;
+                let mut blocked = 0_u64;
+                let mut failed = 0_u64;
+                for task in scoped {
+                    match task.lifecycle {
+                        PromptTaskLifecycle::Running
+                        | PromptTaskLifecycle::AwaitingActivity
+                        | PromptTaskLifecycle::AwaitingPriorSettle
+                        | PromptTaskLifecycle::DeliveryUncertain => running += 1,
+                        PromptTaskLifecycle::Completed
+                            if include_acknowledged || task.acknowledged_at_ms.is_none() =>
+                        {
+                            completed += 1
+                        }
+                        PromptTaskLifecycle::Blocked
+                            if include_acknowledged || task.acknowledged_at_ms.is_none() =>
+                        {
+                            blocked += 1
+                        }
+                        PromptTaskLifecycle::Failed
+                            if include_acknowledged || task.acknowledged_at_ms.is_none() =>
+                        {
+                            failed += 1
+                        }
+                        _ => {}
+                    }
+                }
+                json!({
+                    "ok": true,
+                    "summary": {
+                        "running": running,
+                        "completed": completed,
+                        "blocked": blocked,
+                        "failed": failed,
+                    },
+                    "tasks": terminal.into_iter().map(|task| task.public_json()).collect::<Vec<_>>(),
+                })
+            }
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+            }),
+        }
+    }
+
+    pub fn task_ack_for_parent_session(&self, task_id: &str, parent_session_ref: &str) -> Value {
+        match self.load_task(task_id) {
+            Ok(Some(task)) if task.parent_session_ref.as_deref() != Some(parent_session_ref) => {
+                json!({
+                    "ok": false,
+                    "code": "agent_task_parent_mismatch",
+                    "task_id": task_id,
+                })
+            }
+            Ok(_) => self.task_ack(task_id),
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+            }),
+        }
+    }
+
+    pub fn task_ack(&self, task_id: &str) -> Value {
+        match self.load_task(task_id) {
+            Ok(Some(mut task)) => {
+                let now = now_ms();
+                task.acknowledged_at_ms = Some(now);
+                task.notification_state = "acknowledged".to_owned();
+                task.updated_at_ms = now;
+                match self.save_task(&task, None) {
+                    Ok(()) => json!({"ok": true, "task": task.public_json()}),
+                    Err(error) => json!({
+                        "ok": false,
+                        "code": "agent_task_store_unavailable",
+                        "message": error,
+                    }),
+                }
+            }
+            Ok(None) => json!({
+                "ok": false,
+                "code": "agent_task_not_found",
+                "task_id": task_id,
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+            }),
+        }
+    }
+
+    fn wait_task(&self, task_id: &str, wait: &Value) -> Value {
+        let timeout_ms = wait
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_WAIT_MS)
+            .min(MAX_WAIT_MS);
+        let until = wait
+            .get("until")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            match self.reconcile_task(task_id) {
+                Ok(Some(task)) => {
+                    if task_matches_wait(&task, &until) {
+                        return json!({
+                            "completed": true,
+                            "task_id": task_id,
+                            "matched": task.lifecycle.as_str(),
+                            "task": task.public_json(),
+                        });
+                    }
+                    if task.is_terminal() {
+                        return json!({
+                            "completed": true,
+                            "task_id": task_id,
+                            "matched": task.lifecycle.as_str(),
+                            "task": task.public_json(),
+                        });
+                    }
+                }
+                Ok(None) => {
+                    return json!({
+                        "completed": false,
+                        "task_id": task_id,
+                        "reason": "agent_task_not_found",
+                    });
+                }
+                Err(error) => {
+                    return json!({
+                        "completed": false,
+                        "task_id": task_id,
+                        "reason": "agent_task_store_unavailable",
+                        "message": error,
+                    });
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let task = self
+                    .reconcile_task(task_id)
+                    .ok()
+                    .flatten()
+                    .map(|task| task.public_json())
+                    .unwrap_or(Value::Null);
+                return json!({
+                    "completed": false,
+                    "task_id": task_id,
+                    "reason": "agent_task_wait_timeout",
+                    "task": task,
+                });
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn start_task_tracker(&self) {
+        let Some(cache) = self.inner.cache.as_ref() else {
+            return;
+        };
+        let mut cursor = cache.subscribe_cursor();
+        let weak = Arc::downgrade(&self.inner);
+        let _ = thread::Builder::new()
+            .name("herdr-mcp-agent-task-tracker".to_owned())
+            .spawn(move || {
+                loop {
+                    match cursor.has_changed() {
+                        Ok(true) => {
+                            let _ = cursor.borrow_and_update();
+                            let Some(inner) = weak.upgrade() else {
+                                return;
+                            };
+                            let registry = PromptRegistry { inner };
+                            registry.reconcile_active_tasks();
+                        }
+                        Ok(false) => thread::sleep(Duration::from_millis(50)),
+                        Err(_) => return,
+                    }
+                }
+            });
+    }
+
+    fn reconcile_active_tasks(&self) {
+        let Ok(tasks) = self.list_tasks(512) else {
+            return;
+        };
+        for mut task in tasks {
+            if task.is_terminal() {
+                self.enrich_terminal_task(&mut task);
+                if let Ok(Some(reloaded)) = self.load_task(&task.task_id) {
+                    task = reloaded;
+                }
+                if task.notification_state == "pending" {
+                    self.maybe_notify_parent(&task);
+                }
+            } else {
+                let _ = self.reconcile_task(&task.task_id);
+            }
+        }
+    }
+
+    fn enrich_terminal_task(&self, task: &mut PromptTaskRecord) {
+        const RECENT_READ_BUDGET: Duration = Duration::from_millis(500);
+        const SEMANTIC_GRACE: Duration = Duration::from_millis(300);
+
+        if !task.is_terminal() || task.semantic.is_some() {
+            return;
+        }
+        let Some(client) = self.inner.client.as_ref().cloned() else {
+            return;
+        };
+
+        // Persist deterministic terminal state first. Readback + Jev run
+        // entirely in the background; the terminal path waits at most one
+        // short grace window for an advisory that is already ready.
+        task.semantic = Some(json!({
+            "ok": true,
+            "attempted": true,
+            "used": false,
+            "reason": "pending",
+            "advisory_only": true,
+        }));
+        task.updated_at_ms = now_ms();
+        let _ = self.save_task(task, None);
+
+        let registry = self.clone();
+        let task_id = task.task_id.clone();
+        let target = task.target.clone();
+        let terminal_status = task.terminal_status.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let _ = thread::Builder::new()
+            .name("herdr-mcp-agent-task-semantic".to_owned())
+            .spawn(move || {
+                let advice = match client.call_with_timeout(
+                    "agent.read",
+                    json!({
+                        "target": target,
+                        "source": "recent_unwrapped",
+                        "lines": 120,
+                    }),
+                    RECENT_READ_BUDGET,
+                ) {
+                    Ok(value) => match bounded_recent_text(&value, 12_000)
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        Some(recent_text) => agent_closeout_advice(&json!({
+                            "target": target,
+                            "recent_text": recent_text,
+                            "agent_status": terminal_status,
+                            "process_running": false,
+                        })),
+                        None => json!({
+                            "ok": true,
+                            "attempted": false,
+                            "used": false,
+                            "reason": "recent_text_unavailable",
+                            "advisory_only": true,
+                        }),
+                    },
+                    Err(error) => json!({
+                        "ok": true,
+                        "attempted": false,
+                        "used": false,
+                        "reason": "recent_text_unavailable",
+                        "error_code": error.code,
+                        "advisory_only": true,
+                    }),
+                };
+                if let Ok(Some(mut current)) = registry.load_task(&task_id) {
+                    current.semantic = Some(advice.clone());
+                    current.updated_at_ms = now_ms();
+                    let _ = registry.save_task(&current, None);
+                }
+                let _ = sender.send(advice);
+            });
+
+        if let Ok(advice) = receiver.recv_timeout(SEMANTIC_GRACE) {
+            task.semantic = Some(advice);
+            task.updated_at_ms = now_ms();
+            let _ = self.save_task(task, None);
+        }
+    }
+
+    fn maybe_notify_parent(&self, trigger: &PromptTaskRecord) {
+        let Some(parent_target) = trigger.parent_target.as_deref() else {
+            return;
+        };
+        if trigger.notification_state != "pending" {
+            return;
+        }
+        let Some(client) = self.inner.client.as_ref() else {
+            return;
+        };
+        let Some(parent_state) = agent_state_of(client, parent_target) else {
+            return;
+        };
+        if !matches!(parent_state.agent_status.as_deref(), Some("idle" | "done")) {
+            return;
+        }
+
+        let Ok(all_tasks) = self.list_tasks(512) else {
+            return;
+        };
+        let active_sibling = all_tasks.iter().any(|task| {
+            task.parent_target.as_deref() == Some(parent_target) && !task.is_terminal()
+        });
+        let urgent = all_tasks.iter().any(|task| {
+            task.parent_target.as_deref() == Some(parent_target)
+                && task.notification_state == "pending"
+                && (matches!(
+                    task.lifecycle,
+                    PromptTaskLifecycle::Blocked | PromptTaskLifecycle::Failed
+                ) || semantic_notification_urgent(task))
+        });
+        if active_sibling && !urgent {
+            const COALESCE_GRACE_MS: u64 = 500;
+            let terminal_at = trigger.terminal_at_ms.unwrap_or(trigger.updated_at_ms);
+            let age_ms = now_ms().saturating_sub(terminal_at);
+            if age_ms < COALESCE_GRACE_MS {
+                let delay_ms = COALESCE_GRACE_MS.saturating_sub(age_ms);
+                let registry = self.clone();
+                let task_id = trigger.task_id.clone();
+                let _ = thread::Builder::new()
+                    .name("herdr-mcp-agent-task-coalesce".to_owned())
+                    .spawn(move || {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        if let Ok(Some(task)) = registry.load_task(&task_id)
+                            && task.notification_state == "pending"
+                        {
+                            registry.maybe_notify_parent(&task);
+                        }
+                    });
+                return;
+            }
+        }
+
+        let mut pending = all_tasks
+            .into_iter()
+            .filter(|task| {
+                task.parent_target.as_deref() == Some(parent_target)
+                    && task.is_terminal()
+                    && task.notification_state == "pending"
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        pending.sort_by(|left, right| {
+            semantic_notification_priority(right)
+                .cmp(&semantic_notification_priority(left))
+                .then_with(|| {
+                    left.terminal_cursor
+                        .unwrap_or(u64::MAX)
+                        .cmp(&right.terminal_cursor.unwrap_or(u64::MAX))
+                })
+        });
+        pending.truncate(32);
+
+        let now = now_ms();
+        for task in &mut pending {
+            task.notification_state = "in_flight".to_owned();
+            task.notification_attempts = task.notification_attempts.saturating_add(1);
+            task.notification_at_ms = Some(now);
+            task.notification_error = None;
+            task.updated_at_ms = now;
+            if self.save_task(task, None).is_err() {
+                return;
+            }
+        }
+
+        let mut lines = vec![format!(
+            "Herdr child-task update: {} terminal task(s).",
+            pending.len()
+        )];
+        for task in &pending {
+            let semantic = semantic_notification_summary(task);
+            lines.push(format!(
+                "- {}: {} (child {}, turn {}, terminal_seq {}){}",
+                task.task_id,
+                task.lifecycle.as_str(),
+                task.target,
+                task.turn_id.as_deref().unwrap_or("unverified"),
+                task.terminal_cursor
+                    .map(|cursor| cursor.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                semantic
+            ));
+        }
+        lines.push(
+            "Use herdr_mcp.agent.task.inbox or herdr_mcp.agent.task.status for durable details; do not re-dispatch a terminal or delivery-uncertain task blindly."
+                .to_owned(),
+        );
+        let text = lines.join("\n");
+
+        let outcome = client.call_with_timeout(
+            "agent.prompt",
+            json!({"target": parent_target, "text": text}),
+            Duration::from_secs(10),
+        );
+        let finished_at = now_ms();
+        match outcome {
+            Ok(_) => {
+                for task in &mut pending {
+                    task.notification_state = "delivered".to_owned();
+                    task.notification_at_ms = Some(finished_at);
+                    task.notification_error = None;
+                    task.updated_at_ms = finished_at;
+                    let _ = self.save_task(task, None);
+                }
+            }
+            Err(error) => {
+                let definitely_not_delivered = definitely_not_delivered(&error);
+                for task in &mut pending {
+                    task.notification_state = if definitely_not_delivered {
+                        "pending".to_owned()
+                    } else {
+                        "uncertain".to_owned()
+                    };
+                    task.notification_at_ms = Some(finished_at);
+                    task.notification_error = Some(truncate_chars(&error.message, 512));
+                    task.updated_at_ms = finished_at;
+                    let _ = self.save_task(task, None);
+                }
+            }
+        }
+    }
+
+    fn reconcile_task(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
+        let Some(mut task) = self.load_task(task_id)? else {
+            return Ok(None);
+        };
+        if task.is_terminal() {
+            return Ok(Some(task));
+        }
+        let Some(cache) = self.inner.cache.as_ref() else {
+            return Ok(Some(task));
+        };
+        let digest = cache.digest_since(task.last_cursor);
+        if digest.cursor.saturating_sub(task.last_cursor) > 2048 {
+            task.lifecycle = PromptTaskLifecycle::DeliveryUncertain;
+        }
+        let mut changed = false;
+        for event in &digest.events {
+            if apply_task_event(&mut task, event) {
+                changed = true;
+            }
+        }
+        if digest.cursor > task.last_cursor {
+            task.last_cursor = digest.cursor;
+            task.updated_at_ms = now_ms();
+            changed = true;
+        }
+        if changed {
+            self.save_task(&task, None)?;
+            if task.is_terminal() {
+                self.enrich_terminal_task(&mut task);
+                if let Some(reloaded) = self.load_task(task_id)? {
+                    task = reloaded;
+                }
+                self.maybe_notify_parent(&task);
+                if let Some(reloaded) = self.load_task(task_id)? {
+                    task = reloaded;
+                }
+            }
+        }
+        Ok(Some(task))
+    }
+
+    fn workspace_for_pane(&self, pane_id: &str) -> Option<String> {
+        let snapshot = self.inner.cache.as_ref()?.snapshot();
+        snapshot
+            .get("panes")
+            .and_then(Value::as_array)
+            .and_then(|panes| {
+                panes
+                    .iter()
+                    .find(|pane| pane.get("pane_id").and_then(Value::as_str) == Some(pane_id))
+            })
+            .and_then(|pane| pane.get("workspace_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                snapshot
+                    .get("agents")
+                    .and_then(Value::as_array)
+                    .and_then(|agents| {
+                        agents.iter().find(|agent| {
+                            agent.get("pane_id").and_then(Value::as_str) == Some(pane_id)
+                        })
+                    })
+                    .and_then(|agent| agent.get("workspace_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    }
+
+    fn load_task(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(None);
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        let Some(record) = store.operation_ledger(task_id)? else {
+            return Ok(None);
+        };
+        if record.kind != PROMPT_TASK_OPERATION_KIND {
+            return Ok(None);
+        }
+        decode_task_record(&record).map(Some)
+    }
+
+    fn list_tasks(&self, limit: usize) -> Result<Vec<PromptTaskRecord>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(vec![]);
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        store
+            .operation_ledgers(PROMPT_TASK_OPERATION_KIND, limit)?
+            .into_iter()
+            .map(|record| decode_task_record(&record))
+            .collect()
+    }
+
+    fn save_task(&self, task: &PromptTaskRecord, request_hash: Option<&str>) -> Result<(), String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(());
+        };
+        let encoded = serde_json::to_string(task)
+            .map_err(|error| format!("cannot encode agent task: {error}"))?;
+        let now = now_ms();
+        let expires_at = now.saturating_add(PROMPT_TASK_TTL_MS);
+        let mut store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        store.put_operation_ledger(OperationLedgerInput {
+            op_id: &task.task_id,
+            kind: PROMPT_TASK_OPERATION_KIND,
+            idempotency_key: None,
+            request_hash,
+            phase: if task.is_terminal() {
+                "terminal"
+            } else {
+                "active"
+            },
+            state: task.lifecycle.as_str(),
+            result_json: &encoded,
+            now_ms: i64::try_from(now).unwrap_or(i64::MAX),
+            expires_at: Some(i64::try_from(expires_at).unwrap_or(i64::MAX)),
+        })
+    }
+}
+
+fn bounded_recent_text(value: &Value, max_chars: usize) -> Option<String> {
+    fn first_text(value: &Value) -> Option<&str> {
+        if let Some(text) = value.as_str() {
+            return Some(text);
+        }
+        let object = value.as_object()?;
+        for key in ["text", "content", "output", "recent", "recent_unwrapped"] {
+            if let Some(text) = object.get(key).and_then(Value::as_str) {
+                return Some(text);
+            }
+        }
+        for key in ["result", "read", "agent", "data"] {
+            if let Some(text) = object.get(key).and_then(first_text) {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    first_text(value).map(|text| truncate_chars(text, max_chars))
+}
+
+fn semantic_probability(task: &PromptTaskRecord, key: &str) -> f64 {
+    task.semantic
+        .as_ref()
+        .and_then(|semantic| semantic.get("assessment"))
+        .and_then(|assessment| assessment.get(key))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn semantic_notification_urgent(task: &PromptTaskRecord) -> bool {
+    let state = task
+        .semantic
+        .as_ref()
+        .and_then(|semantic| semantic.pointer("/assessment/state"))
+        .and_then(Value::as_str);
+    semantic_probability(task, "needs_human") >= 0.70
+        || semantic_probability(task, "needs_followup") >= 0.90
+        || semantic_probability(task, "needs_handoff") >= 0.90
+        || matches!(state, Some("waiting_user" | "blocked_external"))
+}
+
+fn semantic_notification_priority(task: &PromptTaskRecord) -> u32 {
+    let lifecycle: u32 = match task.lifecycle {
+        PromptTaskLifecycle::Failed => 400,
+        PromptTaskLifecycle::Blocked => 350,
+        PromptTaskLifecycle::Completed => 100,
+        _ => 0,
+    };
+    let needs_human = (semantic_probability(task, "needs_human") * 100.0) as u32;
+    let needs_followup = (semantic_probability(task, "needs_followup") * 80.0) as u32;
+    let needs_handoff = (semantic_probability(task, "needs_handoff") * 60.0) as u32;
+    lifecycle
+        .saturating_add(needs_human)
+        .saturating_add(needs_followup)
+        .saturating_add(needs_handoff)
+}
+
+fn semantic_notification_summary(task: &PromptTaskRecord) -> String {
+    let Some(assessment) = task
+        .semantic
+        .as_ref()
+        .and_then(|semantic| semantic.get("assessment"))
+    else {
+        return String::new();
+    };
+    let state = assessment
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let needs_human = assessment
+        .get("needs_human")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let task_completed = assessment
+        .get("task_completed")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let needs_followup = assessment
+        .get("needs_followup")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let needs_handoff = assessment
+        .get("needs_handoff")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    format!(
+        " [semantic state={state}, task_completed={task_completed:.2}, needs_followup={needs_followup:.2}, needs_human={needs_human:.2}, needs_handoff={needs_handoff:.2}]"
+    )
+}
+
+fn decode_task_record(record: &OperationLedgerRecord) -> Result<PromptTaskRecord, String> {
+    let encoded = record
+        .result_json
+        .as_deref()
+        .ok_or_else(|| format!("agent task {} has no durable payload", record.op_id))?;
+    serde_json::from_str(encoded)
+        .map_err(|error| format!("cannot decode agent task {}: {error}", record.op_id))
+}
+
+fn runtime_turn_id(task_id: &str, marker: &str) -> String {
+    let digest = stable_digest(&[
+        b"herdr_prompt/runtime_turn",
+        task_id.as_bytes(),
+        marker.as_bytes(),
+    ]);
+    format!("turn:agent:{}", &digest[..32])
+}
+
+fn task_matches_wait(task: &PromptTaskRecord, until: &[String]) -> bool {
+    if until.is_empty() {
+        return task.is_terminal();
+    }
+    until.iter().any(|status| match status.as_str() {
+        "working" => task.activity_observed,
+        "blocked" => matches!(task.lifecycle, PromptTaskLifecycle::Blocked),
+        "idle" | "done" => matches!(task.lifecycle, PromptTaskLifecycle::Completed),
+        "unknown" => false,
+        _ => false,
+    })
+}
+
+fn task_event_status(event: &Value) -> Option<&str> {
+    event
+        .get("agent_status")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .get("pane")
+                .and_then(|pane| pane.get("agent_status"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
+    let cursor = event.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+    if cursor <= task.start_cursor || cursor <= task.last_cursor {
+        return false;
+    }
+    let pane_id = event.get("pane_id").and_then(Value::as_str).or_else(|| {
+        event
+            .get("pane")
+            .and_then(|pane| pane.get("pane_id"))
+            .and_then(Value::as_str)
+    });
+    if task.pane_id.as_deref() != pane_id {
+        return false;
+    }
+
+    let kind = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .replace('.', "_");
+    let now = now_ms();
+    if matches!(kind.as_str(), "pane_closed" | "pane_exited") {
+        task.lifecycle = PromptTaskLifecycle::Failed;
+        task.terminal_status = Some(kind);
+        task.terminal_cursor = Some(cursor);
+        task.terminal_at_ms = Some(now);
+        task.notification_state = "pending".to_owned();
+        task.updated_at_ms = now;
+        return true;
+    }
+
+    let Some(status) = task_event_status(event) else {
+        return false;
+    };
+    if task.lifecycle == PromptTaskLifecycle::AwaitingPriorSettle {
+        if matches!(status, "idle" | "done" | "blocked") {
+            task.prior_settle_observed = true;
+            task.lifecycle = PromptTaskLifecycle::AwaitingActivity;
+            task.updated_at_ms = now;
+            return true;
+        }
+        return false;
+    }
+
+    match status {
+        "working" => {
+            task.activity_observed = true;
+            task.lifecycle = PromptTaskLifecycle::Running;
+            if task.turn_id.is_none() {
+                task.turn_id = Some(runtime_turn_id(
+                    task.task_id.as_str(),
+                    &format!("cursor:{cursor}"),
+                ));
+            }
+            task.updated_at_ms = now;
+            true
+        }
+        "blocked" => {
+            if !task.activity_observed {
+                task.activity_observed = true;
+                if task.turn_id.is_none() {
+                    task.turn_id = Some(runtime_turn_id(
+                        task.task_id.as_str(),
+                        &format!("cursor:{cursor}"),
+                    ));
+                }
+            }
+            task.lifecycle = PromptTaskLifecycle::Blocked;
+            task.terminal_status = Some("blocked".to_owned());
+            task.terminal_cursor = Some(cursor);
+            task.terminal_at_ms = Some(now);
+            task.notification_state = "pending".to_owned();
+            task.updated_at_ms = now;
+            true
+        }
+        "idle" | "done" if task.activity_observed => {
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            task.terminal_status = Some(status.to_owned());
+            task.terminal_cursor = Some(cursor);
+            task.terminal_at_ms = Some(now);
+            task.notification_state = "pending".to_owned();
+            task.updated_at_ms = now;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -325,7 +1456,84 @@ fn annotate_idempotency_persistence(mut result: Value, persistence_error: Value)
     result
 }
 
+pub const AGENT_TASK_DISPATCH_METHOD: &str = "herdr_mcp.agent.task.dispatch";
+pub const AGENT_TASK_STATUS_METHOD: &str = "herdr_mcp.agent.task.status";
+pub const AGENT_TASK_INBOX_METHOD: &str = "herdr_mcp.agent.task.inbox";
+pub const AGENT_TASK_ACK_METHOD: &str = "herdr_mcp.agent.task.ack";
+
+pub fn task_call_with_parent_session(
+    registry: &PromptRegistry,
+    method: &str,
+    params: &Value,
+    caller_parent_session_ref: Option<&str>,
+) -> Value {
+    match method {
+        AGENT_TASK_STATUS_METHOD => {
+            let Some(task_id) = params.get("task_id").and_then(Value::as_str) else {
+                return invalid("task_id is required");
+            };
+            if task_id.is_empty() || task_id.len() > 128 {
+                return invalid("task_id must be a non-empty string up to 128 bytes");
+            }
+            if let Some(parent_session_ref) = caller_parent_session_ref {
+                registry.task_status_for_parent_session(task_id, parent_session_ref)
+            } else {
+                registry.task_status(task_id)
+            }
+        }
+        AGENT_TASK_INBOX_METHOD => {
+            let workspace_id = params.get("workspace_id").and_then(Value::as_str);
+            let parent_target = params.get("parent_target").and_then(Value::as_str);
+            let parent_session_ref = caller_parent_session_ref
+                .or_else(|| params.get("parent_session_ref").and_then(Value::as_str));
+            let include_acknowledged = params
+                .get("include_acknowledged")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(50)
+                .clamp(1, 512) as usize;
+            registry.task_inbox(
+                workspace_id,
+                parent_target,
+                parent_session_ref,
+                include_acknowledged,
+                limit,
+            )
+        }
+        AGENT_TASK_ACK_METHOD => {
+            let Some(task_id) = params.get("task_id").and_then(Value::as_str) else {
+                return invalid("task_id is required");
+            };
+            if task_id.is_empty() || task_id.len() > 128 {
+                return invalid("task_id must be a non-empty string up to 128 bytes");
+            }
+            if let Some(parent_session_ref) = caller_parent_session_ref {
+                registry.task_ack_for_parent_session(task_id, parent_session_ref)
+            } else {
+                registry.task_ack(task_id)
+            }
+        }
+        _ => json!({
+            "ok": false,
+            "code": "unknown_agent_task_method",
+            "method": method,
+        }),
+    }
+}
+
 pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Value {
+    run_with_parent_session(client, registry, args, None)
+}
+
+pub fn run_with_parent_session(
+    client: &HerdrClient,
+    registry: &PromptRegistry,
+    args: &Value,
+    parent_session_ref: Option<&str>,
+) -> Value {
     if let Err(error) = mutation::check_global("herdr_prompt") {
         return error;
     }
@@ -342,68 +1550,110 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         Ok(value) => value,
         Err(error) => return error,
     };
+    let parent_target = match optional_str(args, "parent_target") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     let wait = match parse_wait(args.get("wait")) {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let fingerprint = request_fingerprint(target, text, wait.as_ref());
+    // Observation preferences such as wait are not part of mutation identity.
+    // The same target/text intent must keep the same task under one idempotency key.
+    let fingerprint = request_fingerprint(target, text);
     let dispatch_id = dispatch_id(idempotency_key, &fingerprint);
+    let task_id = dispatch_id.as_str();
     let mut operation_id = None;
 
     if let Some(key) = idempotency_key {
         match registry.begin(key, &fingerprint) {
             Ok(BeginPrompt::Reserved(op_id)) => operation_id = op_id,
             Ok(BeginPrompt::Replay(mut result)) => {
-                insert_dispatch_id(&mut result, &dispatch_id);
+                insert_dispatch_id(&mut result, task_id);
+                insert_task_id(&mut result, task_id);
+                attach_task_observation(registry, &mut result, task_id, None);
+                if let Some(wait) = wait.as_ref() {
+                    apply_task_wait(registry, &mut result, task_id, wait);
+                }
                 return result;
             }
             Err(mut error) => {
-                insert_dispatch_id(&mut error, &dispatch_id);
+                insert_dispatch_id(&mut error, task_id);
+                insert_task_id(&mut error, task_id);
                 return error;
             }
         }
     }
 
+    let start_cursor = registry.current_task_cursor();
     let before = agent_state_of(client, target);
+    // Native Herdr 0.9.x wait is lifecycle/status based and cannot identify the
+    // prompt turn. Submit exactly once without native wait, then wait on the
+    // Runtime-owned task ledger below.
     let params = json!({
         "target": target,
         "text": text,
-        "wait": wait.clone().unwrap_or(Value::Null),
     });
-    let wait_timeout_ms = wait
-        .as_ref()
-        .and_then(|value| value.get("timeout_ms"))
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_WAIT_MS);
-    let call_timeout_ms = if wait.is_some() {
-        wait_timeout_ms.saturating_add(5_000).min(MAX_WAIT_MS)
-    } else {
-        DEFAULT_CALL_TIMEOUT_MS
-    };
 
     let mut result = match client.call_with_timeout(
         "agent.prompt",
         params,
-        Duration::from_millis(call_timeout_ms),
+        Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS),
     ) {
         Ok(response) => prompt_success(
             client,
             target,
             before.as_ref(),
-            wait.is_some(),
+            false,
             response,
             idempotency_key.is_none(),
-            &dispatch_id,
+            task_id,
         ),
-        Err(error) => prompt_failure(
-            client,
-            target,
-            before.as_ref(),
-            wait.is_some(),
-            error,
-            &dispatch_id,
-        ),
+        Err(error) => prompt_failure(client, target, before.as_ref(), false, error, task_id),
     };
+    insert_task_id(&mut result, task_id);
+
+    let submitted = result.get("submitted").and_then(Value::as_bool);
+    let after = agent_state_from_result(&result);
+    match registry.register_task(RegisterTaskInput {
+        task_id,
+        target,
+        fingerprint: &fingerprint,
+        before: before.as_ref(),
+        after: after.as_ref(),
+        submitted,
+        start_cursor,
+        parent_target,
+        parent_session_ref,
+    }) {
+        Ok(Some(task)) => {
+            if let Some(object) = result.as_object_mut() {
+                object.insert("task_tracking".to_owned(), json!(true));
+                object.insert("turn_id".to_owned(), json!(task.turn_id));
+                object.insert("task".to_owned(), task.public_json());
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            if let Some(object) = result.as_object_mut() {
+                object.insert("task_tracking".to_owned(), json!(false));
+                object.insert(
+                    "task_persistence".to_owned(),
+                    json!({
+                        "ok": false,
+                        "code": "agent_task_store_unavailable",
+                        "message": error,
+                    }),
+                );
+                object.insert(
+                    "task_hint".to_owned(),
+                    json!("the prompt may already be running, but durable task tracking is unavailable; do not blindly re-dispatch"),
+                );
+            }
+        }
+    }
+
+    attach_task_observation(registry, &mut result, task_id, None);
 
     if let Some(op_id) = operation_id
         && let Some(object) = result.as_object_mut()
@@ -411,6 +1661,8 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         object.insert("op_id".to_owned(), json!(op_id));
     }
 
+    // Persist only the submission/task identity outcome. A caller's optional
+    // wait is an observation request and must not become the replay payload.
     if let Some(key) = idempotency_key {
         if let Err(persist_error) = registry.complete(key, &fingerprint, &result) {
             return annotate_idempotency_persistence(result, persist_error);
@@ -420,6 +1672,10 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         {
             object.insert("idempotency_persisted".to_owned(), json!(true));
         }
+    }
+
+    if let Some(wait) = wait.as_ref() {
+        apply_task_wait(registry, &mut result, task_id, wait);
     }
     result
 }
@@ -735,6 +1991,79 @@ fn insert_dispatch_id(result: &mut Value, dispatch_id: &str) {
     }
 }
 
+fn insert_task_id(result: &mut Value, task_id: &str) {
+    if let Some(object) = result.as_object_mut() {
+        object
+            .entry("task_id".to_owned())
+            .or_insert_with(|| json!(task_id));
+    }
+}
+
+fn attach_task_observation(
+    registry: &PromptRegistry,
+    result: &mut Value,
+    task_id: &str,
+    wait: Option<&Value>,
+) {
+    if wait.is_some() {
+        return;
+    }
+    let status = registry.task_status(task_id);
+    if status.get("ok").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    if let Some(object) = result.as_object_mut()
+        && let Some(task) = status.get("task")
+    {
+        if let Some(turn_id) = task.get("turn_id") {
+            object.insert("turn_id".to_owned(), turn_id.clone());
+        }
+        object.insert("task".to_owned(), task.clone());
+    }
+}
+
+fn apply_task_wait(registry: &PromptRegistry, result: &mut Value, task_id: &str, wait: &Value) {
+    let task_wait = registry.wait_task(task_id, wait);
+    let completed = task_wait
+        .get("completed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(object) = result.as_object_mut() {
+        if let Some(task) = task_wait.get("task") {
+            object.insert("task".to_owned(), task.clone());
+        }
+        object.insert("wait".to_owned(), task_wait);
+        if !completed {
+            object.insert("ok".to_owned(), json!(false));
+            object.insert("failure".to_owned(), json!("agent_task_wait_timeout"));
+            object.insert(
+                "failure_phase".to_owned(),
+                json!("post_submission_task_wait"),
+            );
+            object.insert("retryable".to_owned(), json!(false));
+            object.insert(
+                "hint".to_owned(),
+                json!("the prompt was submitted once; task wait timed out, so inspect the returned task_id/inbox before any retry"),
+            );
+        }
+    }
+}
+
+fn agent_state_from_result(result: &Value) -> Option<AgentState> {
+    let after = result.get("after")?;
+    Some(AgentState {
+        pane_id: result
+            .get("resolved_pane")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        agent_status: after
+            .get("agent_status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        state_change_seq: after.get("state_change_seq").and_then(Value::as_u64),
+    })
+}
+
 fn insert_dispatch(result: &mut Map<String, Value>, dispatch_id: &str, correlation: Value) {
     result.insert("dispatch_id".to_owned(), json!(dispatch_id));
     result.insert("dispatch_correlation".to_owned(), correlation);
@@ -907,14 +2236,8 @@ fn parse_wait(value: Option<&Value>) -> Result<Option<Value>, Value> {
     Ok(Some(Value::Object(normalized)))
 }
 
-fn request_fingerprint(target: &str, text: &str, wait: Option<&Value>) -> String {
-    let wait_json = wait.map(Value::to_string).unwrap_or_default();
-    stable_digest(&[
-        b"herdr_prompt/request",
-        target.as_bytes(),
-        text.as_bytes(),
-        wait_json.as_bytes(),
-    ])
+fn request_fingerprint(target: &str, text: &str) -> String {
+    stable_digest(&[b"herdr_prompt/request", target.as_bytes(), text.as_bytes()])
 }
 
 fn stable_digest(parts: &[&[u8]]) -> String {
@@ -1253,6 +2576,22 @@ mod tests {
         assert!(replay["op_id"].as_str().unwrap().starts_with("op:prompt:"));
         assert_eq!(replay["dispatch_id"], dispatch_id);
 
+        let waited_replay = run(
+            &unreachable,
+            &second_registry,
+            &json!({
+                "target": "pi",
+                "text": "durable work",
+                "idempotency_key": "prompt-persisted-1",
+                "wait": {"until": ["working"], "timeout_ms": 1000}
+            }),
+        );
+        assert_eq!(waited_replay["idempotent_replay"], true);
+        assert_eq!(waited_replay["dispatch_id"], dispatch_id);
+        assert_eq!(waited_replay["task_id"], dispatch_id);
+        assert_eq!(waited_replay["wait"]["completed"], true);
+        assert_eq!(waited_replay["wait"]["matched"], "running");
+
         let conflict = run(
             &unreachable,
             &second_registry,
@@ -1266,6 +2605,88 @@ mod tests {
         assert_eq!(conflict["retryable"], false);
 
         drop(second_registry);
+        fs::remove_file(&db_path).ok();
+        fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
+        fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn task_lifecycle_is_activity_gated_durable_and_acknowledgeable() {
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-ledger-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let registry = PromptRegistry::with_store(store);
+        let before = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("working".to_owned()),
+            state_change_seq: Some(10),
+        };
+        let after = before.clone();
+        let task_id = "dispatch:prompt:task-lifecycle-test";
+        let initial = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target: "child",
+                fingerprint: "fingerprint",
+                before: Some(&before),
+                after: Some(&after),
+                submitted: Some(true),
+                start_cursor: 100,
+                parent_target: Some("parent"),
+                parent_session_ref: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.lifecycle, PromptTaskLifecycle::AwaitingPriorSettle);
+        let expected_turn_id = runtime_turn_id(task_id, "dispatch");
+        assert_eq!(initial.turn_id.as_deref(), Some(expected_turn_id.as_str()));
+        assert!(!initial.exact_native_turn);
+
+        let mut task = initial;
+        assert!(apply_task_event(
+            &mut task,
+            &json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})
+        ));
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::AwaitingActivity);
+        assert!(task.prior_settle_observed);
+        assert!(!task.is_terminal());
+
+        assert!(apply_task_event(
+            &mut task,
+            &json!({"cursor": 102, "pane_id": "w1:p1", "agent_status": "working"})
+        ));
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Running);
+        assert!(task.activity_observed);
+
+        assert!(apply_task_event(
+            &mut task,
+            &json!({"cursor": 103, "pane_id": "w1:p1", "agent_status": "done"})
+        ));
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Completed);
+        assert!(task.is_terminal());
+        registry.save_task(&task, None).unwrap();
+        drop(registry);
+
+        let reopened =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&db_path).unwrap())));
+        let status = reopened.task_status(task_id);
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["task"]["lifecycle"], "completed");
+        assert_eq!(status["task"]["parent_target"], "parent");
+        assert_eq!(status["task"]["turn_correlation"], "runtime_activity_gate");
+
+        let inbox = reopened.task_inbox(None, Some("parent"), None, false, 10);
+        assert_eq!(inbox["summary"]["completed"], 1);
+        assert_eq!(inbox["tasks"][0]["task_id"], task_id);
+        assert_eq!(reopened.task_ack(task_id)["ok"], true);
+        let after_ack = reopened.task_inbox(None, Some("parent"), None, false, 10);
+        assert_eq!(after_ack["summary"]["completed"], 0);
+        assert!(after_ack["tasks"].as_array().unwrap().is_empty());
+
+        drop(reopened);
         fs::remove_file(&db_path).ok();
         fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
         fs::remove_file(db_path.with_extension("sqlite-shm")).ok();

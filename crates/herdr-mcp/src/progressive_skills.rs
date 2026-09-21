@@ -3,6 +3,10 @@ use crate::capability_inventory::{AgentCapabilityRecord, CapabilityInventoryStor
 use crate::capability_resolver::{WorkerCapability, project_capabilities_with_inventory};
 use crate::local_skills::{self, LocalSkillFile, parse_frontmatter, read_file_bounded};
 use crate::paths::RuntimePaths;
+use crate::prompt::{
+    AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
+    AGENT_TASK_STATUS_METHOD,
+};
 use crate::semantic::{
     DEFAULT_DECISION_THRESHOLD, SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService,
 };
@@ -146,6 +150,68 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "children": {"type": "array", "minItems": 1, "maxItems": 16},
                 },
                 "required": ["children"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": AGENT_TASK_DISPATCH_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "target": {"type": "string", "maxLength": 256},
+                    "text": {"type": "string", "maxLength": 65536},
+                    "parent_target": {"type": "string", "maxLength": 256},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                    "wait": {
+                        "type": "object",
+                        "properties": {
+                            "until": {"type": "array", "items": {"type": "string"}},
+                            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 60000}
+                        }
+                    }
+                },
+                "required": ["target", "text", "parent_target", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": AGENT_TASK_STATUS_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "task_id": {"type": "string", "maxLength": 128},
+                },
+                "required": ["task_id"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": AGENT_TASK_INBOX_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "workspace_id": {"type": "string", "maxLength": 128},
+                    "parent_target": {"type": "string", "maxLength": 256},
+                    "parent_session_ref": {"type": "string", "maxLength": 256},
+                    "include_acknowledged": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 512},
+                },
+                "required": [],
+                "empty": true,
+            },
+        }),
+        json!({
+            "method": AGENT_TASK_ACK_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "task_id": {"type": "string", "maxLength": 128},
+                },
+                "required": ["task_id"],
                 "empty": false,
             },
         }),
@@ -1419,6 +1485,30 @@ impl ProgressiveSkillService {
                 "A human decision or action is needed",
                 "No human decision or action is needed",
             ),
+        )
+        .ask(
+            "task_completed",
+            SemanticQuestion::noul(
+                "Does the bounded recent output indicate that the delegated task objective itself is complete, beyond this turn merely settling?",
+                "The delegated task objective is complete",
+                "The delegated task objective is not yet complete",
+            ),
+        )
+        .ask(
+            "needs_followup",
+            SemanticQuestion::noul(
+                "Does the parent need to perform follow-up work after this settled turn to complete the delegated objective?",
+                "Parent follow-up work is needed",
+                "No parent follow-up work is needed",
+            ),
+        )
+        .ask(
+            "needs_handoff",
+            SemanticQuestion::noul(
+                "Does the bounded recent output indicate that the work should be handed off to another agent, tool, or WebChat session?",
+                "A handoff is needed",
+                "No handoff is needed",
+            ),
         );
 
         let response = match service.evaluate(&request) {
@@ -1472,6 +1562,15 @@ impl ProgressiveSkillService {
                 "confidence": confidence,
                 "needs_human": response
                     .answer("needs_human")
+                    .and_then(SemanticAnswer::noul_probability),
+                "task_completed": response
+                    .answer("task_completed")
+                    .and_then(SemanticAnswer::noul_probability),
+                "needs_followup": response
+                    .answer("needs_followup")
+                    .and_then(SemanticAnswer::noul_probability),
+                "needs_handoff": response
+                    .answer("needs_handoff")
                     .and_then(SemanticAnswer::noul_probability),
             },
             "provider": response.provider,
@@ -3140,6 +3239,10 @@ fn resource_context_json(raw_snapshot: &Value) -> Value {
     })
 }
 
+pub(crate) fn agent_closeout_advice(params: &Value) -> Value {
+    ProgressiveSkillService::new().agent_closeout_advise_method(params)
+}
+
 fn validate_object_keys(params: &Value, allowed: &[&str]) -> Result<(), Value> {
     let Some(object) = params.as_object() else {
         return Err(invalid_params("params must be an object"));
@@ -4373,7 +4476,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 16 * 1024];
             let _ = stream.read(&mut request);
-            let body = r#"{"model":"jev-test","answers":{"closeout_state":{"type":"choice","choice":"claims_complete","probabilities":{"working":0.02,"claims_complete":0.9,"waiting_user":0.02,"blocked_external":0.02,"unclear":0.04},"confidence":0.9},"needs_human":{"type":"noul","noul":0.1}}}"#;
+            let body = r#"{"model":"jev-test","answers":{"closeout_state":{"type":"choice","choice":"claims_complete","probabilities":{"working":0.02,"claims_complete":0.9,"waiting_user":0.02,"blocked_external":0.02,"unclear":0.04},"confidence":0.9},"needs_human":{"type":"noul","noul":0.1},"task_completed":{"type":"noul","noul":0.95},"needs_followup":{"type":"noul","noul":0.1},"needs_handoff":{"type":"noul","noul":0.05}}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()

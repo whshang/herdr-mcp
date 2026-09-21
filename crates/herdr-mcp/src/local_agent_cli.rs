@@ -1,4 +1,4 @@
-use crate::cli::{ContinuityCommand, MemoryCommand, WebChatCommand};
+use crate::cli::{AgentCommand, ContinuityCommand, MemoryCommand, WebChatCommand};
 use crate::link::local_mcp::{
     LinkRuntimeTransport, LocalMcpConfig, LocalMcpTransport, RuntimeToolResult,
 };
@@ -10,6 +10,10 @@ use crate::progressive_skills::{
     BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
     BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
     WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+};
+use crate::prompt::{
+    AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
+    AGENT_TASK_STATUS_METHOD,
 };
 use crate::state_store::BrowserDeliveryState;
 use serde_json::{Map, Value, json};
@@ -87,6 +91,63 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<ExitCode, String> {
         ),
     };
     print_private_result(call_private(method, params, None)?)
+}
+
+pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
+    match command {
+        AgentCommand::Dispatch {
+            target,
+            text,
+            parent_target,
+            idempotency_key,
+            wait,
+            timeout_ms,
+        } => {
+            let mut params = json!({
+                "target": target,
+                "text": text,
+                "parent_target": parent_target,
+                "idempotency_key": idempotency_key,
+            });
+            if wait {
+                params["wait"] = json!({
+                    "until": ["idle", "done", "blocked"],
+                    "timeout_ms": timeout_ms,
+                });
+            }
+            print_private_result(call_private(AGENT_TASK_DISPATCH_METHOD, params, None)?)
+        }
+        AgentCommand::Status { task_id } => print_private_result(call_private(
+            AGENT_TASK_STATUS_METHOD,
+            json!({"task_id": task_id}),
+            None,
+        )?),
+        AgentCommand::Inbox {
+            workspace_id,
+            parent_target,
+            include_acknowledged,
+            limit,
+        } => {
+            let mut params = Map::new();
+            insert_optional(&mut params, "workspace_id", workspace_id);
+            insert_optional(&mut params, "parent_target", parent_target);
+            params.insert(
+                "include_acknowledged".to_owned(),
+                json!(include_acknowledged),
+            );
+            params.insert("limit".to_owned(), json!(limit));
+            print_private_result(call_private(
+                AGENT_TASK_INBOX_METHOD,
+                Value::Object(params),
+                None,
+            )?)
+        }
+        AgentCommand::Ack { task_id } => print_private_result(call_private(
+            AGENT_TASK_ACK_METHOD,
+            json!({"task_id": task_id}),
+            None,
+        )?),
+    }
 }
 
 pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {

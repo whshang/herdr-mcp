@@ -282,6 +282,12 @@ Where supported, these use conversation-scoped Auto.
 
 z.ai and DeepSeek Auto only performs Herdr progress/settled wake behavior. ChatGPT-specific stale-view recovery, permission-card handling, end-of-turn semantic judgement and automatic rollover are not treated as generic capabilities.
 
+### Asynchronous parent wake for Agent tasks
+
+When ChatGPT dispatches long-running local Agent work through `herdr_prompt`, the stable browser session identity travels with the request into Runtime. Runtime immediately returns `task_id / dispatch_id / turn_id` and later persists the terminal result in the durable parent inbox. The extension still uses Herdr settled events as a cheap trigger, but task ownership, `completed / blocked / failed`, Jev advisory, and HUD task counters come from the session-scoped inbox; only tasks owned by the current `browser_session_ref` can wake that conversation. A task is acknowledged only after wake delivery succeeds, so extension downtime or a failed wake leaves the durable result pending.
+
+For fan-out, a fast Jev result may advise aggregation: if sibling tasks are still running and the available advisory is clearly non-urgent, the result can remain pending for a later combined notification. `blocked / failed`, `needs_human`, and other urgent outcomes wake first. If Jev is not configured, fails, or does not return inside the short grace, the adapter fails open to deterministic terminal wake instead of blocking the parent on semantic inference.
+
 ## End-of-turn semantic judgement
 
 A ChatGPT reply can be syntactically finished while semantically unfinished: for example, it may say that tests still need to run or that the next step is to inspect Git.

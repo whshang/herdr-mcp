@@ -421,6 +421,17 @@ impl CacheState {
         if let Some(pane_id) = pane_id {
             digest.insert("pane_id".to_owned(), json!(pane_id));
         }
+        for key in [
+            "agent_status",
+            "agent",
+            "title",
+            "display_agent",
+            "state_change_seq",
+        ] {
+            if let Some(value) = input.data.get(key) {
+                digest.insert(key.to_owned(), value.clone());
+            }
+        }
         if let Some(pane) = input.pane {
             digest.insert("pane".to_owned(), Value::Object(pane.clone()));
         }

@@ -35,7 +35,7 @@ At the current `main` baseline used to open this closeout lane:
 - final stable 1.0 source is **not frozen yet**;
 - open extension-changing work may advance the manifest version before the final package is qualified.
 
-The semantic-judgment policy is now on `main` at extension 0.1.103. The provider-cleanup closeout lane advances its exact candidate to 0.1.114 for supported Grok optional-site access, direct Chrome-permission authority, provider-scoped bounded recovery, historical-turn Grok settlement recovery, endpoint-affine browser actuation when multiple Extension hosts are online, and dispatch-id-bound durable result settlement. Treat 0.1.114 as a candidate until that lane is merged. Any later extension-changing PR has the same rule.
+The supported-provider/browser-recovery closeout is now on `main` at extension 0.1.114. The asynchronous Agent-task / durable parent-wake lane changes extension behavior again and therefore advances its exact candidate to **0.1.115**. Treat 0.1.115 as a development candidate until this lane is merged and the exact DEV/STANDALONE package is qualified. Any later extension-changing PR has the same rule.
 
 The successful package workflow run `35325140968` qualified the 0.1.101 package at source `4e28c285`. That is valid historical evidence for that source, but main has advanced, so it is not the final stable-1.0 package identity.
 

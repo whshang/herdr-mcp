@@ -195,7 +195,7 @@ herdr-mcp は一部の read パスを、より狭い evidence ソースへ degra
 
 ### `herdr_prompt`
 
-失敗が submit 後の状態待ちの間に起きた場合、agent はすでに prompt を受け取っている可能性があります。まず agent の状態/出力を inspect してください。同じ意図を繰り返す場合は `idempotency_key` を再利用してください。
+通常の長時間 task では Parent を待機させ続けません。`herdr_prompt` は一度だけ submit して直ちに `task_id` / `dispatch_id` / Runtime `turn_id` を返し、Parent は別の作業を続けます。Runtime は `herdr_mcp.agent.task.status` / `herdr_mcp.agent.task.inbox` でその task を追跡します。互換 `wait` を明示した場合も待つ対象はこの `task_id` であり、以前のグローバル `idle/done` 状態ではありません。wait timeout は未配送を意味しないため、再送前に返された task/inbox を確認してください。同じ意図では `idempotency_key` を再利用します。
 
 ### `herdr_exec`
 
@@ -213,19 +213,17 @@ MCP が提供するのは：
 ChatGPT → workstation
 ```
 
-ローカルタスクが後から完了しても、新しい ChatGPT turn が自動で作られることはありません。次の向きには：
+現在の WebChat が dispatch した Agent task では、Runtime が terminal result を durable parent inbox に保存し、その後ブラウザ拡張が現在の `browser session_ref` に属する inbox を読み、次の WebChat turn を作れます。Parent は Child の実行中に元の turn を待機させ続ける必要がありません。
 
-```text
-workstation → ChatGPT
-```
+Agent が終了したのに ChatGPT が続かない場合は次を確認してください：
 
-browser continuity を使います：
+- Native Messaging host が正常である。
+- conversation に安定した `browser_session_ref` があり、正しい workspace に binding されている。
+- 該当する Auto scope が有効である。
+- `herdr_mcp.agent.task.inbox` で task が terminal かつ未 acknowledge である。
+- sibling task がまだ running の場合、Jev が集約を助言することがあります。`blocked` / `failed` や高い `needs_human` は優先して wake します。Jev が未設定、timeout、error の場合も deterministic terminal notification は抑止されません。
 
-- Native Messaging host がインストールされている。
-- 現在の conversation が正しい workspace に binding されている。
-- 該当する Auto scope が有効である、または HUD の手動アクションを使う。
-
-詳しくは [Browser continuity](browser-continuity.md) を参照してください。
+HUD の手動 continue は明示的な fallback として残ります。詳しくは [Browser continuity](browser-continuity.md) を参照してください。
 
 ## 症状：HUD が誤った workspace 名を表示する
 

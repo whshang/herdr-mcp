@@ -47,6 +47,7 @@ pub enum Command {
     AgentSkill(AgentSkillCommand),
     Continuity(ContinuityCommand),
     Memory(MemoryCommand),
+    Agent(AgentCommand),
     WebChat(WebChatCommand),
     Dev(DevCommand),
     Candidate {
@@ -236,6 +237,30 @@ pub enum MemoryCommand {
         work_chain_id: String,
         query: String,
         limit: usize,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentCommand {
+    Dispatch {
+        target: String,
+        text: String,
+        parent_target: String,
+        idempotency_key: String,
+        wait: bool,
+        timeout_ms: u64,
+    },
+    Status {
+        task_id: String,
+    },
+    Inbox {
+        workspace_id: Option<String>,
+        parent_target: Option<String>,
+        include_acknowledged: bool,
+        limit: usize,
+    },
+    Ack {
+        task_id: String,
     },
 }
 
@@ -482,6 +507,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "agent-skill" => parse_agent_skill(&args[1..]),
         "continuity" => parse_continuity(&args[1..]),
         "memory" => parse_memory(&args[1..]),
+        "agent" => parse_agent(&args[1..]),
         "webchat" => parse_webchat(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
@@ -688,6 +714,140 @@ fn parse_memory(args: &[String]) -> Result<Command, String> {
             "unknown memory command '{value}' (expected resume or search)"
         )),
         None => Err("memory requires resume or search".to_owned()),
+    }
+}
+
+fn parse_agent(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("dispatch") => {
+            if args.len() < 3 {
+                return Err(
+                    "agent dispatch requires <target> <text> --parent <target> --idempotency-key <key> [--wait] [--timeout-ms N]"
+                        .to_owned(),
+                );
+            }
+            let target = args[1].clone();
+            let text = args[2].clone();
+            if target.is_empty() || text.is_empty() {
+                return Err("agent dispatch target/text must not be empty".to_owned());
+            }
+            let mut parent_target = None;
+            let mut idempotency_key = None;
+            let mut wait = false;
+            let mut timeout_ms = 25_000_u64;
+            let mut index = 3;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--parent" => {
+                        let Some(value) = args.get(index + 1) else {
+                            return Err("--parent requires a target".to_owned());
+                        };
+                        parent_target = Some(value.clone());
+                        index += 2;
+                    }
+                    "--idempotency-key" => {
+                        let Some(value) = args.get(index + 1) else {
+                            return Err("--idempotency-key requires a value".to_owned());
+                        };
+                        idempotency_key = Some(value.clone());
+                        index += 2;
+                    }
+                    "--wait" => {
+                        wait = true;
+                        index += 1;
+                    }
+                    "--timeout-ms" => {
+                        let Some(value) = args.get(index + 1) else {
+                            return Err("--timeout-ms requires a value".to_owned());
+                        };
+                        timeout_ms = value
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|value| (1..=60_000).contains(value))
+                            .ok_or_else(|| {
+                                "--timeout-ms must be an integer in 1..=60000".to_owned()
+                            })?;
+                        index += 2;
+                    }
+                    flag => return Err(format!("unknown agent dispatch option '{flag}'")),
+                }
+            }
+            Ok(Command::Agent(AgentCommand::Dispatch {
+                target,
+                text,
+                parent_target: parent_target
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "--parent is required".to_owned())?,
+                idempotency_key: idempotency_key
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "--idempotency-key is required".to_owned())?,
+                wait,
+                timeout_ms,
+            }))
+        }
+        Some("status") => {
+            if args.len() != 2 || args[1].is_empty() {
+                return Err("agent status requires <task_id>".to_owned());
+            }
+            Ok(Command::Agent(AgentCommand::Status {
+                task_id: args[1].clone(),
+            }))
+        }
+        Some("ack") => {
+            if args.len() != 2 || args[1].is_empty() {
+                return Err("agent ack requires <task_id>".to_owned());
+            }
+            Ok(Command::Agent(AgentCommand::Ack {
+                task_id: args[1].clone(),
+            }))
+        }
+        Some("inbox") => {
+            let mut workspace_id = None;
+            let mut parent_target = None;
+            let mut include_acknowledged = false;
+            let mut limit = 50_usize;
+            let mut index = 1;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--workspace" => {
+                        let Some(value) = args.get(index + 1) else {
+                            return Err("--workspace requires a workspace id".to_owned());
+                        };
+                        workspace_id = Some(value.clone());
+                        index += 2;
+                    }
+                    "--parent" => {
+                        let Some(value) = args.get(index + 1) else {
+                            return Err("--parent requires a target".to_owned());
+                        };
+                        parent_target = Some(value.clone());
+                        index += 2;
+                    }
+                    "--all" => {
+                        include_acknowledged = true;
+                        index += 1;
+                    }
+                    "--limit" => {
+                        let Some(value) = args.get(index + 1) else {
+                            return Err("--limit requires a value".to_owned());
+                        };
+                        limit = parse_bounded_usize(value, "--limit", 1, 512)?;
+                        index += 2;
+                    }
+                    flag => return Err(format!("unknown agent inbox option '{flag}'")),
+                }
+            }
+            Ok(Command::Agent(AgentCommand::Inbox {
+                workspace_id,
+                parent_target,
+                include_acknowledged,
+                limit,
+            }))
+        }
+        Some(value) => Err(format!(
+            "unknown agent command '{value}' (expected dispatch, status, inbox, or ack)"
+        )),
+        None => Err("agent requires dispatch, status, inbox, or ack".to_owned()),
     }
 }
 
