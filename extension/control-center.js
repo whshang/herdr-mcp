@@ -384,7 +384,7 @@ function renderPageContext(state) {
   const bindings = pageContextBindings();
   const supported = Boolean(info?.site);
 
-  if (pageContext.loading) {
+  if (pageContext.loading && !supported) {
     pageContextCard.hidden = true;
     return;
   }
@@ -427,8 +427,6 @@ function renderPageContext(state) {
 
 async function refreshPageContext() {
   const seq = ++pageContextRefreshSeq;
-  pageContext = { ...pageContext, loading: true, error: null };
-  renderPageContext(store.get());
   let tabs = [];
   try { tabs = await chrome.tabs.query({ active: true, currentWindow: true }); }
   catch (error) {
@@ -444,6 +442,15 @@ async function refreshPageContext() {
     renderAll();
     return;
   }
+  const sameTab = pageContext.tabId === tab.id;
+  pageContext = {
+    loading: true,
+    tabId: tab.id,
+    windowId: tab.windowId ?? null,
+    response: sameTab ? pageContext.response : null,
+    error: null,
+  };
+  renderPageContext(store.get());
   const response = await bg({ type: "h2w_state", tabId: tab.id });
   if (seq !== pageContextRefreshSeq) return;
   pageContext = {
