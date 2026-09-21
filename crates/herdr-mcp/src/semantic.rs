@@ -534,6 +534,29 @@ impl SemanticService {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_empty() -> Self {
+        Self {
+            providers: Vec::new(),
+            chat_providers: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_decision_route(id: &str, url: &str) -> Result<Self, SemanticError> {
+        let provider = HttpSemanticProvider::new(
+            id.to_owned(),
+            SemanticProtocol::Decision,
+            "test".to_owned(),
+            url.to_owned(),
+            "jev-test".to_owned(),
+        )?;
+        Ok(Self {
+            providers: vec![Box::new(provider)],
+            chat_providers: Vec::new(),
+        })
+    }
+
+    #[cfg(test)]
     fn from_config_with_edge_probe(edge_available: impl FnOnce() -> bool) -> Self {
         let available = edge_available();
         Self::from_config_with_edge_capabilities(|| crate::worker::SemanticProxyCapabilities {

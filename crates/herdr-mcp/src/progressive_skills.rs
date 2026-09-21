@@ -1285,6 +1285,16 @@ impl ProgressiveSkillService {
         snapshot: &Value,
         inventory: &[AgentCapabilityRecord],
     ) -> Value {
+        self.planning_advise_method_with_inventory_and_semantic(params, snapshot, inventory, None)
+    }
+
+    fn planning_advise_method_with_inventory_and_semantic(
+        &self,
+        params: &Value,
+        snapshot: &Value,
+        inventory: &[AgentCapabilityRecord],
+        semantic_service: Option<&SemanticService>,
+    ) -> Value {
         const KEYS: &[&str] = &[
             "deterministic_tool",
             "task_text",
@@ -1319,7 +1329,22 @@ impl ProgressiveSkillService {
             agent_route_criteria(&initial_advice, &capabilities.workers, &initial_startable);
         let mut semantic = if task.deterministic_tool.is_none() {
             task_text.as_deref().map(|task_text| {
-                self.semantic_planning_advice(task_text, params, &mut task, &agent_route_criteria)
+                if let Some(service) = semantic_service {
+                    self.semantic_planning_advice_with_service(
+                        task_text,
+                        params,
+                        &mut task,
+                        &agent_route_criteria,
+                        service,
+                    )
+                } else {
+                    self.semantic_planning_advice(
+                        task_text,
+                        params,
+                        &mut task,
+                        &agent_route_criteria,
+                    )
+                }
             })
         } else {
             None
@@ -2117,11 +2142,28 @@ impl ProgressiveSkillService {
         task: &mut TaskProfile,
         agent_route_criteria: &BTreeMap<String, Option<String>>,
     ) -> Value {
+        let service = SemanticService::from_config();
+        self.semantic_planning_advice_with_service(
+            task_text,
+            params,
+            task,
+            agent_route_criteria,
+            &service,
+        )
+    }
+
+    fn semantic_planning_advice_with_service(
+        &self,
+        task_text: &str,
+        params: &Value,
+        task: &mut TaskProfile,
+        agent_route_criteria: &BTreeMap<String, Option<String>>,
+        service: &SemanticService,
+    ) -> Value {
         const MAX_SKILLS: usize = 48;
         const MAX_METHODS: usize = 48;
         const TOP_ROUTES: usize = 6;
 
-        let service = SemanticService::from_config();
         let capability = service.capability_json();
         if !service.configured() {
             return json!({
@@ -3911,12 +3953,6 @@ mod tests {
 
     #[test]
     fn planning_agent_route_is_advisory_and_falls_back_to_deterministic_candidates() {
-        let _guard = crate::test_env::lock();
-        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
-        let config_dir = temp_root("planning-agent-route");
-        unsafe {
-            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
-        }
         let service = ProgressiveSkillService::new();
         let inventory = vec![
             inventory_record("pi", true, Some(true), Some(true)),
@@ -3935,10 +3971,12 @@ mod tests {
             "ownership_isolated": true
         });
 
-        let no_config = service.planning_advise_method_with_inventory(
+        let no_semantic = SemanticService::test_empty();
+        let no_config = service.planning_advise_method_with_inventory_and_semantic(
             &params,
             &planning_snapshot(),
             &inventory,
+            Some(&no_semantic),
         );
         assert_eq!(no_config["semantic"]["used"], false);
         assert_eq!(no_config["semantic"]["reason"], "not_configured");
@@ -3950,39 +3988,47 @@ mod tests {
         let deterministic_advice = no_config["advice"].clone();
         let deterministic_startable = no_config["startable_candidates"].clone();
 
-        use std::io::{Read, Write};
+        use std::io::{ErrorKind, Read, Write};
         use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 64 * 1024];
-            let _ = stream.read(&mut request);
-            let body = r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"live:worker","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        let config_path = config_dir.join("config.json");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"{{"semantic":{{"routes":[{{"name":"planning-agent-route","protocol":"decision","url":"http://127.0.0.1:{port}/v1","model":"jev-test","api_key":"test"}}]}}}}"#
-            ),
+        fn repeat_semantic_server(body: &'static str) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut request = [0_u8; 64 * 1024];
+                            let _ = stream.read(&mut request);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            port
+        }
+        let port = repeat_semantic_server(
+            r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"live:worker","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#,
+        );
+        let configured_semantic = SemanticService::test_decision_route(
+            "planning-agent-route",
+            &format!("http://127.0.0.1:{port}/v1"),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-
-        let configured = service.planning_advise_method_with_inventory(
+        let configured = service.planning_advise_method_with_inventory_and_semantic(
             &params,
             &planning_snapshot(),
             &inventory,
+            Some(&configured_semantic),
         );
         assert_eq!(configured["semantic"]["used"], true);
         assert_eq!(
@@ -3992,37 +4038,25 @@ mod tests {
         assert_eq!(configured["advice"], deterministic_advice);
         assert_eq!(configured["startable_candidates"], deterministic_startable);
 
-        let invalid_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let invalid_port = invalid_listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (mut stream, _) = invalid_listener.accept().unwrap();
-            let mut request = [0_u8; 64 * 1024];
-            let _ = stream.read(&mut request);
-            let body = r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"start:forbidden","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"{{"semantic":{{"routes":[{{"name":"planning-agent-route-invalid","protocol":"decision","url":"http://127.0.0.1:{invalid_port}/v1","model":"jev-test","api_key":"test"}}]}}}}"#
-            ),
+        let invalid_port = repeat_semantic_server(
+            r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"start:forbidden","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#,
+        );
+        let invalid_semantic = SemanticService::test_decision_route(
+            "planning-agent-route-invalid",
+            &format!("http://127.0.0.1:{invalid_port}/v1"),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let invalid_route = service.planning_advise_method_with_inventory(
+        let invalid_route = service.planning_advise_method_with_inventory_and_semantic(
             &params,
             &planning_snapshot(),
             &inventory,
+            Some(&invalid_semantic),
         );
-        assert_eq!(invalid_route["semantic"]["used"], true);
+        assert_eq!(
+            invalid_route["semantic"]["used"], true,
+            "semantic={}",
+            invalid_route["semantic"]
+        );
         assert!(
             invalid_route["semantic"]["routing"]["agents"]
                 .as_array()
@@ -4035,20 +4069,13 @@ mod tests {
             deterministic_startable
         );
 
-        std::fs::write(
-            &config_path,
-            r#"{"semantic":{"routes":[{"name":"offline","protocol":"decision","url":"http://127.0.0.1:1/v1","model":"jev-test","api_key":"test"}]}}"#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let provider_error = service.planning_advise_method_with_inventory(
+        let offline_semantic =
+            SemanticService::test_decision_route("offline", "http://127.0.0.1:1/v1").unwrap();
+        let provider_error = service.planning_advise_method_with_inventory_and_semantic(
             &params,
             &planning_snapshot(),
             &inventory,
+            Some(&offline_semantic),
         );
         assert_eq!(provider_error["semantic"]["used"], false);
         assert_ne!(provider_error["semantic"]["reason"], "not_configured");
@@ -4057,14 +4084,6 @@ mod tests {
             provider_error["startable_candidates"],
             deterministic_startable
         );
-
-        unsafe {
-            match previous_config {
-                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
-                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&config_dir);
     }
 
     #[test]
