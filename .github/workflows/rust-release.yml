@@ -184,13 +184,16 @@ jobs:
           node scripts/build-rust-release-manifest.mjs \
             --root "$PWD" \
             --assets-dir "$PWD/release-assets" \
-            --output "$PWD/release-assets/release-manifest.json" \
+            --output "$PWD/release-assets/runtime-manifest.json" \
             --repo "$GITHUB_REPOSITORY" \
             --tag "$TAG" \
             --repository-id "$GITHUB_REPOSITORY_ID" \
             --source-commit "$GITHUB_SHA" \
             --source-ref "$GITHUB_REF" \
             --workflow-name "$GITHUB_WORKFLOW"
+          if [[ "$TAG" == *-* ]]; then
+            cp "$PWD/release-assets/runtime-manifest.json" "$PWD/release-assets/release-manifest.json"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: rust-release-bundle
@@ -218,7 +221,7 @@ jobs:
           subject-path: |
             release-assets/herdr-mcp-*
             release-assets/herdr-edge-*.mjs
-            release-assets/release-manifest.json
+            release-assets/*manifest.json
 
   qualification:
     needs: attest
@@ -236,7 +239,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          manifest="release-assets/release-manifest.json"
+          manifest="release-assets/runtime-manifest.json"
           source_commit="$(jq -r '.release_identity.source_commit' "$manifest")"
           source_ref="$(jq -r '.release_identity.source_ref' "$manifest")"
           [[ "$source_commit" == "$GITHUB_SHA" ]] || { echo "qualification source_commit does not match dispatched commit" >&2; exit 1; }
@@ -272,7 +275,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          manifest="release-assets/release-manifest.json"
+          manifest="release-assets/runtime-manifest.json"
           tag="$(jq -r '.tag' "$manifest")"
           source_commit="$(jq -r '.release_identity.source_commit' "$manifest")"
           source_ref="$(jq -r '.release_identity.source_ref' "$manifest")"

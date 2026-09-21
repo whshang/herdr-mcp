@@ -234,6 +234,20 @@ If a step fails:
 - after activation: evaluate rollback;
 - uncertain mutation delivery: inspect first, never blindly repeat.
 
+## Upgrading an existing v0.4.8 installation to 1.0
+
+For an ordinary enrolled user, the supported path is intentionally one command:
+
+```bash
+herdr-mcp update
+```
+
+The user does **not** download a 1.0 binary manually, run `update major-apply`, recreate the Worker, re-pair devices, or re-add the ChatGPT Connector. The immutable v0.4.8 updater first discovers the schema-5 v0.4.9 migration bridge. That bridge runs only as the original update job's detached worker; it is not installed as the production service. It downloads and attests the compatible schema-15 / Runtime Contract epoch-4 Runtime, invokes that Runtime's qualified major migration while the exact v0.4.8 service is still the source, and then asks the new Runtime to reconcile the already-proven Cloudflare Worker in place.
+
+The Worker identity and public origin remain stable. Durable Objects, secrets, known optional bindings, enrolled devices, OAuth issuer and Connector records are retained. Cloudflare authorization may open in the browser during the same update job. If more than one accessible Cloudflare account contains the same Worker name, the update fails closed unless the non-secret `CLOUDFLARE_ACCOUNT_ID` disambiguator is supplied. If the foreground v0.4.8 updater reaches its bounded watch timeout while authorization is still pending, the detached migration continues; a second update command is not required.
+
+The bridge keeps the exact v0.4.8 binary and schema-5 database snapshot as N-1 rollback material before migration. `herdr-mcp update major-rollback` remains the explicit recovery command if the migrated Runtime must be reverted. `update major-apply` remains an operator-level primitive used by the bridge and recovery/UAT workflows, not the normal v0.4.8 user instruction.
+
 ## `herdr-self-update`
 
 `bin/herdr-self-update` uses the generation mechanism.
