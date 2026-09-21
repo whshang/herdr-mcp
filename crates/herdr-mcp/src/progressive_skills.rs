@@ -24,6 +24,8 @@ pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
 pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
 pub const AGENT_CLOSEOUT_ADVISE_METHOD: &str = "herdr_mcp.agent.closeout.advise";
+pub const AGENT_ATTENTION_ADVISE_METHOD: &str = "herdr_mcp.agent.attention.advise";
+pub const VALIDATION_ADVISE_METHOD: &str = "herdr_mcp.validation.advise";
 pub const GITHUB_STATUS_METHOD: &str = "herdr_mcp.github.status";
 pub const CLEANUP_PREVIEW_METHOD: &str = "herdr_mcp.cleanup.preview";
 pub const EXEC_WAIT_METHOD: &str = "herdr_mcp.exec.wait";
@@ -136,6 +138,34 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             },
         }),
         json!({
+            "method": AGENT_ATTENTION_ADVISE_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "children": {"type": "array", "minItems": 1, "maxItems": 16},
+                },
+                "required": ["children"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": VALIDATION_ADVISE_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string", "maxLength": 1024},
+                    "summary": {"type": "string", "maxLength": 4096},
+                    "changed_files": {"type": "array", "maxItems": 64},
+                    "changed_symbols": {"type": "array", "maxItems": 64},
+                    "candidate_checks": {"type": "array", "maxItems": 32},
+                },
+                "required": ["changed_files"],
+                "empty": false,
+            },
+        }),
+        json!({
             "method": GITHUB_STATUS_METHOD,
             "source": "herdr_mcp_local",
             "params": {
@@ -157,6 +187,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 "properties": {
                     "project_root": {"type": "string"},
                     "target_ref": {"type": "string"},
+                    "advisory": {"type": "boolean"},
                 },
                 "required": ["project_root"],
                 "empty": false,
@@ -1156,6 +1187,8 @@ impl ProgressiveSkillService {
             LOCAL_LOAD_METHOD => self.load_method(params),
             PLANNING_ADVISE_METHOD => self.planning_advise_method(params, snapshot),
             AGENT_CLOSEOUT_ADVISE_METHOD => self.agent_closeout_advise_method(params),
+            AGENT_ATTENTION_ADVISE_METHOD => self.agent_attention_advise_method(params),
+            VALIDATION_ADVISE_METHOD => self.validation_advise_method(params),
             GITHUB_STATUS_METHOD => crate::github_status::status(params, snapshot),
             CLEANUP_PREVIEW_METHOD => crate::cleanup_preview::preview(params, snapshot),
             TEXT_READ_METHOD => crate::text_transfer::read(params),
@@ -1443,6 +1476,486 @@ impl ProgressiveSkillService {
             "model": response.model,
             "capability": capability,
             "authority": "semantic classification only; deterministic reclaim gates remain authoritative",
+        })
+    }
+
+    fn agent_attention_advise_method(&self, params: &Value) -> Value {
+        if let Err(error) = validate_object_keys(params, &["children"]) {
+            return error;
+        }
+        let Some(children) = params.get("children").and_then(Value::as_array) else {
+            return invalid_params("children must be an array");
+        };
+        if children.is_empty() || children.len() > 16 {
+            return invalid_params("children must contain 1 to 16 entries");
+        }
+        let allowed = [
+            "task_id",
+            "dispatch_id",
+            "agent_id",
+            "terminal_state",
+            "status",
+            "recent_text",
+            "age_ms",
+            "has_running_exec",
+            "dirty_worktree",
+            "open_pr",
+        ];
+        let mut frozen = Vec::with_capacity(children.len());
+        for (index, child) in children.iter().enumerate() {
+            let Some(object) = child.as_object() else {
+                return invalid_params(&format!("children[{index}] must be an object"));
+            };
+            if let Err(error) = validate_object_keys(child, &allowed) {
+                return error;
+            }
+            let bounded = |key: &str, max: usize| -> Result<Option<String>, Value> {
+                match object.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(value))
+                        if !value.trim().is_empty() && value.len() <= max =>
+                    {
+                        Ok(Some(value.clone()))
+                    }
+                    Some(Value::String(_)) => Err(invalid_params(&format!(
+                        "children[{index}].{key} must be non-empty and at most {max} bytes"
+                    ))),
+                    Some(_) => Err(invalid_params(&format!(
+                        "children[{index}].{key} must be a string when provided"
+                    ))),
+                }
+            };
+            let task_id = match bounded("task_id", 160) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let dispatch_id = match bounded("dispatch_id", 160) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let agent_id = match bounded("agent_id", 256) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let terminal_state = match bounded("terminal_state", 64) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let status = match bounded("status", 64) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let recent_text = match bounded("recent_text", 8000) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let age_ms = match object.get("age_ms") {
+                None | Some(Value::Null) => None,
+                Some(value) => match value.as_u64() {
+                    Some(value) if value <= 604_800_000 => Some(value),
+                    _ => {
+                        return invalid_params(&format!(
+                            "children[{index}].age_ms must be an integer from 0 to 604800000"
+                        ));
+                    }
+                },
+            };
+            for key in ["has_running_exec", "dirty_worktree", "open_pr"] {
+                if object
+                    .get(key)
+                    .is_some_and(|value| !value.is_null() && !value.is_boolean())
+                {
+                    return invalid_params(&format!(
+                        "children[{index}].{key} must be a boolean when provided"
+                    ));
+                }
+            }
+            frozen.push(json!({
+                "id": format!("child_{index}"),
+                "task_id": task_id,
+                "dispatch_id": dispatch_id,
+                "agent_id": agent_id,
+                "terminal_state": terminal_state,
+                "status": status,
+                "recent_text": recent_text,
+                "age_ms": age_ms,
+                "has_running_exec": object.get("has_running_exec").and_then(Value::as_bool),
+                "dirty_worktree": object.get("dirty_worktree").and_then(Value::as_bool),
+                "open_pr": object.get("open_pr").and_then(Value::as_bool),
+            }));
+        }
+
+        let service = SemanticService::from_config();
+        let capability = service.capability_json();
+        if !service.configured() {
+            return json!({
+                "ok": true, "attempted": true, "used": false,
+                "reason": "not_configured", "advisory_only": true,
+                "children": frozen, "capability": capability,
+            });
+        }
+        let categories = BTreeMap::from([
+            ("continue_unobserved".to_owned(), Some("The child appears to be progressing normally and does not need immediate parent attention".to_owned())),
+            ("verify_completion".to_owned(), Some("The child claims or appears complete and should be verified next".to_owned())),
+            ("needs_human".to_owned(), Some("The child appears to require a human decision or action".to_owned())),
+            ("blocked_external".to_owned(), Some("The child appears blocked on an external dependency or service".to_owned())),
+            ("investigate_drift".to_owned(), Some("The child appears active but may be drifting from its assigned objective".to_owned())),
+            ("unclear".to_owned(), Some("The bounded evidence does not support a clearer classification".to_owned())),
+        ]);
+        let mut request = SemanticRequest::new(json!({"children": frozen}));
+        for index in 0..children.len() {
+            request = request.ask(
+                format!("child_{index}_state"),
+                SemanticQuestion::choice(
+                    "Which advisory attention state best describes this child?",
+                    categories.clone(),
+                ),
+            );
+        }
+        let child_criteria = (0..children.len())
+            .map(|index| {
+                (
+                    format!("child_{index}"),
+                    Some(format!("Frozen child summary at index {index}")),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if child_criteria.len() >= 2 {
+            request = request.ask(
+                "next_child",
+                SemanticQuestion::choice(
+                    "Which child deserves the parent's next bounded inspection?",
+                    child_criteria,
+                ),
+            );
+        }
+        let response = match service.evaluate(&request) {
+            Ok(response) => response,
+            Err(error) => {
+                return json!({
+                    "ok": true, "attempted": true, "used": false,
+                    "reason": error.code(), "advisory_only": true,
+                    "children": frozen, "capability": capability,
+                });
+            }
+        };
+        let mut assessments = Vec::new();
+        for index in 0..children.len() {
+            let key = format!("child_{index}_state");
+            let Some((state, probabilities, confidence)) =
+                response.answer(&key).and_then(SemanticAnswer::choice_value)
+            else {
+                return json!({
+                    "ok": true, "attempted": true, "used": false,
+                    "reason": "bad_response", "advisory_only": true,
+                    "children": frozen, "capability": capability,
+                });
+            };
+            if !categories.contains_key(state) {
+                return json!({
+                    "ok": true, "attempted": true, "used": false,
+                    "reason": "bad_response", "advisory_only": true,
+                    "children": frozen, "capability": capability,
+                });
+            }
+            assessments.push(json!({
+                "id": format!("child_{index}"),
+                "state": state,
+                "probabilities": probabilities,
+                "confidence": confidence,
+            }));
+        }
+        if children.len() >= 2 {
+            let Some((selected, _, _)) = response
+                .answer("next_child")
+                .and_then(SemanticAnswer::choice_value)
+            else {
+                return json!({
+                    "ok": true, "attempted": true, "used": false,
+                    "reason": "bad_response", "advisory_only": true,
+                    "children": frozen, "capability": capability,
+                });
+            };
+            let selected_index = selected
+                .strip_prefix("child_")
+                .and_then(|value| value.parse::<usize>().ok());
+            if selected_index.is_none_or(|index| index >= children.len()) {
+                return json!({
+                    "ok": true, "attempted": true, "used": false,
+                    "reason": "bad_response", "advisory_only": true,
+                    "children": frozen, "capability": capability,
+                });
+            }
+        }
+        let ranking = response
+            .answer("next_child")
+            .and_then(SemanticAnswer::choice_value)
+            .map(|(_, probabilities, _)| {
+                let mut ranked = probabilities
+                    .iter()
+                    .filter_map(|(id, probability)| {
+                        id.strip_prefix("child_")
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .filter(|index| *index < children.len())
+                            .map(|_| (id.clone(), *probability))
+                    })
+                    .collect::<Vec<_>>();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked
+                    .into_iter()
+                    .map(|(id, probability)| json!({"id": id, "probability": probability}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        json!({
+            "ok": true, "attempted": true, "used": true, "advisory_only": true,
+            "children": frozen, "assessments": assessments, "attention_ranking": ranking,
+            "provider": response.provider, "model": response.model, "capability": capability,
+            "authority": "semantic attention triage only; deterministic task, process, terminal, replay, and reclaim facts remain authoritative",
+        })
+    }
+
+    fn validation_advise_method(&self, params: &Value) -> Value {
+        const KEYS: &[&str] = &[
+            "project_root",
+            "summary",
+            "changed_files",
+            "changed_symbols",
+            "candidate_checks",
+        ];
+        if let Err(error) = validate_object_keys(params, KEYS) {
+            return error;
+        }
+        let parse_strings =
+            |key: &str, max_items: usize, max_len: usize| -> Result<Vec<String>, Value> {
+                let Some(values) = params.get(key) else {
+                    return Ok(Vec::new());
+                };
+                if values.is_null() {
+                    return Ok(Vec::new());
+                }
+                let Some(values) = values.as_array() else {
+                    return Err(invalid_params(&format!("{key} must be an array")));
+                };
+                if values.len() > max_items {
+                    return Err(invalid_params(&format!(
+                        "{key} must contain at most {max_items} entries"
+                    )));
+                }
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| match value.as_str() {
+                        Some(value) if !value.trim().is_empty() && value.len() <= max_len => {
+                            Ok(value.to_owned())
+                        }
+                        _ => Err(invalid_params(&format!(
+                            "{key}[{index}] must be a non-empty string at most {max_len} bytes"
+                        ))),
+                    })
+                    .collect()
+            };
+        let changed_files = match parse_strings("changed_files", 64, 1024) {
+            Ok(values) if !values.is_empty() => values,
+            Ok(_) => return invalid_params("changed_files must contain at least one entry"),
+            Err(error) => return error,
+        };
+        let changed_symbols = match parse_strings("changed_symbols", 64, 256) {
+            Ok(values) => values,
+            Err(error) => return error,
+        };
+        let summary = match optional_bounded_nonempty_string(params, "summary", 4096) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let project_root = match optional_bounded_nonempty_string(params, "project_root", 1024) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let supplied_checks = match parse_strings("candidate_checks", 32, 256) {
+            Ok(values) => values,
+            Err(error) => return error,
+        };
+        let mut check_ids = BTreeSet::new();
+        if supplied_checks.is_empty() {
+            for path in &changed_files {
+                if path.starts_with("crates/herdr-mcp/") {
+                    check_ids.insert("rust_gate".to_owned());
+                }
+                if path.starts_with("extension/") {
+                    check_ids.insert("extension_targeted".to_owned());
+                    check_ids.insert("extension_smoke".to_owned());
+                    if path == "extension/background.js"
+                        || path.contains("binding")
+                        || path.contains("browser-state")
+                    {
+                        check_ids.insert("extension_background_bind".to_owned());
+                    }
+                }
+                if path.starts_with("edge/")
+                    || path.starts_with("src/")
+                    || path.contains("contract")
+                {
+                    check_ids.insert("node_build".to_owned());
+                    check_ids.insert("edge_tests".to_owned());
+                }
+                if path.starts_with("docs/") || path == "README.md" {
+                    check_ids.insert("docs_gate".to_owned());
+                    check_ids.insert("hygiene_gate".to_owned());
+                }
+            }
+        } else {
+            check_ids.extend(supplied_checks);
+        }
+        let checks = check_ids.into_iter().collect::<Vec<_>>();
+        let service = SemanticService::from_config();
+        let capability = service.capability_json();
+        let deterministic = json!({
+            "changed_files": changed_files,
+            "changed_symbols": changed_symbols,
+            "candidate_checks": checks,
+            "checks_preserved": true,
+        });
+        if !service.configured() {
+            return json!({
+                "ok": true, "attempted": true, "used": false,
+                "reason": "not_configured", "advisory_only": true,
+                "deterministic": deterministic, "capability": capability,
+            });
+        }
+        let criteria = checks
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    Some(format!("Frozen deterministic validation candidate {id}")),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut request = SemanticRequest::new(json!({
+            "project_root": project_root, "summary": summary,
+            "changed_files": changed_files, "changed_symbols": changed_symbols,
+            "candidate_checks": checks,
+        }))
+        .ask(
+            "regression_surface",
+            SemanticQuestion::choice(
+                "Which bounded regression surface best describes these changes?",
+                BTreeMap::from([
+                    (
+                        "rust".to_owned(),
+                        Some("Rust runtime or native control plane".to_owned()),
+                    ),
+                    (
+                        "extension".to_owned(),
+                        Some("Browser extension behavior".to_owned()),
+                    ),
+                    (
+                        "edge".to_owned(),
+                        Some("Edge or cross-language contract behavior".to_owned()),
+                    ),
+                    (
+                        "docs".to_owned(),
+                        Some("Documentation or generated site only".to_owned()),
+                    ),
+                    (
+                        "cross_boundary".to_owned(),
+                        Some("Multiple ownership boundaries are affected".to_owned()),
+                    ),
+                    (
+                        "unknown".to_owned(),
+                        Some("The bounded evidence is insufficient".to_owned()),
+                    ),
+                ]),
+            ),
+        )
+        .ask(
+            "cross_boundary_risk",
+            SemanticQuestion::noul(
+                "Do these frozen changes span multiple validation ownership boundaries?",
+                "Multiple ownership boundaries are affected",
+                "The change is contained within one ownership boundary",
+            ),
+        );
+        if criteria.len() >= 2 {
+            request = request.ask(
+                "first_check",
+                SemanticQuestion::choice(
+                    "Which frozen validation candidate is most useful to run first?",
+                    criteria.clone(),
+                ),
+            );
+        }
+        let response = match service.evaluate(&request) {
+            Ok(response) => response,
+            Err(error) => {
+                return json!({
+                    "ok": true, "attempted": true, "used": false,
+                    "reason": error.code(), "advisory_only": true,
+                    "deterministic": deterministic, "capability": capability,
+                });
+            }
+        };
+        let Some((surface, surface_probabilities, surface_confidence)) = response
+            .answer("regression_surface")
+            .and_then(SemanticAnswer::choice_value)
+        else {
+            return json!({
+                "ok": true, "attempted": true, "used": false,
+                "reason": "bad_response", "advisory_only": true,
+                "deterministic": deterministic, "capability": capability,
+            });
+        };
+        if criteria.len() >= 2 {
+            let Some((selected, _, _)) = response
+                .answer("first_check")
+                .and_then(SemanticAnswer::choice_value)
+            else {
+                return json!({
+                    "ok": true, "attempted": true, "used": false,
+                    "reason": "bad_response", "advisory_only": true,
+                    "deterministic": deterministic, "capability": capability,
+                });
+            };
+            if !criteria.contains_key(selected) {
+                return json!({
+                    "ok": true, "attempted": true, "used": false,
+                    "reason": "bad_response", "advisory_only": true,
+                    "deterministic": deterministic, "capability": capability,
+                });
+            }
+        }
+        let ranking = response
+            .answer("first_check")
+            .and_then(SemanticAnswer::choice_value)
+            .map(|(_, probabilities, _)| {
+                let allowed = criteria.keys().cloned().collect::<BTreeSet<_>>();
+                let mut ranked = probabilities
+                    .iter()
+                    .filter(|(id, _)| allowed.contains(*id))
+                    .map(|(id, probability)| (id.clone(), *probability))
+                    .collect::<Vec<_>>();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked
+                    .into_iter()
+                    .map(|(id, probability)| json!({"id": id, "probability": probability}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        json!({
+            "ok": true, "attempted": true, "used": true, "advisory_only": true,
+            "deterministic": deterministic,
+            "recommended_first_checks": ranking,
+            "likely_regression_surface": {
+                "value": surface,
+                "probabilities": surface_probabilities,
+                "confidence": surface_confidence,
+            },
+            "cross_boundary_risk": response
+                .answer("cross_boundary_risk")
+                .and_then(SemanticAnswer::noul_probability),
+            "provider": response.provider, "model": response.model, "capability": capability,
+            "authority": "semantic ordering only; deterministic required checks and gate outcomes remain authoritative",
         })
     }
 
@@ -2744,6 +3257,43 @@ mod tests {
         root
     }
 
+    fn semantic_test_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 64 * 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://127.0.0.1:{}/v1", address.port())
+    }
+
+    fn write_semantic_test_config(config_dir: &std::path::Path, url: &str) {
+        let path = config_dir.join("config.json");
+        let route_name = config_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("semantic-test");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"semantic":{{"routes":[{{"name":"{route_name}","protocol":"decision","url":"{url}","model":"jev-test","api_key":"test"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn catalog_is_stable_and_covers_all_non_skill_tools_once() {
         let service = ProgressiveSkillService::new();
@@ -3539,6 +4089,160 @@ mod tests {
             "task_independence_unspecified"
         );
         assert_eq!(result["advice"]["parallelism"]["worth_considering"], false);
+    }
+
+    #[test]
+    fn agent_attention_decision_mode_preserves_authoritative_child_facts_across_semantic_states() {
+        let _guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = temp_root("attention-semantic");
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+        let service = ProgressiveSkillService::new();
+        let params = json!({
+            "children": [
+                {
+                    "task_id": "task_a",
+                    "agent_id": "worker-a",
+                    "terminal_state": "running",
+                    "status": "working",
+                    "recent_text": "Implementing the requested change.",
+                    "age_ms": 1000,
+                    "has_running_exec": true,
+                    "dirty_worktree": true,
+                    "open_pr": false
+                },
+                {
+                    "task_id": "task_b",
+                    "agent_id": "worker-b",
+                    "terminal_state": "completed",
+                    "status": "done",
+                    "recent_text": "Implementation complete; tests passed.",
+                    "age_ms": 2000,
+                    "has_running_exec": false,
+                    "dirty_worktree": false,
+                    "open_pr": true
+                }
+            ]
+        });
+
+        let no_config = service.agent_attention_advise_method(&params);
+        assert_eq!(no_config["used"], false);
+        assert_eq!(no_config["reason"], "not_configured");
+        assert_eq!(no_config["children"][1]["terminal_state"], "completed");
+        assert!(no_config.get("terminal_state").is_none());
+        assert!(no_config.get("safe_to_reclaim").is_none());
+
+        let url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"child_0_state":{"type":"choice","choice":"continue_unobserved","probabilities":{"continue_unobserved":0.8,"verify_completion":0.05,"needs_human":0.02,"blocked_external":0.03,"investigate_drift":0.05,"unclear":0.05},"confidence":0.8},"child_1_state":{"type":"choice","choice":"verify_completion","probabilities":{"continue_unobserved":0.02,"verify_completion":0.9,"needs_human":0.01,"blocked_external":0.01,"investigate_drift":0.01,"unclear":0.05},"confidence":0.9},"next_child":{"type":"choice","choice":"child_1","probabilities":{"child_0":0.1,"child_1":0.9},"confidence":0.9}}}"#,
+        );
+        write_semantic_test_config(&config_dir, &url);
+        let configured = service.agent_attention_advise_method(&params);
+        assert_eq!(configured["used"], true);
+        assert_eq!(configured["assessments"][1]["state"], "verify_completion");
+        assert_eq!(configured["attention_ranking"][0]["id"], "child_1");
+        assert_eq!(configured["children"], no_config["children"]);
+        assert!(configured.get("safe_to_reclaim").is_none());
+        assert!(configured.get("terminal_complete").is_none());
+
+        write_semantic_test_config(&config_dir, "http://127.0.0.1:1/v1");
+        let provider_error = service.agent_attention_advise_method(&params);
+        assert_eq!(provider_error["used"], false);
+        assert_ne!(provider_error["reason"], "not_configured");
+        assert_eq!(provider_error["children"], no_config["children"]);
+
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn validation_decision_mode_ranks_only_frozen_checks_and_preserves_projection() {
+        let _guard = crate::test_env::lock();
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let config_dir = temp_root("validation-semantic");
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+        let service = ProgressiveSkillService::new();
+        let params = json!({
+            "summary": "Rust runtime and extension integration change",
+            "changed_files": [
+                "crates/herdr-mcp/src/mcp.rs",
+                "extension/background.js",
+                "docs/_wip/v1.0-status.md"
+            ],
+            "changed_symbols": ["local_call", "background wake"]
+        });
+
+        let no_config = service.validation_advise_method(&params);
+        assert_eq!(no_config["used"], false);
+        assert_eq!(no_config["reason"], "not_configured");
+        let deterministic = no_config["deterministic"].clone();
+        assert!(
+            deterministic["candidate_checks"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("rust_gate"))
+        );
+        assert!(
+            deterministic["candidate_checks"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("extension_smoke"))
+        );
+
+        let url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"regression_surface":{"type":"choice","choice":"cross_boundary","probabilities":{"rust":0.1,"extension":0.1,"edge":0.02,"docs":0.03,"cross_boundary":0.7,"unknown":0.05},"confidence":0.7},"cross_boundary_risk":{"type":"noul","noul":0.95},"first_check":{"type":"choice","choice":"rust_gate","probabilities":{"rust_gate":0.61,"extension_targeted":0.15,"extension_smoke":0.1,"extension_background_bind":0.06,"docs_gate":0.04,"hygiene_gate":0.04},"confidence":0.61}}}"#,
+        );
+        write_semantic_test_config(&config_dir, &url);
+        let configured = service.validation_advise_method(&params);
+        assert_eq!(configured["used"], true);
+        assert_eq!(configured["deterministic"], deterministic);
+        assert_eq!(
+            configured["likely_regression_surface"]["value"],
+            "cross_boundary"
+        );
+        let allowed = deterministic["candidate_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            configured["recommended_first_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["id"].as_str().is_some_and(|id| allowed.contains(id)))
+        );
+
+        let invalid_url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"regression_surface":{"type":"choice","choice":"cross_boundary","probabilities":{"rust":0.1,"extension":0.1,"edge":0.02,"docs":0.03,"cross_boundary":0.7,"unknown":0.05},"confidence":0.7},"cross_boundary_risk":{"type":"noul","noul":0.95},"first_check":{"type":"choice","choice":"rogue","probabilities":{"rogue":1.0},"confidence":1.0}}}"#,
+        );
+        write_semantic_test_config(&config_dir, &invalid_url);
+        let invalid_choice = service.validation_advise_method(&params);
+        assert_eq!(invalid_choice["used"], false);
+        assert_eq!(invalid_choice["deterministic"], deterministic);
+
+        write_semantic_test_config(&config_dir, "http://127.0.0.1:1/v1");
+        let provider_error = service.validation_advise_method(&params);
+        assert_eq!(provider_error["used"], false);
+        assert_ne!(provider_error["reason"], "not_configured");
+        assert_eq!(provider_error["deterministic"], deterministic);
+
+        unsafe {
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&config_dir);
     }
 
     #[test]
