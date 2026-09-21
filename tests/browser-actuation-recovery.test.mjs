@@ -10,6 +10,14 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+const projectPageInfoStart = backgroundSource.indexOf("function browserProjectPageInfoFromSupportedUrl(");
+const projectPageInfoEnd = backgroundSource.indexOf("\nfunction browserPageContextInfoFromSupportedUrl", projectPageInfoStart);
+assert.ok(projectPageInfoStart >= 0 && projectPageInfoEnd > projectPageInfoStart, "provider project page helper must remain extractable");
+const projectPageInfoSource = backgroundSource.slice(projectPageInfoStart, projectPageInfoEnd);
+const browserProjectPageInfoFromSupportedUrl = new Function(
+  `${projectPageInfoSource}; return browserProjectPageInfoFromSupportedUrl;`,
+)();
+
 const canonicalRecoveryStart = backgroundSource.indexOf("async function findBrowserSessionTargetByCanonicalIdentity(");
 const recoveryStart = backgroundSource.indexOf("async function recoverBrowserSessionTarget(");
 const recoveryEnd = backgroundSource.indexOf("\nasync function handleBrowserActuation", recoveryStart);
@@ -28,10 +36,34 @@ const archiveCleanupEnd = backgroundSource.indexOf("\nasync function recoverBrow
 assert.ok(archiveCleanupStart >= 0 && archiveCleanupEnd > archiveCleanupStart, "archive tab cleanup helpers must remain extractable");
 const archiveCleanupSource = backgroundSource.slice(archiveCleanupStart, archiveCleanupEnd);
 
-const registrationStart = wakeSource.indexOf('async function registerCurrentConversation(reason = "startup")');
+const projectIdentityStart = wakeSource.indexOf("async function currentAdapterProjectIdentity(convKey)");
+const registrationStart = projectIdentityStart;
 const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch()", registrationStart);
 assert.ok(registrationStart >= 0 && registrationEnd > registrationStart, "registration helper must remain extractable");
 const registrationSource = wakeSource.slice(registrationStart, registrationEnd);
+const projectIdentityEnd = wakeSource.indexOf(
+  '\n  async function registerCurrentConversation(reason = "startup")',
+  projectIdentityStart,
+);
+assert.ok(projectIdentityStart >= 0 && projectIdentityEnd > projectIdentityStart, "provider project identity helper must remain extractable");
+const projectIdentitySource = wakeSource.slice(projectIdentityStart, projectIdentityEnd);
+
+function delayedClaudeProjectIdentityHarness(sequence) {
+  let index = 0;
+  const convKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const ADAPTER = {
+    name: "claude",
+    getConversationKey: () => convKey,
+    getProjectIdentity: () => sequence[Math.min(index, sequence.length - 1)] ?? null,
+  };
+  const wait = async () => { index += 1; };
+  const observe = new Function(
+    "ADAPTER",
+    "wait",
+    `${projectIdentitySource}; return currentAdapterProjectIdentity;`,
+  )(ADAPTER, wait);
+  return { observe, convKey, calls: () => index + 1 };
+}
 
 function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) {
   const queryArgs = [];
@@ -210,6 +242,45 @@ function recoveryHarness(tabRecords) {
   );
   return { recover, browserSessionTargets, queryArgs };
 }
+
+test("user sees WebChat control on Claude and Grok project homes | Given supported provider project URLs without conversations | When project page identity is parsed | Then project context exists without a conversation key", () => {
+  const claude = browserProjectPageInfoFromSupportedUrl(
+    "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+  );
+  assert.deepEqual(claude, {
+    site: "claude",
+    project_id: "01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+    conversation_id: null,
+    convKey: null,
+    pageKey: "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+  });
+
+  const grok = browserProjectPageInfoFromSupportedUrl(
+    "https://grok.com/project/eacfb5b0-1ce3-4724-8b10-8d323896ffec",
+  );
+  assert.deepEqual(grok, {
+    site: "grok",
+    project_id: "eacfb5b0-1ce3-4724-8b10-8d323896ffec",
+    conversation_id: null,
+    convKey: null,
+    pageKey: "https://grok.com/project/eacfb5b0-1ce3-4724-8b10-8d323896ffec",
+  });
+
+  assert.equal(
+    browserProjectPageInfoFromSupportedUrl(
+      "https://grok.com/project/eacfb5b0-1ce3-4724-8b10-8d323896ffec?chat=cd60accd-c663-4a40-a292-53a192996423",
+    ),
+    null,
+    "a real Grok project chat remains owned by the session parser",
+  );
+  assert.equal(
+    browserProjectPageInfoFromSupportedUrl(
+      "https://claude.ai/chat/ace3312e-1eac-424f-8363-ad0ee0f6b24d",
+    ),
+    null,
+    "a real Claude chat remains owned by the session parser",
+  );
+});
 
 function createAnchorHarness({ tabs = [], scopes = [], targets = [], recovered = null } = {}) {
   const tabMap = new Map(tabs.map((tab) => [tab.id, { ...tab }]));
@@ -872,6 +943,17 @@ test("terminal stale session reservations do not block ordinary browser identity
   }
   assert.match(segment, /reservationRef:\s*null/);
   assert.doesNotMatch(segment, /browser_session_materialization_conflict[\s\S]*reservationRef:\s*null/);
+});
+
+test("user keeps one Claude Browser Registry session across reload | Given the Project breadcrumb renders after the chat route | When registration resolves the provider scope | Then it waits for the Project identity before choosing the parent", async () => {
+  const project = {
+    id: "01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+    name: "herdr-mcp",
+    key: "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+  };
+  const harness = delayedClaudeProjectIdentityHarness([null, null, project]);
+  assert.deepEqual(await harness.observe(harness.convKey), project);
+  assert.equal(harness.calls(), 3);
 });
 
 test("conversation registration fences route changes before and after async background registration", () => {

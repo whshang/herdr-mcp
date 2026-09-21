@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.115";
+const H2W_CONTENT_VERSION = "0.1.116";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -2531,7 +2531,9 @@ const H2W_CONTENT_VERSION = "0.1.115";
             convKey = ADAPTER.getConversationKey();
           }
           const identityMatchesRoute = Boolean(convKey && registeredConvKey === convKey);
-          const project = currentChatGptProjectFromCatalog(chatGptProjectCatalogCache.projects);
+          const project = ADAPTER.name === "chatgpt"
+            ? currentChatGptProjectFromCatalog(chatGptProjectCatalogCache.projects)
+            : (typeof ADAPTER.getProjectIdentity === "function" ? ADAPTER.getProjectIdentity() : null);
           sendResponse({
             convKey,
             url: location.href,
@@ -2936,6 +2938,26 @@ const H2W_CONTENT_VERSION = "0.1.115";
     return matches[0];
   }
 
+  async function currentAdapterProjectIdentity(convKey) {
+    if (typeof ADAPTER.getProjectIdentity !== "function") return null;
+    let project = ADAPTER.getProjectIdentity();
+    if (project || ADAPTER.name !== "claude") return project;
+
+    // Claude renders the stable /chat/<uuid> route before its chat header.
+    // Give the header breadcrumb one bounded observation window so the same
+    // conversation cannot alternate between account- and Project-parented
+    // Browser Registry sessions across reloads. A real non-Project chat still
+    // registers after the window expires; route drift cancels the observation.
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      await wait(100);
+      if (ADAPTER.getConversationKey() !== convKey) return null;
+      project = ADAPTER.getProjectIdentity();
+      if (project) return project;
+    }
+    return null;
+  }
+
   async function registerCurrentConversation(reason = "startup") {
     if (!runtimeAlive()) return null;
     const registrationAttempt = ++browserRegistrationAttempt;
@@ -2956,7 +2978,12 @@ const H2W_CONTENT_VERSION = "0.1.115";
       } catch (_) {}
     }
     const browserProjects = chatGptProjectRoute ? [] : await chatGptProjectCatalog(accountNativeIdentity);
-    const browserCurrentProject = chatGptProjectRoute ? null : currentChatGptProjectFromCatalog(browserProjects);
+    const adapterProject = await currentAdapterProjectIdentity(convKey);
+    const browserCurrentProject = chatGptProjectRoute
+      ? null
+      : (ADAPTER.name === "chatgpt"
+        ? currentChatGptProjectFromCatalog(browserProjects)
+        : adapterProject);
     if (registrationAttempt !== browserRegistrationAttempt || ADAPTER.getConversationKey() !== convKey) {
       if (registeredConvKey === convKey) {
         if (ADAPTER.getConversationKey() !== convKey) {

@@ -97,6 +97,32 @@ test("Claude adapter exposes only concrete /chat UUID session identity", () => {
   assert.equal(h.adapter.getConversationKey(), null);
 });
 
+test("user keeps Claude Project identity exact | Given sidebar Project links and one visible chat-header breadcrumb | When the adapter resolves Project identity | Then only the chat-header Project is accepted", () => {
+  const h = harness();
+  const projectLink = element({
+    text: "herdr-mcp",
+    attrs: { href: "/project/223e4567-e89b-42d3-a456-426614174001" },
+  });
+  h.set('[data-testid="chat-header"] a[href*="/project/"]', projectLink);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getProjectIdentity())),
+    {
+      id: "223e4567-e89b-42d3-a456-426614174001",
+      name: "herdr-mcp",
+      key: "https://claude.ai/project/223e4567-e89b-42d3-a456-426614174001",
+    },
+  );
+
+  h.set('[data-testid="chat-header"] a[href*="/project/"]', [
+    projectLink,
+    element({
+      text: "novo",
+      attrs: { href: "/project/323e4567-e89b-42d3-a456-426614174002" },
+    }),
+  ]);
+  assert.equal(h.adapter.getProjectIdentity(), null);
+});
+
 test("Claude adapter uses bounded semantic composer, message, and generation selectors", () => {
   const h = harness();
   const composer = element();

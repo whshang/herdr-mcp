@@ -33,6 +33,8 @@ const GEMINI_SPARK_KEY = "https://gemini.google.com/u/1/spark/chat/gemini-recove
 const CLAUDE_CHAT_ID = "123e4567-e89b-12d3-a456-426614174000";
 const CLAUDE_CHAT_URL = `https://claude.ai/chat/${CLAUDE_CHAT_ID}?from=history`;
 const CLAUDE_CHAT_KEY = `https://claude.ai/chat/${CLAUDE_CHAT_ID}`;
+const CLAUDE_PROJECT_ID = "523e4567-e89b-42d3-a456-426614174004";
+const CLAUDE_PROJECT_KEY = `https://claude.ai/project/${CLAUDE_PROJECT_ID}`;
 const GROK_CHAT_ID = "223e4567-e89b-12d3-a456-426614174001";
 const GROK_CHAT_URL = `https://grok.com/c/${GROK_CHAT_ID}?rid=ignored`;
 const GROK_CHAT_KEY = `https://grok.com/c/${GROK_CHAT_ID}`;
@@ -801,10 +803,20 @@ globalThis.chrome = {
 };
 
 // Content-script stub for wake.js h2w_get_convkey responses.
-function installContentScript(tabId, url, convKey, site = "chatgpt") {
+function installContentScript(
+  tabId,
+  url,
+  convKey,
+  site = "chatgpt",
+  browserProjectId = null,
+  browserProjectName = null,
+) {
   tabs.set(tabId, {
     url, listener: (msg, _sender, sendResponse) => {
-      if (msg?.type === "h2w_get_convkey") { sendResponse({ convKey, url, site }); return; }
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({ convKey, url, site, browserProjectId, browserProjectName });
+        return;
+      }
       if (msg?.type === "h2w_wake") { sendResponse({}); return; }
       if (msg?.type === "h2w_queue_deliver") {
         queuedInsertDeliveries.push({ tabId, ...msg });
@@ -917,7 +929,7 @@ const browserRegister = browserRegistryRequests[0] || {};
 const browserRegisterRetry = browserRegistryRequests[1] || {};
 ok(browserRegister.operation === "endpoint.register"
     && !Object.prototype.hasOwnProperty.call(browserRegister, "browser_family")
-    && browserRegister.extension_version === "0.1.115"
+    && browserRegister.extension_version === "0.1.116"
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
   "browser endpoint registration carries one opaque profile seed and leaves browser product identity to the native host",
   JSON.stringify(browserRegister));
@@ -1660,6 +1672,66 @@ console.log("\n[binding flow]");
   onMsg({ type: "h2w_unbind", convKey: CONV, workspace_id: "w2Y" }, {}, (r) => resolveP(r));
   const r = await p;
   ok(r?.ok === true && !Object.keys(storage.herdrWakeBindings).length, "unbind last workspace clears storage", JSON.stringify(r));
+}
+
+// ---- Scenario 5c: provider Project binding is inherited by its concrete chat ----
+{
+  installContentScript(107, CLAUDE_PROJECT_KEY, null, "claude");
+  const boundProject = await dispatchMessage({
+    type: "h2w_bind",
+    tabId: 107,
+    binding_key: CLAUDE_PROJECT_KEY,
+    workspace_id: "wH",
+    workspace_label: "herdr-mcp (wH)",
+  }, { tab: { id: 107, url: CLAUDE_PROJECT_KEY } });
+  const projectStoreKey = `${CLAUDE_PROJECT_KEY}::wH`;
+  ok(boundProject?.ok === true
+      && boundProject.binding_key === CLAUDE_PROJECT_KEY
+      && boundProject.binding_scope === "project"
+      && storage.herdrWakeBindings[projectStoreKey]?.active_conv_key == null,
+    "Claude Project home binds one project-scoped workspace without fabricating a conversation",
+    JSON.stringify(boundProject));
+
+  installContentScript(
+    108,
+    CLAUDE_CHAT_URL,
+    CLAUDE_CHAT_KEY,
+    "claude",
+    CLAUDE_PROJECT_ID,
+    "herdr-mcp",
+  );
+  const inherited = await dispatchMessage(
+    { type: "h2w_state", tabId: 108 },
+    { tab: { id: 108, url: CLAUDE_CHAT_URL } },
+  );
+  ok(inherited?.bindingKey === CLAUDE_PROJECT_KEY
+      && inherited?.binding?.workspace_id === "wH"
+      && inherited?.sessionBindings?.length === 1,
+    "Claude chat inherits the existing Project binding from the same proven project identity",
+    JSON.stringify(inherited));
+
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "claude",
+    convKey: CLAUDE_CHAT_KEY,
+    url: CLAUDE_CHAT_URL,
+    browserCurrentProjectId: CLAUDE_PROJECT_ID,
+    browserCurrentProjectName: "herdr-mcp",
+  }, { tab: { id: 108, url: CLAUDE_CHAT_URL } });
+  ok(registered?.bound === true
+      && storage.herdrWakeBindings[projectStoreKey]?.active_conv_key === CLAUDE_CHAT_KEY
+      && storage.herdrWakeBindings[projectStoreKey]?.tabId === 108,
+    "Claude registration adopts the concrete chat as the Project binding delivery target",
+    JSON.stringify(registered));
+
+  const removed = await dispatchMessage({
+    type: "h2w_unbind",
+    binding_key: CLAUDE_PROJECT_KEY,
+    workspace_id: "wH",
+  }, {});
+  ok(removed?.ok === true && !storage.herdrWakeBindings[projectStoreKey],
+    "provider Project binding cleanup removes the exact shared scope",
+    JSON.stringify(removed));
 }
 
 // ---- Scenario 6: state for popup rendering ----

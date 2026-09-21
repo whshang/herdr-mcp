@@ -29,6 +29,32 @@ class ClaudeAdapter extends BaseAdapter {
     return this.getConversationKey();
   }
 
+  getProjectIdentity() {
+    if (!this.getSessionIdentity()) return null;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const matches = new Map();
+    for (const link of document.querySelectorAll('[data-testid="chat-header"] a[href*="/project/"]')) {
+      if (!this.elementVisible(link)) continue;
+      let url = null;
+      try {
+        url = new URL(String(link.getAttribute?.("href") || link.href || ""), location.origin);
+      } catch (_) {
+        continue;
+      }
+      const match = url.origin === "https://claude.ai"
+        ? url.pathname.match(/^\/project\/([0-9a-f-]{36})\/?$/i)
+        : null;
+      if (!match || !uuid.test(match[1])) continue;
+      const projectId = match[1].toLowerCase();
+      matches.set(projectId, {
+        id: projectId,
+        name: String(link.innerText || link.textContent || "").replace(/\s+/g, " ").trim() || null,
+        key: `https://claude.ai/project/${projectId}`,
+      });
+    }
+    return matches.size === 1 ? [...matches.values()][0] : null;
+  }
+
   getInputEl() {
     const chains = [
       '[data-testid="chat-input"][contenteditable="true"]',

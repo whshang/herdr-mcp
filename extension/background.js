@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.115";
+const H2W_SCRIPT_VERSION = "0.1.116";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -937,16 +937,100 @@ function browserConversationInfoFromSupportedUrl(rawUrl) {
   return null;
 }
 
+function providerProjectPageKey(site, projectId) {
+  const rawId = String(projectId || "").trim();
+  if (!rawId) return null;
+  if (site === "chatgpt" && /^g-p-[A-Za-z0-9_-]+$/.test(rawId)) {
+    return `https://chatgpt.com/g/${encodeURIComponent(rawId)}`;
+  }
+  if (!["claude", "grok"].includes(site)
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawId)) {
+    return null;
+  }
+  const id = rawId.toLowerCase();
+  const origin = site === "claude" ? "https://claude.ai" : "https://grok.com";
+  return `${origin}/project/${id}`;
+}
+
+function browserProjectPageInfoFromSupportedUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    const site = url.origin === "https://claude.ai"
+      ? "claude"
+      : url.origin === "https://grok.com"
+        ? "grok"
+        : null;
+    if (!site) return null;
+    const projectMatch = url.pathname.match(
+      /^\/project\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i,
+    );
+    if (!projectMatch) return null;
+    if (site === "grok" && url.searchParams.has("chat")) return null;
+    const projectId = projectMatch[1].toLowerCase();
+    return {
+      site,
+      project_id: projectId,
+      conversation_id: null,
+      convKey: null,
+      pageKey: `${url.origin}/project/${projectId}`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserSiteHomeInfoFromSupportedUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    const site = url.origin === "https://claude.ai"
+      ? "claude"
+      : url.origin === "https://grok.com"
+        ? "grok"
+        : null;
+    if (!site || url.pathname !== "/" || url.search || url.hash) return null;
+    return {
+      site,
+      project_id: null,
+      conversation_id: null,
+      convKey: null,
+      pageKey: null,
+      is_site_home: true,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserPageContextInfoFromSupportedUrl(rawUrl) {
+  return browserConversationInfoFromSupportedUrl(rawUrl)
+    || browserProjectPageInfoFromSupportedUrl(rawUrl)
+    || browserSiteHomeInfoFromSupportedUrl(rawUrl);
+}
+
 function enrichConversationInfoWithBrowserScope(tabId, info) {
-  if (!tabId || !info || info.site !== "chatgpt" || info.project_id) return info;
+  if (!tabId || !info) return info;
+  if (info.project_id) {
+    const pageKey = providerProjectPageKey(info.site, info.project_id);
+    return pageKey && !info.pageKey ? { ...info, pageKey } : info;
+  }
   const scope = browserTabScopes.get(tabId);
   const projectId = typeof scope?.projectId === "string" && scope.projectId.trim()
     ? scope.projectId.trim()
     : String(info.browserProjectId || "").trim();
-  if (!/^g-p-[A-Za-z0-9_-]+$/.test(projectId)) return info;
   const projectName = typeof scope?.projectName === "string" && scope.projectName.trim()
     ? scope.projectName.trim()
     : String(info.browserProjectName || "").trim();
+  if (info.site !== "chatgpt") {
+    const pageKey = providerProjectPageKey(info.site, projectId);
+    if (!pageKey) return info;
+    return {
+      ...info,
+      project_id: projectId.toLowerCase(),
+      project_name: projectName || null,
+      pageKey,
+    };
+  }
+  if (!/^g-p-[A-Za-z0-9_-]+$/.test(projectId)) return info;
   return {
     ...info,
     project_id: projectId,
@@ -1150,9 +1234,13 @@ function bindingStoreKey(convKey, workspaceId) {
   return `${convKey}::${workspaceId}`;
 }
 
+function projectBindingKeyForConversationInfo(info) {
+  if (!info?.project_id) return null;
+  return info.project_key || info.pageKey || providerProjectPageKey(info.site, info.project_id);
+}
+
 function bindingKeyForConversationInfo(info, fallback = null) {
-  if (info?.project_id && info?.project_key) return info.project_key;
-  return info?.convKey || fallback || null;
+  return projectBindingKeyForConversationInfo(info) || info?.convKey || info?.pageKey || fallback || null;
 }
 
 function parseBindingStoreKey(storeKey) {
@@ -1210,13 +1298,30 @@ function directBindingsForConv(bindings, convKey) {
   return out;
 }
 
-function bindingsForConv(bindings, convKey) {
-  const info = chatGptConversationInfo(convKey);
-  if (info?.project_id && info.project_key) {
-    const projectScoped = directBindingsForConv(bindings, info.project_key);
+function bindingsForPageInfo(bindings, info, fallbackKey = null) {
+  const bindingKey = bindingKeyForConversationInfo(info, fallbackKey);
+  if (info?.project_id && bindingKey) {
+    const projectScoped = directBindingsForConv(bindings, bindingKey);
     if (projectScoped.length) return projectScoped;
   }
-  return directBindingsForConv(bindings, convKey);
+  if (info?.convKey) {
+    const activeProjectBindings = Object.entries(bindings || {})
+      .filter(([, binding]) => (
+        isProjectScopedBinding(binding)
+        && binding?.active_conv_key === info.convKey
+        && (!info.project_id || !binding?.project_id || binding.project_id === info.project_id)
+      ))
+      .map(([storeKey, binding]) => ({ storeKey, ...binding }));
+    if (activeProjectBindings.length) return activeProjectBindings;
+    const direct = directBindingsForConv(bindings, info.convKey);
+    if (direct.length) return direct;
+  }
+  return bindingKey ? directBindingsForConv(bindings, bindingKey) : [];
+}
+
+function bindingsForConv(bindings, convKey) {
+  const info = browserConversationInfoFromSupportedUrl(convKey);
+  return bindingsForPageInfo(bindings, info, convKey);
 }
 
 function isProjectScopedBinding(binding) {
@@ -1902,6 +2007,7 @@ function grokConversationInfo(rawUrl) {
       site: "grok",
       conversation_id: conversationId,
       project_id: projectId,
+      pageKey: providerProjectPageKey("grok", projectId),
       convKey: `${url.origin}/project/${projectId}?chat=${conversationId}`,
     };
   } catch (_) {
@@ -2236,7 +2342,7 @@ async function observeBrowserConversation({
         parent_ref: parentRef,
         native_identity: pageInfo.project_id,
         display_label: pageInfo.project_name || null,
-        canonical_url: pageInfo.project_launch_url || pageInfo.project_key || null,
+        canonical_url: pageInfo.project_launch_url || pageInfo.project_key || pageInfo.pageKey || null,
         observation_generation: observationGeneration,
         observed_at: Date.now(),
       });
@@ -7465,21 +7571,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       const bindings = await loadBindings();
-      const parsedPageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
-      const catalogProjectId = /^g-p-[A-Za-z0-9_-]+$/.test(String(msg.browserCurrentProjectId || ""))
-        ? String(msg.browserCurrentProjectId)
-        : null;
-      const catalogProjectName = String(msg.browserCurrentProjectName || "").trim() || null;
-      const pageInfo = parsedPageInfo?.site === "chatgpt" && !parsedPageInfo.project_id && catalogProjectId
-        ? {
-            ...parsedPageInfo,
-            project_id: catalogProjectId,
-            project_name: catalogProjectName,
-            project_key: `https://chatgpt.com/g/${encodeURIComponent(catalogProjectId)}`,
-            project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(catalogProjectId)}`,
-          }
-        : parsedPageInfo;
-      const browserPageInfo = pageInfo?.site === "chatgpt"
+      const rawPageInfo = registeringSite === "chatgpt"
+        ? conversationInfoFromSupportedUrl(msg.url || msg.convKey)
+        : (browserConversationInfo(registeringSite, msg.url || msg.convKey)
+          || conversationInfoFromSupportedUrl(msg.url || msg.convKey));
+      const rawCurrentProjectId = String(msg.browserCurrentProjectId || "").trim();
+      const currentProjectId = registeringSite === "chatgpt"
+        ? (/^g-p-[A-Za-z0-9_-]+$/.test(rawCurrentProjectId) ? rawCurrentProjectId : null)
+        : (providerProjectPageKey(registeringSite, rawCurrentProjectId)
+          ? rawCurrentProjectId.toLowerCase()
+          : null);
+      const currentProjectName = String(msg.browserCurrentProjectName || "").trim() || null;
+      let pageInfo = rawPageInfo;
+      if (pageInfo && currentProjectId) {
+        if (pageInfo.project_id
+            && String(pageInfo.project_id).toLowerCase() !== String(currentProjectId).toLowerCase()) {
+          sendResponse({ ok: false, error: "project_identity_mismatch" });
+          return;
+        }
+        const projectKey = providerProjectPageKey(registeringSite, currentProjectId);
+        pageInfo = {
+          ...pageInfo,
+          project_id: currentProjectId,
+          project_name: currentProjectName || pageInfo.project_name || null,
+          ...(registeringSite === "chatgpt"
+            ? { project_key: projectKey, project_launch_url: projectKey }
+            : { pageKey: projectKey }),
+        };
+      }
+      const browserPageInfo = ["chatgpt", "gemini", "claude", "grok"].includes(registeringSite)
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       let browserObservation = null;
@@ -7517,7 +7637,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
         }
       }
-      let matched = bindingsForConv(bindings, msg.convKey);
+      let matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
       if (!matched.length && sender.tab?.id) {
         if (pageInfo?.site === "chatgpt") {
           const migration = await migrateChatGptRootBindingState(
@@ -7526,7 +7646,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             msg.url || sender.tab?.url || null,
             sender.tab.id,
           );
-          if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
+          if (migration.migrated) {
+            matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
+          }
         } else if (!["gemini", "claude", "grok"].includes(registeringSite)) {
           const migration = await migrateZaiRootConversationState(
             bindings,
@@ -7534,7 +7656,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             msg.url || sender.tab?.url || null,
             sender.tab.id,
           );
-          if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
+          if (migration.migrated) {
+            matched = bindingsForPageInfo(bindings, pageInfo, msg.convKey);
+          }
         }
       }
       if (matched.length) {
@@ -8036,13 +8160,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Opening a browser control surface wakes the service worker; restore streams and timers lost to suspension.
       void ensureAlive(bindings, authoritativeState);
       let convInfo = null;
+      let pageInfo = null;
       if (msg.tabId) {
         convInfo = await conversationInfoForTab(msg.tabId);
+        pageInfo = convInfo;
+        if (!pageInfo) {
+          try {
+            const tab = await chrome.tabs.get(msg.tabId);
+            pageInfo = browserPageContextInfoFromSupportedUrl(tab?.url);
+          } catch (_) {}
+        }
       }
-      const binding = convInfo ? primaryBindingForConv(bindings, convInfo.convKey) : null;
-      const sessionBindings = convInfo
-        ? bindingsForConv(bindings, convInfo.convKey).map((b) => bindingView(b))
-        : [];
+      const bindingKey = bindingKeyForConversationInfo(pageInfo);
+      const pageBindings = pageInfo ? bindingsForPageInfo(bindings, pageInfo, bindingKey) : [];
+      const binding = pageBindings[0] || null;
+      const sessionBindings = pageBindings.map((b) => bindingView(b));
       const bindingViewOne = binding ? bindingView(binding) : null;
       const idleNudgeLast = convInfo?.convKey
         ? (lastIdleNudgeResult.get(convInfo.convKey) || null)
@@ -8053,6 +8185,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const semanticCapabilities = await runtimeSemanticCapabilities();
       sendResponse({
         convInfo,
+        pageInfo,
+        bindingKey,
         browserEndpoint: browserEndpointView(browserEndpoint),
         binding: bindingViewOne,
         sessionBindings,
@@ -8163,19 +8297,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const tabId = msg.tabId || sender.tab?.id;
       if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
       const convInfo = await conversationInfoForTab(tabId);
-      const requestedConvKey = String(msg.convKey || "").trim();
-      if (!convInfo?.convKey && !requestedConvKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
-      const pageInfo = convInfo || conversationInfoFromSupportedUrl(requestedConvKey);
-      const effectiveConvKey = bindingKeyForConversationInfo(pageInfo, convInfo?.convKey || requestedConvKey);
-      if (!effectiveConvKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
+      let tab = null;
+      try { tab = await chrome.tabs.get(tabId); } catch (_) {}
+      const requestedBindingKey = String(msg.binding_key || msg.convKey || "").trim();
+      const requestedInfo = requestedBindingKey
+        ? browserPageContextInfoFromSupportedUrl(requestedBindingKey)
+        : null;
+      const pageInfo = convInfo
+        || browserPageContextInfoFromSupportedUrl(tab?.url)
+        || requestedInfo;
+      const effectiveBindingKey = bindingKeyForConversationInfo(pageInfo);
+      if (!effectiveBindingKey) {
+        sendResponse({ ok: false, error: "conversation-unavailable" });
+        return;
+      }
+      if (requestedBindingKey
+          && requestedBindingKey !== effectiveBindingKey
+          && requestedBindingKey !== pageInfo?.convKey) {
+        sendResponse({ ok: false, error: "binding_scope_mismatch" });
+        return;
+      }
       const workspace_id = msg.workspace_id
         || (typeof msg.pane === "string" && msg.pane.includes(":") ? msg.pane.split(":")[0] : null);
       if (!workspace_id) { sendResponse({ ok: false, error: "workspace_required" }); return; }
-      const storeKey = bindingStoreKey(effectiveConvKey, workspace_id);
-      if (bindings[storeKey]) { sendResponse({ ok: false, error: "already-bound", convKey: effectiveConvKey, workspace_id }); return; }
+      const storeKey = bindingStoreKey(effectiveBindingKey, workspace_id);
+      if (bindings[storeKey]) {
+        sendResponse({
+          ok: false,
+          error: "already-bound",
+          convKey: effectiveBindingKey,
+          binding_key: effectiveBindingKey,
+          workspace_id,
+        });
+        return;
+      }
       const workspace_label = msg.workspace_label
         || workspaceTitleWithId({ id: workspace_id, label: msg.workspace_label_raw, roots: msg.roots });
-      const continuity_id = bindingsForConv(bindings, effectiveConvKey).map((x) => x.continuity_id).find(Boolean)
+      const continuity_id = bindingsForPageInfo(bindings, pageInfo, effectiveBindingKey)
+        .map((x) => x.continuity_id).find(Boolean)
         || newContinuityId();
       const projectScoped = Boolean(pageInfo?.project_id);
       const pendingRoot = pageInfo?.site === "chatgpt" && pageInfo?.is_new_chat_root === true;
@@ -8199,7 +8358,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         focus_agent: msg.agent || null,
         agent: null, // The binding targets a workspace, not an individual agent.
         workingPanes: {},
-        convKey: effectiveConvKey,
+        convKey: effectiveBindingKey,
         site: pageInfo?.site || "unknown",
         binding_scope: projectScoped ? "project" : (pendingRoot ? "pending" : "conversation"),
         project_id: pageInfo?.project_id || null,
@@ -8234,7 +8393,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try { void chrome.tabs.sendMessage(tabId, { type: "h2w_bound", pane: workspace_label, workspace_id, workspace_label }).catch(() => {}); } catch (e) {}
       sendResponse({
         ok: true,
-        convKey: effectiveConvKey,
+        convKey: effectiveBindingKey,
+        binding_key: effectiveBindingKey,
         binding_scope: b.binding_scope,
         project_id: b.project_id,
         workspace_id,
@@ -8246,9 +8406,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_unbind") {
     void (async () => {
       const bindings = await loadBindings();
-      const convKey = msg.convKey;
+      const bindingKey = String(msg.binding_key || msg.convKey || "").trim();
       const wsId = msg.workspace_id || null;
-      const session = bindingsForConv(bindings, convKey);
+      const pageInfo = browserPageContextInfoFromSupportedUrl(bindingKey);
+      const session = pageInfo
+        ? bindingsForPageInfo(bindings, pageInfo, bindingKey)
+        : bindingsForConv(bindings, bindingKey);
       const selected = wsId
         ? session.find((b) => (b.workspace_id || normalizeWorkspaceId(b)) === wsId)
         : null;
@@ -8275,9 +8438,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await saveBindings(bindings);
       broadcastControlMessage({ type: "herdr_control_binding_changed" });
       await restoreTabDiscardabilityIfUnbound(tabId, bindings);
-      if (!bindingsForConv(bindings, convKey).length) {
-        clearIdleNudgeRetry(convKey);
-        lastTurnEndedPayload.delete(convKey);
+      const remaining = pageInfo
+        ? bindingsForPageInfo(bindings, pageInfo, bindingKey)
+        : bindingsForConv(bindings, bindingKey);
+      if (!remaining.length) {
+        clearIdleNudgeRetry(bindingKey);
+        lastTurnEndedPayload.delete(bindingKey);
       }
       if (tabId) { try { void chrome.tabs.sendMessage(tabId, { type: "h2w_unbound", workspace_id: wsId || null }).catch(() => {}); } catch (e) {} }
       if (!Object.keys(bindings).length) clearActionBadge();
