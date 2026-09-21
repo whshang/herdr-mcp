@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 已在 Apple Silicon macOS、原生 Debian x86_64 与 ARM64 上完成生产级验证。Windows x86_64 与 Windows ARM64 都会发布 1.0 candidate：两者都在 GitHub 原生 Windows runner 上做构建/运行验证，但在实体机 UAT 通过前都不晋级为生产支持。Windows 使用 Herdr named pipe、Windows Credential Manager、当前用户 Startup 文件夹快捷方式登录自启动和独立用户进程；受管 Windows runtime 启动时会探测配置的 Herdr API，如果 Herdr 已安装但 server 尚未运行，会以当前用户权限尽力启动 `herdr server`，但 herdr-mcp 不负责安装或删除 Herdr 本体。Browser Native Messaging 与产品级 reinstall/uninstall 仍不属于 Windows 实体机支持声明。精确的“已测试/尚未测试”边界见[平台支持矩阵](platform-support-matrix.md)。
+当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 已在 Apple Silicon macOS、原生 Debian x86_64 与 ARM64 上完成生产级验证。Windows x86_64 与 Windows ARM64 都会发布 1.0 candidate。Windows x86_64 已在实体机上实际跑过安装/恢复与真实 Connector 对话，但在最新 main 的精确 candidate 上完整记录 #394 的晋级证据前仍保持 Candidate；Windows ARM64 目前仍只有 hosted runner 资格验证。Windows 使用 Herdr named pipe、Windows Credential Manager、当前用户 Startup 文件夹快捷方式登录自启动和独立用户进程；受管 Windows runtime 启动时会探测配置的 Herdr API，如果 Herdr 已安装但 server 尚未运行，会以当前用户权限尽力启动 `herdr server`，但 herdr-mcp 不负责安装或删除 Herdr 本体。Browser Native Messaging 与产品级 reinstall/uninstall 仍不属于 Windows 实体机支持声明。精确的“已测试/尚未测试”边界见[平台支持矩阵](platform-support-matrix.md)。
 
 旧版本安装按[Runtime 自升级](runtime-self-upgrade.md)原地升级。已有 Worker、设备关系和健康的 ChatGPT Connector 不需要为了升级当前 runtime 重新创建。
 
