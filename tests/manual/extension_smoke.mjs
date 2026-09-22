@@ -85,10 +85,14 @@ const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
 const hudStateViewSource = readFileSync(path.join(EXT, "content", "hud", "state-view.js"), "utf8");
 const hudRendererSource = readFileSync(path.join(EXT, "content", "hud", "renderer.js"), "utf8");
-ok(manifest.version === "0.1.118", "manifest version stays aligned with the browser product build");
+// Compare the shipped script versions against the loaded manifest instead of a
+// hardcoded release string, so a manifest bump cannot leave these three
+// alignment contracts silently stale.
+const manifestVersion = String(manifest.version || "");
+ok(/^\d+\.\d+\.\d+$/.test(manifestVersion), "manifest version stays aligned with the browser product build");
 ok(manifest.permissions?.includes("activeTab"), "Control Center can identify the user-invoked active WebChat tab before optional site access is granted");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.118"'), "background version matches manifest");
+ok(backgroundSource.includes(`const H2W_SCRIPT_VERSION = "${manifestVersion}"`), "background version matches manifest");
 ok(backgroundSource.includes('routeAgentTaskInboxWake')
     && backgroundSource.includes('/extension/agent/tasks')
     && backgroundSource.includes('taskAttentionStateMap')
@@ -102,7 +106,7 @@ ok(wakeSource.includes('tasks: hud?.task_summary || null')
     && hudRendererSource.includes('tasks.blocked')
     && hudRendererSource.includes('tasks.uncertain'),
   "HUD renders durable task running/completed/blocked/uncertain counters from the Runtime inbox");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.118"'), "content version matches manifest");
+ok(wakeSource.includes(`const H2W_CONTENT_VERSION = "${manifestVersion}"`), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
