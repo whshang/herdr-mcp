@@ -142,13 +142,13 @@ class GrokAdapter extends BaseAdapter {
     const seen = new Set();
     for (const selector of selectors) {
       for (const element of document.querySelectorAll(selector)) {
-        if (!this.elementVisible(element) || seen.has(element)) continue;
+        if (seen.has(element)) continue;
         seen.add(element);
         nodes.push(element);
       }
       if (nodes.length > 0) break;
     }
-    const element = nodes.at(-1) || null;
+    const element = [...nodes].reverse().find((candidate) => this.elementVisible(candidate)) || null;
     if (!element) return { messageId: null, text: "", count: 0 };
     let messageId = element.getAttribute?.("data-message-id")
       || element.getAttribute?.("data-message-uuid")
@@ -181,8 +181,7 @@ class GrokAdapter extends BaseAdapter {
       const ordinalText = acceptedUserMessageRef.slice(syntheticPrefix.length);
       if (!/^\d+$/.test(ordinalText)) return null;
       const userOrdinal = Number(ordinalText);
-      const users = [...document.querySelectorAll('[data-testid="user-message"]')]
-        .filter((element) => this.elementVisible(element));
+      const users = [...document.querySelectorAll('[data-testid="user-message"]')];
       const acceptedUser = users[userOrdinal] || null;
       if (!acceptedUser) return null;
 
@@ -190,7 +189,7 @@ class GrokAdapter extends BaseAdapter {
         ...document.querySelectorAll(
           '[data-testid="user-message"], [data-testid="assistant-message"]',
         ),
-      ].filter((element) => this.elementVisible(element));
+      ];
       const acceptedIndex = transcript.indexOf(acceptedUser);
       if (acceptedIndex < 0) return null;
 
@@ -221,8 +220,7 @@ class GrokAdapter extends BaseAdapter {
       }
       if (!hasLaterUser && this.isGenerationInProgress()) return null;
 
-      const assistants = [...document.querySelectorAll('[data-testid="assistant-message"]')]
-        .filter((element) => this.elementVisible(element));
+      const assistants = [...document.querySelectorAll('[data-testid="assistant-message"]')];
       const assistantOrdinal = assistants.indexOf(assistantElement);
       if (assistantOrdinal < 0) return null;
       const assistantMessageId = assistantElement.getAttribute?.("data-message-id")

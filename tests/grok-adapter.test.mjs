@@ -194,6 +194,44 @@ test("user keeps stable Grok turn identity | Given response wrappers are replace
   );
 });
 
+test("user keeps stable Grok turn identity | Given hidden historical turns | When the latest visible turn is snapshotted | Then synthetic refs keep full-transcript ordinals", () => {
+  const h = harness();
+  const hiddenUser = element({ text: "older prompt", visible: false });
+  const hiddenAssistant = element({ text: "older answer", visible: false });
+  const currentUser = element({
+    text: "current prompt",
+    attrs: { "data-testid": "user-message" },
+  });
+  const currentAssistant = element({
+    text: "current answer",
+    attrs: { "data-testid": "assistant-message" },
+  });
+  h.set('[data-testid="user-message"]', [hiddenUser, currentUser]);
+  h.set('[data-testid="assistant-message"]', [hiddenAssistant, currentAssistant]);
+  h.set(
+    '[data-testid="user-message"], [data-testid="assistant-message"]',
+    [hiddenUser, hiddenAssistant, currentUser, currentAssistant],
+  );
+
+  assert.equal(
+    h.adapter.getMessageSnapshot("user").messageId,
+    "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:1",
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(h.adapter.getResultSettlementSnapshot(
+      "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:1",
+    ))),
+    {
+      ok: true,
+      currentNodeRole: "assistant",
+      finished: true,
+      messageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:assistant:1",
+      userMessageId: "grok-dom-v1:123e4567-e89b-12d3-a456-426614174000:user:1",
+      text: "current answer",
+    },
+  );
+});
+
 test("Grok adapter hashes same-origin session userId before returning native identity", async () => {
   const h = harness();
   const userId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";

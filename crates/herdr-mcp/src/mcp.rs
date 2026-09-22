@@ -5853,9 +5853,13 @@ fn browser_dispatch_result_is_durable(
         return false;
     }
     match dispatch.work_chain_id {
-        Some(_) => {
-            dispatch.result_turn_message_id.is_some() && dispatch.result_evidence_id.is_some()
-        }
+        Some(_) => matches!(
+            (
+                dispatch.result_turn_message_id.as_ref(),
+                dispatch.result_evidence_id.as_ref()
+            ),
+            (Some(_), Some(_)) | (None, None)
+        ),
         None => dispatch.result_turn_message_id.is_none() && dispatch.result_evidence_id.is_none(),
     }
 }
@@ -9960,7 +9964,7 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        {
+        let settled_dispatch = {
             let mut guard = store.lock().unwrap();
             let settled = guard
                 .settle_browser_dispatch_result(BrowserDispatchResultInput {
@@ -9975,7 +9979,8 @@ mod tests {
                 .unwrap();
             assert!(!settled.replayed);
             assert_eq!(settled.dispatch.dispatch_id, dispatch_id);
-        }
+            settled.dispatch
+        };
 
         let status = browser_operation_call(
             &store,
@@ -10003,6 +10008,23 @@ mod tests {
         );
         // The worker text lives in Work Memory, not in the planner-facing status.
         assert!(!status.to_string().contains("final worker answer text"));
+
+        let mut settled_without_work_memory = settled_dispatch;
+        settled_without_work_memory.result_turn_message_id = None;
+        settled_without_work_memory.result_evidence_id = None;
+        assert!(browser_dispatch_result_is_durable(
+            &settled_without_work_memory
+        ));
+        assert_eq!(
+            browser_dispatch_execution_state(&settled_without_work_memory),
+            Some("settled")
+        );
+
+        settled_without_work_memory.result_turn_message_id =
+            Some("partial-work-memory-turn".to_owned());
+        assert!(!browser_dispatch_result_is_durable(
+            &settled_without_work_memory
+        ));
     }
 
     #[test]
