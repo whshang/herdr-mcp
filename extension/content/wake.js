@@ -902,6 +902,18 @@ function normalizeHerdrMentionAlias(value) {
     const deadline = Date.now() + 2000;
     while (Date.now() < deadline) {
       if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
+      const candidates = typeof ADAPTER.getComposerAppCandidates === "function"
+        ? ADAPTER.getComposerAppCandidates(keyword)
+        : [];
+      if (candidates.length === 1) {
+        candidates[0].click();
+        const selectedDeadline = Date.now() + 2500;
+        while (Date.now() < selectedDeadline) {
+          if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
+          await wait(100);
+        }
+        return false;
+      }
       await wait(100);
     }
     return false;
