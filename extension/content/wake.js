@@ -888,18 +888,23 @@ function normalizeHerdrMentionAlias(value) {
     if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
     const selector = ADAPTER.getWatchMainWorldSelector();
     if (!selector) return false;
-    const mention = await insertMainWorld(`@${alias}`, selector);
-    if (!mention.ok) return false;
-    // ChatGPT converts an exact @app token into an ecosystemMention pill when
-    // the user commits the token with Space. Reproduce that user action in MAIN.
-    const separator = await insertMainWorld(" ", selector, true);
-    if (!separator.ok) return false;
-    const deadline = Date.now() + 1200;
+
+    // A plain inserted "@alias" is not enough. ChatGPT opens the app picker
+    // from the @ keystroke and consumes following characters as search input.
+    // Type the trigger first, then the query, and let the existing app picker
+    // selection path decide the final pill state.
+    const trigger = await insertMainWorld("@", selector);
+    if (!trigger.ok) return false;
+    await wait(250);
+    const query = await insertMainWorld(alias, selector, true);
+    if (!query.ok) return false;
+
+    const deadline = Date.now() + 2000;
     while (Date.now() < deadline) {
       if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
-      await wait(80);
+      await wait(100);
     }
-    return ADAPTER.getSelectedComposerApps().includes(keyword);
+    return false;
   }
 
   async function ensureHerdrComposerReference() {
