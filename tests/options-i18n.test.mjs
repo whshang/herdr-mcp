@@ -37,7 +37,7 @@ test("Simplified Chinese Options copy avoids legacy mixed-language prose", () =>
   }
 });
 
-test("Options keeps local Runtime secrets and transport details out of extension settings", () => {
+test("user keeps Runtime-only configuration out of the extension | Given browser settings are rendered | When Options is inspected | Then Runtime URL, Page Assist, and secrets stay outside the form while config.json guidance remains visible", () => {
   assert.doesNotMatch(optionsHtml, /id="token"|HERDR_MCP_TOKEN|Bearer Token/);
   assert.doesNotMatch(optionsJs, /\$\("token"\)|cfg\.token|config\.token/);
   assert.doesNotMatch(optionsHtml, /id="url"|id="pageAssistOrigins"/);
