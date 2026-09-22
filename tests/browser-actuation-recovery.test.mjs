@@ -1215,7 +1215,7 @@ test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowled
   assert.equal(busy.result.attempted, false);
 });
 
-test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit attempt cannot be proven | When Browser Actuation returns | Then it is uncertain with a bounded readback instead of a retryable rejection", async () => {
+test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch or fresh-create attempt cannot be proven | When Browser Actuation returns | Then it stays uncertain without replaying or dropping the create reservation", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
   const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
@@ -1224,7 +1224,12 @@ test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit at
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
   const commandSource = wakeSource.slice(commandStart, commandEnd);
-  const ctx = { snapshotTimeouts: [], wakeArgs: null };
+  const ctx = {
+    snapshotTimeouts: [],
+    wakeArgs: [],
+    reservationWrites: [],
+    reservationRemovals: 0,
+  };
 
   const act = new Function("ctx", `
     const ADAPTER = {
@@ -1236,7 +1241,10 @@ test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit at
       getMessageSnapshot: () => ({}),
     };
     const chatGptConversationId = () => "current";
-    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const sessionStorage = {
+      setItem: (key, value) => ctx.reservationWrites.push([key, value]),
+      removeItem: () => { ctx.reservationRemovals += 1; },
+    };
     const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
     let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
     let registeredBrowserGeneration = 17;
@@ -1253,7 +1261,7 @@ test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit at
       return { ok: false };
     };
     const performWake = async (args) => {
-      ctx.wakeArgs = args;
+      ctx.wakeArgs.push(args);
       return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
     };
     const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
@@ -1268,12 +1276,31 @@ test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit at
     params: { message: "next turn", required_apps: [] },
   });
 
-  assert.equal(ctx.wakeArgs.browserActuation, true);
+  assert.equal(ctx.wakeArgs[0].browserActuation, true);
   assert.deepEqual(ctx.snapshotTimeouts, [1200]);
   assert.equal(result.command_accepted, true);
   assert.equal(result.rejected, false);
   assert.equal(result.accepted_message_observed, false);
   assert.equal(result.generation_owner, null);
+
+  const reservationRef = "bsr_" + "c".repeat(64);
+  const create = await act({
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      reservation_ref: reservationRef,
+      message: "first worker turn",
+      required_apps: [],
+    },
+  });
+
+  assert.equal(ctx.wakeArgs[1].browserActuation, true);
+  assert.deepEqual(ctx.snapshotTimeouts, [1200, 6000]);
+  assert.equal(create.command_accepted, true);
+  assert.equal(create.rejected, false);
+  assert.equal(create.stable_resource_ref_observed, false);
+  assert.deepEqual(ctx.reservationWrites, [["herdrBrowserSessionReservationV1", reservationRef]]);
+  assert.equal(ctx.reservationRemovals, 0);
 });
 
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {

@@ -2203,6 +2203,9 @@ function normalizeHerdrMentionAlias(value) {
     const exactChatGptDispatchIdentity = ADAPTER.name === "chatgpt"
       && !creatingSession
       && command?.operation === "herdr_mcp.browser_dispatch.submit";
+    const boundedChatGptSubmit = exactChatGptDispatchIdentity || (
+      ADAPTER.name === "chatgpt" && creatingSession
+    );
     const snapshotTimeoutMs = exactChatGptDispatchIdentity ? 1200 : 6000;
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
@@ -2212,18 +2215,18 @@ function normalizeHerdrMentionAlias(value) {
     const result = await performWake({
       template: message,
       autoAllow: false,
-      browserActuation: exactChatGptDispatchIdentity,
+      browserActuation: boundedChatGptSubmit,
       requiredApps,
     });
     if (!result?.ok) {
-      if (creatingSession) {
-        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
-      }
-      if (exactChatGptDispatchIdentity && result?.uncertain === true) {
+      if (boundedChatGptSubmit && result?.uncertain === true) {
         evidence.command_accepted = true;
         evidence.resource_available = true;
         evidence.canonical_url_observed = providerCanonicalConversationObserved();
         return evidence;
+      }
+      if (creatingSession) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
       return browserRejectedEvidence(
         evidence,
