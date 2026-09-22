@@ -74,14 +74,35 @@ class ChatGPTAdapter extends BaseAdapter {
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
     const seen = new Set();
     const matches = [];
-    for (const leaf of document.querySelectorAll('span')) {
-      if (!visible(leaf) || String(leaf.textContent || '').trim().toLowerCase() !== wanted) continue;
-      const candidate = leaf.closest('[tabindex="0"]');
-      if (!candidate || !visible(candidate) || input.contains(candidate) || seen.has(candidate)) continue;
-      seen.add(candidate);
-      matches.push(candidate);
+    const selectors = [
+      '[role="option"]',
+      '[role="menuitem"]',
+      '[data-testid*="app"]',
+      '[tabindex="0"]',
+    ];
+    for (const node of document.querySelectorAll(selectors.join(','))) {
+      if (!visible(node) || input.contains(node) || seen.has(node)) continue;
+      const text = [
+        node.textContent,
+        node.getAttribute('aria-label'),
+        node.getAttribute('data-value'),
+      ].filter(Boolean).join(' ').trim().toLowerCase();
+      if (!text.includes(wanted)) continue;
+      seen.add(node);
+      matches.push(node);
     }
-    return matches;
+    return matches.sort((a, b) => {
+      const score = (node) => {
+        const role = node.getAttribute('role') || '';
+        const testid = node.getAttribute('data-testid') || '';
+        let value = 0;
+        if (role === 'option') value += 50;
+        if (role === 'menuitem') value += 40;
+        if (/app|connector|mention/i.test(testid)) value += 20;
+        return value;
+      };
+      return score(b) - score(a);
+    });
   }
 
   getWatchMainWorldSelector() {

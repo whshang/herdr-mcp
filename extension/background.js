@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.118";
+const H2W_SCRIPT_VERSION = "0.1.119";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -1639,7 +1639,7 @@ async function migrateZaiRootConversationState(bindings, targetConvKey, targetUr
     bindings[nextKey] = next;
     delete bindings[oldKey];
     clearProgressTimer(oldKey);
-    if (next.status === "working") armProgressTimer(nextKey, next);
+    if (automationEnabledForBinding(next)) armProgressTimer(nextKey, next);
   }
 
   if (CONVERSATION_AUTOMATION[rootKey] === true
@@ -1702,7 +1702,7 @@ async function migrateChatGptRootBindingState(bindings, targetConvKey, targetUrl
     bindings[nextKey] = next;
     delete bindings[oldKey];
     clearProgressTimer(oldKey);
-    if (next.status === "working" && bindingDeliveryConvKey(next)) armProgressTimer(nextKey, next);
+    if (automationEnabledForBinding(next) && bindingDeliveryConvKey(next)) armProgressTimer(nextKey, next);
   }
 
   await chrome.storage.local.set({ herdrWakeBindings: bindings });
@@ -4293,7 +4293,9 @@ async function onPushHello(storeKey, data) {
   b.status = d.status;
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
-  if (d.status === "working" && automationEnabledForBinding(b)) armProgressTimer(storeKey, b);
+  // Hello recovery re-arms Auto for every enabled conversation, not only for a
+  // working one: a settle missed while offline must still reach the watcher.
+  if (automationEnabledForBinding(b)) armProgressTimer(storeKey, b);
   const taskWake = await routeAgentTaskInboxWake(b, { wakeKind: "round" });
   if (taskWake.matched) {
     if (taskWake.wake) callLog(`task inbox recovery wake: ws=${ws}`);
@@ -4348,7 +4350,9 @@ async function onPushSettled(storeKey, data) {
     settleRetry: true,
   });
   if (taskWake.matched) {
-    if (d.kind === "round") clearProgressTimer(storeKey);
+    // A finished round ends progress reporting, but Auto keeps watching the now
+    // settled conversation. Only turning Auto off stops the watcher.
+    if (d.kind === "round" && !automationEnabledForBinding(b)) clearProgressTimer(storeKey);
     if (taskWake.wake) {
       callLog(`task terminal wake: ws=${ws}, pending=${taskWake.inbox?.tasks?.length || 0}`);
       setActionBadge("✓", "#16a34a", 4000);
@@ -4385,7 +4389,7 @@ async function onPushSettled(storeKey, data) {
     if (owned) callLog(`supervisor woken on agent settled ${ws} -> ${d.status}`);
   }
 
-  if (d.kind === "round") clearProgressTimer(storeKey);
+  if (d.kind === "round" && !automationEnabledForBinding(b)) clearProgressTimer(storeKey);
   if (!d.wake) return;
   if (!automationEnabledForBinding(b)) return;
 
@@ -4432,11 +4436,11 @@ async function onPushSettled(storeKey, data) {
   }
 }
 
-// ---- Periodic progress checks while working ----
-// One setInterval per convKey; repeated working events replace rather than stack it.
-// lastTickAt controls check cadence. lastSentAt anchors the send cooldown.
-// hasProgressSent records whether this working round has sent progress.
-const progressTimers = new Map(); // convKey -> { id, lastTickAt, lastSentAt, lastOutputSent, hasProgressSent, inFlight }
+// ---- Auto watcher (progress while working, settled-continue while idle) ----
+// One setInterval per binding storeKey; repeated working events replace rather
+// than stack it. lastTickAt controls check cadence. lastSentAt anchors the send
+// cooldown. hasProgressSent records whether this working round has sent progress.
+const progressTimers = new Map(); // storeKey -> { id, lastTickAt, lastSentAt, lastOutputSent, hasProgressSent, inFlight }
 const lastIdleNudgeAt = new Map(); // convKey -> ms
 const lastJudgedAssistantFp = new Map(); // convKey -> terminal assistant fingerprint (done or wake delivered)
 const idleNudgeInFlight = new Set(); // convKey -> one judge/send attempt at a time
@@ -4956,13 +4960,25 @@ function scheduleIdleNudgeRetry(convKey, delayMs) {
   callLog(`llm-judge retry scheduled: ${convKey} in ${Math.round(ms / 1000)}s`);
 }
 
-async function retryIdleNudge(convKey) {
-  if (!automationScopeForConversation(convKey).enabled) return;
+/**
+ * Judge the conversation's current settled turn and continue it when warranted.
+ * Shared by the cooldown retry and the Auto watcher's settled branch; every
+ * early exit records an explicit reason so `auto watcher fired decision=` and
+ * the HUD can distinguish a healthy no-op from a blocked wake.
+ */
+async function retryIdleNudge(convKey, { scheduleRetry = true } = {}) {
+  if (!automationScopeForConversation(convKey).enabled) {
+    return rememberIdleNudge(convKey, { nudged: false, reason: "disabled" });
+  }
   const cooldownSec = paceIntervalSec();
-  if (cooldownSec <= 0) return;
+  if (cooldownSec <= 0) {
+    return rememberIdleNudge(convKey, { nudged: false, reason: "pacing_disabled" });
+  }
   const bindings = await loadBindings();
   const primary = primaryBindingForConv(bindings, convKey);
-  if (!primary?.tabId) return;
+  if (!primary?.tabId) {
+    return rememberIdleNudge(convKey, { nudged: false, reason: "no_target_tab" });
+  }
   let payload = lastTurnEndedPayload.get(convKey);
   try {
     const snap = await chrome.tabs.sendMessage(primary.tabId, { type: "h2w_snapshot_turn" });
@@ -4979,19 +4995,23 @@ async function retryIdleNudge(convKey) {
   } catch (e) {
     callLog(`llm-judge retry snapshot failed ${convKey}:`, e.message);
   }
-  if (!payload?.assistantText) return;
+  if (!payload?.assistantText) {
+    return rememberIdleNudge(convKey, { nudged: false, reason: "no_turn_observed" });
+  }
   if (payload.generating || payload.turnInProgress) {
-    scheduleIdleNudgeRetry(convKey, 5000);
-    return;
+    // The Auto watcher re-checks on its own interval; only a turn-end retry
+    // schedules the tighter second-scale follow-up.
+    if (scheduleRetry) scheduleIdleNudgeRetry(convKey, 5000);
+    return rememberIdleNudge(convKey, { nudged: false, reason: "still_generating" });
   }
   const semanticCapabilities = await runtimeSemanticCapabilities();
   const semanticJudgeConfigured = semanticCapabilities.evaluate_available || semanticCapabilities.chat_available;
   if (!semanticJudgeConfigured && !looksLikeSubstantiveReply(payload.assistantText)) {
     callLog(`llm-judge retry skip: not substantive ${convKey}`);
-    return;
+    return rememberIdleNudge(convKey, { nudged: false, reason: "not_substantive" });
   }
   callLog(`llm-judge retry firing: ${convKey}`);
-  await maybeIdleNudge(payload);
+  return await maybeIdleNudge(payload);
 }
 
 // ---------------------------------------------------------------------------
@@ -5672,8 +5692,15 @@ async function maybeIdleNudgeInner(msg) {
     },
   });
   if (supervisor.owned) {
+    const supervisorSent = supervisor.status === "decided"
+      && Boolean(supervisor.result?.effects?.send);
+    // A decided-but-not-sent turn (complete, wait-external, ask-human, handoff,
+    // guard-denied) is final for this assistant body. Auto's watcher revisits
+    // the same settled conversation on its interval, so remember the turn here
+    // instead of repeating the planner/semantic work every check.
+    if (!supervisorSent) lastJudgedAssistantFp.set(convKey, fp);
     return rememberIdleNudge(convKey, {
-      nudged: supervisor.status !== "decided" ? false : Boolean(supervisor.result?.effects?.send),
+      nudged: supervisorSent,
       reason: supervisor.status === "decided"
         ? ({
           CONTINUE: "supervisor_continue", WAIT_EXTERNAL: "supervisor_wait_external",
@@ -5795,6 +5822,10 @@ function progressTickSecMs() {
   return ms > 0 ? ms : 0;
 }
 
+// The Auto watcher. One interval per bound conversation/workspace: while the
+// agent works it reports progress, while the conversation settles it reaches
+// the same continue decision a turn boundary would. It is armed whenever Auto
+// is enabled for the conversation, never only for a working binding.
 function armProgressTimer(storeKey, bindingSeed = null) {
   const ms = progressTickSecMs();
   if (ms <= 0) return;
@@ -5817,7 +5848,12 @@ function armProgressTimer(storeKey, bindingSeed = null) {
   };
   ts.id = setInterval(() => tickProgress(storeKey, ts), ms);
   progressTimers.set(storeKey, ts);
-  callLog(`progress tick armed: ${storeKey}, check every ${ms / 1000}s, cooldown ${CFG.progressFallbackSec || 0}s`);
+  const scope = automationScopeForConversation(bindingSeed?.convKey || bindingSeed?.tabUrl || "");
+  callLog(
+    `auto watcher armed ${storeKey} scope=${scope.project_id ? "project" : "conversation"}`,
+    `status=${bindingSeed?.status || "unknown"} next_check=${ms / 1000}s`,
+    `cooldown=${CFG.progressFallbackSec || 0}s`,
+  );
 }
 
 function clearProgressTimer(storeKey) {
@@ -5830,11 +5866,28 @@ async function tickProgress(storeKey, ts) {
   const bindings = await loadBindings();
   const b = bindings[storeKey];
   if (!b) { clearProgressTimer(storeKey); return; }
-  if (b.status !== "working" || !automationEnabledForBinding(b)) { clearProgressTimer(storeKey); return; }
-  if (!shouldProgressTick({ status: b.status, lastTickAt: ts.lastTickAt }, Date.now(), CFG)) return;
+  if (!automationEnabledForBinding(b)) {
+    callLog(`auto watcher stopped ${storeKey}: automation disabled`);
+    clearProgressTimer(storeKey);
+    return;
+  }
+  const agentWorking = b.status === "working";
+  if (agentWorking) {
+    if (!shouldProgressTick({ status: b.status, lastTickAt: ts.lastTickAt }, Date.now(), CFG)) return;
+  } else {
+    // Settled/idle conversations pace on the same interval. progressTickSec is
+    // Auto's check cadence, so the working-only contract of shouldProgressTick
+    // stays untouched.
+    const now = Date.now();
+    if (!(typeof ts.lastTickAt === "number" && now - ts.lastTickAt >= progressTickSecMs())) return;
+  }
   ts.inFlight = true;
   try {
     ts.lastTickAt = Date.now();
+    if (!agentWorking) {
+      await autoWatcherSettled(storeKey, b);
+      return;
+    }
     // Prefer SSE agent_output from any pane in this workspace; fall back to /push/state.
     let output = "";
     const ws = normalizeWorkspaceId(b);
@@ -5856,7 +5909,10 @@ async function tickProgress(storeKey, ts) {
     if (cur !== ts || !automationEnabledForBinding(b)) return;
     const bindingsNow = await loadBindings();
     const curB = bindingsNow[storeKey];
-    if (!curB || curB.status !== "working") return;
+    if (!curB) { clearProgressTimer(storeKey); return; }
+    // The agent settled while this tick was in flight; the next tick owns the
+    // settled decision instead of reporting progress for a finished round.
+    if (curB.status !== "working") return;
     const decision = shouldSendProgress(
       {
         lastSentAt: ts.lastSentAt,
@@ -5896,28 +5952,71 @@ async function tickProgress(storeKey, ts) {
   }
 }
 
-// Reconcile after configuration or stream rebuilds, preserving send baselines.
+/**
+ * Settled/idle branch of the Auto watcher. The decision and the send stay with
+ * the existing settled-turn judge (maybeIdleNudge -> routeWake), so composer
+ * delivery, the Herdr app reference and every fail-closed guard are unchanged;
+ * the watcher only makes sure that decision is reached without waiting for a
+ * new turn boundary.
+ */
+async function autoWatcherSettled(storeKey, b) {
+  const convKey = b?.convKey || "";
+  if (!convKey) {
+    callLog("auto watcher fired decision=no_conversation");
+    return;
+  }
+  const bindings = await loadBindings();
+  const primaryKey = bindingStoreKeyFromBinding(primaryBindingForConv(bindings, convKey));
+  if (!primaryKey || primaryKey !== storeKey) {
+    // One conversation can hold several workspace bindings; exactly one watcher
+    // owns the settled decision so the judge never runs concurrently per pane.
+    callLog(`auto watcher fired decision=secondary_binding conv=${convKey}`);
+    return;
+  }
+  const result = await retryIdleNudge(convKey, { scheduleRetry: false });
+  callLog(`auto watcher fired decision=${result?.reason || "none"} conv=${convKey}`);
+}
+
+// Reconcile after configuration, binding, or stream rebuilds, preserving send
+// baselines for timers that stay armed.
 function reconcileProgressTimers(bindings) {
   if (progressTickSecMs() <= 0) {
     for (const storeKey of [...progressTimers.keys()]) clearProgressTimer(storeKey);
     return;
   }
-  for (const storeKey of [...progressTimers.keys()]) {
-    const b = bindings[storeKey];
-    if (!b || b.status !== "working" || !automationEnabledForBinding(b)) clearProgressTimer(storeKey);
+  const watched = new Set();
+  for (const [storeKey, b] of Object.entries(bindings || {})) {
+    if (!b || !automationEnabledForBinding(b)) continue;
+    watched.add(storeKey);
+    if (!progressTimers.has(storeKey)) armProgressTimer(storeKey, b);
   }
-  for (const [storeKey, b] of Object.entries(bindings)) {
-    if (b.status === "working" && automationEnabledForBinding(b)) armProgressTimer(storeKey, b);
+  for (const storeKey of [...progressTimers.keys()]) {
+    if (!watched.has(storeKey)) clearProgressTimer(storeKey);
   }
 }
 
+/**
+ * Single automatic-wake entrypoint. Every Auto path (progress report, settled
+ * continue, LLM/Jev nudge, supervisor effect) reaches the composer pipeline
+ * through here, so one failure line explains every blocked automatic send.
+ */
 async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
+  const result = await routeWakeAttempt(b, extra, template, wakeKind);
+  if (result?.ok !== true) {
+    callLog(
+      `auto wake blocked reason=${result?.reason || result?.error || result?.blocked || "wake_failed"}`,
+      `conv=${bindingDeliveryConvKey(b) || b?.convKey || "unknown"}`,
+      `status=${extra?.status || "unknown"}`,
+      result?.error ? `error=${result.error}` : "",
+    );
+  }
+  return result;
+}
+
+async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
   if (!automationEnabledForBinding(b)) return { ok: false, reason: "disabled" };
   const runtimeGate = await automationRuntimeGate();
-  if (!runtimeGate.ok) {
-    callLog(`auto wake blocked: local runtime unavailable (${runtimeGate.error})`);
-    return runtimeGate;
-  }
+  if (!runtimeGate.ok) return runtimeGate;
   const handoffs = await loadHandoffTransfers();
   if (activeTransferFromSource(handoffs, bindingDeliveryConvKey(b) || b?.convKey || "")) {
     return { ok: false, reason: "handoff_active" };
@@ -6304,7 +6403,8 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       next.handoff_from = transfer.source_conv_key;
       next.handoff_at = now;
       delete next.expires_at;
-      if (next.status === "working" && targetTabId) armProgressTimer(storeKey, next);
+      // Watcher re-arm happens once in reconcileProgressTimers() after the
+      // committed binding set is known.
     }
     const inheritedAutomation = inheritedAutomationStorageForTransfer(transfer, targetInfo.convKey);
     try {
@@ -6384,7 +6484,8 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       targetRow.revision = bindingRevision(targetRow);
       delete bindings[sourceKey];
       clearProgressTimer(sourceKey);
-      if (targetRow.status === "working" && targetTabId) armProgressTimer(targetKey, targetRow);
+      // Watcher re-arm happens once in reconcileProgressTimers() after the
+      // committed binding set is known.
     }
     const inheritedAutomation = inheritedAutomationStorageForTransfer(transfer, targetInfo.convKey);
     try {
@@ -6463,7 +6564,6 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
     bindings[bindingStoreKey(targetInfo.convKey, ws)] = next;
     delete bindings[oldKey];
     clearProgressTimer(oldKey);
-    if (next.status === "working") armProgressTimer(bindingStoreKey(targetInfo.convKey, ws), next);
   }
 
   // Binding cutover and Auto inheritance are one logical commit. Persist both
@@ -7725,7 +7825,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.scripting.executeScript({
       target: { tabId: sender.tab.id },
       world: "MAIN",
-      func: (text, selector) => {
+      func: (text, selector, append) => {
         try {
           const all = [...document.querySelectorAll(selector)];
           const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
@@ -7733,8 +7833,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           el.focus();
           const sel = window.getSelection();
           const range = document.createRange();
-          // Select all before insertText so retries replace instead of append.
-          range.selectNodeContents(el);
+          if (append) {
+            // Preserve provider-owned composer nodes such as app mention pills.
+            // Do not select the editor contents after a pill was inserted. Some
+            // provider editors rebuild the whole composer from that selection
+            // and drop the app reference. Place the caret after the current
+            // editor tree instead.
+            const tail = el.lastChild;
+            if (tail) {
+              range.selectNodeContents(tail);
+              range.collapse(false);
+            } else {
+              range.selectNodeContents(el);
+              range.collapse(false);
+            }
+          } else {
+            // Normal insertion replaces the current composer content.
+            range.selectNodeContents(el);
+          }
           sel.removeAllRanges();
           sel.addRange(range);
           const ok = document.execCommand("insertText", false, text);
@@ -7744,7 +7860,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
         } catch (e) { return { ok: false, error: String(e) }; }
       },
-      args: [msg.text, msg.selector],
+      args: [msg.text, msg.selector, Boolean(msg.append)],
     }).then((res) => {
       const r = res && res[0] && res[0].result;
       sendResponse(r || { ok: false, error: "no-result" });
@@ -8103,6 +8219,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.enabled === true) CONVERSATION_AUTOMATION[convKey] = true;
         else delete CONVERSATION_AUTOMATION[convKey];
         await chrome.storage.local.set({ [CONVERSATION_AUTOMATION_STORAGE_KEY]: CONVERSATION_AUTOMATION });
+        callLog(`automation ${msg.enabled === true ? "enabled" : "disabled"} conversation=${convKey} scope=conversation`);
+        const bindings = await loadBindings();
+        reconcileProgressTimers(bindings);
+        if (msg.enabled === true && !bindingsForConv(bindings, convKey).length) {
+          callLog(`auto watcher pending: no binding conversation=${convKey}`);
+        }
         sendResponse({ ok: true, ...automationScopeForConversation(convKey) });
         void notifyAutomationChanged();
         return;
@@ -8131,8 +8253,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.enabled === true) PROJECT_AUTOMATION[projectId] = true;
       else delete PROJECT_AUTOMATION[projectId];
       await chrome.storage.local.set({ [PROJECT_AUTOMATION_STORAGE_KEY]: PROJECT_AUTOMATION });
+      callLog(
+        `automation ${msg.enabled === true ? "enabled" : "disabled"}`,
+        `conversation=${convKey || ""} scope=project project=${projectId}`,
+      );
       const bindings = await loadBindings();
       reconcileProgressTimers(bindings);
+      if (msg.enabled === true && !Object.values(bindings).some((row) => row?.project_id === projectId)) {
+        callLog(`auto watcher pending: no binding project=${projectId}`);
+      }
       for (const convKey of [...idleNudgeRetryTimers.keys()]) {
         if (!automationScopeForConversation(convKey).enabled) clearIdleNudgeRetry(convKey);
       }
@@ -8388,6 +8517,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       b.revision = bindingRevision(b);
       bindings[storeKey] = b;
       await saveBindings(bindings);
+      // A binding created after Auto was already enabled must start watching
+      // immediately instead of waiting for the next keepalive reconcile.
+      reconcileProgressTimers(bindings);
       broadcastControlMessage({ type: "herdr_control_binding_changed" });
       ensurePushStream(bindings);
       try { void chrome.tabs.sendMessage(tabId, { type: "h2w_bound", pane: workspace_label, workspace_id, workspace_label }).catch(() => {}); } catch (e) {}
@@ -8847,7 +8979,7 @@ async function rebuildStreams() {
     `transport=native-ipc, automationMode=${normalizeAutomationMode(CFG.automationMode)}`,
   );
   ensurePushStream(bindings);
-  reconcileProgressTimers(bindings); // Re-arm or stop working progress timers.
+  reconcileProgressTimers(bindings); // Re-arm or stop Auto watchers.
 }
 
 // After service-worker suspension, restore missing in-memory streams and timers
@@ -8869,10 +9001,9 @@ async function ensureAlive(preloaded, runtimeState = null) {
   if (!browserEndpoint) await registerLocalBrowserEndpoint();
   const bindings = preloaded || await loadBindings();
   ensurePushStream(bindings);
-  if (progressTickSecMs() <= 0) return;
-  for (const [storeKey, b] of Object.entries(bindings)) {
-    if (b.status === "working" && automationEnabledForBinding(b) && !progressTimers.has(storeKey)) armProgressTimer(storeKey);
-  }
+  // Restore every missing Auto watcher, including settled conversations whose
+  // progress timer was previously dropped by the working-only gate.
+  reconcileProgressTimers(bindings);
 }
 
 // ---- Install, browser startup, and every service-worker startup ----

@@ -2247,7 +2247,12 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(chatGptAdapterSource, /data-inline-selection-pill/);
   assert.match(chatGptAdapterSource, /data-symbol="ecosystemMention"/);
   assert.match(chatGptAdapterSource, /data-keyword/);
-  assert.match(chatGptAdapterSource, /leaf\.closest\('\[tabindex="0"\]'\)/);
+  // The generalized picker resolves the pill from visible, scored candidates in
+  // the opened menu; ambiguity stays fail-closed via candidates.length !== 1 in
+  // wake.js (asserted below).
+  assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
+  assert.match(chatGptAdapterSource, /visible\(node\)/);
+  assert.match(chatGptAdapterSource, /return matches\.sort/);
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);

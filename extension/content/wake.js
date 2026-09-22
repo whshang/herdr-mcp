@@ -9,7 +9,12 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.118";
+const H2W_CONTENT_VERSION = "0.1.119";
+
+function normalizeHerdrMentionAlias(value) {
+  const alias = String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
+  return alias || "herdr";
+}
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -403,10 +408,10 @@ const H2W_CONTENT_VERSION = "0.1.118";
   }
 
   // ---- MAIN-world insertion for contenteditable sites ----
-  function insertMainWorld(text, selector) {
+  function insertMainWorld(text, selector, append = false) {
     return new Promise((resolve) => {
       try {
-        chrome.runtime.sendMessage({ type: "h2w_insert_main", text, selector }, (resp) => {
+        chrome.runtime.sendMessage({ type: "h2w_insert_main", text, selector, append }, (resp) => {
           if (chrome.runtime.lastError || !resp) resolve({ ok: false, error: "no-response" });
           else resolve(resp);
         });
@@ -443,6 +448,42 @@ const H2W_CONTENT_VERSION = "0.1.118";
       }
     }
     return mainWorldCommitted(text);
+  }
+
+  async function ensureAppendedCommitted(text) {
+    if (mainWorldCommitted(text)) return true;
+    const selector = ADAPTER.getWatchMainWorldSelector();
+    if (!selector) return false;
+    const result = await insertMainWorld(text, selector, true);
+    if (!result.ok) return false;
+    for (let i = 0; i < 10; i += 1) {
+      await wait(100);
+      if (mainWorldCommitted(text)) return true;
+    }
+    return mainWorldCommitted(text);
+  }
+
+  async function ensureTextAfterComposerAppSelection(text) {
+    const selector = ADAPTER.getWatchMainWorldSelector();
+    if (!selector) return false;
+    // Keep the provider-owned app pill. Replacing the composer value after
+    // selection removes the pill, so append through the editor path.
+    const result = await insertMainWorld(` ${text}`, selector, true);
+    if (!result.ok) return false;
+    for (let i = 0; i < 10; i += 1) {
+      await wait(100);
+      if (mainWorldCommitted(text)) return true;
+    }
+    return mainWorldCommitted(text);
+  }
+
+  async function configuredHerdrMentionAlias() {
+    try {
+      const settings = await chrome.storage.local.get(["herdrMentionAlias"]);
+      return normalizeHerdrMentionAlias(settings.herdrMentionAlias);
+    } catch (_) {
+      return "herdr";
+    }
   }
 
   function isHerdrWakeComposerText(text) {
@@ -850,6 +891,82 @@ const H2W_CONTENT_VERSION = "0.1.118";
     return { ok: requested.every((app) => selected.includes(app)), apps: selected };
   }
 
+  async function activateHerdrComposerAppByTyping(alias) {
+    if (ADAPTER.name !== "chatgpt"
+        || typeof ADAPTER.getSelectedComposerApps !== "function"
+        || typeof ADAPTER.getWatchMainWorldSelector !== "function") {
+      return false;
+    }
+    const keyword = String(alias || "").trim().toLowerCase();
+    if (!keyword) return false;
+    if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
+    const selector = ADAPTER.getWatchMainWorldSelector();
+    if (!selector) return false;
+
+    // ChatGPT's picker can treat synthetic character-by-character insertion as
+    // replacement of the current search token. Use a complete paste-like token
+    // so the composer receives the same value a user can paste.
+    const mention = await insertMainWorld(`@${alias}`, selector);
+    if (!mention.ok) return false;
+    await wait(500);
+
+    // ChatGPT's app picker commits the single pasted candidate with Enter.
+    // Tab can move focus instead of selecting in some composer versions.
+    const confirm = await insertMainWorld("\n", selector, true);
+    if (!confirm.ok) return false;
+
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
+      const candidates = typeof ADAPTER.getComposerAppCandidates === "function"
+        ? ADAPTER.getComposerAppCandidates(keyword)
+        : [];
+      if (candidates.length === 1) {
+        candidates[0].click();
+        const selectedDeadline = Date.now() + 2500;
+        while (Date.now() < selectedDeadline) {
+          if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
+          await wait(100);
+        }
+        return false;
+      }
+      await wait(100);
+    }
+    return false;
+  }
+
+  async function ensureHerdrComposerReference() {
+    if (ADAPTER.name !== "chatgpt"
+        || typeof ADAPTER.getSelectedComposerApps !== "function") {
+      return { ok: true, referenced: false, alias: null };
+    }
+    const alias = await configuredHerdrMentionAlias();
+    const keyword = alias.toLowerCase();
+    if (ADAPTER.getSelectedComposerApps().includes(keyword)) {
+      return { ok: true, referenced: true, alias };
+    }
+    if (await activateHerdrComposerAppByTyping(alias)) {
+      return { ok: true, referenced: true, alias };
+    }
+
+    // Do not send a raw @alias message when provider-owned selection failed.
+    // The user-visible task must not continue without a verified Herdr app pill.
+    return { ok: false, referenced: false, alias, error: "herdr-reference-selection-not-observed" };
+  }
+
+  async function ensureComposerAppReferences(apps = []) {
+    const requested = [...new Set(apps.map((app) => normalizeHerdrMentionAlias(app)).filter(Boolean))];
+    if (!requested.length) return { ok: true, apps: [] };
+    for (const app of requested) {
+      if (ADAPTER.getSelectedComposerApps?.().includes(app)) continue;
+      const activated = await activateHerdrComposerAppByTyping(app);
+      if (!activated) {
+        return { ok: false, error: `composer-app-${app}-selection-not-observed` };
+      }
+    }
+    return { ok: true, apps: ADAPTER.getSelectedComposerApps() };
+  }
+
   function captureSubmitAckBaseline(sendButton = null) {
     return {
       composer: composerNorm(),
@@ -1157,15 +1274,24 @@ const H2W_CONTENT_VERSION = "0.1.118";
         }
       }
 
+      const herdrReference = await ensureHerdrComposerReference();
+      if (!herdrReference.ok) {
+        return { ok: false, error: herdrReference.error || "herdr-reference-unavailable" };
+      }
       let committedOk = false;
       if (ADAPTER.needsMainWorldInsert) {
-        committedOk = await ensureCommitted(text, boundedBrowserActuation ? 1 : 3);
+        committedOk = herdrReference.referenced
+          ? await ensureTextAfterComposerAppSelection(text)
+          : await ensureCommitted(text, boundedBrowserActuation ? 1 : 3);
         if (!committedOk) {
-          try {
-            const el = ADAPTER.getInputEl();
-            const strip = (node) => { for (const c of [...node.childNodes]) { if (c.nodeType === 3 && c.data.includes(text)) c.remove(); else strip(c); } };
-            if (el) strip(el);
-          } catch (e) {}
+          if (herdrReference.referenced) await clearComposer();
+          else {
+            try {
+              const el = ADAPTER.getInputEl();
+              const strip = (node) => { for (const c of [...node.childNodes]) { if (c.nodeType === 3 && c.data.includes(text)) c.remove(); else strip(c); } };
+              if (el) strip(el);
+            } catch (e) {}
+          }
           return { ok: false, error: "insert-failed" };
         }
         if (boundedBrowserActuation) {

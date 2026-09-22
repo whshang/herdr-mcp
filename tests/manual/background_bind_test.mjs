@@ -851,6 +851,38 @@ function installContentScript(
   });
 }
 
+function installAutoWakeContentScript(tabId, convKey, { wakeResult = { ok: true, committed: true } } = {}) {
+  const captures = [];
+  tabs.set(tabId, {
+    url: convKey,
+    listener: (msg, _sender, sendResponse) => {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({ convKey, url: convKey, site: "chatgpt" });
+        return;
+      }
+      if (msg?.type === "h2w_wake") {
+        captures.push(msg);
+        sendResponse({ ...wakeResult });
+        return;
+      }
+      if (msg?.type === "h2w_snapshot_turn") {
+        // A settled assistant turn that declares remaining work: exactly what
+        // the bounded no-LLM Auto fallback is allowed to continue.
+        sendResponse({
+          convKey,
+          userText: "please keep the migration moving",
+          assistantText: "I reviewed the first half of the migration plan and stopped at a safe point; three files still need to be updated before this round is complete.",
+          generating: false,
+          turnInProgress: false,
+        });
+        return;
+      }
+      sendResponse({ ok: true });
+    },
+  });
+  return captures;
+}
+
 // ---- Load background.js ----
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
@@ -927,9 +959,14 @@ ok(await waitForTest(() => browserRegistryRequests.length >= 2),
   "service-worker startup attempts browser endpoint registration before the Native Messaging push stream and the first active surface can recover an injected failure");
 const browserRegister = browserRegistryRequests[0] || {};
 const browserRegisterRetry = browserRegistryRequests[1] || {};
+// Compare against the loaded manifest instead of a hardcoded release string so
+// a manifest-version bump cannot leave this contract silently stale.
+const extensionManifestVersion = JSON.parse(
+  readFileSync(path.join(EXT, "manifest.json"), "utf8"),
+).version;
 ok(browserRegister.operation === "endpoint.register"
     && !Object.prototype.hasOwnProperty.call(browserRegister, "browser_family")
-    && browserRegister.extension_version === "0.1.118"
+    && browserRegister.extension_version === extensionManifestVersion
     && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
   "browser endpoint registration carries one opaque profile seed and leaves browser product identity to the native host",
   JSON.stringify(browserRegister));
@@ -2058,6 +2095,138 @@ console.log("\n[plain ChatGPT conversation automation]");
   const mismatch = await mismatchP;
   ok(mismatch?.ok === false && mismatch?.error === "conversation-automation-sender-mismatch",
     "plain ChatGPT automation rejects a sender from a different conversation", JSON.stringify(mismatch));
+}
+
+// ---- Scenario 6cd: Auto watcher continues a settled conversation ----------------
+// Auto must not depend on a new turn boundary or on binding.status === "working":
+// enabling it on a settled conversation has to reach the same continue path.
+console.log("\n[auto watcher]");
+{
+  const wakeLogs = [];
+  const realConsoleLog = console.log;
+  console.log = (...args) => {
+    if (String(args[0] || "").startsWith("[h2w]")) wakeLogs.push(args.map((arg) => String(arg)).join(" "));
+    realConsoleLog(...args);
+  };
+  const priorLlmResponder = llmHandoffResponder;
+  llmHandoffResponder = null;
+  mockLocalRuntimeAvailable = true;
+  try {
+    await dispatchMessage({ type: "h2w_set_config", config: { progressTickSec: 1, progressFallbackSec: 1200 } },
+      { url: "chrome-extension://test-ext/options.html" });
+
+    const convKey = "https://chatgpt.com/c/auto-watcher-settled";
+    const tabId = 356;
+    const wakes = installAutoWakeContentScript(tabId, convKey);
+    const bound = await dispatchMessage({
+      type: "h2w_bind",
+      tabId,
+      pane: "wAuto:p1",
+      agent: "pi",
+      workspace_id: "wAuto",
+      workspace_label: "auto-watcher (wAuto)",
+    }, { tab: { id: tabId, url: convKey } });
+    ok(bound?.ok === true && storage.herdrWakeBindings[`${convKey}::wAuto`]?.status !== "working",
+      "Auto watcher scenario binds a conversation whose binding is not working",
+      JSON.stringify(bound));
+
+    const enabled = await dispatchMessage({
+      type: "h2w_set_project_automation",
+      convKey,
+      site: "chatgpt",
+      enabled: true,
+    }, { tab: { id: tabId, url: convKey } });
+    ok(enabled?.ok === true && enabled?.conversation_automation_enabled === true,
+      "Auto can be enabled on a bound conversation without a working agent",
+      JSON.stringify(enabled));
+
+    ok(await waitForTest(() => wakes.length > 0, 6000, 25),
+      "Auto delivers a continue wake after the check interval instead of waiting for a turn boundary");
+    const wake = wakes[0] || {};
+    ok(wake?.data?.llmNudge === true && String(wake?.data?.template || "").trim().length > 0,
+      "settled Auto continue hands a real nudge template to the composer pipeline",
+      JSON.stringify(wake?.data || {}).slice(0, 200));
+    ok(wake?.data?.autoAllow === true
+        && !Object.prototype.hasOwnProperty.call(wake?.data || {}, "manual"),
+      "settled Auto continue stays an automatic wake and never reuses the manual Continue message",
+      JSON.stringify(Object.keys(wake?.data || {})));
+
+    ok(wakeLogs.some((line) => line.includes(`automation enabled conversation=${convKey} scope=conversation`)),
+      "enabling Auto logs the conversation and scope it applied to",
+      wakeLogs.filter((line) => line.includes("automation ")).slice(0, 3).join(" | "));
+    ok(wakeLogs.some((line) => line.includes("auto watcher armed") && line.includes("next_check=1s")),
+      "the Auto watcher logs one armed check with its next check interval",
+      wakeLogs.filter((line) => line.includes("auto watcher armed")).slice(0, 3).join(" | "));
+    ok(wakeLogs.some((line) => line.includes("auto watcher fired decision=fallback_continue")),
+      "the Auto watcher logs the decision it reached",
+      wakeLogs.filter((line) => line.includes("auto watcher fired")).slice(0, 3).join(" | "));
+
+    const firstWakeCount = wakes.length;
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    ok(wakes.length === firstWakeCount,
+      "the same settled assistant turn is not nudged again on later watcher checks",
+      `${firstWakeCount} -> ${wakes.length}`);
+
+    // A refuse-to-deliver composer must surface as a blocked wake, never as a
+    // silent success and never as a plain-text fallback.
+    const blockedConv = "https://chatgpt.com/c/auto-watcher-blocked";
+    const blockedTabId = 357;
+    const blockedWakes = installAutoWakeContentScript(blockedTabId, blockedConv,
+      { wakeResult: { ok: false, blocked: "user-typing" } });
+    await dispatchMessage({
+      type: "h2w_bind",
+      tabId: blockedTabId,
+      pane: "wBlocked:p1",
+      agent: "pi",
+      workspace_id: "wBlocked",
+      workspace_label: "auto-blocked (wBlocked)",
+    }, { tab: { id: blockedTabId, url: blockedConv } });
+    await dispatchMessage({
+      type: "h2w_set_project_automation",
+      convKey: blockedConv,
+      site: "chatgpt",
+      enabled: true,
+    }, { tab: { id: blockedTabId, url: blockedConv } });
+    ok(await waitForTest(() => blockedWakes.length > 0, 6000, 25),
+      "Auto still reaches the composer pipeline when the delivery is going to be refused");
+    ok(await waitForTest(() => wakeLogs.some((line) => line.includes("auto wake blocked reason=user-typing")), 4000, 25),
+      "a refused composer delivery is reported as an explicit blocked auto wake",
+      wakeLogs.filter((line) => line.includes("auto wake blocked")).slice(0, 3).join(" | "));
+
+    // Auto on an unbound conversation can never send: no binding means none of
+    // the bind-time guards (tab, conversation target, app reference) can run.
+    const unboundConv = "https://chatgpt.com/c/auto-watcher-unbound";
+    const unbound = await dispatchMessage({
+      type: "h2w_set_project_automation",
+      convKey: unboundConv,
+      site: "chatgpt",
+      enabled: true,
+    }, { tab: { id: 358, url: unboundConv } });
+    ok(unbound?.ok === true && unbound?.conversation_automation_enabled === true,
+      "Auto preference is still saved for an unbound conversation",
+      JSON.stringify(unbound));
+    ok(wakeLogs.some((line) => line.includes(`auto watcher pending: no binding conversation=${unboundConv}`)),
+      "Auto on an unbound conversation reports the missing binding instead of arming a sender");
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    ok(!wakeLogs.some((line) => line.includes(`conv=${unboundConv}`)),
+      "an unbound conversation never reaches an Auto watcher decision or blocked wake",
+      wakeLogs.filter((line) => line.includes(unboundConv)).slice(0, 3).join(" | "));
+
+    for (const conv of [convKey, blockedConv, unboundConv]) {
+      await dispatchMessage({
+        type: "h2w_set_project_automation",
+        convKey: conv,
+        site: "chatgpt",
+        enabled: false,
+      }, { tab: { id: tabId, url: conv } });
+    }
+    for (const watchedTabId of [tabId, blockedTabId]) tabs.delete(watchedTabId);
+    await dispatchMessage({ type: "h2w_set_config", config: { progressTickSec: 60, progressFallbackSec: 1200 } },
+      { url: "chrome-extension://test-ext/options.html" });
+  } finally {
+    llmHandoffResponder = priorLlmResponder;
+    console.log = realConsoleLog;
+  }
 }
 
 // ---- Scenario 6d: z.ai new-chat root state follows the first persisted /c/<chat_id> only ----
