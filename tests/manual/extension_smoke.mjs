@@ -108,6 +108,18 @@ ok(wakeSource.includes('tasks: hud?.task_summary || null')
   "HUD renders durable task running/completed/blocked/uncertain counters from the Runtime inbox");
 ok(wakeSource.includes(`const H2W_CONTENT_VERSION = "${manifestVersion}"`), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
+// Fail-closed app-reference gate: a wake may only insert its prompt after the
+// Herdr composer app reference was observed, and a failed selection must return
+// before the first insertion. This pin keeps the gate from being deleted while
+// the surrounding composer code is refactored.
+const herdrReferenceIndex = wakeSource.indexOf("const herdrReference = await ensureHerdrComposerReference()");
+const herdrReferenceFailIndex = wakeSource.indexOf("if (!herdrReference.ok) {", herdrReferenceIndex);
+const herdrReferenceInsertIndex = wakeSource.indexOf("await ensureTextAfterComposerAppSelection(text)", herdrReferenceIndex);
+ok(herdrReferenceIndex >= 0
+    && herdrReferenceFailIndex > herdrReferenceIndex
+    && herdrReferenceInsertIndex > herdrReferenceFailIndex
+    && wakeSource.includes("herdr-reference-selection-not-observed"),
+  "wake refuses to insert a prompt when the Herdr composer app reference cannot be observed");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
