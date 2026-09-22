@@ -10,7 +10,6 @@ test("Simplified Chinese Options copy avoids legacy mixed-language prose", () =>
   assert.equal(zh.options_title, "Herdr 浏览器设置");
 
   const optionKeys = [
-    "hint_url",
     "hint_locale",
     "hint_tick",
     "hint_fallback",
@@ -38,10 +37,17 @@ test("Simplified Chinese Options copy avoids legacy mixed-language prose", () =>
   }
 });
 
-test("Options no longer exposes or persists a Herdr bearer token", () => {
+test("Options keeps local Runtime secrets and transport details out of extension settings", () => {
   assert.doesNotMatch(optionsHtml, /id="token"|HERDR_MCP_TOKEN|Bearer Token/);
   assert.doesNotMatch(optionsJs, /\$\("token"\)|cfg\.token|config\.token/);
-  assert.match(zh.hint_url, /不保存 Herdr Token/);
+  assert.doesNotMatch(optionsHtml, /id="url"|id="pageAssistOrigins"/);
+  assert.doesNotMatch(optionsJs, /herdrMcpUrl|pageAssistOrigins|hostPermissionPatternForUrl/);
+  assert.match(optionsHtml, /~\/\.config\/herdr-mcp\/config\.json/);
+  assert.match(optionsHtml, /"semantic"/);
+  assert.match(optionsHtml, /"routes"/);
+  assert.match(optionsHtml, /id="runtime_config_guide"/);
+  assert.match(zh.options_runtime_config_hint, /不保存在扩展/);
+  assert.match(zh.options_runtime_config_hint, /0600/);
 });
 
 test("Simplified Chinese editable automation prompts use Chinese prose", () => {
@@ -106,8 +112,8 @@ test("Options requests optional host access only from explicit user settings", (
   assert.match(optionsJs, /https:\/\/grok\.com\/\*/);
   assert.match(optionsHtml, /id="grokSiteAccess"/);
   assert.doesNotMatch(optionsHtml, /id="experimentalGrokEnabled"/);
+  assert.doesNotMatch(optionsHtml, /id="pageAssistOrigins"/);
   assert.match(optionsJs, /removeHostPermissions/);
   assert.doesNotMatch(optionsJs, /llmJudge|jevJudge/);
   assert.equal(typeof zh.host_permission_denied, "string");
-  assert.equal(typeof zh.host_permission_invalid_url, "string");
 });

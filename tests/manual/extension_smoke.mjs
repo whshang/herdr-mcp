@@ -145,10 +145,9 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
   "broad network access is optional and the always-on host permission stays loopback-only");
 ok(!manifest.content_scripts.some((entry) => (entry.js || []).includes("content/page-assist.js"))
     && backgroundSource.includes("pageAssistOrigins: []")
-    && optionsHtml.includes('id="pageAssistOrigins"')
-    && optionsSource.includes('for (const origin of config.pageAssistOrigins || [])')
-    && optionsSource.includes('pageAssistOrigins: cleanPa'),
-  "Page Assist is default-off, is never statically injected, and requests only origins explicitly saved in Options");
+    && !optionsHtml.includes('id="pageAssistOrigins"')
+    && !optionsSource.includes("pageAssistOrigins"),
+  "Page Assist stays default-off and is not exposed as an extension setting");
 const pageAssistDispatchSource = backgroundSource.match(
   /async function performPageAssistRequest\(msg\) \{[\s\S]*?\n}\n/,
 )?.[0] || "";
