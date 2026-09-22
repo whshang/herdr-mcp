@@ -8119,6 +8119,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.enabled === true) CONVERSATION_AUTOMATION[convKey] = true;
         else delete CONVERSATION_AUTOMATION[convKey];
         await chrome.storage.local.set({ [CONVERSATION_AUTOMATION_STORAGE_KEY]: CONVERSATION_AUTOMATION });
+        const bindings = await loadBindings();
+        reconcileProgressTimers(bindings);
         sendResponse({ ok: true, ...automationScopeForConversation(convKey) });
         void notifyAutomationChanged();
         return;
