@@ -7725,7 +7725,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.scripting.executeScript({
       target: { tabId: sender.tab.id },
       world: "MAIN",
-      func: (text, selector) => {
+      func: (text, selector, append) => {
         try {
           const all = [...document.querySelectorAll(selector)];
           const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
@@ -7733,8 +7733,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           el.focus();
           const sel = window.getSelection();
           const range = document.createRange();
-          // Select all before insertText so retries replace instead of append.
-          range.selectNodeContents(el);
+          if (append) {
+            // Preserve provider-owned composer nodes such as app mention pills.
+            // Only move the caret to the end of the editor before inserting text.
+            range.selectNodeContents(el);
+            range.collapse(false);
+          } else {
+            // Normal insertion replaces the current composer content.
+            range.selectNodeContents(el);
+          }
           sel.removeAllRanges();
           sel.addRange(range);
           const ok = document.execCommand("insertText", false, text);
@@ -7744,7 +7751,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
         } catch (e) { return { ok: false, error: String(e) }; }
       },
-      args: [msg.text, msg.selector],
+      args: [msg.text, msg.selector, Boolean(msg.append)],
     }).then((res) => {
       const r = res && res[0] && res[0].result;
       sendResponse(r || { ok: false, error: "no-result" });
