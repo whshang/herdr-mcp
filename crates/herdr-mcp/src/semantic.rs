@@ -470,6 +470,31 @@ trait SemanticProvider: Send + Sync {
     ) -> Result<SemanticResponse, SemanticError>;
 }
 
+#[cfg(test)]
+struct TestErrorSemanticProvider {
+    id: String,
+    code: &'static str,
+}
+
+#[cfg(test)]
+impl SemanticProvider for TestErrorSemanticProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn protocol(&self) -> &'static str {
+        "decision"
+    }
+
+    fn evaluate(
+        &self,
+        _request: &SemanticRequest,
+        _timeout: Duration,
+    ) -> Result<SemanticResponse, SemanticError> {
+        Err(SemanticError::new(self.code))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticChatMessage {
     pub role: String,
@@ -669,6 +694,17 @@ impl SemanticService {
             providers: vec![Box::new(provider)],
             chat_providers: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_error(id: &str, code: &'static str) -> Self {
+        Self {
+            providers: vec![Box::new(TestErrorSemanticProvider {
+                id: id.to_owned(),
+                code,
+            })],
+            chat_providers: Vec::new(),
+        }
     }
 
     #[cfg(test)]

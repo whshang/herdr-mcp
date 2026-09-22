@@ -71,6 +71,9 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /provides no workstation or child-process execution result/s);
     assert.match(r.content, /When Herdr result fields are present, their execution and delivery evidence is authoritative/s);
     assert.match(r.content, /Host-side policy remains external to Herdr and is not altered by this planner guide/);
+    assert.match(r.content, /delegation_allowed=false.*no compatible \*\*live\*\* worker.*not by itself a stop condition/s);
+    assert.match(r.content, /agent_lifecycle\.action=start_agent_then_dispatch.*agent\.start/s);
+    assert.match(r.content, /Never treat `agent:null`.*as proof that Herdr\/tooling is unavailable/s);
     assert.match(r.content, /If browser control is unavailable, use the already-prepared Copy Prompt/);
     assert.match(r.content, /If automatic delivery produces no Herdr execution or result fields.*use the prepared manual path/s);
     assert.match(r.content, /If Herdr reports uncertain delivery, do not replay the mutation automatically/);

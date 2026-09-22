@@ -60,7 +60,7 @@ herdr-mcp semantic score --state "..." --question "..." --criterion "..." --crit
 
 `setup` は route 引数なしの場合に TypeSafe.ai（`decision`、`jev-latest`）を推奨例として使います。カスタム route では `--name`、`--protocol`、`--url`、`--model` をすべて指定します。Provider identity はハードコードされた分岐ではなく設定です。API Key は argv では受け取らず、対話端末では非表示入力、automation では stdin の 1 行を利用します。typed-decision protocol では、既存の mode-`0600` `config.json` に保存する前に候補 route 自体を検証し、失敗時は既存設定を変更しません。`status --json` も API Key を返しません。
 
-`decide`、`choose`、`score` は Browser Auto、planning、Parent orchestration、Work Memory と同じ Runtime `SemanticService` route pool を再利用します。構造化入力には `--state-json` を使います。semantic route が未設定なら判断不可を明示し、Herdr の決定論的経路は変わりません。
+`decide`、`choose`、`score` は Browser Auto、planning、Parent orchestration、Work Memory と同じ Runtime `SemanticService` route pool を再利用します。プレーンテキスト入力の `--state` の代わりに、構造化入力では `--state-json` を使います。semantic route が未設定なら判断不可を明示し、Herdr の決定論的経路は変わりません。
 
 ## ソース開発 runtime: DEV / PROD
 

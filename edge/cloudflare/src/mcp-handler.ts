@@ -464,6 +464,25 @@ function isOpenAiDiscoverClient(client?: McpClientContext): boolean {
   return isOpenAiMcpUserAgent(client?.userAgent) || isChatgptOAuthClientId(client?.oauthClientId);
 }
 
+function recordOpenAiClientLifecycle(
+  method: string,
+  deps: McpDeps,
+  publicContract: ReturnType<typeof resolvePublicContract>,
+): void {
+  if (!isOpenAiDiscoverClient(deps.client)) return;
+  if (!["initialize", "server/discover", "tools/list"].includes(method)) return;
+  deps.logger.warn("mcp.client_lifecycle", {
+    method,
+    client_kind: "openai-mcp",
+    connector_bound: Boolean(deps.client?.connectorId),
+    grant_generation: deps.client?.grantGeneration ?? null,
+    auth_source: deps.client?.authSource ?? null,
+    contract_epoch: publicContract.contract_epoch,
+    contract_hash: publicContract.contract_hash,
+    tool_count: publicContract.tool_count,
+  });
+}
+
 function discoverSupportedVersions(client?: McpClientContext): string[] {
   const versions: string[] = [...MCP_SUPPORTED_PROTOCOLS];
   if (isOpenAiDiscoverClient(client) && !versions.includes(OPENAI_PROBE_PROTOCOL)) {
@@ -492,6 +511,7 @@ export async function handleMcp(
   if (request.jsonrpc !== "2.0" || typeof request.method !== "string") {
     return rpcError(id, -32600, "Invalid Request");
   }
+  recordOpenAiClientLifecycle(request.method, deps, publicContract);
 
   if (request.method === "notifications/initialized") {
     return { status: 204, body: null };
@@ -1292,6 +1312,12 @@ export async function handleMcp(
       routingReason: route.routing_reason,
       op: name,
       opClass,
+      clientKind: isOpenAiDiscoverClient(deps.client) ? "openai-mcp" : "other",
+      connectorBound: Boolean(deps.client?.connectorId),
+      grantGeneration: deps.client?.grantGeneration ?? null,
+      authSource: deps.client?.authSource ?? null,
+      contractEpoch: publicContract.contract_epoch,
+      contractHash: publicContract.contract_hash,
     });
 
     let activeRequestId = requestId;

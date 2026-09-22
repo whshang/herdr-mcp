@@ -54,7 +54,7 @@ For step-by-step manual setup, use the [manual install guide](docs/i18n/en/insta
 
 ### ChatGPT configuration
 
-Enable Developer Mode for Plugins, open **Plugins → Browse plugins**, then add `herdr` with the complete Worker URL ending in `/mcp` and complete OAuth. Work in a ChatGPT Project; in the first message of each new chat, use the composer `+` button to reference `herdr` so that conversation enables the plugin.
+Enable Developer Mode for Plugins, open **Plugins → Browse plugins**, then add `herdr` with the complete Worker URL ending in `/mcp` and complete OAuth. Work in a ChatGPT Project; select or mention `herdr` on each message that needs fresh workstation data or another Herdr action. ChatGPT app selection is message-scoped, so a later tool-using message may need the app selected again even while the Herdr runtime and Link remain healthy.
 
 [ChatGPT setup](docs/i18n/en/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
 

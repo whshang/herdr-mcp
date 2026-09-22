@@ -15,13 +15,15 @@ import { handleMcp } from "../dist/mcp-handler.js";
 function deps(over = {}) {
   const calls = [];
   const targets = [];
+  const logs = [];
   return {
     calls,
     targets,
+    logs,
     value: {
       limits: makeLimits(),
       edgeEnv: over.edgeEnv,
-      logger: { warn() {} },
+      logger: { warn(event, fields) { logs.push({ event, fields }); } },
       getStub: (workstationId) => {
         targets.push(workstationId);
         return { workstationId };
@@ -241,10 +243,27 @@ test("server/discover advertises supported versions without OAuth claims", async
 
 test("server/discover for openai-mcp keeps SDK wire first and adds 2026-07-28", async () => {
   const d = deps();
-  d.value.client = { userAgent: "openai-mcp/1.0.0", oauthClientId: null };
+  d.value.client = {
+    userAgent: "openai-mcp/1.0.0",
+    oauthClientId: null,
+    connectorId: "conn_test",
+    grantGeneration: 7,
+    authSource: "oauth_edge",
+  };
   const r = await handleMcp(req("d", "server/discover", {}), "w1", d.value);
   assert.equal(r.body.result.supportedVersions[0], "2025-11-25");
   assert.equal(r.body.result.supportedVersions.includes("2026-07-28"), true);
+  const lifecycle = d.logs.find((entry) => entry.event === "mcp.client_lifecycle");
+  assert.ok(lifecycle);
+  assert.equal(lifecycle.fields.method, "server/discover");
+  assert.equal(lifecycle.fields.client_kind, "openai-mcp");
+  assert.equal(lifecycle.fields.connector_bound, true);
+  assert.equal(lifecycle.fields.grant_generation, 7);
+  assert.equal(lifecycle.fields.auth_source, "oauth_edge");
+  assert.equal(typeof lifecycle.fields.contract_hash, "string");
+  assert.equal(Number.isInteger(lifecycle.fields.contract_epoch), true);
+  assert.equal(Number.isInteger(lifecycle.fields.tool_count), true);
+  assert.equal(Object.hasOwn(lifecycle.fields, "params"), false);
 });
 
 test("initialize negotiates unknown protocol versions down to SDK wire", async () => {

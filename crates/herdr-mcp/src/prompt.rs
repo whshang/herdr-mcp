@@ -1804,7 +1804,29 @@ fn prompt_failure(
             },
         ),
     );
-    if !resolve_failure && !retryable {
+    if resolve_failure {
+        result.insert("submitted".to_owned(), json!(false));
+        result.insert("delivery_state".to_owned(), json!("not_delivered"));
+        result.insert("requires_human".to_owned(), json!(false));
+        result.insert(
+            "recovery".to_owned(),
+            json!({
+                "action": "start_agent_then_reprompt",
+                "inspect": "herdr_inspect",
+                "split_method": "pane.split",
+                "start_method": "agent.start",
+                "reuse_existing_pane_only_when": "verified_task_owned_free_shell",
+                "reprompt": "same_idempotency_key",
+                "reclaim": "planner_created_pane_only"
+            }),
+        );
+        result.insert(
+            "hint".to_owned(),
+            json!(
+                "agent target did not resolve and nothing was submitted. This is a pre-dispatch condition, not a human boundary. Re-read herdr_inspect, select a compatible startable Agent, and use a verified task-owned free shell pane or pane.split a task-owned pane before agent.start. Re-prompt with the same idempotency_key after the Agent is ready; never infer pane ownership from agent:null."
+            ),
+        );
+    } else if !retryable {
         result.insert("delivery_uncertain".to_owned(), json!(true));
         result.insert(
             "hint".to_owned(),
@@ -2730,5 +2752,31 @@ mod tests {
         assert_eq!(result["dispatch_correlation"]["terminal"], false);
         assert_eq!(result["submitted"], "unknown");
         assert_eq!(result["delivery_uncertain"], true);
+    }
+
+    #[test]
+    fn unresolved_agent_target_is_pre_dispatch_not_human_boundary() {
+        let socket = temp_socket();
+        let client = HerdrClient::new(&socket);
+        let result = prompt_failure(
+            &client,
+            "w1:p9",
+            None,
+            false,
+            HerdrError {
+                code: "agent_not_found".to_owned(),
+                message: "no agent is bound to pane w1:p9".to_owned(),
+            },
+            "dispatch:prompt:missing-agent",
+        );
+        assert_eq!(result["failure_phase"], "resolve");
+        assert_eq!(result["submitted"], false);
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["requires_human"], false);
+        assert_eq!(result["retryable"], false);
+        assert_eq!(result["recovery"]["action"], "start_agent_then_reprompt");
+        assert_eq!(result["recovery"]["start_method"], "agent.start");
+        assert_eq!(result["recovery"]["split_method"], "pane.split");
+        assert!(result.get("delivery_uncertain").is_none());
     }
 }

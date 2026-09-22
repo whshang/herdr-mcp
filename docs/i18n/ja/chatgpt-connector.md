@@ -50,7 +50,7 @@ https://<your-edge-origin>/mcp
 ```
 
 4. ブラウザで OAuth を完了します。初回の認可時、Herdr はブラウザの言語から中国語・英語・日本語のいずれかを選択します。ステップ 1 では、ターミナル用に `herdr-mcp connector approve <approval-request-id>` をコピーします。このコマンドはローカルの `herdr-mcp` サービスと Herdr server を確認したうえで、ステップ 2 が 6 桁の承認コードを求めます。承認済みの WebChat Connector はあくまで通常の MCP にすぎず、別の Connector を承認することはできません。
-5. ChatGPT の **Project** を作成または開きます。新しいチャットでは毎回、最初のメッセージでコンポーザーの `+` ボタンから `herdr` を参照し、そのチャットでプラグインを有効にします。
+5. ChatGPT の **Project** を作成または開きます。新しいワークステーション情報の取得や Herdr の操作が必要なメッセージごとに `herdr` を選択または参照します。ChatGPT の App 選択はメッセージ単位です。以前の結果は App を再選択せずに会話できますが、後続メッセージで新しい tool call が必要な場合は `herdr` の再選択または mention が必要になることがあります。その時点で Edge、Link、runtime が正常なら、これは ChatGPT 側の tool projection 境界であり、Herdr のオフラインを意味しません。
 
 `HERDR_MCP_TOKEN` を ChatGPT に貼り付けないでください。公開 ChatGPT アクセスは OAuth を使用します。静的な bearer は curl や Cursor などのローカルクライアント向けです。
 
