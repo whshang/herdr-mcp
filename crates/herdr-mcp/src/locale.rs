@@ -211,6 +211,7 @@ pub fn help(section: HelpSection, locale: Locale) -> String {
     if locale == Locale::En {
         return match section {
             HelpSection::General => crate::cli::help(),
+            HelpSection::Semantic => crate::cli::semantic_help(),
             HelpSection::Worker => crate::cli::worker_help(),
             HelpSection::Connector => crate::cli::connector_help(),
             HelpSection::Automation => crate::cli::automation_help(),
@@ -225,6 +226,7 @@ pub fn help(section: HelpSection, locale: Locale) -> String {
 
     match section {
         HelpSection::General => general_help(locale),
+        HelpSection::Semantic => semantic_help(locale),
         HelpSection::Worker => worker_help(locale),
         HelpSection::Connector => connector_help(locale),
         HelpSection::Automation => automation_help(locale),
@@ -245,7 +247,7 @@ fn general_help(l: Locale) -> String {
     ));
     out.push_str(l.text("", "用户常用命令：\n", "ユーザー向けコマンド：\n"));
     out.push_str(
-        "  herdr-mcp install\n  herdr-mcp status [--verbose]\n  herdr-mcp doctor [--verbose|--json]\n  herdr-mcp network repair\n  herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n  herdr-mcp scan [--json] [--refresh] [--probe]\n  herdr-mcp agent-skill <status|sync>\n  herdr-mcp continuity <search|resume> ...\n  herdr-mcp memory <resume|search> ...\n  herdr-mcp webchat <endpoints|resources|create|send|dispatch-status|archive|handoff> ...\n  herdr-mcp profile check --file <profile.json>\n  herdr-mcp instance list\n  herdr-mcp instance reap <name> --confirm\n  herdr-mcp qualification <lock|unlock|status>\n  herdr-mcp worker bootstrap\n  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n  herdr-mcp worker update\n  herdr-mcp device list\n  herdr-mcp connector list\n  herdr-mcp connector approve <approval-request-id>\n  herdr-mcp connector revoke <connector-id> --confirm\n  herdr-mcp automation create --name NAME --device <device-id-or-unique-name>\n  herdr-mcp automation list\n  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|major-apply|major-rollback|auto|status]\n  herdr-mcp extension standalone <install [--ref REF] [--path PATH]|status>\n  herdr-mcp rollback\n  herdr-mcp reinstall\n  herdr-mcp uninstall\n  herdr-mcp lang [auto|en|zh|ja]\n\n",
+        "  herdr-mcp install\n  herdr-mcp status [--verbose]\n  herdr-mcp doctor [--verbose|--json]\n  herdr-mcp semantic <status|setup|remove|decide|choose|score> ...\n  herdr-mcp network repair\n  herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n  herdr-mcp scan [--json] [--refresh] [--probe]\n  herdr-mcp agent-skill <status|sync>\n  herdr-mcp continuity <search|resume> ...\n  herdr-mcp memory <resume|search> ...\n  herdr-mcp webchat <endpoints|resources|create|send|dispatch-status|archive|handoff> ...\n  herdr-mcp profile check --file <profile.json>\n  herdr-mcp instance list\n  herdr-mcp instance reap <name> --confirm\n  herdr-mcp qualification <lock|unlock|status>\n  herdr-mcp worker bootstrap\n  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n  herdr-mcp worker update\n  herdr-mcp device list\n  herdr-mcp connector list\n  herdr-mcp connector approve <approval-request-id>\n  herdr-mcp connector revoke <connector-id> --confirm\n  herdr-mcp automation create --name NAME --device <device-id-or-unique-name>\n  herdr-mcp automation list\n  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|major-apply|major-rollback|auto|status]\n  herdr-mcp extension standalone <install [--ref REF] [--path PATH]|status>\n  herdr-mcp rollback\n  herdr-mcp reinstall\n  herdr-mcp uninstall\n  herdr-mcp lang [auto|en|zh|ja]\n\n",
     );
     out.push_str(l.text(
         "",
@@ -261,6 +263,27 @@ fn general_help(l: Locale) -> String {
         "  herdr-mcp version\n  herdr-mcp config [path|show|init [--edge-origin https://host]|set-edge-origin https://host]\n  herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n  herdr-mcp herdr-supervisor <install|status|enable|disable|start|stop|uninstall>\n  herdr-mcp link <status|run|install|uninstall>\n  herdr-mcp link cutover [--dry-run|--execute|--rollback]\n  herdr-mcp link seal [status|record --dual-uat|record --rollback-uat|adopt-existing-rust --ack --reason REASON|--dry-run|--execute]\n  herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n  herdr-mcp tcc-broker <install [--force]|status|uninstall>\n  herdr-mcp native-host <install|status|uninstall|rollback>\n  herdr-mcp native-host dev <enable [PATH]|disable>\n  herdr-mcp native-host use <store|standalone|dev>\n  herdr-mcp extension-host [chrome-extension://.../]\n  herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME | --signed-url] [--overwrite] [--confirm-dirty] [--confirm-busy]\n  herdr-mcp dev [status]\n  herdr-mcp dev sync [--dry-run] [--allow-dirty]\n  herdr-mcp dev rollback\n  herdr-mcp candidate [--port 8873]\n",
     );
     out
+}
+
+fn semantic_help(l: Locale) -> String {
+    format!(
+        "Herdr MCP — {}\n\n{}\n\n  herdr-mcp semantic status [--json]\n  herdr-mcp semantic setup [--name NAME] [--protocol decision|decision-vercel|openai-chat] [--url URL] [--model MODEL]\n  herdr-mcp semantic remove <route-name>\n  herdr-mcp semantic decide --state TEXT --question TEXT --yes TEXT --no TEXT [--json]\n  herdr-mcp semantic choose --state TEXT --question TEXT --option KEY[=DESCRIPTION] --option KEY[=DESCRIPTION] ... [--json]\n  herdr-mcp semantic score --state TEXT --question TEXT --criterion TEXT --criterion TEXT ... [--json]\n\n{}\n",
+        l.text(
+            "Semantic decisions",
+            "快速语义判断",
+            "高速セマンティック判断"
+        ),
+        l.text(
+            "Fast semantic models are optional. Herdr keeps deterministic behavior without them. TypeSafe.ai is the recommended setup reference; compatible providers use the same generic route configuration.",
+            "快速 decision 模型是可选能力；没有配置时 Herdr 仍保持原有确定性行为。默认推荐 TypeSafe.ai 作为配置参考，其他兼容 Provider 使用同一套通用 route 配置。",
+            "高速 decision モデルは任意です。未設定でも Herdr の決定論的な動作は維持されます。TypeSafe.ai を推奨セットアップ例とし、互換 Provider は同じ汎用 route 設定を使用します。"
+        ),
+        l.text(
+            "setup never accepts an API key on argv. With no route options it uses the TypeSafe.ai reference; a custom provider supplies name/protocol/url/model together. The key is read privately from a terminal, or one line from stdin for automation. Use --state-json for structured decision input.",
+            "setup 不接受命令行参数里的 API Key；不传 route 参数时使用 TypeSafe.ai 参考配置，自定义 Provider 需要同时提供 name/protocol/url/model。Key 在交互终端隐藏读取，自动化场景可从 stdin 读取一行。结构化判断输入使用 --state-json。",
+            "setup は argv から API Key を受け取りません。route 引数なしでは TypeSafe.ai の参照設定を使い、カスタム Provider では name/protocol/url/model をすべて指定します。Key は対話端末で非表示入力し、自動化では stdin の 1 行を使えます。構造化入力には --state-json を使います。"
+        )
+    )
 }
 
 fn worker_help(l: Locale) -> String {
@@ -457,6 +480,9 @@ mod tests {
             assert!(text.contains("herdr-mcp lang [auto|en|zh|ja]"));
             assert!(text.contains("HERDR_MCP_INSTANCE=uat"));
         }
+        let zh_semantic = help(HelpSection::Semantic, Locale::ZhCn);
+        assert!(zh_semantic.contains("TypeSafe.ai"));
+        assert!(zh_semantic.contains("herdr-mcp semantic setup"));
         let ja_webchat = help(HelpSection::WebChat, Locale::Ja);
         assert!(ja_webchat.contains("delivery_state=applied"));
         assert!(ja_webchat.contains("idempotency key"));

@@ -45,6 +45,17 @@ If `~/.local/bin/herdr-mcp` exists but the interactive shell cannot resolve it, 
 
 On macOS, run `herdr-mcp permissions status` before Cloudflare work. If it reports `needs_setup`, grant Full Disk Access once to the stable Herdr-MCP broker, then run `herdr-mcp permissions verify`; do not probe protected paths first or use `sudo`. The broker carries MCP file/Git TCC, not pane shell; panes follow their execution host's TCC. Linux uses the user-service/process backend. Windows uses a Startup-folder shortcut, user processes and Credential Manager without elevation; it can start installed `herdr server` if needed. Normal install needs no Node.js, Wrangler, npm or Cargo.
 
+### Optional fast semantic decisions
+
+After the core runtime is healthy, tell the user that a fast decision model is optional. The recommended reference is [TypeSafe.ai](https://typesafe.ai/), but it is not a required provider and must not block installation. The user may create an API key there and run:
+
+```bash
+herdr-mcp semantic setup
+herdr-mcp semantic status
+```
+
+`semantic setup` reads the API key through hidden terminal input and never accepts it on argv. A compatible provider can instead be configured with `--name`, `--protocol`, `--url`, and `--model`. If the user skips this step, Herdr keeps the same deterministic behavior and installation continues normally.
+
 ## 4. First Worker: Cloudflare + bootstrap
 
 Cloudflare Workers Free is enough for Herdr and needs no payment method. If the user has no account, say registration is free and recommend Google sign-in. When a Token is required, open <https://dash.cloudflare.com/profile/api-tokens>. Prefer **Edit Cloudflare Workers** for the selected Account. A custom token needs **Account Settings → Read** and **Workers Scripts → Write/Edit**. If `workers/subdomain` returns 403, report the missing permission and do not inflate the token scope. **Core install does not require R2**; add Workers R2 Storage only for artifact relay.

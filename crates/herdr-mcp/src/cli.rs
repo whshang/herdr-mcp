@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpSection {
     General,
+    Semantic,
     Worker,
     Connector,
     Automation,
@@ -41,6 +42,7 @@ pub enum Command {
         file: String,
     },
     Config(ConfigCommand),
+    Semantic(SemanticCommand),
     Instance(InstanceCommand),
     Qualification(QualificationCommand),
     Worker(WorkerCommand),
@@ -116,6 +118,41 @@ pub enum ConfigCommand {
     Show,
     Init { edge_origin: Option<String> },
     SetEdgeOrigin { edge_origin: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SemanticState {
+    Text(String),
+    Json(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SemanticQuestionSpec {
+    Decide { yes: String, no: String },
+    Choose { options: Vec<String> },
+    Score { criteria: Vec<String> },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SemanticCommand {
+    Status {
+        json: bool,
+    },
+    Setup {
+        name: Option<String>,
+        protocol: Option<String>,
+        url: Option<String>,
+        model: Option<String>,
+    },
+    Remove {
+        name: String,
+    },
+    Evaluate {
+        state: SemanticState,
+        question: String,
+        spec: SemanticQuestionSpec,
+        json: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -498,6 +535,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "uninstall" => no_extra(args, Command::Uninstall),
         "reinstall" => no_extra(args, Command::Reinstall),
         "config" => parse_config(&args[1..]),
+        "semantic" => parse_semantic(&args[1..]),
         "instance" => parse_instance(&args[1..]),
         "qualification" => parse_qualification(&args[1..]),
         "worker" => parse_worker(&args[1..]),
@@ -2094,6 +2132,156 @@ fn parse_config(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_semantic(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("help" | "--help" | "-h") if args.len() == 1 => Ok(Command::Help {
+            section: HelpSection::Semantic,
+        }),
+        Some("status") => match &args[1..] {
+            [] => Ok(Command::Semantic(SemanticCommand::Status { json: false })),
+            [flag] if flag == "--json" => {
+                Ok(Command::Semantic(SemanticCommand::Status { json: true }))
+            }
+            _ => Err("usage: herdr-mcp semantic status [--json]".to_owned()),
+        },
+        Some("setup") => parse_semantic_setup(&args[1..]),
+        Some("remove") => match &args[1..] {
+            [name] if !name.starts_with('-') => Ok(Command::Semantic(SemanticCommand::Remove {
+                name: name.clone(),
+            })),
+            _ => Err("usage: herdr-mcp semantic remove <route-name>".to_owned()),
+        },
+        Some("decide") => parse_semantic_evaluate(&args[1..], "decide"),
+        Some("choose") => parse_semantic_evaluate(&args[1..], "choose"),
+        Some("score") => parse_semantic_evaluate(&args[1..], "score"),
+        Some(value) => Err(format!(
+            "unknown semantic command '{value}' (expected status, setup, remove, decide, choose, or score)"
+        )),
+        None => Ok(Command::Help {
+            section: HelpSection::Semantic,
+        }),
+    }
+}
+
+fn parse_semantic_setup(args: &[String]) -> Result<Command, String> {
+    let mut name = None;
+    let mut protocol = None;
+    let mut url = None;
+    let mut model = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if matches!(flag, "--api-key" | "--key") {
+            return Err(
+                "API keys are never accepted on argv; semantic setup reads the key privately"
+                    .to_owned(),
+            );
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?
+            .clone();
+        let target = match flag {
+            "--name" => &mut name,
+            "--protocol" => &mut protocol,
+            "--url" => &mut url,
+            "--model" => &mut model,
+            _ => return Err(format!("unknown semantic setup option '{flag}'")),
+        };
+        if target.replace(value).is_some() {
+            return Err(format!("duplicate semantic setup option '{flag}'"));
+        }
+        index += 2;
+    }
+    Ok(Command::Semantic(SemanticCommand::Setup {
+        name,
+        protocol,
+        url,
+        model,
+    }))
+}
+
+fn parse_semantic_evaluate(args: &[String], kind: &str) -> Result<Command, String> {
+    let mut state = None;
+    let mut question = None;
+    let mut yes = None;
+    let mut no = None;
+    let mut options = Vec::new();
+    let mut criteria = Vec::new();
+    let mut json = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if flag == "--json" {
+            if json {
+                return Err("duplicate semantic --json".to_owned());
+            }
+            json = true;
+            index += 1;
+            continue;
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?
+            .clone();
+        match flag {
+            "--state" => {
+                if state.replace(SemanticState::Text(value)).is_some() {
+                    return Err("provide exactly one --state or --state-json".to_owned());
+                }
+            }
+            "--state-json" => {
+                if state.replace(SemanticState::Json(value)).is_some() {
+                    return Err("provide exactly one --state or --state-json".to_owned());
+                }
+            }
+            "--question" => {
+                if question.replace(value).is_some() {
+                    return Err("duplicate semantic --question".to_owned());
+                }
+            }
+            "--yes" if kind == "decide" => {
+                if yes.replace(value).is_some() {
+                    return Err("duplicate semantic --yes".to_owned());
+                }
+            }
+            "--no" if kind == "decide" => {
+                if no.replace(value).is_some() {
+                    return Err("duplicate semantic --no".to_owned());
+                }
+            }
+            "--option" if kind == "choose" => options.push(value),
+            "--criterion" if kind == "score" => criteria.push(value),
+            _ => return Err(format!("unknown semantic {kind} option '{flag}'")),
+        }
+        index += 2;
+    }
+
+    let state = state
+        .ok_or_else(|| format!("semantic {kind} requires --state TEXT or --state-json JSON"))?;
+    let question = question.ok_or_else(|| format!("semantic {kind} requires --question TEXT"))?;
+    let spec = match kind {
+        "decide" => SemanticQuestionSpec::Decide {
+            yes: yes.ok_or_else(|| "semantic decide requires --yes TEXT".to_owned())?,
+            no: no.ok_or_else(|| "semantic decide requires --no TEXT".to_owned())?,
+        },
+        "choose" if options.len() >= 2 => SemanticQuestionSpec::Choose { options },
+        "choose" => return Err("semantic choose requires at least two --option values".to_owned()),
+        "score" if criteria.len() >= 2 => SemanticQuestionSpec::Score { criteria },
+        "score" => {
+            return Err("semantic score requires at least two --criterion values".to_owned());
+        }
+        _ => unreachable!(),
+    };
+    Ok(Command::Semantic(SemanticCommand::Evaluate {
+        state,
+        question,
+        spec,
+        json,
+    }))
+}
+
 fn no_extra(args: &[String], command: Command) -> Result<Command, String> {
     if args.len() == 1 {
         Ok(command)
@@ -2452,6 +2640,7 @@ User path:\n\
   herdr-mcp install\n\
   herdr-mcp status [--verbose]\n\
   herdr-mcp doctor [--verbose|--json]  (default is concise; exit 0 = no known failure in probed layers)\n\
+  herdr-mcp semantic <status|setup|remove|decide|choose|score> ...  (optional fast semantic decisions; provider-neutral)\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
@@ -2531,6 +2720,22 @@ aligned Rust prod owner only when no valid Node rollback backup remains. link mi
 Rust-compatible runtime-control-prod generation (default dry-run; --write-staging\n\
 writes a pending sibling; --apply rewrites the live control file only with\n\
 HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"
+}
+
+pub fn semantic_help() -> &'static str {
+    "Herdr-MCP semantic decisions\n\n\
+Fast semantic decisions are optional. Herdr keeps deterministic behavior when no route is configured.\n\
+TypeSafe.ai is the recommended setup reference, while the route schema remains provider-neutral.\n\n\
+Usage:\n\
+  herdr-mcp semantic status [--json]\n\
+  herdr-mcp semantic setup [--name NAME] [--protocol decision|decision-vercel|openai-chat] [--url URL] [--model MODEL]\n\
+  herdr-mcp semantic remove <route-name>\n\
+  herdr-mcp semantic decide --state TEXT --question TEXT --yes TEXT --no TEXT [--json]\n\
+  herdr-mcp semantic choose --state TEXT --question TEXT --option KEY[=DESCRIPTION] --option KEY[=DESCRIPTION] ... [--json]\n\
+  herdr-mcp semantic score --state TEXT --question TEXT --criterion TEXT --criterion TEXT ... [--json]\n\n\
+Use --state-json JSON instead of --state TEXT when the decision input is structured JSON.\n\
+semantic setup never accepts an API key on argv. It reads the key privately from the terminal, or one line from stdin for automation.\n\
+The zero-option setup reference is TypeSafe.ai System One (decision / jev-latest). For a custom provider, pass --name, --protocol, --url and --model together.\n"
 }
 
 pub fn continuity_help() -> &'static str {
@@ -3043,6 +3248,55 @@ mod tests {
             }
         );
         assert!(parse(args(&["doctor", "--json", "--verbose"])).is_err());
+        assert_eq!(
+            parse(args(&["semantic", "status"])).unwrap().command,
+            Command::Semantic(SemanticCommand::Status { json: false })
+        );
+        assert_eq!(
+            parse(args(&["semantic", "setup"])).unwrap().command,
+            Command::Semantic(SemanticCommand::Setup {
+                name: None,
+                protocol: None,
+                url: None,
+                model: None,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "semantic",
+                "choose",
+                "--state",
+                "deploy result",
+                "--question",
+                "What should happen next?",
+                "--option",
+                "continue=more work remains",
+                "--option",
+                "done=acceptance is complete",
+            ]))
+            .unwrap()
+            .command,
+            Command::Semantic(SemanticCommand::Evaluate {
+                state: SemanticState::Text("deploy result".to_owned()),
+                question: "What should happen next?".to_owned(),
+                spec: SemanticQuestionSpec::Choose {
+                    options: vec![
+                        "continue=more work remains".to_owned(),
+                        "done=acceptance is complete".to_owned(),
+                    ],
+                },
+                json: false,
+            })
+        );
+        assert!(
+            parse(args(&[
+                "semantic",
+                "setup",
+                "--api-key",
+                "must-not-enter-argv",
+            ]))
+            .is_err()
+        );
         assert_eq!(
             parse(args(&["network", "repair"])).unwrap().command,
             Command::Network(NetworkCommand::Repair)

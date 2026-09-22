@@ -168,6 +168,16 @@ herdr-mcp webchat handoff --continuity-id hc:... --source-url 'https://chatgpt.c
 
 ChatGPT Auto 的确定性浏览器/runtime 安全门始终保持权威。普通回合结束后的语义判断采用固定渐进链：**typed evaluation route（Jev）→ chat route（LLM）→ 有界脚本兜底**。Goal 模式还会把 Jev 的五信号结果作为现有 LLM Goal Supervisor 的 advisory prior；Work Memory/TODO evidence 仍是完成权威。浏览器扩展不保存 Provider endpoint、model 或 API key，只调用本机 Herdr Runtime 的统一语义能力。Provider 配置只有两层：单机使用 mode-`0600` 的 `~/.config/herdr-mcp/config.json`，全局使用 Cloudflare Worker 的共享 route pool；同一能力有本机 route 时始终优先本机。每条 route 使用统一的 `name / protocol / url / model / api_key` JSON 对象。`protocol` 同时决定 route 类型：`decision` 与 `decision-vercel` 属于 typed evaluation，`openai-chat` 属于 chat。TypeSafe 与 OpenRouter 共用 `protocol=decision`。route 的配置顺序就是优先级：第一个健康 route 为 primary，后续 route 只在失败或 cooldown 后有界接替；每个 route 的 timeout 与整个 pool 的总 deadline 分开。旧 `config.toml` 首次读取时会迁移为 JSON，并保留为 `config.toml.migrated`。
 
+同一套语义能力也通过 `herdr-mcp semantic` 提供给 CLI。`herdr-mcp semantic setup` 不传 route 参数时把 TypeSafe.ai / `jev-latest` 作为推荐参考，自定义 Provider 需要同时提供 route name、protocol、URL 和 model；API Key 使用隐藏输入，不接受 argv。`semantic decide`、`semantic choose`、`semantic score` 可以直接调用 typed decision，`semantic status` 查看 route 是否可用且不会显示凭证。
+
+```bash
+herdr-mcp semantic status
+herdr-mcp semantic setup
+herdr-mcp semantic choose --state "CI 已完成" --question "下一步做什么？" \
+  --option verify="执行确定性验证" \
+  --option done="验收已经完成"
+```
+
 如果在 macOS 使用 STANDALONE 通道，`herdr-mcp doctor` 还会检查 Google Chrome 是否真的从受管 `~/.config/herdr-mcp/extensions/standalone/current` 路径加载固定 Herdr standalone ID。出现 `standalone-extension-load state=drift` 表示 Chrome 仍在使用另一份 Load unpacked 目录；按 `doctor` 输出的 `expected` 路径重新加载 Herdr 扩展即可。
 
 [Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [扩展说明](docs/i18n/zh-CN/extension.md) · [浏览器连续工作](docs/i18n/zh-CN/browser-continuity.md)

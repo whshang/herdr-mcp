@@ -45,6 +45,23 @@ macOS では、`reinstall` が製品の修復/置き換え経路です。Linux �
 
 `service ...`、`link ...`、`native-host ...`、`candidate` は高度/内部コマンドです。`dev` は以下で説明する高度な**ソース開発**サーフェスです。通常の runtime インストール経路としてリポジトリの checkout、Node.js、npm、`service install` を使用しないでください。
 
+## 高速セマンティック判断
+
+`herdr-mcp semantic` は Runtime 既存の provider-neutral な semantic layer を通常の CLI として公開します。セマンティック出力は補助判断だけに使われ、task、Git、validation、permission、delivery、cleanup の決定論的な事実は従来の authority を保ちます。
+
+```bash
+herdr-mcp semantic status
+herdr-mcp semantic setup
+herdr-mcp semantic remove <route-name>
+herdr-mcp semantic decide --state "..." --question "..." --yes "..." --no "..."
+herdr-mcp semantic choose --state "..." --question "..." --option a="..." --option b="..."
+herdr-mcp semantic score --state "..." --question "..." --criterion "..." --criterion "..."
+```
+
+`setup` は route 引数なしの場合に TypeSafe.ai（`decision`、`jev-latest`）を推奨例として使います。カスタム route では `--name`、`--protocol`、`--url`、`--model` をすべて指定します。Provider identity はハードコードされた分岐ではなく設定です。API Key は argv では受け取らず、対話端末では非表示入力、automation では stdin の 1 行を利用します。typed-decision protocol では、既存の mode-`0600` `config.json` に保存する前に候補 route 自体を検証し、失敗時は既存設定を変更しません。`status --json` も API Key を返しません。
+
+`decide`、`choose`、`score` は Browser Auto、planning、Parent orchestration、Work Memory と同じ Runtime `SemanticService` route pool を再利用します。構造化入力には `--state-json` を使います。semantic route が未設定なら判断不可を明示し、Herdr の決定論的経路は変わりません。
+
 ## ソース開発 runtime: DEV / PROD
 
 現在の runtime には、安定した復旧元を失わずに herdr-mcp ソースを dogfood するための明示的な経路が 1 つだけあります:

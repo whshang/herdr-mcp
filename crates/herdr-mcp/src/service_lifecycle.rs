@@ -334,6 +334,8 @@ fn finish_install_lifecycle(
         );
     }
 
+    crate::semantic_cli::print_install_hint(&paths, language);
+
     Ok(result)
 }
 

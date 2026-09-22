@@ -45,6 +45,17 @@ herdr-mcp doctor
 
 macOS では Cloudflare の作業の前に `herdr-mcp permissions status` を実行します。`needs_setup` を報告した場合は、安定した Herdr-MCP broker に Full Disk Access を一度付与してから `herdr-mcp permissions verify` を実行してください。先に保護パスを探査したり、`sudo` を使ったりしないでください。broker が担うのは MCP のファイル / Git TCC であり、ペインの shell ではありません。ペインはその実行ホストの TCC に従います。Linux は user-service / process backend を使います。Windows は昇格なしで Startup フォルダのショートカット、ユーザープロセス、Credential Manager を使い、必要ならインストール済みの `herdr server` を起動できます。通常のインストールに Node.js、Wrangler、npm、Cargo は不要です。
 
+### 任意：高速セマンティック判断
+
+コア runtime が正常になった後、高速 decision モデルは任意であることをユーザーに案内します。推奨設定例は [TypeSafe.ai](https://typesafe.ai/) ですが、必須 Provider ではなく、インストールを妨げてはいけません。ユーザーはそこで API Key を作成し、次を実行できます。
+
+```bash
+herdr-mcp semantic setup
+herdr-mcp semantic status
+```
+
+`semantic setup` は API Key を非表示の端末入力から読み取り、argv では受け取りません。他の互換 Provider は `--name`、`--protocol`、`--url`、`--model` で設定できます。この手順を省略しても Herdr は従来の決定論的動作を維持し、インストールは通常どおり続行します。
+
 ## 4. 最初の Worker：Cloudflare + bootstrap
 
 Herdr には Cloudflare Workers Free で十分で、支払い方法は不要です。ユーザーにアカウントがない場合は、登録が無料であることを伝え、Google サインインを勧めてください。Token が必要なときは <https://dash.cloudflare.com/profile/api-tokens> を開きます。選択した Account には **Edit Cloudflare Workers** を推奨します。カスタム Token には **Account Settings → Read** と **Workers Scripts → Write/Edit** が必要です。`workers/subdomain` が 403 を返す場合は、不足している権限を報告し、Token のスコープを広げないでください。**コアインストールに R2 は不要です**。Workers R2 Storage は artifact relay のためにだけ追加します。

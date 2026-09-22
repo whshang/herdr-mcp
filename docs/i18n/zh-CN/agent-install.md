@@ -45,6 +45,17 @@ herdr-mcp doctor
 
 macOS 在 Cloudflare 工作前先执行 `herdr-mcp permissions status`。仅当它返回 `needs_setup` 时，集中引导用户在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中为稳定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker` 授权一次，再执行 `herdr-mcp permissions verify`。setup 前不要主动探测受保护路径，`sudo` 也不能替代。broker 只承担 MCP 文件/Git 的 TCC，不是 pane shell；pane/Agent 的 TCC 取决于其执行宿主。后续复用这一次授权，避免每个进程各弹一次。普通 runtime 更新保留已授权 broker；只有明确的 compatibility migration 才执行 `permissions setup --upgrade-broker`。Linux/Windows 不走这套 TCC 流程。Linux 使用 release 自带的受支持 user-service / process backend，不套用 macOS launchd 假设。Windows 使用当前用户 Startup 文件夹快捷方式登录自启动、独立用户进程与 Credential Manager，不要求提权；Herdr API 不可达时会尝试启动已安装的 `herdr server`。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
 
+### 可选：快速语义判断
+
+核心 runtime 健康后，向用户说明快速 decision 模型属于可选能力。默认推荐参考 [TypeSafe.ai](https://typesafe.ai/)，它不是必选 Provider，也不能阻塞安装。用户可以在那里创建 API Key，然后执行：
+
+```bash
+herdr-mcp semantic setup
+herdr-mcp semantic status
+```
+
+`semantic setup` 通过隐藏终端输入读取 API Key，绝不从 argv 接收。其他兼容 Provider 可通过 `--name`、`--protocol`、`--url`、`--model` 配置。用户跳过这一项时，Herdr 继续保持原有确定性行为，安装流程正常继续。
+
 ## 4. 第一台 Worker：Cloudflare + bootstrap
 
 Herdr 使用 Cloudflare Workers Free 即可，不需要绑卡。用户没有 Cloudflare 账号时，先明确告诉他可免费注册，推荐直接用 Google 登录，步骤最少。需要 Token 时打开 <https://dash.cloudflare.com/profile/api-tokens>。推荐 Cloudflare 的 **Edit Cloudflare Workers** 模板并限定到本次使用的 Account。自定义 Token 的核心预检需要 **Account Settings → Read** 和 **Workers Scripts → Write/Edit**。Token 验证有效但 `workers/subdomain` 返回 403 时，指出缺少的权限，不要无根据扩大权限。**核心安装不需要 R2**；只有用户明确启用 artifact relay 时才增加 Workers R2 Storage。

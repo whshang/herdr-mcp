@@ -925,6 +925,39 @@ pub fn extension_evaluate_json(payload: &Value) -> Value {
     }
 }
 
+pub(crate) fn evaluate_decision_route_json(
+    route: &crate::config::SemanticRouteConfig,
+    payload: &Value,
+) -> Value {
+    let request = match semantic_request_from_json(payload) {
+        Ok(request) => request,
+        Err(error) => return json!({"ok": false, "code": error.public_code()}),
+    };
+    let Some(protocol) = SemanticProtocol::parse(&route.protocol) else {
+        return json!({"ok": false, "code": "route_invalid"});
+    };
+    if !matches!(
+        protocol,
+        SemanticProtocol::Decision | SemanticProtocol::DecisionVercel
+    ) {
+        return json!({"ok": false, "code": "route_not_typed_decision"});
+    }
+    let provider = match HttpSemanticProvider::new(
+        format!("config-route:{}", route.name),
+        protocol,
+        route.api_key.clone().unwrap_or_default(),
+        route.url.clone().unwrap_or_default(),
+        route.model.clone().unwrap_or_default(),
+    ) {
+        Ok(provider) => provider,
+        Err(error) => return json!({"ok": false, "code": error.public_code()}),
+    };
+    match provider.evaluate(&request, DECISION_ATTEMPT_TIMEOUT) {
+        Ok(response) => response.to_json(),
+        Err(error) => json!({"ok": false, "code": error.public_code()}),
+    }
+}
+
 pub fn extension_chat_json(payload: &Value) -> Value {
     let Some(object) = payload.as_object() else {
         return json!({"ok": false, "code": "invalid_request"});
