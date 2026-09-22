@@ -29,11 +29,14 @@ test("user gets one narrow Jev question | Given a settled turn | When the semant
   assert.match(request.questions.has_unfinished_work.criteria.false, /requires a user\/external decision/i);
 });
 
-test("user gets the calibrated fixed Jev boundary | Given continue done and middle probabilities | When Jev is interpreted | Then 0.70 separates continue done and fallback", () => {
+test("user gets the fixed Jev tri-state boundary | Given positive negative and middle probabilities | When Jev is interpreted | Then 0.80 and 0.20 bound true false and uncertainty", () => {
   const answer = (noul) => ({ model: "jev-latest", answers: { has_unfinished_work: { type: "noul", noul } } });
-  assert.equal(DEFAULT_JEV_THRESHOLD, 0.70);
-  assert.equal(interpretJevPendingWorkAnswer(answer(0.70)).signal, "continue");
-  assert.equal(interpretJevPendingWorkAnswer(answer(0.30)).signal, "done");
+  assert.equal(DEFAULT_JEV_THRESHOLD, 0.80);
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.80)).result, "true");
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.80)).signal, "continue");
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.20)).result, "false");
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.20)).signal, "done");
+  assert.equal(interpretJevPendingWorkAnswer(answer(0.55)).result, "uncertain");
   assert.equal(interpretJevPendingWorkAnswer(answer(0.55)).signal, "uncertain");
   assert.equal(interpretJevPendingWorkAnswer(answer(2)).ok, false);
 
