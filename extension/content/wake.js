@@ -905,11 +905,12 @@ function normalizeHerdrMentionAlias(value) {
       await wait(120);
     }
 
-    // ChatGPT commits the app token after the user finishes the mention query
-    // and types a separator. Without this commit step the picker can keep the
-    // transient search text and later restore the original composer content.
-    const separator = await insertMainWorld(" ", selector, true);
-    if (!separator.ok) return false;
+    // ChatGPT's app picker commits the mention with a keyboard confirmation.
+    // Space is treated inconsistently by the current composer and may close
+    // the picker while leaving raw text behind. Prefer Tab, which follows the
+    // user selection flow without adding a visible separator.
+    const confirm = await insertMainWorld("\t", selector, true);
+    if (!confirm.ok) return false;
 
     const deadline = Date.now() + 2000;
     while (Date.now() < deadline) {
