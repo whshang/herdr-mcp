@@ -889,21 +889,12 @@ function normalizeHerdrMentionAlias(value) {
     const selector = ADAPTER.getWatchMainWorldSelector();
     if (!selector) return false;
 
-    // A plain inserted "@alias" is not enough. ChatGPT opens the app picker
-    // from the @ keystroke and consumes following characters as search input.
-    // Type the trigger first, then the query, and let the existing app picker
-    // selection path decide the final pill state.
-    const trigger = await insertMainWorld("@", selector);
-    if (!trigger.ok) return false;
-    await wait(250);
-    // ChatGPT's picker reacts to keyboard-like incremental input. A single
-    // inserted string can bypass the picker state machine, so feed the query
-    // one character at a time and allow React to observe each update.
-    for (const char of alias) {
-      const query = await insertMainWorld(char, selector, true);
-      if (!query.ok) return false;
-      await wait(120);
-    }
+    // ChatGPT's picker can treat synthetic character-by-character insertion as
+    // replacement of the current search token. Use a complete paste-like token
+    // so the composer receives the same value a user can paste.
+    const mention = await insertMainWorld(`@${alias}`, selector);
+    if (!mention.ok) return false;
+    await wait(500);
 
     // ChatGPT's app picker commits the mention with a keyboard confirmation.
     // Space is treated inconsistently by the current composer and may close
