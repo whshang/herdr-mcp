@@ -902,8 +902,14 @@ function normalizeHerdrMentionAlias(value) {
     for (const char of alias) {
       const query = await insertMainWorld(char, selector, true);
       if (!query.ok) return false;
-      await wait(80);
+      await wait(120);
     }
+
+    // ChatGPT commits the app token after the user finishes the mention query
+    // and types a separator. Without this commit step the picker can keep the
+    // transient search text and later restore the original composer content.
+    const separator = await insertMainWorld(" ", selector, true);
+    if (!separator.ok) return false;
 
     const deadline = Date.now() + 2000;
     while (Date.now() < deadline) {
