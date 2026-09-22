@@ -32,7 +32,7 @@ The model keeps planning. Your computers keep the real state. Small tasks can ru
 | macOS Apple Silicon | Production | Physical-machine runtime, TCC, Link, Connector and browser-extension UAT |
 | Linux x86_64 | Production | Physical Debian installation/lifecycle + static release qualification |
 | Linux ARM64 / aarch64 | Production | Physical NanoPi R5C Debian 11 install/Link UAT + native ARM64 static release qualification |
-| Windows x86_64 | Candidate | Hosted Windows CI/release build; physical UAT not completed |
+| Windows x86_64 | Candidate | Hosted Windows CI/release build + physical-machine install/recovery and real Connector conversation exercised; Production promotion still gated on exact-current-main #394 evidence |
 | Windows ARM64 / aarch64 | Candidate | Native `windows-11-arm` CI/release build; physical UAT not completed |
 | WSL | Unsupported | No qualified host/guest filesystem or lifecycle boundary |
 
