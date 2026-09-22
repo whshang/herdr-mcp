@@ -896,11 +896,9 @@ function normalizeHerdrMentionAlias(value) {
     if (!mention.ok) return false;
     await wait(500);
 
-    // ChatGPT's app picker commits the mention with a keyboard confirmation.
-    // Space is treated inconsistently by the current composer and may close
-    // the picker while leaving raw text behind. Prefer Tab, which follows the
-    // user selection flow without adding a visible separator.
-    const confirm = await insertMainWorld("\t", selector, true);
+    // ChatGPT's app picker commits the single pasted candidate with Enter.
+    // Tab can move focus instead of selecting in some composer versions.
+    const confirm = await insertMainWorld("\n", selector, true);
     if (!confirm.ok) return false;
 
     const deadline = Date.now() + 2000;
