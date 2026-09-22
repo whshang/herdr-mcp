@@ -290,3 +290,5 @@ The installed `herdr --skill` is useful as **release-matched native Herdr refere
 ## 10. Completion discipline
 
 For operational changes, do not declare success from code or unit tests alone. Verify the relevant real boundary: local runtime, persistent Link, Edge status, browser extension smoke, GitHub workflow syntax, or public endpoint as appropriate. Keep rollback evidence until the replacement path has been proven from the same client that matters.
+
+For multi-step planner work, keep a lightweight current-turn acceptance checklist when the user provides a completion goal. Before a final response, reconcile completed evidence against remaining checks. If required checks remain, continue the planned workflow instead of reporting completion. This checklist is planner guidance only; it does not create a Runtime task owner, scheduler, or new persistence model.
