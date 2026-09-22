@@ -7735,9 +7735,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const range = document.createRange();
           if (append) {
             // Preserve provider-owned composer nodes such as app mention pills.
-            // Only move the caret to the end of the editor before inserting text.
-            range.selectNodeContents(el);
-            range.collapse(false);
+            // Do not select the editor contents after a pill was inserted. Some
+            // provider editors rebuild the whole composer from that selection
+            // and drop the app reference. Place the caret after the current
+            // editor tree instead.
+            const tail = el.lastChild;
+            if (tail) {
+              range.selectNodeContents(tail);
+              range.collapse(false);
+            } else {
+              range.selectNodeContents(el);
+              range.collapse(false);
+            }
           } else {
             // Normal insertion replaces the current composer content.
             range.selectNodeContents(el);
