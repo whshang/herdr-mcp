@@ -896,8 +896,14 @@ function normalizeHerdrMentionAlias(value) {
     const trigger = await insertMainWorld("@", selector);
     if (!trigger.ok) return false;
     await wait(250);
-    const query = await insertMainWorld(alias, selector, true);
-    if (!query.ok) return false;
+    // ChatGPT's picker reacts to keyboard-like incremental input. A single
+    // inserted string can bypass the picker state machine, so feed the query
+    // one character at a time and allow React to observe each update.
+    for (const char of alias) {
+      const query = await insertMainWorld(char, selector, true);
+      if (!query.ok) return false;
+      await wait(80);
+    }
 
     const deadline = Date.now() + 2000;
     while (Date.now() < deadline) {
