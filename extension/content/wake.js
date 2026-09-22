@@ -954,6 +954,19 @@ function normalizeHerdrMentionAlias(value) {
     return { ok: false, referenced: false, alias, error: "herdr-reference-selection-not-observed" };
   }
 
+  async function ensureComposerAppReferences(apps = []) {
+    const requested = [...new Set(apps.map((app) => normalizeHerdrMentionAlias(app)).filter(Boolean))];
+    if (!requested.length) return { ok: true, apps: [] };
+    for (const app of requested) {
+      if (ADAPTER.getSelectedComposerApps?.().includes(app)) continue;
+      const activated = await activateHerdrComposerAppByTyping(app);
+      if (!activated) {
+        return { ok: false, error: `composer-app-${app}-selection-not-observed` };
+      }
+    }
+    return { ok: true, apps: ADAPTER.getSelectedComposerApps() };
+  }
+
   function captureSubmitAckBaseline(sendButton = null) {
     return {
       composer: composerNorm(),
