@@ -933,16 +933,9 @@ function normalizeHerdrMentionAlias(value) {
       return { ok: true, referenced: true, alias };
     }
 
-    // Provider editor changes can stop synthetic typing from opening the picker.
-    // Clear the raw @alias and reuse the existing exact Apps-menu selection,
-    // which succeeds only after a provider-owned pill is observed.
-    await clearComposer();
-    for (let i = 0; i < 8 && ADAPTER.inputHasContent(); i += 1) await wait(50);
-    const selected = await ensureRequiredComposerApps([alias]);
-    if (!selected.ok) {
-      return { ok: false, referenced: false, alias, error: `herdr-reference-${selected.error}` };
-    }
-    return { ok: true, referenced: true, alias };
+    // Do not send a raw @alias message when provider-owned selection failed.
+    // The user-visible task must not continue without a verified Herdr app pill.
+    return { ok: false, referenced: false, alias, error: "herdr-reference-selection-not-observed" };
   }
 
   function captureSubmitAckBaseline(sendButton = null) {
