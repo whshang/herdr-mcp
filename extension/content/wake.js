@@ -463,6 +463,20 @@ function normalizeHerdrMentionAlias(value) {
     return mainWorldCommitted(text);
   }
 
+  async function ensureTextAfterComposerAppSelection(text) {
+    const selector = ADAPTER.getWatchMainWorldSelector();
+    if (!selector) return false;
+    // Keep the provider-owned app pill. Replacing the composer value after
+    // selection removes the pill, so append through the editor path.
+    const result = await insertMainWorld(` ${text}`, selector, true);
+    if (!result.ok) return false;
+    for (let i = 0; i < 10; i += 1) {
+      await wait(100);
+      if (mainWorldCommitted(text)) return true;
+    }
+    return mainWorldCommitted(text);
+  }
+
   async function configuredHerdrMentionAlias() {
     try {
       const settings = await chrome.storage.local.get(["herdrMentionAlias"]);
@@ -1254,7 +1268,7 @@ function normalizeHerdrMentionAlias(value) {
       let committedOk = false;
       if (ADAPTER.needsMainWorldInsert) {
         committedOk = herdrReference.referenced
-          ? await ensureAppendedCommitted(text)
+          ? await ensureTextAfterComposerAppSelection(text)
           : await ensureCommitted(text, boundedBrowserActuation ? 1 : 3);
         if (!committedOk) {
           if (herdrReference.referenced) await clearComposer();
