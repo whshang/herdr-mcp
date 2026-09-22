@@ -258,10 +258,9 @@ fn project_snapshot(
             "refresh": "herdr-mcp scan --probe",
         }),
     );
-    output.insert(
-        "semantic_judgment".to_owned(),
-        crate::semantic::SemanticService::from_config().capability_json(),
-    );
+    let semantic = crate::semantic::SemanticService::from_config().capability_json();
+    output.insert("semantic".to_owned(), semantic.clone());
+    output.insert("semantic_judgment".to_owned(), semantic);
     if source == SnapshotSource::Lists {
         output.insert(
             "warnings".to_owned(),

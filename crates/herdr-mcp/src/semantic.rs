@@ -4,14 +4,12 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Mutex, OnceLock, atomic::AtomicUsize};
 use std::time::{Duration, Instant};
 use url::Url;
 
-pub const DEFAULT_DECISION_THRESHOLD: f64 = 0.70;
+pub const DEFAULT_DECISION_THRESHOLD: f64 = 0.80;
+pub const DEFAULT_NEGATIVE_DECISION_THRESHOLD: f64 = 0.20;
 pub const EDGE_SEMANTIC_PROVIDER_ID: &str = "edge-semantic";
 
 /// Vercel AI Gateway requires this protocol version header before evaluating the request.
@@ -21,6 +19,8 @@ const VERCEL_GATEWAY_PROTOCOL_VERSION: &str = "0.0.1";
 /// spend the failover allowance of the routes behind it.
 const DECISION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 const DECISION_POOL_BUDGET: Duration = Duration::from_secs(10);
+const CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const CHAT_POOL_BUDGET: Duration = Duration::from_secs(12);
 const SEMANTIC_ATTEMPT_LIMIT: usize = 3;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 const MAX_QUESTIONS: usize = 32;
@@ -33,6 +33,55 @@ static EDGE_PROXY_AVAILABILITY: Mutex<Option<(Instant, crate::worker::SemanticPr
 static ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static CHAT_ROUTE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static ROUTE_COOLDOWNS: OnceLock<Mutex<BTreeMap<String, Instant>>> = OnceLock::new();
+static SEMANTIC_TRACES: OnceLock<Mutex<BTreeMap<&'static str, SemanticTrace>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct SemanticTrace {
+    route: String,
+    protocol: String,
+    latency_ms: u64,
+    result_class: String,
+    confidence: Option<f64>,
+    fallback_reason: Option<String>,
+}
+
+impl SemanticTrace {
+    fn to_json(&self) -> Value {
+        json!({
+            "route": self.route,
+            "protocol": self.protocol,
+            "latency_ms": self.latency_ms,
+            "result_class": self.result_class,
+            "confidence": self.confidence,
+            "fallback_reason": self.fallback_reason,
+        })
+    }
+}
+
+fn semantic_traces() -> &'static Mutex<BTreeMap<&'static str, SemanticTrace>> {
+    SEMANTIC_TRACES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn record_semantic_trace(boundary: &'static str, trace: SemanticTrace) {
+    if let Ok(mut traces) = semantic_traces().lock() {
+        traces.insert(boundary, trace);
+    }
+}
+
+fn semantic_trace_json(boundary: &'static str) -> Value {
+    semantic_traces()
+        .lock()
+        .ok()
+        .and_then(|traces| traces.get(boundary).cloned())
+        .map(|trace| {
+            let mut value = trace.to_json();
+            if let Some(object) = value.as_object_mut() {
+                object.insert("boundary".to_owned(), json!(boundary));
+            }
+            value
+        })
+        .unwrap_or(Value::Null)
+}
 
 #[derive(Debug, Clone)]
 pub enum SemanticQuestion {
@@ -244,7 +293,11 @@ pub enum SemanticAnswer {
 impl SemanticAnswer {
     fn to_json(&self) -> Value {
         match self {
-            Self::Noul(probability) => json!({"type": "noul", "noul": probability}),
+            Self::Noul(probability) => json!({
+                "type": "noul",
+                "noul": probability,
+                "result": semantic_truth_result(*probability),
+            }),
             Self::Choice {
                 choice,
                 probabilities,
@@ -275,6 +328,10 @@ impl SemanticAnswer {
         }
     }
 
+    pub fn noul_result(&self) -> Option<&'static str> {
+        self.noul_probability().map(semantic_truth_result)
+    }
+
     pub fn choice_value(&self) -> Option<(&str, &BTreeMap<String, f64>, f64)> {
         match self {
             Self::Choice {
@@ -295,6 +352,16 @@ impl SemanticAnswer {
             } => Some((*score, probabilities, *confidence)),
             _ => None,
         }
+    }
+}
+
+fn semantic_truth_result(probability: f64) -> &'static str {
+    if probability >= DEFAULT_DECISION_THRESHOLD {
+        "true"
+    } else if probability <= DEFAULT_NEGATIVE_DECISION_THRESHOLD {
+        "false"
+    } else {
+        "uncertain"
     }
 }
 
@@ -320,6 +387,17 @@ impl SemanticResponse {
                 .collect::<Map<_, _>>(),
         })
     }
+
+    fn confidence(&self) -> Option<f64> {
+        self.answers
+            .values()
+            .map(|answer| match answer {
+                SemanticAnswer::Noul(probability) => probability.max(1.0 - probability),
+                SemanticAnswer::Choice { confidence, .. }
+                | SemanticAnswer::Score { confidence, .. } => *confidence,
+            })
+            .reduce(f64::max)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,8 +408,25 @@ impl SemanticError {
         Self(code.into())
     }
 
+    fn fallback_json(&self) -> Value {
+        json!({
+            "attempted": self.code() != "not_configured",
+            "used": false,
+            "reason": self.code(),
+            "fallback": "deterministic"
+        })
+    }
+
     pub fn code(&self) -> &str {
         &self.0
+    }
+
+    fn public_code(&self) -> &str {
+        if self.code() == "timeout" {
+            "provider_timeout"
+        } else {
+            self.code()
+        }
     }
 
     fn http_status(&self) -> Option<u16> {
@@ -367,6 +462,7 @@ impl SemanticError {
 
 trait SemanticProvider: Send + Sync {
     fn id(&self) -> &str;
+    fn protocol(&self) -> &'static str;
     fn evaluate(
         &self,
         request: &SemanticRequest,
@@ -402,6 +498,7 @@ pub struct SemanticChatResponse {
 
 trait SemanticChatProvider: Send + Sync {
     fn id(&self) -> &str;
+    fn protocol(&self) -> &'static str;
     fn chat(
         &self,
         messages: &[SemanticChatMessage],
@@ -466,24 +563,39 @@ impl RouteBudget {
     fn split(attempt: Duration, total: Duration) -> Self {
         Self { attempt, total }
     }
-
-    /// One caller-owned allowance that a single route may spend in full.
-    fn single(total: Duration) -> Self {
-        Self {
-            attempt: total,
-            total,
-        }
-    }
 }
 
+#[cfg(test)]
 fn execute_route_pool<T>(
     route_count: usize,
     cursor: &AtomicUsize,
     budget: RouteBudget,
-    mut route_id: impl FnMut(usize) -> String,
-    mut call: impl FnMut(usize, Duration) -> Result<T, SemanticError>,
+    route_id: impl FnMut(usize) -> String,
+    call: impl FnMut(usize, Duration) -> Result<T, SemanticError>,
 ) -> Result<T, SemanticError> {
-    let start = cursor.fetch_add(1, Ordering::Relaxed) % route_count;
+    execute_route_pool_with_observer(
+        route_count,
+        cursor,
+        budget,
+        route_id,
+        |_| "unknown",
+        call,
+        |_, _, _, _| {},
+    )
+}
+
+fn execute_route_pool_with_observer<T>(
+    route_count: usize,
+    _cursor: &AtomicUsize,
+    budget: RouteBudget,
+    mut route_id: impl FnMut(usize) -> String,
+    mut route_protocol: impl FnMut(usize) -> &'static str,
+    mut call: impl FnMut(usize, Duration) -> Result<T, SemanticError>,
+    mut observe: impl FnMut(&str, &'static str, Duration, &Result<T, SemanticError>),
+) -> Result<T, SemanticError> {
+    // Config order is the priority order. Failed routes are skipped through cooldown,
+    // but successful requests keep the configured primary route.
+    let start = 0;
     let deadline = Instant::now() + budget.total;
     let mut last = SemanticError::new("provider_unavailable");
     let mut attempted = false;
@@ -505,7 +617,10 @@ fn execute_route_pool<T>(
         }
         attempted = true;
         attempts += 1;
-        match call(index, remaining.min(budget.attempt)) {
+        let started_at = Instant::now();
+        let result = call(index, remaining.min(budget.attempt));
+        observe(&id, route_protocol(index), started_at.elapsed(), &result);
+        match result {
             Ok(response) => {
                 clear_route_cooldown(&id);
                 return Ok(response);
@@ -611,7 +726,10 @@ impl SemanticService {
         request: &SemanticRequest,
         timeout: Duration,
     ) -> Result<SemanticResponse, SemanticError> {
-        self.evaluate_with_budget(request, RouteBudget::single(timeout))
+        self.evaluate_with_budget(
+            request,
+            RouteBudget::split(timeout.min(DECISION_ATTEMPT_TIMEOUT), timeout),
+        )
     }
 
     fn evaluate_with_budget(
@@ -621,14 +739,51 @@ impl SemanticService {
     ) -> Result<SemanticResponse, SemanticError> {
         request.validate()?;
         if self.providers.is_empty() {
+            record_semantic_trace(
+                "typed_decision",
+                SemanticTrace {
+                    route: "none".to_owned(),
+                    protocol: "decision".to_owned(),
+                    latency_ms: 0,
+                    result_class: "not_configured".to_owned(),
+                    confidence: None,
+                    fallback_reason: Some("not_configured".to_owned()),
+                },
+            );
             return Err(SemanticError::new("not_configured"));
         }
-        execute_route_pool(
+        execute_route_pool_with_observer(
             self.providers.len(),
             &ROUTE_CURSOR,
             budget,
             |index| self.providers[index].id().to_owned(),
+            |index| self.providers[index].protocol(),
             |index, remaining| self.providers[index].evaluate(request, remaining),
+            |route, protocol, latency, result| {
+                let (result_class, confidence, fallback_reason) = match result {
+                    Ok(response) => ("used", response.confidence(), None),
+                    Err(error) => (
+                        match error.code() {
+                            "timeout" => "timeout",
+                            "invalid_response" => "invalid_response",
+                            _ => "provider_error",
+                        },
+                        None,
+                        Some(error.code().to_owned()),
+                    ),
+                };
+                record_semantic_trace(
+                    "typed_decision",
+                    SemanticTrace {
+                        route: route.to_owned(),
+                        protocol: protocol.to_owned(),
+                        latency_ms: latency.as_millis().min(u64::MAX as u128) as u64,
+                        result_class: result_class.to_owned(),
+                        confidence,
+                        fallback_reason,
+                    },
+                );
+            },
         )
     }
 
@@ -644,24 +799,109 @@ impl SemanticService {
             return Err(SemanticError::new("invalid_request"));
         }
         if self.chat_providers.is_empty() {
+            record_semantic_trace(
+                "chat_semantic",
+                SemanticTrace {
+                    route: "none".to_owned(),
+                    protocol: "openai-chat".to_owned(),
+                    latency_ms: 0,
+                    result_class: "not_configured".to_owned(),
+                    confidence: None,
+                    fallback_reason: Some("not_configured".to_owned()),
+                },
+            );
             return Err(SemanticError::new("not_configured"));
         }
-        execute_route_pool(
+        execute_route_pool_with_observer(
             self.chat_providers.len(),
             &CHAT_ROUTE_CURSOR,
-            RouteBudget::single(timeout),
+            RouteBudget::split(
+                timeout.min(CHAT_ATTEMPT_TIMEOUT),
+                timeout.min(CHAT_POOL_BUDGET),
+            ),
             |index| self.chat_providers[index].id().to_owned(),
+            |index| self.chat_providers[index].protocol(),
             |index, remaining| self.chat_providers[index].chat(messages, remaining),
+            |route, protocol, latency, result| {
+                let (result_class, fallback_reason) = match result {
+                    Ok(_) => ("used", None),
+                    Err(error) => (
+                        match error.code() {
+                            "timeout" => "timeout",
+                            "invalid_response" => "invalid_response",
+                            _ => "provider_error",
+                        },
+                        Some(error.code().to_owned()),
+                    ),
+                };
+                record_semantic_trace(
+                    "chat_semantic",
+                    SemanticTrace {
+                        route: route.to_owned(),
+                        protocol: protocol.to_owned(),
+                        latency_ms: latency.as_millis().min(u64::MAX as u128) as u64,
+                        result_class: result_class.to_owned(),
+                        confidence: None,
+                        fallback_reason,
+                    },
+                );
+            },
         )
     }
 
     pub fn capability_json(&self) -> Value {
+        let configured = self.configured() || self.chat_configured();
+        let typed_trace = semantic_trace_json("typed_decision");
+        let chat_trace = semantic_trace_json("chat_semantic");
+        let typed_degraded = typed_trace["route"].as_str().is_some_and(|route| {
+            self.providers.iter().any(|provider| provider.id() == route)
+                && typed_trace["result_class"].as_str().is_some_and(|class| {
+                    matches!(class, "timeout" | "invalid_response" | "provider_error")
+                })
+        });
+        let chat_degraded = chat_trace["route"].as_str().is_some_and(|route| {
+            self.chat_providers
+                .iter()
+                .any(|provider| provider.id() == route)
+                && chat_trace["result_class"].as_str().is_some_and(|class| {
+                    matches!(class, "timeout" | "invalid_response" | "provider_error")
+                })
+        });
+        let degraded = typed_degraded || chat_degraded;
+        let typed_route = self
+            .providers
+            .iter()
+            .find(|provider| !route_is_cooling_down(provider.id()))
+            .or_else(|| self.providers.first())
+            .map(|provider| provider.id());
+        let chat_route = self
+            .chat_providers
+            .iter()
+            .find(|provider| !route_is_cooling_down(provider.id()))
+            .or_else(|| self.chat_providers.first())
+            .map(|provider| provider.id());
+
         json!({
-            "available": self.configured() || self.chat_configured(),
+            "configured": configured,
+            "available": configured,
+            "reason": if configured { Value::Null } else { json!("not_configured") },
             "evaluate_available": self.configured(),
             "chat_available": self.chat_configured(),
+            "typed_route": typed_route,
+            "chat_route": chat_route,
             "providers": self.providers.iter().map(|provider| provider.id()).collect::<Vec<_>>(),
             "chat_providers": self.chat_providers.iter().map(|provider| provider.id()).collect::<Vec<_>>(),
+            "provider_state": if !configured {
+                "not_configured"
+            } else if degraded {
+                "degraded"
+            } else {
+                "ready"
+            },
+            "trace": {
+                "typed_decision": typed_trace,
+                "chat_semantic": chat_trace,
+            },
             "policy": "advisory_only",
             "fallback": "existing_behavior",
         })
@@ -679,7 +919,9 @@ pub fn extension_evaluate_json(payload: &Value) -> Value {
     };
     match SemanticService::from_config().evaluate(&request) {
         Ok(response) => response.to_json(),
-        Err(error) => json!({"ok": false, "code": error.code()}),
+        Err(error) => {
+            json!({"ok": false, "code": error.public_code(), "semantic": error.fallback_json()})
+        }
     }
 }
 
@@ -728,7 +970,9 @@ pub fn extension_chat_json(payload: &Value) -> Value {
             "content": response.content,
             "usage": response.usage,
         }),
-        Err(error) => json!({"ok": false, "code": error.code()}),
+        Err(error) => {
+            json!({"ok": false, "code": error.public_code(), "semantic": error.fallback_json()})
+        }
     }
 }
 
@@ -860,6 +1104,14 @@ impl SemanticProtocol {
             _ => None,
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::DecisionVercel => "decision-vercel",
+            Self::OpenAiChat => "openai-chat",
+        }
+    }
 }
 
 struct EdgeSemanticProvider;
@@ -867,6 +1119,10 @@ struct EdgeSemanticProvider;
 impl SemanticProvider for EdgeSemanticProvider {
     fn id(&self) -> &str {
         EDGE_SEMANTIC_PROVIDER_ID
+    }
+
+    fn protocol(&self) -> &'static str {
+        "decision"
     }
 
     fn evaluate(
@@ -896,6 +1152,10 @@ struct EdgeSemanticChatProvider;
 impl SemanticChatProvider for EdgeSemanticChatProvider {
     fn id(&self) -> &str {
         "edge-semantic-chat"
+    }
+
+    fn protocol(&self) -> &'static str {
+        "openai-chat"
     }
 
     fn chat(
@@ -989,6 +1249,10 @@ impl HttpSemanticProvider {
 impl SemanticProvider for HttpSemanticProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn protocol(&self) -> &'static str {
+        self.protocol.as_str()
     }
 
     fn evaluate(
@@ -1102,6 +1366,10 @@ impl OpenAiChatProvider {
 impl SemanticChatProvider for OpenAiChatProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn protocol(&self) -> &'static str {
+        "openai-chat"
     }
 
     fn chat(
@@ -1413,6 +1681,7 @@ mod tests {
     use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
     use std::thread;
 
     fn one_shot_server_with_status(status: u16, body: &'static str) -> String {
@@ -1435,8 +1704,25 @@ mod tests {
         one_shot_server_with_status(200, body)
     }
 
+    fn one_shot_slow_server(delay: Duration, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = stream.read(&mut request);
+            thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://127.0.0.1:{}/v1", address.port())
+    }
+
     #[test]
-    fn user_gets_typed_semantic_answers() {
+    fn typed_semantic_batches_multiple_questions_in_one_request() {
         let base_url = one_shot_server(
             r#"{"model":"jev-test","answers":{"edit":{"type":"noul","noul":0.96},"route":{"type":"choice","choice":"code","probabilities":{"code":0.9,"docs":0.1},"confidence":0.88},"effort":{"type":"score","score":1.7,"legend":{"0":"low","1":"medium","2":"high"},"probabilities":{"0":0.05,"1":0.2,"2":0.75},"confidence":0.81}}}"#,
         );
@@ -1498,7 +1784,126 @@ mod tests {
     }
 
     #[test]
-    fn provider_pool_rotates_healthy_typed_routes() {
+    fn noul_results_use_one_true_false_uncertain_contract() {
+        assert_eq!(SemanticAnswer::Noul(0.80).noul_result(), Some("true"));
+        assert_eq!(SemanticAnswer::Noul(0.20).noul_result(), Some("false"));
+        assert_eq!(SemanticAnswer::Noul(0.50).noul_result(), Some("uncertain"));
+        assert_eq!(SemanticAnswer::Noul(0.79).noul_result(), Some("uncertain"));
+        assert_eq!(SemanticAnswer::Noul(0.21).noul_result(), Some("uncertain"));
+    }
+
+    #[test]
+    fn capability_reports_configuration_routes_and_trace_without_affecting_health() {
+        let _guard = crate::test_env::lock();
+        if let Ok(mut traces) = semantic_traces().lock() {
+            traces.clear();
+        }
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
+
+        let empty = SemanticService::test_empty().capability_json();
+        assert_eq!(empty["configured"], false);
+        assert_eq!(empty["available"], false);
+        assert_eq!(empty["reason"], "not_configured");
+        assert!(empty["typed_route"].is_null());
+        assert_eq!(empty["provider_state"], "not_configured");
+
+        let url =
+            one_shot_server(r#"{"model":"jev-test","answers":{"q":{"type":"noul","noul":0.9}}}"#);
+        let service = SemanticService::test_decision_route("trace-route", &url).unwrap();
+        let request = SemanticRequest::new(json!({"task":"trace"})).ask(
+            "q",
+            SemanticQuestion::noul("Can work continue?", "yes", "no"),
+        );
+        service.evaluate(&request).unwrap();
+        let capability = service.capability_json();
+        assert_eq!(capability["configured"], true);
+        assert_eq!(capability["available"], true);
+        assert!(capability["reason"].is_null());
+        assert_eq!(capability["typed_route"], "trace-route");
+        assert_eq!(capability["provider_state"], "ready");
+        assert_eq!(
+            capability["trace"]["typed_decision"]["boundary"],
+            "typed_decision"
+        );
+        assert_eq!(
+            capability["trace"]["typed_decision"]["route"],
+            "trace-route"
+        );
+        assert_eq!(
+            capability["trace"]["typed_decision"]["protocol"],
+            "decision"
+        );
+        assert_eq!(
+            capability["trace"]["typed_decision"]["result_class"],
+            "used"
+        );
+        assert_eq!(capability["trace"]["typed_decision"]["confidence"], 0.9);
+        assert!(capability["trace"]["typed_decision"]["fallback_reason"].is_null());
+    }
+
+    #[test]
+    fn provider_timeout_is_explicit_and_keeps_deterministic_fallback() {
+        let _guard = crate::test_env::lock();
+        if let Ok(mut traces) = semantic_traces().lock() {
+            traces.clear();
+        }
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
+
+        let url = one_shot_slow_server(
+            Duration::from_millis(100),
+            r#"{"model":"jev-test","answers":{"q":{"type":"noul","noul":0.9}}}"#,
+        );
+        let service = SemanticService::test_decision_route("timeout-route", &url).unwrap();
+        let request = SemanticRequest::new(json!({"task":"timeout"})).ask(
+            "q",
+            SemanticQuestion::noul("Can work continue?", "yes", "no"),
+        );
+        let error = service
+            .evaluate_with_timeout(&request, Duration::from_millis(20))
+            .unwrap_err();
+        assert_eq!(error.code(), "timeout");
+        assert_eq!(error.public_code(), "provider_timeout");
+        assert_eq!(error.fallback_json()["attempted"], true);
+        assert_eq!(error.fallback_json()["used"], false);
+        assert_eq!(error.fallback_json()["reason"], "timeout");
+        assert_eq!(error.fallback_json()["fallback"], "deterministic");
+
+        let capability = service.capability_json();
+        assert_eq!(capability["provider_state"], "degraded");
+        assert_eq!(
+            capability["trace"]["typed_decision"]["result_class"],
+            "timeout"
+        );
+        assert_eq!(
+            capability["trace"]["typed_decision"]["fallback_reason"],
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn malformed_semantic_response_never_becomes_false() {
+        let _guard = crate::test_env::lock();
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
+        let url =
+            one_shot_server(r#"{"model":"jev-test","answers":{"q":{"type":"noul","noul":"bad"}}}"#);
+        let service = SemanticService::test_decision_route("bad-response-route", &url).unwrap();
+        let request = SemanticRequest::new(json!({"task":"bad-response"})).ask(
+            "q",
+            SemanticQuestion::noul("Can work continue?", "yes", "no"),
+        );
+        let error = service.evaluate(&request).unwrap_err();
+        assert_eq!(error.code(), "invalid_response");
+        assert_eq!(service.capability_json()["provider_state"], "degraded");
+    }
+
+    #[test]
+    fn provider_pool_keeps_primary_until_failure_then_uses_backup() {
         let _guard = crate::test_env::lock();
         ROUTE_CURSOR.store(0, Ordering::Relaxed);
         if let Ok(mut cooldowns) = route_cooldowns().lock() {

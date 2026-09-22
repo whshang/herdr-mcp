@@ -486,6 +486,51 @@ pub fn print_doctor(
     );
     println!("{}", crate::child_process::doctor_line());
     println!("{}", standalone_browser.doctor_line());
+    let semantic = crate::semantic::SemanticService::from_config().capability_json();
+    let semantic_configured = semantic["configured"].as_bool().unwrap_or(false);
+    let semantic_degraded = semantic["provider_state"].as_str() == Some("degraded");
+    let typed_result = semantic["trace"]["typed_decision"]["result_class"].as_str();
+    let chat_result = semantic["trace"]["chat_semantic"]["result_class"].as_str();
+    let capability_state = |configured: bool, result: Option<&str>| {
+        if !configured {
+            "OPTIONAL"
+        } else if matches!(
+            result,
+            Some("timeout" | "invalid_response" | "provider_error")
+        ) {
+            "DEGRADED"
+        } else {
+            "PASS"
+        }
+    };
+    println!(
+        "LAYER semantic-acceleration state={} typed={} chat={} policy={} fallback={} provider_state={} fallback_active={} typed_reason={} chat_reason={}",
+        if !semantic_configured {
+            "OPTIONAL"
+        } else if semantic_degraded {
+            "DEGRADED"
+        } else {
+            "READY"
+        },
+        capability_state(
+            semantic["evaluate_available"].as_bool().unwrap_or(false),
+            typed_result,
+        ),
+        capability_state(
+            semantic["chat_available"].as_bool().unwrap_or(false),
+            chat_result,
+        ),
+        semantic["policy"].as_str().unwrap_or("unknown"),
+        semantic["fallback"].as_str().unwrap_or("unknown"),
+        semantic["provider_state"].as_str().unwrap_or("unknown"),
+        semantic_degraded,
+        semantic["trace"]["typed_decision"]["fallback_reason"]
+            .as_str()
+            .unwrap_or("none"),
+        semantic["trace"]["chat_semantic"]["fallback_reason"]
+            .as_str()
+            .unwrap_or("none"),
+    );
     print_check(
         language.text(
             "local agent Skill",

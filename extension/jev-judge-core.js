@@ -1,7 +1,16 @@
 // Jev semantic gate — pure request/response helpers.
 // Provider/model selection lives in the Herdr Runtime semantic provider pool.
 
-export const DEFAULT_JEV_THRESHOLD = 0.70;
+export const DEFAULT_JEV_THRESHOLD = 0.80;
+
+function triStateNoul(probability, threshold) {
+  if (probability >= threshold) return "true";
+  const negativeThreshold = 1 - threshold;
+  if (probability <= negativeThreshold || Math.abs(probability - negativeThreshold) < 1e-12) {
+    return "false";
+  }
+  return "uncertain";
+}
 
 export function normalizeJevJudgeThreshold(value) {
   const n = Number(value);
@@ -136,6 +145,12 @@ export function interpretJevGoalSemanticAnswer(payload, threshold = DEFAULT_JEV_
     ok: true,
     threshold: t,
     probabilities,
+    states: Object.fromEntries(
+      JEV_GOAL_SIGNAL_KEYS.map((key) => [
+        key,
+        triStateNoul(probabilities[key], t),
+      ]),
+    ),
     strong: JEV_GOAL_SIGNAL_KEYS.filter((key) => probabilities[key] >= t),
     model: typeof payload?.model === "string" ? payload.model : null,
     usage: payload?.usage && typeof payload.usage === "object" ? payload.usage : null,
@@ -156,7 +171,8 @@ export function interpretJevPendingWorkAnswer(payload, threshold = DEFAULT_JEV_T
     ok: true,
     probability: p,
     threshold: t,
-    signal: p >= t ? "continue" : p <= 1 - t ? "done" : "uncertain",
+    result: triStateNoul(p, t),
+    signal: triStateNoul(p, t) === "true" ? "continue" : triStateNoul(p, t) === "false" ? "done" : "uncertain",
     handoffBoundaryStable: optionalNoul("handoff_boundary_stable"),
     usefulWorkRemaining: optionalNoul("useful_work_remaining"),
     model: typeof payload?.model === "string" ? payload.model : null,

@@ -103,6 +103,8 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
         json!({
             "method": PLANNING_ADVISE_METHOD,
             "source": "herdr_mcp_local",
+            "access": "read_only",
+            "advisory_only": true,
             "params": {
                 "properties": {
                     "deterministic_tool": {"type": "string"},
@@ -1358,6 +1360,10 @@ impl ProgressiveSkillService {
         json!({
             "ok": true,
             "decision_owner": "web_planner",
+            "planning_policy": {
+                "read_only": true,
+                "advisory_only": true,
+            },
             "advice": dispatch_advice_json(&advice),
             "semantic": semantic.unwrap_or_else(|| json!({
                 "attempted": false,
@@ -2337,14 +2343,14 @@ impl ProgressiveSkillService {
 
         let mut applied_fields = Vec::new();
         let mut profile = Map::new();
+        let mut profile_results = Map::new();
         let mut apply_positive = |answer_id: &str, param_key: &str, target: &mut bool| {
-            let probability = response
-                .answer(answer_id)
-                .and_then(SemanticAnswer::noul_probability);
+            let answer = response.answer(answer_id);
+            let probability = answer.and_then(SemanticAnswer::noul_probability);
+            let result = answer.and_then(SemanticAnswer::noul_result);
             profile.insert(param_key.to_owned(), json!(probability));
-            if params.get(param_key).is_none()
-                && probability.is_some_and(|value| value >= DEFAULT_DECISION_THRESHOLD)
-            {
+            profile_results.insert(param_key.to_owned(), json!(result));
+            if params.get(param_key).is_none() && result == Some("true") {
                 *target = true;
                 applied_fields.push(param_key.to_owned());
             }
@@ -2472,6 +2478,7 @@ impl ProgressiveSkillService {
             "model": response.model,
             "threshold": DEFAULT_DECISION_THRESHOLD,
             "profile": Value::Object(profile),
+            "profile_results": Value::Object(profile_results),
             "applied_fields": applied_fields,
             "routing": {
                 "skills": ranked("skill_route"),
@@ -4112,6 +4119,8 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0]["method"], PLANNING_ADVISE_METHOD);
         assert_eq!(methods[0]["source"], "herdr_mcp_local");
+        assert_eq!(methods[0]["access"], "read_only");
+        assert_eq!(methods[0]["advisory_only"], true);
         assert_eq!(
             methods[0]["params"]["properties"]["independent_units"]["maximum"],
             64
