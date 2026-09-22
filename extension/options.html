@@ -107,9 +107,9 @@
     .text-link:hover { text-decoration:underline; }
     .actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:16px; }
     .page-actions { justify-content:flex-end; margin-top:18px; }
-    #status { margin-top:12px; font-size:13px; padding:10px 12px; border-radius:6px; background:#f5f5f5; }
-    #status:empty { display:none; }
-    #status a { color:var(--accent); font-weight:600; }
+    .status-box { margin-top:12px; font-size:13px; padding:10px 12px; border-radius:6px; background:#f5f5f5; }
+    .status-box:empty { display:none; }
+    .status-box a { color:var(--accent); font-weight:600; }
     .ok { color:#107d32; }
     .err { color:#d8001b; white-space:pre-line; }
     @media (max-width: 520px) {
@@ -128,6 +128,15 @@
   </div>
 
   <section class="card">
+    <h2 id="title_diagnostics">Connection check</h2>
+    <div class="hint" id="hint_diagnostics"></div>
+    <div class="actions">
+      <button id="test">Test connection</button>
+    </div>
+    <div id="connectionStatus" class="status-box"></div>
+  </section>
+
+  <section class="card">
     <h2 id="title_general">General</h2>
     <div class="field">
       <label id="lab_locale">Language</label>
@@ -143,16 +152,6 @@
       <input type="checkbox" id="automationMode">
       <label id="lab_automation_mode" for="automationMode">Allow ChatGPT Project-shared Auto controls</label>
       <div class="hint" id="hint_automation_mode"></div>
-    </div>
-  </section>
-
-  <section class="card">
-    <h2 id="title_supported_webchat">Supported WebChat site access</h2>
-    <div class="hint" id="hint_supported_webchat"></div>
-    <div class="switch-row">
-      <input type="checkbox" id="grokSiteAccess">
-      <label id="lab_grok_site_access" for="grokSiteAccess">Allow grok.com</label>
-      <div class="hint" id="hint_grok_site_access"></div>
     </div>
   </section>
 
@@ -178,6 +177,10 @@
 
   <section class="card">
     <h2 id="title_continuity">Automation behavior</h2>
+    <div class="actions">
+      <button id="resetTemplates" type="button">Reset templates</button>
+      <div class="hint" id="hint_reset_templates"></div>
+    </div>
     <div class="field">
       <label id="lab_wake">Completion message template</label>
       <textarea id="template">{agent} · {pane} · {status} · {output}</textarea>
@@ -226,18 +229,10 @@
     <a class="text-link" id="runtime_config_guide" target="_blank" rel="noreferrer"></a>
   </section>
 
-  <section class="card">
-    <h2 id="title_diagnostics">Connection check</h2>
-    <div class="hint" id="hint_diagnostics"></div>
-    <div class="actions">
-      <button id="test">Test connection</button>
-    </div>
-  </section>
-
   <div class="actions page-actions">
     <button class="primary" id="save">Save settings</button>
   </div>
-  <div id="status"></div>
+  <div id="status" class="status-box"></div>
 
   <script type="module" src="options.js"></script>
 </body>

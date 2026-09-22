@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.119";
+const H2W_SCRIPT_VERSION = "0.1.120";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -72,8 +72,8 @@ const EXPERIMENTAL_SITE_PERMISSION_PATTERNS = {
   deepseek: "https://chat.deepseek.com/*",
   gemini: "https://gemini.google.com/*",
 };
-const SUPPORTED_OPTIONAL_TAB_URLS = { grok: "*://grok.com/*" };
-const SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS = { grok: "https://grok.com/*" };
+const SUPPORTED_DYNAMIC_TAB_URLS = { grok: "*://grok.com/*" };
+const SUPPORTED_SITE_PERMISSION_PATTERNS = { grok: "https://grok.com/*" };
 const EXPERIMENTAL_CONTENT_SCRIPTS = [
   {
     id: "herdr-experimental-zai",
@@ -114,7 +114,7 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
     persistAcrossSessions: true,
   },
 ];
-const SUPPORTED_OPTIONAL_CONTENT_SCRIPTS = [
+const SUPPORTED_DYNAMIC_CONTENT_SCRIPTS = [
   {
     id: "herdr-supported-grok",
     site: "grok",
@@ -467,8 +467,8 @@ async function activeH2WTabUrls() {
   for (const [site, pattern] of Object.entries(EXPERIMENTAL_TAB_URLS)) {
     if (experimentalSiteEnabled(site)) urls.push(pattern);
   }
-  for (const [site, pattern] of Object.entries(SUPPORTED_OPTIONAL_TAB_URLS)) {
-    const permissionPattern = SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS[site];
+  for (const [site, pattern] of Object.entries(SUPPORTED_DYNAMIC_TAB_URLS)) {
+    const permissionPattern = SUPPORTED_SITE_PERMISSION_PATTERNS[site];
     if (permissionPattern && await hasHostPermission(permissionPattern)) urls.push(pattern);
   }
   return urls;
@@ -480,7 +480,7 @@ async function activeH2WTabUrlsForProvider(provider) {
     ? "*://chatgpt.com/*"
     : provider === "claude"
       ? "*://claude.ai/*"
-      : EXPERIMENTAL_TAB_URLS[provider] || SUPPORTED_OPTIONAL_TAB_URLS[provider] || null;
+      : EXPERIMENTAL_TAB_URLS[provider] || SUPPORTED_DYNAMIC_TAB_URLS[provider] || null;
   if (!pattern) return urls;
   return urls.includes(pattern) ? [pattern] : [];
 }
@@ -564,7 +564,7 @@ async function syncSupportedOptionalContentScripts() {
     || !chrome.scripting?.registerContentScripts
     || !chrome.scripting?.unregisterContentScripts) return;
   const ids = [
-    ...SUPPORTED_OPTIONAL_CONTENT_SCRIPTS.map((spec) => spec.id),
+    ...SUPPORTED_DYNAMIC_CONTENT_SCRIPTS.map((spec) => spec.id),
     ...RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS,
   ];
   let current = [];
@@ -574,9 +574,9 @@ async function syncSupportedOptionalContentScripts() {
     if (!registered.has(retiredId)) continue;
     try { await chrome.scripting.unregisterContentScripts({ ids: [retiredId] }); } catch (_) {}
   }
-  for (const spec of SUPPORTED_OPTIONAL_CONTENT_SCRIPTS) {
+  for (const spec of SUPPORTED_DYNAMIC_CONTENT_SCRIPTS) {
     const { site, ...registration } = spec;
-    const permitted = await hasHostPermission(SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS[site]);
+    const permitted = await hasHostPermission(SUPPORTED_SITE_PERMISSION_PATTERNS[site]);
     if (!permitted) {
       if (registered.has(spec.id)) {
         try { await chrome.scripting.unregisterContentScripts({ ids: [spec.id] }); } catch (_) {}
@@ -859,12 +859,6 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
         await chrome.storage.local.remove("idleNudgeCooldownSec");
       }
     } catch (e) {}
-  }
-  // Preserve an explicit legacy Grok opt-out when it can be distinguished.
-  // Missing/true legacy state never grants host access; supported Grok access
-  // is owned solely by Chrome's revocable optional site permission.
-  if (stored.experimentalGrokEnabled === false && chrome.permissions?.remove) {
-    try { await chrome.permissions.remove({ origins: [SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok] }); } catch (_) {}
   }
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
@@ -7666,7 +7660,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       if (registeringSite === "grok"
-          && !await hasHostPermission(SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok)) {
+          && !await hasHostPermission(SUPPORTED_SITE_PERMISSION_PATTERNS.grok)) {
         sendResponse({ ok: false, error: "site-access-disabled" });
         return;
       }
@@ -8156,9 +8150,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       delete incoming.jevJudgeBaseUrl;
       delete incoming.jevJudgeApiKey;
       delete incoming.jevJudgeModel;
-      if (incoming.experimentalGrokEnabled === false && chrome.permissions?.remove) {
-        try { await chrome.permissions.remove({ origins: [SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok] }); } catch (_) {}
-      }
       delete incoming.experimentalGrokEnabled;
       delete incoming.enabled;
       delete incoming.idleNudgeEnabled;

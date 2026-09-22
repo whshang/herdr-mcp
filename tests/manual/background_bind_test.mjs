@@ -1152,10 +1152,10 @@ console.log("\n[Claude listener-less recovery]");
     JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
 }
 
-console.log("\n[Grok supported optional-origin registration and recovery]");
+console.log("\n[Grok supported default-origin registration and recovery]");
 {
   ok(await waitForTest(() => registeredContentScripts.has("herdr-supported-grok")),
-    "supported Grok registers one dynamic content script when site permission exists");
+    "supported Grok registers one dynamic content script from its required site permission");
   const script = registeredContentScripts.get("herdr-supported-grok") || {};
   ok(script.matches?.[0] === "https://grok.com/*"
       && script.js?.includes("content/injector/grok.js")
@@ -1164,31 +1164,8 @@ console.log("\n[Grok supported optional-origin registration and recovery]");
     "Grok dynamic script is exact-origin scoped and does not inherit the JSON bridge",
     JSON.stringify(script));
 
-  await chrome.permissions.remove({ origins: ["https://grok.com/*"] });
-  ok(await waitForTest(() => !registeredContentScripts.has("herdr-supported-grok")),
-    "revoking Grok site access unregisters its dynamic content script");
-  const blocked = await dispatchMessage({
-    type: "h2w_register",
-    site: "grok",
-    convKey: GROK_CHAT_KEY,
-    url: GROK_CHAT_URL,
-    accountNativeIdentity: `grok-account-sha256:${"e".repeat(64)}`,
-  }, { tab: { id: 905, url: GROK_CHAT_URL } });
-  ok(blocked?.ok === false && blocked?.error === "site-access-disabled",
-    "Grok registration fails closed without supported site access",
-    JSON.stringify(blocked));
-
   const fallbackTabId = 906;
   tabs.set(fallbackTabId, { id: fallbackTabId, url: GROK_CHAT_URL, status: "complete", listener: null });
-  const reloadsBeforeEnable = reloadCalls.length;
-  await chrome.permissions.request({ origins: ["https://grok.com/*"] });
-  ok(await waitForTest(() => registeredContentScripts.has("herdr-supported-grok")),
-    "granting Grok site access re-registers the dynamic content script");
-  ok(reloadCalls.slice(reloadsBeforeEnable).some((call) => call.tabId === fallbackTabId),
-    "first Grok dynamic-script registration reloads an already-open complete Grok tab once",
-    JSON.stringify(reloadCalls.slice(reloadsBeforeEnable)));
-
-  tabs.get(fallbackTabId).listener = null;
   const reloadsBeforeFallback = reloadCalls.length;
   const fallbackState = await dispatchMessage({ type: "h2w_state", tabId: fallbackTabId });
   ok(fallbackState?.convInfo?.site === "grok"

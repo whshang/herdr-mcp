@@ -140,9 +140,10 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
     && manifest.host_permissions?.includes("http://127.0.0.1:8772/*")
     && manifest.host_permissions?.includes("https://chatgpt.com/*")
     && manifest.host_permissions?.includes("https://claude.ai/*")
+    && manifest.host_permissions?.includes("https://grok.com/*")
     && manifest.optional_host_permissions?.includes("https://*/*")
     && manifest.optional_host_permissions?.includes("http://*/*"),
-  "broad network access is optional and the always-on host permission stays loopback-only");
+  "broad network access is optional while supported WebChat origins are explicit required permissions");
 ok(!manifest.content_scripts.some((entry) => (entry.js || []).includes("content/page-assist.js"))
     && backgroundSource.includes("pageAssistOrigins: []")
     && !optionsHtml.includes('id="pageAssistOrigins"')
@@ -166,14 +167,14 @@ ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
   "experimental content-script registration requires an explicitly granted site permission");
-ok(backgroundSource.includes("SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS")
+ok(backgroundSource.includes("SUPPORTED_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('grok: "https://grok.com/*"')
     && backgroundSource.includes('id: "herdr-supported-grok"')
     && backgroundSource.includes('RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS = ["herdr-experimental-grok"]')
     && backgroundSource.includes("await hasHostPermission(permissionPattern)")
     && !backgroundSource.includes("supportedOptionalSiteAccess")
-    && !manifest.host_permissions?.includes("https://grok.com/*"),
-  "supported Grok uses revocable Chrome site permission as the single runtime authority");
+    && manifest.host_permissions?.includes("https://grok.com/*"),
+  "supported Grok uses the required Chrome site permission as the runtime authority");
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";
@@ -950,13 +951,13 @@ ok(optionsHtml.includes('id="experimentalZAiEnabled"')
     && optionsHtml.includes('id="experimentalDeepSeekEnabled"')
     && optionsHtml.includes('id="experimentalGeminiEnabled"')
     && !optionsHtml.includes('id="experimentalGrokEnabled"')
-    && optionsHtml.includes('id="grokSiteAccess"')
+    && !optionsHtml.includes('id="grokSiteAccess"')
     && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled"')
     && optionsSource.includes('experimentalZAiEnabled: $("experimentalZAiEnabled").checked')
     && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked')
     && optionsSource.includes('experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked')
-    && optionsSource.includes('chrome.permissions?.contains?.({ origins: ["https://grok.com/*"] })'),
-  "Options separates supported Grok site access from experimental provider switches");
+    && !optionsSource.includes("grokSiteAccess"),
+  "Options keeps supported WebChat sites out of settings and exposes only experimental provider switches");
 ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md")
     && optionsSource.includes("setConnectionFailure")
     && [enLocale, zhLocale, jaLocale].every((locale) => locale.open_github_setup_guide),

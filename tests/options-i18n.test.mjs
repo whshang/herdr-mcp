@@ -46,8 +46,11 @@ test("user keeps Runtime-only configuration out of the extension | Given browser
   assert.match(optionsHtml, /"semantic"/);
   assert.match(optionsHtml, /"routes"/);
   assert.match(optionsHtml, /id="runtime_config_guide"/);
+  assert.match(optionsHtml, /id="resetTemplates"/);
+  assert.ok(optionsHtml.indexOf('id="title_diagnostics"') < optionsHtml.indexOf('id="title_general"'));
   assert.match(zh.options_runtime_config_hint, /不保存在扩展/);
   assert.match(zh.options_runtime_config_hint, /0600/);
+  assert.match(zh.reset_templates, /默认模板/);
 });
 
 test("Simplified Chinese editable automation prompts use Chinese prose", () => {
@@ -109,11 +112,19 @@ test("Options requests optional host access only from explicit user settings", (
   assert.match(optionsJs, /https:\/\/chat\.z\.ai\/\*/);
   assert.match(optionsJs, /https:\/\/chat\.deepseek\.com\/\*/);
   assert.match(optionsJs, /https:\/\/gemini\.google\.com\/\*/);
-  assert.match(optionsJs, /https:\/\/grok\.com\/\*/);
-  assert.match(optionsHtml, /id="grokSiteAccess"/);
+  assert.doesNotMatch(optionsJs, /https:\/\/grok\.com\/\*/);
+  assert.doesNotMatch(optionsHtml, /id="grokSiteAccess"/);
   assert.doesNotMatch(optionsHtml, /id="experimentalGrokEnabled"/);
   assert.doesNotMatch(optionsHtml, /id="pageAssistOrigins"/);
   assert.match(optionsJs, /removeHostPermissions/);
   assert.doesNotMatch(optionsJs, /llmJudge|jevJudge/);
   assert.equal(typeof zh.host_permission_denied, "string");
+});
+
+test("user keeps default templates aligned with the selected language | Given localized template defaults | When the locale changes or Reset templates is clicked | Then untouched defaults follow the locale and custom text is not blindly replaced", () => {
+  assert.match(optionsJs, /const previousDefaults = templateDefaults\(\)/);
+  assert.match(optionsJs, /if \(\$\(elementId\)\.value === previousDefaults\[storageKey\]\)/);
+  assert.match(optionsJs, /localizedConfig\[storageKey\] = \$\(elementId\)\.value/);
+  assert.match(optionsJs, /\$\("resetTemplates"\)\.addEventListener\("click"/);
+  assert.match(optionsJs, /resetTemplateFields\(\)/);
 });
