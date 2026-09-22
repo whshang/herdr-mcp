@@ -91,7 +91,18 @@ class ChatGPTAdapter extends BaseAdapter {
       seen.add(node);
       matches.push(node);
     }
-    return matches;
+    return matches.sort((a, b) => {
+      const score = (node) => {
+        const role = node.getAttribute('role') || '';
+        const testid = node.getAttribute('data-testid') || '';
+        let value = 0;
+        if (role === 'option') value += 50;
+        if (role === 'menuitem') value += 40;
+        if (/app|connector|mention/i.test(testid)) value += 20;
+        return value;
+      };
+      return score(b) - score(a);
+    });
   }
 
   getWatchMainWorldSelector() {
