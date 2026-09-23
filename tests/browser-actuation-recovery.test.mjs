@@ -899,11 +899,12 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
   assert.doesNotMatch(identitySegment, /accountNativeIdentity|email|userId/i);
 });
 
-test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and Enter fallbacks", () => {
+test("user keeps the ordinary ChatGPT submit path bounded | Given a ready composer | When fallback ordering is inspected | Then MAIN-world send-button click precedes isolated-world fallbacks", () => {
   assert.match(wakeSource, /function submitMainWorld\(selector\)/);
   assert.match(wakeSource, /type:\s*"h2w_submit_main"/);
   assert.match(backgroundSource, /msg\?\.type === "h2w_submit_main"/);
-  assert.match(backgroundSource, /form\.requestSubmit\(sendButton\)/);
+  assert.match(backgroundSource, /sendButton\.click\(\)/);
+  assert.doesNotMatch(backgroundSource, /form\.requestSubmit\(sendButton\)/);
   const submitStart = wakeSource.indexOf("async function submit() {");
   const submitEnd = wakeSource.indexOf("// ---- Auto-allow", submitStart);
   const submitSegment = wakeSource.slice(submitStart, submitEnd);
@@ -1172,44 +1173,67 @@ test("user can stop a live answer | Given an explicit visible stop control while
   assert.equal(result.generation_stopped, true);
 });
 
-test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then the mutation is attempted once and remains uncertain", async () => {
+test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one Enter submit is attempted and uncertain delivery never falls through to another submit", async () => {
   const start = wakeSource.indexOf("  async function submitBrowserActuationOnce()");
   const end = wakeSource.indexOf("  // ---- Submission ----", start);
   assert.ok(start >= 0 && end > start, "bounded Browser Actuation submit helper must remain extractable");
   const helperSource = wakeSource.slice(start, end);
 
   async function run({ busy = false, ack = false } = {}) {
-    const ctx = { busy, ack, clicks: 0 };
+    const ctx = { busy, ack, clicks: 0, mainSubmits: 0, enterSubmits: 0 };
+    ctx.input = { innerText: "next turn" };
     ctx.button = {
       disabled: false,
       click() { ctx.clicks += 1; },
     };
     const submitOnce = new Function("ctx", `
       const isComposerGenerating = () => ctx.busy;
-      const ADAPTER = { getInputEl: () => ({ innerText: "next turn" }) };
+      const ADAPTER = {
+        name: "chatgpt",
+        needsMainWorldInsert: true,
+        inputHasContent: () => true,
+        getInputEl: () => ctx.input,
+        getWatchMainWorldSelector: () => "#prompt-textarea",
+      };
       const wait = async () => {};
       const findSendButton = () => ctx.button;
       const isSendButton = (button) => Boolean(button) && button.disabled !== true;
       const captureSubmitAckBaseline = () => ({});
       const waitForSubmitAck = async () => ctx.ack;
+      const submitMainWorld = async () => {
+        ctx.mainSubmits += 1;
+        return { ok: true, submitted: true };
+      };
+      const dispatchEnterSubmit = () => { ctx.enterSubmits += 1; };
       ${helperSource}
       return submitBrowserActuationOnce;
     `)(ctx);
-    return { result: await submitOnce(), clicks: ctx.clicks };
+    return {
+      result: await submitOnce(),
+      clicks: ctx.clicks,
+      mainSubmits: ctx.mainSubmits,
+      enterSubmits: ctx.enterSubmits,
+    };
   }
 
   const delayed = await run({ ack: false });
-  assert.equal(delayed.clicks, 1);
+  assert.equal(delayed.enterSubmits, 1);
+  assert.equal(delayed.mainSubmits, 0);
+  assert.equal(delayed.clicks, 0);
   assert.equal(delayed.result.ok, false);
   assert.equal(delayed.result.attempted, true);
   assert.equal(delayed.result.uncertain, true);
 
   const accepted = await run({ ack: true });
-  assert.equal(accepted.clicks, 1);
+  assert.equal(accepted.enterSubmits, 1);
+  assert.equal(accepted.mainSubmits, 0);
+  assert.equal(accepted.clicks, 0);
   assert.equal(accepted.result.ok, true);
   assert.equal(accepted.result.attempted, true);
 
   const busy = await run({ busy: true });
+  assert.equal(busy.enterSubmits, 0);
+  assert.equal(busy.mainSubmits, 0);
   assert.equal(busy.clicks, 0);
   assert.equal(busy.result.ok, false);
   assert.equal(busy.result.attempted, false);
@@ -1296,12 +1320,88 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   });
 
   assert.equal(ctx.wakeArgs[1].browserActuation, true);
-  assert.deepEqual(ctx.snapshotTimeouts, [1200, 6000]);
+  assert.deepEqual(ctx.snapshotTimeouts, [1200, 1200]);
   assert.equal(create.command_accepted, true);
   assert.equal(create.rejected, false);
   assert.equal(create.stable_resource_ref_observed, false);
   assert.deepEqual(ctx.reservationWrites, [["herdrBrowserSessionReservationV1", reservationRef]]);
   assert.equal(ctx.reservationRemovals, 0);
+});
+
+test("user waits through transient fresh ChatGPT composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
+  assert.ok(commandStart >= 0 && commandEnd > commandStart);
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const ctx = {
+    busyChecks: 0,
+    busySequence: [true, true, false, true, false, false, false, true],
+    waits: 0,
+    wakeCalls: 0,
+    reservationRemovals: 0,
+  };
+
+  const act = new Function("ctx", `
+    const ADAPTER = {
+      name: "chatgpt",
+      getConversationKey: () => "https://chatgpt.com/g/g-p-test/project",
+      getCanonicalConversationUrl: () => "",
+      getInputEl: () => ({}),
+      inputHasContent: () => false,
+      getMessageSnapshot: () => ({}),
+    };
+    const chatGptConversationId = () => null;
+    const sessionStorage = {
+      setItem: () => {},
+      removeItem: () => { ctx.reservationRemovals += 1; },
+    };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = null;
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = "https://chatgpt.com/g/g-p-test/project";
+    const currentHerdrRequiredApps = () => [];
+    const providerCanonicalConversationObserved = () => false;
+    const document = { hidden: false };
+    const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
+    const isTurnInProgress = () => {
+      const value = ctx.busySequence[ctx.busyChecks] ?? false;
+      ctx.busyChecks += 1;
+      return value;
+    };
+    const runtimeAlive = () => true;
+    const wait = async () => { ctx.waits += 1; };
+    const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
+    const fetchChatGptConversationSnapshot = async () => ({ ok: false });
+    const performWake = async () => {
+      ctx.wakeCalls += 1;
+      return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
+    };
+    const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    ${evidenceSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)(ctx);
+
+  const reservationRef = "bsr_" + "d".repeat(64);
+  const result = await act({
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      reservation_ref: reservationRef,
+      message: "fresh worker turn",
+      required_apps: [],
+    },
+  });
+
+  assert.ok(ctx.waits >= 2, "fresh create should wait for transient composer busy state to clear");
+  assert.equal(ctx.wakeCalls, 1, "the provider submit path must be entered exactly once");
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.rejected, false);
+  assert.equal(ctx.reservationRemovals, 0, "uncertain delivery keeps the reservation for reconciliation");
 });
 
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {
@@ -1337,7 +1437,8 @@ test("user receives exact content rejection reasons | Given browser controls rej
       const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
       const isTurnInProgress = () => ctx.turnInProgress === true;
       const runtimeAlive = () => true;
-      const wait = async () => {};
+      const Date = { now: () => ctx.now || 0 };
+      const wait = async (ms = 0) => { ctx.now = (ctx.now || 0) + Math.max(1, ms); };
       const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
       const fetchChatGptConversationSnapshot = async () => ({ ok: false });
       const performWake = async () => ({ ok: ctx.wakeOk !== false });
@@ -2220,10 +2321,17 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
     "fresh-session actuation must enter Chat mode before waiting for the composer",
   );
   assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 20000/);
-  assert.match(createSegment, /while \(!ADAPTER\.getInputEl\(\) && Date\.now\(\) < composerReadyDeadline\)/);
+  assert.match(createSegment, /let freshCreateStableIdleSamples = 0/);
+  assert.match(createSegment, /const idleAndEmpty = inputMounted/);
+  assert.match(createSegment, /&& !isTurnInProgress\(\)/);
+  assert.match(createSegment, /&& !ADAPTER\.inputHasContent\(\)/);
+  assert.match(createSegment, /freshCreateStableIdleSamples \+= 1/);
+  assert.match(createSegment, /freshCreateStableIdleSamples >= 3/);
+  assert.match(createSegment, /freshCreateStableIdleSamples = 0/);
+  assert.match(createSegment, /if \(\(!creatingSession && isTurnInProgress\(\)\) \|\| ADAPTER\.inputHasContent\(\)\)/);
   assert.match(createSegment, /await wait\(200\)/);
   assert.ok(
-    createSegment.indexOf("const composerReadyDeadline") < createSegment.indexOf("if (isTurnInProgress() || ADAPTER.inputHasContent())"),
+    createSegment.indexOf("const composerReadyDeadline") < createSegment.indexOf("if ((!creatingSession && isTurnInProgress()) || ADAPTER.inputHasContent())"),
     "fresh-session composer readiness must settle before the normal busy guard",
   );
   assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
@@ -2534,7 +2642,7 @@ function createActuationBranchHarness({
     "browserConversationInfo", "browserConversationInfoFromSupportedUrl",
     "sendTabMessageWithTimeout",
     "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
-    "unavailableBrowserActuationEvidence", "Date", "setTimeout",
+    "unavailableBrowserActuationEvidence", "BROWSER_CREATE_CONTENT_TIMEOUT_MS", "Date", "setTimeout",
     `async function __actuate(command) {\n` +
     `const actuationId = String(command?.actuation_id || "");\n` +
     `const dispatchId = String(command?.dispatch_id || "");\n` +
@@ -2546,7 +2654,7 @@ function createActuationBranchHarness({
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
     sendTabMessageWithTimeout,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
-    unavailable, dateShim, setTimeoutShim);
+    unavailable, 43_000, dateShim, setTimeoutShim);
 
   return {
     actuate,
@@ -2754,6 +2862,11 @@ test("user Given a fresh ChatGPT create When content dispatch throws Then the ex
   assert.equal(evidence?.command_accepted, true);
   assert.equal(evidence?.resource_available, true);
   assert.equal(evidence?.result?.error, "browser_create_content_dispatch_failed");
+  assert.equal(evidence?.result?.tab_opened, true);
+  assert.equal(evidence?.result?.tab_closed, true);
+  assert.equal(evidence?.result?.tab_cleanup_verified, true);
+  assert.deepEqual(harness.removedTabs, [100]);
+  assert.equal(harness.tabs.has(71), true, "content failure cleanup must preserve the user's anchor tab");
 });
 
 test("user can create two independent workers | Given one exact Project scope spans multiple windows and the original source tab is unavailable | When two session.create mutations run consecutively while sibling workers are generating | Then each mutation opens and delivers only to its own fresh tab", async () => {

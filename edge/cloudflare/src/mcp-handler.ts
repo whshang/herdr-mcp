@@ -1364,8 +1364,10 @@ export async function handleMcp(
       typeof runtimeArgs.timeout_ms === "number" && Number.isFinite(runtimeArgs.timeout_ms)
         ? Math.max(1, runtimeArgs.timeout_ms)
         : undefined;
+    const browserSessionCreate = name === "herdr_call"
+      && runtimeArgs.method === "herdr_mcp.browser_session.create";
     const requestBudgetMs = requestedToolTimeoutMs === undefined
-      ? deps.limits.requestTimeoutMs
+      ? (browserSessionCreate ? MAX_REQUEST_TIMEOUT_MS : deps.limits.requestTimeoutMs)
       : Math.min(
           MAX_REQUEST_TIMEOUT_MS,
           Math.max(deps.limits.requestTimeoutMs, requestedToolTimeoutMs + REQUEST_SETTLEMENT_GRACE_MS),
