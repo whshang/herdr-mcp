@@ -2291,6 +2291,9 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
+  assert.match(wakeSource, /!composerModelVisibleText\(\)/);
+  assert.match(wakeSource, /const search = selector \? await insertMainWorld\(app, selector\) : null/);
+  assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
   assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
   assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);
