@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.125";
+const H2W_CONTENT_VERSION = "0.1.126";
 
 function normalizeHerdrMentionAlias(value) {
   const alias = String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -657,6 +657,9 @@ function normalizeHerdrMentionAlias(value) {
       return;
     }
 
+    const selectedAppsBeforeQueue = typeof ADAPTER.getSelectedComposerApps === "function"
+      ? ADAPTER.getSelectedComposerApps()
+      : [];
     queuedInsertActionBusy = true;
     updateQueuedInsertButton();
     try {
@@ -679,11 +682,25 @@ function normalizeHerdrMentionAlias(value) {
         return;
       }
       await clearComposer();
-      for (let i = 0; i < 8 && composerNorm(); i += 1) await wait(75);
-      if (composerNorm()) {
+      const queuedComposerTextCleared = () => {
+        if (!composerNorm()) return true;
+        return selectedAppsBeforeQueue.length > 0
+          && typeof ADAPTER.composerHasOnlyAppPills === "function"
+          && ADAPTER.composerHasOnlyAppPills(selectedAppsBeforeQueue);
+      };
+      for (let i = 0; i < 8 && !queuedComposerTextCleared(); i += 1) await wait(75);
+      if (!queuedComposerTextCleared()) {
         showHudToast(hudText("queue_added_clear_failed", { count: queuedInsertCount },
           `Queued (${queuedInsertCount}), but the composer could not be cleared.`), "err");
         return;
+      }
+      if (selectedAppsBeforeQueue.length > 0) {
+        const restoredApps = await ensureRequiredComposerApps(selectedAppsBeforeQueue);
+        if (!restoredApps.ok) {
+          showHudToast(hudText("queue_app_restore_failed", { count: queuedInsertCount },
+            `Queued (${queuedInsertCount}), but the selected ChatGPT App could not be restored.`), "err");
+          return;
+        }
       }
 
       if (isTurnInProgress()) {
@@ -1165,6 +1182,17 @@ function normalizeHerdrMentionAlias(value) {
       }
 
       if (resumeOnly) {
+        if (requiredApps.length > 0) {
+          const appSelection = await ensureRequiredComposerApps(requiredApps);
+          if (!appSelection.ok) {
+            return {
+              ok: false,
+              error: appSelection.error || "required-app-selection-unavailable",
+              requiredApps,
+              selectedApps: appSelection.apps || [],
+            };
+          }
+        }
         if (boundedBrowserActuation) {
           const outcome = await submitBrowserActuationOnce();
           noteWakeResult(n, outcome.ok);
@@ -2660,7 +2688,7 @@ function normalizeHerdrMentionAlias(value) {
             template: msg.template || "",
             autoAllow: false,
             handoff: true,
-            requiredApps: currentHerdrRequiredApps(),
+            requiredApps: Array.isArray(msg.requiredApps) ? msg.requiredApps : currentHerdrRequiredApps(),
           });
           if (result?.ok && ADAPTER.name === "chatgpt" && CONVERSATION_HEALTH && conversationHealth) {
             markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
@@ -2694,7 +2722,7 @@ function normalizeHerdrMentionAlias(value) {
             template: msg.template || "",
             autoAllow: false,
             handoff: true,
-            requiredApps: currentHerdrRequiredApps(),
+            requiredApps: Array.isArray(msg.requiredApps) ? msg.requiredApps : currentHerdrRequiredApps(),
           });
           if (!result?.ok) { sendResponse(result); return; }
           if (ADAPTER.name === "chatgpt" && CONVERSATION_HEALTH && conversationHealth) {

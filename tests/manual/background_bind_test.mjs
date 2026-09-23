@@ -83,6 +83,7 @@ let targetComposerReadyAfter = 0;
 let targetProbeCount = 0;
 let targetSeedCount = 0;
 let seedTemplateCaptures = [];
+let seedRequiredAppsCaptures = [];
 let tabCreateCount = 0;
 let tabUpdateCount = 0;
 let lastTabUpdate = null;
@@ -248,6 +249,7 @@ function targetListener(tab) {
     if (msg?.type === "h2w_handoff_seed") {
       targetSeedCount += 1;
       seedTemplateCaptures.push(msg.template || "");
+      seedRequiredAppsCaptures.push(Array.isArray(msg.requiredApps) ? [...msg.requiredApps] : []);
       if (handoffSeedMode === "confirmed") {
         targetSeeded = true;
         tab.url = PROJECT_TARGET_URL;
@@ -2494,6 +2496,7 @@ console.log("\n[project handoff]");
   targetProbeCount = 0;
   targetSeedCount = 0;
   seedTemplateCaptures = [];
+  seedRequiredAppsCaptures = [];
   projectNavigationReadyAfter = 2;
   projectNavigationPollCount = 0;
   sourceProbeLooksSeeded = true;
@@ -2515,6 +2518,20 @@ console.log("\n[project handoff]");
       && storage.herdrWakeBindings[sourceKey]?.binding_scope === "project"
       && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
     "Project binding is stable while the source conversation is the active target");
+  let resolveRegisterApp;
+  const registerAppP = new Promise((r) => { resolveRegisterApp = r; });
+  onMsg({
+    type: "h2w_register",
+    convKey: PROJECT_SOURCE,
+    url: PROJECT_SOURCE_URL,
+    site: "chatgpt",
+    browserAppKeywords: ["herdr-custom"],
+  }, { tab: { id: 401, url: PROJECT_SOURCE_URL } }, (r) => resolveRegisterApp(r));
+  const registeredApp = await registerAppP;
+  ok(registeredApp?.bound === true
+      && storage.herdrWakeBindings[sourceKey]?.herdr_app_keyword === "herdr-custom",
+    "Project source learns the provider-owned custom Herdr App identity",
+    JSON.stringify(registeredApp));
   const continuityId = storage.herdrWakeBindings[sourceKey].continuity_id;
 
   let resolveHudOff;
@@ -2658,6 +2675,11 @@ console.log("\n[project handoff]");
       && !seedTemplateCaptures[0].includes("<<<HERDR_HANDOFF_V1"),
     "ChatGPT target seed carries continuity id and old conversation URL without a legacy packet",
     JSON.stringify(seedTemplateCaptures).slice(0, 200));
+  ok(seedRequiredAppsCaptures.length === 1
+      && seedRequiredAppsCaptures[0].length === 1
+      && seedRequiredAppsCaptures[0][0] === "herdr-custom",
+    "ChatGPT target seed inherits the source binding custom App identity before target registration",
+    JSON.stringify(seedRequiredAppsCaptures));
   ok(!!storage.herdrWakeBindings[sourceKey]
       && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
     "Project binding stays on the source target while target delivery is uncertain");
@@ -2679,6 +2701,8 @@ console.log("\n[project handoff]");
     "committed rollover keeps the Project binding and switches only its active conversation target");
   ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
     "continuity id survives the Project target switch");
+  ok(storage.herdrWakeBindings[targetKey]?.herdr_app_keyword === "herdr-custom",
+    "Project rollover preserves the learned custom Herdr App identity");
   ok(storage.herdrWakeBindings[targetKey]?.handoff_from === PROJECT_SOURCE,
     "Project binding records its predecessor conversation");
   let resolveTargetHud;
