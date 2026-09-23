@@ -475,7 +475,7 @@ test("mutating call retries generation supersede only after the runtime proves i
   assert.equal(new Set(d.calls.map((call) => call.deadlineMs)).size, 1);
 });
 
-test("herdr_devices executes at Edge without model-directive hints or tools/list contract drift", async () => {
+test("user gets device facts without advisory prose | Given Edge-local device inventory | When herdr_devices is called | Then device facts remain and action hints are absent", async () => {
   const devices = [{ device_id: DEVICE_A, name: "macbook" }];
   const d = deps({ devices });
 
@@ -1027,7 +1027,7 @@ test("tools/call preserves an existing MCP CallToolResult including image conten
   assert.deepEqual(r.body.result, callToolResult);
 });
 
-test("tools/call removes Herdr advisory prose while preserving user process output", async () => {
+test("user keeps process output while advisory prose is removed | Given Herdr-generated hints and caller-owned output | When tools/call returns through Edge | Then hints are absent and caller output is unchanged", async () => {
   const workstationResult = {
     content: [{
       type: "text",
