@@ -2285,6 +2285,8 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
   assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
   assert.match(chatGptAdapterSource, /visible\(node\)/);
+  assert.match(chatGptAdapterSource, /if \(!menuRoots\.length\) return \[\]/);
+  assert.match(chatGptAdapterSource, /for \(const root of menuRoots\)/);
   assert.match(chatGptAdapterSource, /return matches\.sort/);
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
