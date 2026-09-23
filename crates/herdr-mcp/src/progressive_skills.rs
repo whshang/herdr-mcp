@@ -3709,11 +3709,9 @@ mod tests {
     }
 
     fn write_semantic_test_config(config_dir: &std::path::Path, url: &str) {
+        // Keep route names short: temp dir names can exceed the 64-char semantic route limit.
         let path = config_dir.join("config.json");
-        let route_name = config_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("semantic-test");
+        let route_name = "semantic-test";
         std::fs::write(
             &path,
             format!(
