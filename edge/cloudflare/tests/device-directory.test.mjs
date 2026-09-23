@@ -33,6 +33,7 @@ test("device directory joins durable identity with read-only WorkstationDO state
   assert.equal(devices.length, 2);
   assert.equal(devices[0].device_id, DEV_A);
   assert.equal(devices[0].connection, "online");
+  assert.equal(devices[0].health, "healthy");
   assert.equal(devices[0].runtime_generation, "rust-a");
   assert.equal(devices[0].enrolled_at_ms, 100);
   assert.equal(devices[0].last_seen_at_ms, 900);
@@ -41,6 +42,7 @@ test("device directory joins durable identity with read-only WorkstationDO state
   assert.equal(devices[0].reconnect_count, 2);
   assert.equal(devices[0].last_reconnect_crossed_recycle_threshold, false);
   assert.equal(devices[1].connection, "stale");
+  assert.equal(devices[1].health, "unknown");
   assert.equal(devices[1].last_recovered_at_ms, null);
   assert.equal(devices[1].reconnect_count, 0);
   assert.equal(Object.hasOwn(devices[0], "workstation_id"), false);
