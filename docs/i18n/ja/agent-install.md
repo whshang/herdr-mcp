@@ -114,7 +114,7 @@ Custom Domain がない場合は、まず `workers.dev` への直接接続を試
 - マシンが canonical な `dev_<ULID>` デバイス identity を持つ。
 - 認証済みの実際の MCP リクエストが、公開 origin からこのワークステーションへ往復して完了する。
 
-その後、ChatGPT で Plugins の Developer mode を有効にし、**Plugins → Browse plugins** から完全な `https://…workers.dev/mcp` で Herdr Connector を追加し、OAuth を完了します。既定/例の App 名は `herdr` ですが、カスタム名も利用できます。ChatGPT の Project 内で作業し、新しいチャットの最初のメッセージでワークステーションへアクセスするとき、その App を `+` ボタンから選択または参照します。拡張が実際の provider-owned App keyword を学習し、後続の Herdr turn で再利用します。
+その後、ChatGPT の **Settings → Account security & login** を開いて **Developer mode** を有効にします。**Plugins → Browse plugins** で右上の **+ → Create APP** を選び、完全な `https://…workers.dev/mcp` を使って MCP App を作成し、OAuth を完了します。推奨例の App 名は `herdr` ですが、カスタム名も利用できます。ChatGPT の Project 内で作業し、新しいチャットの最初のメッセージでワークステーションへアクセスするとき、その App を `+` ボタンから選択または参照します。拡張が実際の provider-owned App keyword を学習し、後続の Herdr turn で再利用します。
 
 Chrome 拡張 / Native Messaging の経路は任意であり、コア Connector の前提条件ではありません。ユーザーがブラウザの連続性、引き継ぎ、Control Center を望むときにだけ、[拡張のガイド](extension.md)からインストールしてください。拡張の配布 / 開発の詳細はそのガイドに残します。
 

@@ -154,8 +154,8 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 这一步需要用户本人操作。让 Coding Agent 暂停并指导：
 
-1. 在 ChatGPT 插件设置中开启 **Developer mode**；
-2. 进入“**插件 → 浏览插件**”，添加 Herdr Connector；默认/建议示例名称是 `herdr`，但也支持自定义 App 名称；
+1. 打开 ChatGPT **设置 → 账户安全与登录**，启用 **开发者模式（Developer mode）**；
+2. 进入“**插件 → 浏览插件**”，点击右上角 **+ → Create APP**，创建 MCP 应用。建议名称使用 `herdr`，也支持自定义 App 名称；
 3. 粘贴完整的 `${MCP_URL}`，必须包含最后的 `/mcp`；
 4. 完成浏览器 OAuth；首次授权页会按浏览器语言自动使用中文、英文或日文，并明确要求先在终端运行批准命令，再按 CLI 提示输入 6 位验证码；
 5. 创建或打开一个 **Project**，后续在项目里工作；

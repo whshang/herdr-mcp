@@ -154,8 +154,8 @@ An unauthenticated `/mcp` response of `401` can be correct. The useful checks ar
 
 This is a human step. The coding agent should pause and guide the user:
 
-1. open ChatGPT settings and enable **Developer mode** for Plugins;
-2. open **Plugins → Browse plugins** and add the Herdr Connector; `herdr` is the recommended/default example name, but a custom App name is supported;
+1. open ChatGPT **Settings → Account security & login** and enable **Developer mode**;
+2. open **Plugins → Browse plugins**, click the top-right **+ → Create APP**, and create an MCP app. `herdr` is the recommended example name, but a custom App name is supported;
 3. paste the complete deployed `${MCP_URL}`, including the final `/mcp`;
 4. complete OAuth in the browser; the approval page selects Chinese, English, or Japanese from the browser language and asks you to run the Terminal approval command before entering the six-digit code;
 5. create or open a **Project** and work there;

@@ -154,8 +154,8 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 これは人手による手順です。coding agent は一旦停止してユーザーを案内する必要があります。
 
-1. ChatGPT の設定を開き、Plugins の **Developer mode** を有効にします;
-2. **Plugins → Browse plugins** を開き、Herdr Connector を追加します。既定/推奨例の名前は `herdr` ですが、カスタム App 名も利用できます;
+1. ChatGPT の **Settings → Account security & login** を開き、**Developer mode** を有効にします;
+2. **Plugins → Browse plugins** を開き、右上の **+ → Create APP** から MCP App を作成します。推奨例の名前は `herdr` ですが、カスタム App 名も利用できます;
 3. デプロイ済みの完全な `${MCP_URL}` を貼り付けます。末尾の `/mcp` も含めます;
 4. ブラウザで OAuth を完了します。承認ページはブラウザの言語から中国語・英語・日本語を選択し、6 桁のコードを入力する前にターミナルの承認コマンドを実行するよう求めます;
 5. **Project** を作成または開き、そこで作業します;
