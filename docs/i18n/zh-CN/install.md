@@ -8,27 +8,28 @@
 
 ## 安装前确认
 
-### 1. Herdr 已经可用
+### 1. `herdr-mcp install` 会自动修复 Herdr 依赖
+
+可以先手工查看 Herdr：
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
 ```
 
-如果 Herdr 未安装，推荐直接使用 Herdr 官方 stable 安装器：
+但这不再是首次安装的前置条件。正常执行 `herdr-mcp install` 时，herdr-mcp 会按顺序从 `HERDR_BIN`、用户稳定安装路径、Homebrew/`/usr/local` 和当前 PATH 查找 Herdr。已经安装时会先验证 CLI/API，并自动尝试 `herdr update`；Herdr Server 已运行时使用 live handoff 更新。完全找不到 Herdr 时，会从 <https://herdr.dev/> 下载并执行官方安装器。herdr-mcp 服务安装完成后还会确认本机 Herdr Server/API 已可达：macOS 通过受管 Supervisor/TCC broker 启动，Linux/Windows 在需要时启动当前用户的 Herdr Server。
+
+官方安装命令保留为排障时的人工兜底：
 
 ```bash
 # macOS / Linux
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-Windows：
-
 ```powershell
+# Windows
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
-
-安装后重新执行 `herdr --version`。Herdr 本体的详细安装行为以 <https://herdr.dev/docs/install/> 为准。
 
 ### 2. 明确要连接的客户端
 
@@ -38,7 +39,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 已在 Apple Silicon macOS、原生 Debian x86_64 与 ARM64 上完成生产级验证。Herdr-MCP 1.0 也已经在原生 Windows 上启用首台设备 `worker bootstrap`，包含 canonical device enrollment、Windows Credential Manager 凭据持久化、受管 runtime 激活和 Link reconcile。Windows x86_64 与 Windows ARM64 仍按 1.0 Candidate 发布，而不是生产支持平台：Windows x86_64 已在实体机上实际跑过安装/恢复与真实 Connector 对话，但最终精确 1.0 candidate 还需要补一条“全新 Windows → first-device bootstrap”实体机记录，并完成 #394 的其余晋级证据；Windows ARM64 目前仍只有 hosted runner 资格验证。Windows 使用 Herdr named pipe、Windows Credential Manager、当前用户 Startup 文件夹快捷方式登录自启动和独立用户进程；受管 Windows runtime 启动时会探测配置的 Herdr API，如果 Herdr 已安装但 server 尚未运行，会以当前用户权限尽力启动 `herdr server`，但 herdr-mcp 不负责安装或删除 Herdr 本体。Browser Native Messaging 与产品级 reinstall/uninstall 仍不属于 Windows 实体机支持声明。精确的“已测试/尚未测试”边界见[平台支持矩阵](platform-support-matrix.md)。
+当前 stable runtime 以 <https://github.com/whshang/herdr-mcp/releases> 的 `Latest` stable Release 为准。首台设备 `worker bootstrap` 和已有 fleet 的 `worker connect` 已在 Apple Silicon macOS、原生 Debian x86_64 与 ARM64 上完成生产级验证。Herdr-MCP 1.0 也已经在原生 Windows 上启用首台设备 `worker bootstrap`，包含 canonical device enrollment、Windows Credential Manager 凭据持久化、受管 runtime 激活和 Link reconcile。Windows x86_64 与 Windows ARM64 仍按 1.0 Candidate 发布，而不是生产支持平台：Windows x86_64 已在实体机上实际跑过安装/恢复与真实 Connector 对话，但最终精确 1.0 candidate 还需要补一条“全新 Windows → first-device bootstrap”实体机记录，并完成 #394 的其余晋级证据；Windows ARM64 目前仍只有 hosted runner 资格验证。Windows 使用 Herdr named pipe、Windows Credential Manager、当前用户 Startup 文件夹快捷方式登录自启动和独立用户进程。显式 `herdr-mcp install` 现在也负责 Windows 上的 Herdr 依赖恢复：解析或调用官方安装器安装 Herdr CLI、尝试 stable 更新，并确认当前用户的 `herdr server` 已可达；Herdr 卸载仍保持独立。Browser Native Messaging 与产品级 reinstall/uninstall 仍不属于 Windows 实体机支持声明。精确的“已测试/尚未测试”边界见[平台支持矩阵](platform-support-matrix.md)。
 
 旧版本安装按[Runtime 自升级](runtime-self-upgrade.md)原地升级。已有 Worker、设备关系和健康的 ChatGPT Connector 不需要为了升级当前 runtime 重新创建。
 

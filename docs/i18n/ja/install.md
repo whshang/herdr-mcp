@@ -8,28 +8,28 @@
 
 ## インストール前の確認
 
-### 1. Herdr が利用できること
+### 1. `herdr-mcp install` が Herdr 依存関係を自動修復する
+
+必要なら次で Herdr を手動確認できます。
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
 ```
 
-Herdr が入っていない場合は、公式の stable インストーラーを使用してください。
+ただし、これは初回インストールの前提条件ではありません。通常の `herdr-mcp install` は `HERDR_BIN`、ユーザーの安定インストール先、Homebrew/`/usr/local`、現在の PATH の順で Herdr を解決します。既存 Herdr は CLI/API を検証してから自動更新を試み、Server が動作中なら live handoff を使います。Herdr が見つからない場合は <https://herdr.dev/> の公式 installer を取得して実行します。herdr-mcp service のインストール後には Herdr Server/API が実際に到達可能かも確認します。macOS は管理対象 Supervisor/TCC broker、Linux/Windows は必要に応じて現在のユーザーの Herdr Server を起動します。
 
-macOS / Linux:
+公式 installer はトラブルシューティング用の手動フォールバックとして引き続き利用できます。
 
 ```bash
+# macOS / Linux
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-Windows:
-
 ```powershell
+# Windows
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
-
-その後、もう一度 `herdr --version` を実行します。Herdr 本体のインストール動作については <https://herdr.dev/docs/install/> が正式な情報源です。
 
 ### 2. 必要なクライアント経路を決める
 
@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## サポート対象プラットフォームの境界
 
-<https://github.com/whshang/herdr-mcp/releases> の GitHub `Latest` stable Release を使用してください。初回デバイスの `worker bootstrap` と既存 fleet の `worker connect` は、Apple Silicon macOS と、x86_64・ARM64 双方の native Debian 系 Linux で production-qualified です。Herdr-MCP 1.0 では native Windows でも初回デバイスの `worker bootstrap` が有効になり、canonical device enrollment、Windows Credential Manager への資格情報保存、managed runtime の activation、Link reconcile まで含まれます。Windows x86_64 と Windows ARM64 は引き続き 1.0 Candidate として公開され、Production 扱いではありません。Windows x86_64 は実機で install/recovery と実際の Connector 会話まで確認済みですが、正確な最終 1.0 candidate では fresh first-device bootstrap の実機記録と #394 の残りの昇格証拠が必要です。Windows ARM64 は現在も hosted runner の qualification のみです。Windows は Herdr named pipe、Windows Credential Manager、カレントユーザーの Startup フォルダー ショートカットによる autostart、デタッチされたユーザープロセスを使用します。この managed Windows runtime が起動すると、設定された Herdr API を調べ、必要であれば既にインストール済みの `herdr server` をベストエフォートで起動します。Herdr 自体のインストールや削除は行いません。Browser Native Messaging と製品レベルの reinstall / uninstall は、Windows 実機 UAT の主張には含まれません。テスト済み / 未テストの正確な境界は [platform support matrix](platform-support-matrix.md) を参照してください。
+<https://github.com/whshang/herdr-mcp/releases> の GitHub `Latest` stable Release を使用してください。初回デバイスの `worker bootstrap` と既存 fleet の `worker connect` は、Apple Silicon macOS と、x86_64・ARM64 双方の native Debian 系 Linux で production-qualified です。Herdr-MCP 1.0 では native Windows でも初回デバイスの `worker bootstrap` が有効になり、canonical device enrollment、Windows Credential Manager への資格情報保存、managed runtime の activation、Link reconcile まで含まれます。Windows x86_64 と Windows ARM64 は引き続き 1.0 Candidate として公開され、Production 扱いではありません。Windows x86_64 は実機で install/recovery と実際の Connector 会話まで確認済みですが、正確な最終 1.0 candidate では fresh first-device bootstrap の実機記録と #394 の残りの昇格証拠が必要です。Windows ARM64 は現在も hosted runner の qualification のみです。Windows は Herdr named pipe、Windows Credential Manager、カレントユーザーの Startup フォルダー ショートカットによる autostart、デタッチされたユーザープロセスを使用します。明示的な `herdr-mcp install` は Windows でも Herdr 依存関係の復旧を担当し、公式 Herdr CLI を解決またはインストールし、stable 更新を試み、カレントユーザーの `herdr server` が到達可能であることを確認します。Herdr のアンインストールは独立したままです。Browser Native Messaging と製品レベルの reinstall / uninstall は、Windows 実機 UAT の主張には含まれません。テスト済み / 未テストの正確な境界は [platform support matrix](platform-support-matrix.md) を参照してください。
 
 古いインストールについては [Runtime self-upgrade](runtime-self-upgrade.md) に従ってください。runtime はその場でアップグレードします。現在の Release に移行するためだけに、健全な Worker、デバイス関係、ChatGPT Connector を作り直さないでください。
 
