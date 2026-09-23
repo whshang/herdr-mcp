@@ -59,6 +59,17 @@ Debian では、マシンのアーキテクチャに一致する静的 musl Rele
 
 macOS では `herdr-mcp permissions status` から始めます。`needs_setup` が返る場合は `herdr-mcp permissions setup` を実行し、**System Settings → Privacy & Security → Full Disk Access** で正確にその安定した broker を有効にしてから、`herdr-mcp permissions verify` を実行します。macOS のプロンプトを引き出すためだけに、setup の前に `~/Documents` を調べないでください。host-capable broker は、MCP の保護フォルダー向けファイル / Git ツールにおける安定した TCC クライアントです。そのリクエスト面は、保護フォルダー向けファイル / Git 操作の固定 allowlist（`fs_read`、`fs_list`、`fs_grep`、`fs_image`、`fs_edit`、`fs_write`、`fs_patch`、`git`）であり、任意の shell / exec 面ではありません。native Herdr の pane と Agent は、それぞれの実行ホストの TCC identity に従います。managed `herdr server` はこの host-capable broker を通して起動されるため、その配下の pane と Agent は broker の identity を再利用します。一方、この managed パスの外で起動された Herdr ホストは、そのホスト自身の TCC 境界を保ちます。したがって通常の初回インストールでは、プロセスごとに個別承認するのではなく、Full Disk Access の承認が 1 回必要です。通常の runtime 更新はこの broker を保持します。`permissions setup --upgrade-broker` は明示的な互換 migration にのみ使用してください。macOS は別途、安定した `herdr-mcp-credential-helper` による Keychain アクセスを 1 回だけ求めることがあります。この一度きりのプロンプトを承認し、更新をまたいで helper を安定させてください。プラットフォームの詳細は [CLI reference](cli-reference.md) と [Troubleshooting](troubleshooting.md) にあります。ローカルの doctor が不健全なうちは、公開 Edge を追加しないでください。
 
+### 任意：高速セマンティック判断
+
+ローカル runtime が正常になった後、高速 decision モデルを任意で設定できます。`herdr-mcp install` はこの機能を案内しますが、設定を必須にはしません。TypeSafe.ai は汎用 `decision` プロトコルを利用できるため推奨設定例ですが、製品依存ではありません。この例を使う場合は <https://typesafe.ai/> で登録して API Key を作成し、次の setup コマンドを実行します。
+
+```bash
+herdr-mcp semantic setup
+herdr-mcp semantic status
+```
+
+setup は TypeSafe.ai / `jev-latest` を既定の参考値として使うだけで、`--name`、`--protocol`、`--url`、`--model` で上書きできます。API Key は非表示の端末入力から読み取り、typed-decision route は保存前に実際の検証を行います。ローカル route の資格情報は mode-`0600` の runtime 設定にだけ保存されます。semantic 設定を省略しても、従来の決定論的 runtime 経路は変わりません。
+
 ## ステップ 2：公開 Edge をデプロイする
 
 Cloudflare Workers Free は Herdr にとって十分であり、支払い方法は必要ありません。Cloudflare アカウントがない場合は、サインインページで無料アカウントを作成します。Google サインインが最短の推奨経路です。
@@ -144,7 +155,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 これは人手による手順です。coding agent は一旦停止してユーザーを案内する必要があります。
 
 1. ChatGPT の設定を開き、Plugins の **Developer mode** を有効にします;
-2. **Plugins → Browse plugins** を開き、`herdr` という名前のカスタムプラグインを追加します;
+2. **Plugins → Browse plugins** を開き、Herdr Connector を追加します。既定/推奨例の名前は `herdr` ですが、カスタム App 名も利用できます;
 3. デプロイ済みの完全な `${MCP_URL}` を貼り付けます。末尾の `/mcp` も含めます;
 4. ブラウザで OAuth を完了します。承認ページはブラウザの言語から中国語・英語・日本語を選択し、6 桁のコードを入力する前にターミナルの承認コマンドを実行するよう求めます;
 5. **Project** を作成または開き、そこで作業します;

@@ -13,6 +13,8 @@ Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explic
 
 UI/terminal focus is observational; mutations still require the intended explicit workspace/pane/project identity. Reconnect with read-only observations before deciding whether any uncertain mutation may be retried.
 
+A pane and an Agent are separate resources. A pane with `agent:null` is not a valid `herdr_prompt` target and is not evidence that the planner owns or may repurpose that pane. `agent.start` binds a chosen Agent kind to an existing free shell pane; it does not create layout. When no verified task-owned free shell pane exists, create one with `pane.split`, use the returned pane identity for `agent.start`, and re-read live Agent state before dispatch. Close only panes/workspaces created by the current task after terminal evidence is captured.
+
 ## Discussion grounding across devices, workspaces, and history
 
 Before discussing or planning prior project work when more than one device/workspace/history could plausibly match, resolve context in this order:

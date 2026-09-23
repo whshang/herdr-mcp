@@ -64,6 +64,18 @@ pub const BROWSER_DISPATCH_SUBMIT_METHOD: &str = "herdr_mcp.browser_dispatch.sub
 pub const BROWSER_DISPATCH_STATUS_METHOD: &str = "herdr_mcp.browser_dispatch.status";
 pub const BROWSER_DISPATCH_STOP_METHOD: &str = "herdr_mcp.browser_dispatch.stop";
 
+/// Task requirements the semantic layer may fill only when the planner left
+/// them unspecified. Semantic inference can add an advisory requirement, but
+/// cannot override an explicit planner value or become execution authority.
+const SEMANTIC_INFERABLE_KEYS: &[&str] = &[
+    "requires_code_edit",
+    "requires_shell",
+    "requires_vision",
+    "destructive_production_mutation",
+    "delegates_other_workers",
+    "shared_runtime_state",
+];
+
 pub fn local_method_schemas(query: &str) -> Vec<Value> {
     let schemas = vec![
         json!({
@@ -1354,9 +1366,34 @@ impl ProgressiveSkillService {
         let advice = advise_dispatch(&task, &capabilities);
         let startable_candidates =
             startable_candidates_json(inventory, &visibility, snapshot, &task);
+        let agent_lifecycle = agent_lifecycle_json(&advice, &startable_candidates);
         if let Some(semantic) = semantic.as_mut() {
             retain_compatible_agent_routes(semantic, &advice, &startable_candidates);
         }
+        let planner_supplied_requirements = SEMANTIC_INFERABLE_KEYS
+            .iter()
+            .copied()
+            .filter(|key| params.get(*key).is_some_and(|value| !value.is_null()))
+            .map(|key| json!(key))
+            .collect::<Vec<_>>();
+        let semantic_inferred_requirements = semantic
+            .as_ref()
+            .and_then(|semantic| semantic.get("applied_fields"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let determinism = json!({
+            "advice_basis": if semantic_inferred_requirements.is_empty() {
+                "planner_supplied_requirements"
+            } else {
+                "planner_requirements_plus_semantic_inferred"
+            },
+            "planner_supplied_requirements": planner_supplied_requirements,
+            "semantic_inferred_requirements": semantic_inferred_requirements,
+            "zero_candidates_blocks_execution": false,
+            "authority": "deterministic gates remain authoritative",
+            "note": "planning advice, semantic inference, agent ranking, and zero compatible candidates never block direct execution or create a human boundary"
+        });
         json!({
             "ok": true,
             "decision_owner": "web_planner",
@@ -1367,6 +1404,8 @@ impl ProgressiveSkillService {
             "advice": dispatch_advice_json(&advice),
             "semantic": semantic.unwrap_or_else(|| json!({
                 "attempted": false,
+                "used": false,
+                "advisory_only": true,
                 "reason": if task_text.is_none() {
                     "task_text_absent"
                 } else {
@@ -1401,6 +1440,8 @@ impl ProgressiveSkillService {
                 "question_mode": "one_at_a_time"
             },
             "startable_candidates": startable_candidates,
+            "agent_lifecycle": agent_lifecycle,
+            "determinism": determinism,
             "resource_context": resource_context_json(snapshot),
             "refresh": {
                 "live": "herdr_inspect/herdr_since",
@@ -2175,6 +2216,7 @@ impl ProgressiveSkillService {
             return json!({
                 "attempted": true,
                 "used": false,
+                "advisory_only": true,
                 "reason": "not_configured",
                 "capability": capability,
             });
@@ -2335,6 +2377,7 @@ impl ProgressiveSkillService {
                 return json!({
                     "attempted": true,
                     "used": false,
+                    "advisory_only": true,
                     "reason": error.code(),
                     "capability": capability,
                 });
@@ -2474,6 +2517,7 @@ impl ProgressiveSkillService {
         json!({
             "attempted": true,
             "used": true,
+            "advisory_only": true,
             "provider": response.provider,
             "model": response.model,
             "threshold": DEFAULT_DECISION_THRESHOLD,
@@ -3108,8 +3152,15 @@ fn startable_candidates_json(
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     let mut rejected = Vec::new();
+    let mut evidence_gap = Vec::new();
     for record in available {
         if let Some(reason) = inactive_candidate_reject_reason(record, task) {
+            if reason.ends_with("_not_verified") {
+                evidence_gap.push(json!({
+                    "kind": record.agent,
+                    "reason": reason,
+                }));
+            }
             rejected.push(json!({"kind": record.agent, "reason": reason}));
         } else {
             candidates.push(record);
@@ -3151,6 +3202,11 @@ fn startable_candidates_json(
         .into_iter()
         .take(MAX_PLANNING_WORKERS)
         .collect::<Vec<_>>();
+    let evidence_gap_shown = evidence_gap
+        .iter()
+        .take(MAX_PLANNING_WORKERS)
+        .cloned()
+        .collect::<Vec<_>>();
     json!({
         "available_total": candidates.len() + rejected_total,
         "compatible_total": candidates.len(),
@@ -3161,7 +3217,80 @@ fn startable_candidates_json(
         "rejected_shown": rejected_shown.len(),
         "rejected_truncated": rejected_total > rejected_shown.len(),
         "rejected": rejected_shown,
+        "evidence_gap": {
+            "present": !evidence_gap.is_empty(),
+            "count": evidence_gap.len(),
+            "shown": evidence_gap_shown.len(),
+            "truncated": evidence_gap.len() > evidence_gap_shown.len(),
+            "items": evidence_gap_shown,
+            "action": if evidence_gap.is_empty() { Value::Null } else { json!("refresh_capability_evidence") },
+            "command": if evidence_gap.is_empty() { Value::Null } else { json!("herdr-mcp scan --probe") },
+            "meaning": "unverified capability evidence is not proof that an installed/startable Agent is unavailable"
+        },
         "meaning": "installed/startable evidence only; planner decides whether creating a new Agent lane is worth the resource cost",
+    })
+}
+
+fn agent_lifecycle_json(advice: &DispatchAdvice, startable_candidates: &Value) -> Value {
+    if advice.direct_tool.is_some() {
+        return json!({
+            "state": "direct_tool_available",
+            "can_proceed": true,
+            "requires_human": false,
+            "action": "use_direct_tool",
+            "authority": "deterministic"
+        });
+    }
+    if advice.delegation_allowed && !advice.candidates.is_empty() {
+        return json!({
+            "state": "live_agent_available",
+            "can_proceed": true,
+            "requires_human": false,
+            "action": "dispatch_existing_agent",
+            "authority": "deterministic",
+            "ownership": "do_not_reclaim_foreign_or_user_owned_panes"
+        });
+    }
+    if startable_candidates
+        .get("compatible_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        return json!({
+            "state": "startable_agent_available",
+            "can_proceed": true,
+            "requires_human": false,
+            "action": "start_agent_then_dispatch",
+            "authority": "deterministic",
+            "sequence": ["pane.split", "agent.start", "agent.prompt_or_task_dispatch"],
+            "pane_policy": "reuse only a verified task-owned free shell pane; otherwise create a planner-owned pane",
+            "ownership": "agent:null is not ownership evidence",
+            "reclaim": "planner_created_pane_only_after_terminal_and_captured_evidence"
+        });
+    }
+    if startable_candidates
+        .pointer("/evidence_gap/present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return json!({
+            "state": "capability_evidence_missing",
+            "can_proceed": true,
+            "requires_human": false,
+            "action": "refresh_capability_evidence",
+            "command": "herdr-mcp scan --probe",
+            "then": "re-run planning advice; continue direct work instead of treating the Agent surface as unavailable",
+            "authority": "deterministic"
+        });
+    }
+    json!({
+        "state": "no_compatible_agent",
+        "can_proceed": true,
+        "requires_human": false,
+        "action": "continue_without_agent",
+        "authority": "deterministic",
+        "meaning": "delegation is optional; absence of a live/startable Agent is not a tool-channel or human boundary"
     })
 }
 
@@ -3606,6 +3735,10 @@ mod tests {
         assert!(content.contains("continuity.search"));
         assert!(content.contains("confirmation_required"));
         assert!(content.contains("never choose by recency or textual similarity"));
+        assert!(content.contains("A pane and an Agent are separate resources"));
+        assert!(content.contains("agent:null"));
+        assert!(content.contains("pane.split"));
+        assert!(content.contains("agent.start"));
     }
 
     #[test]
@@ -3637,6 +3770,11 @@ mod tests {
         assert!(content.contains("External host outcome"));
         assert!(content.contains("no Herdr execution identity or result fields"));
         assert!(content.contains("Host policy is external to Agent Dispatch"));
+        assert!(content.contains("pre-dispatch condition"));
+        assert!(content.contains("delivery_state=not_delivered"));
+        assert!(content.contains("requires_human=false"));
+        assert!(content.contains("startable_candidates.evidence_gap.present=true"));
+        assert!(content.contains("never proves planner ownership"));
         for forbidden in [
             "one bounded, identical retry",
             "existing compatible local Agent",
@@ -3949,6 +4087,12 @@ mod tests {
                 .any(|item| item["kind"] == "unknown-worker"
                     && item["reason"] == "code_edit_capability_not_verified")
         );
+        assert_eq!(result["agent_lifecycle"]["state"], "live_agent_available");
+        assert_eq!(
+            result["agent_lifecycle"]["action"],
+            "dispatch_existing_agent"
+        );
+        assert_eq!(result["agent_lifecycle"]["requires_human"], false);
         assert_eq!(result["resource_context"]["duplicate_utility_panes"], 1);
         assert_eq!(result["resource_context"]["working_agents"], 1);
         assert_eq!(
@@ -3956,6 +4100,97 @@ mod tests {
             1
         );
         assert!(result["advice"].get("selected_target").is_none());
+    }
+
+    #[test]
+    fn planning_no_live_worker_with_startable_agent_is_not_a_stop_condition() {
+        let service = ProgressiveSkillService::new();
+        let inventory = vec![inventory_record("pi", true, Some(true), Some(true))];
+        let snapshot = json!({
+            "agents": [],
+            "panes": [
+                {"pane_id": "w1:p1", "workspace_id": "w1", "label": "user-shell"},
+                {"pane_id": "w1:p2", "workspace_id": "w1", "label": "herdr-mcp:utility"}
+            ],
+            "workspaces": [
+                {"workspace_id": "w1", "worktree": {"checkout_path": "/repo"}}
+            ]
+        });
+        let result = service.planning_advise_method_with_inventory(
+            &json!({
+                "project_root": "/repo",
+                "requires_code_edit": true,
+                "requires_shell": true,
+                "independent_units": 1,
+                "ownership_isolated": true
+            }),
+            &snapshot,
+            &inventory,
+        );
+        assert_eq!(result["advice"]["delegation_allowed"], false);
+        assert_eq!(result["advice"]["reason"], "no_compatible_live_worker");
+        assert_eq!(result["startable_candidates"]["compatible_total"], 1);
+        assert_eq!(
+            result["startable_candidates"]["candidates"][0]["kind"],
+            "pi"
+        );
+        assert_eq!(
+            result["agent_lifecycle"]["state"],
+            "startable_agent_available"
+        );
+        assert_eq!(
+            result["agent_lifecycle"]["action"],
+            "start_agent_then_dispatch"
+        );
+        assert_eq!(result["agent_lifecycle"]["can_proceed"], true);
+        assert_eq!(result["agent_lifecycle"]["requires_human"], false);
+        assert_eq!(
+            result["agent_lifecycle"]["sequence"],
+            json!(["pane.split", "agent.start", "agent.prompt_or_task_dispatch"])
+        );
+        assert_eq!(
+            result["agent_lifecycle"]["ownership"],
+            "agent:null is not ownership evidence"
+        );
+    }
+
+    #[test]
+    fn planning_missing_capability_evidence_is_not_agent_unavailable() {
+        let service = ProgressiveSkillService::new();
+        let inventory = vec![inventory_record("pi", true, None, None)];
+        let result = service.planning_advise_method_with_inventory(
+            &json!({
+                "project_root": "/repo",
+                "requires_code_edit": true,
+                "requires_shell": true,
+                "independent_units": 1,
+                "ownership_isolated": true
+            }),
+            &json!({
+                "agents": [],
+                "panes": [],
+                "workspaces": [{"workspace_id": "w1", "worktree": {"checkout_path": "/repo"}}]
+            }),
+            &inventory,
+        );
+        assert_eq!(result["startable_candidates"]["compatible_total"], 0);
+        assert_eq!(
+            result["startable_candidates"]["evidence_gap"]["present"],
+            true
+        );
+        assert_eq!(
+            result["startable_candidates"]["evidence_gap"]["action"],
+            "refresh_capability_evidence"
+        );
+        assert_eq!(
+            result["agent_lifecycle"]["state"],
+            "capability_evidence_missing"
+        );
+        assert_eq!(
+            result["agent_lifecycle"]["action"],
+            "refresh_capability_evidence"
+        );
+        assert_eq!(result["agent_lifecycle"]["requires_human"], false);
     }
 
     #[test]
@@ -3994,6 +4229,7 @@ mod tests {
         );
         let deterministic_advice = no_config["advice"].clone();
         let deterministic_startable = no_config["startable_candidates"].clone();
+        let deterministic_lifecycle = no_config["agent_lifecycle"].clone();
 
         use std::io::{ErrorKind, Read, Write};
         use std::net::TcpListener;
@@ -4044,6 +4280,7 @@ mod tests {
         );
         assert_eq!(configured["advice"], deterministic_advice);
         assert_eq!(configured["startable_candidates"], deterministic_startable);
+        assert_eq!(configured["agent_lifecycle"], deterministic_lifecycle);
 
         let invalid_port = repeat_semantic_server(
             r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.9},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"two","probabilities":{"two":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"start:forbidden","probabilities":{"live:worker":0.9,"start:builder":0.1},"confidence":0.9}}}"#,
@@ -4075,6 +4312,7 @@ mod tests {
             invalid_route["startable_candidates"],
             deterministic_startable
         );
+        assert_eq!(invalid_route["agent_lifecycle"], deterministic_lifecycle);
 
         let offline_semantic =
             SemanticService::test_decision_route("offline", "http://127.0.0.1:1/v1").unwrap();
@@ -4091,6 +4329,134 @@ mod tests {
             provider_error["startable_candidates"],
             deterministic_startable
         );
+        assert_eq!(provider_error["agent_lifecycle"], deterministic_lifecycle);
+    }
+
+    #[test]
+    fn planning_semantic_inference_is_explicitly_advisory_and_never_a_stop_gate() {
+        const ANSWER: &str = r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.9},"requires_shell":{"type":"noul","noul":0.1},"requires_vision":{"type":"noul","noul":0.1},"destructive_production_mutation":{"type":"noul","noul":0.1},"delegates_other_workers":{"type":"noul","noul":0.1},"shared_runtime_state":{"type":"noul","noul":0.1},"independent_units":{"type":"choice","choice":"one","probabilities":{"one":0.9},"confidence":0.9},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"1":0.9},"confidence":0.9},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.9},"confidence":0.9},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.9},"confidence":0.9},"agent_route":{"type":"choice","choice":"start:codex","probabilities":{"start:codex":0.9},"confidence":0.9}}}"#;
+        const UNCERTAIN_ANSWER: &str = r#"{"model":"jev-test","answers":{"requires_code_edit":{"type":"noul","noul":0.5},"requires_shell":{"type":"noul","noul":0.5},"requires_vision":{"type":"noul","noul":0.5},"destructive_production_mutation":{"type":"noul","noul":0.5},"delegates_other_workers":{"type":"noul","noul":0.5},"shared_runtime_state":{"type":"noul","noul":0.5},"independent_units":{"type":"choice","choice":"one","probabilities":{"one":0.45,"two":0.35,"three":0.2},"confidence":0.45},"reasoning_tier":{"type":"score","score":1.0,"probabilities":{"0":0.34,"1":0.33,"2":0.33},"confidence":0.34},"skill_route":{"type":"choice","choice":"agent-dispatch","probabilities":{"agent-dispatch":0.4},"confidence":0.4},"method_route":{"type":"choice","choice":"herdr_mcp.agent.closeout.advise","probabilities":{"herdr_mcp.agent.closeout.advise":0.4},"confidence":0.4},"agent_route":{"type":"choice","choice":"start:codex","probabilities":{"start:codex":0.4},"confidence":0.4}}}"#;
+        let service = ProgressiveSkillService::new();
+        let inventory = vec![inventory_record("codex", true, None, Some(true))];
+        let partial = json!({"task_text": "Review the change set.", "project_root": "/repo"});
+
+        let unavailable = service.planning_advise_method_with_inventory_and_semantic(
+            &partial,
+            &json!({"agents": [], "panes": [], "workspaces": []}),
+            &inventory,
+            Some(&SemanticService::test_empty()),
+        );
+        assert_eq!(unavailable["semantic"]["advisory_only"], true);
+        assert_eq!(
+            unavailable["determinism"]["semantic_inferred_requirements"],
+            json!([])
+        );
+        assert_eq!(
+            unavailable["determinism"]["zero_candidates_blocks_execution"],
+            false
+        );
+        assert_eq!(unavailable["agent_lifecycle"]["can_proceed"], true);
+        assert_eq!(unavailable["agent_lifecycle"]["requires_human"], false);
+
+        let timeout = service.planning_advise_method_with_inventory_and_semantic(
+            &partial,
+            &json!({"agents": [], "panes": [], "workspaces": []}),
+            &inventory,
+            Some(&SemanticService::test_error("planning-timeout", "timeout")),
+        );
+        assert_eq!(timeout["semantic"]["used"], false);
+        assert_eq!(timeout["semantic"]["advisory_only"], true);
+        assert_eq!(timeout["semantic"]["reason"], "timeout");
+        assert_eq!(
+            timeout["determinism"]["semantic_inferred_requirements"],
+            json!([])
+        );
+        assert_eq!(timeout["agent_lifecycle"]["can_proceed"], true);
+        assert_eq!(timeout["agent_lifecycle"]["requires_human"], false);
+        assert_eq!(
+            timeout["agent_lifecycle"]["action"],
+            "start_agent_then_dispatch"
+        );
+
+        let uncertain_url = semantic_test_server(UNCERTAIN_ANSWER);
+        let uncertain_semantic =
+            SemanticService::test_decision_route("planning-uncertain", &uncertain_url).unwrap();
+        let uncertain = service.planning_advise_method_with_inventory_and_semantic(
+            &partial,
+            &json!({"agents": [], "panes": [], "workspaces": []}),
+            &inventory,
+            Some(&uncertain_semantic),
+        );
+        assert_eq!(uncertain["semantic"]["used"], true);
+        assert_eq!(uncertain["semantic"]["advisory_only"], true);
+        assert_eq!(
+            uncertain["determinism"]["semantic_inferred_requirements"],
+            json!([])
+        );
+        assert_eq!(uncertain["agent_lifecycle"]["can_proceed"], true);
+        assert_eq!(uncertain["agent_lifecycle"]["requires_human"], false);
+        assert_eq!(
+            uncertain["agent_lifecycle"]["action"],
+            "start_agent_then_dispatch"
+        );
+
+        let url = semantic_test_server(ANSWER);
+        let semantic = SemanticService::test_decision_route("planning-inference", &url).unwrap();
+        let inferred = service.planning_advise_method_with_inventory_and_semantic(
+            &partial,
+            &json!({"agents": [], "panes": [], "workspaces": []}),
+            &inventory,
+            Some(&semantic),
+        );
+        assert_eq!(inferred["semantic"]["advisory_only"], true);
+        assert_eq!(
+            inferred["determinism"]["semantic_inferred_requirements"],
+            json!(["requires_code_edit"])
+        );
+        assert_eq!(
+            inferred["determinism"]["advice_basis"],
+            "planner_requirements_plus_semantic_inferred"
+        );
+        assert_eq!(inferred["startable_candidates"]["compatible_total"], 0);
+        assert_eq!(inferred["agent_lifecycle"]["requires_human"], false);
+        assert_eq!(inferred["agent_lifecycle"]["can_proceed"], true);
+        assert_eq!(
+            inferred["agent_lifecycle"]["action"],
+            "refresh_capability_evidence"
+        );
+        assert_eq!(
+            inferred["determinism"]["zero_candidates_blocks_execution"],
+            false
+        );
+
+        let explicit_url = semantic_test_server(ANSWER);
+        let explicit_semantic =
+            SemanticService::test_decision_route("planning-explicit", &explicit_url).unwrap();
+        let explicit = service.planning_advise_method_with_inventory_and_semantic(
+            &json!({
+                "task_text": "Review the change set.",
+                "project_root": "/repo",
+                "requires_code_edit": false
+            }),
+            &json!({"agents": [], "panes": [], "workspaces": []}),
+            &inventory,
+            Some(&explicit_semantic),
+        );
+        assert_eq!(explicit["semantic"]["advisory_only"], true);
+        assert_eq!(
+            explicit["determinism"]["semantic_inferred_requirements"],
+            json!([])
+        );
+        assert_eq!(
+            explicit["determinism"]["planner_supplied_requirements"],
+            json!(["requires_code_edit"])
+        );
+        assert_eq!(explicit["startable_candidates"]["compatible_total"], 1);
+        assert_eq!(
+            explicit["agent_lifecycle"]["action"],
+            "start_agent_then_dispatch"
+        );
+        assert_eq!(SEMANTIC_INFERABLE_KEYS.len(), 6);
     }
 
     #[test]

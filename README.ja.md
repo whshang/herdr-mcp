@@ -54,7 +54,7 @@ Agent は Herdr と herdr-mcp をインストールし、Worker と最終公開�
 
 ### ChatGPT の設定
 
-必要に応じて Developer Mode を有効にし、**Settings → Apps** から `herdr` App/Connector を追加して OAuth を完了します。ワークステーションへ最初にアクセスするメッセージで `herdr` を選択または `@herdr` します。同じ会話では以後も Herdr が継続して利用でき、毎回 mention する必要はありません。Herdr が生成する Auto、Agent 結果、recovery、handoff の turn は app reference を自分で保持します。Edge、Link、runtime が正常なのに tool が消える場合は attachment の回帰として扱い、再度の `@herdr` は一時的な復旧手段に限ります。
+必要に応じて Developer Mode を有効にし、**Settings → Apps** から Herdr App/Connector を追加して OAuth を完了します。既定/例の名前は `herdr` ですが、ユーザー独自の App 名も利用できます。最初にワークステーションへアクセスするメッセージでその App を選択または mention すると、拡張は ChatGPT の実際の App pill から provider-owned keyword を取得し、現在の conversation/Project の既存 binding に保存します。以後の Auto、Agent 結果、recovery、handoff はその実際の名前を再利用するため、同じ会話で毎回 mention する必要はありません。Edge、Link、runtime が正常なのに tool が消える場合は attachment の回帰として扱い、再 mention は一時的な復旧手段に限ります。
 
 [ChatGPT の設定](docs/i18n/ja/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
 
@@ -167,6 +167,16 @@ ChatGPT → MCP → 開発マシンの基本接続には必須ではありませ
 1.0 のブラウザ対応は ChatGPT、Claude、Grok の WebChat セッションを対象にします。ChatGPT は会話 create、dispatch、archive、self-handoff を含む最も広い surface を提供し、Claude と Grok はサインイン済みセッションの dispatch、settled result、reload recovery を提供します。Gemini はオプトインの実験的位置づけのままで、1.0 の受け入れ境界には含みません。
 
 ChatGPT Auto では deterministic な browser/runtime safety gate が常に authoritative です。通常の turn 終了後の semantic judgment は **typed evaluation route（Jev）→ chat route（LLM）→ bounded script fallback** の固定順序で動きます。Goal-aware automation では Jev の 5 signal を既存 LLM Goal Supervisor の advisory prior として使えますが、完了の authority は Work Memory/TODO evidence に残ります。ブラウザ拡張は Provider の endpoint、model、API key を保存せず、ローカル Herdr Runtime の統一 semantic capability だけを呼び出します。Provider 設定は 2 層だけです。単一マシンでは mode-`0600` の `~/.config/herdr-mcp/config.json`、全体共有では Cloudflare Worker route pool を使い、同じ capability にローカル route があればローカルを優先します。各 route は共通 JSON object として `name / protocol / url / model / api_key` を持ちます。`protocol` が route 種別も決め、`decision` と `decision-vercel` は typed evaluation、`openai-chat` は chat です。TypeSafe と OpenRouter は `protocol=decision` を共有します。設定順が route の優先順位で、最初の healthy route が primary、後続 route は failure/cooldown 時の bounded fallback です。route ごとの timeout と pool 全体の deadline は分離されています。旧 `config.toml` は一度だけ JSON へ移行し、`config.toml.migrated` として残します。
+
+同じ semantic capability は `herdr-mcp semantic` から CLI でも利用できます。`herdr-mcp semantic setup` は route 引数なしの場合に TypeSafe.ai / `jev-latest` を推奨例として使い、カスタム Provider では route name、protocol、URL、model をすべて指定します。API Key は非表示入力で受け取り、argv では受け取りません。`semantic decide`、`semantic choose`、`semantic score` から typed decision を直接呼び出し、`semantic status` は credential を表示せず route readiness を確認できます。
+
+```bash
+herdr-mcp semantic status
+herdr-mcp semantic setup
+herdr-mcp semantic choose --state "CI completed" --question "What should happen next?" \
+  --option verify="Run deterministic validation" \
+  --option done="Acceptance is already complete"
+```
 
 macOS で STANDALONE channel を使う場合、`herdr-mcp doctor` は Google Chrome が固定 Herdr standalone ID を managed path `~/.config/herdr-mcp/extensions/standalone/current` から実際に読み込んでいるかも確認します。`standalone-extension-load state=drift` が出た場合、Chrome は別の Load-unpacked directory を使っているため、`doctor` が示す `expected` path から Herdr extension を再読み込みしてください。
 

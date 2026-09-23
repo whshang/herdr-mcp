@@ -63,6 +63,7 @@ mod residue;
 mod runtime_meta;
 mod schema;
 mod semantic;
+mod semantic_cli;
 mod service_lifecycle;
 mod service_manager;
 mod skill;
@@ -289,6 +290,7 @@ fn run() -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        cli::Command::Semantic(command) => semantic_cli::run(command, language),
         cli::Command::Instance(command) => instance_admin::run(command),
         cli::Command::Qualification(command) => qualification::run(command),
         cli::Command::Worker(command) => worker::run(command, language),

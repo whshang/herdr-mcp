@@ -187,6 +187,7 @@ pub fn print_status(
         }
     );
     println!("TCC: {tcc_summary}");
+    println!("{}", semantic_status_line(language));
     println!();
     println!(
         "{}: herdr-mcp status --verbose",
@@ -281,6 +282,7 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
             language.text("disabled", "已关闭", "無効")
         }
     );
+    println!("{}", semantic_status_line(language));
     println!(
         "{}: {}",
         language.text(
@@ -314,6 +316,48 @@ fn print_status_verbose(paths: &RuntimePaths, config: &Config, language: crate::
         ),
         crate::local_agent_skill::status_line()
     );
+}
+
+fn semantic_status_line(language: crate::locale::Locale) -> String {
+    let semantic = crate::semantic::SemanticService::from_config().capability_json();
+    let configured = semantic["configured"].as_bool().unwrap_or(false);
+    let degraded = semantic["provider_state"].as_str() == Some("degraded");
+    if !configured {
+        return language
+            .text(
+                "Semantic: optional · no fast decision route configured · herdr-mcp semantic setup",
+                "语义判断：可选 · 尚未配置快速 decision route · herdr-mcp semantic setup",
+                "セマンティック判断：任意 · 高速 decision route 未設定 · herdr-mcp semantic setup",
+            )
+            .to_owned();
+    }
+
+    let typed = if semantic["evaluate_available"].as_bool().unwrap_or(false) {
+        language.text(
+            "typed decisions ready",
+            "decision 就绪",
+            "decision 利用可能",
+        )
+    } else {
+        language.text(
+            "typed decisions unavailable",
+            "decision 不可用",
+            "decision 利用不可",
+        )
+    };
+    if degraded {
+        format!(
+            "{}: {} · {typed}",
+            language.text("Semantic", "语义判断", "セマンティック判断"),
+            language.text("degraded", "降级", "DEGRADED")
+        )
+    } else {
+        format!(
+            "{}: {} · {typed}",
+            language.text("Semantic", "语义判断", "セマンティック判断"),
+            language.text("ready", "就绪", "READY")
+        )
+    }
 }
 
 pub fn print_doctor(
@@ -503,6 +547,32 @@ pub fn print_doctor(
             "PASS"
         }
     };
+    println!(
+        "{}",
+        language.text(
+            if !semantic_configured {
+                "CHECK Semantic decisions: OPTIONAL · Herdr works normally without a provider · configure with herdr-mcp semantic setup"
+            } else if semantic_degraded {
+                "CHECK Semantic decisions: DEGRADED · provider fallback is active · deterministic behavior is preserved"
+            } else {
+                "CHECK Semantic decisions: READY · fast advisory decisions are available · deterministic checks stay authoritative"
+            },
+            if !semantic_configured {
+                "检查 语义判断：可选 · 未配置 Provider 不影响 Herdr 正常工作 · 可运行 herdr-mcp semantic setup"
+            } else if semantic_degraded {
+                "检查 语义判断：降级 · Provider fallback 已启用 · 确定性行为保持不变"
+            } else {
+                "检查 语义判断：就绪 · 可使用快速辅助判断 · 确定性检查仍保持权威"
+            },
+            if !semantic_configured {
+                "確認 セマンティック判断：任意 · Provider 未設定でも Herdr は通常動作 · herdr-mcp semantic setup で設定可能"
+            } else if semantic_degraded {
+                "確認 セマンティック判断：DEGRADED · Provider fallback が有効 · 決定論的動作は維持"
+            } else {
+                "確認 セマンティック判断：READY · 高速な補助判断を利用可能 · 決定論的チェックが引き続き権威"
+            }
+        )
+    );
     println!(
         "LAYER semantic-acceleration state={} typed={} chat={} policy={} fallback={} provider_state={} fallback_active={} typed_reason={} chat_reason={}",
         if !semantic_configured {

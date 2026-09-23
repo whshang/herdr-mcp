@@ -25,6 +25,10 @@ Reject blocked workers, project mismatch, conflicting mutation ownership, destru
 
 Keep bounded `DispatchAdvice` evidence: task profile, direct deterministic option, compatible candidates, relevant rejection reasons, optional parallelism opportunity, ownership scope, and validation boundary. A selected target exists only after the Web planner chooses one. Uncertain submission is observed before any retry.
 
+`agent_not_found`, `unknown_agent`, or an unbound pane is a **pre-dispatch condition**, not a human boundary. When prompt evidence says `delivery_state=not_delivered` and `requires_human=false`, do not stop. Re-read `herdr_inspect`, use deterministic `startable_candidates` / `agent_lifecycle`, and choose a compatible Agent kind. Reuse a pane only when this task already owns and has verified that free shell pane; otherwise create a task-owned pane with `pane.split`, start the Agent with `agent.start`, wait for it to become ready, then re-prompt with the same idempotency key. `agent:null` proves only that no Agent is bound; it never proves planner ownership. Reclaim only panes this task created, and only after the worker is terminal, delivery is certain, and its output/Git evidence is captured.
+
+When `startable_candidates.evidence_gap.present=true`, an installed Agent exists but a required capability is not yet verified. Keep the capability gate fail-closed, run the advertised capability refresh, and re-plan; never rewrite “unverified” as “Agent unavailable” or “Herdr unavailable”.
+
 ## External host outcome
 
 A response with no Herdr execution identity or result fields is not evidence that the workstation, child process, filesystem, or remote service executed anything. When Herdr result fields are present, use those fields to describe the local operation. Host policy is external to Agent Dispatch and does not change worker selection or task ownership.

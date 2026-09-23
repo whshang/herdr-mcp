@@ -1249,6 +1249,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
     let registeredBrowserGeneration = 17;
     let registeredConvKey = "https://chatgpt.com/c/current";
+    const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
     const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
@@ -1330,6 +1331,7 @@ test("user receives exact content rejection reasons | Given browser controls rej
       let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
       let registeredBrowserGeneration = 17;
       let registeredConvKey = "conv-current";
+      const currentHerdrRequiredApps = () => ["herdr"];
       const providerCanonicalConversationObserved = () => true;
       const document = { hidden: false };
       const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
@@ -2238,7 +2240,9 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(createSegment, /requiredApps,/);
 
   const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
-  const registrationSegment = wakeSource.slice(registrationStart, registrationStart + 3500);
+  const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch", registrationStart);
+  assert.ok(registrationStart >= 0 && registrationEnd > registrationStart);
+  const registrationSegment = wakeSource.slice(registrationStart, registrationEnd);
   assert.match(registrationSegment, /chatGptProjectRoute/);
   assert.match(registrationSegment, /chatGptProjectRoute\s*\?\s*\[\]\s*:\s*await chatGptProjectCatalog\(accountNativeIdentity\)/);
   assert.match(registrationSegment, /browserSessionReservationRef/);
@@ -2278,14 +2282,25 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   // the opened menu; ambiguity stays fail-closed via candidates.length !== 1 in
   // wake.js (asserted below).
   assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
+  assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
+  assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
   assert.match(chatGptAdapterSource, /visible\(node\)/);
   assert.match(chatGptAdapterSource, /return matches\.sort/);
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
-  assert.match(wakeSource, /\["herdr", \.\.\.requestedApps\]/);
+  assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
+  assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);
+  assert.match(wakeSource, /const defaultChatGptApps = creatingSession \? \["herdr"\] : observedHerdrApps/);
+  assert.match(wakeSource, /requestedApps\.length \? requestedApps : defaultChatGptApps/);
   assert.match(wakeSource, /composerHasOnlyAppPills\(requiredApps\)/);
+});
+
+test("user never gets a guessed app on an existing ChatGPT conversation | Given no learned Herdr app identity | When recovery or handoff prepares another turn | Then existing-session sends have no synthetic app requirement while fresh session.create keeps the default compatibility name", () => {
+  assert.match(wakeSource, /function currentHerdrRequiredApps\(\)[\s\S]*if \(!registeredHerdrAppKeyword\) return \[\]/);
+  assert.match(wakeSource, /const defaultChatGptApps = creatingSession \? \["herdr"\] : observedHerdrApps/);
+  assert.doesNotMatch(wakeSource, /registeredHerdrAppKeyword \|\| "herdr"/);
 });
 
 test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conversation | When Auto wakes continue the thread | Then only Herdr-generated turns reassert the app requirement", () => {
@@ -2293,7 +2308,19 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   const routeEnd = backgroundSource.indexOf("async function deliverWakeToTab(", routeStart);
   assert.ok(routeStart >= 0 && routeEnd > routeStart);
   const route = backgroundSource.slice(routeStart, routeEnd);
-  assert.match(route, /requiredApps:\s*\["herdr"\]/);
+  assert.match(route, /requiredApps:\s*bindingRequiredApps\(b\)/);
+  assert.match(backgroundSource, /function bindingRequiredApps\(binding\)/);
+  assert.match(backgroundSource, /herdr_app_keyword/);
+  assert.match(backgroundSource, /b\.herdr_app_keyword = browserAppKeywords\[0\]/);
+  assert.match(wakeSource, /browserAppKeywords/);
+  assert.match(chatGptAdapterSource, /getLatestUserAppKeywords\(latestUser = null\)/);
+  assert.match(wakeSource, /registeredConversationBound/);
+  assert.match(wakeSource, /getLatestUserAppKeywords\(latestTurnForRole\("user"\)\)/);
+  assert.match(wakeSource, /shouldLearnAppIdentity/);
+  assert.match(wakeSource, /registerCurrentConversation\(shouldLearnAppIdentity \? "app-identity" : "poll"\)/);
+  assert.match(wakeSource, /registerCurrentConversation\("binding-changed"\)/);
+  assert.doesNotMatch(backgroundSource, /requiredApps:\s*\["herdr"\]/);
+  assert.doesNotMatch(wakeSource, /requiredApps:\s*\["herdr"\]/);
 
   const wakeStart = wakeSource.indexOf("async function performWake(data)");
   const wakeEnd = wakeSource.indexOf("\n  // ---- Delivery confirmation", wakeStart);
@@ -2304,6 +2331,17 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   assert.match(wake, /ensureRequiredComposerApps\(requiredApps\)/);
   assert.doesNotMatch(wake, /ensureHerdrComposerReference/);
   assert.doesNotMatch(wake, /if \(requiredApps\.length > 0\)[\s\S]*await clearComposer\(\)/);
+});
+
+test("user keeps Herdr attached on queued next-turn delivery | Given a bound ChatGPT conversation with an observed Herdr app keyword | When Queue delivers the next user turn | Then the delivery reuses only the observed app identity and never guesses an unknown keyword", () => {
+  const queueStart = wakeSource.indexOf('if (msg?.type === "h2w_queue_deliver")');
+  const queueEnd = wakeSource.indexOf('if (msg?.type === "h2w_wake")', queueStart);
+  assert.ok(queueStart >= 0 && queueEnd > queueStart);
+  const queue = wakeSource.slice(queueStart, queueEnd);
+  assert.match(queue, /registeredConversationBound && registeredHerdrAppKeyword/);
+  assert.match(queue, /requiredApps:\s*registeredConversationBound && registeredHerdrAppKeyword/);
+  assert.match(queue, /currentHerdrRequiredApps\(\)/);
+  assert.match(backgroundSource, /function bindingRequiredApps\(binding\)[\s\S]*return keyword \? \[keyword\] : \[\]/);
 });
 
 // Regression: session.create must not passively deadlock on a Browser Registry

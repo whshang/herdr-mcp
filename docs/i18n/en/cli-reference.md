@@ -45,6 +45,23 @@ On macOS, `reinstall` is the product repair/replacement path. On Linux, runtime 
 
 `service ...`, `link ...`, `native-host ...` and `candidate` are advanced/internal commands. `dev` is an advanced **source-development** surface described below. Do not use a repository checkout, Node.js, npm or `service install` as the normal runtime installation path.
 
+## Fast semantic decisions
+
+`herdr-mcp semantic` exposes the Runtime's existing provider-neutral semantic layer as a normal CLI surface. Semantic output is advisory; deterministic task, Git, validation, permission, delivery and cleanup facts keep their existing authority.
+
+```bash
+herdr-mcp semantic status
+herdr-mcp semantic setup
+herdr-mcp semantic remove <route-name>
+herdr-mcp semantic decide --state "..." --question "..." --yes "..." --no "..."
+herdr-mcp semantic choose --state "..." --question "..." --option a="..." --option b="..."
+herdr-mcp semantic score --state "..." --question "..." --criterion "..." --criterion "..."
+```
+
+`setup` with no route options uses TypeSafe.ai (`decision`, `jev-latest`) as its recommended reference. A custom route supplies `--name`, `--protocol`, `--url`, and `--model` together. Provider identity is therefore configuration, not a hard-coded decision branch. API keys are never accepted on argv: an interactive terminal uses hidden input, while automation may provide one line on stdin. For typed-decision protocols, setup verifies the exact candidate route before writing it to the existing mode-`0600` `config.json`; a failed verification leaves the previous configuration unchanged. `status --json` is machine-readable and never returns the API key.
+
+`decide`, `choose`, and `score` all use the same Runtime `SemanticService` route pool used by browser Auto, planning, Parent orchestration and Work Memory. `--state-json` accepts structured JSON instead of plain `--state` text. With no semantic route, the command reports that the decision is unavailable and Herdr's deterministic path remains unchanged.
+
 ## Source-development runtime: DEV / PROD
 
 Current runtimes have one explicit path for dogfooding herdr-mcp source without losing a stable recovery source:
