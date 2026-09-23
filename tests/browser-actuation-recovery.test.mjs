@@ -1304,6 +1304,75 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   assert.equal(ctx.reservationRemovals, 0);
 });
 
+test("fresh ChatGPT create waits through transient composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart);
+  assert.ok(commandStart >= 0 && commandEnd > commandStart);
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  const ctx = { busyChecks: 0, waits: 0, wakeCalls: 0, reservationRemovals: 0 };
+
+  const act = new Function("ctx", `
+    const ADAPTER = {
+      name: "chatgpt",
+      getConversationKey: () => "https://chatgpt.com/g/g-p-test/project",
+      getCanonicalConversationUrl: () => "",
+      getInputEl: () => ({}),
+      inputHasContent: () => false,
+      getMessageSnapshot: () => ({}),
+    };
+    const chatGptConversationId = () => null;
+    const sessionStorage = {
+      setItem: () => {},
+      removeItem: () => { ctx.reservationRemovals += 1; },
+    };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = null;
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = "https://chatgpt.com/g/g-p-test/project";
+    const currentHerdrRequiredApps = () => [];
+    const providerCanonicalConversationObserved = () => false;
+    const document = { hidden: false };
+    const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
+    const isTurnInProgress = () => {
+      ctx.busyChecks += 1;
+      return ctx.busyChecks <= 2;
+    };
+    const runtimeAlive = () => true;
+    const wait = async () => { ctx.waits += 1; };
+    const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
+    const fetchChatGptConversationSnapshot = async () => ({ ok: false });
+    const performWake = async () => {
+      ctx.wakeCalls += 1;
+      return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
+    };
+    const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
+    ${evidenceSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)(ctx);
+
+  const reservationRef = "bsr_" + "d".repeat(64);
+  const result = await act({
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      reservation_ref: reservationRef,
+      message: "fresh worker turn",
+      required_apps: [],
+    },
+  });
+
+  assert.ok(ctx.waits >= 2, "fresh create should wait for transient composer busy state to clear");
+  assert.equal(ctx.wakeCalls, 1, "the provider submit path must be entered exactly once");
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.rejected, false);
+  assert.equal(ctx.reservationRemovals, 0, "uncertain delivery keeps the reservation for reconciliation");
+});
+
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
@@ -1337,7 +1406,8 @@ test("user receives exact content rejection reasons | Given browser controls rej
       const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
       const isTurnInProgress = () => ctx.turnInProgress === true;
       const runtimeAlive = () => true;
-      const wait = async () => {};
+      const Date = { now: () => ctx.now || 0 };
+      const wait = async (ms = 0) => { ctx.now = (ctx.now || 0) + Math.max(1, ms); };
       const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
       const fetchChatGptConversationSnapshot = async () => ({ ok: false });
       const performWake = async () => ({ ok: ctx.wakeOk !== false });
@@ -2220,7 +2290,10 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
     "fresh-session actuation must enter Chat mode before waiting for the composer",
   );
   assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 20000/);
-  assert.match(createSegment, /while \(!ADAPTER\.getInputEl\(\) && Date\.now\(\) < composerReadyDeadline\)/);
+  assert.match(createSegment, /const freshCreateComposerReady = \(\) => Boolean\(ADAPTER\.getInputEl\(\)\)/);
+  assert.match(createSegment, /&& !isTurnInProgress\(\)/);
+  assert.match(createSegment, /&& !ADAPTER\.inputHasContent\(\)/);
+  assert.match(createSegment, /while \(!freshCreateComposerReady\(\) && Date\.now\(\) < composerReadyDeadline\)/);
   assert.match(createSegment, /await wait\(200\)/);
   assert.ok(
     createSegment.indexOf("const composerReadyDeadline") < createSegment.indexOf("if (isTurnInProgress() || ADAPTER.inputHasContent())"),

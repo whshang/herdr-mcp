@@ -2151,11 +2151,15 @@ function normalizeHerdrMentionAlias(value) {
     }
     if (creatingSession) {
       // Browser Registry scope registration can beat ChatGPT's Project-home
-      // composer mount. Existing-session dispatches must still fail closed on
-      // the current page state, but a freshly created tab gets one bounded
-      // readiness window before we decide that insertion is unavailable.
+      // composer hydration. Existing-session dispatches must still fail closed
+      // on the current page state, but a freshly created tab gets one bounded
+      // readiness window for the composer to mount and become idle/empty.
+      // This is still the same create actuation: no second submit is scheduled.
       const composerReadyDeadline = Date.now() + 20000;
-      while (!ADAPTER.getInputEl() && Date.now() < composerReadyDeadline) {
+      const freshCreateComposerReady = () => Boolean(ADAPTER.getInputEl())
+        && !isTurnInProgress()
+        && !ADAPTER.inputHasContent();
+      while (!freshCreateComposerReady() && Date.now() < composerReadyDeadline) {
         if (!runtimeAlive()) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
           return {
@@ -2169,6 +2173,10 @@ function normalizeHerdrMentionAlias(value) {
       if (!ADAPTER.getInputEl()) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         return browserRejectedEvidence(evidence, "browser_create_composer_unavailable");
+      }
+      if (!freshCreateComposerReady()) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+        return browserRejectedEvidence(evidence, "browser_create_composer_busy");
       }
     }
     if (isTurnInProgress() || ADAPTER.inputHasContent()) {
