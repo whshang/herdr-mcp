@@ -1244,6 +1244,13 @@ fn extension_browser_resource_observe(
     if canonical_url.is_some_and(|value| !value.starts_with("https://")) {
         return Err("browser_canonical_url_invalid".to_owned());
     }
+    if provider == "chatgpt"
+        && kind == "session"
+        && reservation_ref.is_some()
+        && canonical_url.is_some_and(|value| value.starts_with("https://chatgpt.com/c/WEB:"))
+    {
+        return Err("browser_session_identity_provisional".to_owned());
+    }
     let observation_generation = browser_registry_positive_i64(payload, "observation_generation")?;
     let mut store = state
         .state_store
@@ -3956,6 +3963,35 @@ mod tests {
                 crate::state_store::BrowserSessionReservation::Existing(_) => unreachable!(),
             }
         };
+
+        let provisional_session = json!({
+            "operation": "resource.observe",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "session",
+            "parent_ref": account_ref,
+            "native_identity": "WEB:provisional-http-locator",
+            "display_label": null,
+            "canonical_url": "https://chatgpt.com/c/WEB:provisional-http-locator",
+            "reservation_ref": reservation_ref,
+            "observation_generation": 1,
+            "observed_at": 1004
+        });
+        let response = app
+            .clone()
+            .oneshot(request(provisional_session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let reservation = store
+            .lock()
+            .unwrap()
+            .browser_session_reservation(&reservation_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation.state, "pending");
+        assert!(reservation.session_ref.is_none());
 
         let session = json!({
             "operation": "resource.observe",
