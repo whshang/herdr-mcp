@@ -899,11 +899,12 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
   assert.doesNotMatch(identitySegment, /accountNativeIdentity|email|userId/i);
 });
 
-test("ChatGPT submit tries bounded MAIN-world requestSubmit before DOM click and Enter fallbacks", () => {
+test("ChatGPT submit tries bounded MAIN-world send-button click before isolated-world fallbacks", () => {
   assert.match(wakeSource, /function submitMainWorld\(selector\)/);
   assert.match(wakeSource, /type:\s*"h2w_submit_main"/);
   assert.match(backgroundSource, /msg\?\.type === "h2w_submit_main"/);
-  assert.match(backgroundSource, /form\.requestSubmit\(sendButton\)/);
+  assert.match(backgroundSource, /sendButton\.click\(\)/);
+  assert.doesNotMatch(backgroundSource, /form\.requestSubmit\(sendButton\)/);
   const submitStart = wakeSource.indexOf("async function submit() {");
   const submitEnd = wakeSource.indexOf("// ---- Auto-allow", submitStart);
   const submitSegment = wakeSource.slice(submitStart, submitEnd);
@@ -1172,7 +1173,7 @@ test("user can stop a live answer | Given an explicit visible stop control while
   assert.equal(result.generation_stopped, true);
 });
 
-test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one MAIN-world requestSubmit is attempted and uncertain delivery never falls through to a second click", async () => {
+test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one MAIN-world send-button click is attempted and uncertain delivery never falls through to a second submit", async () => {
   const start = wakeSource.indexOf("  async function submitBrowserActuationOnce()");
   const end = wakeSource.indexOf("  // ---- Submission ----", start);
   assert.ok(start >= 0 && end > start, "bounded Browser Actuation submit helper must remain extractable");

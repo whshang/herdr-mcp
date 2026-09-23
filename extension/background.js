@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.130";
+const H2W_SCRIPT_VERSION = "0.1.131";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -7967,7 +7967,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               || String(sendButton.getAttribute("type") || "").toLowerCase() !== "submit") {
             return { ok: false, error: "no-submit-button" };
           }
-          form.requestSubmit(sendButton);
+          sendButton.click();
           return { ok: true, submitted: true };
         } catch (e) { return { ok: false, error: String(e) }; }
       },
