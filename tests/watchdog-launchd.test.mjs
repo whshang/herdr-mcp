@@ -8,7 +8,7 @@ import test from 'node:test';
 const url = new URL('../bin/watchdog.sh', import.meta.url);
 const script = await readFile(url, 'utf8');
 const cli = await readFile(new URL('../bin/herdr-mcp', import.meta.url), 'utf8');
-const plannerSkill = await readFile(new URL('../assets/herdr-mcp-SKILL.md', import.meta.url), 'utf8');
+const workstationControlSkill = await readFile(new URL('../assets/herdr/skills/workstation-control/SKILL.md', import.meta.url), 'utf8');
 
 async function writeExecutable(path, text) {
   await writeFile(path, text, { mode: 0o700 });
@@ -326,19 +326,12 @@ test('watchdog state writes are atomic and malformed state fails closed', async 
 });
 
 test('herdr_skill policy pins bounded outage recovery and uncertain-mutation safety', () => {
-  assert.match(plannerSkill, /RunAtLoad=true/);
-  assert.match(plannerSkill, /KeepAlive=true/);
-  assert.match(plannerSkill, /dev\.herdr-mcp\.health-watchdog/);
-  assert.match(plannerSkill, /historical `dev\.herdr-mcp\.watchdog` identity/);
-  assert.match(plannerSkill, /read-only.*reconnect attempts/s);
-  assert.match(plannerSkill, /retry_after_ms/);
-  assert.match(plannerSkill, /retry_read_only_probe/);
-  assert.match(plannerSkill, /backoff_ms/);
-  assert.match(plannerSkill, /delivery_state=not_delivered/);
-  assert.match(plannerSkill, /agent_status_wait_timeout.*not.*offline/s);
-  assert.match(plannerSkill, /\*\*never blindly resend it\*\*/);
-  assert.match(plannerSkill, /workstation_info\.boot_id.*herdr_since\(cursor=0\)/s);
-  assert.match(plannerSkill, /service restart/);
+  assert.match(workstationControlSkill, /retry_after_ms/);
+  assert.match(workstationControlSkill, /retry_read_only_probe/);
+  assert.match(workstationControlSkill, /backoff_ms/);
+  assert.match(workstationControlSkill, /delivery_state=not_delivered/);
+  assert.match(workstationControlSkill, /Cross-transport recovery.*proven Edge non-delivery/s);
+  assert.match(workstationControlSkill, /raw SSH is a final bootstrap\/recovery path/);
 });
 
 test('CLI still delegates Rust service lifecycle to the active runtime', () => {

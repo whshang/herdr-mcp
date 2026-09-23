@@ -7,6 +7,8 @@ description: Advise, submit, and verify useful independent coding-agent work fro
 
 Own: `herdr_prompt`. Combine this policy with live facts from `herdr_inspect`/`herdr_since`; never encode a permanent agent/model ranking or infer a worker's role from its name/kind.
 
+Call shape: target one explicit live Agent name or pane identity and use one stable `idempotency_key` for the intended prompt submission. Normal orchestration is asynchronous; retain the returned task/dispatch identity instead of blocking on a global Agent state. After timeout or transport failure, retry only when delivery evidence says `not_delivered` or live state proves the prompt did not apply.
+
 ## Selection
 
 1. Delegation is optional. The Web planner decides whether independent reasoning, implementation, review, test analysis, or a capability-specific task has enough value to justify it.
@@ -24,6 +26,8 @@ Generic same-project reasoning may consider an idle allowed worker even when opt
 Reject blocked workers, project mismatch, conflicting mutation ownership, destructive production/runtime mutation, and middle-manager delegation. Do not invent work because a worker is idle.
 
 Keep bounded `DispatchAdvice` evidence: task profile, direct deterministic option, compatible candidates, relevant rejection reasons, optional parallelism opportunity, ownership scope, and validation boundary. A selected target exists only after the Web planner chooses one. Uncertain submission is observed before any retry.
+
+If native workers are unavailable or unsuitable, a configured headless external harness may be used only as a bounded fallback for a self-contained task. Give it an explicit checkpoint and verify Git/files/tests afterward; process exit alone is not completion evidence. Interactive fallback remains human-operated.
 
 `agent_not_found`, `unknown_agent`, or an unbound pane is a **pre-dispatch condition**, not a human boundary. When prompt evidence says `delivery_state=not_delivered` and `requires_human=false`, do not stop. Re-read `herdr_inspect`, use deterministic `startable_candidates` / `agent_lifecycle`, and choose a compatible Agent kind. Reuse a pane only when this task already owns and has verified that free shell pane; otherwise create a task-owned pane with `pane.split`, start the Agent with `agent.start`, wait for it to become ready, then re-prompt with the same idempotency key. `agent:null` proves only that no Agent is bound; it never proves planner ownership. Reclaim only panes this task created, and only after the worker is terminal, delivery is certain, and its output/Git evidence is captured.
 

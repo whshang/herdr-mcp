@@ -53,3 +53,7 @@ Parallel mutations require non-overlapping file/runtime ownership. Shared files 
 After implementation, run the smallest relevant validation wave plus Git evidence, then reconcile all lanes before integration. For non-trivial implementation, bug fixes, reliability/refactor work, or releases, also load the `engineering-robustness` reference and apply its regression, sibling-path, and state-plane completion gates.
 
 Reclaim a lane only when no worker is active, no mutation outcome is uncertain, changes are clean or preserved, and branch disposition is known. Reconcile Herdr workspace, Git worktree, and planner-created branch state separately. Runtime release generations are outside development-worktree cleanup.
+
+## Herdr-MCP development-only retrospective
+
+When the target project is Herdr-MCP itself, finish non-trivial development/debug/release work with one bounded call-pattern review after the user's acceptance checks are complete. Report at most three concrete latency/reliability improvements supported by this task's actual calls. Do not start another optimization lane merely because the retrospective found an idea, and do not load this retrospective for ordinary Herdr-MCP use outside repository development.

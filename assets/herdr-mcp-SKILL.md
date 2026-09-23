@@ -1,295 +1,117 @@
 ---
 name: herdr-mcp
-summary: Remote-planner operating policy for herdr-mcp. This document has precedence over the appended native Herdr pane-agent reference when the caller is a web model outside HERDR_ENV.
+description: Remote/Web planner policy for Herdr-MCP. Use for workstation files/Git/exec, Agent dispatch, multi-device routing, Continuity, supported WebChat control, and Herdr-MCP maintenance. Keep the entrypoint compact and load progressive domain Skills only when the current task needs them.
 ---
 
-# herdr-mcp remote planner skill
+# Herdr-MCP remote planner
 
-You are operating **through herdr-mcp from a remote/web planner**. You are not a pane-local Herdr agent. The goal is to make the remote model effective without wasting local agent API calls, duplicating orchestration layers, or breaking the persistent Connector while upgrading this project.
+You are a remote/Web planner using Herdr-MCP. Keep planning in the current model; use Herdr for live workstation facts, deterministic operations, durable tasks, and supported WebChat control.
 
-## 0. Project-local instructions and reusable skills
+## 0. Ground the target project
 
-As soon as a target project root is known, and **before substantive project work in that project (including read-only analysis, the first mutation, or agent dispatch)**, inspect the project root for `AGENTS.md`, `CLAUDE.md`, and `README.md`. Read every one that exists; missing files are normal and are not errors. Do this once per target project root before continuing the task. Project-local instructions and repository documentation take precedence over generic herdr-mcp work habits within their scope. Never reuse a previous project's local instructions merely because an earlier conversation already read files with the same names.
+When a project root is known, read its existing `AGENTS.md`, `CLAUDE.md`, and `README.md` before substantive work, including read-only analysis or mutation. Missing files are normal.
 
-For task-specific reusable skills, support the frozen project and user `.agents` conventions without eagerly loading all skill bodies:
+Discover reusable Skills lazily from:
 
 - project: `<project-root>/.agents/skills/*/SKILL.md`;
 - user: `$HOME/.agents/skills/*/SKILL.md`.
 
-Discover candidate entrypoints only when the current task could benefit from a reusable skill. Read the matching `SKILL.md` on demand, then follow it for that task. Prefer project-scoped skills over same-name user-scoped skills. If two same-scope copies with the same skill name differ materially, read both and treat the conflict explicitly instead of silently choosing one. Do not recursively ingest every skill directory into context.
-
-Use `herdr_fs_list` / `herdr_fs_read` for project-scoped skill files inside managed roots. User-scoped skill directories are outside managed roots, so use `herdr_exec` only for bounded read-only discovery/reads of that known user skill root; do not broaden that exception into arbitrary home-directory scanning. When `herdr_exec.steps` is available, use one structured executable/argv step for a known file read (for example `cat` with the literal absolute path as its argv) instead of shell expansion, pipelines, redirects, command substitution, or command concatenation that the read does not require. On older contracts without `steps`, keep the freeform command to one single-purpose read. System/developer safety constraints still outrank any local instruction or skill.
-
-## 0A. Conversation continuity recovery
-
-Treat phrases such as “continue”, “resume”, “keep going”, “接着”, “继续上次”, or “where did we leave off?” as **prior-work continuity intent** when the current conversation does not already contain enough verified context. Do not ask the user to provide a Herdr continuity ID before attempting safe discovery.
-
-Use the existing `herdr_call` local methods in this order:
-
-Performance rule: when stable `conversation_id` and optional `project_id` are already available from the user's input, call `continuity.resume` once with those identifiers. Do not spend a separate `continuity.resolve` round trip before that resume; use `continuity.search` only when stable identity remains ambiguous.
-
-1. If the user supplies a full ChatGPT conversation URL, pass it unchanged to `continuity.resume` as `conversation_url`. Rust parses the Project/conversation identity and resumes the unique durable chain in the same call; use `continuity.search` only if the result is ambiguous. The browser extension is not required for this manual URL-based recovery. If the URL was never captured into the local journal, the private ChatGPT body cannot be fetched through MCP from the URL alone; continue from independently persisted Herdr/Git state only when that evidence is sufficient.
-2. If the conversation contains an explicit `continuity_id` or `[HERDR_CONTINUITY_REF ...]`, call `continuity.resume` for exactly that ID.
-3. If a concrete current/known conversation ID is available, prefer `continuity.resolve` for that exact conversation.
-4. Otherwise call `continuity.search` with the strongest stable identity facts already known: `conversation_id`, `project_id`, and/or `workspace_id`. Add `query` only from distinguishing task terms the user actually supplied; a generic word such as “continue” is a trigger, not selection evidence.
-5. When `continuity.search` returns `resolution=unique_exact` and `auto_resume_safe=true`, resume exactly that candidate automatically.
-6. When URL-based or ordinary `continuity.search` returns `confirmation_required`, show only the bounded candidate evidence (for example title, workspace, update time, recent user/assistant excerpts) and ask the user which prior chain to continue. **Never** select a chain merely because it is newest or textually most similar.
-7. When no chain matches, do not invent an ID. Ask for one distinguishing detail, or proceed as fresh work if the user says this is new work.
-
-For ChatGPT-to-ChatGPT self-handoff, first call the read-only private method `herdr_mcp.browser_handoff.prepare` with the existing `continuity_id` and exact `source_url`. It returns one canonical handoff package: `automatic_delivery.params.message` and `manual_delivery.copy_prompt` are the same string, and the package reuses the durable continuity chain instead of creating a parallel one. Pass that message unchanged to `herdr_mcp.browser_session.create` with one idempotency key. Do not enumerate browser endpoints, accounts, Projects, generations, or device ids first; Rust derives the same account/Project route from the registered source session. If browser control is unavailable, use the already-prepared Copy Prompt. If automatic delivery produces no Herdr execution or result fields, do not infer workstation execution from that outcome; use the prepared manual path or re-observe the exact dispatch when one exists. If Herdr reports uncertain delivery, do not replay the mutation automatically. Users without browser automation can open a new WebChat and paste the Copy Prompt directly; `source_url` remains an audit anchor and durable state comes from `continuity.resume`. ego-browser is development/UAT infrastructure, never a user dependency.
-
-After any `continuity.resume`, treat the journal as persisted historical working context, not current machine truth: re-check the relevant Herdr workspace/runtime/Git state before mutation. Read-only discovery may happen before continuity identity is resolved; mutations must not rely on an uncertain recovered chain.
-
-## 1. Work ladder
-
-Use the cheapest deterministic layer that can complete the task.
-
-1. **Inspect once when state matters**: `herdr_inspect` for workspace/pane/agent/runtime identity.
-2. **Direct workstation operations first**:
-   - read/search/list: `herdr_fs_read`, `herdr_fs_grep`, `herdr_fs_list`;
-   - multi-file edits: prefer `herdr_fs_patch`; exact single replacement: `herdr_fs_edit`; new/full file: `herdr_fs_write`;
-   - deterministic Git facts: `herdr_git`;
-   - short shell/build/probe: `herdr_exec`;
-   - long build/test/process: prefer `herdr_exec_start` -> `herdr_exec_read` (delta) over a blocking `herdr_exec`; `herdr_exec_kill` only when needed;
-   - images inside managed repos: `herdr_fs_image`.
-3. **Artifact/file ingress — always take the shortest safe path** (v0.4.2 built-in policy):
-   1. If the artifact already lives in a managed project, use the direct local tools (`herdr_fs_*`) — no relay, no import.
-   2. If it is at a safe signed HTTPS URL the local runtime can fetch, import it directly with `herdr-mcp artifact import --url HTTPS_URL --path MANAGED_PATH --signed-url` (no capability needed for a direct signed import).
-   3. If the MCP/Connector exposes a directly consumable file reference, consume it directly.
-   4. Only when none of the above applies, use the private R2 generic artifact relay as a temporary cross-boundary upload/download relay (`POST /artifacts` then `herdr-mcp artifact import` with `HERDR_ARTIFACT_CAPABILITY`).
-   The browser extension is **never** binary/file transport. Images are just one artifact type; after an image import lands, verify visually with `herdr_fs_image`.
-   For small non-secret UTF-8 text already present on one enrolled workstation and needed on another, prefer the private local methods instead of the artifact relay: call `herdr_mcp.text.read` through `herdr_call` on the source device, then pass its returned `content` and `sha256` to `herdr_mcp.text.write` on the target device. Both calls must carry an explicit top-level `device` selector; text transfer never derives its device from a workspace/pane ref. This path is limited to regular non-symlink files under the workstation HOME, at most 256 KiB, with SHA-256 integrity, explicit overwrite, default backup, and secret-like path/content rejection. It is not a binary, directory, credential, or automatic synchronization mechanism, and it does not expand the public MCP tool contract.
-   Device enrollment is a **Worker/fleet administration** operation; enrolled devices have no owner/member hierarchy. WebChat Connectors remain ordinary MCP principals even after explicit approval and must never be treated as fleet administrators. Create a short-lived pairing on **any already-enrolled computer** with `herdr-mcp worker pair`; never run `worker pair` on the fresh computer as a discovery probe. If no enrolled device exists because this is the first Worker, complete the first-Worker Cloudflare bootstrap before pairing. Default pairing TTL to 600 seconds unless the user requests shorter, show the pairing address, one-time 6-digit code, exact expiry, and copyable `herdr-mcp worker connect <pairing_address>` command together, and never persist pairing data to Git, shell history, ordinary logs, or unattended automation.
-   To permanently revoke an enrolled computer, first use `herdr_devices` to identify the immutable `device_id`, then run `herdr-mcp worker revoke <device-id> --confirm` from any enrolled computer. Never revoke by display name or pane/workspace ref. Revoke is permanent for that device identity and credential; re-enrollment requires a new pairing and device identity.
-   Device-aware `herdr_ref_*` values are opaque routing/affinity metadata, not authorization capabilities. Do not decode, synthesize, or edit them; use only refs returned by Herdr. Bare workspace/pane ids remain local to the explicitly selected/default device, while `workspace_ref` / `pane_ref` preserve device affinity for a follow-up. When following a sibling ref, pass its value through the existing schema field (`workspace`, `workspace_id`, `pane`, `pane_id`, or `target`); do not invent `workspace_ref` / `pane_ref` input parameters. For Agent operations prefer the unique addressable Agent name when available; a pane ref identifies the pane and does not promise that the same Agent occupant will remain there forever.
-4. **Use a development agent only when reasoning or parallel investigation is genuinely useful**. Discover live workers and their evidence-backed capabilities at runtime. When the progressive bootstrap advertises `herdr_mcp.planning.advise`, use it for non-trivial dispatch/orchestration decisions instead of rebuilding the same candidate/resource filtering and lifecycle rules manually; it is read-only advice and never authorizes or starts an Agent. Let task requirements, current load, verified quality/cost/latency traits, ownership, and project compatibility inform the choice; never assign implementation/audit roles from agent names.
-   - `advice.delegation_allowed=false` means no compatible **live** worker is immediately dispatchable; it is not by itself a stop condition. Read deterministic `agent_lifecycle` and `startable_candidates`. If `agent_lifecycle.action=start_agent_then_dispatch`, create or reuse only a verified task-owned free shell pane, call native `agent.start`, wait for readiness, then dispatch. If capability evidence is missing, refresh it and re-plan. Never treat `agent:null`, an unverified capability, or semantic uncertainty as proof that Herdr/tooling is unavailable, and reclaim only resources this task created.
-5. **If Herdr-native workers are unavailable, DeepSeek Harness headless is an optional CLI fallback when installed**. Use it for narrow, self-contained implementation or review tasks; do not put a broad critical-path refactor behind it. Resolve the executable before dispatch: `herdr_exec_start` can have a smaller PATH than the visible utility pane (for example, a user npm-global install may live at `$HOME/.npm-global/bin/dsh`). Run the resolved binary as `dsh --profile headless "<task>"` through `herdr_exec_start`, then use private `herdr_mcp.exec.wait` when advertised; use `herdr_exec_read` only for immediate/delta output or when the wait method is unavailable. Do not use a synchronous 60-second `herdr_exec` for non-trivial DSH coding work: a tool mutation can finish before DSH prints its final answer. **Do not treat exit code 0 alone as completion evidence**: require a non-empty final answer or an explicit task completion marker, and for mutation tasks also verify the expected Git/files/test state. Give each DSH job an explicit time/output/diff checkpoint; if it produces neither useful output nor a relevant diff, inspect process/Git state once, cancel if appropriate, and fall back rather than waiting indefinitely. Prompt wording such as “implement now” is not a substitute for that budget. If an automated headless job needs a different model/reasoning profile, scope the override to that headless invocation/profile (for example with a temporary `--patch`) and never mutate the operator's global interactive/TUI configuration as an automation side effect. `dsh-tui` is a human-interactive fallback, not the normal automated worker.
-6. **The web model remains the planner**. Do not ask a local coding agent or fallback harness to become a middle manager or to dispatch other agents for you.
-7. **Native Herdr methods are the escape hatch, not the default tool catalog**: use `herdr_methods` to discover the installed socket schema, then `herdr_call` for methods that do not deserve a dedicated MCP tool.
-
-## 1A. Latency-aware tool scheduling
-
-Before the first remote call, form the next dependency-aware **wave** from facts already known. A call must earn its round trip by doing at least one of three things: obtain evidence that can change a decision, execute work whose arguments/safety boundary are already known, or verify a falsifiable acceptance boundary. Do not call one tool merely to create the thought that determines the next obvious tool call.
-
-Within a wave, do not re-enter model planning between deterministic steps whose arguments and safety are already known. When the current public schema advertises `herdr_exec.steps`, prefer one transparent structured `program` + `args` step per process and let the local runtime execute same-boundary steps sequentially. Use freeform `herdr_exec.command` only when actual shell semantics such as pipes, redirects, expansion, or command substitution are required. Do not concatenate several otherwise independent process invocations with `&&`, `;`, or a generated script solely to save remote calls. On older contracts without `steps`, keep each shell command narrow and single-purpose rather than manufacturing a large command bundle. For read-only inspection, do not combine unrelated file, search, remote-host, or datastore probes merely to reduce request count. Re-plan only when new evidence changes later arguments/safety, a human action is required, or mutation delivery becomes uncertain.
-
-**Request-shaping rule — one public call, one logical intent, one authority boundary.** One OpenAI-visible public tool call must represent exactly one logical intent, one authority boundary, and at most one mutation boundary. Internal Herdr/Edge batching, caching and coalescing remain encouraged: keep combining same-boundary deterministic work, reusing fingerprints/cursors/`next_offset`, and letting the runtime batch its own socket work. What is **not** allowed is concatenating unrelated host, file, database, network, or service actions into one freeform `herdr_exec` (or one `herdr_call`) **solely** to save a model/MCP round trip: unrelated authority boundaries — read versus mutate, one host/service/credential scope versus another, one datastore versus another — must stay separate public calls even when that costs an extra round trip. A coherent multi-file `herdr_fs_patch`, or one same-boundary command wave whose arguments and safety are already known, is still one intent and one mutation boundary rather than many. Reducing ambiguity per public call is the goal; it does not by itself make any tool "absolutely safe" and is not permission to weaken authorization or bypass host safety checks.
-
-WebChat/Connector hosts can reject an invocation before Herdr receives it. A host-side rejection that contains none of Herdr's execution identity or result fields (for example `op_id`, `session_id`, `backend`, `pane_id`, `exit_code`, `execution`, `failure_origin`, or `device_id`) provides no workstation or child-process execution result and must not be attributed to the Herdr runtime, SSH transport, filesystem, database, or remote service. When Herdr result fields are present, their execution and delivery evidence is authoritative for the local operation. Host-side policy remains external to Herdr and is not altered by this planner guide.
-
-- Treat one `herdr_inspect` as the aggregate baseline for runtime, workspace, pane, Agent, project-root, and dirty-state facts. Reuse those exact IDs and paths instead of immediately rebuilding the same view with separate workspace/pane/agent/status calls.
-- Do not load `herdr_skill` as a session heartbeat. Load it once when detailed remote-planner policy or Agent control is actually needed; request `include_native_reference=false` unless the task specifically needs native Herdr CLI semantics.
-- Independent read-only operations should be issued concurrently when the client supports parallel tool calls. Examples: project-instruction reads, independent greps, Git facts, and unrelated file reads. Only serialize when one result determines the next call's arguments or safety decision.
-- Large `herdr_git status`/`diff`/`log`, successful large `herdr_exec` output, and `herdr_fs_grep` are already compacted (counts, directory or file grouping, exec head/tail). Plan from `counts`/`compacted` and the summarized `output`; do not re-call the same scope hoping for a full dump unless a specific path still needs detail.
-- Long build/test/process work belongs in `herdr_exec_start`, not the canonical utility pane or a blocking `herdr_exec`. Treat the utility pane as a short-command / human-visible interaction surface, not durable evidence storage for a long test. Ordinary roots use a native background process; macOS privacy-protected roots use one task-owned auto-closing Herdr pane so a long session cannot monopolize `herdr-mcp:utility`. `herdr_exec_start` returns `phase=started` plus `progress` (`bytes_read`, `bytes_total`, `elapsed_ms`); keep the `session_id` so a later model turn can continue the same session. When the private `herdr_mcp.exec.wait` method is advertised, follow the bounded-wait policy below instead of polling `herdr_exec_read`. If workstation `boot_id` or runtime identity changes, first inspect whether that session still exists; never infer the final exit code from stale pane scrollback.
-- Network-bound file transfers whose completion time depends on remote latency or artifact size count as long work by default, even when the command itself is deterministic. This includes GitHub Actions artifact downloads via `gh api` / `gh run download`, `curl`/`wget`, `scp`/`rsync`, and comparable uploads/downloads. Start them once with `herdr_exec_start`, then use the private bounded `herdr_mcp.exec.wait` path when advertised; use `herdr_exec_read` only for immediate/delta output or when the wait method is unavailable. Do not spend the synchronous `herdr_exec` timeout budget hoping the transfer finishes within 60 seconds. If a transfer was mistakenly started synchronously and returns timeout or uncertain delivery, first inspect the original process/session and destination-file growth; never start a duplicate transfer until evidence proves the original is no longer running and replacement is safe.
-- Keep long-task polling compact. Read only from `next_offset`; summarize progress and failures instead of replaying the full log into each model turn. When the private `herdr_mcp.exec.wait` method is advertised, prefer one bounded wait (normally 10 seconds, maximum 20 seconds) over repeated empty `herdr_exec_read` polling; it returns as soon as new output or completion is observable. Use ordinary `herdr_exec_read` for immediate/delta reads when output is already expected. Completion evidence should normally be `phase=completed` + `exit_code` + a bounded failure/final-summary excerpt, followed by the relevant boundary verification when the task needs more than process success.
-- For GitHub repository settings, PR mergeability, Auto-merge, required checks, and external deployment statuses, prefer `herdr_call(method="herdr_mcp.github.status", ...)` when the progressive bootstrap advertises it. It performs a fresh local authenticated `gh` read instead of trusting a possibly stale Connector projection. When the GitHub `owner/repo` is already known, pass it as `repository`; this skips the local Git remote probe and keeps `gh --repo` out of a macOS TCC-protected project cwd. Pass the returned `fingerprint` back as `previous_fingerprint` while monitoring. For active CI, also pass `wait_ms=20000`: the workstation combines the bounded wait and one fresh GitHub probe into a single call, then returns either the changed state or compact `changed=false`. The 20-second ceiling leaves headroom under the Edge request deadline. This replaces separate planner sleep/status round trips and `gh run watch`, whose repeated snapshots waste Edge/model context without adding evidence.
-- After the first state baseline, prefer `herdr_since(cursor)` for incremental workspace/agent changes instead of repeatedly calling full `herdr_inspect`.
-- Before doing a manual multi-call Git worktree/branch cleanup audit, prefer `herdr_call(method="herdr_mcp.cleanup.preview", params={"project_root":"<managed-root>"})` when the progressive bootstrap advertises it. The read-only preview aggregates worktrees/branches, dirty state, target reachability, live Herdr workspace/Agent occupancy, fresh GitHub branch identity, and open PR references without fetching or deleting anything. Treat `safe_to_delete=true` as conservative evidence, not mutation authority: re-check immediately before the actual lifecycle mutation, keep dirty/unmerged/occupied resources, and use an OID lease for remote branch deletion. A stale target ref or unavailable GitHub/resource evidence fails closed.
-- Treat Edge/Worker calls as a real shared request budget. Optimize **logical work per remote call**: combine same-boundary deterministic work, batch Skill ids, reuse `previous_fingerprint` / `next_offset` / continuity cursors, and prefer compact private summary methods. Start long work once and read deltas only when completion or actionable progress could plausibly have changed. When the live runtime says JSON-RPC batch or multi-operation arguments are unavailable, coalesce through supported operations rather than inventing an unsafe protocol batch. Mutation fencing and final verification still outrank request savings.
-- Use `herdr_exec_read(offset=next_offset)` as a delta read. Never restart at offset 0 unless earlier output is actually needed again.
-- Prefer one `herdr_fs_patch` for a coherent multi-file mutation instead of a chain of tiny edits. Mutations in the same project remain ordered by default; independent isolated mutation lanes may proceed in parallel.
-- Do not call `herdr_methods` before every `herdr_call`; discover only the method/schema that is unknown, then reuse the known schema during the task.
-- The generated **Live herdr-mcp runtime context** is authoritative for current execution capabilities such as server-side concurrency, JSON-RPC batch, and multi-operation tool arguments. Prefer fewer high-value bounded calls when no batch form exists; prefer an advertised server-side batch over N sequential model round trips.
-
-Target shape:
-
-```text
-plan from known facts
-  -> one aggregate baseline when needed
-  -> one independent read wave
-  -> one or more safety-bounded execution bundles
-  -> one validation wave
-  -> event/delta follow-up only when change is expected
-```
-
-Before discussing prior or multi-device project work, load `workstation-control` and resolve its `device -> project/workspace -> continuity/history -> live Git/runtime` sequence. When material product/engineering decisions remain unresolved after facts are read, load `requirements-grilling`. For non-trivial lane planning, load `development-orchestration`; it owns the five-beat execution cadence and Required/Advisory semantics, while `herdr_mcp.planning.advise` exposes compact machine-readable levels and live resource/candidate evidence.
-
-## 1B. Workspace, tab, pane and worktree lifecycle
-
-Herdr workspaces and Git worktrees are resources, not task history. A new worktree can duplicate dependency trees, build caches, watchers and initialization cost, so its lifetime should approximate an **active independent mutation lane**.
-
-- Default to the current project/workspace and a sibling pane. Read-only analysis, grep, Git status/log/diff, review, architecture discussion and ordinary test execution do **not** justify a new worktree.
-- Treat the workspace as the project/lane boundary, a tab as a human-readable activity grouping, and a pane as one terminal/agent surface. Do not keep splitting one tab merely because `pane.split` is available.
-- Herdr 0.9.1 saved SSH machines and herdr-mcp Edge devices are separate control-plane identities even when they target the same physical workstation. A Herdr machine address is scoped by machine profile + Herdr session + workspace/pane id; an Edge address is scoped by immutable `device_id` + workspace/pane id. Never treat a bare id such as `w1:p1` as globally unique across machines, and never merge identities solely by hostname or display name.
-- When both control planes reach the same Herdr server/session, workspace, pane, agent, terminal, Git and filesystem state are shared live state rather than replicated state. Machine profile selection in the Herdr TUI must not silently retarget an Edge call: Edge operations stay bound to the explicit/default herdr-mcp device and `herdr_ref_*` affinity.
-- Herdr 0.9.1 provides native programmatic saved-machine routing with `herdr --machine <label-or-id> <command>`. Use it for explicit maintenance/UAT/recovery operations across supported API command families after verifying both local and remote Herdr are upgraded; it uses the saved machine's session without requiring an open remote Herdr window. `herdr --remote <target>` remains the interactive remote-TUI path. A failed `--machine` command must never be treated as a Local result or silently replayed locally. For pre-0.9.1 bootstrap/repair only, resolve `herdr machine list --json` and use explicit SSH execution as the compatibility path, then re-read the remote ids before acting.
-- Prefer the structured `herdr_inspect.herdr_native` projection over guessing from a version string. `cli_version` and `server_version` are separate evidence; `machine_forwarding` is feature-detected from the installed CLI; `saved_machine_count`/`saved_machines` describe only local saved profiles. `version_state=server_restart_pending` means the installed client is newer than the still-running compatible server. This state is diagnostic, not permission to stop Herdr or close panes.
-- When `herdr_inspect.herdr_native.handoff_blocked_reason=legacy_sender_pane_limit`, an older running sender still owns more than 64 panes during the first 0.9.1 upgrade. Preserve those panes and wait for a safe handoff/restart window; never close unrelated panes merely to cross the threshold.
-- SSH/Herdr-machine control is an explicit maintenance/UAT/recovery transport, not a transparent fallback for an Edge mutation. After an Edge failure, switch transports only after checking delivery evidence: `delivery_state=not_delivered` may permit a verified reissue; `delivery_unknown`, delivered/uncertain state, or missing evidence requires live state inspection before any SSH-side mutation.
-- Recovery transport order is explicit: use the enrolled Edge route while it is healthy; after proven non-delivery or live proof that a mutation was not applied, a saved-machine `--machine` route may be used when the target Herdr server is reachable; use raw SSH only for bootstrap/recovery when the target Herdr server or machine-forwarding path itself is unavailable. None of these routes may infer an Edge `device_id` from a machine label/hostname or vice versa.
-- Herdr 0.9.1 fixes client-side filtering for duplicate workspace/tab ids across connected machines, but ids remain server/session scoped. Preserve machine/session affinity and Edge device affinity independently, and keep live help/schema/capability checks as the authority when endpoints differ in version.
-- Prefer a new labeled tab when starting a distinct activity inside the same workspace or when the current tab already mixes several unrelated panes. For a distinct Agent activity, prefer `tab.create` and start the Agent in that tab's returned root pane instead of repeatedly splitting the currently focused tab. Use a pane split for tightly related side-by-side work that benefits from simultaneous visibility. When the live schema advertises them, use `tab.create` and `pane.move` to rebalance crowded tabs instead of opening another workspace or worktree.
-- Do not hard-code a universal panes-per-tab limit: screen size and task shape differ. The trigger is loss of readability — nested splits, unrelated panes competing for space, or a user having to hunt for the active surface. Close temporary panes and tabs after their activity is complete; preserve any pane that still owns a working agent, uncertain mutation, or needed interactive state.
-- Treat resource reclamation as part of task completion, not optional housekeeping. After the task's result is captured and the relevant validation is complete, run one bounded **completion resource sweep** for resources created by the current planner: classify Agent panes as working/blocked/unknown versus settled; close completed temporary panes and tabs; close a completed workspace when it no longer carries needed interactive state; remove a development worktree only when the reclaim evidence below is satisfied; and remove a planner-created local branch only after its commits are merged/reachable from the intended integration target or the lane was explicitly abandoned. Do not wait for the user to notice accumulated panes before cleaning up resources the planner itself created.
-- A settled Agent (`done` or an `idle` Agent whose requested work is already captured and verified) does not need to remain open merely to preserve task history. Close its temporary pane/tab when safe; the persisted Agent/session evidence and Git state are the history. Conversely, do not close a pre-existing user/other-session pane, tab, or workspace merely because it looks idle: require explicit user authorization or unambiguous task ownership first.
-- Use `herdr_exec` directly for bounded process work in the selected workspace/project. Ordinary roots run as durable native sessions and do not require a visible pane. When structured `herdr_exec.steps` is advertised, batch only already-known same-boundary process invocations as explicit steps; otherwise keep shell calls narrow instead of joining them into one larger command string. On macOS privacy-protected roots (Documents/Desktop/Downloads), `herdr_exec` reuses that workspace's canonical `herdr-mcp:utility` pane so TCC ownership stays with the Herdr terminal; do not split a fresh pane per command. Do not use `pane.split` or `herdr_exec_start` merely to get another shell: `herdr_exec_start` is a durable session and should be started once only for genuinely long work. Bounded SSH maintenance/recovery follows the same protected-root resource discipline; long remote work uses one durable session and the same `session_id`. Keep planner-created extra panes scoped to the conflicting activity, then reclaim them after the work is captured and verified. Do not churn a canonical reusable utility pane as ordinary completion cleanup, and reclaim any stale utility pane only after proving it is not the canonical busy/owned surface.
-- Before creating a worktree, inspect current workspace/project state and query the repo's existing Herdr worktrees (`worktree.list` through the live native schema when needed). Reuse an existing suitable worktree before creating another one.
-- Create a new worktree only for an independent mutating branch/lane, for isolation from unrelated dirty work, or when the user explicitly requests that topology.
-- Creating/opening a worktree does not authorize dependency installation. Run `npm ci`, `pnpm install`, virtualenv creation or equivalent bootstrap only when the task actually requires those dependencies.
-- Do not create a second worktree merely because an existing worker is read-only or reviewing. Prefer another pane in the same safe checkout for non-mutating parallelism.
-- At the end of a lane, the completion resource sweep must reconcile **both** Herdr workspace state and Git worktree state. They can diverge: a workspace may survive after its underlying checkout has disappeared, or a checkout may remain after the workspace is closed.
-- Reclaim only with deterministic evidence: no working agent, no uncertain mutation, changes are clean or safely preserved, and the branch is merged or explicitly abandoned. Close the Herdr workspace and remove the development worktree through native lifecycle APIs; never blindly `rm -rf` a checkout.
-- Dirty, unmerged, actively used, outcome-unknown, or ownership-unclear worktrees are preserved and reported instead of force-cleaned.
-- `~/.herdr/worktrees/**` is the development-worktree domain. `~/.config/herdr-mcp/releases/**` is the immutable runtime-generation domain and is **never** subject to development worktree cleanup.
-- Before opening another mutation worktree, reconcile completed lanes first. The number of long-lived development worktrees should stay close to the number of currently active independent mutation lanes, not the number of historical tasks.
+Load only Skills relevant to the current task. Prefer project-scoped instructions over same-name user Skills. Do not recursively ingest every Skill. System/developer constraints and runtime authorization still outrank Markdown.
 
-## 1C. DEVELOPMENT-ONLY herdr-mcp retrospective
+## 1. Connected-tool calling contract
 
-While `herdr-mcp` is still under active development, every task about developing, debugging, testing, releasing, or operating **herdr-mcp** ends with one bounded self-review **after the user's primary plan and validation are complete**. Remove or sharply reduce this section before the stable production Skill is frozen.
+These shapes are easy to get wrong. Treat them as part of the public calling contract.
 
-- Review only the tool calls actually made in this task: avoidable MCP/model round trips, serial reads that could have formed one wave, repeated inspect/Git/topology work, oversized outputs, unnecessary agent prompts, or unnecessary workspace/worktree creation.
-- Separate observed evidence from speculation. Prefer concrete evidence such as repeated calls, subprocess/RPC counts, timeouts, payload size, or bootstrap/worktree cost.
-- Report at most three actionable herdr-mcp improvement suggestions, ordered by expected user-visible latency/reliability benefit.
-- Do not interrupt the current plan, mutate code, open another worktree, or start another optimization lane merely to pursue a retrospective suggestion unless the user already authorized that lane.
-- If an issue is already covered by the active optimization plan, reference that item instead of creating a duplicate task.
+| Surface | Required shape | Avoid |
+| --- | --- | --- |
+| `device` | Put the device name or `device_id` inside the tool arguments. When more than one workstation is plausible, pass it explicitly. `herdr_devices` is the listing exception. | Treating a bare workspace/pane id as globally unique or guessing a device from focus/recency. |
+| `herdr_call` | Pass `method` plus `params` as a **JSON object string** such as `"{\"continuity_id\":\"hc:...\"}"`; add `device` at the tool level when needed. | Passing `params` as an object or spreading method arguments into the public tool call. |
+| `herdr_exec` | Use `command` **or** `steps`, never both. Pass `workspace`; pass `project_root` when that workspace contains more than one project. | Packing unrelated host/file/service actions into one shell command just to save a round trip. |
+| `confirm_dirty` / `confirm_busy` | Set only after live evidence confirms the condition and current-task ownership is still safe. | Setting them to `true` by default or treating them as permission to overwrite another lane. |
+| Agent dispatch | Use an explicit target and a stable `idempotency_key` for the intended submission. Default to asynchronous task tracking. | Re-sending after timeout without delivery evidence. |
+| File mutation | Existing file: prefer `herdr_fs_edit` or `herdr_fs_patch`. New file or intentional full replacement: `herdr_fs_write`. | Using `herdr_fs_write` as a generic edit tool. |
+| Long execution | Start once with `herdr_exec_start`, retain `session_id`, then continue with `herdr_exec_read(next_offset)` or the advertised wait method. | Running a long build/download/test repeatedly through blocking `herdr_exec`. |
 
-## 2. Modification rules
+For a mutation retry, `delivery_state=not_delivered` can permit reissue after recovery. `unknown`, `uncertain`, `delivered`, missing delivery evidence, or a transport timeout requires live observation before any replay.
 
-- Prefer direct edits over prompting an agent to make trivial deterministic changes.
-- Respect managed-root, readonly, dirty and busy gates. `confirm_dirty`/`confirm_busy` acknowledge a known condition; they are not permission to overwrite unrelated work.
-- Do not overwrite unrelated dirty changes. Read the exact target or diff first.
-- `herdr_exec` runs one command in the selected project root. Its result reports `execution.started` / `execution.completed` / `execution.exit_code` plus `failure_origin`, so a non-zero child exit (`failure_origin=child_process`) is distinguishable from a pre-start control-plane refusal (`started=false`, `failure_origin=herdr_control_plane`, `delivery_state=not_delivered`) and from an uncertain start (`started=null`). When the complete bounded stdout (or, failing that, stderr) is exactly one JSON object, the result also carries `structured_output` with `structured_output_stream` next to the unchanged `output`. Command output is returned as the child process produced it; the `herdr_fs_*` tools additionally exclude secret-like paths, so use file tools for ordinary file IO.
-- Mutating agent prompts should carry an `idempotency_key`. If delivery is uncertain, inspect/since before retrying.
-- If `herdr_exec` may already have been delivered, never blindly rerun it after a transport/control-plane error.
-- Treat TaskGroup/ExceptionGroup snapshot failures as a control-plane transient until file/Git/direct exec evidence says otherwise.
+## 2. Work ladder and progressive Skills
 
-## 2A. Engineering robustness and AI self-verification
+Use the cheapest deterministic layer that can finish the work.
 
-For non-trivial implementation, bug fixes, reliability/refactor work, state-machine/background work, or releases, load the built-in `engineering-robustness` reference once for the task when available:
+1. Get one aggregate baseline with `herdr_inspect` when live state matters.
+2. Use direct tools for file, Git, and bounded execution work.
+3. Use `herdr_since(cursor)` for incremental change instead of rebuilding the same full snapshot.
+4. Use `herdr_methods(query)` only when an unknown native/private method schema is needed; cache and reuse the discovered shape.
+5. Delegate only work that benefits from independent reasoning, parallel investigation, or a separate implementation/review lane.
 
-```text
-herdr_call(method="herdr_mcp.skill.load", params={"ids":["engineering-robustness"],"project_root":"<project-root>"})
-```
+Load the domain Skill when its trigger appears:
 
-The reference is policy only and grants no mutation authority. Even when the progressive module is unavailable, preserve this minimum loop:
+| Trigger | Load |
+| --- | --- |
+| multiple devices/workspaces, native methods, reconnect, prior-work recovery, Continuity, browser handoff | `workstation-control` |
+| file search/list/read | `files-search` |
+| edit/write/patch, dirty/busy gates | `files-mutation` |
+| Git status/diff/log/branch/worktree facts | `git-repository` |
+| short vs long commands, sessions, output offsets | `execution` |
+| Agent selection/dispatch/retry/task evidence | `agent-dispatch` |
+| multi-lane development, ownership, validation, cleanup | `development-orchestration` |
+| non-trivial bug/refactor/release reliability | `engineering-robustness` |
+| unresolved product/engineering requirements after facts are read | `requirements-grilling` |
 
-- understand current architecture, ownership, invariants, and relevant project rules before adding another state owner or abstraction;
-- for a real bug, leave a regression test/check that would fail on the old behavior when feasible, then search sibling paths for the same failure class;
-- prioritize **silent-wrongness** tests: stale results, late tasks overwriting newer state, ambiguous delivery, command-success-without-effect, generation/cache mismatch, duplicate retry side effects, and source/artifact/runtime drift;
-- avoid unnecessary settings, permissions, resident listeners, compatibility branches, and lifecycle/state entities when a safe existing boundary or default is sufficient;
-- let AI execute focused regression tests, the broader relevant gate, and the real boundary verification instead of handing routine verification back to a human;
-- verify source/Git/CI/artifact/deployment/activated-runtime/user-visible state as separate planes when they are relevant; never infer a later plane from an earlier green signal;
-- update durable rules/references when a non-obvious failure rationale should survive the current task, and remove stale rules/tests when behavior is intentionally retired.
+When several Skills are needed for one task, load their ids in one bounded request when the runtime supports batched Skill loading.
 
-A task is not complete merely because code compiles, a worker says done, a process exits 0, or one test suite is green. Completion requires evidence at the boundary that can actually falsify the user-visible failure.
+## 3. Request shaping
 
-## 3. Agent dispatch preferences
+Plan one dependency-aware wave from facts already known.
 
-Use an agent when at least one is true:
+- One public call represents one logical intent, one authority boundary, and at most one mutation boundary.
+- Run independent reads concurrently when the client supports parallel tool calls.
+- Keep dependent mutations ordered unless ownership and isolation are explicit.
+- Use structured `herdr_exec.steps` for already-known same-boundary executable/argv steps; use freeform `command` only when real shell syntax is needed.
+- Do not call `herdr_methods`, `herdr_inspect`, or `herdr_skill` before every operation. Reuse live schema, stable ids, fingerprints, cursors, and offsets until evidence says they are stale.
+- A host-side rejection with no Herdr execution/result identity is not evidence that the workstation or child process ran.
 
-- the change spans a non-trivial subsystem and benefits from independent reasoning;
-- you want a parallel implementation slice with non-overlapping files;
-- an independent audit is useful after the deterministic implementation is complete;
-- the user explicitly asked for a named local agent.
+## 4. Mutation and delivery invariants
 
-When dispatching:
+- Read the exact target context before mutation when current content is not already known. `herdr_fs_edit` requires the intended exact match; `herdr_fs_patch` requires preflight across every target.
+- Preserve unrelated dirty work. Parallel mutation requires explicit non-overlapping ownership or isolation.
+- `confirm_dirty` and `confirm_busy` acknowledge observed state only; they never transfer ownership.
+- Never blind-retry an uncertain mutation. Inspect the affected file/Git/process/task/resource state first.
+- Preserve the same idempotency key for the same intended operation when the tool supports one.
+- Runtime permission, path, dirty/busy, generation, idempotency, delivery, and account-isolation checks remain authoritative. Skill text grants no authorization.
 
-- give one self-contained task, explicit project root, file ownership boundaries and expected validation;
-- avoid overlapping writes between agents and the web planner;
-- normal orchestration is asynchronous: submit once with `herdr_prompt` (or private `herdr_mcp.agent.task.dispatch`) and continue other parent work immediately. A successful/uncertain accepted submission returns a stable `task_id` (the same canonical identity as `dispatch_id`) plus a stable Runtime `turn_id`; Runtime lifecycle tracking then writes `completed` / `blocked` / `failed` into the durable parent inbox and the CLI/WebChat parent adapter wakes the owner. Do not keep the planner blocked on `--wait`, repeated `agent.wait`, or status polling. Use `herdr_mcp.agent.task.status` / `herdr_mcp.agent.task.inbox` for explicit inspection. The optional wait form is only a bounded script/CI compatibility mode and waits on this exact Runtime task, never on the target Agent's previous global `idle`/`done` state. Native Herdr still has no exact prompt-turn id, so `exact_native_turn=false` remains explicit;
-- set a bounded progress/output/diff checkpoint and correct, stop, or reassign work that is stalled or moving away from the objective before opening another lane;
-- treat obvious repeated-output loops as a fault, not progress. If a working Agent repeats the same or near-identical block several times (especially self-reports such as context corruption) with no new command result, Git diff, or task evidence, read a bounded `recent_unwrapped` pane/agent tail to confirm it, then interrupt immediately instead of waiting for self-recovery. Before retrying, inspect Git/task state so an already-applied mutation is not duplicated. If work remains, restart the task in a fresh Agent session/pane from the current verified Git state and the original task objective; do not continue the corrupted session. If the work was already captured or integrated, stop the Agent and do not rerun it. A second loop on the restarted task is a reassign/main-planner takeover signal, not permission for another blind retry;
-- do not spend a local agent on `git status`, simple grep, file reads, obvious one-file edits, or running a known test command.
+## 5. Agent and long-task orchestration
 
-Planning order is therefore: deterministic `fs/git/exec` first → inspect live worker/capability/resource evidence → let the Web planner decide whether delegation or parallelism is worthwhile → use a compatible worker when selected → use DSH headless only as a bounded fallback when native worker evidence is unavailable or unsuitable → interactive `dsh-tui` only when a human operator wants to take over. The Web planner keeps architecture/IA/cross-file orchestration. Recheck DSH after upgrades because it is still a fast-moving developer preview.
+Normal Agent orchestration is asynchronous. Submit one bounded task, retain its stable task/dispatch identity, continue independent Parent work, and consume durable task/inbox evidence later.
 
-### 3A. Consume semantic decisions at Parent orchestration boundaries
+Load `agent-dispatch` before non-trivial dispatch. Keep the target explicit, do not infer capability from an Agent name, and do not turn a child Agent into a middle manager.
 
-Treat the existing semantic/Jev private methods as an advisory layer inside the normal Parent loop. Do not bolt Jev onto each `herdr_fs_*`, `herdr_git`, `herdr_exec*`, `herdr_inspect`, or mutation call. Facts and mutations remain deterministic; a semantic result may only classify or order what the Parent should inspect or verify next.
+A process exit code, Agent `done`, or prose claim is not task completion by itself. Verify the relevant diff/files/tests/runtime boundary.
 
-Use this main path for delegated development work:
+For non-trivial multi-lane work, load `development-orchestration`. It owns lane topology, progress correction, cross-audit, and cleanup. For reliability-sensitive implementation, also load `engineering-robustness`.
 
-```text
-plan -> deterministic execute/dispatch -> observe deterministic task facts
-     -> attention advice -> deterministic observation/validation
-     -> closeout advice when useful -> deterministic cleanup.preview
-     -> optional cleanup advice -> deterministic resource reclamation
-```
+## 6. Multi-device, Continuity, and WebChat
 
-- **Plan boundary:** for non-trivial routing/delegation choices, consume `herdr_mcp.planning.advise` once. Explicit deterministic-tool choices and capability rejection remain authoritative.
-- **Observe/attention boundary:** submit Agent work fire-and-forget and retain its task/dispatch correlation. When the installed runtime advertises durable task/inbox support, prefer one `herdr_mcp.agent.task.inbox` read with `advisory=true`: Runtime returns authoritative task lifecycle facts plus one bounded evaluation from the existing `herdr_mcp.agent.attention.advise` primitive for that frozen inbox batch. The batch is evaluated only when unacknowledged terminal facts exist; active siblings may join the same decision so fan-out does not create one Jev call per child. Terminal facts wake the Parent even when Jev is unavailable or exceeds the bounded inbox budget. If inbox advisory is unavailable, keep using `herdr_since`/inspect plus deterministic task/process evidence and call `herdr_mcp.agent.attention.advise` once for the frozen child set; never create a second task ledger. `continue_unobserved` means leave independent running children alone and continue Parent work without a wait/poll loop; `verify_completion` enters deterministic change projection and validation; `needs_human` surfaces the real human boundary without inventing input; `blocked_external` preserves blocker evidence; `investigate_drift` permits read-only inspect/read evidence only. Semantic terminal guesses never replace actual terminal/task/process facts.
-- **Validation boundary:** freeze the validation candidates from deterministic changed-file/symbol/status evidence, then call `herdr_mcp.validation.advise` once to choose the most informative relevant check to run first. Run every required deterministic gate afterward. A semantic answer cannot add a non-frozen check, remove a required check, mark a gate passed, rerun CI, or merge.
-- **Closeout boundary:** after deterministic validation evidence exists, use `herdr_mcp.agent.closeout.advise` only when bounded recent Agent output still helps classify whether the child is working, claiming completion, waiting for a human, or externally blocked. It does not create terminal truth or reclaim authority.
-- **Cleanup boundary:** call `herdr_mcp.cleanup.preview` with `advisory=true` for task-owned resources. Semantic cleanup triage may rank the next inspection, while `safe_to_delete`, reasons, reachability, open-PR references, dirty state, live occupancy, and the actual close/remove/delete operations remain deterministic. Re-check immediately before mutation and verify task-owned resources are gone afterward.
+For prior-work or multi-device intent, load `workstation-control` and resolve:
 
-Missing semantic configuration, route exhaustion, provider error/timeout, or malformed semantic output must leave this same Parent workflow usable. Fall back to the existing deterministic order and evidence; never block a Herdr operation merely because semantic advice is unavailable. Keep semantic input bounded and structured, combine related questions into one request at the boundary, and avoid provider RTT loops.
+`device -> project/workspace -> continuity/history -> live Git/runtime`.
 
-## 4. Runtime and contract model
+A resumed journal is historical evidence; refresh live state before mutation. Never choose a chain by recency or text similarity alone.
 
-Keep these lifetimes separate:
+For ChatGPT/WebChat handoff, use the canonical Herdr handoff path from `workstation-control`; preserve one continuity chain and one idempotency identity. Uncertain delivery is reconciliation-only, not an automatic replay.
 
-- **Edge**: stable public MCP/OAuth origin and frozen public contract epoch;
-- **herdr-link**: persistent workstation WSS sidecar;
-- **runtime generation**: frequently replaceable local herdr-mcp server.
+The browser extension is the browser-side execution/observation boundary for supported WebChat. It is not general RPA and not file transport.
 
-A runtime implementation version may advance without changing the ChatGPT-visible tool ABI. Candidate activation must validate the actual `tools/list` against the expected contract epoch/hash. A new model-visible tool is a deliberate **contract epoch** operation; never smuggle it into an existing epoch during an ordinary runtime update.
+## 7. Herdr-MCP maintenance
 
-## 5. Self-maintenance and self-update
+When the target repository is Herdr-MCP itself, its project `AGENTS.md` owns version-specific runtime, release, CI/CD, browser-extension, Automation Client, DEV/PROD, service-lifecycle, and recovery details. Do not duplicate those long-lived maintenance rules in this entrypoint.
 
-herdr-mcp is expected to be able to maintain itself without dropping the stable Connector.
+Keep source/build/installed/active-runtime/user-CLI identities distinct. Service/update/link lifecycle mutations run through the repository's documented independent-terminal path, not through the managed process they may restart.
 
-Preferred release flow:
+The DEV-only retrospective belongs to `development-orchestration` when that Skill is loaded; it is not part of every Herdr-MCP call.
 
-1. Inspect current runtime/link/Edge identity.
-2. For repository changes, edit directly or delegate narrowly, then build/test.
-3. Use `herdr-self-update check` to compare the running/local release with the configured source.
-4. Use `herdr-self-update apply` for a supervised A/B update. The command returns before the active runtime is restarted; its detached worker records structured state in `~/.config/herdr-mcp/`.
-5. The updater must build/test a release, start a loopback candidate, register and validate it through the persistent generation manager, atomically switch traffic, reload the stable 8772 service from the new release, promote the new stable generation, then stop the temporary candidate.
-6. On failure it must preserve or restore the prior stable generation and plist. Never change DNS, OAuth identity, Edge contract epoch or public hostname as part of a local runtime update.
-7. After any update, verify from the **same remote Connector** that `herdr_inspect` reports the expected runtime version and that Edge status converges to the new generation/version.
+## 8. Completion
 
-Keep runtime **DEV / PROD** distinct. On a maintainer workstation, use `herdr-mcp dev sync` from the intended repo/worktree to compile and activate a source-dogfood DEV generation. It refuses a dirty checkout unless `--allow-dirty` is explicit, pins the current PROD binary before activation, and reuses the transactional service + production-Link generation reconcile path; it never deploys Edge/DNS/OAuth. Use `herdr-mcp dev status` to verify channel/source/generation evidence and `herdr-mcp dev rollback` to return to the pinned PROD binary. Do not call a repo build PROD merely because it is running on port 8772. For ordinary release upgrades, keep using the published/verified PROD update path rather than DEV sync.
+Completion requires evidence at the affected boundary, not just request success or `exit_code=0`.
 
-## 6. Control-plane outage recovery
-
-The production Rust server is supervised by macOS launchd as `dev.herdr-mcp.server` with `RunAtLoad=true` and `KeepAlive=true`, so a crashed process is normally relaunched automatically. The periodic `dev.herdr-mcp.health-watchdog` covers a separate case: the server job remains loaded but repeated loopback `/health` checks fail. This health sidecar deliberately does **not** reuse the historical `dev.herdr-mcp.watchdog` identity or its generic watchdog state/script/log files, which the Rust service manager reserves for legacy Node-watchdog adoption/rollback. Its managed artifacts use the `health-watchdog.*` namespace under `~/.config/herdr-mcp/` plus the dedicated health-watchdog launchd plist. The health watchdog only `kickstart -k`s that already-loaded job after consecutive failures and a cooldown; if the server job has been explicitly unloaded by `service stop`/uninstall, the health watchdog resets its failure state and **must not** bootstrap or restart it.
-
-`agent_status_wait_timeout` and snapshot `TaskGroup`/`ExceptionGroup` failures are bounded wait/snapshot transients; they are **not** evidence that the workstation is offline and are not permission to replay a mutation. Use the reconnect sequence below for actual control-plane connectivity failures such as `workstation_offline`, `herdr_transport`, connection refused, or a missing/unreachable Herdr socket.
-
-Raw HTTP gateway/backpressure failures such as **429, 502, 503, 504, or 524** are transport evidence, not proof that a mutation was never delivered. Honor `Retry-After` when present; 429 must back off rather than create a retry storm. Read-only calls may use bounded retries, but a mutating call must never be replayed solely because the HTTP status is conventionally retryable. Require explicit `delivery_state=not_delivered`, or inspect live Git/runtime/resource state and prove the mutation was not applied first. A non-JSON Edge 5xx/429 should surface as a structured transient HTTP error instead of being misclassified as a generic malformed response.
-
-When a real control-plane connectivity failure occurs during the current web-model turn, first inspect the structured tool error. For `workstation_offline` / `workstation_reconnecting`, Edge returns `retryable=true`, `delivery_state=not_delivered`, `retry_after_ms`, a bounded `recovery` policy, and `requires_human=false`. Treat that metadata as the authoritative retry hint instead of guessing from the error string. The current policy is `action=retry_read_only_probe`, `probe_tool=herdr_inspect`, `max_attempts=3`, and `backoff_ms=[5000,10000,20000]`. `requires_human=false` is an explicit no-escalation signal for that error; do not replay the failed mutation while waiting and do not hand routine recovery to the operator.
-
-If structured recovery metadata is unavailable because an older Edge/runtime is in use, fall back to exactly three **read-only** reconnect attempts using the same bounded schedule:
-
-1. Wait about **5 seconds**, then call `herdr_inspect` (or another read-only connection check).
-2. If still unavailable, wait about **10 seconds**, then perform the second read-only check.
-3. If still unavailable, wait about **20 seconds**, then perform the third and final read-only check. Stop after these three retries; the intended current-turn recovery window is roughly **35 seconds**, long enough to span the health watchdog's default two 15-second observations without becoming an unbounded poll loop.
-4. Compare the recovered `workstation_info.boot_id`, runtime PID/start time, and runtime generation with the identities saved before the outage. If `boot_id` changed or `cursor_reset=true`, discard the old incremental cursor and resynchronize from `herdr_since(cursor=0)` plus live workspace/agent/Git/runtime state before making another mutation.
-5. If the failed mutation explicitly returned `delivery_state=not_delivered`, Edge attests that it never left the Edge and it may be reissued after connectivity is restored; preserve the same `idempotency_key` when the tool supports one. If the result says `delivery_unknown`, `delivered`, omits delivery state, returns `delivery_uncertain`, or came from a transport/control-plane timeout with uncertain outcome, **never blindly resend it**. The planner must automatically inspect the available request/resource evidence first: `herdr_inspect`/`herdr_since`, Git status/log/diff, runtime/service status, agent state, or the target resource. Reissue only when that evidence proves the mutation was not applied; routine delivery verification is not work to hand back to the user.
-6. The three-probe window bounds one planner recovery attempt; it is **not a human-escalation threshold**. If those probes still fail, preserve any uncertain mutation state and continue independent safe work or an already-enrolled alternate workstation when that serves the same user goal. Do not ask the operator to restart Herdr merely because the probe window elapsed. Escalate to a human only when an existing boundary actually requires human interaction (for example a macOS permission/TCC prompt, browser/account/OAuth sign-in or approval), an irreversible action requires explicit confirmation, or structured/live supervisor or Link evidence demonstrates that automatic recovery is genuinely exhausted and identifies a manual action. `workstation_offline`, `workstation_reconnecting`, `runtime_unavailable`, `request_timeout`, and `delivery_uncertain` alone are not evidence of that condition.
-
-If automatic recovery has been proven exhausted and the diagnosed manual action is specifically to restart the managed Rust service, the last-resort operator command is:
-
-```bash
-"$HOME/.config/herdr-mcp/runtime/current/herdr-mcp" service restart && \
-"$HOME/.config/herdr-mcp/runtime/current/herdr-mcp" service status
-```
-
-Do not silently substitute local container/shell work for an unavailable Herdr workstation when the task depends on that workstation.
-
-## 7. CI/CD boundaries
-
-- Pull requests and pushes must run build, root tests, Edge/contract tests and extension smoke.
-- GitHub Pages is static documentation/product surface only; it does not carry credentials.
-- Cloudflare production deployment runs only after the Edge/contract gate and uses a GitHub `production` Environment with a least-privilege Workers token. The workflow must never require DNS/Tunnel/Admin permission.
-- Runtime and Cloudflare Edge remain separate release/rollback planes. Interactive `herdr-mcp update` may, after a successful same-contract Runtime update, reconcile the user's proven existing Worker in place with temporary Cloudflare authorization; `herdr-mcp worker update` runs that reconciliation directly. Non-interactive auto-update never opens Cloudflare authorization. Contract/OAuth/DNS migrations remain explicit and separate.
-- Unattended external callers such as GitLab CI must use a separately provisioned **Automation Client**, never a shared fleet-wide bearer and never the local `HERDR_MCP_TOKEN`. Create one trust boundary per project/environment with `herdr-mcp automation create --name <name> --device <device-id-or-unique-name>` on any enrolled workstation. The Worker resolves and stores one immutable bound `device_id`. The command returns a stable `client_id` plus a `client_secret` exactly once; store them as masked/protected CI variables (normally `HERDR_MCP_CLIENT_ID` and `HERDR_MCP_CLIENT_SECRET`) together with `HERDR_MCP_URL`. Each job exchanges those credentials at `/oauth/token` with `grant_type=client_credentials` for a short-lived access token (maximum one hour, no refresh token), then uses that access token on `/mcp`.
-- Automation Clients are ordinary MCP principals bound to exactly one enrolled device, not fleet administrators. An omitted device selector routes to the bound device; an explicit selector or device-aware ref for another device fails closed. They cannot create/revoke devices, approve/revoke Connectors, create another Automation Client, or inspect other devices. `herdr-mcp automation list` returns non-secret inventory/issuance metadata; `automation rotate ... --confirm` replaces the long-lived secret immediately; `automation revoke ... --confirm` fences both future minting and already-issued access tokens. Automation administration remains an enrolled-device/operator CLI/REST action and is not exposed through approved WebChat private MCP methods.
-
-## 8. Browser extension boundary
-
-The browser extension is the reverse/wake channel and stays on the local machine. It is **never binary/file transport**; the artifact/file ingress path is the local tools + direct signed import + private R2 relay ladder in section 1. Current installs send bounded request/stream messages to the registered Chrome Native Messaging host, which verifies the active official extension origin and reaches herdr-mcp through `~/.config/herdr-mcp/extension.sock` (mode `0600`). That trusted Unix-IPC listener is deliberately tokenless, and the Native Host strips browser-supplied `Authorization`; the browser never receives or stores `HERDR_MCP_TOKEN`. This does **not** make `http://127.0.0.1:8772/mcp` unauthenticated: the loopback TCP MCP endpoint still requires its local bearer, even for same-machine callers. First-party local clients may source that credential from protected local state so the user does not paste it manually; raw curl/third-party TCP clients must authenticate explicitly. The extension does not need the public Worker/OAuth URL. Do not route extension traffic through Cloudflare merely because the Connector uses Cloudflare.
-
-## 9. Native Herdr reference
-
-The installed `herdr --skill` is useful as **release-matched native Herdr reference material** for pane/workspace/agent concepts and CLI semantics. Its `HERDR_ENV=1` / "stop when outside Herdr" rule applies to pane-local agents, not to this remote MCP planner. For remote calls, the installed socket schema returned by `herdr_methods` is authoritative.
-
-## 10. Completion discipline
-
-For operational changes, do not declare success from code or unit tests alone. Verify the relevant real boundary: local runtime, persistent Link, Edge status, browser extension smoke, GitHub workflow syntax, or public endpoint as appropriate. Keep rollback evidence until the replacement path has been proven from the same client that matters.
-
-For multi-step planner work, keep a lightweight current-turn acceptance checklist when the user provides a completion goal. Before a final response, reconcile completed evidence against remaining checks. If required checks remain, continue the planned workflow instead of reporting completion. This checklist is planner guidance only; it does not create a Runtime task owner, scheduler, or new persistence model.
+For work created by the current planner, perform one bounded completion sweep after validation: reconcile Agent/task state, panes/workspaces, Git worktrees/branches, and any long exec sessions. Reclaim only task-owned resources whose outcome is known and safely preserved. Never close or delete user/other-task resources merely because they look idle.
