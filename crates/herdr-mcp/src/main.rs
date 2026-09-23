@@ -30,6 +30,7 @@ mod fs_tools;
 mod git_tools;
 mod github_status;
 mod herdr;
+mod herdr_dependency;
 mod herdr_native;
 mod herdr_supervisor;
 mod inspect;
