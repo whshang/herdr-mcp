@@ -41,8 +41,8 @@ A green connector status only proves one layer. The reliable validation is a fre
 
 The exact ChatGPT UI evolves. The general flow is:
 
-1. Enable Developer mode for Plugins.
-2. Open **Plugins → Browse plugins** and add the Herdr Connector. `herdr` is the default/example App name, but a custom display name is supported.
+1. Open ChatGPT **Settings → Account security & login** and enable **Developer mode**.
+2. Open **Plugins → Browse plugins**, click the **+** button in the top-right corner, choose **Create APP**, and create an MCP app. `herdr` is the recommended example App name, but a custom display name is supported.
 3. Enter the complete MCP URL, including `/mcp`:
 
 ```text

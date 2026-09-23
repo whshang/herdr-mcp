@@ -39,7 +39,7 @@ Then run `herdr --version` again. Herdr's own install behavior is authoritative 
 
 ## Supported platform boundary
 
-Use the GitHub `Latest` stable Release at <https://github.com/whshang/herdr-mcp/releases>. First-device `worker bootstrap` and existing-fleet `worker connect` are production-qualified on Apple Silicon macOS and native Debian-class Linux on both x86_64 and ARM64. Windows x86_64 and Windows ARM64 are published 1.0 candidates. Windows x86_64 has been exercised on physical hardware, including install/recovery and a real Connector conversation, but remains Candidate until the complete #394 promotion record is captured against the exact current-main candidate. Windows ARM64 still has hosted-runner qualification only. Windows uses Herdr named pipes, Windows Credential Manager, current-user Startup-folder shortcut autostart, and detached user processes. When that managed Windows runtime starts, it probes the configured Herdr API and best-effort starts an already-installed `herdr server` if needed; it does not install or remove Herdr itself. Browser Native Messaging and product-level reinstall/uninstall remain outside the Windows physical-UAT claim. See the [platform support matrix](platform-support-matrix.md) for the exact tested/not-yet-tested boundary.
+Use the GitHub `Latest` stable Release at <https://github.com/whshang/herdr-mcp/releases>. First-device `worker bootstrap` and existing-fleet `worker connect` are production-qualified on Apple Silicon macOS and native Debian-class Linux on both x86_64 and ARM64. Herdr-MCP 1.0 also enables first-device `worker bootstrap` on native Windows, including canonical device enrollment, Windows Credential Manager persistence, managed runtime activation, and Link reconciliation. Windows x86_64 and Windows ARM64 remain published 1.0 candidates rather than Production platforms: Windows x86_64 has been exercised on physical hardware for install/recovery and a real Connector conversation, while the exact final 1.0 candidate still requires a fresh first-device bootstrap record plus the remaining #394 promotion evidence. Windows ARM64 still has hosted-runner qualification only. Windows uses Herdr named pipes, Windows Credential Manager, current-user Startup-folder shortcut autostart, and detached user processes. When that managed Windows runtime starts, it probes the configured Herdr API and best-effort starts an already-installed `herdr server` if needed; it does not install or remove Herdr itself. Browser Native Messaging and product-level reinstall/uninstall remain outside the Windows physical-UAT claim. See the [platform support matrix](platform-support-matrix.md) for the exact tested/not-yet-tested boundary.
 
 For an older installation, follow [Runtime self-upgrade](runtime-self-upgrade.md). Upgrade the runtime in place; do not recreate a healthy Worker, device relationship, or ChatGPT Connector just to move to the current release.
 
@@ -154,8 +154,8 @@ An unauthenticated `/mcp` response of `401` can be correct. The useful checks ar
 
 This is a human step. The coding agent should pause and guide the user:
 
-1. open ChatGPT settings and enable **Developer mode** for Plugins;
-2. open **Plugins → Browse plugins** and add the Herdr Connector; `herdr` is the recommended/default example name, but a custom App name is supported;
+1. open ChatGPT **Settings → Account security & login** and enable **Developer mode**;
+2. open **Plugins → Browse plugins**, click the top-right **+ → Create APP**, and create an MCP app. `herdr` is the recommended example name, but a custom App name is supported;
 3. paste the complete deployed `${MCP_URL}`, including the final `/mcp`;
 4. complete OAuth in the browser; the approval page selects Chinese, English, or Japanese from the browser language and asks you to run the Terminal approval command before entering the six-digit code;
 5. create or open a **Project** and work there;

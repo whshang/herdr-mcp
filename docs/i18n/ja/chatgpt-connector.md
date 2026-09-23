@@ -41,8 +41,8 @@ Connector のステータスが緑であることは、一つの層を証明す�
 
 ChatGPT の UI は変化し続けます。一般的な流れは次のとおりです。
 
-1. Plugins の Developer mode を有効にします。
-2. **Plugins → Browse plugins** を開き、Herdr Connector を追加します。既定/例の名前は `herdr` ですが、カスタム App 名も利用できます。
+1. ChatGPT の **Settings → Account security & login** を開き、**Developer mode** を有効にします。
+2. **Plugins → Browse plugins** を開き、右上の **+** をクリックして **Create APP** を選び、MCP App を作成します。推奨例の名前は `herdr` ですが、カスタム App 名も利用できます。
 3. 完全な MCP URL を入力します。末尾の `/mcp` も含めます。
 
 ```text
