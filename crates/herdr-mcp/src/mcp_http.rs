@@ -1236,7 +1236,7 @@ fn extension_browser_resource_observe(
     let endpoint_ref = browser_registry_authoritative_endpoint_ref(state, payload)?;
     let provider = browser_registry_string(payload, "provider", 32)?;
     let kind = browser_registry_string(payload, "kind", 16)?;
-    let parent_ref = browser_registry_optional_string(payload, "parent_ref", 96)?;
+    let observed_parent_ref = browser_registry_optional_string(payload, "parent_ref", 96)?;
     let native_identity = browser_registry_string(payload, "native_identity", 1024)?;
     let display_label = browser_registry_optional_string(payload, "display_label", 256)?;
     let canonical_url = browser_registry_optional_string(payload, "canonical_url", 2048)?;
@@ -1249,6 +1249,43 @@ fn extension_browser_resource_observe(
         .state_store
         .lock()
         .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let reservation = if let Some(reservation_ref) = reservation_ref {
+        if kind != "session" || !reservation_ref.starts_with("bsr_") {
+            return Err("browser_session_reservation_ref_invalid".to_owned());
+        }
+        let reservation = store
+            .browser_session_reservation(reservation_ref)?
+            .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+        if reservation.endpoint_ref != endpoint_ref
+            || reservation.provider != provider
+            || reservation.expected_generation != observation_generation
+        {
+            return Err("browser_session_materialization_scope_mismatch".to_owned());
+        }
+        let expected_parent = reservation
+            .space_ref
+            .as_deref()
+            .unwrap_or(&reservation.account_ref);
+        if !matches!(
+            observed_parent_ref,
+            Some(parent)
+                if parent == expected_parent || parent == reservation.account_ref.as_str()
+        ) {
+            return Err("browser_session_materialization_scope_mismatch".to_owned());
+        }
+        Some(reservation)
+    } else {
+        None
+    };
+    let parent_ref = reservation
+        .as_ref()
+        .map(|reservation| {
+            reservation
+                .space_ref
+                .as_deref()
+                .unwrap_or(&reservation.account_ref)
+        })
+        .or(observed_parent_ref);
     let resource = store.observe_browser_resource(BrowserResourceObservationInput {
         endpoint_ref: &endpoint_ref,
         provider,
@@ -1270,12 +1307,9 @@ fn extension_browser_resource_observe(
             observed_at,
         )?;
     }
-    let materialized_reservation = if let Some(reservation_ref) = reservation_ref {
-        if kind != "session" || !reservation_ref.starts_with("bsr_") {
-            return Err("browser_session_reservation_ref_invalid".to_owned());
-        }
+    let materialized_reservation = if let Some(reservation) = reservation {
         Some(store.materialize_browser_session_reservation(
-            reservation_ref,
+            &reservation.reservation_ref,
             &resource.resource_ref,
             observed_at,
         )?)
@@ -3878,6 +3912,27 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let space = json!({
+            "operation": "resource.observe",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "space",
+            "parent_ref": account_ref,
+            "native_identity": "g-p-http-materialization",
+            "display_label": "HTTP Project",
+            "canonical_url": "https://chatgpt.com/g/g-p-http-materialization",
+            "observation_generation": 1,
+            "observed_at": 1003
+        });
+        let response = app.clone().oneshot(request(space)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let space_result: Value = serde_json::from_slice(&body).unwrap();
+        let space_ref = space_result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let reservation_ref = {
             let mut guard = store.lock().unwrap();
             match guard
@@ -3885,7 +3940,7 @@ mod tests {
                     endpoint_ref: &endpoint_ref,
                     provider: "chatgpt",
                     account_ref: &account_ref,
-                    space_ref: None,
+                    space_ref: Some(&space_ref),
                     display_label: "HTTP materialization",
                     expected_generation: 1,
                     idempotency_key_digest: &"a".repeat(64),
@@ -3921,6 +3976,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let session_result: Value = serde_json::from_slice(&body).unwrap();
         let session_ref = session_result["resource"]["resource_ref"].as_str().unwrap();
+        assert_eq!(session_result["resource"]["parent_ref"], space_ref);
         assert_eq!(session_result["reservation"]["state"], "materialized");
         assert_eq!(session_result["reservation"]["session_ref"], session_ref);
         let locator = store
