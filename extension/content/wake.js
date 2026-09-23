@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.131";
+const H2W_CONTENT_VERSION = "0.1.132";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -985,45 +985,14 @@ function normalizeHerdrMentionAlias(value) {
       return { ok: false, attempted: false, error: "submit-unavailable" };
     }
     const baseline = captureSubmitAckBaseline(btn);
-    if (ADAPTER.name === "chatgpt"
-        && ADAPTER.needsMainWorldInsert
-        && ADAPTER.inputHasContent()
-        && typeof ADAPTER.getWatchMainWorldSelector === "function") {
-      const selector = ADAPTER.getWatchMainWorldSelector();
-      if (selector) {
-        const mainSubmit = await submitMainWorld(selector);
-        if (mainSubmit?.ok && mainSubmit?.submitted === true) {
-          if (await waitForSubmitAck(baseline, 5000)) {
-            return { ok: true, attempted: true };
-          }
-          return {
-            ok: false,
-            attempted: true,
-            uncertain: true,
-            error: "submit-unconfirmed",
-          };
-        }
-        const mainError = String(mainSubmit?.error || "");
-        const definitelyNotSubmitted = [
-          "no-input",
-          "empty-input",
-          "no-submit-form",
-          "no-submit-button",
-        ].includes(mainError);
-        if (!definitelyNotSubmitted) {
-          return {
-            ok: false,
-            attempted: true,
-            uncertain: true,
-            error: "submit-unconfirmed",
-          };
-        }
-      }
+    const input = ADAPTER.getInputEl();
+    if (!input) {
+      return { ok: false, attempted: false, error: "submit-input-unavailable" };
     }
     try {
-      btn.click();
+      dispatchEnterSubmit(input);
     } catch (_) {
-      return { ok: false, attempted: false, error: "submit-click-failed" };
+      return { ok: false, attempted: false, error: "submit-enter-failed" };
     }
     if (await waitForSubmitAck(baseline, 5000)) {
       return { ok: true, attempted: true };

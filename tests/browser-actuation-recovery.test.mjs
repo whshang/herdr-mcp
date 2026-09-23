@@ -899,7 +899,7 @@ test("page identity handshake lazily recovers only opaque Browser Registry ident
   assert.doesNotMatch(identitySegment, /accountNativeIdentity|email|userId/i);
 });
 
-test("ChatGPT submit tries bounded MAIN-world send-button click before isolated-world fallbacks", () => {
+test("user keeps the ordinary ChatGPT submit path bounded | Given a ready composer | When fallback ordering is inspected | Then MAIN-world send-button click precedes isolated-world fallbacks", () => {
   assert.match(wakeSource, /function submitMainWorld\(selector\)/);
   assert.match(wakeSource, /type:\s*"h2w_submit_main"/);
   assert.match(backgroundSource, /msg\?\.type === "h2w_submit_main"/);
@@ -1173,19 +1173,15 @@ test("user can stop a live answer | Given an explicit visible stop control while
   assert.equal(result.generation_stopped, true);
 });
 
-test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one MAIN-world send-button click is attempted and uncertain delivery never falls through to a second submit", async () => {
+test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one Enter submit is attempted and uncertain delivery never falls through to another submit", async () => {
   const start = wakeSource.indexOf("  async function submitBrowserActuationOnce()");
   const end = wakeSource.indexOf("  // ---- Submission ----", start);
   assert.ok(start >= 0 && end > start, "bounded Browser Actuation submit helper must remain extractable");
   const helperSource = wakeSource.slice(start, end);
 
-  async function run({
-    busy = false,
-    ack = false,
-    hasSelector = true,
-    mainResult = { ok: true, submitted: true },
-  } = {}) {
-    const ctx = { busy, ack, hasSelector, mainResult, clicks: 0, mainSubmits: 0 };
+  async function run({ busy = false, ack = false } = {}) {
+    const ctx = { busy, ack, clicks: 0, mainSubmits: 0, enterSubmits: 0 };
+    ctx.input = { innerText: "next turn" };
     ctx.button = {
       disabled: false,
       click() { ctx.clicks += 1; },
@@ -1196,8 +1192,8 @@ test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowled
         name: "chatgpt",
         needsMainWorldInsert: true,
         inputHasContent: () => true,
-        getInputEl: () => ({ innerText: "next turn" }),
-        getWatchMainWorldSelector: () => ctx.hasSelector ? "#prompt-textarea" : null,
+        getInputEl: () => ctx.input,
+        getWatchMainWorldSelector: () => "#prompt-textarea",
       };
       const wait = async () => {};
       const findSendButton = () => ctx.button;
@@ -1206,8 +1202,9 @@ test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowled
       const waitForSubmitAck = async () => ctx.ack;
       const submitMainWorld = async () => {
         ctx.mainSubmits += 1;
-        return ctx.mainResult;
+        return { ok: true, submitted: true };
       };
+      const dispatchEnterSubmit = () => { ctx.enterSubmits += 1; };
       ${helperSource}
       return submitBrowserActuationOnce;
     `)(ctx);
@@ -1215,41 +1212,27 @@ test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowled
       result: await submitOnce(),
       clicks: ctx.clicks,
       mainSubmits: ctx.mainSubmits,
+      enterSubmits: ctx.enterSubmits,
     };
   }
 
   const delayed = await run({ ack: false });
-  assert.equal(delayed.mainSubmits, 1);
+  assert.equal(delayed.enterSubmits, 1);
+  assert.equal(delayed.mainSubmits, 0);
   assert.equal(delayed.clicks, 0);
   assert.equal(delayed.result.ok, false);
   assert.equal(delayed.result.attempted, true);
   assert.equal(delayed.result.uncertain, true);
 
   const accepted = await run({ ack: true });
-  assert.equal(accepted.mainSubmits, 1);
+  assert.equal(accepted.enterSubmits, 1);
+  assert.equal(accepted.mainSubmits, 0);
   assert.equal(accepted.clicks, 0);
   assert.equal(accepted.result.ok, true);
   assert.equal(accepted.result.attempted, true);
 
-  const explicitPreSubmitFailure = await run({
-    ack: true,
-    mainResult: { ok: false, error: "no-submit-form" },
-  });
-  assert.equal(explicitPreSubmitFailure.mainSubmits, 1);
-  assert.equal(explicitPreSubmitFailure.clicks, 1);
-  assert.equal(explicitPreSubmitFailure.result.ok, true);
-
-  const mainWorldResponseLost = await run({
-    ack: false,
-    mainResult: { ok: false, error: "no-response" },
-  });
-  assert.equal(mainWorldResponseLost.mainSubmits, 1);
-  assert.equal(mainWorldResponseLost.clicks, 0);
-  assert.equal(mainWorldResponseLost.result.ok, false);
-  assert.equal(mainWorldResponseLost.result.attempted, true);
-  assert.equal(mainWorldResponseLost.result.uncertain, true);
-
   const busy = await run({ busy: true });
+  assert.equal(busy.enterSubmits, 0);
   assert.equal(busy.mainSubmits, 0);
   assert.equal(busy.clicks, 0);
   assert.equal(busy.result.ok, false);
