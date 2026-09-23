@@ -252,7 +252,10 @@ impl SemanticRequest {
     }
 
     fn validate(&self) -> Result<(), SemanticError> {
-        if serde_json::to_vec(&self.state)
+        if !matches!(
+            &self.state,
+            Value::String(_) | Value::Object(_) | Value::Array(_)
+        ) || serde_json::to_vec(&self.state)
             .map_err(|_| SemanticError::new("invalid_request"))?
             .len()
             > MAX_STATE_BYTES
@@ -1850,6 +1853,37 @@ mod tests {
             .unwrap();
         assert_eq!((score, confidence), (1.7, 0.81));
         assert_eq!(probabilities.get("2"), Some(&0.75));
+    }
+
+    #[test]
+    fn semantic_state_matches_typesafe_system_one_contract() {
+        let question = || {
+            SemanticQuestion::noul(
+                "Is this valid?",
+                "Valid semantic state",
+                "Invalid semantic state",
+            )
+        };
+
+        for state in [json!("text"), json!({"task":"check"}), json!(["task"])] {
+            assert!(
+                SemanticRequest::new(state)
+                    .ask("valid", question())
+                    .validate()
+                    .is_ok()
+            );
+        }
+
+        for state in [Value::Null, json!(true), json!(1)] {
+            assert_eq!(
+                SemanticRequest::new(state)
+                    .ask("valid", question())
+                    .validate()
+                    .unwrap_err()
+                    .code(),
+                "invalid_request"
+            );
+        }
     }
 
     #[test]
