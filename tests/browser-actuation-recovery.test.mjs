@@ -2290,9 +2290,17 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
-  assert.match(wakeSource, /registeredHerdrAppKeyword \? currentHerdrRequiredApps\(\) : \[\]/);
-  assert.match(wakeSource, /requestedApps\.length \? requestedApps : currentHerdrRequiredApps\(\)/);
+  assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
+  assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);
+  assert.match(wakeSource, /const defaultChatGptApps = creatingSession \? \["herdr"\] : observedHerdrApps/);
+  assert.match(wakeSource, /requestedApps\.length \? requestedApps : defaultChatGptApps/);
   assert.match(wakeSource, /composerHasOnlyAppPills\(requiredApps\)/);
+});
+
+test("user never gets a guessed app on an existing ChatGPT conversation | Given no learned Herdr app identity | When recovery or handoff prepares another turn | Then existing-session sends have no synthetic app requirement while fresh session.create keeps the default compatibility name", () => {
+  assert.match(wakeSource, /function currentHerdrRequiredApps\(\)[\s\S]*if \(!registeredHerdrAppKeyword\) return \[\]/);
+  assert.match(wakeSource, /const defaultChatGptApps = creatingSession \? \["herdr"\] : observedHerdrApps/);
+  assert.doesNotMatch(wakeSource, /registeredHerdrAppKeyword \|\| "herdr"/);
 });
 
 test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conversation | When Auto wakes continue the thread | Then only Herdr-generated turns reassert the app requirement", () => {

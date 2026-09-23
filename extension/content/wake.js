@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.124";
+const H2W_CONTENT_VERSION = "0.1.125";
 
 function normalizeHerdrMentionAlias(value) {
   const alias = String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2063,10 +2063,12 @@ function normalizeHerdrMentionAlias(value) {
     const message = typeof params.message === "string" ? params.message.trim() : "";
     const reasoning = params.reasoning_effort;
     const requestedApps = Array.isArray(params.required_apps) ? params.required_apps : [];
+    const observedHerdrApps = ADAPTER.name === "chatgpt" ? currentHerdrRequiredApps() : [];
+    const defaultChatGptApps = creatingSession ? ["herdr"] : observedHerdrApps;
     const requiredApps = ADAPTER.name === "chatgpt"
       ? [...new Set([
-        ...(registeredHerdrAppKeyword ? currentHerdrRequiredApps() : []),
-        ...(requestedApps.length ? requestedApps : currentHerdrRequiredApps()),
+        ...observedHerdrApps,
+        ...(requestedApps.length ? requestedApps : defaultChatGptApps),
       ])]
       : requestedApps;
     if (!message || reasoning != null) {
@@ -3006,8 +3008,8 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   function currentHerdrRequiredApps() {
-    const keyword = normalizeHerdrMentionAlias(registeredHerdrAppKeyword || "herdr").toLowerCase();
-    return [keyword];
+    if (!registeredHerdrAppKeyword) return [];
+    return [normalizeHerdrMentionAlias(registeredHerdrAppKeyword).toLowerCase()];
   }
 
   async function currentAdapterProjectIdentity(convKey) {

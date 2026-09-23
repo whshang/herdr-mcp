@@ -136,6 +136,10 @@ ok(wakeSource.includes("registeredConversationBound && registeredHerdrAppKeyword
     && wakeSource.includes("queueInsert: true")
     && wakeSource.includes("requiredApps: registeredConversationBound && registeredHerdrAppKeyword"),
   "queued next-turn delivery preserves a learned Herdr app identity without guessing one");
+ok(wakeSource.includes("if (!registeredHerdrAppKeyword) return []")
+    && wakeSource.includes('const defaultChatGptApps = creatingSession ? ["herdr"] : observedHerdrApps')
+    && !wakeSource.includes('registeredHerdrAppKeyword || "herdr"'),
+  "existing ChatGPT sends never guess an app identity while fresh session.create keeps the compatibility default");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
