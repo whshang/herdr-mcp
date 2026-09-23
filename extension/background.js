@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.123";
+const H2W_SCRIPT_VERSION = "0.1.124";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -1342,7 +1342,8 @@ function observedAppKeywords(value) {
 }
 
 function bindingRequiredApps(binding) {
-  return [normalizeAppKeyword(binding?.herdr_app_keyword) || "herdr"];
+  const keyword = normalizeAppKeyword(binding?.herdr_app_keyword);
+  return keyword ? [keyword] : [];
 }
 
 function primaryBindingForConv(bindings, convKey) {

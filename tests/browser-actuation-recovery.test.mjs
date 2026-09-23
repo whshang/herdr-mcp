@@ -2282,6 +2282,8 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   // the opened menu; ambiguity stays fail-closed via candidates.length !== 1 in
   // wake.js (asserted below).
   assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
+  assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
+  assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
   assert.match(chatGptAdapterSource, /visible\(node\)/);
   assert.match(chatGptAdapterSource, /return matches\.sort/);
   assert.match(wakeSource, /candidates\.length !== 1/);
@@ -2321,6 +2323,17 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   assert.match(wake, /ensureRequiredComposerApps\(requiredApps\)/);
   assert.doesNotMatch(wake, /ensureHerdrComposerReference/);
   assert.doesNotMatch(wake, /if \(requiredApps\.length > 0\)[\s\S]*await clearComposer\(\)/);
+});
+
+test("user keeps Herdr attached on queued next-turn delivery | Given a bound ChatGPT conversation with an observed Herdr app keyword | When Queue delivers the next user turn | Then the delivery reuses only the observed app identity and never guesses an unknown keyword", () => {
+  const queueStart = wakeSource.indexOf('if (msg?.type === "h2w_queue_deliver")');
+  const queueEnd = wakeSource.indexOf('if (msg?.type === "h2w_wake")', queueStart);
+  assert.ok(queueStart >= 0 && queueEnd > queueStart);
+  const queue = wakeSource.slice(queueStart, queueEnd);
+  assert.match(queue, /registeredConversationBound && registeredHerdrAppKeyword/);
+  assert.match(queue, /requiredApps:\s*registeredConversationBound && registeredHerdrAppKeyword/);
+  assert.match(queue, /currentHerdrRequiredApps\(\)/);
+  assert.match(backgroundSource, /function bindingRequiredApps\(binding\)[\s\S]*return keyword \? \[keyword\] : \[\]/);
 });
 
 // Regression: session.create must not passively deadlock on a Browser Registry

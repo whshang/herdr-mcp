@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.123";
+const H2W_CONTENT_VERSION = "0.1.124";
 
 function normalizeHerdrMentionAlias(value) {
   const alias = String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2781,6 +2781,9 @@ function normalizeHerdrMentionAlias(value) {
             template: text,
             autoAllow: false,
             queueInsert: true,
+            requiredApps: registeredConversationBound && registeredHerdrAppKeyword
+              ? currentHerdrRequiredApps()
+              : [],
           });
           if (result.ok) {
             rememberQueuedInsertBatch(convKey, batchId);

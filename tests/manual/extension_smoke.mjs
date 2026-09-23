@@ -122,6 +122,7 @@ ok(routeWakeStart >= 0
     && routeWakeEnd > routeWakeStart
     && routeWakeSegment.includes("requiredApps: bindingRequiredApps(b)")
     && backgroundSource.includes("function bindingRequiredApps(binding)")
+    && backgroundSource.includes("return keyword ? [keyword] : []")
     && backgroundSource.includes("herdr_app_keyword")
     && wakeSource.includes("browserAppKeywords")
     && wakeSource.includes("getLatestUserAppKeywords")
@@ -131,6 +132,10 @@ ok(routeWakeStart >= 0
     && !backgroundSource.includes('requiredApps: ["herdr"]')
     && !wakeSource.includes('requiredApps: ["herdr"]'),
   "Herdr auto wakes preserve the observed ChatGPT app identity without forcing a hardcoded app name on unrelated composer sends");
+ok(wakeSource.includes("registeredConversationBound && registeredHerdrAppKeyword")
+    && wakeSource.includes("queueInsert: true")
+    && wakeSource.includes("requiredApps: registeredConversationBound && registeredHerdrAppKeyword"),
+  "queued next-turn delivery preserves a learned Herdr app identity without guessing one");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')

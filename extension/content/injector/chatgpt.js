@@ -86,6 +86,16 @@ class ChatGPTAdapter extends BaseAdapter {
     const input = this.getInputEl();
     if (!wanted || !input) return [];
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    const keywordMatches = (element) => {
+      const nodes = [
+        element,
+        ...Array.from(element.querySelectorAll?.('[data-keyword], [data-value]') || []),
+      ];
+      return nodes.some((candidate) => [
+        candidate?.getAttribute?.('data-keyword'),
+        candidate?.getAttribute?.('data-value'),
+      ].some((value) => String(value || '').trim().toLowerCase() === wanted));
+    };
     const seen = new Set();
     const matches = [];
     const selectors = [
@@ -101,7 +111,7 @@ class ChatGPTAdapter extends BaseAdapter {
         node.getAttribute('aria-label'),
         node.getAttribute('data-value'),
       ].filter(Boolean).join(' ').trim().toLowerCase();
-      if (!text.includes(wanted)) continue;
+      if (!keywordMatches(node) && !text.includes(wanted)) continue;
       seen.add(node);
       matches.push(node);
     }
@@ -110,6 +120,7 @@ class ChatGPTAdapter extends BaseAdapter {
         const role = node.getAttribute('role') || '';
         const testid = node.getAttribute('data-testid') || '';
         let value = 0;
+        if (keywordMatches(node)) value += 100;
         if (role === 'option') value += 50;
         if (role === 'menuitem') value += 40;
         if (/app|connector|mention/i.test(testid)) value += 20;
