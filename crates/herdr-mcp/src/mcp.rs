@@ -513,6 +513,9 @@ const MODEL_VISIBLE_ADVISORY_KEYS: &[&str] = &[
     "pairing_hint",
     "revoke_hint",
     "next_action",
+    "next_surface",
+    "recovery",
+    "instructions",
 ];
 
 const MODEL_VISIBLE_OPAQUE_KEYS: &[&str] = &[
@@ -7280,13 +7283,22 @@ mod tests {
             json!({
                 "ok": true,
                 "hint": "do something next",
-                "nested": {"retry_hint": "retry this way", "fact": "kept"},
+                "instructions": "use another tool",
+                "nested": {
+                    "retry_hint": "retry this way",
+                    "next_surface": "herdr_call",
+                    "recovery": {"action": "retry"},
+                    "fact": "kept"
+                },
                 "output": "user stdout: do not rewrite me",
                 "structured_output": {"hint": "user-owned-json", "value": 7}
             }),
         );
         assert!(visible.get("hint").is_none());
+        assert!(visible.get("instructions").is_none());
         assert!(visible["nested"].get("retry_hint").is_none());
+        assert!(visible["nested"].get("next_surface").is_none());
+        assert!(visible["nested"].get("recovery").is_none());
         assert_eq!(visible["nested"]["fact"], "kept");
         assert_eq!(visible["output"], "user stdout: do not rewrite me");
         assert_eq!(

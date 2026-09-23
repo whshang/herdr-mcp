@@ -181,7 +181,7 @@ test("herdr_methods keeps Edge authority local and routes workstation-local disc
   assert.equal(response.body.result.structuredContent.methods[0].edge_route_deployed, false);
   assert.equal(response.body.result.structuredContent.methods[0].caller_routable, false);
   assert.equal(response.body.result.structuredContent.methods[0].reason, "edge_route_not_deployed");
-  assert.equal(response.body.result.structuredContent.methods[0].next_surface, "herdr_methods");
+  assert.equal(response.body.result.structuredContent.methods[0].next_surface, undefined);
   assert.equal(reserved.calls.length, 0);
 });
 
@@ -540,9 +540,7 @@ test("herdr_call herdr_mcp.device.pair executes at Edge and creates pairing with
     r.body.result.structuredContent.new_device_command,
     `herdr-mcp worker connect "https://edge.example/pair#pair_${"11".repeat(32)}"`,
   );
-  assert.ok(r.body.result.structuredContent.instructions.includes("herdr-mcp worker connect"));
-  assert.ok(r.body.result.structuredContent.instructions.includes("1970-01-01T00:10:00.000Z"));
-  assert.ok(r.body.result.structuredContent.instructions.includes("visible CLI prompt"));
+  assert.equal(r.body.result.structuredContent.instructions, undefined);
   assert.deepEqual(pairingInput, { ttl_seconds: 300, name: "new-workstation" });
   assert.equal(d.calls.length, 0, "must never forward to a workstation");
   assert.equal(d.targets.length, 0);
@@ -1034,7 +1032,13 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
       text: JSON.stringify({
         ok: true,
         hint: "do something next",
-        nested: { retry_hint: "retry this way", fact: "kept" },
+        instructions: "use another tool",
+        nested: {
+          retry_hint: "retry this way",
+          next_surface: "herdr_call",
+          recovery: { action: "retry" },
+          fact: "kept",
+        },
         output: "user stdout: do not rewrite me",
         structured_output: { hint: "user-owned-json", value: 7 },
       }),
@@ -1042,7 +1046,13 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
     structuredContent: {
       ok: true,
       hint: "do something next",
-      nested: { task_hint: "send another task", fact: "kept" },
+      instructions: "use another tool",
+      nested: {
+        task_hint: "send another task",
+        next_surface: "herdr_call",
+        recovery: { action: "retry" },
+        fact: "kept",
+      },
       output: "user stdout: do not rewrite me",
       structured_output: { hint: "user-owned-json", value: 7 },
     },
@@ -1059,13 +1069,19 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
     d.value,
   );
   assert.equal(response.body.result.structuredContent.hint, undefined);
+  assert.equal(response.body.result.structuredContent.instructions, undefined);
   assert.equal(response.body.result.structuredContent.nested.task_hint, undefined);
+  assert.equal(response.body.result.structuredContent.nested.next_surface, undefined);
+  assert.equal(response.body.result.structuredContent.nested.recovery, undefined);
   assert.equal(response.body.result.structuredContent.nested.fact, "kept");
   assert.equal(response.body.result.structuredContent.output, "user stdout: do not rewrite me");
   assert.deepEqual(response.body.result.structuredContent.structured_output, { hint: "user-owned-json", value: 7 });
   const text = JSON.parse(response.body.result.content[0].text);
   assert.equal(text.hint, undefined);
+  assert.equal(text.instructions, undefined);
   assert.equal(text.nested.retry_hint, undefined);
+  assert.equal(text.nested.next_surface, undefined);
+  assert.equal(text.nested.recovery, undefined);
   assert.equal(text.nested.fact, "kept");
   assert.equal(text.output, "user stdout: do not rewrite me");
   assert.deepEqual(text.structured_output, { hint: "user-owned-json", value: 7 });
@@ -1169,13 +1185,7 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
   assert.equal(r.body.result.structuredContent.delivery_state, "not_delivered");
   assert.equal(r.body.result.structuredContent.retry_after_ms, 5000);
   assert.deepEqual(r.body.result.structuredContent.details, { source: "edge-test" });
-  assert.deepEqual(r.body.result.structuredContent.recovery, {
-    action: "retry_read_only_probe",
-    probe_tool: "herdr_inspect",
-    max_attempts: 3,
-    backoff_ms: [5000, 10000, 20000],
-    mutation_replay: "only_after_not_delivered_or_verified_not_applied",
-  });
+  assert.equal(r.body.result.structuredContent.recovery, undefined);
 });
 
 test("read-only tools/call retries a non-JSON transient Edge 524 with a fresh request id", async () => {
