@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.1 — 2026-09-23
+
+- Stable Runtime releases now publish and attest a byte-identical `release-manifest.json` compatibility alias alongside `runtime-manifest.json`. This restores direct stable update discovery for v1.0.0-alpha.9/pre-1.0 updaters, which otherwise skip v1.0.0 and fall back to the v0.4.9 schema-5 manifest. Historical v1.0.0 recovery remains supported even though that one stable bundle lacks the alias. Runtime schema/contract and browser extension 0.1.133 are unchanged. [PR #546](https://github.com/whshang/herdr-mcp/pull/546)
+
 ## v1.0.0 — 2026-09-23
 
 - **Stable 1.0 release:** Herdr MCP 1.0 is the first stable multi-device Web AI ↔ workstation control-plane release. ChatGPT is the reference WebChat provider; Claude and Grok remain compatibility providers for signed-in dispatch/result flows, while Gemini is outside the stable 1.0 support claim. The stable Runtime contract is epoch 4 / 18 tools, first-party Edge is epoch 7 / 19 actions, and durable Runtime state is schema 15. Runtime and browser-extension releases remain independent planes.
