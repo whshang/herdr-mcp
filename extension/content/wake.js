@@ -2156,10 +2156,18 @@ function normalizeHerdrMentionAlias(value) {
       // readiness window for the composer to mount and become idle/empty.
       // This is still the same create actuation: no second submit is scheduled.
       const composerReadyDeadline = Date.now() + 20000;
-      const freshCreateComposerReady = () => Boolean(ADAPTER.getInputEl())
-        && !isTurnInProgress()
-        && !ADAPTER.inputHasContent();
-      while (!freshCreateComposerReady() && Date.now() < composerReadyDeadline) {
+      let freshCreateStableIdleSamples = 0;
+      while (Date.now() < composerReadyDeadline) {
+        const inputMounted = Boolean(ADAPTER.getInputEl());
+        const idleAndEmpty = inputMounted
+          && !isTurnInProgress()
+          && !ADAPTER.inputHasContent();
+        if (idleAndEmpty) {
+          freshCreateStableIdleSamples += 1;
+          if (freshCreateStableIdleSamples >= 3) break;
+        } else {
+          freshCreateStableIdleSamples = 0;
+        }
         if (!runtimeAlive()) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
           return {
@@ -2174,12 +2182,12 @@ function normalizeHerdrMentionAlias(value) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         return browserRejectedEvidence(evidence, "browser_create_composer_unavailable");
       }
-      if (!freshCreateComposerReady()) {
+      if (freshCreateStableIdleSamples < 3) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         return browserRejectedEvidence(evidence, "browser_create_composer_busy");
       }
     }
-    if (isTurnInProgress() || ADAPTER.inputHasContent()) {
+    if ((!creatingSession && isTurnInProgress()) || ADAPTER.inputHasContent()) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }

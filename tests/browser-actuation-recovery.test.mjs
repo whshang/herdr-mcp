@@ -1313,7 +1313,13 @@ test("fresh ChatGPT create waits through transient composer busy without a secon
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
   const commandSource = wakeSource.slice(commandStart, commandEnd);
-  const ctx = { busyChecks: 0, waits: 0, wakeCalls: 0, reservationRemovals: 0 };
+  const ctx = {
+    busyChecks: 0,
+    busySequence: [true, true, false, true, false, false, false, true],
+    waits: 0,
+    wakeCalls: 0,
+    reservationRemovals: 0,
+  };
 
   const act = new Function("ctx", `
     const ADAPTER = {
@@ -1338,8 +1344,9 @@ test("fresh ChatGPT create waits through transient composer busy without a secon
     const document = { hidden: false };
     const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
     const isTurnInProgress = () => {
+      const value = ctx.busySequence[ctx.busyChecks] ?? false;
       ctx.busyChecks += 1;
-      return ctx.busyChecks <= 2;
+      return value;
     };
     const runtimeAlive = () => true;
     const wait = async () => { ctx.waits += 1; };
@@ -2290,13 +2297,17 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
     "fresh-session actuation must enter Chat mode before waiting for the composer",
   );
   assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 20000/);
-  assert.match(createSegment, /const freshCreateComposerReady = \(\) => Boolean\(ADAPTER\.getInputEl\(\)\)/);
+  assert.match(createSegment, /let freshCreateStableIdleSamples = 0/);
+  assert.match(createSegment, /const idleAndEmpty = inputMounted/);
   assert.match(createSegment, /&& !isTurnInProgress\(\)/);
   assert.match(createSegment, /&& !ADAPTER\.inputHasContent\(\)/);
-  assert.match(createSegment, /while \(!freshCreateComposerReady\(\) && Date\.now\(\) < composerReadyDeadline\)/);
+  assert.match(createSegment, /freshCreateStableIdleSamples \+= 1/);
+  assert.match(createSegment, /freshCreateStableIdleSamples >= 3/);
+  assert.match(createSegment, /freshCreateStableIdleSamples = 0/);
+  assert.match(createSegment, /if \(\(!creatingSession && isTurnInProgress\(\)\) \|\| ADAPTER\.inputHasContent\(\)\)/);
   assert.match(createSegment, /await wait\(200\)/);
   assert.ok(
-    createSegment.indexOf("const composerReadyDeadline") < createSegment.indexOf("if (isTurnInProgress() || ADAPTER.inputHasContent())"),
+    createSegment.indexOf("const composerReadyDeadline") < createSegment.indexOf("if ((!creatingSession && isTurnInProgress()) || ADAPTER.inputHasContent())"),
     "fresh-session composer readiness must settle before the normal busy guard",
   );
   assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
