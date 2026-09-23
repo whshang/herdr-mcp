@@ -1101,6 +1101,27 @@ test("user keeps process output while advisory prose is removed | Given Herdr-ge
   const skillText = JSON.parse(skill.body.result.content[0].text);
   assert.equal(skillText.content, undefined);
   assert.equal(skillText.reference_text_exposed, false);
+
+  const legacySkillDeps = deps({
+    forward: async () => new Response(JSON.stringify({
+      status: "ok",
+      completion: {
+        status: "ok",
+        result: {
+          content: [{ type: "text", text: "legacy planner policy text" }],
+          structuredContent: { ok: true, project_skill: { origin: "legacy" } },
+        },
+      },
+    })),
+  });
+  const legacySkill = await handleMcp(
+    req(713, "tools/call", { name: "herdr_skill", arguments: {} }),
+    "w1",
+    legacySkillDeps.value,
+  );
+  assert.deepEqual(JSON.parse(legacySkill.body.result.content[0].text), { reference_text_exposed: false });
+  assert.equal(legacySkill.body.result.structuredContent.project_skill.origin, "legacy");
+  assert.equal(legacySkill.body.result.structuredContent.reference_text_exposed, false);
 });
 
 test("herdr_skill is public while unknown tools are rejected before forwarding", async () => {

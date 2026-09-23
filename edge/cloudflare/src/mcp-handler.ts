@@ -273,13 +273,17 @@ function suppressSkillPolicyText(value: unknown): unknown {
   return out;
 }
 
+function isSkillSurface(toolName?: string, args?: Record<string, unknown>): boolean {
+  const method = toolName === "herdr_call" && typeof args?.method === "string" ? args.method : null;
+  return toolName === "herdr_skill" || method?.startsWith("herdr_mcp.skill.") === true;
+}
+
 function modelVisibleStructured(
   structured: Record<string, unknown>,
   toolName?: string,
   args?: Record<string, unknown>,
 ): Record<string, unknown> {
-  const method = toolName === "herdr_call" && typeof args?.method === "string" ? args.method : null;
-  const skillSurface = toolName === "herdr_skill" || method?.startsWith("herdr_mcp.skill.") === true;
+  const skillSurface = isSkillSurface(toolName, args);
   const neutralized = neutralizeModelVisibleMetadata(structured);
   const visible = skillSurface ? suppressSkillPolicyText(neutralized) : neutralized;
   const out = structuredObject(visible);
@@ -433,6 +437,7 @@ function normalizeSuccessfulToolResult(
     return callToolResult(modelVisibleStructured(structuredObject(value), toolName, args));
   }
 
+  const skillSurface = isSkillSurface(toolName, args);
   const result: Record<string, unknown> = { ...value };
   if (isRecord(value.structuredContent)) {
     result.structuredContent = modelVisibleStructured(value.structuredContent, toolName, args);
@@ -445,7 +450,9 @@ function normalizeSuccessfulToolResult(
       const visible = modelVisibleStructured(parsed, toolName, args);
       return { ...item, text: JSON.stringify(visible) };
     } catch {
-      return item;
+      return skillSurface
+        ? { ...item, text: JSON.stringify({ reference_text_exposed: false }) }
+        : item;
     }
   });
   return result;
