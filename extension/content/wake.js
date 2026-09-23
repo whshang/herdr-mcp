@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.122";
+const H2W_CONTENT_VERSION = "0.1.123";
 
 function normalizeHerdrMentionAlias(value) {
   const alias = String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2486,6 +2486,7 @@ function normalizeHerdrMentionAlias(value) {
   let registeredBrowserSessionRef = null;
   let registeredBrowserGeneration = null;
   let registeredHerdrAppKeyword = null;
+  let registeredConversationBound = false;
   let browserRegistrationAttempt = 0;
   let chatGptProjectCatalogCache = { accountNativeIdentity: null, fetchedAt: 0, projects: [] };
   const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
@@ -2723,6 +2724,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       if (msg?.type === "h2w_bound" || msg?.type === "h2w_unbound") {
         console.log(`[h2w] ${msg.type === "h2w_bound" ? "bound " + msg.pane : "unbound"}`);
+        void registerCurrentConversation("binding-changed");
         if (usesOperationalHud()) void refreshPageHud();
         return;
       }
@@ -3036,6 +3038,7 @@ function normalizeHerdrMentionAlias(value) {
       registeredBrowserSessionRef = null;
       registeredBrowserGeneration = null;
       registeredHerdrAppKeyword = null;
+      registeredConversationBound = false;
     }
     const accountNativeIdentity = await browserAccountNativeIdentity();
     let chatGptProjectRoute = false;
@@ -3058,6 +3061,7 @@ function normalizeHerdrMentionAlias(value) {
           registeredBrowserSessionRef = null;
           registeredBrowserGeneration = null;
           registeredHerdrAppKeyword = null;
+          registeredConversationBound = false;
         }
       }
       return null;
@@ -3069,7 +3073,7 @@ function normalizeHerdrMentionAlias(value) {
     } catch (_) {}
     const browserAppKeywords = ADAPTER.name === "chatgpt"
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
-      ? ADAPTER.getLatestUserAppKeywords()
+      ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
       : [];
     const response = await sendBg({
       type: "h2w_register",
@@ -3090,6 +3094,7 @@ function normalizeHerdrMentionAlias(value) {
             registeredBrowserSessionRef = null;
             registeredBrowserGeneration = null;
             registeredHerdrAppKeyword = null;
+            registeredConversationBound = false;
           }
         }
         return null;
@@ -3108,6 +3113,7 @@ function normalizeHerdrMentionAlias(value) {
         && response.herdr_app_keyword.trim()
         ? response.herdr_app_keyword.trim().toLowerCase()
         : null;
+      registeredConversationBound = response?.bound === true;
       restoreBrowserResultAssignment(response?.browser_pending_dispatch);
       if (browserSessionReservationRef && registeredBrowserSessionRef) {
         if (response?.browser_pending_dispatch
@@ -3154,7 +3160,16 @@ function normalizeHerdrMentionAlias(value) {
       if (document.hidden) return;
       maybeRefreshBrowserPendingDispatchAssignment();
       const convKey = ADAPTER.getConversationKey();
-      if (convKey && convKey !== registeredConvKey) void registerCurrentConversation("poll");
+      const observedApps = ADAPTER.name === "chatgpt"
+        && registeredConversationBound
+        && !registeredHerdrAppKeyword
+        && typeof ADAPTER.getLatestUserAppKeywords === "function"
+        ? ADAPTER.getLatestUserAppKeywords(latestTurnForRole("user"))
+        : [];
+      const shouldLearnAppIdentity = convKey === registeredConvKey && observedApps.length === 1;
+      if (convKey && (convKey !== registeredConvKey || shouldLearnAppIdentity)) {
+        void registerCurrentConversation(shouldLearnAppIdentity ? "app-identity" : "poll");
+      }
       if (ADAPTER.name === "chatgpt") ensureQueuedInsertButton();
     }, 1000);
     try {

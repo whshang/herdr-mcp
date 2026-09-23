@@ -88,7 +88,7 @@ herdr-mcp worker connect "<pairing-address>"
 
 Ask for the six-digit verification code only when the CLI requests it. The display name defaults from the computer name; pass `--name` only when the user explicitly wants a different name. This path does not deploy another Worker, create another Connector, or copy a fleet-wide long-lived secret to the new machine.
 
-The enrolled identity is immutable `device_id=dev_<ULID>`; keep display name separate and never invent `WORKSTATION_ID` from hostname.
+The immutable `device_id` is `dev_<ULID>` with a 26-character ULID (for example `dev_01ARZ3NDEKTSV4RRFFQ69G5FAV`); keep display name separate. Do **not** invent a `WORKSTATION_ID` from hostname.
 
 See [join an existing fleet](existing-worker-connect.md) for detail.
 
@@ -102,7 +102,7 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-Without a Custom Domain, try `workers.dev` first. On DNS failure, query Cloudflare DNS then Google DNS; only a candidate passing real TLS `/health` may become a marked single-host hosts entry. Retry direct Link, then an existing local proxy, then signed shared Relay. Never change system DNS, OAuth issuer, or public MCP origin.
+Without a Custom Domain, try `workers.dev` first. On DNS failure, query Cloudflare DNS then Google DNS; only a candidate passing real TLS `/health` may become a marked single-host hosts entry. Retry direct Link, then an existing local proxy; keep signed shared Relay last. Never change system DNS, OAuth issuer, or public MCP origin.
 
 ## 7. Final acceptance
 

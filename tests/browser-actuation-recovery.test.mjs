@@ -2303,7 +2303,12 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   assert.match(backgroundSource, /herdr_app_keyword/);
   assert.match(backgroundSource, /b\.herdr_app_keyword = browserAppKeywords\[0\]/);
   assert.match(wakeSource, /browserAppKeywords/);
-  assert.match(chatGptAdapterSource, /getLatestUserAppKeywords\(\)/);
+  assert.match(chatGptAdapterSource, /getLatestUserAppKeywords\(latestUser = null\)/);
+  assert.match(wakeSource, /registeredConversationBound/);
+  assert.match(wakeSource, /getLatestUserAppKeywords\(latestTurnForRole\("user"\)\)/);
+  assert.match(wakeSource, /shouldLearnAppIdentity/);
+  assert.match(wakeSource, /registerCurrentConversation\(shouldLearnAppIdentity \? "app-identity" : "poll"\)/);
+  assert.match(wakeSource, /registerCurrentConversation\("binding-changed"\)/);
   assert.doesNotMatch(backgroundSource, /requiredApps:\s*\["herdr"\]/);
   assert.doesNotMatch(wakeSource, /requiredApps:\s*\["herdr"\]/);
 
