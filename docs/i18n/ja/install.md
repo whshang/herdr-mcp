@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## サポート対象プラットフォームの境界
 
-<https://github.com/whshang/herdr-mcp/releases> の GitHub `Latest` stable Release を使用してください。初回デバイスの `worker bootstrap` と既存 fleet の `worker connect` は、Apple Silicon macOS と、x86_64・ARM64 双方の native Debian 系 Linux で production-qualified です。Windows x86_64 と Windows ARM64 は 1.0 candidate として公開されます。Windows x86_64 は実機で install/recovery と実際の Connector 会話まで確認済みですが、最新 main の正確な candidate に対する #394 の完全な昇格記録が揃うまでは Candidate のままです。Windows ARM64 は現在も hosted runner の qualification のみです。Windows は Herdr named pipe、Windows Credential Manager、カレントユーザーの Startup フォルダー ショートカットによる autostart、デタッチされたユーザープロセスを使用します。この managed Windows runtime が起動すると、設定された Herdr API を調べ、必要であれば既にインストール済みの `herdr server` をベストエフォートで起動します。Herdr 自体のインストールや削除は行いません。Browser Native Messaging と製品レベルの reinstall / uninstall は、Windows 実機 UAT の主張には含まれません。テスト済み / 未テストの正確な境界は [platform support matrix](platform-support-matrix.md) を参照してください。
+<https://github.com/whshang/herdr-mcp/releases> の GitHub `Latest` stable Release を使用してください。初回デバイスの `worker bootstrap` と既存 fleet の `worker connect` は、Apple Silicon macOS と、x86_64・ARM64 双方の native Debian 系 Linux で production-qualified です。Herdr-MCP 1.0 では native Windows でも初回デバイスの `worker bootstrap` が有効になり、canonical device enrollment、Windows Credential Manager への資格情報保存、managed runtime の activation、Link reconcile まで含まれます。Windows x86_64 と Windows ARM64 は引き続き 1.0 Candidate として公開され、Production 扱いではありません。Windows x86_64 は実機で install/recovery と実際の Connector 会話まで確認済みですが、正確な最終 1.0 candidate では fresh first-device bootstrap の実機記録と #394 の残りの昇格証拠が必要です。Windows ARM64 は現在も hosted runner の qualification のみです。Windows は Herdr named pipe、Windows Credential Manager、カレントユーザーの Startup フォルダー ショートカットによる autostart、デタッチされたユーザープロセスを使用します。この managed Windows runtime が起動すると、設定された Herdr API を調べ、必要であれば既にインストール済みの `herdr server` をベストエフォートで起動します。Herdr 自体のインストールや削除は行いません。Browser Native Messaging と製品レベルの reinstall / uninstall は、Windows 実機 UAT の主張には含まれません。テスト済み / 未テストの正確な境界は [platform support matrix](platform-support-matrix.md) を参照してください。
 
 古いインストールについては [Runtime self-upgrade](runtime-self-upgrade.md) に従ってください。runtime はその場でアップグレードします。現在の Release に移行するためだけに、健全な Worker、デバイス関係、ChatGPT Connector を作り直さないでください。
 
@@ -154,8 +154,8 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 これは人手による手順です。coding agent は一旦停止してユーザーを案内する必要があります。
 
-1. ChatGPT の設定を開き、Plugins の **Developer mode** を有効にします;
-2. **Plugins → Browse plugins** を開き、Herdr Connector を追加します。既定/推奨例の名前は `herdr` ですが、カスタム App 名も利用できます;
+1. ChatGPT の **Settings → Account security & login** を開き、**Developer mode** を有効にします;
+2. **Plugins → Browse plugins** を開き、右上の **+ → Create APP** から MCP App を作成します。推奨例の名前は `herdr` ですが、カスタム App 名も利用できます;
 3. デプロイ済みの完全な `${MCP_URL}` を貼り付けます。末尾の `/mcp` も含めます;
 4. ブラウザで OAuth を完了します。承認ページはブラウザの言語から中国語・英語・日本語を選択し、6 桁のコードを入力する前にターミナルの承認コマンドを実行するよう求めます;
 5. **Project** を作成または開き、そこで作業します;

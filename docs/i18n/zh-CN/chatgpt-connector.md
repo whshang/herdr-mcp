@@ -43,8 +43,8 @@ ChatGPT 能完成 initialize / discovery / `tools/list`。
 
 当前 ChatGPT Web 的开发者模式可以添加自定义 MCP 应用。界面和套餐权限可能变化，整体流程保持一致：
 
-1. 在 ChatGPT 插件设置中启用 Developer mode；
-2. 进入“**插件 → 浏览插件**”，添加 Herdr Connector；默认/建议示例名称是 `herdr`，但可以使用自定义 App 名称；
+1. 打开 ChatGPT **设置 → 账户安全与登录**，启用 **开发者模式（Developer mode）**；
+2. 进入“**插件 → 浏览插件**”，点击右上角 **+**，选择 **Create APP**，创建 MCP 应用。建议名称使用 `herdr`，也可以自定义 App 名称；
 3. MCP URL 填完整地址，必须包含 `/mcp`：
 
    ```text
