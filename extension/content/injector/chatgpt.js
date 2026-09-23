@@ -90,6 +90,9 @@ class ChatGPTAdapter extends BaseAdapter {
     const input = this.getInputEl();
     if (!wanted || !input) return [];
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    const menuRoots = [...document.querySelectorAll('.popover, [role="menu"], [role="listbox"]')]
+      .filter((node) => visible(node) && !input.contains(node));
+    if (!menuRoots.length) return [];
     const keywordMatches = (element) => {
       const nodes = [
         element,
@@ -108,16 +111,18 @@ class ChatGPTAdapter extends BaseAdapter {
       '[data-testid*="app"]',
       '[tabindex="0"]',
     ];
-    for (const node of document.querySelectorAll(selectors.join(','))) {
-      if (!visible(node) || input.contains(node) || seen.has(node)) continue;
-      const text = [
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('data-value'),
-      ].filter(Boolean).join(' ').trim().toLowerCase();
-      if (!keywordMatches(node) && !text.includes(wanted)) continue;
-      seen.add(node);
-      matches.push(node);
+    for (const root of menuRoots) {
+      for (const node of root.querySelectorAll(selectors.join(','))) {
+        if (!visible(node) || input.contains(node) || seen.has(node)) continue;
+        const text = [
+          node.textContent,
+          node.getAttribute('aria-label'),
+          node.getAttribute('data-value'),
+        ].filter(Boolean).join(' ').trim().toLowerCase();
+        if (!keywordMatches(node) && !text.includes(wanted)) continue;
+        seen.add(node);
+        matches.push(node);
+      }
     }
     return matches.sort((a, b) => {
       const score = (node) => {
