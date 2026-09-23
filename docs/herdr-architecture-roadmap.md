@@ -57,7 +57,7 @@ beta.2   multi-device / multi-endpoint / multi-account reservation + failover
 rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 ```
 
-编译加速与内存/资源治理不是额外里程碑，也不引入第二调度器或状态权威。它们作为 1.0 横向工程约束随上述阶段验证：保持 Runtime / production Link / Supervisor 的可靠性边界；以 Work Memory 的 checkpoint + bounded raw tail、轻量 browser/provider resource state、aggregate byte admission、beta.2 Fleet Control resource evidence 为核心；crate/linker/allocator/Cargo profile 等优化只按 Herdr 自身 touched-file、CI、RSS/PSS 与 burst-to-idle 基准决定。活动方案见 [`_wip/v1.0-performance-resource-plan.md`](./_wip/v1.0-performance-resource-plan.md)。
+编译加速与内存/资源治理不是额外里程碑，也不引入第二调度器或状态权威。它们作为 1.0 横向工程约束随上述阶段验证：保持 Runtime / production Link / Supervisor 的可靠性边界；以 Work Memory 的 checkpoint + bounded raw tail、轻量 browser/provider resource state、aggregate byte admission、beta.2 Fleet Control resource evidence 为核心；crate/linker/allocator/Cargo profile 等优化只按 Herdr 自身 touched-file、CI、RSS/PSS 与 burst-to-idle 基准决定。1.0 阶段采用的方案已归档到 [`history/architecture/v1.0-performance-resource-plan.md`](./history/architecture/v1.0-performance-resource-plan.md)；后续性能工作按新的实际问题单独建立当前计划。
 
 **序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）只记录早期计划与 provenance；后续真实实现补入第二 Provider、Claude/Grok、Page Assist 与 Alpha 9，因此上表是当前唯一正式里程碑序列。alpha.5 用于满足冻结 plan §17 的 “at least two providers prove the semantic adapter seam” gate，证明 adapter seam 是 provider-neutral 的。Alpha 9 不增加工具数量；native-default `herdr_exec` 因会改变 epoch-2 明确的 VISIBLE utility-pane 语义而未在旧 hash 下发布，若未来继续该方向必须显式演进 Runtime Execution contract。
 
