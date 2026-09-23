@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.121";
+const H2W_CONTENT_VERSION = "0.1.122";
 
 function normalizeHerdrMentionAlias(value) {
   const alias = String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2064,7 +2064,10 @@ function normalizeHerdrMentionAlias(value) {
     const reasoning = params.reasoning_effort;
     const requestedApps = Array.isArray(params.required_apps) ? params.required_apps : [];
     const requiredApps = ADAPTER.name === "chatgpt"
-      ? [...new Set(["herdr", ...requestedApps])]
+      ? [...new Set([
+        ...(registeredHerdrAppKeyword ? currentHerdrRequiredApps() : []),
+        ...(requestedApps.length ? requestedApps : currentHerdrRequiredApps()),
+      ])]
       : requestedApps;
     if (!message || reasoning != null) {
       if (creatingSession) {
@@ -2482,6 +2485,7 @@ function normalizeHerdrMentionAlias(value) {
   let registeredConvKey = null;
   let registeredBrowserSessionRef = null;
   let registeredBrowserGeneration = null;
+  let registeredHerdrAppKeyword = null;
   let browserRegistrationAttempt = 0;
   let chatGptProjectCatalogCache = { accountNativeIdentity: null, fetchedAt: 0, projects: [] };
   const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
@@ -2653,7 +2657,7 @@ function normalizeHerdrMentionAlias(value) {
             template: msg.template || "",
             autoAllow: false,
             handoff: true,
-            requiredApps: ["herdr"],
+            requiredApps: currentHerdrRequiredApps(),
           });
           if (result?.ok && ADAPTER.name === "chatgpt" && CONVERSATION_HEALTH && conversationHealth) {
             markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
@@ -2687,7 +2691,7 @@ function normalizeHerdrMentionAlias(value) {
             template: msg.template || "",
             autoAllow: false,
             handoff: true,
-            requiredApps: ["herdr"],
+            requiredApps: currentHerdrRequiredApps(),
           });
           if (!result?.ok) { sendResponse(result); return; }
           if (ADAPTER.name === "chatgpt" && CONVERSATION_HEALTH && conversationHealth) {
@@ -2996,6 +3000,11 @@ function normalizeHerdrMentionAlias(value) {
     return matches[0];
   }
 
+  function currentHerdrRequiredApps() {
+    const keyword = normalizeHerdrMentionAlias(registeredHerdrAppKeyword || "herdr").toLowerCase();
+    return [keyword];
+  }
+
   async function currentAdapterProjectIdentity(convKey) {
     if (typeof ADAPTER.getProjectIdentity !== "function") return null;
     let project = ADAPTER.getProjectIdentity();
@@ -3026,6 +3035,7 @@ function normalizeHerdrMentionAlias(value) {
       // Browser Registry target while the new route is still registering.
       registeredBrowserSessionRef = null;
       registeredBrowserGeneration = null;
+      registeredHerdrAppKeyword = null;
     }
     const accountNativeIdentity = await browserAccountNativeIdentity();
     let chatGptProjectRoute = false;
@@ -3047,6 +3057,7 @@ function normalizeHerdrMentionAlias(value) {
         if (ADAPTER.getConversationKey() !== convKey) {
           registeredBrowserSessionRef = null;
           registeredBrowserGeneration = null;
+          registeredHerdrAppKeyword = null;
         }
       }
       return null;
@@ -3056,6 +3067,10 @@ function normalizeHerdrMentionAlias(value) {
       const stored = sessionStorage.getItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
       browserSessionReservationRef = /^bsr_[0-9a-f]{64}$/.test(String(stored || "")) ? stored : null;
     } catch (_) {}
+    const browserAppKeywords = ADAPTER.name === "chatgpt"
+      && typeof ADAPTER.getLatestUserAppKeywords === "function"
+      ? ADAPTER.getLatestUserAppKeywords()
+      : [];
     const response = await sendBg({
       type: "h2w_register",
       convKey,
@@ -3063,6 +3078,7 @@ function normalizeHerdrMentionAlias(value) {
       site: ADAPTER.name,
       accountNativeIdentity,
       browserProjects,
+      browserAppKeywords,
       browserCurrentProjectId: browserCurrentProject?.id || null,
       browserCurrentProjectName: browserCurrentProject?.name || null,
       browserSessionReservationRef,
@@ -3073,6 +3089,7 @@ function normalizeHerdrMentionAlias(value) {
           if (ADAPTER.getConversationKey() !== convKey) {
             registeredBrowserSessionRef = null;
             registeredBrowserGeneration = null;
+            registeredHerdrAppKeyword = null;
           }
         }
         return null;
@@ -3086,6 +3103,10 @@ function normalizeHerdrMentionAlias(value) {
       registeredBrowserGeneration = Number.isSafeInteger(response?.browser_generation)
         && response.browser_generation > 0
         ? response.browser_generation
+        : null;
+      registeredHerdrAppKeyword = typeof response?.herdr_app_keyword === "string"
+        && response.herdr_app_keyword.trim()
+        ? response.herdr_app_keyword.trim().toLowerCase()
         : null;
       restoreBrowserResultAssignment(response?.browser_pending_dispatch);
       if (browserSessionReservationRef && registeredBrowserSessionRef) {
@@ -4212,7 +4233,7 @@ function normalizeHerdrMentionAlias(value) {
       template: "继续",
       autoAllow: false,
       recovery: true,
-      requiredApps: ["herdr"],
+      requiredApps: currentHerdrRequiredApps(),
     });
     if (!result?.ok) {
       markConversationState({ ...conversationHealth, explicit_error_continue_attempt: 0 });
@@ -4400,7 +4421,7 @@ function normalizeHerdrMentionAlias(value) {
       template: hudLabels.recovery_probe_template,
       autoAllow: false,
       recovery: true,
-      requiredApps: ["herdr"],
+      requiredApps: currentHerdrRequiredApps(),
     });
     if (!result?.ok) return false;
     markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
@@ -4489,7 +4510,7 @@ function normalizeHerdrMentionAlias(value) {
         template: hudLabels.stale_view_activation_template,
         autoAllow: false,
         recovery: true,
-        requiredApps: ["herdr"],
+        requiredApps: currentHerdrRequiredApps(),
       });
       if (!result?.ok) return false;
       markConversationState(RECOVERY_CONTROLLER.markRecoverySent({

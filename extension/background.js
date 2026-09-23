@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.121";
+const H2W_SCRIPT_VERSION = "0.1.122";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -1328,6 +1328,21 @@ function isProjectScopedBinding(binding) {
 function bindingDeliveryConvKey(binding) {
   if (isProjectScopedBinding(binding)) return binding.active_conv_key || null;
   return binding?.convKey || null;
+}
+
+function normalizeAppKeyword(value) {
+  const keyword = String(value || "").trim().toLowerCase();
+  if (!keyword || keyword.length > 128 || /[\u0000-\u001f\u007f]/.test(keyword)) return null;
+  return keyword;
+}
+
+function observedAppKeywords(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(normalizeAppKeyword).filter(Boolean))].slice(0, 8);
+}
+
+function bindingRequiredApps(binding) {
+  return [normalizeAppKeyword(binding?.herdr_app_keyword) || "herdr"];
 }
 
 function primaryBindingForConv(bindings, convKey) {
@@ -6031,7 +6046,7 @@ async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || default
         template: rawText,
         llmNudge: true,
         autoAllow: true,
-        requiredApps: ["herdr"],
+        requiredApps: bindingRequiredApps(b),
       },
     };
     return deliverWakeToTab(b, payload);
@@ -6111,7 +6126,7 @@ async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || default
       working_count,
       template: rendered,
       autoAllow: true,
-      requiredApps: ["herdr"],
+      requiredApps: bindingRequiredApps(b),
     },
   };
 
@@ -6169,13 +6184,16 @@ async function deliverWakeToTab(b, payload) {
 }
 
 async function manualDirectContinue(tabId, convKey) {
-  return deliverWakeToTab({ tabId, convKey, site: "chatgpt" }, {
+  const bindings = await loadBindings();
+  const binding = primaryBindingForConv(bindings, convKey);
+  const target = binding || { tabId, convKey, site: "chatgpt" };
+  return deliverWakeToTab({ ...target, tabId, convKey }, {
     type: "h2w_wake",
     data: {
       template: configuredManualContinueMessage(),
       manual: true,
       autoAllow: false,
-      requiredApps: ["herdr"],
+      requiredApps: bindingRequiredApps(binding),
     },
   });
 }
@@ -7679,6 +7697,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           ? rawCurrentProjectId.toLowerCase()
           : null);
       const currentProjectName = String(msg.browserCurrentProjectName || "").trim() || null;
+      const browserAppKeywords = registeringSite === "chatgpt"
+        ? observedAppKeywords(msg.browserAppKeywords)
+        : [];
       let pageInfo = rawPageInfo;
       if (pageInfo && currentProjectId) {
         if (pageInfo.project_id
@@ -7774,6 +7795,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (browserObservation?.accountRef) b.browser_account_ref = browserObservation.accountRef;
           if (browserObservation?.spaceRef) b.browser_space_ref = browserObservation.spaceRef;
           if (browserObservation?.sessionRef) b.browser_session_ref = browserObservation.sessionRef;
+          if (!normalizeAppKeyword(b.herdr_app_keyword) && browserAppKeywords.length === 1) {
+            b.herdr_app_keyword = browserAppKeywords[0];
+          }
           if (Number.isSafeInteger(browserObservation?.observationGeneration)
               && browserObservation.observationGeneration > 0) {
             b.browser_generation = browserObservation.observationGeneration;
@@ -7788,14 +7812,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ensurePushStream(bindings);
         await saveBindings(bindings);
         const first = matched[0];
+        const firstBinding = bindings[first.storeKey] || first;
         sendResponse({
           bound: true,
-          workspace_id: first.workspace_id || normalizeWorkspaceId(first),
-          workspace_label: first.workspace_label || null,
-          pane: first.pane,
-          status: first.status || null,
-          bindings: matched.map((b) => bindingView(b)),
+          workspace_id: firstBinding.workspace_id || normalizeWorkspaceId(firstBinding),
+          workspace_label: firstBinding.workspace_label || null,
+          pane: firstBinding.pane,
+          status: firstBinding.status || null,
+          bindings: matched.map((b) => bindingView(bindings[b.storeKey] || b)),
           browser_session_ref: browserObservation?.sessionRef || null,
+          herdr_app_keyword: normalizeAppKeyword(firstBinding.herdr_app_keyword),
           browser_pending_dispatch: browserObservation?.pendingDispatch || null,
           browser_generation: browserObservation?.observationGeneration || null,
           browser_account_ref: browserObservation?.accountRef || null,
@@ -7805,6 +7831,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({
           bound: false,
           browser_session_ref: browserObservation?.sessionRef || null,
+          herdr_app_keyword: null,
           browser_pending_dispatch: browserObservation?.pendingDispatch || null,
           browser_generation: browserObservation?.observationGeneration || null,
           browser_account_ref: browserObservation?.accountRef || null,

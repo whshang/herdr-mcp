@@ -2,11 +2,11 @@
 
 *Minimal end-to-end execution contract for a coding agent. Human-facing details live in the [manual install guide](install.md); failure diagnosis lives in [troubleshooting](troubleshooting.md).*
 
-> **Execution role: Agent.** Read this page once, then execute it. Do not recursively load every linked document up front; open a detailed guide only when its blocker actually occurs. The user owns only the steps that truly require a person: sign-in, system approval, Cloudflare Token creation/account or domain choice, and ChatGPT OAuth.
+> **Execution role: Agent.** Read once and execute. Open linked details only for an active blocker. Human-only steps are sign-in, system approval, Cloudflare Token/account/domain choice, and ChatGPT OAuth.
 
 ## 1. Execution rules
 
-1. **Plan before calling tools.** Before the first mutation, internally resolve the current machine/fleet state, human-only boundaries, dependencies between steps, and final acceptance checks. Issue currently known independent reads as one wave. Put deterministic shell/Git work that shares the same project and safety boundary into one bounded execution call, including the local checks needed between those steps. Re-plan only when a result changes the next arguments or safety decision, a user action is required, or mutation delivery is uncertain. Do not run `status` after every command and do not poll merely to prove that nothing changed.
+1. **Plan before calling tools.** Before the first mutation, resolve machine/fleet state, human boundaries, dependencies, and final checks. Batch known independent reads. Put deterministic shell/Git work sharing one project and safety boundary into one bounded execution call. Re-plan only when results change arguments or safety, user action is required, or mutation delivery is uncertain.
 2. **Preserve existing work.** Never `reset --hard`, `clean -fd`, overwrite unrelated dirty files, or rebuild an existing fleet as an installation shortcut.
 3. **Normal installation uses the current Stable GitHub Release only.** Do not clone this repository or use `npm`/`cargo` to build the workstation runtime unless the user explicitly asked for source development.
 4. **Keep secrets ephemeral.** Never echo a Cloudflare Token or write it to Git, ordinary logs, or shell history. Pass it only through the current process environment or a hidden CLI prompt. Never put the local `HERDR_MCP_TOKEN` or Cloudflare Token into ChatGPT.
@@ -31,7 +31,7 @@ Check `herdr` first. If it is missing, install the official stable build:
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-On Windows use `install.ps1`; verify `herdr --version` and `herdr api schema`. Windows is Candidate; UAT must use the exact candidate artifact, never an older binary or ad-hoc source build.
+On Windows use `install.ps1`; verify `herdr --version` and `herdr api schema`. Windows Candidate UAT uses the exact candidate artifact, never an ad-hoc source build.
 
 Download the **Latest stable** platform binary from <https://github.com/whshang/herdr-mcp/releases>, place it on the user `PATH` (normally `~/.local/bin/herdr-mcp`), then run:
 
@@ -41,20 +41,20 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-If `~/.local/bin/herdr-mcp` exists but the interactive shell cannot resolve it, classify this as `installed_but_not_on_shell_path`, repair the user's PATH, and verify a fresh shell. Do not reinstall or create a second PATH owner. Use [Troubleshooting](troubleshooting.md) only if the PATH repair is needed.
+If `~/.local/bin/herdr-mcp` exists but the shell cannot resolve it, classify `installed_but_not_on_shell_path`, repair PATH, verify a fresh shell, and do not reinstall or create a second PATH owner.
 
-On macOS, run `herdr-mcp permissions status` before Cloudflare work. If it reports `needs_setup`, grant Full Disk Access once to the stable Herdr-MCP broker, then run `herdr-mcp permissions verify`; do not probe protected paths first or use `sudo`. The broker carries MCP file/Git TCC, not pane shell; panes follow their execution host's TCC. Linux uses the user-service/process backend. Windows uses a Startup-folder shortcut, user processes and Credential Manager without elevation; it can start installed `herdr server` if needed. Normal install needs no Node.js, Wrangler, npm or Cargo.
+On macOS, run `herdr-mcp permissions status` before Cloudflare work. If it reports `needs_setup`, grant Full Disk Access to the stable Herdr-MCP broker, then run `herdr-mcp permissions verify`; do not probe protected paths first or use `sudo`. Linux and Windows use their normal user-level service/process paths. Normal install needs no Node.js, Wrangler, npm or Cargo.
 
 ### Optional fast semantic decisions
 
-After the core runtime is healthy, tell the user that a fast decision model is optional. The recommended reference is [TypeSafe.ai](https://typesafe.ai/), but it is not a required provider and must not block installation. The user may create an API key there and run:
+Fast semantic decisions are optional and must not block installation; [TypeSafe.ai](https://typesafe.ai/) is the reference provider. After the core runtime is healthy, the user may run:
 
 ```bash
 herdr-mcp semantic setup
 herdr-mcp semantic status
 ```
 
-`semantic setup` reads the API key through hidden terminal input and never accepts it on argv. A compatible provider can instead be configured with `--name`, `--protocol`, `--url`, and `--model`. If the user skips this step, Herdr keeps the same deterministic behavior and installation continues normally.
+`semantic setup` reads the API key through hidden input. Skipping it keeps the same deterministic behavior.
 
 ## 4. First Worker: Cloudflare + bootstrap
 
@@ -68,7 +68,7 @@ Run:
 herdr-mcp worker bootstrap
 ```
 
-This command owns Cloudflare API preflight, Account and `workers.dev` subdomain resolution, existing-Herdr-Worker detection, release manifest plus `herdr-edge-<version>.mjs` artifact attestation, Worker/DO bootstrap, first canonical device enrollment, credential storage, and production Link reconciliation. The normal user path does not run Wrangler and does not require a source checkout.
+This command owns Cloudflare API preflight, Account/`workers.dev` resolution, existing-Worker detection, release manifest + `herdr-edge-<version>.mjs` artifact attestation, Worker/DO bootstrap, device enrollment, credentials, and production Link reconciliation. It does not run Wrangler or require a source checkout.
 
 Choose the public origin once, before Connector creation:
 
@@ -88,7 +88,7 @@ herdr-mcp worker connect "<pairing-address>"
 
 Ask for the six-digit verification code only when the CLI requests it. The display name defaults from the computer name; pass `--name` only when the user explicitly wants a different name. This path does not deploy another Worker, create another Connector, or copy a fleet-wide long-lived secret to the new machine.
 
-The enrolled identity is an immutable `device_id`, for example `dev_01ARZ3NDEKTSV4RRFFQ69G5FAV`: `dev_` plus a 26-character ULID. Keep the display name separate from identity. Do **not** invent a `WORKSTATION_ID` from the hostname.
+The enrolled identity is immutable `device_id=dev_<ULID>`; keep display name separate and never invent `WORKSTATION_ID` from hostname.
 
 See [join an existing fleet](existing-worker-connect.md) for detail.
 
@@ -102,11 +102,11 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-Without a Custom Domain, try `workers.dev` directly first. On DNS failure, runtimes with this recovery query Cloudflare DNS then Google DNS; only a candidate passing the real TLS `/health` Herdr check may become a marked single-host system-hosts entry. On v0.4.8, the Agent performs the same verified hosts recovery from the manual install guide before rerunning bootstrap. Unix may require interactive `sudo`; Windows may require an elevated terminal. Retry direct Link next, then an existing local proxy; keep signed shared Relay last. Never change system DNS, network nodes, OAuth issuer, or the public MCP origin.
+Without a Custom Domain, try `workers.dev` first. On DNS failure, query Cloudflare DNS then Google DNS; only a candidate passing real TLS `/health` may become a marked single-host hosts entry. Retry direct Link, then an existing local proxy, then signed shared Relay. Never change system DNS, OAuth issuer, or public MCP origin.
 
 ## 7. Final acceptance
 
-Combine read-only checks into one final verification wave instead of repeating the same checks after every installation step. Installation is complete only when all of these are proven:
+Combine read-only checks into one final verification wave. Installation is complete only when:
 
 - `herdr-mcp status` / `doctor` are healthy;
 - `herdr-mcp link status` shows the enrolled production Link online;
@@ -114,9 +114,9 @@ Combine read-only checks into one final verification wave instead of repeating t
 - the machine has a canonical `dev_<ULID>` device identity;
 - one real authenticated MCP request completes from the public origin to this workstation and back.
 
-Then in ChatGPT enable Developer mode for Plugins, open **Plugins → Browse plugins**, and add `herdr` with the complete `https://…workers.dev/mcp` address, including `/mcp`; finish OAuth. Work inside a ChatGPT Project. In every new chat, use the `+` button in the first message to reference `herdr` so that chat enables the plugin.
+Then in ChatGPT enable Developer mode for Plugins, open **Plugins → Browse plugins**, add the Herdr Connector with the complete `https://…workers.dev/mcp` address, and finish OAuth. `herdr` is the default/example App name; custom names are supported. Work inside a ChatGPT Project. In each new chat, use the `+` button in the first message that needs workstation access to select/reference that App. The extension learns its provider-owned keyword and reuses it for later Herdr turns.
 
-The Chrome extension / Native Messaging path is optional and is not a prerequisite for the core Connector. Install it from the [extension guide](extension.md) only when the user wants browser continuity, handoff, or the Control Center; keep extension distribution/development details in that guide.
+Chrome extension / Native Messaging is optional for browser continuity, handoff, and Control Center; see [extension guide](extension.md).
 
 ## 8. Cleanup and report
 

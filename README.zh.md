@@ -54,7 +54,7 @@ Agent 会检查电脑环境、安装 Herdr 和 herdr-mcp、创建 Worker、确�
 
 ### ChatGPT 配置
 
-需要时开启 Developer Mode，然后在 **设置 → Apps** 添加 `herdr` App/Connector 并完成 OAuth。在首次需要访问工作站的消息里选择或 `@herdr`；同一会话后续应持续保留 Herdr，不需要每轮重复 mention。Herdr 自动继续、Agent 结果、恢复和 handoff 产生的新 turn 会自行保留 app reference；如果 Edge、Link、runtime 都健康但工具仍消失，应视为 attachment 回归，重复 `@herdr` 只作为临时恢复手段。
+需要时开启 Developer Mode，然后在 **设置 → Apps** 添加 Herdr App/Connector 并完成 OAuth。默认/示例名称是 `herdr`，但也支持用户自定义插件名称。在首次需要访问工作站的消息里选择或 mention 这个 App；扩展会从 ChatGPT 真实的 App pill 读取 provider-owned keyword，并把它保存到当前 conversation/Project 的既有 binding。后续 Herdr 自动继续、Agent 结果、恢复和 handoff 都复用这个真实名称，因此同一会话不需要每轮重复 mention。若 Edge、Link、runtime 都健康但工具仍消失，应视为 attachment 回归，再次 mention 只作为临时恢复手段。
 
 [ChatGPT 配置](docs/i18n/zh-CN/chatgpt-connector.md) · [OpenAI Developer Mode / MCP 文档](https://help.openai.com/en/articles/12584461)
 

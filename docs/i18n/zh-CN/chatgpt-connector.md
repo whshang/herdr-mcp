@@ -44,7 +44,7 @@ ChatGPT 能完成 initialize / discovery / `tools/list`。
 当前 ChatGPT Web 的开发者模式可以添加自定义 MCP 应用。界面和套餐权限可能变化，整体流程保持一致：
 
 1. 在 ChatGPT 插件设置中启用 Developer mode；
-2. 进入“**插件 → 浏览插件**”，添加自定义插件，名称建议 `herdr`；
+2. 进入“**插件 → 浏览插件**”，添加 Herdr Connector；默认/建议示例名称是 `herdr`，但可以使用自定义 App 名称；
 3. MCP URL 填完整地址，必须包含 `/mcp`：
 
    ```text
@@ -52,7 +52,7 @@ ChatGPT 能完成 initialize / discovery / `tools/list`。
    ```
 
 4. 完成浏览器 OAuth。首次授权页会根据浏览器语言自动使用中文、英文或日文。第一步复制 `herdr-mcp connector approve <approval-request-id>` 到终端；该命令先检查本机 `herdr-mcp` 服务和 Herdr server 是否就绪，第二步才要求输入页面上的 6 位验证码。已批准的 WebChat Connector 仍只有普通 MCP 权限，不能继续批准另一个 Connector；
-5. 创建或打开 ChatGPT **Project**。首次需要读取工作站数据或执行 Herdr 动作时选择或 `@herdr`。同一会话后续应持续保留 Herdr，不需要每轮重复 `@herdr`。Herdr 自动继续、Agent 结果、恢复和 handoff 产生的新 turn 会显式保留 app reference。如果之后 Edge、Link、runtime 都健康但工具仍消失，应按 attachment 回归处理；再次 `@herdr` 只是恢复 workaround，不是正常使用流程。
+5. 创建或打开 ChatGPT **Project**。首次需要读取工作站数据或执行 Herdr 动作时，选择或 mention 你为这个 Connector 设置的 App 名称；默认/示例名称是 `herdr`，但自定义名称也支持。扩展会从 ChatGPT 真实 App pill 的 provider-owned `data-keyword` 读取身份，并写入当前 conversation/Project 的既有 binding。后续 Herdr 自动继续、Agent 结果、恢复、handoff 和 Browser Actuation 都复用这个已观察到的真实身份，因此同一会话不需要每轮重复 mention。如果之后 Edge、Link、runtime 都健康但工具仍消失，应按 attachment 回归处理；再次选择该 App 只是恢复 workaround，不是正常使用流程。
 
 **不要填写本机 `HERDR_MCP_TOKEN`。** ChatGPT 公网入口使用 OAuth；静态 bearer 只用于本机 curl / Cursor 和兼容路径。
 

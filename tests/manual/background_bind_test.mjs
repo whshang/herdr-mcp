@@ -1662,11 +1662,26 @@ console.log("\n[binding flow]");
 {
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
-  onMsg({ type: "h2w_register", convKey: CONV, url: CONV, site: "chatgpt" }, { tab: { id: 202 } }, (r) => resolveP(r));
+  onMsg({
+    type: "h2w_register",
+    convKey: CONV,
+    url: CONV,
+    site: "chatgpt",
+    browserAppKeywords: ["herdr-mcp"],
+  }, { tab: { id: 202 } }, (r) => resolveP(r));
   const r = await p;
   ok(r?.bound === true && (r.workspace_id === "wH" || r.pane === "wH:p1"), "register restores the binding", JSON.stringify(r));
   ok(storage.herdrWakeBindings[SK_WH].tabId === 202, "tabId updated on first binding");
   ok(storage.herdrWakeBindings[`${CONV}::w2Y`].tabId === 202, "tabId updated on second binding");
+  ok(r?.herdr_app_keyword === "herdr-mcp"
+      && storage.herdrWakeBindings[SK_WH].herdr_app_keyword === "herdr-mcp"
+      && storage.herdrWakeBindings[`${CONV}::w2Y`].herdr_app_keyword === "herdr-mcp",
+    "register persists the observed ChatGPT Herdr app keyword on every matching binding",
+    JSON.stringify({
+      response: r,
+      first: storage.herdrWakeBindings[SK_WH],
+      second: storage.herdrWakeBindings[`${CONV}::w2Y`],
+    }));
 }
 
 // ---- Scenario 5: unbind one workspace ----

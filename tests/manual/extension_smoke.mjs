@@ -120,11 +120,17 @@ const performWakeEnd = wakeSource.indexOf("\n  // ---- Delivery confirmation", p
 const performWakeSegment = wakeSource.slice(performWakeStart, performWakeEnd);
 ok(routeWakeStart >= 0
     && routeWakeEnd > routeWakeStart
-    && routeWakeSegment.includes('requiredApps: ["herdr"]')
+    && routeWakeSegment.includes("requiredApps: bindingRequiredApps(b)")
+    && backgroundSource.includes("function bindingRequiredApps(binding)")
+    && backgroundSource.includes("herdr_app_keyword")
+    && wakeSource.includes("browserAppKeywords")
+    && wakeSource.includes("getLatestUserAppKeywords")
     && performWakeSegment.includes("if (requiredApps.length > 0)")
     && performWakeSegment.includes("ensureRequiredComposerApps(requiredApps)")
-    && !performWakeSegment.includes("ensureHerdrComposerReference"),
-  "Herdr auto wakes preserve the tool attachment without forcing app selection on unrelated composer sends");
+    && !performWakeSegment.includes("ensureHerdrComposerReference")
+    && !backgroundSource.includes('requiredApps: ["herdr"]')
+    && !wakeSource.includes('requiredApps: ["herdr"]'),
+  "Herdr auto wakes preserve the observed ChatGPT app identity without forcing a hardcoded app name on unrelated composer sends");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
@@ -295,7 +301,7 @@ ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes("explicit_error_continue_attempt")
     && wakeSource.includes('template: "继续"')
     && wakeSource.includes('recovery: true')
-    && wakeSource.includes('requiredApps: ["herdr"]')
+    && wakeSource.includes('requiredApps: currentHerdrRequiredApps()')
     && wakeSource.includes("(assistantChanged || curLen > lastAsstLen)"),
   "ChatGPT explicit transport failures stop faking progress and use one bounded reload followed by at most one safe Continue");
 const semanticAutoStart = backgroundSource.indexOf("const jevConfigured = semanticCapabilities.evaluate_available;");

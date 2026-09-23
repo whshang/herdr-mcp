@@ -1249,6 +1249,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
     let registeredBrowserGeneration = 17;
     let registeredConvKey = "https://chatgpt.com/c/current";
+    const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
     const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
@@ -1330,6 +1331,7 @@ test("user receives exact content rejection reasons | Given browser controls rej
       let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
       let registeredBrowserGeneration = 17;
       let registeredConvKey = "conv-current";
+      const currentHerdrRequiredApps = () => ["herdr"];
       const providerCanonicalConversationObserved = () => true;
       const document = { hidden: false };
       const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
@@ -2238,7 +2240,9 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(createSegment, /requiredApps,/);
 
   const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
-  const registrationSegment = wakeSource.slice(registrationStart, registrationStart + 3500);
+  const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch", registrationStart);
+  assert.ok(registrationStart >= 0 && registrationEnd > registrationStart);
+  const registrationSegment = wakeSource.slice(registrationStart, registrationEnd);
   assert.match(registrationSegment, /chatGptProjectRoute/);
   assert.match(registrationSegment, /chatGptProjectRoute\s*\?\s*\[\]\s*:\s*await chatGptProjectCatalog\(accountNativeIdentity\)/);
   assert.match(registrationSegment, /browserSessionReservationRef/);
@@ -2284,7 +2288,8 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
-  assert.match(wakeSource, /\["herdr", \.\.\.requestedApps\]/);
+  assert.match(wakeSource, /registeredHerdrAppKeyword \? currentHerdrRequiredApps\(\) : \[\]/);
+  assert.match(wakeSource, /requestedApps\.length \? requestedApps : currentHerdrRequiredApps\(\)/);
   assert.match(wakeSource, /composerHasOnlyAppPills\(requiredApps\)/);
 });
 
@@ -2293,7 +2298,14 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   const routeEnd = backgroundSource.indexOf("async function deliverWakeToTab(", routeStart);
   assert.ok(routeStart >= 0 && routeEnd > routeStart);
   const route = backgroundSource.slice(routeStart, routeEnd);
-  assert.match(route, /requiredApps:\s*\["herdr"\]/);
+  assert.match(route, /requiredApps:\s*bindingRequiredApps\(b\)/);
+  assert.match(backgroundSource, /function bindingRequiredApps\(binding\)/);
+  assert.match(backgroundSource, /herdr_app_keyword/);
+  assert.match(backgroundSource, /b\.herdr_app_keyword = browserAppKeywords\[0\]/);
+  assert.match(wakeSource, /browserAppKeywords/);
+  assert.match(chatGptAdapterSource, /getLatestUserAppKeywords\(\)/);
+  assert.doesNotMatch(backgroundSource, /requiredApps:\s*\["herdr"\]/);
+  assert.doesNotMatch(wakeSource, /requiredApps:\s*\["herdr"\]/);
 
   const wakeStart = wakeSource.indexOf("async function performWake(data)");
   const wakeEnd = wakeSource.indexOf("\n  // ---- Delivery confirmation", wakeStart);

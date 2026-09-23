@@ -45,6 +45,18 @@ class ChatGPTAdapter extends BaseAdapter {
     return [...selected];
   }
 
+  getLatestUserAppKeywords() {
+    const turns = [...document.querySelectorAll('[data-message-author-role="user"]')];
+    const latest = turns[turns.length - 1] || null;
+    if (!latest) return [];
+    const selected = new Set();
+    for (const pill of latest.querySelectorAll('[data-inline-selection-pill][data-symbol="ecosystemMention"][data-keyword]')) {
+      const keyword = String(pill.getAttribute('data-keyword') || '').trim().toLowerCase();
+      if (keyword) selected.add(keyword);
+    }
+    return [...selected];
+  }
+
   composerHasOnlyAppPills(requiredApps = []) {
     const input = this.getInputEl();
     if (!input) return false;
