@@ -46,7 +46,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. When stable conversation_id and project_id are already available from user input, call continuity.resume once with those identifiers instead of spending a separate continuity.resolve round trip. Before the first remote call, form the next dependency-aware call plan from facts already known. A call is justified only when it obtains decision-changing evidence, executes planned work, or verifies an acceptance boundary. On continue/resume intent, search durable Continuity before asking for an ID; when a ChatGPT conversation URL is supplied, call continuity.resume directly with conversation_url and use continuity.search only for bounded ambiguity discovery; never select a chain by recency or text similarity alone. For ChatGPT self-handoff, call the read-only herdr_mcp.browser_handoff.prepare once, then pass its automatic_delivery message unchanged to browser_session.create with one idempotency key. The prepared manual_delivery.copy_prompt is the same canonical message. If browser control is unavailable or automatic delivery returns no Herdr execution/result evidence, do not infer workstation execution; use the prepared Copy Prompt or re-observe the exact dispatch when one exists. Herdr-reported uncertain delivery is reconciliation-only and must not be replayed automatically. Do not enumerate browser endpoints, accounts, projects, generations, or device ids first. When live state matters, establish one baseline with herdr_inspect, then reuse IDs/paths, herdr_since cursors, fingerprints, and exec offsets. Load herdr_skill only when the task needs its detailed operating policy or before Agent control; request include_native_reference=false unless native Herdr CLI semantics are specifically needed. Group independent reads into one wave. For deterministic same-boundary process steps, prefer transparent herdr_exec.steps when the current public schema advertises it; otherwise keep each freeform shell command narrow and single-purpose. Do not concatenate independent process invocations with shell operators solely to reduce remote calls. Use herdr_exec.command only when actual shell syntax is required. Re-plan only when a result changes the next arguments or safety decision, requires user action, or creates delivery uncertainty. Prefer private summary methods such as cleanup.preview over reconstructing the same view. Discover an unknown native method once with herdr_methods, then reuse its schema. Never blind-retry uncertain mutations. Before sending a final response for a multi-step task, reconcile the current goal and acceptance items against completed evidence and remaining checks. If required acceptance items remain unverified, continue the planned tool workflow instead of reporting completion. This is a planner execution discipline only and does not create a runtime task authority.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr exposes enrolled-workstation state, project files, Git, process execution, Agent tasks, durable Continuity, and supported browser/WebChat control. Mutating results carry explicit delivery, idempotency, and retryability evidence. Uncertain outcomes remain distinct from confirmed delivery. Runtime, Git, task, and browser observations are reported as current-state facts.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -499,7 +499,98 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         }
     };
 
-    Ok(tool_result(output, false))
+    Ok(tool_result(
+        model_visible_tool_output(name, &arguments, output),
+        false,
+    ))
+}
+
+const MODEL_VISIBLE_ADVISORY_KEYS: &[&str] = &[
+    "hint",
+    "retry_hint",
+    "idempotency_hint",
+    "task_hint",
+    "pairing_hint",
+    "revoke_hint",
+    "next_action",
+];
+
+const MODEL_VISIBLE_OPAQUE_KEYS: &[&str] = &[
+    "output",
+    "partial_output",
+    "stdout",
+    "stderr",
+    "structured_output",
+    "prompt",
+    "command",
+];
+
+fn model_visible_tool_output(name: &str, arguments: &Value, output: Value) -> Value {
+    let method = (name == "herdr_call")
+        .then(|| arguments.get("method").and_then(Value::as_str))
+        .flatten();
+    let skill_surface = name == "herdr_skill"
+        || method.is_some_and(|method| method.starts_with("herdr_mcp.skill."));
+    let output = neutralize_model_visible_metadata(output, None);
+    let mut output = if skill_surface {
+        suppress_model_visible_skill_text(output)
+    } else {
+        output
+    };
+    if skill_surface && let Some(object) = output.as_object_mut() {
+        object.insert("reference_text_exposed".to_owned(), json!(false));
+    }
+    output
+}
+
+fn neutralize_model_visible_metadata(value: Value, parent_key: Option<&str>) -> Value {
+    if parent_key.is_some_and(|key| MODEL_VISIBLE_OPAQUE_KEYS.contains(&key)) {
+        return value;
+    }
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| neutralize_model_visible_metadata(value, None))
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut visible = serde_json::Map::new();
+            for (key, value) in object {
+                if MODEL_VISIBLE_ADVISORY_KEYS.contains(&key.as_str()) || key.ends_with("_hint") {
+                    continue;
+                }
+                let value = if MODEL_VISIBLE_OPAQUE_KEYS.contains(&key.as_str()) {
+                    value
+                } else {
+                    neutralize_model_visible_metadata(value, Some(&key))
+                };
+                visible.insert(key, value);
+            }
+            Value::Object(visible)
+        }
+        other => other,
+    }
+}
+
+fn suppress_model_visible_skill_text(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(suppress_model_visible_skill_text)
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    (key != "content").then(|| (key, suppress_model_visible_skill_text(value)))
+                })
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 fn chatgpt_conversation_url_ref(raw: &str) -> Option<(String, Option<String>)> {
@@ -7074,7 +7165,8 @@ fn image_tool_result(image: fs_tools::ImageData) -> Value {
 }
 
 fn tool_result(value: Value, is_error: bool) -> Value {
-    let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
+    let visible = neutralize_model_visible_metadata(value, None);
+    let text = serde_json::to_string(&visible).unwrap_or_else(|_| "{}".to_owned());
     if is_error {
         json!({"content": [{"type": "text", "text": text}], "isError": true})
     } else {
@@ -7168,13 +7260,52 @@ mod tests {
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
         assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
         let instructions = result["instructions"].as_str().unwrap();
-        assert!(instructions.contains("continue/resume intent"));
-        assert!(instructions.contains("search durable Continuity before asking"));
-        assert!(instructions.contains("never select a chain by recency or text similarity alone"));
-        assert!(instructions.contains("browser_handoff.prepare"));
-        assert!(instructions.contains("execution/result evidence"));
-        assert!(!instructions.contains("pre-delivery safety rejection"));
-        assert!(!instructions.contains("retry the original create arguments"));
+        assert!(instructions.contains("delivery, idempotency, and retryability evidence"));
+        assert!(instructions.contains("current-state facts"));
+        for forbidden in [
+            " never ", " do not ", " prefer ", " should ", " must ", " call ", " load ", " use ",
+        ] {
+            assert!(
+                !format!(" {} ", instructions.to_ascii_lowercase()).contains(forbidden),
+                "directive wording leaked into MCP instructions: {instructions}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_visible_results_remove_advisory_prose_without_touching_process_output() {
+        let visible = model_visible_tool_output(
+            "herdr_exec",
+            &json!({"workspace": "w1"}),
+            json!({
+                "ok": true,
+                "hint": "do something next",
+                "nested": {"retry_hint": "retry this way", "fact": "kept"},
+                "output": "user stdout: do not rewrite me",
+                "structured_output": {"hint": "user-owned-json", "value": 7}
+            }),
+        );
+        assert!(visible.get("hint").is_none());
+        assert!(visible["nested"].get("retry_hint").is_none());
+        assert_eq!(visible["nested"]["fact"], "kept");
+        assert_eq!(visible["output"], "user stdout: do not rewrite me");
+        assert_eq!(
+            visible["structured_output"],
+            json!({"hint": "user-owned-json", "value": 7})
+        );
+
+        let skill = model_visible_tool_output(
+            "herdr_skill",
+            &json!({}),
+            json!({
+                "ok": true,
+                "content": "planner policy text",
+                "project_skill": {"origin": "bundled"}
+            }),
+        );
+        assert!(skill.get("content").is_none());
+        assert_eq!(skill["project_skill"]["origin"], "bundled");
+        assert_eq!(skill["reference_text_exposed"], false);
     }
 
     #[test]

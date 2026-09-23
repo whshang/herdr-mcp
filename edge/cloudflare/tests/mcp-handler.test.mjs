@@ -475,7 +475,7 @@ test("mutating call retries generation supersede only after the runtime proves i
   assert.equal(new Set(d.calls.map((call) => call.deadlineMs)).size, 1);
 });
 
-test("herdr_devices executes at Edge and exposes pairing hint without tools/list contract drift", async () => {
+test("user gets device facts without advisory prose | Given Edge-local device inventory | When herdr_devices is called | Then device facts remain and action hints are absent", async () => {
   const devices = [{ device_id: DEVICE_A, name: "macbook" }];
   const d = deps({ devices });
 
@@ -490,18 +490,13 @@ test("herdr_devices executes at Edge and exposes pairing hint without tools/list
     additionalProperties: false,
   });
 
-  // 2. herdr_devices response exposes the devices and non-secret action hint
+  // 2. herdr_devices exposes routing facts without model-directive action prose.
   const r = await handleMcp(req(72, "tools/call", { name: "herdr_devices", arguments: {} }), "legacy-default", d.value);
   assert.equal(r.body.result.isError, undefined);
   assert.equal(r.body.result.structuredContent.ok, true);
   assert.deepEqual(r.body.result.structuredContent.devices, devices);
-  assert.ok(typeof r.body.result.structuredContent.pairing_hint === "string");
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr-mcp worker pair"));
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr-mcp worker connect"));
-  assert.ok(r.body.result.structuredContent.revoke_hint.includes("herdr-mcp worker revoke <device_id>"));
-  assert.equal(r.body.result.structuredContent.pairing_hint.includes("herdr_mcp.device.pair"), false);
-  assert.equal(r.body.result.structuredContent.revoke_hint.includes("herdr_mcp.device.revoke"), false);
-  assert.ok(r.body.result.structuredContent.revoke_hint.includes("Never revoke by display name"));
+  assert.equal(r.body.result.structuredContent.pairing_hint, undefined);
+  assert.equal(r.body.result.structuredContent.revoke_hint, undefined);
   assert.equal(d.calls.length, 0);
 });
 
@@ -1030,6 +1025,103 @@ test("tools/call preserves an existing MCP CallToolResult including image conten
   );
   assert.equal(r.body.id, 71);
   assert.deepEqual(r.body.result, callToolResult);
+});
+
+test("user keeps process output while advisory prose is removed | Given Herdr-generated hints and caller-owned output | When tools/call returns through Edge | Then hints are absent and caller output is unchanged", async () => {
+  const workstationResult = {
+    content: [{
+      type: "text",
+      text: JSON.stringify({
+        ok: true,
+        hint: "do something next",
+        nested: { retry_hint: "retry this way", fact: "kept" },
+        output: "user stdout: do not rewrite me",
+        structured_output: { hint: "user-owned-json", value: 7 },
+      }),
+    }],
+    structuredContent: {
+      ok: true,
+      hint: "do something next",
+      nested: { task_hint: "send another task", fact: "kept" },
+      output: "user stdout: do not rewrite me",
+      structured_output: { hint: "user-owned-json", value: 7 },
+    },
+  };
+  const d = deps({
+    forward: async () => new Response(JSON.stringify({
+      status: "ok",
+      completion: { status: "ok", result: workstationResult },
+    })),
+  });
+  const response = await handleMcp(
+    req(711, "tools/call", { name: "herdr_exec", arguments: { workspace: "w1", command: "printf ok" } }),
+    "w1",
+    d.value,
+  );
+  assert.equal(response.body.result.structuredContent.hint, undefined);
+  assert.equal(response.body.result.structuredContent.nested.task_hint, undefined);
+  assert.equal(response.body.result.structuredContent.nested.fact, "kept");
+  assert.equal(response.body.result.structuredContent.output, "user stdout: do not rewrite me");
+  assert.deepEqual(response.body.result.structuredContent.structured_output, { hint: "user-owned-json", value: 7 });
+  const text = JSON.parse(response.body.result.content[0].text);
+  assert.equal(text.hint, undefined);
+  assert.equal(text.nested.retry_hint, undefined);
+  assert.equal(text.nested.fact, "kept");
+  assert.equal(text.output, "user stdout: do not rewrite me");
+  assert.deepEqual(text.structured_output, { hint: "user-owned-json", value: 7 });
+
+  const skillDeps = deps({
+    forward: async () => new Response(JSON.stringify({
+      status: "ok",
+      completion: {
+        status: "ok",
+        result: {
+          content: [{ type: "text", text: JSON.stringify({
+            ok: true,
+            content: "planner policy text",
+            project_skill: { origin: "bundled" },
+          }) }],
+          structuredContent: {
+            ok: true,
+            content: "planner policy text",
+            project_skill: { origin: "bundled" },
+          },
+        },
+      },
+    })),
+  });
+  const skill = await handleMcp(
+    req(712, "tools/call", { name: "herdr_skill", arguments: {} }),
+    "w1",
+    skillDeps.value,
+  );
+  assert.equal(skill.body.result.structuredContent.content, undefined);
+  assert.equal(skill.body.result.structuredContent.project_skill.origin, "bundled");
+  assert.equal(skill.body.result.structuredContent.reference_text_exposed, false);
+  const skillText = JSON.parse(skill.body.result.content[0].text);
+  assert.equal(skillText.content, undefined);
+  assert.equal(skillText.reference_text_exposed, false);
+
+  const legacySkillDeps = deps({
+    forward: async () => new Response(JSON.stringify({
+      status: "ok",
+      completion: {
+        status: "ok",
+        result: {
+          content: [{ type: "text", text: "legacy planner policy text" }],
+          structuredContent: { ok: true, project_skill: { origin: "legacy" } },
+        },
+      },
+    })),
+  });
+  const legacySkill = await handleMcp(
+    req(713, "tools/call", { name: "herdr_skill", arguments: {} }),
+    "w1",
+    legacySkillDeps.value,
+  );
+  assert.deepEqual(JSON.parse(legacySkill.body.result.content[0].text), { reference_text_exposed: false });
+  assert.equal(legacySkill.body.result.structuredContent.project_skill.origin, "legacy");
+  assert.equal(legacySkill.body.result.structuredContent.reference_text_exposed, false);
 });
 
 test("herdr_skill is public while unknown tools are rejected before forwarding", async () => {
