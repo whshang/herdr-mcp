@@ -9,6 +9,8 @@ mod capability_scan;
 mod child_process;
 mod cleanup_preview;
 mod cli;
+mod codex_history;
+mod codex_paths;
 mod config;
 mod contract;
 mod credential_store;
