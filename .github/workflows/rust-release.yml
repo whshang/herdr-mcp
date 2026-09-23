@@ -194,9 +194,9 @@ jobs:
             --source-commit "$GITHUB_SHA" \
             --source-ref "$GITHUB_REF" \
             --workflow-name "$GITHUB_WORKFLOW"
-          if [[ "$TAG" == *-* ]]; then
-            cp "$PWD/release-assets/runtime-manifest.json" "$PWD/release-assets/release-manifest.json"
-          fi
+          # Keep the legacy alias for pre-1.0 updaters. Those clients discover
+          # only release-manifest.json and still verify its attestation/name.
+          cp "$PWD/release-assets/runtime-manifest.json" "$PWD/release-assets/release-manifest.json"
       - uses: actions/upload-artifact@v4
         with:
           name: rust-release-bundle
