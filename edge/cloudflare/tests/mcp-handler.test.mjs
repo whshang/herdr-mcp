@@ -1378,6 +1378,24 @@ test("browser and Page Assist private methods require explicit enrolled device s
   assert.equal(d.calls[1].args.method, "herdr_mcp.browser_session.archive");
   assert.equal(d.calls[1].args.device, undefined, "device selector is consumed at the Edge before forwarding");
 
+  const create = await handleMcp(
+    req(41, "tools/call", {
+      name: "herdr_call",
+      _meta: { "openai/session": "openai-session-anon-123" },
+      arguments: {
+        method: "browser_session.create",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: "{}",
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(create.body.result.isError, undefined);
+  assert.equal(d.calls.length, 3, "browser session create forwards once");
+  assert.equal(d.calls[2].args.method, "herdr_mcp.browser_session.create");
+  assert.equal(d.calls[2].deadlineMs, 66_000, "fresh create receives the full bounded Edge request budget");
+
   const pageAssist = await handleMcp(
     req(5, "tools/call", {
       name: "herdr_call",
@@ -1395,9 +1413,9 @@ test("browser and Page Assist private methods require explicit enrolled device s
     d.value,
   );
   assert.equal(pageAssist.body.result.isError, undefined);
-  assert.equal(d.calls.length, 3, "Page Assist request forwards to the selected workstation");
-  assert.equal(d.calls[2].args.method, "herdr_mcp.page_assist");
-  assert.deepEqual(d.calls[2].trace, {
+  assert.equal(d.calls.length, 4, "Page Assist request forwards to the selected workstation");
+  assert.equal(d.calls[3].args.method, "herdr_mcp.page_assist");
+  assert.deepEqual(d.calls[3].trace, {
     page_assist_grants: [{
       endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     }],
@@ -1418,8 +1436,8 @@ test("browser and Page Assist private methods require explicit enrolled device s
     d.value,
   );
   assert.equal(agentPrompt.body.result.isError, undefined);
-  assert.equal(d.calls.length, 4, "agent prompt forwards once to the selected workstation");
-  assert.deepEqual(d.calls[3].trace, {
+  assert.equal(d.calls.length, 5, "agent prompt forwards once to the selected workstation");
+  assert.deepEqual(d.calls[4].trace, {
     webchat_authorization: {
       principal_ref: "connector:conn_auditconnector123",
       connector_id: "conn_auditconnector123",

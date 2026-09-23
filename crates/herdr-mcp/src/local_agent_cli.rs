@@ -651,12 +651,13 @@ fn call_private_with_context(
         );
     }
     let trace = (!trace.is_empty()).then_some(trace);
+    let timeout_ms = local_private_timeout_ms(method);
     let request = RuntimeRequest {
         workstation_id: "local-agent-cli".to_owned(),
         request_id: local_request_id(),
         operation: "herdr_call".to_owned(),
         arguments: Some(arguments),
-        timeout_ms: Some(30_000u64.into()),
+        timeout_ms: Some(timeout_ms.into()),
         contract_epoch: Some(u64::from(contract.epoch).into()),
         contract_hash: Some(contract.hash),
         idempotency_key: params
@@ -688,6 +689,14 @@ fn call_private_with_context(
                 .map(|value| format!(" details={}", compact_json(value)))
                 .unwrap_or_default()
         )),
+    }
+}
+
+fn local_private_timeout_ms(method: &str) -> u64 {
+    if method == "herdr_mcp.browser_session.create" {
+        60_000
+    } else {
+        30_000
     }
 }
 
@@ -832,6 +841,18 @@ fn compact_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_session_create_gets_the_extended_local_call_budget_only() {
+        assert_eq!(
+            local_private_timeout_ms("herdr_mcp.browser_session.create"),
+            60_000
+        );
+        assert_eq!(
+            local_private_timeout_ms("herdr_mcp.browser_session.open"),
+            30_000
+        );
+    }
 
     #[test]
     fn grant_trace_contains_only_browser_scope() {

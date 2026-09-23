@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.129";
+const H2W_CONTENT_VERSION = "0.1.133";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -985,10 +985,14 @@ function normalizeHerdrMentionAlias(value) {
       return { ok: false, attempted: false, error: "submit-unavailable" };
     }
     const baseline = captureSubmitAckBaseline(btn);
+    const input = ADAPTER.getInputEl();
+    if (!input) {
+      return { ok: false, attempted: false, error: "submit-input-unavailable" };
+    }
     try {
-      btn.click();
+      dispatchEnterSubmit(input);
     } catch (_) {
-      return { ok: false, attempted: false, error: "submit-click-failed" };
+      return { ok: false, attempted: false, error: "submit-enter-failed" };
     }
     if (await waitForSubmitAck(baseline, 5000)) {
       return { ok: true, attempted: true };
@@ -2151,11 +2155,23 @@ function normalizeHerdrMentionAlias(value) {
     }
     if (creatingSession) {
       // Browser Registry scope registration can beat ChatGPT's Project-home
-      // composer mount. Existing-session dispatches must still fail closed on
-      // the current page state, but a freshly created tab gets one bounded
-      // readiness window before we decide that insertion is unavailable.
+      // composer hydration. Existing-session dispatches must still fail closed
+      // on the current page state, but a freshly created tab gets one bounded
+      // readiness window for the composer to mount and become idle/empty.
+      // This is still the same create actuation: no second submit is scheduled.
       const composerReadyDeadline = Date.now() + 20000;
-      while (!ADAPTER.getInputEl() && Date.now() < composerReadyDeadline) {
+      let freshCreateStableIdleSamples = 0;
+      while (Date.now() < composerReadyDeadline) {
+        const inputMounted = Boolean(ADAPTER.getInputEl());
+        const idleAndEmpty = inputMounted
+          && !isTurnInProgress()
+          && !ADAPTER.inputHasContent();
+        if (idleAndEmpty) {
+          freshCreateStableIdleSamples += 1;
+          if (freshCreateStableIdleSamples >= 3) break;
+        } else {
+          freshCreateStableIdleSamples = 0;
+        }
         if (!runtimeAlive()) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
           return {
@@ -2170,8 +2186,12 @@ function normalizeHerdrMentionAlias(value) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         return browserRejectedEvidence(evidence, "browser_create_composer_unavailable");
       }
+      if (freshCreateStableIdleSamples < 3) {
+        try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
+        return browserRejectedEvidence(evidence, "browser_create_composer_busy");
+      }
     }
-    if (isTurnInProgress() || ADAPTER.inputHasContent()) {
+    if ((!creatingSession && isTurnInProgress()) || ADAPTER.inputHasContent()) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
@@ -2198,7 +2218,7 @@ function normalizeHerdrMentionAlias(value) {
     const boundedChatGptSubmit = exactChatGptDispatchIdentity || (
       ADAPTER.name === "chatgpt" && creatingSession
     );
-    const snapshotTimeoutMs = exactChatGptDispatchIdentity ? 1200 : 6000;
+    const snapshotTimeoutMs = exactChatGptDispatchIdentity || creatingSession ? 1200 : 6000;
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
       : { ok: false };

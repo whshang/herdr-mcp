@@ -48,6 +48,7 @@ const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
 // reconciliation plus HTTP/serialization overhead before the outer request
 // can turn a durable reservation/dispatch into an ambiguous gateway timeout.
 const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(22);
+const BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT: Duration = Duration::from_secs(53);
 const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
 const BROWSER_ACTUATION_ENDPOINT_PARAM: &str = "__herdr_browser_endpoint_ref";
 // The extension polls for browser actuation on the shared SSE heartbeat. Keep
@@ -79,6 +80,7 @@ const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
 struct BrowserActuationBroker {
     inner: Arc<(Mutex<BrowserActuationState>, Condvar)>,
     timeout: Duration,
+    create_timeout: Duration,
     late_completion_ttl: Duration,
 }
 
@@ -102,6 +104,7 @@ impl Default for BrowserActuationBroker {
         Self {
             inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
             timeout: BROWSER_ACTUATION_TIMEOUT,
+            create_timeout: BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT,
             late_completion_ttl: BROWSER_LATE_COMPLETION_TTL,
         }
     }
@@ -113,6 +116,7 @@ impl BrowserActuationBroker {
         Self {
             inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
             timeout,
+            create_timeout: timeout,
             late_completion_ttl,
         }
     }
@@ -267,7 +271,12 @@ impl BrowserActuator for BrowserActuationBroker {
         }));
         ready.notify_all();
 
-        let deadline = Instant::now() + self.timeout;
+        let timeout = if operation == "herdr_mcp.browser_session.create" {
+            self.create_timeout
+        } else {
+            self.timeout
+        };
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(evidence) = state.completions.remove(&actuation_id) {
                 state.pending.remove(&actuation_id);
@@ -1227,7 +1236,7 @@ fn extension_browser_resource_observe(
     let endpoint_ref = browser_registry_authoritative_endpoint_ref(state, payload)?;
     let provider = browser_registry_string(payload, "provider", 32)?;
     let kind = browser_registry_string(payload, "kind", 16)?;
-    let parent_ref = browser_registry_optional_string(payload, "parent_ref", 96)?;
+    let observed_parent_ref = browser_registry_optional_string(payload, "parent_ref", 96)?;
     let native_identity = browser_registry_string(payload, "native_identity", 1024)?;
     let display_label = browser_registry_optional_string(payload, "display_label", 256)?;
     let canonical_url = browser_registry_optional_string(payload, "canonical_url", 2048)?;
@@ -1235,11 +1244,55 @@ fn extension_browser_resource_observe(
     if canonical_url.is_some_and(|value| !value.starts_with("https://")) {
         return Err("browser_canonical_url_invalid".to_owned());
     }
+    if provider == "chatgpt"
+        && kind == "session"
+        && reservation_ref.is_some()
+        && canonical_url.is_some_and(|value| value.starts_with("https://chatgpt.com/c/WEB:"))
+    {
+        return Err("browser_session_identity_provisional".to_owned());
+    }
     let observation_generation = browser_registry_positive_i64(payload, "observation_generation")?;
     let mut store = state
         .state_store
         .lock()
         .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let reservation = if let Some(reservation_ref) = reservation_ref {
+        if kind != "session" || !reservation_ref.starts_with("bsr_") {
+            return Err("browser_session_reservation_ref_invalid".to_owned());
+        }
+        let reservation = store
+            .browser_session_reservation(reservation_ref)?
+            .ok_or_else(|| "browser_session_reservation_not_found".to_owned())?;
+        if reservation.endpoint_ref != endpoint_ref
+            || reservation.provider != provider
+            || reservation.expected_generation != observation_generation
+        {
+            return Err("browser_session_materialization_scope_mismatch".to_owned());
+        }
+        let expected_parent = reservation
+            .space_ref
+            .as_deref()
+            .unwrap_or(&reservation.account_ref);
+        if !matches!(
+            observed_parent_ref,
+            Some(parent)
+                if parent == expected_parent || parent == reservation.account_ref.as_str()
+        ) {
+            return Err("browser_session_materialization_scope_mismatch".to_owned());
+        }
+        Some(reservation)
+    } else {
+        None
+    };
+    let parent_ref = reservation
+        .as_ref()
+        .map(|reservation| {
+            reservation
+                .space_ref
+                .as_deref()
+                .unwrap_or(&reservation.account_ref)
+        })
+        .or(observed_parent_ref);
     let resource = store.observe_browser_resource(BrowserResourceObservationInput {
         endpoint_ref: &endpoint_ref,
         provider,
@@ -1261,12 +1314,9 @@ fn extension_browser_resource_observe(
             observed_at,
         )?;
     }
-    let materialized_reservation = if let Some(reservation_ref) = reservation_ref {
-        if kind != "session" || !reservation_ref.starts_with("bsr_") {
-            return Err("browser_session_reservation_ref_invalid".to_owned());
-        }
+    let materialized_reservation = if let Some(reservation) = reservation {
         Some(store.materialize_browser_session_reservation(
-            reservation_ref,
+            &reservation.reservation_ref,
             &resource.resource_ref,
             observed_at,
         )?)
@@ -3869,6 +3919,27 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let space = json!({
+            "operation": "resource.observe",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "space",
+            "parent_ref": account_ref,
+            "native_identity": "g-p-http-materialization",
+            "display_label": "HTTP Project",
+            "canonical_url": "https://chatgpt.com/g/g-p-http-materialization",
+            "observation_generation": 1,
+            "observed_at": 1003
+        });
+        let response = app.clone().oneshot(request(space)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let space_result: Value = serde_json::from_slice(&body).unwrap();
+        let space_ref = space_result["resource"]["resource_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let reservation_ref = {
             let mut guard = store.lock().unwrap();
             match guard
@@ -3876,7 +3947,7 @@ mod tests {
                     endpoint_ref: &endpoint_ref,
                     provider: "chatgpt",
                     account_ref: &account_ref,
-                    space_ref: None,
+                    space_ref: Some(&space_ref),
                     display_label: "HTTP materialization",
                     expected_generation: 1,
                     idempotency_key_digest: &"a".repeat(64),
@@ -3892,6 +3963,35 @@ mod tests {
                 crate::state_store::BrowserSessionReservation::Existing(_) => unreachable!(),
             }
         };
+
+        let provisional_session = json!({
+            "operation": "resource.observe",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "session",
+            "parent_ref": account_ref,
+            "native_identity": "WEB:provisional-http-locator",
+            "display_label": null,
+            "canonical_url": "https://chatgpt.com/c/WEB:provisional-http-locator",
+            "reservation_ref": reservation_ref,
+            "observation_generation": 1,
+            "observed_at": 1004
+        });
+        let response = app
+            .clone()
+            .oneshot(request(provisional_session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let reservation = store
+            .lock()
+            .unwrap()
+            .browser_session_reservation(&reservation_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reservation.state, "pending");
+        assert!(reservation.session_ref.is_none());
 
         let session = json!({
             "operation": "resource.observe",
@@ -3912,6 +4012,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let session_result: Value = serde_json::from_slice(&body).unwrap();
         let session_ref = session_result["resource"]["resource_ref"].as_str().unwrap();
+        assert_eq!(session_result["resource"]["parent_ref"], space_ref);
         assert_eq!(session_result["reservation"]["state"], "materialized");
         assert_eq!(session_result["reservation"]["session_ref"], session_ref);
         let locator = store
@@ -4510,6 +4611,8 @@ mod tests {
         assert!(BROWSER_ACTUATION_TIMEOUT > SSE_HEARTBEAT);
         assert!(BROWSER_ACTUATION_TIMEOUT <= Duration::from_secs(22));
         assert!(BROWSER_ACTUATION_TIMEOUT < Duration::from_secs(30));
+        assert!(BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT > BROWSER_ACTUATION_TIMEOUT);
+        assert!(BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT < Duration::from_secs(60));
     }
 
     #[tokio::test]
