@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.128";
+const H2W_SCRIPT_VERSION = "0.1.129";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -6317,6 +6317,8 @@ async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
     return rememberIdleNudge(convKey, { ok: true, continued: false, nudged: false, reason: "llm_ambiguous", raw: verdict.raw });
   }
 
+  const bindings = await loadBindings();
+  const binding = primaryBindingForConv(bindings, convKey);
   const result = await deliverWakeToTab({ tabId, convKey, site: "chatgpt" }, {
     type: "h2w_wake",
     data: {
@@ -6324,6 +6326,7 @@ async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
       llmNudge: true,
       manual: true,
       autoAllow: false,
+      requiredApps: bindingRequiredApps(binding),
     },
   });
   if (!result?.ok) {

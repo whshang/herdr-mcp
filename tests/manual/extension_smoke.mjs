@@ -1149,6 +1149,15 @@ ok(manualStatusBlock.includes("fetchStateFresh()")
     && !manualStatusBlock.includes('type: "h2w_wake"')
     && wakeSource.includes('action === "status" && result?.ok && result?.checked === true'),
   "Check Herdr is read-only and cannot be blocked by composer Stop controls");
+const manualLlmStart = backgroundSource.indexOf("async function manualLlmJudgeContinue(");
+const manualLlmEnd = manualLlmStart >= 0 ? backgroundSource.indexOf("// ---- Conversation handoff", manualLlmStart) : -1;
+const manualLlmBlock = manualLlmStart >= 0 && manualLlmEnd > manualLlmStart
+  ? backgroundSource.slice(manualLlmStart, manualLlmEnd)
+  : "";
+ok(manualLlmBlock.includes("loadBindings()")
+    && manualLlmBlock.includes("primaryBindingForConv(bindings, convKey)")
+    && manualLlmBlock.includes("requiredApps: bindingRequiredApps(binding)"),
+  "manual semantic continuation preserves the authoritative bound ChatGPT App identity");
 ok(localAuthSource.includes("void opened.catch(() => {});")
     && localAuthSource.includes("void done.catch(() => {});"),
   "native stream failures are observed immediately without hiding later await errors");
