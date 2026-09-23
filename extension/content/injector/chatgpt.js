@@ -59,17 +59,21 @@ class ChatGPTAdapter extends BaseAdapter {
     return [...selected];
   }
 
-  composerHasOnlyAppPills(requiredApps = []) {
+  getComposerTextWithoutAppPills() {
     const input = this.getInputEl();
-    if (!input) return false;
-    const requested = [...new Set(requiredApps.map((app) => String(app || '').trim().toLowerCase()).filter(Boolean))];
-    const selected = this.getSelectedComposerApps();
-    if (!requested.length || requested.some((app) => !selected.includes(app))) return false;
+    if (!input) return '';
     const clone = input.cloneNode(true);
     for (const node of clone.querySelectorAll('[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]')) {
       node.remove();
     }
-    return String(clone.textContent || '').replace(/\uFEFF/g, '').trim() === '';
+    return String(clone.textContent || '').replace(/\uFEFF/g, '').trim();
+  }
+
+  composerHasOnlyAppPills(requiredApps = []) {
+    const requested = [...new Set(requiredApps.map((app) => String(app || '').trim().toLowerCase()).filter(Boolean))];
+    const selected = this.getSelectedComposerApps();
+    if (!requested.length || requested.some((app) => !selected.includes(app))) return false;
+    return this.getComposerTextWithoutAppPills() === '';
   }
 
   openComposerAppsMenu() {

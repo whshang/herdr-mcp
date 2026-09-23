@@ -108,10 +108,9 @@ ok(wakeSource.includes('tasks: hud?.task_summary || null')
   "HUD renders durable task running/completed/blocked/uncertain counters from the Runtime inbox");
 ok(wakeSource.includes(`const H2W_CONTENT_VERSION = "${manifestVersion}"`), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
-// Conversation attachment contract: Herdr-generated wake turns explicitly
-// require the Herdr app, while the shared composer pipeline only touches app
-// selection when the caller asked for requiredApps. Ordinary user/queued text
-// must not be rewritten merely because the extension is present.
+// Conversation attachment contract: extension-generated ChatGPT turns preserve
+// a provider-owned App identity only from explicit input, the learned binding,
+// or the pills already selected by the user. Unknown identity is never guessed.
 const routeWakeStart = backgroundSource.indexOf("async function routeWakeAttempt(");
 const routeWakeEnd = backgroundSource.indexOf("async function deliverWakeToTab(", routeWakeStart);
 const routeWakeSegment = backgroundSource.slice(routeWakeStart, routeWakeEnd);
@@ -132,14 +131,18 @@ ok(routeWakeStart >= 0
     && !backgroundSource.includes('requiredApps: ["herdr"]')
     && !wakeSource.includes('requiredApps: ["herdr"]'),
   "Herdr auto wakes preserve the observed ChatGPT app identity without forcing a hardcoded app name on unrelated composer sends");
-ok(wakeSource.includes("registeredConversationBound && registeredHerdrAppKeyword")
+ok(wakeSource.includes("const queuedSelectedApps =")
+    && wakeSource.includes("composerHasOnlyAppPills(queuedSelectedApps)")
     && wakeSource.includes("queueInsert: true")
-    && wakeSource.includes("requiredApps: registeredConversationBound && registeredHerdrAppKeyword"),
-  "queued next-turn delivery preserves a learned Herdr app identity without guessing one");
+    && wakeSource.includes("requiredApps: queuedSelectedApps.length > 0 ? queuedSelectedApps : currentHerdrRequiredApps()")
+    && wakeSource.includes("getComposerTextWithoutAppPills"),
+  "queued next-turn delivery preserves exact provider-owned App pills and excludes them from queued draft text");
 ok(wakeSource.includes("if (!registeredHerdrAppKeyword) return []")
-    && wakeSource.includes('const defaultChatGptApps = creatingSession ? ["herdr"] : observedHerdrApps')
-    && !wakeSource.includes('registeredHerdrAppKeyword || "herdr"'),
-  "existing ChatGPT sends never guess an app identity while fresh session.create keeps the compatibility default");
+    && !wakeSource.includes("defaultChatGptApps")
+    && !wakeSource.includes('registeredHerdrAppKeyword || "herdr"')
+    && !wakeSource.includes('return alias || "herdr"')
+    && backgroundSource.includes("createParams = { ...params, required_apps: inheritedRequiredApps }"),
+  "ChatGPT sends never guess an App identity; fresh session.create inherits only observed source evidence");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')

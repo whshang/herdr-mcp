@@ -2292,15 +2292,16 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
   assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
   assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);
-  assert.match(wakeSource, /const defaultChatGptApps = creatingSession \? \["herdr"\] : observedHerdrApps/);
-  assert.match(wakeSource, /requestedApps\.length \? requestedApps : defaultChatGptApps/);
+  assert.match(wakeSource, /\.\.\.observedHerdrApps, \.\.\.requestedApps/);
+  assert.doesNotMatch(wakeSource, /defaultChatGptApps/);
   assert.match(wakeSource, /composerHasOnlyAppPills\(requiredApps\)/);
 });
 
-test("user never gets a guessed app on an existing ChatGPT conversation | Given no learned Herdr app identity | When recovery or handoff prepares another turn | Then existing-session sends have no synthetic app requirement while fresh session.create keeps the default compatibility name", () => {
+test("user never gets a guessed ChatGPT app | Given no learned Herdr app identity | When recovery handoff or fresh session creation prepares another turn | Then only observed or inherited provider-owned identities are used", () => {
   assert.match(wakeSource, /function currentHerdrRequiredApps\(\)[\s\S]*if \(!registeredHerdrAppKeyword\) return \[\]/);
-  assert.match(wakeSource, /const defaultChatGptApps = creatingSession \? \["herdr"\] : observedHerdrApps/);
+  assert.doesNotMatch(wakeSource, /defaultChatGptApps/);
   assert.doesNotMatch(wakeSource, /registeredHerdrAppKeyword \|\| "herdr"/);
+  assert.doesNotMatch(wakeSource, /return alias \|\| "herdr"/);
   assert.match(backgroundSource, /function learnedBindingRequiredApps\(bindings\)/);
   assert.match(backgroundSource, /async function handoffMessageWithRequiredApps/);
   assert.match(backgroundSource, /createParams = \{ \.\.\.params, required_apps: inheritedRequiredApps \}/);
@@ -2352,14 +2353,15 @@ test("user keeps Herdr attached on queued next-turn delivery | Given a bound Cha
   const queueEnd = wakeSource.indexOf('if (msg?.type === "h2w_wake")', queueStart);
   assert.ok(queueStart >= 0 && queueEnd > queueStart);
   const queue = wakeSource.slice(queueStart, queueEnd);
-  assert.match(queue, /registeredConversationBound && registeredHerdrAppKeyword/);
-  assert.match(queue, /requiredApps:\s*registeredConversationBound && registeredHerdrAppKeyword/);
-  assert.match(queue, /currentHerdrRequiredApps\(\)/);
+  assert.match(queue, /const queuedSelectedApps =/);
+  assert.match(queue, /composerHasOnlyAppPills\(queuedSelectedApps\)/);
+  assert.match(queue, /requiredApps:\s*queuedSelectedApps\.length > 0 \? queuedSelectedApps : currentHerdrRequiredApps\(\)/);
   assert.match(backgroundSource, /function bindingRequiredApps\(binding\)[\s\S]*return keyword \? \[keyword\] : \[\]/);
   const enqueueStart = wakeSource.indexOf("async function queueCurrentComposerMessage()");
   const enqueueEnd = wakeSource.indexOf("\n  function ensureQueuedInsertButton", enqueueStart);
   assert.ok(enqueueStart >= 0 && enqueueEnd > enqueueStart);
   const enqueue = wakeSource.slice(enqueueStart, enqueueEnd);
+  assert.match(enqueue, /getComposerTextWithoutAppPills/);
   assert.match(enqueue, /selectedAppsBeforeQueue/);
   assert.match(enqueue, /ensureRequiredComposerApps\(selectedAppsBeforeQueue\)/);
   assert.ok(enqueue.indexOf("await clearComposer()") < enqueue.indexOf("ensureRequiredComposerApps(selectedAppsBeforeQueue)"),
