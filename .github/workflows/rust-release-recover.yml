@@ -222,12 +222,12 @@ jobs:
               raise SystemExit("release manifest targets do not match tagged target contract")
           if manifest_mode == "runtime":
               expected = {"runtime-manifest.json"}
-              if legacy_manifest.is_file():
-                  if legacy_manifest.read_bytes() != manifest_path.read_bytes():
-                      raise SystemExit("legacy manifest alias differs from runtime manifest")
+              if "-" in tag:
+                  if not legacy_manifest.is_file() or legacy_manifest.read_bytes() != manifest_path.read_bytes():
+                      raise SystemExit("prerelease legacy manifest alias is missing or differs from runtime manifest")
                   expected.add("release-manifest.json")
-              elif tag != "v1.0.0":
-                  raise SystemExit("runtime release legacy manifest alias is missing")
+              elif legacy_manifest.exists():
+                  raise SystemExit("stable 1.0+ release must not publish release-manifest.json")
           else:
               expected = {"release-manifest.json"}
           for asset in assets:

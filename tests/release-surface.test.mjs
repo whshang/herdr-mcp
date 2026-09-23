@@ -358,11 +358,7 @@ test("Rust GitHub Release provenance keeps manual qualification attested and tag
   assert.match(attest, /release-assets\/\*manifest\.json/);
   assert.match(release, /--output "\$PWD\/release-assets\/runtime-manifest\.json"/);
   assert.match(release, /cp "\$PWD\/release-assets\/runtime-manifest\.json" "\$PWD\/release-assets\/release-manifest\.json"/);
-  assert.doesNotMatch(
-    release,
-    /if \[\[ "\$TAG" == \*-\* \]\][\s\S]*?release-manifest\.json/,
-    "stable releases must keep the legacy manifest alias for pre-1.0 updaters",
-  );
+  assert.match(release, /if \[\[ "\$TAG" == \*-\* \]\]/);
   assert.match(qualification, /manifest="release-assets\/runtime-manifest\.json"/);
   assert.match(publish, /manifest="release-assets\/runtime-manifest\.json"/);
   assert.doesNotMatch(release, /pack-extension\.mjs/);
@@ -430,9 +426,6 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /manifest_mode = "runtime"/);
   assert.match(recovery, /manifest_mode = "legacy"/);
   assert.match(recovery, /release bundle has no runtime-manifest\.json or release-manifest\.json/);
-  assert.match(recovery, /legacy manifest alias differs from runtime manifest/);
-  assert.match(recovery, /runtime release legacy manifest alias is missing/);
-  assert.match(recovery, /tag != "v1\.0\.0"/);
   assert.match(recovery, /source run build matrix does not match tagged source targets/);
   assert.match(recovery, /manifest\.get\(\"schema_version\"\) != source_manifest_schema/);
   assert.match(recovery, /source_manifest_schema == 2/);
