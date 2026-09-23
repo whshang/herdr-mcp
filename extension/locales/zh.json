@@ -142,6 +142,7 @@
   "hud_queue_storage_unavailable": "排队存储暂不可用；消息没有加入队列，请稍后重试。",
   "hud_queue_added_draft_changed": "消息已排队（共 {count} 条）；检测到输入框内容已变化，因此没有自动清空。",
   "hud_queue_added_clear_failed": "消息已排队（共 {count} 条），但输入框未能安全清空；本次不会自动发送。",
+  "hud_queue_app_restore_failed": "消息已排队（共 {count} 条），但未能恢复已选择的 ChatGPT App；本次不会自动发送。",
   "hud_queue_clear_confirm": "清空当前会话的 {count} 条排队消息？",
   "hud_queue_cleared": "排队消息已清空。",
   "hud_automation_on_hint": "当前 ChatGPT Project 已开启自动模式。同一 Project 的其它会话和接力目标共享这个设置：Herdr 进度、settled 续接、回复恢复和自动接力可以自动运行。Herdr 工具权限卡独立于 Auto；即使关闭 Auto，也会按 fail-closed 规则自动放行明确匹配的权限卡。配置了 LLM Provider 时使用 LLM 做回合后判断；未配置时使用有界的“继续”兜底，只有助手明确说明仍有未完成工作才会继续串联。自动模式下“继续 / 查 Herdr / LLM 判断”等人工推进动作会锁定；满足安全条件时“接力”仍可使用。",

@@ -142,6 +142,7 @@
   "hud_queue_storage_unavailable": "Queue storage is temporarily unavailable. The message was not queued; try again later.",
   "hud_queue_added_draft_changed": "Message queued ({count} total); the composer changed, so the new draft was left untouched.",
   "hud_queue_added_clear_failed": "Message queued ({count} total), but the composer could not be cleared safely; it will not auto-send yet.",
+  "hud_queue_app_restore_failed": "Message queued ({count} total), but the selected ChatGPT App could not be restored; it will not auto-send yet.",
   "hud_queue_clear_confirm": "Clear {count} queued message(s) for this conversation?",
   "hud_queue_cleared": "Queued messages cleared.",
   "hud_automation_on_hint": "Auto is on for the current ChatGPT Project. Other conversations in the same Project and handoff targets share this setting: Herdr progress, settled continuation, reply recovery, and automatic handoff can run automatically. Herdr tool permission cards are handled independently of Auto and remain auto-accepted when Auto is off. When an LLM provider is configured, post-turn decisions use it; without one, Auto uses a bounded Continue fallback and stops chaining unless the assistant explicitly says work remains. Manual Continue / Check Herdr / LLM decide actions are locked while Auto is on; Handoff remains available when safe.",

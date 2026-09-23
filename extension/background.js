@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.125";
+const H2W_SCRIPT_VERSION = "0.1.126";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -382,7 +382,7 @@ function hudLabels() {
     "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
-    "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
+    "queue_added_draft_changed", "queue_added_clear_failed", "queue_app_restore_failed", "queue_clear_confirm", "queue_cleared",
     "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint",
     "aria_toggle_automation", "automation_enabled", "automation_disabled", "automation_update_failed",
     "judge_no_continue", "judge_turn_in_progress", "herdr_status_checked", "continue_sent", "continue_failed",
@@ -1344,6 +1344,15 @@ function observedAppKeywords(value) {
 function bindingRequiredApps(binding) {
   const keyword = normalizeAppKeyword(binding?.herdr_app_keyword);
   return keyword ? [keyword] : [];
+}
+
+function learnedBindingRequiredApps(bindings) {
+  const keywords = [...new Set(
+    (bindings || [])
+      .map((binding) => normalizeAppKeyword(binding?.herdr_app_keyword))
+      .filter(Boolean),
+  )];
+  return keywords.length === 1 ? keywords : [];
 }
 
 function primaryBindingForConv(bindings, convKey) {
@@ -2932,12 +2941,29 @@ async function sendBrowserActuationTabMessage(tabId, message) {
   return sendTabMessageWithTimeout(tabId, message, 18000);
 }
 
+async function handoffMessageWithRequiredApps(site, message) {
+  if (site !== "chatgpt"
+      || Array.isArray(message?.requiredApps)
+      || !["h2w_handoff_prompt", "h2w_handoff_seed"].includes(String(message?.type || ""))) {
+    return message;
+  }
+  const transferId = String(message?.transferId || "").trim();
+  if (!transferId) return message;
+  const transfers = await loadHandoffTransfers();
+  const transfer = transfers?.[transferId] || null;
+  if (!transfer) return message;
+  const bindings = await loadBindings();
+  const requiredApps = learnedBindingRequiredApps(bindingsForTransferSource(bindings, transfer));
+  return requiredApps.length === 1 ? { ...message, requiredApps } : message;
+}
+
 async function sendHandoffTabMessage(tabId, site, message) {
-  if (site === "chatgpt") return sendChatGptTabMessage(tabId, message);
+  const outbound = await handoffMessageWithRequiredApps(site, message);
+  if (site === "chatgpt") return sendChatGptTabMessage(tabId, outbound);
   let lastError = null;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      return await chrome.tabs.sendMessage(tabId, message);
+      return await chrome.tabs.sendMessage(tabId, outbound);
     } catch (error) {
       lastError = error;
       if (!missingReceiverError(error)) throw error;
@@ -3428,6 +3454,7 @@ async function resolveBrowserCreateAnchorWindow({
   expectedGeneration,
   sourceSessionRef = null,
 } = {}) {
+  let sourceConvKey = null;
   if (sourceSessionRef) {
     let target = browserSessionTargets.get(sourceSessionRef) || null;
     let sourceTab = null;
@@ -3474,7 +3501,13 @@ async function resolveBrowserCreateAnchorWindow({
       return { windowId: null, unavailable: true, reason: "source_session_scope_mismatch" };
     }
     if (target && Number.isInteger(sourceTab?.windowId)) {
-      return { windowId: sourceTab.windowId, unavailable: false, reason: "source_session" };
+      sourceConvKey = String(target.convKey || "").trim() || null;
+      return {
+        windowId: sourceTab.windowId,
+        unavailable: false,
+        reason: "source_session",
+        ...(sourceConvKey ? { sourceConvKey } : {}),
+      };
     }
   }
 
@@ -3505,6 +3538,7 @@ async function resolveBrowserCreateAnchorWindow({
       reason: sourceSessionRef
         ? "source_scope_window"
         : (matchingWindowIds.size === 1 ? "unique_scope_window" : "exact_scope_window"),
+      ...(sourceConvKey ? { sourceConvKey } : {}),
     };
   }
   if (sourceSessionRef) {
@@ -3514,6 +3548,7 @@ async function resolveBrowserCreateAnchorWindow({
     windowId: null,
     unavailable: false,
     reason: "no_scope_window",
+    ...(sourceConvKey ? { sourceConvKey } : {}),
   };
 }
 
@@ -3613,6 +3648,16 @@ async function handleBrowserActuation(command) {
         },
       );
       return;
+    }
+    let createParams = params;
+    if (!Array.isArray(params.required_apps) && anchor.sourceConvKey) {
+      const bindings = await loadBindings();
+      const inheritedRequiredApps = learnedBindingRequiredApps(
+        bindingsForConv(bindings, anchor.sourceConvKey),
+      );
+      if (inheritedRequiredApps.length === 1) {
+        createParams = { ...params, required_apps: inheritedRequiredApps };
+      }
     }
     const anchorWindowId = anchor.windowId;
     let createdTab = null;
@@ -3747,7 +3792,7 @@ async function handleBrowserActuation(command) {
           dispatch_id: dispatchId,
           operation,
           expected_generation: expectedGeneration,
-          params,
+          params: createParams,
         },
       }).then(async (response) => {
         const evidence = response?.evidence && typeof response.evidence === "object"
@@ -6486,6 +6531,8 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       targetRow.workingPanes = { ...(sourceBinding.workingPanes || {}) };
       targetRow.status = sourceBinding.status || "unknown";
       targetRow.lastSettle = sourceBinding.lastSettle || null;
+      const inheritedAppKeyword = normalizeAppKeyword(sourceBinding.herdr_app_keyword);
+      if (inheritedAppKeyword) targetRow.herdr_app_keyword = inheritedAppKeyword;
       targetRow.created_at = sourceBinding.created_at || targetRow.created_at || now;
       targetRow.continuity_id = transfer.continuity_id;
       targetRow.active_conv_key = targetInfo.convKey;

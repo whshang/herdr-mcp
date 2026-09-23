@@ -2301,6 +2301,10 @@ test("user never gets a guessed app on an existing ChatGPT conversation | Given 
   assert.match(wakeSource, /function currentHerdrRequiredApps\(\)[\s\S]*if \(!registeredHerdrAppKeyword\) return \[\]/);
   assert.match(wakeSource, /const defaultChatGptApps = creatingSession \? \["herdr"\] : observedHerdrApps/);
   assert.doesNotMatch(wakeSource, /registeredHerdrAppKeyword \|\| "herdr"/);
+  assert.match(backgroundSource, /function learnedBindingRequiredApps\(bindings\)/);
+  assert.match(backgroundSource, /async function handoffMessageWithRequiredApps/);
+  assert.match(backgroundSource, /createParams = \{ \.\.\.params, required_apps: inheritedRequiredApps \}/);
+  assert.match(backgroundSource, /targetRow\.herdr_app_keyword = inheritedAppKeyword/);
 });
 
 test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conversation | When Auto wakes continue the thread | Then only Herdr-generated turns reassert the app requirement", () => {
@@ -2330,7 +2334,17 @@ test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conv
   assert.match(wake, /if \(requiredApps\.length > 0\)/);
   assert.match(wake, /ensureRequiredComposerApps\(requiredApps\)/);
   assert.doesNotMatch(wake, /ensureHerdrComposerReference/);
-  assert.doesNotMatch(wake, /if \(requiredApps\.length > 0\)[\s\S]*await clearComposer\(\)/);
+  const resumeStart = wake.indexOf("if (resumeOnly) {");
+  const resumeEnd = wake.indexOf("if (clearBeforeInsert) await clearComposer();", resumeStart);
+  assert.ok(resumeStart >= 0 && resumeEnd > resumeStart);
+  const resume = wake.slice(resumeStart, resumeEnd);
+  assert.match(resume, /ensureRequiredComposerApps\(requiredApps\)/);
+  assert.ok(resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("await submit()"),
+    "resume-only submission must restore the required App before submit");
+  const clearBeforeInsert = wake.indexOf("if (clearBeforeInsert) await clearComposer()");
+  const mainAppSelection = wake.indexOf("let appSelection = { ok: true, apps: [] }");
+  assert.ok(clearBeforeInsert >= 0 && mainAppSelection > clearBeforeInsert,
+    "normal wake replacement clears stale text before selecting the required App");
 });
 
 test("user keeps Herdr attached on queued next-turn delivery | Given a bound ChatGPT conversation with an observed Herdr app keyword | When Queue delivers the next user turn | Then the delivery reuses only the observed app identity and never guesses an unknown keyword", () => {
@@ -2342,6 +2356,14 @@ test("user keeps Herdr attached on queued next-turn delivery | Given a bound Cha
   assert.match(queue, /requiredApps:\s*registeredConversationBound && registeredHerdrAppKeyword/);
   assert.match(queue, /currentHerdrRequiredApps\(\)/);
   assert.match(backgroundSource, /function bindingRequiredApps\(binding\)[\s\S]*return keyword \? \[keyword\] : \[\]/);
+  const enqueueStart = wakeSource.indexOf("async function queueCurrentComposerMessage()");
+  const enqueueEnd = wakeSource.indexOf("\n  function ensureQueuedInsertButton", enqueueStart);
+  assert.ok(enqueueStart >= 0 && enqueueEnd > enqueueStart);
+  const enqueue = wakeSource.slice(enqueueStart, enqueueEnd);
+  assert.match(enqueue, /selectedAppsBeforeQueue/);
+  assert.match(enqueue, /ensureRequiredComposerApps\(selectedAppsBeforeQueue\)/);
+  assert.ok(enqueue.indexOf("await clearComposer()") < enqueue.indexOf("ensureRequiredComposerApps(selectedAppsBeforeQueue)"),
+    "queue must restore provider-owned App pills after clearing queued text");
 });
 
 // Regression: session.create must not passively deadlock on a Browser Registry

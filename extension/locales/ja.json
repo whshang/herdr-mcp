@@ -142,6 +142,7 @@
   "hud_queue_storage_unavailable": "キューストレージが一時的に利用できません。メッセージは追加されていません。後でもう一度お試しください。",
   "hud_queue_added_draft_changed": "メッセージをキューに追加しました（計 {count} 件）。入力内容が変わったため、新しい下書きはそのまま残しました。",
   "hud_queue_added_clear_failed": "メッセージをキューに追加しました（計 {count} 件）が、入力欄を安全に消去できなかったため自動送信しません。",
+  "hud_queue_app_restore_failed": "メッセージをキューに追加しました（計 {count} 件）が、選択済みの ChatGPT App を復元できなかったため自動送信しません。",
   "hud_queue_clear_confirm": "この会話のキュー済みメッセージ {count} 件を消去しますか？",
   "hud_queue_cleared": "キュー済みメッセージを消去しました。",
   "hud_automation_on_hint": "現在の ChatGPT Project は Auto オンです。同じ Project の会話と引き継ぎ先で設定を共有し、Herdr の進捗、settled 継続、返信回復、自動引き継ぎを自動実行できます。Herdr のツール権限カードは Auto とは独立しており、Auto オフでも fail-closed 判定に一致する明示的なカードは自動で許可されます。LLM Provider が設定済みなら回合後判定に使用し、未設定なら有界の Continue フォールバックを使います。アシスタントが未完了作業を明示した場合だけ継続して連鎖します。Auto 中は手動進行操作をロックし、安全な場合は引き継ぎを使用できます。",
