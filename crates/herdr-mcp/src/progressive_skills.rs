@@ -781,6 +781,53 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 "empty": false
             }
         }),
+        json!({
+            "method": crate::codex_history::LIST_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+                },
+                "required": ["project_root"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": crate::codex_history::READ_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "session_id": {"type": "string", "maxLength": 128, "description": "Optional. Omit to select the preferred session for the exact project_root."},
+                    "max_messages": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "max_chars": {"type": "integer", "minimum": 1, "maximum": 20000}
+                },
+                "required": ["project_root"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": crate::codex_history::RESUME_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string", "maxLength": 4096},
+                    "session_id": {"type": "string", "maxLength": 128, "description": "Optional. Omit to select the preferred session for the exact project_root."},
+                    "pane_id": {"type": "string", "maxLength": 256},
+                    "name": {"type": "string", "maxLength": 64},
+                    "timeout_ms": {"type": "integer", "minimum": 5000, "maximum": 55000}
+                },
+                "required": ["project_root", "pane_id", "name"],
+                "empty": false
+            }
+        }),
     ];
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -4509,6 +4556,20 @@ mod tests {
         assert_eq!(
             methods[0]["params"]["properties"]["wait_ms"]["maximum"],
             20_000
+        );
+
+        let methods = local_method_schemas("codex_session");
+        assert_eq!(methods.len(), 3);
+        assert_eq!(methods[0]["method"], crate::codex_history::LIST_METHOD);
+        assert_eq!(methods[1]["params"]["required"], json!(["project_root"]));
+        assert_eq!(
+            methods[2]["params"]["required"],
+            json!(["project_root", "pane_id", "name"])
+        );
+        assert!(
+            methods[1]["params"]["properties"]["session_id"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Optional"))
         );
 
         let methods = local_method_schemas("exec.wait");

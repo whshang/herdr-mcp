@@ -59,6 +59,12 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal
       - name: Configure Rust compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Verify Codex local history paths
+        shell: pwsh
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP "codex-history-path-probe.exe"
+          rustup run 1.97.1 rustc crates/herdr-mcp/examples/codex-history-path-probe.rs -o $probe
+          & $probe
       - name: Build Windows UAT candidate
         shell: pwsh
         run: cargo +1.97.1 build --locked --release -p herdr-mcp --target x86_64-pc-windows-msvc

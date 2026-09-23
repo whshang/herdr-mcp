@@ -1,3 +1,4 @@
+use crate::codex_history;
 use crate::contract;
 use crate::exec_sessions::ExecRegistry;
 use crate::exec_tools;
@@ -383,6 +384,26 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             } else if method == EXEC_WAIT_METHOD {
                 exec_tools::wait(context.exec, &params)
+            } else if matches!(
+                method,
+                codex_history::LIST_METHOD
+                    | codex_history::READ_METHOD
+                    | codex_history::RESUME_METHOD
+            ) {
+                codex_history::call(
+                    context.client,
+                    method,
+                    &params,
+                    &context.cache.snapshot(),
+                )
+                .unwrap_or_else(|| {
+                    json!({
+                        "ok": false,
+                        "code": "unknown_local_method",
+                        "method": method,
+                        "message": "unknown herdr-mcp local method; request was not forwarded to the Herdr socket",
+                    })
+                })
             } else if method == prompt::AGENT_TASK_DISPATCH_METHOD {
                 let parent_session_ref = prompt_parent_session_ref(context);
                 prompt::run_with_parent_session(
