@@ -123,14 +123,16 @@ test("Agent install stays concise while preserving the executable bootstrap cont
 
 test("quick Agent protocols plan once, batch safe work, and keep optional details out of the hot path", () => {
   const docs = [
-    ["docs/i18n/en/agent-install.md", { plan: /Plan before calling tools/, bounded: /one bounded execution call/, replan: /Re-plan only/, sourceDev: /source development/, network: /Do not change the user's network environment/, customDomain: /custom domain/i }],
-    ["docs/i18n/zh-CN/agent-install.md", { plan: /先规划，再调用/, bounded: /一个有界执行调用/, replan: /只有当结果会改变/, sourceDev: /源码开发/, network: /不修改用户网络环境/, customDomain: /自定义域名|Custom Domain/i }],
-    ["docs/i18n/ja/agent-install.md", { plan: /ツールを呼ぶ前に計画する/, bounded: /一つの有界な実行呼び出し/, replan: /再計画は、結果が/, sourceDev: /ソース開発|ソース checkout/, network: /ユーザーのネットワーク環境を変更しない/, customDomain: /カスタムドメイン|Custom Domain/ }],
+    ["docs/i18n/en/agent-install.md", { plan: /Plan before calling tools/, bounded: /one bounded execution call/, replan: /Re-plan only/, sourceDev: /source development/, network: /Do not change the user's network environment/, customDomain: /custom domain/i, herdrRecovery: /owns Herdr dependency recovery/ }],
+    ["docs/i18n/zh-CN/agent-install.md", { plan: /先规划，再调用/, bounded: /一个有界执行调用/, replan: /只有当结果会改变/, sourceDev: /源码开发/, network: /不修改用户网络环境/, customDomain: /自定义域名|Custom Domain/i, herdrRecovery: /负责 Herdr 依赖恢复/ }],
+    ["docs/i18n/ja/agent-install.md", { plan: /ツールを呼ぶ前に計画する/, bounded: /一つの有界な実行呼び出し/, replan: /再計画は、結果が/, sourceDev: /ソース開発|ソース checkout/, network: /ユーザーのネットワーク環境を変更しない/, customDomain: /カスタムドメイン|Custom Domain/, herdrRecovery: /Herdr 依存関係の復旧を担当/ }],
   ];
   for (const [rel, markers] of docs) {
     const doc = read(rel);
-    assert.match(doc, /herdr\.dev\/install\.(?:sh|ps1)/);
+    assert.doesNotMatch(doc, /herdr\.dev\/install\.(?:sh|ps1)/);
     assert.match(doc, /GitHub Releases?/);
+    assert.match(doc, /herdr-mcp install/);
+    assert.match(doc, markers.herdrRecovery);
     assert.match(doc, markers.plan);
     assert.match(doc, markers.bounded);
     assert.match(doc, markers.replan);
