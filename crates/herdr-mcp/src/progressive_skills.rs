@@ -3709,9 +3709,13 @@ mod tests {
     }
 
     fn write_semantic_test_config(config_dir: &std::path::Path, url: &str) {
-        // Keep route names short: temp dir names can exceed the 64-char semantic route limit.
+        // Keep names short (≤64) and unique so route cooldowns from other tests do not collide.
         let path = config_dir.join("config.json");
-        let route_name = "semantic-test";
+        static ROUTE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let route_name = format!(
+            "sem-{}",
+            ROUTE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         std::fs::write(
             &path,
             format!(
