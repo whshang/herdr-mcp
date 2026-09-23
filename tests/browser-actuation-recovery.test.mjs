@@ -1172,44 +1172,84 @@ test("user can stop a live answer | Given an explicit visible stop control while
   assert.equal(result.generation_stopped, true);
 });
 
-test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then the mutation is attempted once and remains uncertain", async () => {
+test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one MAIN-world requestSubmit is attempted and uncertain delivery never falls through to a second click", async () => {
   const start = wakeSource.indexOf("  async function submitBrowserActuationOnce()");
   const end = wakeSource.indexOf("  // ---- Submission ----", start);
   assert.ok(start >= 0 && end > start, "bounded Browser Actuation submit helper must remain extractable");
   const helperSource = wakeSource.slice(start, end);
 
-  async function run({ busy = false, ack = false } = {}) {
-    const ctx = { busy, ack, clicks: 0 };
+  async function run({
+    busy = false,
+    ack = false,
+    hasSelector = true,
+    mainResult = { ok: true, submitted: true },
+  } = {}) {
+    const ctx = { busy, ack, hasSelector, mainResult, clicks: 0, mainSubmits: 0 };
     ctx.button = {
       disabled: false,
       click() { ctx.clicks += 1; },
     };
     const submitOnce = new Function("ctx", `
       const isComposerGenerating = () => ctx.busy;
-      const ADAPTER = { getInputEl: () => ({ innerText: "next turn" }) };
+      const ADAPTER = {
+        name: "chatgpt",
+        needsMainWorldInsert: true,
+        inputHasContent: () => true,
+        getInputEl: () => ({ innerText: "next turn" }),
+        getWatchMainWorldSelector: () => ctx.hasSelector ? "#prompt-textarea" : null,
+      };
       const wait = async () => {};
       const findSendButton = () => ctx.button;
       const isSendButton = (button) => Boolean(button) && button.disabled !== true;
       const captureSubmitAckBaseline = () => ({});
       const waitForSubmitAck = async () => ctx.ack;
+      const submitMainWorld = async () => {
+        ctx.mainSubmits += 1;
+        return ctx.mainResult;
+      };
       ${helperSource}
       return submitBrowserActuationOnce;
     `)(ctx);
-    return { result: await submitOnce(), clicks: ctx.clicks };
+    return {
+      result: await submitOnce(),
+      clicks: ctx.clicks,
+      mainSubmits: ctx.mainSubmits,
+    };
   }
 
   const delayed = await run({ ack: false });
-  assert.equal(delayed.clicks, 1);
+  assert.equal(delayed.mainSubmits, 1);
+  assert.equal(delayed.clicks, 0);
   assert.equal(delayed.result.ok, false);
   assert.equal(delayed.result.attempted, true);
   assert.equal(delayed.result.uncertain, true);
 
   const accepted = await run({ ack: true });
-  assert.equal(accepted.clicks, 1);
+  assert.equal(accepted.mainSubmits, 1);
+  assert.equal(accepted.clicks, 0);
   assert.equal(accepted.result.ok, true);
   assert.equal(accepted.result.attempted, true);
 
+  const explicitPreSubmitFailure = await run({
+    ack: true,
+    mainResult: { ok: false, error: "no-submit-form" },
+  });
+  assert.equal(explicitPreSubmitFailure.mainSubmits, 1);
+  assert.equal(explicitPreSubmitFailure.clicks, 1);
+  assert.equal(explicitPreSubmitFailure.result.ok, true);
+
+  const mainWorldResponseLost = await run({
+    ack: false,
+    mainResult: { ok: false, error: "no-response" },
+  });
+  assert.equal(mainWorldResponseLost.mainSubmits, 1);
+  assert.equal(mainWorldResponseLost.clicks, 0);
+  assert.equal(mainWorldResponseLost.result.ok, false);
+  assert.equal(mainWorldResponseLost.result.attempted, true);
+  assert.equal(mainWorldResponseLost.result.uncertain, true);
+
   const busy = await run({ busy: true });
+  assert.equal(busy.mainSubmits, 0);
   assert.equal(busy.clicks, 0);
   assert.equal(busy.result.ok, false);
   assert.equal(busy.result.attempted, false);
