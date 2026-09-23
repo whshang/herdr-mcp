@@ -1320,7 +1320,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   });
 
   assert.equal(ctx.wakeArgs[1].browserActuation, true);
-  assert.deepEqual(ctx.snapshotTimeouts, [1200, 6000]);
+  assert.deepEqual(ctx.snapshotTimeouts, [1200, 1200]);
   assert.equal(create.command_accepted, true);
   assert.equal(create.rejected, false);
   assert.equal(create.stable_resource_ref_observed, false);
@@ -2642,7 +2642,7 @@ function createActuationBranchHarness({
     "browserConversationInfo", "browserConversationInfoFromSupportedUrl",
     "sendTabMessageWithTimeout",
     "postBrowserActuationEvidence", "protectBoundTab", "sendBrowserActuationTabMessage",
-    "unavailableBrowserActuationEvidence", "Date", "setTimeout",
+    "unavailableBrowserActuationEvidence", "BROWSER_CREATE_CONTENT_TIMEOUT_MS", "Date", "setTimeout",
     `async function __actuate(command) {\n` +
     `const actuationId = String(command?.actuation_id || "");\n` +
     `const dispatchId = String(command?.dispatch_id || "");\n` +
@@ -2654,7 +2654,7 @@ function createActuationBranchHarness({
     browserConversationInfo, browserConversationInfoFromSupportedUrl,
     sendTabMessageWithTimeout,
     postBrowserActuationEvidence, protectBoundTab, sendBrowserActuationTabMessage,
-    unavailable, dateShim, setTimeoutShim);
+    unavailable, 43_000, dateShim, setTimeoutShim);
 
   return {
     actuate,
@@ -2862,6 +2862,11 @@ test("user Given a fresh ChatGPT create When content dispatch throws Then the ex
   assert.equal(evidence?.command_accepted, true);
   assert.equal(evidence?.resource_available, true);
   assert.equal(evidence?.result?.error, "browser_create_content_dispatch_failed");
+  assert.equal(evidence?.result?.tab_opened, true);
+  assert.equal(evidence?.result?.tab_closed, true);
+  assert.equal(evidence?.result?.tab_cleanup_verified, true);
+  assert.deepEqual(harness.removedTabs, [100]);
+  assert.equal(harness.tabs.has(71), true, "content failure cleanup must preserve the user's anchor tab");
 });
 
 test("user can create two independent workers | Given one exact Project scope spans multiple windows and the original source tab is unavailable | When two session.create mutations run consecutively while sibling workers are generating | Then each mutation opens and delivers only to its own fresh tab", async () => {

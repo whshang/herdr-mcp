@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.132";
+const H2W_CONTENT_VERSION = "0.1.133";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2218,7 +2218,7 @@ function normalizeHerdrMentionAlias(value) {
     const boundedChatGptSubmit = exactChatGptDispatchIdentity || (
       ADAPTER.name === "chatgpt" && creatingSession
     );
-    const snapshotTimeoutMs = exactChatGptDispatchIdentity ? 1200 : 6000;
+    const snapshotTimeoutMs = exactChatGptDispatchIdentity || creatingSession ? 1200 : 6000;
     const beforeServer = ADAPTER.name === "chatgpt"
       ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
       : { ok: false };

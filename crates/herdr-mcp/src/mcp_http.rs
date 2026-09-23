@@ -48,6 +48,7 @@ const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
 // reconciliation plus HTTP/serialization overhead before the outer request
 // can turn a durable reservation/dispatch into an ambiguous gateway timeout.
 const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(22);
+const BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT: Duration = Duration::from_secs(53);
 const BROWSER_LATE_COMPLETION_TTL: Duration = Duration::from_secs(60);
 const BROWSER_ACTUATION_ENDPOINT_PARAM: &str = "__herdr_browser_endpoint_ref";
 // The extension polls for browser actuation on the shared SSE heartbeat. Keep
@@ -79,6 +80,7 @@ const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
 struct BrowserActuationBroker {
     inner: Arc<(Mutex<BrowserActuationState>, Condvar)>,
     timeout: Duration,
+    create_timeout: Duration,
     late_completion_ttl: Duration,
 }
 
@@ -102,6 +104,7 @@ impl Default for BrowserActuationBroker {
         Self {
             inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
             timeout: BROWSER_ACTUATION_TIMEOUT,
+            create_timeout: BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT,
             late_completion_ttl: BROWSER_LATE_COMPLETION_TTL,
         }
     }
@@ -113,6 +116,7 @@ impl BrowserActuationBroker {
         Self {
             inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
             timeout,
+            create_timeout: timeout,
             late_completion_ttl,
         }
     }
@@ -267,7 +271,12 @@ impl BrowserActuator for BrowserActuationBroker {
         }));
         ready.notify_all();
 
-        let deadline = Instant::now() + self.timeout;
+        let timeout = if operation == "herdr_mcp.browser_session.create" {
+            self.create_timeout
+        } else {
+            self.timeout
+        };
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(evidence) = state.completions.remove(&actuation_id) {
                 state.pending.remove(&actuation_id);
@@ -4510,6 +4519,8 @@ mod tests {
         assert!(BROWSER_ACTUATION_TIMEOUT > SSE_HEARTBEAT);
         assert!(BROWSER_ACTUATION_TIMEOUT <= Duration::from_secs(22));
         assert!(BROWSER_ACTUATION_TIMEOUT < Duration::from_secs(30));
+        assert!(BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT > BROWSER_ACTUATION_TIMEOUT);
+        assert!(BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT < Duration::from_secs(60));
     }
 
     #[tokio::test]

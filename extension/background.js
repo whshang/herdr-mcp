@@ -57,7 +57,8 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.132";
+const H2W_SCRIPT_VERSION = "0.1.133";
+const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -2934,10 +2935,13 @@ async function sendChatGptTabMessage(tabId, message, responseTimeoutMs = 0) {
   }
 }
 
-async function sendBrowserActuationTabMessage(tabId, message) {
+async function sendBrowserActuationTabMessage(tabId, message, responseTimeoutMs = 0) {
   // Browser dispatch stays a single fenced mutation attempt. Bound the content
   // response so one stale view cannot block the shared push queue past the
   // runtime actuation deadline; never reload or resend a submit/stop command.
+  if (Number(responseTimeoutMs) > 0) {
+    return sendTabMessageWithTimeout(tabId, message, Number(responseTimeoutMs));
+  }
   return sendTabMessageWithTimeout(tabId, message, 18000);
 }
 
@@ -3794,8 +3798,9 @@ async function handleBrowserActuation(command) {
           expected_generation: expectedGeneration,
           params: createParams,
         },
-      }).then(async (response) => {
-        const evidence = response?.evidence && typeof response.evidence === "object"
+      }, BROWSER_CREATE_CONTENT_TIMEOUT_MS).then(async (response) => {
+        const hasEvidence = response?.evidence && typeof response.evidence === "object";
+        let evidence = hasEvidence
           ? contentActuationEvidenceWithReason(
               response.evidence,
               "browser_create_content_reason_missing",
@@ -3808,8 +3813,43 @@ async function handleBrowserActuation(command) {
               command_accepted: true,
               resource_available: true,
             };
+        if (!hasEvidence || evidence?.resource_available === false || evidence?.rejected === true) {
+          let tabClosed = false;
+          let tabCleanupVerified = false;
+          try {
+            await chrome.tabs.remove(createdTab.id);
+            tabClosed = true;
+          } catch (_) {}
+          try {
+            await chrome.tabs.get(createdTab.id);
+          } catch (_) {
+            tabCleanupVerified = true;
+          }
+          evidence = {
+            ...evidence,
+            result: {
+              ...(evidence?.result && typeof evidence.result === "object" && !Array.isArray(evidence.result)
+                ? evidence.result
+                : {}),
+              tab_opened: true,
+              tab_closed: tabClosed,
+              tab_cleanup_verified: tabCleanupVerified,
+            },
+          };
+        }
         await postBrowserActuationEvidence(actuationId, evidence);
       }).catch(async () => {
+        let tabClosed = false;
+        let tabCleanupVerified = false;
+        try {
+          await chrome.tabs.remove(createdTab.id);
+          tabClosed = true;
+        } catch (_) {}
+        try {
+          await chrome.tabs.get(createdTab.id);
+        } catch (_) {
+          tabCleanupVerified = true;
+        }
         await postBrowserActuationEvidence(actuationId, {
           ...unavailableBrowserActuationEvidence(
             expectedGeneration,
@@ -3817,6 +3857,12 @@ async function handleBrowserActuation(command) {
           ),
           command_accepted: true,
           resource_available: true,
+          result: {
+            error: "browser_create_content_dispatch_failed",
+            tab_opened: true,
+            tab_closed: tabClosed,
+            tab_cleanup_verified: tabCleanupVerified,
+          },
         }).catch(() => {});
       });
     } catch (_) {
