@@ -680,7 +680,10 @@ test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit
   assert.match(wake, /maybeRecoverExplicitChatGptFailure\(\)/);
   assert.match(wake, /消息发送超时，请重试/);
   assert.match(wake, /连接已中断/);
-  assert.match(wake, /performWake\(\{ template: "继续", autoAllow: false, recovery: true \}\)/);
+  assert.match(
+    wake,
+    /performWake\(\{\s*template: "继续",\s*autoAllow: false,\s*recovery: true,\s*requiredApps: \["herdr"\],\s*\}\)/,
+  );
   assert.match(wake, /explicit_error_reload_attempt/);
   assert.match(wake, /explicit_error_continue_attempt/);
   assert.ok(
