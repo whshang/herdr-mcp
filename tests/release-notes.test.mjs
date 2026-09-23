@@ -14,6 +14,11 @@ test("v0.4.3 authored release notes satisfy the durable publication contract", a
   assert.deepEqual(validateReleaseNotes(TAG, text), []);
 });
 
+test("Chinese authored release notes satisfy the same durable publication contract", async () => {
+  const text = await readFile(join(ROOT, "docs/releases/v1.0.1.md"), "utf8");
+  assert.deepEqual(validateReleaseNotes("v1.0.1", text), []);
+});
+
 test("release notes reject Main changes bullets without implementation PR links", async () => {
   const text = await readFile(join(ROOT, "docs/releases/v0.4.3.md"), "utf8");
   const broken = text.replace(
