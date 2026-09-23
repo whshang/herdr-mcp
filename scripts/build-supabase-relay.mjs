@@ -8,7 +8,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const sourcePath = path.join(repoRoot, "relay/deno/server.ts");
 const outputPath = path.join(
   repoRoot,
-  "supabase/functions/herdr-relay/index.ts",
+  "relay/supabase/functions/herdr-relay/index.ts",
 );
 const entrypointMarker = "// Entrypoint for `deno run` or Deno Deploy";
 
@@ -35,7 +35,7 @@ function main() {
       : "";
     if (actual !== expected) {
       console.error(
-        "supabase/functions/herdr-relay/index.ts is stale; run npm run relay:supabase:bundle",
+        "relay/supabase/functions/herdr-relay/index.ts is stale; run npm run relay:supabase:bundle",
       );
       process.exitCode = 1;
     }
