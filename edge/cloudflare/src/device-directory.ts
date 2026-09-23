@@ -499,14 +499,17 @@ export async function listPublicDevices(
     .filter((device) => device.authorization !== "revoked");
   return Promise.all(devices.map(async (device) => {
     const status = await readStatus(getWorkstationStub(device.workstation_id));
+    const connection = connectionFromStatus(status);
     return {
       device_id: device.device_id,
       name: device.name,
       enrolled_at_ms: device.enrolled_at_ms,
       authorization: device.authorization,
       scheduling: device.scheduling,
-      connection: connectionFromStatus(status),
-      health: typeof status?.runtimeHealth === "string" ? status.runtimeHealth : "unknown",
+      connection,
+      health: connection === "online" && typeof status?.runtimeHealth === "string"
+        ? status.runtimeHealth
+        : "unknown",
       runtime_version: typeof status?.runtimeVersion === "string" ? status.runtimeVersion : null,
       runtime_generation: typeof status?.runtimeGeneration === "string" ? status.runtimeGeneration : null,
       last_seen_at_ms: typeof status?.lastSeenAtMs === "number" && status.lastSeenAtMs >= 0 ? status.lastSeenAtMs : null,

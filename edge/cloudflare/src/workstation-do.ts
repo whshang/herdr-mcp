@@ -1571,6 +1571,14 @@ export class WorkstationDO {
       completed: [],
     };
     this.sendToSocket(ws, ack);
+    const healthQuery: StatusMessage = {
+      protocol_version: RELAY_PROTOCOL_VERSION,
+      kind: "status",
+      workstation_id: expected,
+      query: true,
+      sent_at_ms: now,
+    };
+    this.sendToSocket(ws, healthQuery);
     this.logger.info("ws.hello.accepted", {
       workstationId: hello.workstation_id,
       linkVersion: hello.link_version,

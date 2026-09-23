@@ -151,6 +151,10 @@ test("validated hello records disconnect recovery duration and count in durable 
   assert.ok(body.lastReconnectDurationMs < 5_000);
   assert.equal(body.lastReconnectCrossedRecycleThreshold, false);
   assert.equal(typeof body.lastRecoveredAtMs, "number");
-  assert.equal(sent.at(-1).kind, "hello_ack");
-  assert.equal(sent.at(-1).ok, true);
+  assert.equal(sent.at(-2).kind, "hello_ack");
+  assert.equal(sent.at(-2).ok, true);
+  assert.equal(sent.at(-1).kind, "status");
+  assert.equal(sent.at(-1).workstation_id, "prod-real-runtime");
+  assert.equal(sent.at(-1).query, true);
+  assert.equal(typeof sent.at(-1).sent_at_ms, "number");
 });
