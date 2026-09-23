@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.120";
+const H2W_SCRIPT_VERSION = "0.1.121";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -6031,6 +6031,7 @@ async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || default
         template: rawText,
         llmNudge: true,
         autoAllow: true,
+        requiredApps: ["herdr"],
       },
     };
     return deliverWakeToTab(b, payload);
@@ -6110,6 +6111,7 @@ async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || default
       working_count,
       template: rendered,
       autoAllow: true,
+      requiredApps: ["herdr"],
     },
   };
 
@@ -6173,6 +6175,7 @@ async function manualDirectContinue(tabId, convKey) {
       template: configuredManualContinueMessage(),
       manual: true,
       autoAllow: false,
+      requiredApps: ["herdr"],
     },
   });
 }

@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.120";
+const H2W_CONTENT_VERSION = "0.1.121";
 
 function normalizeHerdrMentionAlias(value) {
   const alias = String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -477,15 +477,6 @@ function normalizeHerdrMentionAlias(value) {
     return mainWorldCommitted(text);
   }
 
-  async function configuredHerdrMentionAlias() {
-    try {
-      const settings = await chrome.storage.local.get(["herdrMentionAlias"]);
-      return normalizeHerdrMentionAlias(settings.herdrMentionAlias);
-    } catch (_) {
-      return "herdr";
-    }
-  }
-
   function isHerdrWakeComposerText(text) {
     const t = normText(text);
     return t.length > 0 && /^herdr workspace\b/i.test(t);
@@ -891,82 +882,6 @@ function normalizeHerdrMentionAlias(value) {
     return { ok: requested.every((app) => selected.includes(app)), apps: selected };
   }
 
-  async function activateHerdrComposerAppByTyping(alias) {
-    if (ADAPTER.name !== "chatgpt"
-        || typeof ADAPTER.getSelectedComposerApps !== "function"
-        || typeof ADAPTER.getWatchMainWorldSelector !== "function") {
-      return false;
-    }
-    const keyword = String(alias || "").trim().toLowerCase();
-    if (!keyword) return false;
-    if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
-    const selector = ADAPTER.getWatchMainWorldSelector();
-    if (!selector) return false;
-
-    // ChatGPT's picker can treat synthetic character-by-character insertion as
-    // replacement of the current search token. Use a complete paste-like token
-    // so the composer receives the same value a user can paste.
-    const mention = await insertMainWorld(`@${alias}`, selector);
-    if (!mention.ok) return false;
-    await wait(500);
-
-    // ChatGPT's app picker commits the single pasted candidate with Enter.
-    // Tab can move focus instead of selecting in some composer versions.
-    const confirm = await insertMainWorld("\n", selector, true);
-    if (!confirm.ok) return false;
-
-    const deadline = Date.now() + 2000;
-    while (Date.now() < deadline) {
-      if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
-      const candidates = typeof ADAPTER.getComposerAppCandidates === "function"
-        ? ADAPTER.getComposerAppCandidates(keyword)
-        : [];
-      if (candidates.length === 1) {
-        candidates[0].click();
-        const selectedDeadline = Date.now() + 2500;
-        while (Date.now() < selectedDeadline) {
-          if (ADAPTER.getSelectedComposerApps().includes(keyword)) return true;
-          await wait(100);
-        }
-        return false;
-      }
-      await wait(100);
-    }
-    return false;
-  }
-
-  async function ensureHerdrComposerReference() {
-    if (ADAPTER.name !== "chatgpt"
-        || typeof ADAPTER.getSelectedComposerApps !== "function") {
-      return { ok: true, referenced: false, alias: null };
-    }
-    const alias = await configuredHerdrMentionAlias();
-    const keyword = alias.toLowerCase();
-    if (ADAPTER.getSelectedComposerApps().includes(keyword)) {
-      return { ok: true, referenced: true, alias };
-    }
-    if (await activateHerdrComposerAppByTyping(alias)) {
-      return { ok: true, referenced: true, alias };
-    }
-
-    // Do not send a raw @alias message when provider-owned selection failed.
-    // The user-visible task must not continue without a verified Herdr app pill.
-    return { ok: false, referenced: false, alias, error: "herdr-reference-selection-not-observed" };
-  }
-
-  async function ensureComposerAppReferences(apps = []) {
-    const requested = [...new Set(apps.map((app) => normalizeHerdrMentionAlias(app)).filter(Boolean))];
-    if (!requested.length) return { ok: true, apps: [] };
-    for (const app of requested) {
-      if (ADAPTER.getSelectedComposerApps?.().includes(app)) continue;
-      const activated = await activateHerdrComposerAppByTyping(app);
-      if (!activated) {
-        return { ok: false, error: `composer-app-${app}-selection-not-observed` };
-      }
-    }
-    return { ok: true, apps: ADAPTER.getSelectedComposerApps() };
-  }
-
   function captureSubmitAckBaseline(sendButton = null) {
     return {
       composer: composerNorm(),
@@ -1210,16 +1125,18 @@ function normalizeHerdrMentionAlias(value) {
     if (!text) return { ok: false, error: "empty-template" };
     const n = normText(text);
     const boundedBrowserActuation = data.browserActuation === true && ADAPTER.name === "chatgpt";
+    const requiredApps = [...new Set((Array.isArray(data.requiredApps) ? data.requiredApps : [])
+      .map((app) => normalizeHerdrMentionAlias(app).toLowerCase())
+      .filter(Boolean))];
     // Short-window deduplication prevents repeated insertion from retries or duplicate timers.
     if (!data.queueInsert && n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
       return { ok: false, blocked: "dedupe" };
     }
     let resumeOnly = false;
     let clearBeforeInsert = false;
-    const requiredAppsOnly = Array.isArray(data.requiredApps)
-      && data.requiredApps.length > 0
+    const requiredAppsOnly = requiredApps.length > 0
       && typeof ADAPTER.composerHasOnlyAppPills === 'function'
-      && ADAPTER.composerHasOnlyAppPills(data.requiredApps);
+      && ADAPTER.composerHasOnlyAppPills(requiredApps);
     if (ADAPTER.inputHasContent() && !data.llmNudge && !requiredAppsOnly) {
       if (composerHasSameWake(text)) {
         resumeOnly = true;
@@ -1274,25 +1191,32 @@ function normalizeHerdrMentionAlias(value) {
         }
       }
 
-      const herdrReference = await ensureHerdrComposerReference();
-      if (!herdrReference.ok) {
-        return { ok: false, error: herdrReference.error || "herdr-reference-unavailable" };
+      let appSelection = { ok: true, apps: [] };
+      if (requiredApps.length > 0) {
+        appSelection = await ensureRequiredComposerApps(requiredApps);
+        if (!appSelection.ok) {
+          return { ok: false, error: appSelection.error || "required-app-selection-unavailable" };
+        }
       }
       let committedOk = false;
       if (ADAPTER.needsMainWorldInsert) {
-        committedOk = herdrReference.referenced
+        committedOk = requiredApps.length > 0
           ? await ensureTextAfterComposerAppSelection(text)
           : await ensureCommitted(text, boundedBrowserActuation ? 1 : 3);
         if (!committedOk) {
-          if (herdrReference.referenced) await clearComposer();
-          else {
+          if (requiredApps.length === 0) {
             try {
               const el = ADAPTER.getInputEl();
               const strip = (node) => { for (const c of [...node.childNodes]) { if (c.nodeType === 3 && c.data.includes(text)) c.remove(); else strip(c); } };
               if (el) strip(el);
             } catch (e) {}
           }
-          return { ok: false, error: "insert-failed" };
+          return {
+            ok: false,
+            error: "insert-failed",
+            requiredApps,
+            selectedApps: appSelection.apps || [],
+          };
         }
         if (boundedBrowserActuation) {
           const outcome = await submitBrowserActuationOnce();
@@ -2138,7 +2062,10 @@ function normalizeHerdrMentionAlias(value) {
     const params = command?.params && typeof command.params === "object" ? command.params : {};
     const message = typeof params.message === "string" ? params.message.trim() : "";
     const reasoning = params.reasoning_effort;
-    const requiredApps = Array.isArray(params.required_apps) ? params.required_apps : [];
+    const requestedApps = Array.isArray(params.required_apps) ? params.required_apps : [];
+    const requiredApps = ADAPTER.name === "chatgpt"
+      ? [...new Set(["herdr", ...requestedApps])]
+      : requestedApps;
     if (!message || reasoning != null) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
@@ -2726,6 +2653,7 @@ function normalizeHerdrMentionAlias(value) {
             template: msg.template || "",
             autoAllow: false,
             handoff: true,
+            requiredApps: ["herdr"],
           });
           if (result?.ok && ADAPTER.name === "chatgpt" && CONVERSATION_HEALTH && conversationHealth) {
             markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
@@ -2759,6 +2687,7 @@ function normalizeHerdrMentionAlias(value) {
             template: msg.template || "",
             autoAllow: false,
             handoff: true,
+            requiredApps: ["herdr"],
           });
           if (!result?.ok) { sendResponse(result); return; }
           if (ADAPTER.name === "chatgpt" && CONVERSATION_HEALTH && conversationHealth) {
@@ -4279,7 +4208,12 @@ function normalizeHerdrMentionAlias(value) {
       markConversationState({ ...conversationHealth, explicit_error_continue_attempt: 0 });
       return true;
     }
-    const result = await performWake({ template: "继续", autoAllow: false, recovery: true });
+    const result = await performWake({
+      template: "继续",
+      autoAllow: false,
+      recovery: true,
+      requiredApps: ["herdr"],
+    });
     if (!result?.ok) {
       markConversationState({ ...conversationHealth, explicit_error_continue_attempt: 0 });
       return true;
@@ -4462,7 +4396,12 @@ function normalizeHerdrMentionAlias(value) {
     if (!RECOVERY_CONTROLLER.shouldSendRecovery(conversationHealth)) return false;
     const safety = recoverySafetySnapshot();
     if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
-    const result = await performWake({ template: hudLabels.recovery_probe_template, autoAllow: false, recovery: true });
+    const result = await performWake({
+      template: hudLabels.recovery_probe_template,
+      autoAllow: false,
+      recovery: true,
+      requiredApps: ["herdr"],
+    });
     if (!result?.ok) return false;
     markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
     paintPageHud({});
@@ -4546,7 +4485,12 @@ function normalizeHerdrMentionAlias(value) {
     if (conversationHealth.reload_reason === "stale_view" && Number(conversationHealth.stale_activation_attempt || 0) < 1) {
       const safety = recoverySafetySnapshot();
       if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
-      const result = await performWake({ template: hudLabels.stale_view_activation_template, autoAllow: false, recovery: true });
+      const result = await performWake({
+        template: hudLabels.stale_view_activation_template,
+        autoAllow: false,
+        recovery: true,
+        requiredApps: ["herdr"],
+      });
       if (!result?.ok) return false;
       markConversationState(RECOVERY_CONTROLLER.markRecoverySent({
         ...conversationHealth,

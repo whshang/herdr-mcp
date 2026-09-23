@@ -54,7 +54,7 @@ Agent は Herdr と herdr-mcp をインストールし、Worker と最終公開�
 
 ### ChatGPT の設定
 
-必要に応じて Developer Mode を有効にし、**Settings → Apps** から `herdr` App/Connector を追加して OAuth を完了します。
+必要に応じて Developer Mode を有効にし、**Settings → Apps** から `herdr` App/Connector を追加して OAuth を完了します。ワークステーションへ最初にアクセスするメッセージで `herdr` を選択または `@herdr` します。同じ会話では以後も Herdr が継続して利用でき、毎回 mention する必要はありません。Herdr が生成する Auto、Agent 結果、recovery、handoff の turn は app reference を自分で保持します。Edge、Link、runtime が正常なのに tool が消える場合は attachment の回帰として扱い、再度の `@herdr` は一時的な復旧手段に限ります。
 
 [ChatGPT の設定](docs/i18n/ja/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
 

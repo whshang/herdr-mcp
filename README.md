@@ -54,7 +54,7 @@ For step-by-step manual setup, use the [manual install guide](docs/i18n/en/insta
 
 ### ChatGPT configuration
 
-Enable Developer Mode for Plugins, open **Plugins → Browse plugins**, then add `herdr` with the complete Worker URL ending in `/mcp` and complete OAuth. Work in a ChatGPT Project; in the first message of each new chat, use the composer `+` button to reference `herdr` so that conversation enables the plugin.
+Enable Developer Mode for Plugins, open **Plugins → Browse plugins**, then add `herdr` with the complete Worker URL ending in `/mcp` and complete OAuth. Work in a ChatGPT Project and select or mention `herdr` on the first message that needs workstation access. The same conversation should keep Herdr available on later turns without repeated `@herdr`; Herdr-generated Auto, Agent-result, recovery, and handoff turns preserve the app reference themselves. If the tools disappear while Edge, Link, and runtime are healthy, treat that as an attachment regression and use `@herdr` only as a recovery workaround.
 
 [ChatGPT setup](docs/i18n/en/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
 
@@ -179,6 +179,16 @@ The browser extension is optional for the core ChatGPT → MCP → workstation c
 For ChatGPT Auto, deterministic browser/runtime safety gates stay authoritative. Ordinary post-turn semantic judgment uses a fixed progressive chain: **typed evaluation routes (Jev) → chat routes (LLM) → bounded script fallback**. Goal-aware automation additionally gives the existing LLM Goal Supervisor one bounded Jev semantic prior, while Work Memory/TODO evidence remains the completion authority. The extension stores no semantic-provider endpoint, model, or API key; it asks the local Herdr Runtime for typed evaluation or chat and keeps semantic policy, probability boundaries, judge prompts, and completion tokens product-owned.
 
 Semantic acceleration is optional: without any semantic route, Herdr keeps the same deterministic behavior. When available, a TypeSafe `decision` route is the recommended primary typed-evaluation route. The native runtime owns one provider-neutral semantic route pool shared by browser Auto, planning Skill/method relevance, Parent orchestration decisions, and Work Memory relevance. Parent orchestration keeps Runtime/Git/task facts authoritative and uses existing decision primitives only at bounded boundaries: `planning.advise` for non-trivial routing, one batch `agent.attention.advise` for an inbox snapshot, `validation.advise` to order a frozen validation set, optional post-validation `agent.closeout.advise`, and `cleanup.preview(advisory=true)` to rank cleanup inspection without changing `safe_to_delete`. The durable inbox fast path evaluates attention only when unacknowledged terminal work exists, folds active siblings into the same request, and uses a 1.5 s semantic budget; missing/slow/error routes immediately preserve deterministic terminal wake and the original validation/cleanup gates. Configuration has exactly two layers: mode-`0600` `~/.config/herdr-mcp/config.json` for one workstation, and the authenticated Cloudflare Worker route pool for all enrolled workstations. Local typed/chat routes take precedence over Worker routes for the same derived mode. The extension never stores provider configuration and the runtime does not read semantic provider values from shell or process environment. The `config.toml` used by released 0.4.x runtimes is migrated once to `config.json` and retained only as `config.toml.migrated`; unreleased 1.0 semantic TOML sections are intentionally not a migration format.
+
+For normal CLI use, the same semantic layer is available through `herdr-mcp semantic`. `herdr-mcp semantic setup` with no route options uses TypeSafe.ai / `jev-latest` as a recommended reference only; a custom provider supplies route name, protocol, URL, and model together. API keys are read privately rather than accepted on argv. `semantic decide`, `semantic choose`, and `semantic score` expose the typed decision primitives directly, while `semantic status` shows route readiness without revealing credentials.
+
+```bash
+herdr-mcp semantic status
+herdr-mcp semantic setup
+herdr-mcp semantic choose --state "CI finished" --question "What should happen next?" \
+  --option verify="Run deterministic validation" \
+  --option done="Acceptance is already complete"
+```
 
 Work Memory search keeps strict FTS5 hits and the frozen cursor authoritative. When typed semantic evaluation is configured and a strict page has spare capacity, the runtime may fetch a bounded relaxed FTS candidate set from the same frozen Work Memory partition and include those candidates only in `semantic_ranking`; they never change persisted hit order or cursor contents. With no semantic route, or when a provider times out, errors, exhausts its pool, or returns invalid output, Work Memory search continues on the strict deterministic path unchanged.
 

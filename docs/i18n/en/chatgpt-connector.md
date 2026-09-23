@@ -50,7 +50,7 @@ https://<your-edge-origin>/mcp
 ```
 
 4. Complete OAuth in the browser. On first authorization, Herdr selects Chinese, English, or Japanese from the browser language. Step 1 copies `herdr-mcp connector approve <approval-request-id>` for Terminal; that command checks the local `herdr-mcp` service and Herdr server before Step 2 asks for the six-digit approval code. An approved WebChat Connector remains ordinary MCP only and cannot approve another Connector.
-5. Create or open a ChatGPT **Project**. In the first message of every new chat, use the composer `+` button to reference `herdr` so that chat enables the plugin.
+5. Create or open a ChatGPT **Project**. Select/reference `herdr` on the first message that needs workstation data or a Herdr action. That opt-in should remain usable for the rest of the same conversation without repeated `@herdr`. Herdr-generated Auto, Agent-result, recovery, and handoff turns explicitly preserve the app reference. If tools disappear later while Edge, Link, and runtime remain healthy, treat it as an attachment regression; mentioning `herdr` again is a recovery workaround, not the normal workflow.
 
 Never paste `HERDR_MCP_TOKEN` into ChatGPT. Public ChatGPT access uses OAuth. Static bearer is for local clients such as curl or Cursor.
 
