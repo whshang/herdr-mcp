@@ -2283,7 +2283,27 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
-  assert.match(wakeSource, /composerHasOnlyAppPills\(data\.requiredApps\)/);
+  assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
+  assert.match(wakeSource, /\["herdr", \.\.\.requestedApps\]/);
+  assert.match(wakeSource, /composerHasOnlyAppPills\(requiredApps\)/);
+});
+
+test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conversation | When Auto wakes continue the thread | Then only Herdr-generated turns reassert the app requirement", () => {
+  const routeStart = backgroundSource.indexOf("async function routeWakeAttempt(");
+  const routeEnd = backgroundSource.indexOf("async function deliverWakeToTab(", routeStart);
+  assert.ok(routeStart >= 0 && routeEnd > routeStart);
+  const route = backgroundSource.slice(routeStart, routeEnd);
+  assert.match(route, /requiredApps:\s*\["herdr"\]/);
+
+  const wakeStart = wakeSource.indexOf("async function performWake(data)");
+  const wakeEnd = wakeSource.indexOf("\n  // ---- Delivery confirmation", wakeStart);
+  assert.ok(wakeStart >= 0 && wakeEnd > wakeStart);
+  const wake = wakeSource.slice(wakeStart, wakeEnd);
+  assert.match(wake, /const requiredApps =/);
+  assert.match(wake, /if \(requiredApps\.length > 0\)/);
+  assert.match(wake, /ensureRequiredComposerApps\(requiredApps\)/);
+  assert.doesNotMatch(wake, /ensureHerdrComposerReference/);
+  assert.doesNotMatch(wake, /if \(requiredApps\.length > 0\)[\s\S]*await clearComposer\(\)/);
 });
 
 // Regression: session.create must not passively deadlock on a Browser Registry

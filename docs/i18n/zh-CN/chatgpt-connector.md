@@ -52,7 +52,7 @@ ChatGPT 能完成 initialize / discovery / `tools/list`。
    ```
 
 4. 完成浏览器 OAuth。首次授权页会根据浏览器语言自动使用中文、英文或日文。第一步复制 `herdr-mcp connector approve <approval-request-id>` 到终端；该命令先检查本机 `herdr-mcp` 服务和 Herdr server 是否就绪，第二步才要求输入页面上的 6 位验证码。已批准的 WebChat Connector 仍只有普通 MCP 权限，不能继续批准另一个 Connector；
-5. 创建或打开 ChatGPT **Project**。每一条需要重新读取工作站数据或执行 Herdr 动作的消息，都选择或引用 `herdr`。ChatGPT 当前的 App 选择按消息生效：之前的结果可以继续讨论，但后续再次调用工具时，可能需要重新选择或 `@herdr`。如果此时 Edge、Link 和 runtime 都健康，这属于 ChatGPT 侧的工具投影边界，不代表 Herdr 已离线。
+5. 创建或打开 ChatGPT **Project**。首次需要读取工作站数据或执行 Herdr 动作时选择或 `@herdr`。同一会话后续应持续保留 Herdr，不需要每轮重复 `@herdr`。Herdr 自动继续、Agent 结果、恢复和 handoff 产生的新 turn 会显式保留 app reference。如果之后 Edge、Link、runtime 都健康但工具仍消失，应按 attachment 回归处理；再次 `@herdr` 只是恢复 workaround，不是正常使用流程。
 
 **不要填写本机 `HERDR_MCP_TOKEN`。** ChatGPT 公网入口使用 OAuth；静态 bearer 只用于本机 curl / Cursor 和兼容路径。
 

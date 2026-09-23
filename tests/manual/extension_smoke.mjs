@@ -108,18 +108,23 @@ ok(wakeSource.includes('tasks: hud?.task_summary || null')
   "HUD renders durable task running/completed/blocked/uncertain counters from the Runtime inbox");
 ok(wakeSource.includes(`const H2W_CONTENT_VERSION = "${manifestVersion}"`), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
-// Fail-closed app-reference gate: a wake may only insert its prompt after the
-// Herdr composer app reference was observed, and a failed selection must return
-// before the first insertion. This pin keeps the gate from being deleted while
-// the surrounding composer code is refactored.
-const herdrReferenceIndex = wakeSource.indexOf("const herdrReference = await ensureHerdrComposerReference()");
-const herdrReferenceFailIndex = wakeSource.indexOf("if (!herdrReference.ok) {", herdrReferenceIndex);
-const herdrReferenceInsertIndex = wakeSource.indexOf("await ensureTextAfterComposerAppSelection(text)", herdrReferenceIndex);
-ok(herdrReferenceIndex >= 0
-    && herdrReferenceFailIndex > herdrReferenceIndex
-    && herdrReferenceInsertIndex > herdrReferenceFailIndex
-    && wakeSource.includes("herdr-reference-selection-not-observed"),
-  "wake refuses to insert a prompt when the Herdr composer app reference cannot be observed");
+// Conversation attachment contract: Herdr-generated wake turns explicitly
+// require the Herdr app, while the shared composer pipeline only touches app
+// selection when the caller asked for requiredApps. Ordinary user/queued text
+// must not be rewritten merely because the extension is present.
+const routeWakeStart = backgroundSource.indexOf("async function routeWakeAttempt(");
+const routeWakeEnd = backgroundSource.indexOf("async function deliverWakeToTab(", routeWakeStart);
+const routeWakeSegment = backgroundSource.slice(routeWakeStart, routeWakeEnd);
+const performWakeStart = wakeSource.indexOf("async function performWake(data)");
+const performWakeEnd = wakeSource.indexOf("\n  // ---- Delivery confirmation", performWakeStart);
+const performWakeSegment = wakeSource.slice(performWakeStart, performWakeEnd);
+ok(routeWakeStart >= 0
+    && routeWakeEnd > routeWakeStart
+    && routeWakeSegment.includes('requiredApps: ["herdr"]')
+    && performWakeSegment.includes("if (requiredApps.length > 0)")
+    && performWakeSegment.includes("ensureRequiredComposerApps(requiredApps)")
+    && !performWakeSegment.includes("ensureHerdrComposerReference"),
+  "Herdr auto wakes preserve the tool attachment without forcing app selection on unrelated composer sends");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
@@ -288,7 +293,9 @@ ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes("消息发送超时，请重试")
     && wakeSource.includes("explicit_error_reload_attempt")
     && wakeSource.includes("explicit_error_continue_attempt")
-    && wakeSource.includes('performWake({ template: "继续", autoAllow: false, recovery: true })')
+    && wakeSource.includes('template: "继续"')
+    && wakeSource.includes('recovery: true')
+    && wakeSource.includes('requiredApps: ["herdr"]')
     && wakeSource.includes("(assistantChanged || curLen > lastAsstLen)"),
   "ChatGPT explicit transport failures stop faking progress and use one bounded reload followed by at most one safe Continue");
 const semanticAutoStart = backgroundSource.indexOf("const jevConfigured = semanticCapabilities.evaluate_available;");

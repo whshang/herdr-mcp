@@ -30,12 +30,12 @@ This WIP owns packaging, channel qualification, Store submission, and release ev
 
 At the current 1.0 closeout candidate:
 
-- extension manifest version: **0.1.120**;
+- extension manifest version: **0.1.121**;
 - Runtime package version: **1.0.0-alpha.9**;
 - final stable 1.0 source is **not frozen yet**;
 - open extension-changing work may advance the manifest version before the final package is qualified.
 
-The current candidate keeps ChatGPT as the reference 1.0 provider while Claude and Grok retain signed-in dispatch, settled-result, and reload-recovery support. ChatGPT, Claude, and Grok are all required WebChat origins at install time; Grok no longer has a separate optional-permission toggle. Settings use visible cards instead of collapsed sections, put connection diagnostics first, keep Page Assist and the local Runtime URL out of user configuration, expose the local `~/.config/herdr-mcp/config.json` route format, and keep localized automation templates aligned with the selected UI language with an explicit reset action. Treat 0.1.120 as a candidate until this lane is merged and the exact STANDALONE package is qualified. Any later extension-changing PR has the same rule.
+The current candidate keeps ChatGPT as the reference 1.0 provider while Claude and Grok retain signed-in dispatch, settled-result, and reload-recovery support. ChatGPT, Claude, and Grok are all required WebChat origins at install time; Grok no longer has a separate optional-permission toggle. Settings use visible cards instead of collapsed sections, put connection diagnostics first, keep Page Assist and the local Runtime URL out of user configuration, expose the local `~/.config/herdr-mcp/config.json` route format, and keep localized automation templates aligned with the selected UI language with an explicit reset action. Extension 0.1.121 also restores the ChatGPT one-mention attachment contract: Herdr-generated Auto/Agent/recovery/handoff turns explicitly carry the Herdr app requirement, while ordinary user and queued messages do not trigger synthetic app selection. Treat 0.1.121 as a candidate until this lane is merged and the exact STANDALONE package is qualified. Any later extension-changing PR has the same rule.
 
 The successful package workflow run `35325140968` qualified the 0.1.101 package at source `4e28c285`. That is valid historical evidence for that source, but main has advanced, so it is not the final stable-1.0 package identity.
 
