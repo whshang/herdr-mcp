@@ -1304,7 +1304,7 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   assert.equal(ctx.reservationRemovals, 0);
 });
 
-test("fresh ChatGPT create waits through transient composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
+test("user waits through transient fresh ChatGPT composer busy without a second submit | Given the new Project tab is scoped but still hydrating | When composer readiness changes from busy to idle | Then the same actuation submits once and keeps its reservation", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
   const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
