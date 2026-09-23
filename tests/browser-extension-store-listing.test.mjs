@@ -64,7 +64,7 @@ test("Store package workflow prepares every main extension update without publis
 });
 
 test("README languages link the frozen Store item instead of a generic search page", async () => {
-  for (const name of ["README.md", "README.zh.md", "README.ja.md"]) {
+  for (const name of ["README.md", "README.en.md", "README.ja.md"]) {
     const text = await readFile(join(root, name), "utf8");
     assert.match(text, new RegExp(`chromewebstore\\.google\\.com/detail/${STORE_ID}`), name);
   }

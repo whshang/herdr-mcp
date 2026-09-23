@@ -545,8 +545,8 @@ test("release.json, skill artifact and design invariants are preserved", async (
   const generatedDocs = await readdir(join(OUT, "docs"));
   assert.equal(generatedDocs.some((name) => name.includes("_wip")), false);
 
-  const readmeEn = await readFile(join(ROOT, "README.md"), "utf8");
-  const readmeZh = await readFile(join(ROOT, "README.zh.md"), "utf8");
+  const readmeZh = await readFile(join(ROOT, "README.md"), "utf8");
+  const readmeEn = await readFile(join(ROOT, "README.en.md"), "utf8");
   const readmeJa = await readFile(join(ROOT, "README.ja.md"), "utf8");
   const edgeReadme = await readFile(join(ROOT, "edge", "cloudflare", "README.md"), "utf8");
   assert.match(readmeEn, /docs\/i18n\/en\//);
@@ -557,8 +557,10 @@ test("release.json, skill artifact and design invariants are preserved", async (
   assert.match(readmeJa, /docs\/i18n\/ja\//, "the Japanese README points at the Japanese maintained docs");
   assert.doesNotMatch(readmeJa, /docs\/i18n\/en\//, "the Japanese README must not fall back to English doc links");
   assert.doesNotMatch(readmeJa, /docs\/i18n\/zh-CN\//);
-  assert.match(readmeJa, /\[English\]\(README\.md\)/);
-  assert.match(readmeJa, /\[简体中文\]\(README\.zh\.md\)/);
+  assert.match(readmeJa, /\[English\]\(README\.en\.md\)/);
+  assert.match(readmeJa, /\[简体中文\]\(README\.md\)/);
+  assert.match(readmeZh, /\[English\]\(README\.en\.md\)/);
+  assert.match(readmeEn, /\[简体中文\]\(README\.md\)/);
   assert.match(edgeReadme, /\.\.\/\.\.\/docs\/i18n\/en\/cloudflare-edge-deployment\.md/);
   assert.match(edgeReadme, /\.\.\/\.\.\/docs\/i18n\/en\/runtime-self-upgrade\.md/);
   assert.doesNotMatch(edgeReadme, /docs\/i18n\/zh-CN\//);
