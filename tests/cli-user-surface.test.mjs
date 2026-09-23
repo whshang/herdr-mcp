@@ -31,7 +31,7 @@ function sectionAfterHeading(doc, heading) {
 }
 
 test("README keeps the exhaustive runtime CLI out of the primary user path", () => {
-  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
+  for (const rel of ["README.md", "README.en.md", "README.ja.md"]) {
     const doc = read(rel);
     assert.doesNotMatch(doc, /## (?:Local runtime CLI|本机 runtime CLI)/);
     assert.match(doc, /herdr-mcp status/);

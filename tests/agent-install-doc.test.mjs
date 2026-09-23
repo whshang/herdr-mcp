@@ -9,9 +9,9 @@ const read = (p) => readFileSync(path.join(ROOT, p), "utf8");
 
 test("README gives the Agent one executable install sentence plus a short explanation", () => {
   const cases = [
-    ["README.md", /Recommended: paste one sentence to your Agent/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/, /The Agent checks the machine/],
-    ["README.zh.md", /推荐：给 Agent 一句话/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/agent-install\.md/, /Agent 会检查电脑环境/],
-    ["README.ja.md", /推奨：Agent に一文だけ渡す/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/ja\/agent-install\.md/, /Agent は/],
+    ["README.md", /## 一句话安装/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/agent-install\.md/, /Agent 会检查环境/],
+    ["README.en.md", /## One-sentence install/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/, /The agent checks the machine/],
+    ["README.ja.md", /## 一文でインストール/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/ja\/agent-install\.md/, /Agent が環境確認/],
   ];
   for (const [rel, heading, protocol, explanation] of cases) {
     const doc = read(rel);
@@ -112,7 +112,7 @@ test("Agent install stays concise while preserving the executable bootstrap cont
     assert.doesNotMatch(doc, /npx wrangler/);
     assert.match(doc, /herdr-mcp install/);
   }
-  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
+  for (const rel of ["README.md", "README.en.md", "README.ja.md"]) {
     const doc = read(rel);
     assert.match(doc, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\//);
     assert.match(doc, /Chrome Web Store/);

@@ -65,7 +65,7 @@ T() {
     en:connector_title) echo "herdr-mcp connector info" ;;
     en:public_unset_line) echo "Public  : (HERDR_MCP_BASE_URL not set)" ;;
     en:recommend_edge) echo "Tip     : deploy edge/cloudflare on workers.dev; Custom Domain is optional" ;;
-    en:config_docs) echo "Setup: README.md (default) / README.zh.md / README.ja.md" ;;
+    en:config_docs) echo "Setup: README.md (Chinese default) / README.en.md / README.ja.md" ;;
     en:already_running) echo "already running — use restart to reload code" ;;
     en:started) echo "started" ;;
     en:start_failed) echo "start failed — see: herdr-mcp logs" ;;
@@ -123,7 +123,7 @@ T() {
     zh:connector_title) echo "herdr-mcp 接入信息" ;;
     zh:public_unset_line) echo "Public  : (未配置 HERDR_MCP_BASE_URL)" ;;
     zh:recommend_edge) echo "推荐    : 先部署 workers.dev Edge；Custom Domain 可选" ;;
-    zh:config_docs) echo "配置步骤见 README.md / README.zh.md / README.ja.md" ;;
+    zh:config_docs) echo "配置步骤见 README.md（默认中文）/ README.en.md / README.ja.md" ;;
     zh:already_running) echo "已在运行 — 如需加载新代码请用 restart" ;;
     zh:started) echo "已启动" ;;
     zh:start_failed) echo "启动失败 — 查看: herdr-mcp logs" ;;
@@ -181,7 +181,7 @@ T() {
     ja:connector_title) echo "herdr-mcp 接続情報" ;;
     ja:public_unset_line) echo "Public  : (HERDR_MCP_BASE_URL 未設定)" ;;
     ja:recommend_edge) echo "推奨    : workers.dev Edge を先にデプロイ。Custom Domain は任意" ;;
-    ja:config_docs) echo "手順: README.md / README.zh.md / README.ja.md" ;;
+    ja:config_docs) echo "手順: README.md（中国語既定）/ README.en.md / README.ja.md" ;;
     ja:already_running) echo "既に実行中 — コード再読込は restart" ;;
     ja:started) echo "起動しました" ;;
     ja:start_failed) echo "起動失敗 — herdr-mcp logs を確認" ;;
