@@ -7,7 +7,11 @@ description: Choose bounded short execution or durable long sessions with herdr_
 
 Own: `herdr_exec`, `herdr_exec_start`, `herdr_exec_read`, `herdr_exec_kill`.
 
+Call shape: `herdr_exec` accepts `command` **or** `steps`, never both. Use `steps` for an ordered same-boundary executable/argv sequence whose arguments are already known; use `command` only when shell syntax is actually required. In a multi-project workspace, include the exact `project_root`.
+
 Use `herdr_exec` for bounded deterministic commands expected to finish in one call. Use `herdr_exec_start` for non-trivial tests, builds, servers, benchmarks, network-bound file transfers, or work that may outlive a Web turn. Treat GitHub Actions artifact downloads (`gh api` / `gh run download`), `curl`/`wget`, `scp`/`rsync`, and comparable uploads/downloads as durable-session work by default when remote latency or artifact size can push them beyond the synchronous budget.
+
+Do not plan a long operation around the synchronous request ceiling and then restart it after timeout. Start long work once, keep the returned session identity, and observe that same process.
 
 Within one WebChat conversation/task, use `herdr_exec` directly for bounded shell work in the same workspace/project. Ordinary roots run as durable native sessions and do not need a visible pane. On macOS privacy-protected roots (Documents/Desktop/Downloads), `herdr_exec` reuses the canonical `herdr-mcp:utility` pane so TCC ownership stays with the Herdr terminal; do not open or split another pane merely to issue the next protected-root command. When several independent short commands for the same boundary are already known, combine them into one readable shell wave with grouped output.
 

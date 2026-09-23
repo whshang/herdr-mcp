@@ -447,13 +447,15 @@ test("release.json, skill artifact and design invariants are preserved", async (
   assert.equal(release.skill, "./herdr-mcp-SKILL.md");
 
   const skill = await readFile(join(OUT, "herdr-mcp-SKILL.md"), "utf8");
-  assert.match(skill, /# herdr-mcp remote planner skill/);
-  assert.match(skill, /dsh --profile headless/);
-  assert.match(skill, /repeated-output loops as a fault/);
-  assert.match(skill, /restart the task in a fresh Agent session\/pane/);
-  assert.match(skill, /inspect Git\/task state so an already-applied mutation is not duplicated/);
-  assert.match(skill, /429, 502, 503, 504, or 524/);
-  assert.match(skill, /mutating call must never be replayed solely because the HTTP status is conventionally retryable/);
+  assert.match(skill, /# Herdr-MCP remote planner/);
+  assert.match(skill, /Connected-tool calling contract/);
+  assert.match(skill, /`params` as a \*\*JSON object string\*\*/);
+  assert.match(skill, /`command` \*\*or\*\* `steps`, never both/);
+  assert.match(skill, /workstation-control/);
+  assert.match(skill, /development-orchestration/);
+  assert.match(skill, /engineering-robustness/);
+  assert.doesNotMatch(skill, /dsh --profile headless/);
+  assert.doesNotMatch(skill, /grant_type=client_credentials/);
 
   const home = await readFile(join(OUT, "index.html"), "utf8");
   assert.match(home, /herdr-mcp/);

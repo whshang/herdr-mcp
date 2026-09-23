@@ -705,24 +705,13 @@ mod tests {
         assert!(result.get("native_reference").is_none());
         let content = result["content"].as_str().unwrap();
         assert!(content.contains("## Live herdr-mcp runtime context"));
-        assert!(content.contains("# herdr-mcp remote planner skill"));
-        assert!(content.contains("## 1A. Latency-aware tool scheduling"));
-        assert!(content.contains("dependency-aware **wave**"));
-        assert!(content.contains("are already compacted"));
-        assert!(content.contains("Long build/test/process work belongs in `herdr_exec_start`"));
-        assert!(
-            content.contains(
-                "follow the bounded-wait policy below instead of polling `herdr_exec_read`"
-            )
-        );
-        assert!(content.contains(
-            "prefer one bounded wait (normally 10 seconds, maximum 20 seconds) over repeated empty `herdr_exec_read` polling"
-        ));
-        assert!(content.contains("phase=started"));
-        assert!(content.contains("phase=completed"));
-        assert!(content.contains("bytes_read"));
-        assert!(content.contains("bytes_total"));
-        assert!(content.contains("elapsed_ms"));
+        assert!(content.contains("# Herdr-MCP remote planner"));
+        assert!(content.contains("## 1. Connected-tool calling contract"));
+        assert!(content.contains("`params` as a **JSON object string**"));
+        assert!(content.contains("Use `command` **or** `steps`, never both"));
+        assert!(content.contains("Start once with `herdr_exec_start`"));
+        assert!(content.contains("`herdr_exec_read(next_offset)`"));
+        assert!(content.contains("one logical intent, one authority boundary"));
         fs::remove_dir_all(config.runtime_status_path.parent().unwrap()).unwrap();
     }
 

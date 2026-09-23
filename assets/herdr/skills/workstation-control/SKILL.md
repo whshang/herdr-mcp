@@ -11,6 +11,12 @@ Own: `herdr_methods`, `herdr_inspect`, `herdr_call`, `herdr_since`.
 
 Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explicit IDs. Prefer `herdr_since(cursor)` for incremental changes. If boot identity changes or the cursor resets, discard stale incremental assumptions and resynchronize.
 
+Connected-tool shape:
+
+- Put `device` inside the public tool arguments object. When multiple enrolled workstations are plausible, pass a device name or `device_id` explicitly. `herdr_devices` is the listing exception.
+- Bare workspace/pane ids are scoped to one selected device/Herdr server session; never reuse them as global ids across devices. Preserve device-aware opaque refs unchanged when Herdr returns them.
+- `herdr_call` takes `method`, `params` as a **JSON object string**, and optional top-level `device`. Encode the native/private method arguments inside that string; do not pass an object or spread those fields into the public tool call.
+
 UI/terminal focus is observational; mutations still require the intended explicit workspace/pane/project identity. Reconnect with read-only observations before deciding whether any uncertain mutation may be retried.
 
 A pane and an Agent are separate resources. A pane with `agent:null` is not a valid `herdr_prompt` target and is not evidence that the planner owns or may repurpose that pane. `agent.start` binds a chosen Agent kind to an existing free shell pane; it does not create layout. When no verified task-owned free shell pane exists, create one with `pane.split`, use the returned pane identity for `agent.start`, and re-read live Agent state before dispatch. Close only panes/workspaces created by the current task after terminal evidence is captured.
@@ -30,6 +36,8 @@ device -> project/workspace -> continuity/history -> live Git/runtime -> require
 - Only after these identities are grounded should requirement grilling, architecture discussion, task decomposition, or mutation begin. Facts discoverable from the selected device/repository are the planner's job to read, not questions for the user.
 
 For Edge connectivity failures, consume structured recovery metadata when present. `workstation_offline` / `workstation_reconnecting` should expose `retryable=true`, `delivery_state=not_delivered`, `retry_after_ms`, and `recovery={action:"retry_read_only_probe",probe_tool:"herdr_inspect",max_attempts:3,backoff_ms:[5000,10000,20000],...}`. Follow that bounded read-only probe schedule rather than inferring a retry policy from prose. A mutation may be reissued after recovery only when the failed result explicitly proves `not_delivered`; `delivery_unknown`, `delivered`, or a missing delivery state requires live evidence before replay.
+
+Saved Herdr SSH-machine profiles and Edge devices are separate routing identities even when they reach the same physical workstation. Normal Web-planner work stays on the enrolled Edge route. Cross-transport recovery is allowed only after proven Edge non-delivery or live proof that the mutation was not applied; raw SSH is a final bootstrap/recovery path, never an implicit mutation fallback.
 
 ## Native methods
 
@@ -63,9 +71,9 @@ When a fresh or uncertain conversation contains prior-work intent such as “con
 Use the existing `herdr_call` surface; this adds no public MCP tool:
 
 ```text
-herdr_call(method="continuity.resume", params={"continuity_id":"hc:..."})
-herdr_call(method="continuity.resolve", params={"conversation_id":"..."})
-herdr_call(method="continuity.search", params={"project_id":"...","workspace_id":"...","query":"distinguishing terms"})
+herdr_call(method="continuity.resume", params="{\"continuity_id\":\"hc:...\"}")
+herdr_call(method="continuity.resolve", params="{\"conversation_id\":\"...\"}")
+herdr_call(method="continuity.search", params="{\"project_id\":\"...\",\"workspace_id\":\"...\",\"query\":\"distinguishing terms\"}")
 ```
 
 Resolution order is explicit continuity reference -> exact conversation resolve -> search with stable project/workspace/conversation identity -> optional user-supplied distinguishing text. `continuity.search` may return bounded title/workspace/update-time and recent-turn excerpts for confirmation.
@@ -75,3 +83,7 @@ Resolution order is explicit continuity reference -> exact conversation resolve 
 - `resolution=none`: do not invent an ID; ask for a distinguishing detail or treat the request as fresh work when the user confirms that intent.
 
 After resume, re-inspect live Herdr/runtime/Git facts on the resolved device/workspace before mutation. The journal records historical working context; it does not authorize stale branches, worktrees, processes, or runtime assumptions.
+
+## Browser handoff
+
+For ChatGPT-to-ChatGPT continuation, use the canonical `herdr_mcp.browser_handoff.prepare` path through `herdr_call`, then pass its unchanged automatic-delivery message to `browser_session.create` with one stable idempotency key. The manual Copy Prompt is the same canonical message. Do not enumerate browser endpoints/accounts/Projects first when the source session already fixes that identity. If browser control is unavailable, use the prepared Copy Prompt. If delivery is uncertain or no Herdr execution/result identity is present, reconcile the exact dispatch/session before any retry.
