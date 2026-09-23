@@ -313,7 +313,7 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
   assert.equal(r3.body.result.structuredContent.code, "device_ambiguous");
   assert.equal(r3.body.result.structuredContent.delivery_state, "not_delivered");
   assert.equal(r3.body.result.structuredContent.candidate_devices.length, 2);
-  assert.match(r3.body.result.structuredContent.next_action, /explicit device/);
+  assert.equal(r3.body.result.structuredContent.next_action, undefined);
 });
 
 test("explicit device plus opaque ref to different device fails closed", async () => {
