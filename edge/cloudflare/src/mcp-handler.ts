@@ -238,6 +238,9 @@ const MODEL_VISIBLE_ADVISORY_KEYS = new Set([
   "pairing_hint",
   "revoke_hint",
   "next_action",
+  "next_surface",
+  "recovery",
+  "instructions",
 ]);
 
 const MODEL_VISIBLE_OPAQUE_KEYS = new Set([

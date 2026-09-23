@@ -552,7 +552,7 @@ fn finish_grep_result(
         return json!({
             "ok": false,
             "code": "grep_incomplete",
-            "message": "grep could not complete within the requested limits; retry with a higher max_bytes",
+            "message": "grep did not complete within the requested limits",
             "root": resolved_root.to_string_lossy(),
             "engine": engine,
             "truncated": true,
