@@ -108,18 +108,41 @@ ok(wakeSource.includes('tasks: hud?.task_summary || null')
   "HUD renders durable task running/completed/blocked/uncertain counters from the Runtime inbox");
 ok(wakeSource.includes(`const H2W_CONTENT_VERSION = "${manifestVersion}"`), "content version matches manifest");
 ok(wakeSource.includes("sampleChatGptModelMessageText"), "content serializes ChatGPT Connector pills into model-visible source text");
-// Fail-closed app-reference gate: a wake may only insert its prompt after the
-// Herdr composer app reference was observed, and a failed selection must return
-// before the first insertion. This pin keeps the gate from being deleted while
-// the surrounding composer code is refactored.
-const herdrReferenceIndex = wakeSource.indexOf("const herdrReference = await ensureHerdrComposerReference()");
-const herdrReferenceFailIndex = wakeSource.indexOf("if (!herdrReference.ok) {", herdrReferenceIndex);
-const herdrReferenceInsertIndex = wakeSource.indexOf("await ensureTextAfterComposerAppSelection(text)", herdrReferenceIndex);
-ok(herdrReferenceIndex >= 0
-    && herdrReferenceFailIndex > herdrReferenceIndex
-    && herdrReferenceInsertIndex > herdrReferenceFailIndex
-    && wakeSource.includes("herdr-reference-selection-not-observed"),
-  "wake refuses to insert a prompt when the Herdr composer app reference cannot be observed");
+// Conversation attachment contract: extension-generated ChatGPT turns preserve
+// a provider-owned App identity only from explicit input, the learned binding,
+// or the pills already selected by the user. Unknown identity is never guessed.
+const routeWakeStart = backgroundSource.indexOf("async function routeWakeAttempt(");
+const routeWakeEnd = backgroundSource.indexOf("async function deliverWakeToTab(", routeWakeStart);
+const routeWakeSegment = backgroundSource.slice(routeWakeStart, routeWakeEnd);
+const performWakeStart = wakeSource.indexOf("async function performWake(data)");
+const performWakeEnd = wakeSource.indexOf("\n  // ---- Delivery confirmation", performWakeStart);
+const performWakeSegment = wakeSource.slice(performWakeStart, performWakeEnd);
+ok(routeWakeStart >= 0
+    && routeWakeEnd > routeWakeStart
+    && routeWakeSegment.includes("requiredApps: bindingRequiredApps(b)")
+    && backgroundSource.includes("function bindingRequiredApps(binding)")
+    && backgroundSource.includes("return keyword ? [keyword] : []")
+    && backgroundSource.includes("herdr_app_keyword")
+    && wakeSource.includes("browserAppKeywords")
+    && wakeSource.includes("getLatestUserAppKeywords")
+    && performWakeSegment.includes("if (requiredApps.length > 0)")
+    && performWakeSegment.includes("ensureRequiredComposerApps(requiredApps)")
+    && !performWakeSegment.includes("ensureHerdrComposerReference")
+    && !backgroundSource.includes('requiredApps: ["herdr"]')
+    && !wakeSource.includes('requiredApps: ["herdr"]'),
+  "Herdr auto wakes preserve the observed ChatGPT app identity without forcing a hardcoded app name on unrelated composer sends");
+ok(wakeSource.includes("const queuedSelectedApps =")
+    && wakeSource.includes("composerHasOnlyAppPills(queuedSelectedApps)")
+    && wakeSource.includes("queueInsert: true")
+    && wakeSource.includes("requiredApps: queuedSelectedApps.length > 0 ? queuedSelectedApps : currentHerdrRequiredApps()")
+    && wakeSource.includes("getComposerTextWithoutAppPills"),
+  "queued next-turn delivery preserves exact provider-owned App pills and excludes them from queued draft text");
+ok(wakeSource.includes("if (!registeredHerdrAppKeyword) return []")
+    && !wakeSource.includes("defaultChatGptApps")
+    && !wakeSource.includes('registeredHerdrAppKeyword || "herdr"')
+    && !wakeSource.includes('return alias || "herdr"')
+    && backgroundSource.includes("createParams = { ...params, required_apps: inheritedRequiredApps }"),
+  "ChatGPT sends never guess an App identity; fresh session.create inherits only observed source evidence");
 ok(performanceCoreSource.includes('[data-testid="collapsible-user-message-toggle"]'), "message sampling excludes ChatGPT long-message collapse controls");
 ok(controlCenterHtml.includes('id="deviceToggleButton"')
     && controlCenterHtml.includes('id="devicePanelBody"')
@@ -140,15 +163,15 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
     && manifest.host_permissions?.includes("http://127.0.0.1:8772/*")
     && manifest.host_permissions?.includes("https://chatgpt.com/*")
     && manifest.host_permissions?.includes("https://claude.ai/*")
+    && manifest.host_permissions?.includes("https://grok.com/*")
     && manifest.optional_host_permissions?.includes("https://*/*")
     && manifest.optional_host_permissions?.includes("http://*/*"),
-  "broad network access is optional and the always-on host permission stays loopback-only");
+  "broad network access is optional while supported WebChat origins are explicit required permissions");
 ok(!manifest.content_scripts.some((entry) => (entry.js || []).includes("content/page-assist.js"))
     && backgroundSource.includes("pageAssistOrigins: []")
-    && optionsHtml.includes('id="pageAssistOrigins"')
-    && optionsSource.includes('for (const origin of config.pageAssistOrigins || [])')
-    && optionsSource.includes('pageAssistOrigins: cleanPa'),
-  "Page Assist is default-off, is never statically injected, and requests only origins explicitly saved in Options");
+    && !optionsHtml.includes('id="pageAssistOrigins"')
+    && !optionsSource.includes("pageAssistOrigins"),
+  "Page Assist stays default-off and is not exposed as an extension setting");
 const pageAssistDispatchSource = backgroundSource.match(
   /async function performPageAssistRequest\(msg\) \{[\s\S]*?\n}\n/,
 )?.[0] || "";
@@ -167,14 +190,14 @@ ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
   "experimental content-script registration requires an explicitly granted site permission");
-ok(backgroundSource.includes("SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS")
+ok(backgroundSource.includes("SUPPORTED_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('grok: "https://grok.com/*"')
     && backgroundSource.includes('id: "herdr-supported-grok"')
     && backgroundSource.includes('RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS = ["herdr-experimental-grok"]')
     && backgroundSource.includes("await hasHostPermission(permissionPattern)")
     && !backgroundSource.includes("supportedOptionalSiteAccess")
-    && !manifest.host_permissions?.includes("https://grok.com/*"),
-  "supported Grok uses revocable Chrome site permission as the single runtime authority");
+    && manifest.host_permissions?.includes("https://grok.com/*"),
+  "supported Grok uses the required Chrome site permission as the runtime authority");
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";
@@ -288,7 +311,9 @@ ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes("消息发送超时，请重试")
     && wakeSource.includes("explicit_error_reload_attempt")
     && wakeSource.includes("explicit_error_continue_attempt")
-    && wakeSource.includes('performWake({ template: "继续", autoAllow: false, recovery: true })')
+    && wakeSource.includes('template: "继续"')
+    && wakeSource.includes('recovery: true')
+    && wakeSource.includes('requiredApps: currentHerdrRequiredApps()')
     && wakeSource.includes("(assistantChanged || curLen > lastAsstLen)"),
   "ChatGPT explicit transport failures stop faking progress and use one bounded reload followed by at most one safe Continue");
 const semanticAutoStart = backgroundSource.indexOf("const jevConfigured = semanticCapabilities.evaluate_available;");
@@ -951,13 +976,13 @@ ok(optionsHtml.includes('id="experimentalZAiEnabled"')
     && optionsHtml.includes('id="experimentalDeepSeekEnabled"')
     && optionsHtml.includes('id="experimentalGeminiEnabled"')
     && !optionsHtml.includes('id="experimentalGrokEnabled"')
-    && optionsHtml.includes('id="grokSiteAccess"')
+    && !optionsHtml.includes('id="grokSiteAccess"')
     && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled"')
     && optionsSource.includes('experimentalZAiEnabled: $("experimentalZAiEnabled").checked')
     && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked')
     && optionsSource.includes('experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked')
-    && optionsSource.includes('chrome.permissions?.contains?.({ origins: ["https://grok.com/*"] })'),
-  "Options separates supported Grok site access from experimental provider switches");
+    && !optionsSource.includes("grokSiteAccess"),
+  "Options keeps supported WebChat sites out of settings and exposes only experimental provider switches");
 ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md")
     && optionsSource.includes("setConnectionFailure")
     && [enLocale, zhLocale, jaLocale].every((locale) => locale.open_github_setup_guide),
@@ -1124,6 +1149,15 @@ ok(manualStatusBlock.includes("fetchStateFresh()")
     && !manualStatusBlock.includes('type: "h2w_wake"')
     && wakeSource.includes('action === "status" && result?.ok && result?.checked === true'),
   "Check Herdr is read-only and cannot be blocked by composer Stop controls");
+const manualLlmStart = backgroundSource.indexOf("async function manualLlmJudgeContinue(");
+const manualLlmEnd = manualLlmStart >= 0 ? backgroundSource.indexOf("// ---- Conversation handoff", manualLlmStart) : -1;
+const manualLlmBlock = manualLlmStart >= 0 && manualLlmEnd > manualLlmStart
+  ? backgroundSource.slice(manualLlmStart, manualLlmEnd)
+  : "";
+ok(manualLlmBlock.includes("loadBindings()")
+    && manualLlmBlock.includes("primaryBindingForConv(bindings, convKey)")
+    && manualLlmBlock.includes("requiredApps: bindingRequiredApps(binding)"),
+  "manual semantic continuation preserves the authoritative bound ChatGPT App identity");
 ok(localAuthSource.includes("void opened.catch(() => {});")
     && localAuthSource.includes("void done.catch(() => {});"),
   "native stream failures are observed immediately without hiding later await errors");

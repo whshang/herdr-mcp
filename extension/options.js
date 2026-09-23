@@ -4,37 +4,23 @@ import { nativeHostFailure } from "./native-host-diagnostics.js";
 
 const $ = (id) => document.getElementById(id);
 const KEYS = [
-  "herdrMcpUrl", "wakeTemplate", "progressTickSec", "progressFallbackSec",
+  "wakeTemplate", "progressTickSec", "progressFallbackSec",
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
-  "pageAssistOrigins",
 ];
 let loadedHostPermissionOrigins = [];
-
-function hostPermissionPatternForUrl(rawUrl) {
-  const value = String(rawUrl || "").trim();
-  if (!value) return "";
-  let url;
-  try {
-    url = new URL(value);
-  } catch (_) {
-    throw new Error("invalid_url");
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("invalid_url");
-  return `${url.protocol}//${url.host}/*`;
-}
+const TEMPLATE_FIELDS = [
+  ["template", "wakeTemplate", "default_wake_template"],
+  ["manualContinueMessage", "manualContinueMessage", "manual_continue_message"],
+  ["progressTemplate", "progressTemplate", "default_progress_template"],
+];
 
 function configuredHostPermissionOrigins(config) {
   const origins = [];
   if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
   if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
   if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
-  if (config.grokSiteAccess === true) origins.push("https://grok.com/*");
-  for (const origin of config.pageAssistOrigins || []) {
-    const pattern = hostPermissionPatternForUrl(origin);
-    if (pattern) origins.push(pattern);
-  }
   return [...new Set(origins)];
 }
 
@@ -77,8 +63,6 @@ function applyI18n() {
   $("hint_diagnostics").textContent = t("options_diagnostics_hint");
   $("lab_locale").textContent = t("label_locale");
   $("hint_locale").textContent = t("hint_locale");
-  $("lab_url").textContent = t("label_url");
-  $("hint_url").textContent = t("hint_url");
   $("lab_wake").textContent = t("label_wake_template");
   $("hint_wake").textContent = t("hint_wake_template");
   $("lab_manual_continue").textContent = t("label_manual_continue_message");
@@ -91,10 +75,6 @@ function applyI18n() {
   $("hint_progress").textContent = t("hint_progress_template");
   $("lab_automation_mode").textContent = t("label_automation_mode");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
-  $("title_supported_webchat").textContent = t("label_supported_webchat_section");
-  $("hint_supported_webchat").textContent = t("hint_supported_webchat_section");
-  $("lab_grok_site_access").textContent = t("label_grok_site_access");
-  $("hint_grok_site_access").textContent = t("hint_grok_site_access");
   $("title_experimental").textContent = t("label_experimental_section");
   $("experimental_badge").textContent = t("experimental_badge");
   $("hint_experimental").textContent = t("hint_experimental_section");
@@ -104,10 +84,13 @@ function applyI18n() {
   $("hint_experimental_deepseek").textContent = t("hint_experimental_deepseek");
   $("lab_experimental_gemini").textContent = t("label_experimental_gemini");
   $("hint_experimental_gemini").textContent = t("hint_experimental_gemini");
-  $("title_page_assist").textContent = t("options_page_assist_section");
-  $("hint_page_assist").textContent = t("options_page_assist_hint");
-  $("lab_page_assist_origins").textContent = t("label_page_assist_origins");
-  $("hint_page_assist_origins").textContent = t("hint_page_assist_origins");
+  $("title_runtime_config").textContent = t("options_runtime_config_section");
+  $("hint_runtime_config").textContent = t("options_runtime_config_hint");
+  $("hint_runtime_config_routes").textContent = t("options_runtime_config_routes_hint");
+  $("runtime_config_guide").textContent = t("open_runtime_config_guide");
+  $("runtime_config_guide").href = runtimeConfigGuideUrl();
+  $("resetTemplates").textContent = t("reset_templates");
+  $("hint_reset_templates").textContent = t("hint_reset_templates");
   $("save").textContent = t("save");
   $("test").textContent = t("test");
   $("uiLocale").value = getLocale();
@@ -117,11 +100,17 @@ function applyI18n() {
 function setStatus(text, cls) {
   $("status").textContent = text;
   $("status").className = cls || "";
+  $("status").classList.add("status-box");
+}
+
+function setConnectionStatus(text, cls) {
+  $("connectionStatus").textContent = text;
+  $("connectionStatus").className = cls || "";
+  $("connectionStatus").classList.add("status-box");
 }
 
 async function loadForm() {
   const cfg = await chrome.storage.local.get(KEYS);
-  $("url").value = cfg.herdrMcpUrl || "http://127.0.0.1:8772";
   $("template").value = cfg.wakeTemplate || t("default_wake_template");
   $("progressTickSec").value = cfg.progressTickSec ?? 60;
   $("progressFallbackSec").value = cfg.progressFallbackSec ?? 1200;
@@ -134,12 +123,17 @@ async function loadForm() {
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
   $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
-  let grokSiteAccess = false;
-  try { grokSiteAccess = await chrome.permissions?.contains?.({ origins: ["https://grok.com/*"] }) === true; } catch (_) {}
-  $("grokSiteAccess").checked = grokSiteAccess;
-  const pa = cfg.pageAssistOrigins;
-  $("pageAssistOrigins").value = Array.isArray(pa) ? pa.join("\n") : (pa || "");
-  try { loadedHostPermissionOrigins = configuredHostPermissionOrigins({ ...cfg, grokSiteAccess }); } catch (_) { loadedHostPermissionOrigins = []; }
+  loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg);
+}
+
+function templateDefaults() {
+  return Object.fromEntries(TEMPLATE_FIELDS.map(([, storageKey, localeKey]) => [storageKey, t(localeKey)]));
+}
+
+function resetTemplateFields() {
+  for (const [elementId, , localeKey] of TEMPLATE_FIELDS) {
+    $(elementId).value = t(localeKey);
+  }
 }
 
 function setupGuideUrl() {
@@ -150,9 +144,19 @@ function setupGuideUrl() {
   return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md";
 }
 
+function runtimeConfigGuideUrl() {
+  if (getLocale() === "zh") {
+    return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/zh-CN/extension.md";
+  }
+  if (getLocale() === "ja") {
+    return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/ja/extension.md";
+  }
+  return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/extension.md";
+}
+
 function setConnectionFailure(text) {
-  const status = $("status");
-  status.className = "err";
+  const status = $("connectionStatus");
+  status.className = "status-box err";
   status.replaceChildren();
   const message = document.createElement("span");
   message.textContent = text;
@@ -166,29 +170,28 @@ function setConnectionFailure(text) {
 }
 
 $("uiLocale").addEventListener("change", async () => {
+  const previousDefaults = templateDefaults();
   await setLocale($("uiLocale").value);
   applyI18n();
+  const localizedConfig = { uiLocale: getLocale() };
+  for (const [elementId, storageKey, localeKey] of TEMPLATE_FIELDS) {
+    if ($(elementId).value === previousDefaults[storageKey]) {
+      $(elementId).value = t(localeKey);
+      localizedConfig[storageKey] = $(elementId).value;
+    }
+  }
   await new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: "h2w_set_config", config: { uiLocale: getLocale() } }, () => resolve());
+    chrome.runtime.sendMessage({ type: "h2w_set_config", config: localizedConfig }, () => resolve());
   });
 });
 
+$("resetTemplates").addEventListener("click", () => {
+  resetTemplateFields();
+  setStatus(t("templates_reset_pending_save"), "");
+});
+
 $("save").addEventListener("click", async () => {
-  const rawPa = $("pageAssistOrigins").value.split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean);
-  const cleanPa = [];
-  for (const raw of rawPa) {
-    try {
-      const pat = hostPermissionPatternForUrl(raw);
-      if (!pat) throw new Error("invalid_url");
-      const o = new URL(raw).origin;
-      if (!cleanPa.includes(o)) cleanPa.push(o);
-    } catch (_) {
-      setStatus(`${t("save_failed")}: ${t("host_permission_invalid_url")}`, "err");
-      return;
-    }
-  }
   const config = {
-    herdrMcpUrl: $("url").value.trim(),
     wakeTemplate: $("template").value,
     progressTickSec: parseTickSec($("progressTickSec").value, 60),
     progressFallbackSec: parseTickSec($("progressFallbackSec").value, 1200),
@@ -198,16 +201,9 @@ $("save").addEventListener("click", async () => {
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
-    pageAssistOrigins: cleanPa,
     uiLocale: getLocale(),
   };
-  let nextPermissionOrigins;
-  try {
-    nextPermissionOrigins = configuredHostPermissionOrigins({ ...config, grokSiteAccess: $("grokSiteAccess").checked });
-  } catch (_) {
-    setStatus(`${t("save_failed")}: ${t("host_permission_invalid_url")}`, "err");
-    return;
-  }
+  const nextPermissionOrigins = configuredHostPermissionOrigins(config);
   let granted = false;
   try { granted = await requestHostPermissions(nextPermissionOrigins); } catch (_) { granted = false; }
   if (!granted) {
@@ -227,9 +223,7 @@ $("save").addEventListener("click", async () => {
 });
 
 $("test").addEventListener("click", () => {
-  const url = $("url").value.trim().replace(/\/+$/, "");
-  if (!url) { setStatus(t("need_url"), "err"); return; }
-  setStatus(t("testing"), "");
+  setConnectionStatus(t("testing"), "");
   // Exercise the exact same bounded background transport used by the HUD / Control Center.
   // Direct Options-page fetch can otherwise hang indefinitely on Chrome's
   // loopback-network permission gate and hide the actual remediation.
@@ -239,7 +233,7 @@ $("test").addEventListener("click", () => {
       return;
     }
     if (resp?.ok) {
-      setStatus(`✓ ${t("connect_ok", { n: resp.agents?.length || 0 })}`, "ok");
+      setConnectionStatus(`✓ ${t("connect_ok", { n: resp.agents?.length || 0 })}`, "ok");
       return;
     }
     if (resp?.status === 401) {

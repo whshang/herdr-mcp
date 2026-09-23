@@ -2514,13 +2514,14 @@ impl StateStore {
     /// Matching is exact on provider, target session, accepted user-message ref,
     /// and expected/generation owner. No text similarity is ever consulted.
     ///
-    /// The assistant text is persisted through Work Memory
-    /// ([`Self::append_work_memory_turn`]) under the dispatch's Work Chain,
-    /// together with one deterministic `browser_result` evidence record. The
-    /// existing dispatch row then stores the durable linkage so
-    /// `browser_dispatch.status` can project settlement without a second result
-    /// database. Replays are idempotent; a different assistant-message ref for
-    /// an already-settled dispatch fails closed.
+    /// When a matching Work Memory binding exists, the assistant text is
+    /// persisted through Work Memory ([`Self::append_work_memory_turn`]) under
+    /// the dispatch's Work Chain together with one deterministic
+    /// `browser_result` evidence record. A missing optional Work Memory binding
+    /// does not block dispatch settlement. The existing dispatch row stores the
+    /// durable linkage so `browser_dispatch.status` can project settlement
+    /// without a second result database. Replays are idempotent; a different
+    /// assistant-message ref for an already-settled dispatch fails closed.
     pub fn settle_browser_dispatch_result(
         &mut self,
         input: BrowserDispatchResultInput<'_>,
@@ -2601,54 +2602,68 @@ impl StateStore {
 
         let (turn_message_id, evidence_id) =
             if let Some(work_chain_id) = dispatch.work_chain_id.as_deref() {
-                let (continuity_id, account_ref, space_ref) =
-                    resolve_browser_dispatch_work_memory_scope(
-                        &self.conn,
-                        work_chain_id,
-                        input.provider,
-                        input.session_ref,
-                    )?;
+                let work_memory_scope = match resolve_browser_dispatch_work_memory_scope(
+                    &self.conn,
+                    work_chain_id,
+                    input.provider,
+                    input.session_ref,
+                ) {
+                    Ok(scope) => Some(scope),
+                    Err(error)
+                        if matches!(
+                            error.as_str(),
+                            "work_memory_not_found" | "work_memory_provider_binding_missing"
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
 
-                let turn = self.append_work_memory_turn(WorkMemoryTurnInput {
-                    continuity_id: &continuity_id,
-                    provider: input.provider,
-                    account_ref: account_ref.as_deref(),
-                    space_ref: space_ref.as_deref(),
-                    session_ref: input.session_ref,
-                    provider_message_ref: input.assistant_message_ref,
-                    role: "assistant",
-                    text: input.assistant_text,
-                    fingerprint: None,
-                    observed_at: input.observed_at,
-                })?;
-                let turn_message_id = turn.message_id;
+                if let Some((continuity_id, account_ref, space_ref)) = work_memory_scope {
+                    let turn = self.append_work_memory_turn(WorkMemoryTurnInput {
+                        continuity_id: &continuity_id,
+                        provider: input.provider,
+                        account_ref: account_ref.as_deref(),
+                        space_ref: space_ref.as_deref(),
+                        session_ref: input.session_ref,
+                        provider_message_ref: input.assistant_message_ref,
+                        role: "assistant",
+                        text: input.assistant_text,
+                        fingerprint: None,
+                        observed_at: input.observed_at,
+                    })?;
+                    let turn_message_id = turn.message_id;
 
-                let content = serde_json::json!({
-                    "schema": "herdr.browser_result_evidence/v1",
-                    "dispatch_id": dispatch.dispatch_id,
-                    "provider": dispatch.provider,
-                    "session_ref": dispatch.target_session_ref,
-                    "expected_generation": dispatch.expected_generation,
-                    "generation_owner": dispatch.generation_owner,
-                    "accepted_user_message_ref": input.accepted_user_message_ref,
-                    "assistant_message_ref": input.assistant_message_ref,
-                    "turn_message_id": turn_message_id,
-                    "work_chain_id": work_chain_id,
-                    "lane_id": dispatch.lane_id,
-                })
-                .to_string();
-                let evidence = self.append_work_memory_evidence(WorkMemoryEvidenceInput {
-                    continuity_id: &continuity_id,
-                    kind: "browser_result",
-                    content: &content,
-                    provider: Some(input.provider),
-                    account_ref: account_ref.as_deref(),
-                    space_ref: space_ref.as_deref(),
-                    session_ref: Some(input.session_ref),
-                    portable_source: None,
-                    created_at: input.observed_at,
-                })?;
-                (Some(turn_message_id), Some(evidence.evidence_id))
+                    let content = serde_json::json!({
+                        "schema": "herdr.browser_result_evidence/v1",
+                        "dispatch_id": dispatch.dispatch_id,
+                        "provider": dispatch.provider,
+                        "session_ref": dispatch.target_session_ref,
+                        "expected_generation": dispatch.expected_generation,
+                        "generation_owner": dispatch.generation_owner,
+                        "accepted_user_message_ref": input.accepted_user_message_ref,
+                        "assistant_message_ref": input.assistant_message_ref,
+                        "turn_message_id": turn_message_id,
+                        "work_chain_id": work_chain_id,
+                        "lane_id": dispatch.lane_id,
+                    })
+                    .to_string();
+                    let evidence = self.append_work_memory_evidence(WorkMemoryEvidenceInput {
+                        continuity_id: &continuity_id,
+                        kind: "browser_result",
+                        content: &content,
+                        provider: Some(input.provider),
+                        account_ref: account_ref.as_deref(),
+                        space_ref: space_ref.as_deref(),
+                        session_ref: Some(input.session_ref),
+                        portable_source: None,
+                        created_at: input.observed_at,
+                    })?;
+                    (Some(turn_message_id), Some(evidence.evidence_id))
+                } else {
+                    (None, None)
+                }
             } else {
                 (None, None)
             };
@@ -11630,6 +11645,64 @@ mod tests {
         assert!(replay.turn_message_id.is_empty());
         assert!(replay.evidence_id.is_empty());
         assert_eq!(work_memory_result_counts(&store), (0, 0));
+    }
+
+    #[test]
+    fn browser_dispatch_result_settlement_keeps_missing_work_memory_binding_optional() {
+        const WORK_CHAIN: &str = "wc_ffffffffffffffffffffffffffffffff";
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (_endpoint_ref, dispatch_id) = applied_submit_fixture(
+            &mut store,
+            Some(WORK_CHAIN),
+            "chain-bound browser dispatch without work memory",
+            "settle-chain-without-memory",
+        );
+        store
+            .conn
+            .execute(
+                "DELETE FROM continuity_chains WHERE continuity_id = 'wm:settle'",
+                [],
+            )
+            .unwrap();
+        store
+            .update_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &dispatch_id,
+                expected_generation: 7,
+                delivery_state: BrowserDeliveryState::Applied,
+                generation_owner: Some(7),
+                accepted_user_message_ref: Some("provider-user-chain-without-memory"),
+                updated_at: 12,
+            })
+            .unwrap();
+        let session_ref = store
+            .browser_dispatch(&dispatch_id)
+            .unwrap()
+            .unwrap()
+            .target_session_ref;
+
+        let settled = store
+            .settle_browser_dispatch_result(BrowserDispatchResultInput {
+                provider: "chatgpt",
+                session_ref: &session_ref,
+                expected_generation: 7,
+                accepted_user_message_ref: "provider-user-chain-without-memory",
+                assistant_message_ref: "provider-assistant-chain-without-memory",
+                assistant_text: "chain-bound answer without work memory",
+                observed_at: 13,
+            })
+            .unwrap();
+
+        assert!(!settled.replayed);
+        assert!(settled.turn_message_id.is_empty());
+        assert!(settled.evidence_id.is_empty());
+        assert_eq!(work_memory_result_counts(&store), (0, 0));
+        assert_eq!(
+            settled.dispatch.result_assistant_message_ref.as_deref(),
+            Some("provider-assistant-chain-without-memory")
+        );
+        assert!(settled.dispatch.result_turn_message_id.is_none());
+        assert!(settled.dispatch.result_evidence_id.is_none());
+        assert_eq!(settled.dispatch.result_settled_at, Some(13));
     }
 
     #[test]

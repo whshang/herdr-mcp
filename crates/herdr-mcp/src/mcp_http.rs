@@ -5825,33 +5825,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_sessionless_stress_does_not_allocate_transport_sessions() {
+    async fn openai_sessionless_stress_mixes_handshake_list_and_calls_without_sessions() {
         let root = test_root("openai-stress");
         let state = test_state(&root);
         let sessions = state.sessions.clone();
         let app = candidate_router(state);
-        for id in 0..100 {
-            let list = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "tools/list",
-                "params": {}
-            });
-            let response = app
-                .clone()
-                .oneshot(rpc_request(
-                    Method::POST,
-                    "/mcp",
-                    Some(list),
-                    &[
-                        ("mcp-session-id", "poison"),
-                        ("user-agent", "openai-mcp/1.0.0"),
-                    ],
-                ))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert!(response.headers().get("mcp-session-id").is_none());
+        for id in 0..50 {
+            let requests = [
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("init-{id}"),
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "ChatGPT", "version": "test"}
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("list-{id}"),
+                    "method": "tools/list",
+                    "params": {}
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("discover-{id}"),
+                    "method": "server/discover",
+                    "params": {}
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("call-{id}"),
+                    "method": "tools/call",
+                    "params": {"name": "herdr_methods", "arguments": {"query": "agent"}}
+                }),
+            ];
+            for request in requests {
+                let response = app
+                    .clone()
+                    .oneshot(rpc_request(
+                        Method::POST,
+                        "/mcp",
+                        Some(request),
+                        &[
+                            ("mcp-session-id", "poison"),
+                            ("user-agent", "openai-mcp/1.0.0"),
+                        ],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(response.headers().get("mcp-session-id").is_none());
+            }
         }
         assert_eq!(sessions.len(), 0);
 

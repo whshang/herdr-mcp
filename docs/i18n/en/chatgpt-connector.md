@@ -42,7 +42,7 @@ A green connector status only proves one layer. The reliable validation is a fre
 The exact ChatGPT UI evolves. The general flow is:
 
 1. Enable Developer mode for Plugins.
-2. Open **Plugins → Browse plugins** and add a custom plugin named `herdr`.
+2. Open **Plugins → Browse plugins** and add the Herdr Connector. `herdr` is the default/example App name, but a custom display name is supported.
 3. Enter the complete MCP URL, including `/mcp`:
 
 ```text
@@ -50,7 +50,7 @@ https://<your-edge-origin>/mcp
 ```
 
 4. Complete OAuth in the browser. On first authorization, Herdr selects Chinese, English, or Japanese from the browser language. Step 1 copies `herdr-mcp connector approve <approval-request-id>` for Terminal; that command checks the local `herdr-mcp` service and Herdr server before Step 2 asks for the six-digit approval code. An approved WebChat Connector remains ordinary MCP only and cannot approve another Connector.
-5. Create or open a ChatGPT **Project**. In the first message of every new chat, use the composer `+` button to reference `herdr` so that chat enables the plugin.
+5. Create or open a ChatGPT **Project**. On the first message that needs workstation data or a Herdr action, select/reference the App name you assigned to this Connector. The extension reads the provider-owned `data-keyword` from that real App pill and stores it on the existing conversation/Project binding. Herdr-generated Auto, Agent-result, recovery, handoff, and Browser Actuation turns reuse that observed identity, so the same conversation should stay tool-enabled without repeated mentions. If tools disappear later while Edge, Link, and runtime remain healthy, treat it as an attachment regression; selecting the App again is a recovery workaround, not the normal workflow.
 
 Never paste `HERDR_MCP_TOKEN` into ChatGPT. Public ChatGPT access uses OAuth. Static bearer is for local clients such as curl or Cursor.
 

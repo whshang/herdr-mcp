@@ -59,6 +59,17 @@ On Debian, use the static musl release asset matching the machine architecture: 
 
 On macOS, start with `herdr-mcp permissions status`. If it reports `needs_setup`, run `herdr-mcp permissions setup`, enable the exact stable broker in **System Settings → Privacy & Security → Full Disk Access**, then run `herdr-mcp permissions verify`. Do not probe `~/Documents` before setup just to trigger macOS prompts. The host-capable broker is the stable TCC client for MCP protected-folder file and Git tools: its request surface is a fixed allowlist of protected-folder file/Git operations (`fs_read`, `fs_list`, `fs_grep`, `fs_image`, `fs_edit`, `fs_write`, `fs_patch`, `git`), not an arbitrary shell/exec surface. Native Herdr panes and Agents are governed by the TCC identity of their execution host: the managed `herdr server` is started through this host-capable broker, so panes and Agents beneath it reuse the broker identity, while a Herdr host started outside that managed path keeps that host's own TCC boundary. A normal first install therefore needs one Full Disk Access approval instead of separate approvals per process. Ordinary runtime updates preserve this broker; use `permissions setup --upgrade-broker` only for an explicit compatibility migration. macOS may separately ask once for Keychain access by the stable `herdr-mcp-credential-helper`; approve that one-time prompt and keep the helper stable across updates. Platform details live in [CLI reference](cli-reference.md) and [Troubleshooting](troubleshooting.md). Do not add public Edge while the local doctor is unhealthy.
 
+### Optional: fast semantic decisions
+
+A fast decision model is optional after the local runtime is healthy. `herdr-mcp install` points users to this capability without requiring it. TypeSafe.ai is the recommended reference because it speaks the generic `decision` protocol; it is not a product dependency. If you choose that reference, sign up at <https://typesafe.ai/>, create an API key, then run the setup command below.
+
+```bash
+herdr-mcp semantic setup
+herdr-mcp semantic status
+```
+
+The setup command uses TypeSafe.ai / `jev-latest` only as defaults that can be overridden with `--name`, `--protocol`, `--url`, and `--model`. It reads the API key through hidden terminal input, verifies typed-decision routes before saving them, and stores local route credentials only in the mode-`0600` runtime config. Skipping semantic setup leaves the deterministic runtime path unchanged.
+
 ## Step 2: deploy the public Edge
 
 Cloudflare Workers Free is sufficient for Herdr and does not require a payment method. If you do not have a Cloudflare account, create the free account on the sign-in page; Google sign-in is the recommended shortest path.
@@ -144,7 +155,7 @@ An unauthenticated `/mcp` response of `401` can be correct. The useful checks ar
 This is a human step. The coding agent should pause and guide the user:
 
 1. open ChatGPT settings and enable **Developer mode** for Plugins;
-2. open **Plugins → Browse plugins** and add a custom plugin named `herdr`;
+2. open **Plugins → Browse plugins** and add the Herdr Connector; `herdr` is the recommended/default example name, but a custom App name is supported;
 3. paste the complete deployed `${MCP_URL}`, including the final `/mcp`;
 4. complete OAuth in the browser; the approval page selects Chinese, English, or Japanese from the browser language and asks you to run the Terminal approval command before entering the six-digit code;
 5. create or open a **Project** and work there;

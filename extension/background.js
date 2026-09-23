@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.119";
+const H2W_SCRIPT_VERSION = "0.1.129";
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
 const CHATGPT_PERF_MIGRATION_ALARM = "h2w-chatgpt-perf-migration";
@@ -72,8 +72,8 @@ const EXPERIMENTAL_SITE_PERMISSION_PATTERNS = {
   deepseek: "https://chat.deepseek.com/*",
   gemini: "https://gemini.google.com/*",
 };
-const SUPPORTED_OPTIONAL_TAB_URLS = { grok: "*://grok.com/*" };
-const SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS = { grok: "https://grok.com/*" };
+const SUPPORTED_DYNAMIC_TAB_URLS = { grok: "*://grok.com/*" };
+const SUPPORTED_SITE_PERMISSION_PATTERNS = { grok: "https://grok.com/*" };
 const EXPERIMENTAL_CONTENT_SCRIPTS = [
   {
     id: "herdr-experimental-zai",
@@ -114,7 +114,7 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
     persistAcrossSessions: true,
   },
 ];
-const SUPPORTED_OPTIONAL_CONTENT_SCRIPTS = [
+const SUPPORTED_DYNAMIC_CONTENT_SCRIPTS = [
   {
     id: "herdr-supported-grok",
     site: "grok",
@@ -382,7 +382,7 @@ function hudLabels() {
     "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
-    "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
+    "queue_added_draft_changed", "queue_added_clear_failed", "queue_app_restore_failed", "queue_clear_confirm", "queue_cleared",
     "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint",
     "aria_toggle_automation", "automation_enabled", "automation_disabled", "automation_update_failed",
     "judge_no_continue", "judge_turn_in_progress", "herdr_status_checked", "continue_sent", "continue_failed",
@@ -467,8 +467,8 @@ async function activeH2WTabUrls() {
   for (const [site, pattern] of Object.entries(EXPERIMENTAL_TAB_URLS)) {
     if (experimentalSiteEnabled(site)) urls.push(pattern);
   }
-  for (const [site, pattern] of Object.entries(SUPPORTED_OPTIONAL_TAB_URLS)) {
-    const permissionPattern = SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS[site];
+  for (const [site, pattern] of Object.entries(SUPPORTED_DYNAMIC_TAB_URLS)) {
+    const permissionPattern = SUPPORTED_SITE_PERMISSION_PATTERNS[site];
     if (permissionPattern && await hasHostPermission(permissionPattern)) urls.push(pattern);
   }
   return urls;
@@ -480,7 +480,7 @@ async function activeH2WTabUrlsForProvider(provider) {
     ? "*://chatgpt.com/*"
     : provider === "claude"
       ? "*://claude.ai/*"
-      : EXPERIMENTAL_TAB_URLS[provider] || SUPPORTED_OPTIONAL_TAB_URLS[provider] || null;
+      : EXPERIMENTAL_TAB_URLS[provider] || SUPPORTED_DYNAMIC_TAB_URLS[provider] || null;
   if (!pattern) return urls;
   return urls.includes(pattern) ? [pattern] : [];
 }
@@ -564,7 +564,7 @@ async function syncSupportedOptionalContentScripts() {
     || !chrome.scripting?.registerContentScripts
     || !chrome.scripting?.unregisterContentScripts) return;
   const ids = [
-    ...SUPPORTED_OPTIONAL_CONTENT_SCRIPTS.map((spec) => spec.id),
+    ...SUPPORTED_DYNAMIC_CONTENT_SCRIPTS.map((spec) => spec.id),
     ...RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS,
   ];
   let current = [];
@@ -574,9 +574,9 @@ async function syncSupportedOptionalContentScripts() {
     if (!registered.has(retiredId)) continue;
     try { await chrome.scripting.unregisterContentScripts({ ids: [retiredId] }); } catch (_) {}
   }
-  for (const spec of SUPPORTED_OPTIONAL_CONTENT_SCRIPTS) {
+  for (const spec of SUPPORTED_DYNAMIC_CONTENT_SCRIPTS) {
     const { site, ...registration } = spec;
-    const permitted = await hasHostPermission(SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS[site]);
+    const permitted = await hasHostPermission(SUPPORTED_SITE_PERMISSION_PATTERNS[site]);
     if (!permitted) {
       if (registered.has(spec.id)) {
         try { await chrome.scripting.unregisterContentScripts({ ids: [spec.id] }); } catch (_) {}
@@ -859,12 +859,6 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
         await chrome.storage.local.remove("idleNudgeCooldownSec");
       }
     } catch (e) {}
-  }
-  // Preserve an explicit legacy Grok opt-out when it can be distinguished.
-  // Missing/true legacy state never grants host access; supported Grok access
-  // is owned solely by Chrome's revocable optional site permission.
-  if (stored.experimentalGrokEnabled === false && chrome.permissions?.remove) {
-    try { await chrome.permissions.remove({ origins: [SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok] }); } catch (_) {}
   }
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
@@ -1334,6 +1328,31 @@ function isProjectScopedBinding(binding) {
 function bindingDeliveryConvKey(binding) {
   if (isProjectScopedBinding(binding)) return binding.active_conv_key || null;
   return binding?.convKey || null;
+}
+
+function normalizeAppKeyword(value) {
+  const keyword = String(value || "").trim().toLowerCase();
+  if (!keyword || keyword.length > 128 || /[\u0000-\u001f\u007f]/.test(keyword)) return null;
+  return keyword;
+}
+
+function observedAppKeywords(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(normalizeAppKeyword).filter(Boolean))].slice(0, 8);
+}
+
+function bindingRequiredApps(binding) {
+  const keyword = normalizeAppKeyword(binding?.herdr_app_keyword);
+  return keyword ? [keyword] : [];
+}
+
+function learnedBindingRequiredApps(bindings) {
+  const keywords = [...new Set(
+    (bindings || [])
+      .map((binding) => normalizeAppKeyword(binding?.herdr_app_keyword))
+      .filter(Boolean),
+  )];
+  return keywords.length === 1 ? keywords : [];
 }
 
 function primaryBindingForConv(bindings, convKey) {
@@ -2922,12 +2941,29 @@ async function sendBrowserActuationTabMessage(tabId, message) {
   return sendTabMessageWithTimeout(tabId, message, 18000);
 }
 
+async function handoffMessageWithRequiredApps(site, message) {
+  if (site !== "chatgpt"
+      || Array.isArray(message?.requiredApps)
+      || !["h2w_handoff_prompt", "h2w_handoff_seed"].includes(String(message?.type || ""))) {
+    return message;
+  }
+  const transferId = String(message?.transferId || "").trim();
+  if (!transferId) return message;
+  const transfers = await loadHandoffTransfers();
+  const transfer = transfers?.[transferId] || null;
+  if (!transfer) return message;
+  const bindings = await loadBindings();
+  const requiredApps = learnedBindingRequiredApps(bindingsForTransferSource(bindings, transfer));
+  return requiredApps.length === 1 ? { ...message, requiredApps } : message;
+}
+
 async function sendHandoffTabMessage(tabId, site, message) {
-  if (site === "chatgpt") return sendChatGptTabMessage(tabId, message);
+  const outbound = await handoffMessageWithRequiredApps(site, message);
+  if (site === "chatgpt") return sendChatGptTabMessage(tabId, outbound);
   let lastError = null;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      return await chrome.tabs.sendMessage(tabId, message);
+      return await chrome.tabs.sendMessage(tabId, outbound);
     } catch (error) {
       lastError = error;
       if (!missingReceiverError(error)) throw error;
@@ -3418,6 +3454,7 @@ async function resolveBrowserCreateAnchorWindow({
   expectedGeneration,
   sourceSessionRef = null,
 } = {}) {
+  let sourceConvKey = null;
   if (sourceSessionRef) {
     let target = browserSessionTargets.get(sourceSessionRef) || null;
     let sourceTab = null;
@@ -3464,7 +3501,13 @@ async function resolveBrowserCreateAnchorWindow({
       return { windowId: null, unavailable: true, reason: "source_session_scope_mismatch" };
     }
     if (target && Number.isInteger(sourceTab?.windowId)) {
-      return { windowId: sourceTab.windowId, unavailable: false, reason: "source_session" };
+      sourceConvKey = String(target.convKey || "").trim() || null;
+      return {
+        windowId: sourceTab.windowId,
+        unavailable: false,
+        reason: "source_session",
+        ...(sourceConvKey ? { sourceConvKey } : {}),
+      };
     }
   }
 
@@ -3495,6 +3538,7 @@ async function resolveBrowserCreateAnchorWindow({
       reason: sourceSessionRef
         ? "source_scope_window"
         : (matchingWindowIds.size === 1 ? "unique_scope_window" : "exact_scope_window"),
+      ...(sourceConvKey ? { sourceConvKey } : {}),
     };
   }
   if (sourceSessionRef) {
@@ -3504,6 +3548,7 @@ async function resolveBrowserCreateAnchorWindow({
     windowId: null,
     unavailable: false,
     reason: "no_scope_window",
+    ...(sourceConvKey ? { sourceConvKey } : {}),
   };
 }
 
@@ -3603,6 +3648,16 @@ async function handleBrowserActuation(command) {
         },
       );
       return;
+    }
+    let createParams = params;
+    if (!Array.isArray(params.required_apps) && anchor.sourceConvKey) {
+      const bindings = await loadBindings();
+      const inheritedRequiredApps = learnedBindingRequiredApps(
+        bindingsForConv(bindings, anchor.sourceConvKey),
+      );
+      if (inheritedRequiredApps.length === 1) {
+        createParams = { ...params, required_apps: inheritedRequiredApps };
+      }
     }
     const anchorWindowId = anchor.windowId;
     let createdTab = null;
@@ -3737,7 +3792,7 @@ async function handleBrowserActuation(command) {
           dispatch_id: dispatchId,
           operation,
           expected_generation: expectedGeneration,
-          params,
+          params: createParams,
         },
       }).then(async (response) => {
         const evidence = response?.evidence && typeof response.evidence === "object"
@@ -6037,6 +6092,7 @@ async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || default
         template: rawText,
         llmNudge: true,
         autoAllow: true,
+        requiredApps: bindingRequiredApps(b),
       },
     };
     return deliverWakeToTab(b, payload);
@@ -6116,6 +6172,7 @@ async function routeWakeAttempt(b, extra, template = CFG.wakeTemplate || default
       working_count,
       template: rendered,
       autoAllow: true,
+      requiredApps: bindingRequiredApps(b),
     },
   };
 
@@ -6173,12 +6230,16 @@ async function deliverWakeToTab(b, payload) {
 }
 
 async function manualDirectContinue(tabId, convKey) {
-  return deliverWakeToTab({ tabId, convKey, site: "chatgpt" }, {
+  const bindings = await loadBindings();
+  const binding = primaryBindingForConv(bindings, convKey);
+  const target = binding || { tabId, convKey, site: "chatgpt" };
+  return deliverWakeToTab({ ...target, tabId, convKey }, {
     type: "h2w_wake",
     data: {
       template: configuredManualContinueMessage(),
       manual: true,
       autoAllow: false,
+      requiredApps: bindingRequiredApps(binding),
     },
   });
 }
@@ -6256,6 +6317,8 @@ async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
     return rememberIdleNudge(convKey, { ok: true, continued: false, nudged: false, reason: "llm_ambiguous", raw: verdict.raw });
   }
 
+  const bindings = await loadBindings();
+  const binding = primaryBindingForConv(bindings, convKey);
   const result = await deliverWakeToTab({ tabId, convKey, site: "chatgpt" }, {
     type: "h2w_wake",
     data: {
@@ -6263,6 +6326,7 @@ async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
       llmNudge: true,
       manual: true,
       autoAllow: false,
+      requiredApps: bindingRequiredApps(binding),
     },
   });
   if (!result?.ok) {
@@ -6470,6 +6534,8 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       targetRow.workingPanes = { ...(sourceBinding.workingPanes || {}) };
       targetRow.status = sourceBinding.status || "unknown";
       targetRow.lastSettle = sourceBinding.lastSettle || null;
+      const inheritedAppKeyword = normalizeAppKeyword(sourceBinding.herdr_app_keyword);
+      if (inheritedAppKeyword) targetRow.herdr_app_keyword = inheritedAppKeyword;
       targetRow.created_at = sourceBinding.created_at || targetRow.created_at || now;
       targetRow.continuity_id = transfer.continuity_id;
       targetRow.active_conv_key = targetInfo.convKey;
@@ -7666,7 +7732,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       if (registeringSite === "grok"
-          && !await hasHostPermission(SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok)) {
+          && !await hasHostPermission(SUPPORTED_SITE_PERMISSION_PATTERNS.grok)) {
         sendResponse({ ok: false, error: "site-access-disabled" });
         return;
       }
@@ -7682,6 +7748,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           ? rawCurrentProjectId.toLowerCase()
           : null);
       const currentProjectName = String(msg.browserCurrentProjectName || "").trim() || null;
+      const browserAppKeywords = registeringSite === "chatgpt"
+        ? observedAppKeywords(msg.browserAppKeywords)
+        : [];
       let pageInfo = rawPageInfo;
       if (pageInfo && currentProjectId) {
         if (pageInfo.project_id
@@ -7777,6 +7846,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (browserObservation?.accountRef) b.browser_account_ref = browserObservation.accountRef;
           if (browserObservation?.spaceRef) b.browser_space_ref = browserObservation.spaceRef;
           if (browserObservation?.sessionRef) b.browser_session_ref = browserObservation.sessionRef;
+          if (!normalizeAppKeyword(b.herdr_app_keyword) && browserAppKeywords.length === 1) {
+            b.herdr_app_keyword = browserAppKeywords[0];
+          }
           if (Number.isSafeInteger(browserObservation?.observationGeneration)
               && browserObservation.observationGeneration > 0) {
             b.browser_generation = browserObservation.observationGeneration;
@@ -7791,14 +7863,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ensurePushStream(bindings);
         await saveBindings(bindings);
         const first = matched[0];
+        const firstBinding = bindings[first.storeKey] || first;
         sendResponse({
           bound: true,
-          workspace_id: first.workspace_id || normalizeWorkspaceId(first),
-          workspace_label: first.workspace_label || null,
-          pane: first.pane,
-          status: first.status || null,
-          bindings: matched.map((b) => bindingView(b)),
+          workspace_id: firstBinding.workspace_id || normalizeWorkspaceId(firstBinding),
+          workspace_label: firstBinding.workspace_label || null,
+          pane: firstBinding.pane,
+          status: firstBinding.status || null,
+          bindings: matched.map((b) => bindingView(bindings[b.storeKey] || b)),
           browser_session_ref: browserObservation?.sessionRef || null,
+          herdr_app_keyword: normalizeAppKeyword(firstBinding.herdr_app_keyword),
           browser_pending_dispatch: browserObservation?.pendingDispatch || null,
           browser_generation: browserObservation?.observationGeneration || null,
           browser_account_ref: browserObservation?.accountRef || null,
@@ -7808,6 +7882,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({
           bound: false,
           browser_session_ref: browserObservation?.sessionRef || null,
+          herdr_app_keyword: null,
           browser_pending_dispatch: browserObservation?.pendingDispatch || null,
           browser_generation: browserObservation?.observationGeneration || null,
           browser_account_ref: browserObservation?.accountRef || null,
@@ -8156,9 +8231,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       delete incoming.jevJudgeBaseUrl;
       delete incoming.jevJudgeApiKey;
       delete incoming.jevJudgeModel;
-      if (incoming.experimentalGrokEnabled === false && chrome.permissions?.remove) {
-        try { await chrome.permissions.remove({ origins: [SUPPORTED_OPTIONAL_SITE_PERMISSION_PATTERNS.grok] }); } catch (_) {}
-      }
       delete incoming.experimentalGrokEnabled;
       delete incoming.enabled;
       delete incoming.idleNudgeEnabled;

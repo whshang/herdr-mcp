@@ -252,7 +252,10 @@ impl SemanticRequest {
     }
 
     fn validate(&self) -> Result<(), SemanticError> {
-        if serde_json::to_vec(&self.state)
+        if !matches!(
+            &self.state,
+            Value::String(_) | Value::Object(_) | Value::Array(_)
+        ) || serde_json::to_vec(&self.state)
             .map_err(|_| SemanticError::new("invalid_request"))?
             .len()
             > MAX_STATE_BYTES
@@ -470,6 +473,31 @@ trait SemanticProvider: Send + Sync {
     ) -> Result<SemanticResponse, SemanticError>;
 }
 
+#[cfg(test)]
+struct TestErrorSemanticProvider {
+    id: String,
+    code: &'static str,
+}
+
+#[cfg(test)]
+impl SemanticProvider for TestErrorSemanticProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn protocol(&self) -> &'static str {
+        "decision"
+    }
+
+    fn evaluate(
+        &self,
+        _request: &SemanticRequest,
+        _timeout: Duration,
+    ) -> Result<SemanticResponse, SemanticError> {
+        Err(SemanticError::new(self.code))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticChatMessage {
     pub role: String,
@@ -669,6 +697,17 @@ impl SemanticService {
             providers: vec![Box::new(provider)],
             chat_providers: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_error(id: &str, code: &'static str) -> Self {
+        Self {
+            providers: vec![Box::new(TestErrorSemanticProvider {
+                id: id.to_owned(),
+                code,
+            })],
+            chat_providers: Vec::new(),
+        }
     }
 
     #[cfg(test)]
@@ -922,6 +961,39 @@ pub fn extension_evaluate_json(payload: &Value) -> Value {
         Err(error) => {
             json!({"ok": false, "code": error.public_code(), "semantic": error.fallback_json()})
         }
+    }
+}
+
+pub(crate) fn evaluate_decision_route_json(
+    route: &crate::config::SemanticRouteConfig,
+    payload: &Value,
+) -> Value {
+    let request = match semantic_request_from_json(payload) {
+        Ok(request) => request,
+        Err(error) => return json!({"ok": false, "code": error.public_code()}),
+    };
+    let Some(protocol) = SemanticProtocol::parse(&route.protocol) else {
+        return json!({"ok": false, "code": "route_invalid"});
+    };
+    if !matches!(
+        protocol,
+        SemanticProtocol::Decision | SemanticProtocol::DecisionVercel
+    ) {
+        return json!({"ok": false, "code": "route_not_typed_decision"});
+    }
+    let provider = match HttpSemanticProvider::new(
+        format!("config-route:{}", route.name),
+        protocol,
+        route.api_key.clone().unwrap_or_default(),
+        route.url.clone().unwrap_or_default(),
+        route.model.clone().unwrap_or_default(),
+    ) {
+        Ok(provider) => provider,
+        Err(error) => return json!({"ok": false, "code": error.public_code()}),
+    };
+    match provider.evaluate(&request, DECISION_ATTEMPT_TIMEOUT) {
+        Ok(response) => response.to_json(),
+        Err(error) => json!({"ok": false, "code": error.public_code()}),
     }
 }
 
@@ -1781,6 +1853,37 @@ mod tests {
             .unwrap();
         assert_eq!((score, confidence), (1.7, 0.81));
         assert_eq!(probabilities.get("2"), Some(&0.75));
+    }
+
+    #[test]
+    fn semantic_state_matches_typesafe_system_one_contract() {
+        let question = || {
+            SemanticQuestion::noul(
+                "Is this valid?",
+                "Valid semantic state",
+                "Invalid semantic state",
+            )
+        };
+
+        for state in [json!("text"), json!({"task":"check"}), json!(["task"])] {
+            assert!(
+                SemanticRequest::new(state)
+                    .ask("valid", question())
+                    .validate()
+                    .is_ok()
+            );
+        }
+
+        for state in [Value::Null, json!(true), json!(1)] {
+            assert_eq!(
+                SemanticRequest::new(state)
+                    .ask("valid", question())
+                    .validate()
+                    .unwrap_err()
+                    .code(),
+                "invalid_request"
+            );
+        }
     }
 
     #[test]

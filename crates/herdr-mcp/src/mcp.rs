@@ -253,7 +253,7 @@ fn initialize_result(request: &Value) -> Value {
     let identity = contract::identity().ok();
     json!({
         "protocolVersion": protocol,
-        "capabilities": {"tools": {"listChanged": true}},
+        "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {
             "name": "herdr-mcp",
             "version": crate::runtime_meta::runtime_version()
@@ -271,7 +271,7 @@ fn discover_result() -> Value {
     json!({
         "resultType": "complete",
         "supportedVersions": SUPPORTED_VERSIONS,
-        "capabilities": {"tools": {"listChanged": true}},
+        "capabilities": {"tools": {"listChanged": false}},
         "instructions": SERVER_INSTRUCTIONS,
         "ttlMs": 3_600_000,
         "cacheScope": "private",
@@ -1278,6 +1278,7 @@ fn work_memory_semantic_ranking(
         return json!({
             "attempted": false,
             "used": false,
+            "advisory_only": true,
             "reason": "no_hits",
             "capability": capability,
         });
@@ -1286,6 +1287,7 @@ fn work_memory_semantic_ranking(
         return json!({
             "attempted": true,
             "used": false,
+            "advisory_only": true,
             "reason": "not_configured",
             "capability": capability,
         });
@@ -1324,6 +1326,7 @@ fn work_memory_semantic_ranking(
             return json!({
                 "attempted": true,
                 "used": false,
+                "advisory_only": true,
                 "reason": error.code(),
                 "capability": capability,
             });
@@ -1357,6 +1360,7 @@ fn work_memory_semantic_ranking(
     json!({
         "attempted": true,
         "used": true,
+        "advisory_only": true,
         "provider": response.provider,
         "model": response.model,
         "ranked": ranked,
@@ -5853,9 +5857,13 @@ fn browser_dispatch_result_is_durable(
         return false;
     }
     match dispatch.work_chain_id {
-        Some(_) => {
-            dispatch.result_turn_message_id.is_some() && dispatch.result_evidence_id.is_some()
-        }
+        Some(_) => matches!(
+            (
+                dispatch.result_turn_message_id.as_ref(),
+                dispatch.result_evidence_id.as_ref()
+            ),
+            (Some(_), Some(_)) | (None, None)
+        ),
         None => dispatch.result_turn_message_id.is_none() && dispatch.result_evidence_id.is_none(),
     }
 }
@@ -7157,6 +7165,7 @@ mod tests {
         }));
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "herdr-mcp");
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
         assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("continue/resume intent"));
@@ -7618,6 +7627,7 @@ mod tests {
         let result = discover_result();
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], SDK_WIRE_PROTOCOL);
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
         assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
     }
 
@@ -8296,6 +8306,7 @@ mod tests {
             &hits,
         );
         assert_eq!(no_config["used"], false);
+        assert_eq!(no_config["advisory_only"], true);
         assert_eq!(no_config["reason"], "not_configured");
 
         let semantic_url = semantic_test_server(
@@ -8308,6 +8319,7 @@ mod tests {
             &hits,
         );
         assert_eq!(configured["used"], true);
+        assert_eq!(configured["advisory_only"], true);
         assert_eq!(configured["ranked"][0]["source_id"], "ev_relaxed");
         assert_eq!(configured["ranked"][0]["match_kind"], "relaxed");
         assert_eq!(
@@ -8326,6 +8338,7 @@ mod tests {
             &hits,
         );
         assert_eq!(provider_error["used"], false);
+        assert_eq!(provider_error["advisory_only"], true);
         assert_ne!(provider_error["reason"], "not_configured");
 
         let _ = std::fs::remove_dir_all(&config_dir);
@@ -9960,7 +9973,7 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        {
+        let settled_dispatch = {
             let mut guard = store.lock().unwrap();
             let settled = guard
                 .settle_browser_dispatch_result(BrowserDispatchResultInput {
@@ -9975,7 +9988,8 @@ mod tests {
                 .unwrap();
             assert!(!settled.replayed);
             assert_eq!(settled.dispatch.dispatch_id, dispatch_id);
-        }
+            settled.dispatch
+        };
 
         let status = browser_operation_call(
             &store,
@@ -10003,6 +10017,23 @@ mod tests {
         );
         // The worker text lives in Work Memory, not in the planner-facing status.
         assert!(!status.to_string().contains("final worker answer text"));
+
+        let mut settled_without_work_memory = settled_dispatch;
+        settled_without_work_memory.result_turn_message_id = None;
+        settled_without_work_memory.result_evidence_id = None;
+        assert!(browser_dispatch_result_is_durable(
+            &settled_without_work_memory
+        ));
+        assert_eq!(
+            browser_dispatch_execution_state(&settled_without_work_memory),
+            Some("settled")
+        );
+
+        settled_without_work_memory.result_turn_message_id =
+            Some("partial-work-memory-turn".to_owned());
+        assert!(!browser_dispatch_result_is_durable(
+            &settled_without_work_memory
+        ));
     }
 
     #[test]

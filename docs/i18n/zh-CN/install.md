@@ -58,6 +58,17 @@ Debian 使用与机器架构匹配的静态 musl Release 产物：x86_64 使用 
 
 macOS 先执行 `herdr-mcp permissions status`。只有返回 `needs_setup` 时才执行 `herdr-mcp permissions setup`，在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中为稳定 broker 授权一次，再执行 `herdr-mcp permissions verify`。setup 前不要为了触发弹窗而主动访问 `~/Documents`。host-capable broker 是 MCP 受保护目录文件/Git 工具的稳定 TCC 客户端：它的请求面只是固定的受保护文件/Git 操作白名单（`fs_read`、`fs_list`、`fs_grep`、`fs_image`、`fs_edit`、`fs_write`、`fs_patch`、`git`），不是任意 shell/exec 执行面。native Herdr pane/Agent 的 TCC 取决于其执行宿主：托管的 `herdr server` 通过这个 host-capable broker 启动，因此其下的 pane/Agent 复用 broker 身份；不在这条托管路径上的 Herdr 宿主仍受自身 TCC 边界约束。正常首次安装因此只需要这一处 Full Disk Access 授权，避免每个进程分别弹窗。普通 runtime 更新保留这个 broker；只有明确的 compatibility migration 才执行 `permissions setup --upgrade-broker`。macOS 还可能单独要求稳定的 `herdr-mcp-credential-helper` 访问钥匙串；这属于独立安全边界，首次批准一次，后续更新继续复用。平台细节见 [CLI 参考](cli-reference.md)和[故障排查](troubleshooting.md)。本地 doctor 不健康时先解决 runtime / Herdr 问题，再部署公网 Edge。
 
+### 可选：快速语义判断
+
+本机 runtime 健康后，可以选择配置快速 decision 模型。`herdr-mcp install` 会提示这一能力，但不会要求必须配置。默认推荐参考 TypeSafe.ai，因为它可以直接使用通用 `decision` 协议；它不是产品依赖。选择这个参考方案时，在 <https://typesafe.ai/> 注册并创建 API Key，再执行下面的 setup 命令。
+
+```bash
+herdr-mcp semantic setup
+herdr-mcp semantic status
+```
+
+setup 只把 TypeSafe.ai / `jev-latest` 作为默认参考值，用户可通过 `--name`、`--protocol`、`--url`、`--model` 覆盖。API Key 通过隐藏终端输入读取；typed-decision route 会在保存前做一次真实验证；本机 route 凭证只写入 mode-`0600` 的 runtime 配置。跳过 semantic 配置时，原有确定性 runtime 路径保持不变。
+
 ## 第二步：部署稳定公网 Edge
 
 Herdr 使用 Cloudflare Workers Free 即可，不需要绑卡。没有 Cloudflare 账号时可在登录页免费注册，推荐直接用 Google 登录，步骤最少。
@@ -144,7 +155,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 这一步需要用户本人操作。让 Coding Agent 暂停并指导：
 
 1. 在 ChatGPT 插件设置中开启 **Developer mode**；
-2. 进入“**插件 → 浏览插件**”，添加自定义插件，名称建议 `herdr`；
+2. 进入“**插件 → 浏览插件**”，添加 Herdr Connector；默认/建议示例名称是 `herdr`，但也支持自定义 App 名称；
 3. 粘贴完整的 `${MCP_URL}`，必须包含最后的 `/mcp`；
 4. 完成浏览器 OAuth；首次授权页会按浏览器语言自动使用中文、英文或日文，并明确要求先在终端运行批准命令，再按 CLI 提示输入 6 位验证码；
 5. 创建或打开一个 **Project**，后续在项目里工作；

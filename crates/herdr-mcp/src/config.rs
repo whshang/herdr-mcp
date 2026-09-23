@@ -258,6 +258,24 @@ impl Config {
         redacted.render()
     }
 
+    pub(crate) fn save(&self, path: &Path) -> Result<(), String> {
+        validate_config(self)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "cannot create config directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::write(path, self.render())
+            .map_err(|error| format!("cannot write config {}: {error}", path.display()))?;
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot secure config {}: {error}", path.display()))?;
+        Ok(())
+    }
+
     pub fn set_edge_public_origin(&mut self, origin: &str) -> Result<(), String> {
         self.edge_public_origin = Some(normalize_edge_public_origin(origin)?);
         Ok(())

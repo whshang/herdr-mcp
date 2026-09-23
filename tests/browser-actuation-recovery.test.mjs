@@ -1215,7 +1215,7 @@ test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowled
   assert.equal(busy.result.attempted, false);
 });
 
-test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit attempt cannot be proven | When Browser Actuation returns | Then it is uncertain with a bounded readback instead of a retryable rejection", async () => {
+test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch or fresh-create attempt cannot be proven | When Browser Actuation returns | Then it stays uncertain without replaying or dropping the create reservation", async () => {
   const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
   const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
   const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
@@ -1224,7 +1224,12 @@ test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit at
   assert.ok(commandStart >= 0 && commandEnd > commandStart);
   const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
   const commandSource = wakeSource.slice(commandStart, commandEnd);
-  const ctx = { snapshotTimeouts: [], wakeArgs: null };
+  const ctx = {
+    snapshotTimeouts: [],
+    wakeArgs: [],
+    reservationWrites: [],
+    reservationRemovals: 0,
+  };
 
   const act = new Function("ctx", `
     const ADAPTER = {
@@ -1236,11 +1241,15 @@ test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit at
       getMessageSnapshot: () => ({}),
     };
     const chatGptConversationId = () => "current";
-    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const sessionStorage = {
+      setItem: (key, value) => ctx.reservationWrites.push([key, value]),
+      removeItem: () => { ctx.reservationRemovals += 1; },
+    };
     const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
     let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
     let registeredBrowserGeneration = 17;
     let registeredConvKey = "https://chatgpt.com/c/current";
+    const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
     const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
@@ -1253,7 +1262,7 @@ test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit at
       return { ok: false };
     };
     const performWake = async (args) => {
-      ctx.wakeArgs = args;
+      ctx.wakeArgs.push(args);
       return { ok: false, attempted: true, uncertain: true, error: "submit-unconfirmed" };
     };
     const providerMessageSnapshot = () => ({ messageId: null, text: "", count: 0 });
@@ -1268,12 +1277,31 @@ test("user keeps an unconfirmed submit fail-closed | Given one ChatGPT submit at
     params: { message: "next turn", required_apps: [] },
   });
 
-  assert.equal(ctx.wakeArgs.browserActuation, true);
+  assert.equal(ctx.wakeArgs[0].browserActuation, true);
   assert.deepEqual(ctx.snapshotTimeouts, [1200]);
   assert.equal(result.command_accepted, true);
   assert.equal(result.rejected, false);
   assert.equal(result.accepted_message_observed, false);
   assert.equal(result.generation_owner, null);
+
+  const reservationRef = "bsr_" + "c".repeat(64);
+  const create = await act({
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      reservation_ref: reservationRef,
+      message: "first worker turn",
+      required_apps: [],
+    },
+  });
+
+  assert.equal(ctx.wakeArgs[1].browserActuation, true);
+  assert.deepEqual(ctx.snapshotTimeouts, [1200, 6000]);
+  assert.equal(create.command_accepted, true);
+  assert.equal(create.rejected, false);
+  assert.equal(create.stable_resource_ref_observed, false);
+  assert.deepEqual(ctx.reservationWrites, [["herdrBrowserSessionReservationV1", reservationRef]]);
+  assert.equal(ctx.reservationRemovals, 0);
 });
 
 test("user receives exact content rejection reasons | Given browser controls reject before provider mutation | When create dispatch or stop is attempted | Then each result has a bounded machine reason", async () => {
@@ -1303,6 +1331,7 @@ test("user receives exact content rejection reasons | Given browser controls rej
       let registeredBrowserSessionRef = "br_${"a".repeat(64)}";
       let registeredBrowserGeneration = 17;
       let registeredConvKey = "conv-current";
+      const currentHerdrRequiredApps = () => ["herdr"];
       const providerCanonicalConversationObserved = () => true;
       const document = { hidden: false };
       const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
@@ -2211,7 +2240,9 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(createSegment, /requiredApps,/);
 
   const registrationStart = wakeSource.indexOf('async function registerCurrentConversation');
-  const registrationSegment = wakeSource.slice(registrationStart, registrationStart + 3500);
+  const registrationEnd = wakeSource.indexOf("\n  function startConversationRouteWatch", registrationStart);
+  assert.ok(registrationStart >= 0 && registrationEnd > registrationStart);
+  const registrationSegment = wakeSource.slice(registrationStart, registrationEnd);
   assert.match(registrationSegment, /chatGptProjectRoute/);
   assert.match(registrationSegment, /chatGptProjectRoute\s*\?\s*\[\]\s*:\s*await chatGptProjectCatalog\(accountNativeIdentity\)/);
   assert.match(registrationSegment, /browserSessionReservationRef/);
@@ -2251,12 +2282,95 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   // the opened menu; ambiguity stays fail-closed via candidates.length !== 1 in
   // wake.js (asserted below).
   assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
+  assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
+  assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
   assert.match(chatGptAdapterSource, /visible\(node\)/);
+  assert.match(chatGptAdapterSource, /if \(!menuRoots\.length\) return \[\]/);
+  assert.match(chatGptAdapterSource, /for \(const root of menuRoots\)/);
   assert.match(chatGptAdapterSource, /return matches\.sort/);
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
-  assert.match(wakeSource, /composerHasOnlyAppPills\(data\.requiredApps\)/);
+  assert.match(wakeSource, /!composerModelVisibleText\(\)/);
+  assert.match(wakeSource, /const search = selector \? await insertMainWorld\(app, selector\) : null/);
+  assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);
+  assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
+  assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
+  assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);
+  assert.match(wakeSource, /\.\.\.observedHerdrApps, \.\.\.requestedApps/);
+  assert.doesNotMatch(wakeSource, /defaultChatGptApps/);
+  assert.match(wakeSource, /composerHasOnlyAppPills\(requiredApps\)/);
+});
+
+test("user never gets a guessed ChatGPT app | Given no learned Herdr app identity | When recovery handoff or fresh session creation prepares another turn | Then only observed or inherited provider-owned identities are used", () => {
+  assert.match(wakeSource, /function currentHerdrRequiredApps\(\)[\s\S]*if \(!registeredHerdrAppKeyword\) return \[\]/);
+  assert.doesNotMatch(wakeSource, /defaultChatGptApps/);
+  assert.doesNotMatch(wakeSource, /registeredHerdrAppKeyword \|\| "herdr"/);
+  assert.doesNotMatch(wakeSource, /return alias \|\| "herdr"/);
+  assert.match(backgroundSource, /function learnedBindingRequiredApps\(bindings\)/);
+  assert.match(backgroundSource, /async function handoffMessageWithRequiredApps/);
+  assert.match(backgroundSource, /createParams = \{ \.\.\.params, required_apps: inheritedRequiredApps \}/);
+  assert.match(backgroundSource, /targetRow\.herdr_app_keyword = inheritedAppKeyword/);
+});
+
+test("user keeps Herdr attached across auto turns | Given one Herdr-enabled conversation | When Auto wakes continue the thread | Then only Herdr-generated turns reassert the app requirement", () => {
+  const routeStart = backgroundSource.indexOf("async function routeWakeAttempt(");
+  const routeEnd = backgroundSource.indexOf("async function deliverWakeToTab(", routeStart);
+  assert.ok(routeStart >= 0 && routeEnd > routeStart);
+  const route = backgroundSource.slice(routeStart, routeEnd);
+  assert.match(route, /requiredApps:\s*bindingRequiredApps\(b\)/);
+  assert.match(backgroundSource, /function bindingRequiredApps\(binding\)/);
+  assert.match(backgroundSource, /herdr_app_keyword/);
+  assert.match(backgroundSource, /b\.herdr_app_keyword = browserAppKeywords\[0\]/);
+  assert.match(wakeSource, /browserAppKeywords/);
+  assert.match(chatGptAdapterSource, /getLatestUserAppKeywords\(latestUser = null\)/);
+  assert.match(wakeSource, /registeredConversationBound/);
+  assert.match(wakeSource, /getLatestUserAppKeywords\(latestTurnForRole\("user"\)\)/);
+  assert.match(wakeSource, /shouldLearnAppIdentity/);
+  assert.match(wakeSource, /registerCurrentConversation\(shouldLearnAppIdentity \? "app-identity" : "poll"\)/);
+  assert.match(wakeSource, /registerCurrentConversation\("binding-changed"\)/);
+  assert.doesNotMatch(backgroundSource, /requiredApps:\s*\["herdr"\]/);
+  assert.doesNotMatch(wakeSource, /requiredApps:\s*\["herdr"\]/);
+
+  const wakeStart = wakeSource.indexOf("async function performWake(data)");
+  const wakeEnd = wakeSource.indexOf("\n  // ---- Delivery confirmation", wakeStart);
+  assert.ok(wakeStart >= 0 && wakeEnd > wakeStart);
+  const wake = wakeSource.slice(wakeStart, wakeEnd);
+  assert.match(wake, /const requiredApps =/);
+  assert.match(wake, /if \(requiredApps\.length > 0\)/);
+  assert.match(wake, /ensureRequiredComposerApps\(requiredApps\)/);
+  assert.doesNotMatch(wake, /ensureHerdrComposerReference/);
+  const resumeStart = wake.indexOf("if (resumeOnly) {");
+  const resumeEnd = wake.indexOf("if (clearBeforeInsert) await clearComposer();", resumeStart);
+  assert.ok(resumeStart >= 0 && resumeEnd > resumeStart);
+  const resume = wake.slice(resumeStart, resumeEnd);
+  assert.match(resume, /ensureRequiredComposerApps\(requiredApps\)/);
+  assert.ok(resume.indexOf("ensureRequiredComposerApps(requiredApps)") < resume.indexOf("await submit()"),
+    "resume-only submission must restore the required App before submit");
+  const clearBeforeInsert = wake.indexOf("if (clearBeforeInsert) await clearComposer()");
+  const mainAppSelection = wake.indexOf("let appSelection = { ok: true, apps: [] }");
+  assert.ok(clearBeforeInsert >= 0 && mainAppSelection > clearBeforeInsert,
+    "normal wake replacement clears stale text before selecting the required App");
+});
+
+test("user keeps Herdr attached on queued next-turn delivery | Given a bound ChatGPT conversation with an observed Herdr app keyword | When Queue delivers the next user turn | Then the delivery reuses only the observed app identity and never guesses an unknown keyword", () => {
+  const queueStart = wakeSource.indexOf('if (msg?.type === "h2w_queue_deliver")');
+  const queueEnd = wakeSource.indexOf('if (msg?.type === "h2w_wake")', queueStart);
+  assert.ok(queueStart >= 0 && queueEnd > queueStart);
+  const queue = wakeSource.slice(queueStart, queueEnd);
+  assert.match(queue, /const queuedSelectedApps =/);
+  assert.match(queue, /composerHasOnlyAppPills\(queuedSelectedApps\)/);
+  assert.match(queue, /requiredApps:\s*queuedSelectedApps\.length > 0 \? queuedSelectedApps : currentHerdrRequiredApps\(\)/);
+  assert.match(backgroundSource, /function bindingRequiredApps\(binding\)[\s\S]*return keyword \? \[keyword\] : \[\]/);
+  const enqueueStart = wakeSource.indexOf("async function queueCurrentComposerMessage()");
+  const enqueueEnd = wakeSource.indexOf("\n  function ensureQueuedInsertButton", enqueueStart);
+  assert.ok(enqueueStart >= 0 && enqueueEnd > enqueueStart);
+  const enqueue = wakeSource.slice(enqueueStart, enqueueEnd);
+  assert.match(enqueue, /getComposerTextWithoutAppPills/);
+  assert.match(enqueue, /selectedAppsBeforeQueue/);
+  assert.match(enqueue, /ensureRequiredComposerApps\(selectedAppsBeforeQueue\)/);
+  assert.ok(enqueue.indexOf("await clearComposer()") < enqueue.indexOf("ensureRequiredComposerApps(selectedAppsBeforeQueue)"),
+    "queue must restore provider-owned App pills after clearing queued text");
 });
 
 // Regression: session.create must not passively deadlock on a Browser Registry

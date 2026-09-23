@@ -46,6 +46,23 @@ macOS 上，`reinstall` 是产品级修复 / 重装入口；Linux 的 runtime �
 
 `service ...`、`link ...`、`native-host ...`、`candidate` 属于高级/内部命令；`dev` 是下面单独说明的**源码开发**入口。正常安装本机 runtime 不需要仓库 checkout、Node.js、npm，也不应把 `service install` 当作普通用户入口。
 
+## 快速语义判断
+
+`herdr-mcp semantic` 把 Runtime 已有的 provider-neutral 语义层作为正常 CLI 能力开放。语义输出只作辅助判断；task、Git、validation、权限、delivery、cleanup 等确定性事实继续保持原有权威。
+
+```bash
+herdr-mcp semantic status
+herdr-mcp semantic setup
+herdr-mcp semantic remove <route-name>
+herdr-mcp semantic decide --state "..." --question "..." --yes "..." --no "..."
+herdr-mcp semantic choose --state "..." --question "..." --option a="..." --option b="..."
+herdr-mcp semantic score --state "..." --question "..." --criterion "..." --criterion "..."
+```
+
+`setup` 不传 route 参数时使用 TypeSafe.ai（`decision`、`jev-latest`）作为推荐参考；自定义 route 需要同时提供 `--name`、`--protocol`、`--url`、`--model`。Provider 身份属于配置数据，不进入硬编码判断分支。API Key 不接受 argv 输入：交互终端使用隐藏输入，自动化可从 stdin 提供一行。对于 typed-decision 协议，setup 会先真实验证当前候选 route，再写入既有 mode-`0600` 的 `config.json`；验证失败不会修改原配置。`status --json` 提供机器可读结果，也不会返回 API Key。
+
+`decide`、`choose`、`score` 复用 Browser Auto、planning、Parent orchestration、Work Memory 正在使用的同一个 Runtime `SemanticService` route pool。结构化输入使用 `--state-json`。没有配置 semantic route 时，CLI 会明确说明判断不可用，Herdr 的确定性路径保持不变。
+
 ## 源码开发 Runtime：DEV / PROD
 
 当前 runtime 只有这一条正式路径可以让开发机 dogfood herdr-mcp 源码，同时始终保留稳定 PROD 恢复源：

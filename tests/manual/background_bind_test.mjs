@@ -83,6 +83,7 @@ let targetComposerReadyAfter = 0;
 let targetProbeCount = 0;
 let targetSeedCount = 0;
 let seedTemplateCaptures = [];
+let seedRequiredAppsCaptures = [];
 let tabCreateCount = 0;
 let tabUpdateCount = 0;
 let lastTabUpdate = null;
@@ -248,6 +249,7 @@ function targetListener(tab) {
     if (msg?.type === "h2w_handoff_seed") {
       targetSeedCount += 1;
       seedTemplateCaptures.push(msg.template || "");
+      seedRequiredAppsCaptures.push(Array.isArray(msg.requiredApps) ? [...msg.requiredApps] : []);
       if (handoffSeedMode === "confirmed") {
         targetSeeded = true;
         tab.url = PROJECT_TARGET_URL;
@@ -1152,10 +1154,10 @@ console.log("\n[Claude listener-less recovery]");
     JSON.stringify({ convInfo: fallbackState?.convInfo, reloads: reloadCalls.slice(reloadsBeforeFallback) }));
 }
 
-console.log("\n[Grok supported optional-origin registration and recovery]");
+console.log("\n[Grok supported default-origin registration and recovery]");
 {
   ok(await waitForTest(() => registeredContentScripts.has("herdr-supported-grok")),
-    "supported Grok registers one dynamic content script when site permission exists");
+    "supported Grok registers one dynamic content script from its required site permission");
   const script = registeredContentScripts.get("herdr-supported-grok") || {};
   ok(script.matches?.[0] === "https://grok.com/*"
       && script.js?.includes("content/injector/grok.js")
@@ -1164,31 +1166,8 @@ console.log("\n[Grok supported optional-origin registration and recovery]");
     "Grok dynamic script is exact-origin scoped and does not inherit the JSON bridge",
     JSON.stringify(script));
 
-  await chrome.permissions.remove({ origins: ["https://grok.com/*"] });
-  ok(await waitForTest(() => !registeredContentScripts.has("herdr-supported-grok")),
-    "revoking Grok site access unregisters its dynamic content script");
-  const blocked = await dispatchMessage({
-    type: "h2w_register",
-    site: "grok",
-    convKey: GROK_CHAT_KEY,
-    url: GROK_CHAT_URL,
-    accountNativeIdentity: `grok-account-sha256:${"e".repeat(64)}`,
-  }, { tab: { id: 905, url: GROK_CHAT_URL } });
-  ok(blocked?.ok === false && blocked?.error === "site-access-disabled",
-    "Grok registration fails closed without supported site access",
-    JSON.stringify(blocked));
-
   const fallbackTabId = 906;
   tabs.set(fallbackTabId, { id: fallbackTabId, url: GROK_CHAT_URL, status: "complete", listener: null });
-  const reloadsBeforeEnable = reloadCalls.length;
-  await chrome.permissions.request({ origins: ["https://grok.com/*"] });
-  ok(await waitForTest(() => registeredContentScripts.has("herdr-supported-grok")),
-    "granting Grok site access re-registers the dynamic content script");
-  ok(reloadCalls.slice(reloadsBeforeEnable).some((call) => call.tabId === fallbackTabId),
-    "first Grok dynamic-script registration reloads an already-open complete Grok tab once",
-    JSON.stringify(reloadCalls.slice(reloadsBeforeEnable)));
-
-  tabs.get(fallbackTabId).listener = null;
   const reloadsBeforeFallback = reloadCalls.length;
   const fallbackState = await dispatchMessage({ type: "h2w_state", tabId: fallbackTabId });
   ok(fallbackState?.convInfo?.site === "grok"
@@ -1685,11 +1664,26 @@ console.log("\n[binding flow]");
 {
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
-  onMsg({ type: "h2w_register", convKey: CONV, url: CONV, site: "chatgpt" }, { tab: { id: 202 } }, (r) => resolveP(r));
+  onMsg({
+    type: "h2w_register",
+    convKey: CONV,
+    url: CONV,
+    site: "chatgpt",
+    browserAppKeywords: ["herdr-mcp"],
+  }, { tab: { id: 202 } }, (r) => resolveP(r));
   const r = await p;
   ok(r?.bound === true && (r.workspace_id === "wH" || r.pane === "wH:p1"), "register restores the binding", JSON.stringify(r));
   ok(storage.herdrWakeBindings[SK_WH].tabId === 202, "tabId updated on first binding");
   ok(storage.herdrWakeBindings[`${CONV}::w2Y`].tabId === 202, "tabId updated on second binding");
+  ok(r?.herdr_app_keyword === "herdr-mcp"
+      && storage.herdrWakeBindings[SK_WH].herdr_app_keyword === "herdr-mcp"
+      && storage.herdrWakeBindings[`${CONV}::w2Y`].herdr_app_keyword === "herdr-mcp",
+    "register persists the observed ChatGPT Herdr app keyword on every matching binding",
+    JSON.stringify({
+      response: r,
+      first: storage.herdrWakeBindings[SK_WH],
+      second: storage.herdrWakeBindings[`${CONV}::w2Y`],
+    }));
 }
 
 // ---- Scenario 5: unbind one workspace ----
@@ -2502,6 +2496,7 @@ console.log("\n[project handoff]");
   targetProbeCount = 0;
   targetSeedCount = 0;
   seedTemplateCaptures = [];
+  seedRequiredAppsCaptures = [];
   projectNavigationReadyAfter = 2;
   projectNavigationPollCount = 0;
   sourceProbeLooksSeeded = true;
@@ -2523,6 +2518,20 @@ console.log("\n[project handoff]");
       && storage.herdrWakeBindings[sourceKey]?.binding_scope === "project"
       && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
     "Project binding is stable while the source conversation is the active target");
+  let resolveRegisterApp;
+  const registerAppP = new Promise((r) => { resolveRegisterApp = r; });
+  onMsg({
+    type: "h2w_register",
+    convKey: PROJECT_SOURCE,
+    url: PROJECT_SOURCE_URL,
+    site: "chatgpt",
+    browserAppKeywords: ["herdr-custom"],
+  }, { tab: { id: 401, url: PROJECT_SOURCE_URL } }, (r) => resolveRegisterApp(r));
+  const registeredApp = await registerAppP;
+  ok(registeredApp?.bound === true
+      && storage.herdrWakeBindings[sourceKey]?.herdr_app_keyword === "herdr-custom",
+    "Project source learns the provider-owned custom Herdr App identity",
+    JSON.stringify(registeredApp));
   const continuityId = storage.herdrWakeBindings[sourceKey].continuity_id;
 
   let resolveHudOff;
@@ -2666,6 +2675,11 @@ console.log("\n[project handoff]");
       && !seedTemplateCaptures[0].includes("<<<HERDR_HANDOFF_V1"),
     "ChatGPT target seed carries continuity id and old conversation URL without a legacy packet",
     JSON.stringify(seedTemplateCaptures).slice(0, 200));
+  ok(seedRequiredAppsCaptures.length === 1
+      && seedRequiredAppsCaptures[0].length === 1
+      && seedRequiredAppsCaptures[0][0] === "herdr-custom",
+    "ChatGPT target seed inherits the source binding custom App identity before target registration",
+    JSON.stringify(seedRequiredAppsCaptures));
   ok(!!storage.herdrWakeBindings[sourceKey]
       && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
     "Project binding stays on the source target while target delivery is uncertain");
@@ -2687,6 +2701,8 @@ console.log("\n[project handoff]");
     "committed rollover keeps the Project binding and switches only its active conversation target");
   ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
     "continuity id survives the Project target switch");
+  ok(storage.herdrWakeBindings[targetKey]?.herdr_app_keyword === "herdr-custom",
+    "Project rollover preserves the learned custom Herdr App identity");
   ok(storage.herdrWakeBindings[targetKey]?.handoff_from === PROJECT_SOURCE,
     "Project binding records its predecessor conversation");
   let resolveTargetHud;

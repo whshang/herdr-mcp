@@ -45,17 +45,35 @@ class ChatGPTAdapter extends BaseAdapter {
     return [...selected];
   }
 
-  composerHasOnlyAppPills(requiredApps = []) {
+  getLatestUserAppKeywords(latestUser = null) {
+    const latest = latestUser || (() => {
+      const turns = [...document.querySelectorAll('[data-message-author-role="user"]')];
+      return turns[turns.length - 1] || null;
+    })();
+    if (!latest) return [];
+    const selected = new Set();
+    for (const pill of latest.querySelectorAll('[data-inline-selection-pill][data-symbol="ecosystemMention"][data-keyword]')) {
+      const keyword = String(pill.getAttribute('data-keyword') || '').trim().toLowerCase();
+      if (keyword) selected.add(keyword);
+    }
+    return [...selected];
+  }
+
+  getComposerTextWithoutAppPills() {
     const input = this.getInputEl();
-    if (!input) return false;
-    const requested = [...new Set(requiredApps.map((app) => String(app || '').trim().toLowerCase()).filter(Boolean))];
-    const selected = this.getSelectedComposerApps();
-    if (!requested.length || requested.some((app) => !selected.includes(app))) return false;
+    if (!input) return '';
     const clone = input.cloneNode(true);
     for (const node of clone.querySelectorAll('[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]')) {
       node.remove();
     }
-    return String(clone.textContent || '').replace(/\uFEFF/g, '').trim() === '';
+    return String(clone.textContent || '').replace(/\uFEFF/g, '').trim();
+  }
+
+  composerHasOnlyAppPills(requiredApps = []) {
+    const requested = [...new Set(requiredApps.map((app) => String(app || '').trim().toLowerCase()).filter(Boolean))];
+    const selected = this.getSelectedComposerApps();
+    if (!requested.length || requested.some((app) => !selected.includes(app))) return false;
+    return this.getComposerTextWithoutAppPills() === '';
   }
 
   openComposerAppsMenu() {
@@ -72,6 +90,19 @@ class ChatGPTAdapter extends BaseAdapter {
     const input = this.getInputEl();
     if (!wanted || !input) return [];
     const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    const menuRoots = [...document.querySelectorAll('.popover, [role="menu"], [role="listbox"]')]
+      .filter((node) => visible(node) && !input.contains(node));
+    if (!menuRoots.length) return [];
+    const keywordMatches = (element) => {
+      const nodes = [
+        element,
+        ...Array.from(element.querySelectorAll?.('[data-keyword], [data-value]') || []),
+      ];
+      return nodes.some((candidate) => [
+        candidate?.getAttribute?.('data-keyword'),
+        candidate?.getAttribute?.('data-value'),
+      ].some((value) => String(value || '').trim().toLowerCase() === wanted));
+    };
     const seen = new Set();
     const matches = [];
     const selectors = [
@@ -80,22 +111,25 @@ class ChatGPTAdapter extends BaseAdapter {
       '[data-testid*="app"]',
       '[tabindex="0"]',
     ];
-    for (const node of document.querySelectorAll(selectors.join(','))) {
-      if (!visible(node) || input.contains(node) || seen.has(node)) continue;
-      const text = [
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('data-value'),
-      ].filter(Boolean).join(' ').trim().toLowerCase();
-      if (!text.includes(wanted)) continue;
-      seen.add(node);
-      matches.push(node);
+    for (const root of menuRoots) {
+      for (const node of root.querySelectorAll(selectors.join(','))) {
+        if (!visible(node) || input.contains(node) || seen.has(node)) continue;
+        const text = [
+          node.textContent,
+          node.getAttribute('aria-label'),
+          node.getAttribute('data-value'),
+        ].filter(Boolean).join(' ').trim().toLowerCase();
+        if (!keywordMatches(node) && !text.includes(wanted)) continue;
+        seen.add(node);
+        matches.push(node);
+      }
     }
     return matches.sort((a, b) => {
       const score = (node) => {
         const role = node.getAttribute('role') || '';
         const testid = node.getAttribute('data-testid') || '';
         let value = 0;
+        if (keywordMatches(node)) value += 100;
         if (role === 'option') value += 50;
         if (role === 'menuitem') value += 40;
         if (/app|connector|mention/i.test(testid)) value += 20;
