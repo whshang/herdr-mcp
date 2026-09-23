@@ -1,9 +1,0 @@
-[runtime]
-port = 8772
-
-[dev]
-port = 8872
-
-[update]
-channel = "stable"
-check = true

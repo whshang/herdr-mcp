@@ -8,7 +8,7 @@ import { expectedSupabaseRelaySource } from "../scripts/build-supabase-relay.mjs
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const generatedPath = path.join(
   repoRoot,
-  "supabase/functions/herdr-relay/index.ts",
+  "relay/supabase/functions/herdr-relay/index.ts",
 );
 
 test("Supabase Relay bundle is generated from the Deno Relay source", () => {

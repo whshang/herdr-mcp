@@ -46,7 +46,7 @@ test("relay adapters expected runtime contract constants match the runtime-exec-
 
   for (const relativePath of [
     "relay/deno/server.ts",
-    "supabase/functions/herdr-relay/index.ts",
+    "relay/supabase/functions/herdr-relay/index.ts",
   ]) {
     const source = await readFile(new URL(relativePath, root), "utf8");
     const epochMatch = source.match(/export const EXPECTED_RUNTIME_CONTRACT_EPOCH = (\d+);/);
