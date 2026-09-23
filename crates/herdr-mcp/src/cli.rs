@@ -2651,7 +2651,7 @@ User path:\n\
   herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
   herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
-  herdr-mcp worker bootstrap  (macOS/Linux first device; guided Cloudflare Worker + enrollment bootstrap)\n\
+  herdr-mcp worker bootstrap  (macOS/Linux/Windows first device; guided Cloudflare Worker + enrollment bootstrap)\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME] [--recover-device DEVICE_ID]  (macOS/Linux/Windows enrolled device; creates pairing or exact-device credential recovery)\n  herdr-mcp worker credential-repair prepare|apply|finalize  (advanced headless repair; device secret never leaves the target machine)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS/Linux/Windows; uses the platform credential store and reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp worker update  (existing fleet; release-matched in-place Edge reconcile)\n\
@@ -4479,7 +4479,7 @@ mod tests {
         assert!(text.contains("herdr-mcp status [--verbose]"));
         assert!(text.contains("herdr-mcp doctor [--verbose|--json]"));
         assert!(text.contains("default is concise"));
-        assert!(text.contains("worker bootstrap  (macOS/Linux first device"));
+        assert!(text.contains("worker bootstrap  (macOS/Linux/Windows first device"));
         assert!(
             text.contains("worker connect <pairing-address> [--name NAME]  (macOS/Linux/Windows")
         );
