@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.2 — 2026-09-24
+
+- 修复 v0.4.x schema-5 用户通过 v0.4.9 migration bridge 升级到 1.0.x 时的错误回滚：当 Runtime/schema/service/Link/native-host 已成功提交，仅 Herdr Server readiness 暂未收敛时，major migration 现在保留已提交的新 Runtime 并报告可恢复警告；普通 `herdr-mcp install` 仍严格要求 Herdr Server/API ready，其他迁移与回滚失败继续 fail-closed。v0.4.3 与 v0.4.8 都可继续直接执行 `herdr-mcp update`，无需逐版本升级。 [PR #554](https://github.com/whshang/herdr-mcp/pull/554)
+
 ## v1.0.1 — 2026-09-23
 
 - Explicit `herdr-mcp install` now self-repairs the Herdr dependency: it resolves stable install locations even when shell PATH is incomplete, verifies/updates an existing Herdr CLI, invokes the official installer when absent, and verifies the local Herdr Server/API before installation is considered complete. Stable 1.x continues to publish only `runtime-manifest.json`; the public v0.4.8 major-upgrade path continues to use the dedicated v0.4.9 bridge. Runtime schema/contract and browser extension 0.1.133 are unchanged. [PR #546](https://github.com/whshang/herdr-mcp/pull/546)
