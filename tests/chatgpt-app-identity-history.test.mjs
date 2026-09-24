@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 
 const SOURCE_FILES = {
   background: "extension/background.js",
@@ -16,16 +17,17 @@ const FIXTURE_ROOT = path.join(
   "chatgpt-app-identity-history",
 );
 
-function fixtureDir(version) {
-  return path.join(FIXTURE_ROOT, version);
-}
+const HISTORICAL_SOURCE = JSON.parse(gunzipSync(
+  fs.readFileSync(path.join(FIXTURE_ROOT, "history.json.gz")),
+).toString("utf8"));
 
 function historicalSource(version) {
-  const dir = fixtureDir(version);
+  const source = HISTORICAL_SOURCE[version];
+  assert.ok(source, `missing historical fixture for ${version}`);
   return {
-    background: fs.readFileSync(path.join(dir, "background.js"), "utf8"),
-    wake: fs.readFileSync(path.join(dir, "wake.js"), "utf8"),
-    adapter: fs.readFileSync(path.join(dir, "chatgpt.js"), "utf8"),
+    background: source.background,
+    wake: source.wake,
+    adapter: source.adapter,
   };
 }
 
@@ -43,8 +45,7 @@ function sourceSlice(source, startMarker, endMarker) {
 }
 
 function manifestVersion(version) {
-  const raw = fs.readFileSync(path.join(fixtureDir(version), "manifest.json"), "utf8");
-  return JSON.parse(raw).version;
+  return HISTORICAL_SOURCE[version]?.version;
 }
 
 const probes = {
