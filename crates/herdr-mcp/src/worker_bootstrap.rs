@@ -156,6 +156,10 @@ pub(crate) struct ExistingWorkerStatus {
     pub worker_name: String,
     pub edge_version: String,
     pub target_version: String,
+    /// The Worker was identified through the 0.4.x wrangler template's generic
+    /// `EDGE_PROJECT = "herdr-edge"`; the script name came from its workers.dev
+    /// origin. An in-place update rewrites EDGE_PROJECT to the script name.
+    pub legacy_generic_project: bool,
 }
 
 impl ExistingWorkerStatus {
@@ -628,7 +632,7 @@ pub(crate) fn existing_worker_status(
     target_version: &str,
 ) -> Result<Option<ExistingWorkerStatus>, String> {
     let config = crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    let Some(edge_origin) = config.edge_public_origin else {
+    let Some(edge_origin) = configured_or_link_edge_origin(&config, paths)? else {
         return Ok(None);
     };
     let client = client_for_edge_origin(&edge_origin)?;
@@ -647,12 +651,8 @@ pub(crate) fn existing_worker_status(
         .json()
         .map_err(|_| "current Worker health returned invalid JSON".to_owned())?;
     validate_edge_transport_payload(&payload, &edge_origin)?;
-    let worker_name = payload
-        .get("service")
-        .and_then(Value::as_str)
-        .filter(|value| valid_worker_name(value))
-        .ok_or_else(|| "current Worker health returned no valid service identity".to_owned())?
-        .to_owned();
+    let identity = resolve_worker_service_identity(&payload, &edge_origin)?;
+    let worker_name = identity.script_name;
     let edge_version = payload
         .get("edgeVersion")
         .and_then(Value::as_str)
@@ -664,7 +664,28 @@ pub(crate) fn existing_worker_status(
         worker_name,
         edge_version,
         target_version: target_version.to_owned(),
+        legacy_generic_project: identity.legacy_generic_project,
     }))
+}
+
+/// The Worker origin this computer uses. 1.x records it as
+/// `edge.public_origin`; pre-1.0 installs deployed from the wrangler template
+/// may record it only as the production Link's `HERDR_EDGE_URL`. Returning
+/// `None` makes `worker update` report `edge_not_configured`, so an origin that
+/// is present only in the Link must never be treated as "no Worker": the major
+/// upgrade bridge would otherwise report success while the old Worker, which
+/// rejects the 1.x Link, is left in place.
+fn configured_or_link_edge_origin(
+    config: &crate::config::Config,
+    paths: &RuntimePaths,
+) -> Result<Option<String>, String> {
+    if let Some(origin) = config.edge_public_origin.clone() {
+        return Ok(Some(origin));
+    }
+    if paths.instance.is_named() {
+        return Ok(None);
+    }
+    Ok(crate::worker::production_link_identity()?.and_then(|identity| identity.edge_origin))
 }
 
 pub(crate) fn update_current_worker(paths: &RuntimePaths) -> Result<Value, String> {
@@ -698,11 +719,22 @@ pub(crate) fn update_existing_worker_for_release(
         return Err("worker update requires an exact release source commit".to_owned());
     }
     let config = crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    if config.edge_device_id.is_none() {
-        return Err(
-            "worker update requires this computer to be enrolled in the existing fleet".to_owned(),
-        );
-    }
+    // An enrolled device id proves fleet membership directly. A pre-1.0
+    // single-device install (deployed from the wrangler template) never
+    // enrolled one; it may still update its own Worker when its production Link
+    // runs as that Worker's legacy default workstation. That claim is re-proved
+    // against the live Cloudflare settings below before any mutation.
+    let legacy_default_workstation = if config.edge_device_id.is_some() {
+        None
+    } else {
+        let workstation = crate::worker::production_link_identity()?
+            .and_then(|identity| identity.workstation_id)
+            .ok_or_else(|| {
+                "worker update requires this computer to be enrolled in the existing fleet, or to run that Worker's legacy default-workstation production Link"
+                    .to_owned()
+            })?;
+        Some(workstation)
+    };
     let Some(current) = existing_worker_status(paths, target_version)? else {
         return Ok(json!({
             "ok": true,
@@ -745,6 +777,10 @@ pub(crate) fn update_existing_worker_for_release(
         &current.worker_name,
         &current.edge_origin,
         &current.edge_version,
+        &LegacyWorkerExpectation {
+            generic_project: current.legacy_generic_project,
+            default_workstation_id: legacy_default_workstation.as_deref(),
+        },
     )?;
     let secret_names = cloudflare.list_secret_names(&account.id, &current.worker_name)?;
     let metadata = worker_update_metadata(
@@ -1871,6 +1907,31 @@ fn worker_update_metadata(
                 "WORKSTATION_DO" | "OAUTH_STORE_DO" | "DEVICE_REGISTRY_DO",
             )
             | ("plain_text", "EDGE_ENV" | "EDGE_PROJECT" | "EDGE_VERSION" | "OAUTH_ISSUER") => {}
+            // Pre-1.0 wrangler-template Workers authenticate their single
+            // non-enrolled Link as this workstation id, and the 1.x Edge still
+            // honours it for legacy-default routing/auth. It must survive the
+            // update byte-for-byte or that computer can never reconnect.
+            ("plain_text", "DEFAULT_WORKSTATION_ID") => {
+                let text = binding
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|value| valid_legacy_default_workstation_id(value))
+                    .ok_or_else(|| {
+                        "Worker DEFAULT_WORKSTATION_ID is invalid; refusing an update that could drop it"
+                            .to_owned()
+                    })?;
+                if !inherited_names.insert(name.to_owned()) {
+                    return Err(
+                        "Worker has more than one DEFAULT_WORKSTATION_ID; refusing in-place update"
+                            .to_owned(),
+                    );
+                }
+                desired.push(json!({
+                    "type": "plain_text",
+                    "name": "DEFAULT_WORKSTATION_ID",
+                    "text": text,
+                }));
+            }
             // Cloudflare's upload API can inherit an existing binding by name.
             // Use the strict inheritance query on the update call so a missing
             // prior secret is a hard failure rather than a silently dropped
@@ -1939,11 +2000,59 @@ fn worker_update_metadata(
     Ok(metadata)
 }
 
+/// What the live Cloudflare settings of a pre-1.0 Worker must additionally
+/// prove before an in-place update. `Default` means an ordinary 1.x Worker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LegacyWorkerExpectation<'a> {
+    /// Health identified the Worker through the generic template project.
+    generic_project: bool,
+    /// This computer has no enrolled device id; its production Link must be
+    /// exactly this Worker's `DEFAULT_WORKSTATION_ID`.
+    default_workstation_id: Option<&'a str>,
+}
+
+/// Same acceptance rule the Edge applies to `DEFAULT_WORKSTATION_ID`.
+fn valid_legacy_default_workstation_id(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+fn legacy_default_workstation_binding(bindings: &[Value]) -> Result<Option<String>, String> {
+    let matches = bindings
+        .iter()
+        .filter(|binding| {
+            binding.get("type").and_then(Value::as_str) == Some("plain_text")
+                && binding.get("name").and_then(Value::as_str) == Some("DEFAULT_WORKSTATION_ID")
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [binding] => {
+            let text = binding
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|value| valid_legacy_default_workstation_id(value))
+                .ok_or_else(|| {
+                    "Cloudflare Worker DEFAULT_WORKSTATION_ID is invalid; no mutation was attempted"
+                        .to_owned()
+                })?;
+            Ok(Some(text.to_owned()))
+        }
+        _ => Err(
+            "Cloudflare Worker has more than one DEFAULT_WORKSTATION_ID; no mutation was attempted"
+                .to_owned(),
+        ),
+    }
+}
+
 fn validate_existing_worker_settings(
     settings: &Value,
     worker_name: &str,
     edge_origin: &str,
     edge_version: &str,
+    legacy: &LegacyWorkerExpectation<'_>,
 ) -> Result<(), String> {
     let bindings = settings
         .get("bindings")
@@ -1966,9 +2075,23 @@ fn validate_existing_worker_settings(
         Ok(())
     };
     require_plain("EDGE_ENV", "prod")?;
-    require_plain("EDGE_PROJECT", worker_name)?;
+    let expected_project = if legacy.generic_project {
+        LEGACY_GENERIC_WORKER_SERVICE
+    } else {
+        worker_name
+    };
+    require_plain("EDGE_PROJECT", expected_project)?;
     require_plain("EDGE_VERSION", edge_version)?;
     require_plain("OAUTH_ISSUER", edge_origin)?;
+    let default_workstation = legacy_default_workstation_binding(bindings)?;
+    if let Some(expected) = legacy.default_workstation_id
+        && default_workstation.as_deref() != Some(expected)
+    {
+        return Err(
+            "this computer has no enrolled device id and its production Link is not this Worker's legacy default workstation; no mutation was attempted"
+                .to_owned(),
+        );
+    }
 
     for (name, class_name) in [
         ("WORKSTATION_DO", "WorkstationDO"),
@@ -2368,24 +2491,66 @@ fn probe_edge_transport(
     validate_edge_transport_payload(&payload, edge_origin).map_err(EdgeHealthProbeError::Validation)
 }
 
-fn validate_edge_transport_payload(payload: &Value, edge_origin: &str) -> Result<(), String> {
+/// `EDGE_PROJECT` of the 0.4.x wrangler user template
+/// (`edge/cloudflare/wrangler.user.example.toml`). Those Workers were renamed
+/// per machine at deploy time but kept this generic project value, so their
+/// `/health` reports `service: "herdr-edge"` instead of the script name.
+const LEGACY_GENERIC_WORKER_SERVICE: &str = "herdr-edge";
+
+/// The Cloudflare script a health payload identifies, and whether that
+/// identification relied on the legacy generic template project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerServiceIdentity {
+    script_name: String,
+    legacy_generic_project: bool,
+}
+
+fn resolve_worker_service_identity(
+    payload: &Value,
+    edge_origin: &str,
+) -> Result<WorkerServiceIdentity, String> {
     let service = payload
         .get("service")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Worker HTTP preflight returned no service identity".to_owned())?;
-    match expected_worker_service_from_origin(edge_origin)? {
-        Some(expected) if service != expected => {
+    let expected = expected_worker_service_from_origin(edge_origin)?;
+    if service == LEGACY_GENERIC_WORKER_SERVICE {
+        // Only a workers.dev origin (`<script>.<account>.workers.dev`) names
+        // the script unambiguously. A custom domain gives no such proof, so a
+        // generic legacy identity there is refused rather than guessed.
+        let Some(script_name) = expected else {
             return Err(
-                "Worker HTTP preflight service identity does not match Worker origin".to_owned(),
+                "Worker HTTP preflight reports the generic legacy Herdr project on a custom domain; the Cloudflare script cannot be identified safely"
+                    .to_owned(),
             );
-        }
-        Some(_) => {}
-        None if !valid_worker_name(service) || !service.starts_with("herdr-edge-") => {
-            return Err("Worker HTTP preflight service identity is not a Herdr Worker".to_owned());
-        }
-        None => {}
+        };
+        let legacy_generic_project = script_name != LEGACY_GENERIC_WORKER_SERVICE;
+        return Ok(WorkerServiceIdentity {
+            script_name,
+            legacy_generic_project,
+        });
     }
+    match expected {
+        Some(expected) if service != expected => {
+            Err("Worker HTTP preflight service identity does not match Worker origin".to_owned())
+        }
+        Some(expected) => Ok(WorkerServiceIdentity {
+            script_name: expected,
+            legacy_generic_project: false,
+        }),
+        None if !valid_worker_name(service) || !service.starts_with("herdr-edge-") => {
+            Err("Worker HTTP preflight service identity is not a Herdr Worker".to_owned())
+        }
+        None => Ok(WorkerServiceIdentity {
+            script_name: service.to_owned(),
+            legacy_generic_project: false,
+        }),
+    }
+}
+
+fn validate_edge_transport_payload(payload: &Value, edge_origin: &str) -> Result<(), String> {
+    resolve_worker_service_identity(payload, edge_origin)?;
     let contract = crate::link::edge_contract::parse_edge_health_contract(&payload.to_string())
         .map_err(|error| format!("Worker health runtime contract is invalid: {error}"))?;
     if !crate::link::daemon::is_runtime_rollback_compatible(
@@ -3838,6 +4003,7 @@ mod tests {
             "herdr-edge-mac",
             "https://mcp.example.com",
             "0.4.8",
+            &LegacyWorkerExpectation::default(),
         )
         .unwrap();
         let metadata = worker_update_metadata(
@@ -3890,6 +4056,7 @@ mod tests {
             "herdr-edge-mac",
             "https://mcp.example.com",
             "0.4.8",
+            &LegacyWorkerExpectation::default(),
         )
         .unwrap_err();
         assert!(error.contains("OAUTH_ISSUER"));
@@ -3916,6 +4083,214 @@ mod tests {
         assert!(error.contains("refusing"));
     }
 
+    /// Real `/health` of a field Worker deployed from the 0.4.x wrangler user
+    /// template (renamed script, generic `EDGE_PROJECT`, frozen epoch-2 view).
+    fn legacy_template_health() -> Value {
+        json!({
+            "ok": true,
+            "service": "herdr-edge",
+            "stage": "prod",
+            "edgeVersion": "0.1.0",
+            "edgeEnv": "prod",
+            "contractEpoch": 3,
+            "contractHash": "sha256:b8b4e5d13ccb3a1a7ab0c2e9ccfa913c076d0e1cd978cfe544d1261ea2509071",
+            "runtimeContractEpoch": 2,
+            "runtimeContractHash": crate::link::daemon::LEGACY_EPOCH2_CONTRACT_HASH,
+            "timestampMs": 1790223193902u64
+        })
+    }
+
+    const LEGACY_ORIGIN: &str =
+        "https://herdr-edge-cyandemacbook-air-local.herdr-6a888316.workers.dev";
+    const LEGACY_SCRIPT: &str = "herdr-edge-cyandemacbook-air-local";
+
+    fn legacy_template_settings(default_workstation: &str) -> Value {
+        json!({
+            "bindings": [
+                {"type": "durable_object_namespace", "name": "WORKSTATION_DO", "class_name": "WorkstationDO"},
+                {"type": "durable_object_namespace", "name": "OAUTH_STORE_DO", "class_name": "OAuthStoreDO"},
+                {"type": "durable_object_namespace", "name": "DEVICE_REGISTRY_DO", "class_name": "DeviceRegistryDO"},
+                {"type": "plain_text", "name": "EDGE_ENV", "text": "prod"},
+                {"type": "plain_text", "name": "EDGE_PROJECT", "text": "herdr-edge"},
+                {"type": "plain_text", "name": "EDGE_VERSION", "text": "0.1.0"},
+                {"type": "plain_text", "name": "DEFAULT_WORKSTATION_ID", "text": default_workstation},
+                {"type": "plain_text", "name": "OAUTH_ISSUER", "text": LEGACY_ORIGIN},
+                {"type": "secret_text", "name": "LINK_SHARED_SECRET"}
+            ]
+        })
+    }
+
+    #[test]
+    fn legacy_template_health_names_the_script_from_its_workers_dev_origin() {
+        let payload = legacy_template_health();
+        let identity = resolve_worker_service_identity(&payload, LEGACY_ORIGIN).unwrap();
+        assert_eq!(identity.script_name, LEGACY_SCRIPT);
+        assert!(identity.legacy_generic_project);
+        validate_edge_transport_payload(&payload, LEGACY_ORIGIN).unwrap();
+    }
+
+    #[test]
+    fn legacy_generic_identity_is_refused_on_a_custom_domain() {
+        let error =
+            resolve_worker_service_identity(&legacy_template_health(), "https://mcp.example.com")
+                .unwrap_err();
+        assert!(error.contains("custom domain"));
+    }
+
+    #[test]
+    fn modern_worker_identity_rules_are_unchanged() {
+        let origin = "https://herdr-edge-mac.example.workers.dev";
+        let mut payload = legacy_template_health();
+        payload["service"] = json!("herdr-edge-mac");
+        let identity = resolve_worker_service_identity(&payload, origin).unwrap();
+        assert_eq!(identity.script_name, "herdr-edge-mac");
+        assert!(!identity.legacy_generic_project);
+
+        payload["service"] = json!("herdr-edge-other");
+        assert!(
+            resolve_worker_service_identity(&payload, origin)
+                .unwrap_err()
+                .contains("does not match Worker origin")
+        );
+        payload["service"] = json!("some-other-worker");
+        assert!(
+            resolve_worker_service_identity(&payload, "https://mcp.example.com")
+                .unwrap_err()
+                .contains("is not a Herdr Worker")
+        );
+    }
+
+    #[test]
+    fn legacy_template_worker_updates_in_place_keeping_its_default_workstation() {
+        let settings = legacy_template_settings("my-workstation");
+        validate_existing_worker_settings(
+            &settings,
+            LEGACY_SCRIPT,
+            LEGACY_ORIGIN,
+            "0.1.0",
+            &LegacyWorkerExpectation {
+                generic_project: true,
+                default_workstation_id: Some("my-workstation"),
+            },
+        )
+        .unwrap();
+        let metadata = worker_update_metadata(
+            LEGACY_SCRIPT,
+            LEGACY_ORIGIN,
+            "1.0.3",
+            &settings,
+            &["LINK_SHARED_SECRET".to_owned()],
+        )
+        .unwrap();
+        let bindings = metadata.get("bindings").and_then(Value::as_array).unwrap();
+        let plain = |name: &str| {
+            bindings
+                .iter()
+                .filter(|binding| {
+                    binding.get("type").and_then(Value::as_str) == Some("plain_text")
+                        && binding.get("name").and_then(Value::as_str) == Some(name)
+                })
+                .filter_map(|binding| binding.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        };
+        // Legacy single-device auth survives byte-for-byte, exactly once.
+        assert_eq!(plain("DEFAULT_WORKSTATION_ID"), vec!["my-workstation"]);
+        // The Worker converges to the standard 1.x identity after the update.
+        assert_eq!(plain("EDGE_PROJECT"), vec![LEGACY_SCRIPT]);
+        assert_eq!(plain("EDGE_VERSION"), vec!["1.0.3"]);
+        assert_eq!(plain("OAUTH_ISSUER"), vec![LEGACY_ORIGIN]);
+        assert!(bindings.iter().any(|binding| {
+            binding.get("name").and_then(Value::as_str) == Some("LINK_SHARED_SECRET")
+                && binding.get("type").and_then(Value::as_str) == Some("inherit")
+        }));
+        assert!(metadata.get("migrations").is_none());
+    }
+
+    #[test]
+    fn legacy_update_refuses_a_computer_that_is_not_the_default_workstation() {
+        let error = validate_existing_worker_settings(
+            &legacy_template_settings("my-workstation"),
+            LEGACY_SCRIPT,
+            LEGACY_ORIGIN,
+            "0.1.0",
+            &LegacyWorkerExpectation {
+                generic_project: true,
+                default_workstation_id: Some("another-workstation"),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy default workstation"));
+        assert!(error.contains("no mutation"));
+    }
+
+    #[test]
+    fn legacy_update_refuses_a_non_enrolled_computer_when_worker_has_no_default() {
+        let mut settings = legacy_template_settings("my-workstation");
+        settings["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|binding| binding["name"] != "DEFAULT_WORKSTATION_ID");
+        let error = validate_existing_worker_settings(
+            &settings,
+            LEGACY_SCRIPT,
+            LEGACY_ORIGIN,
+            "0.1.0",
+            &LegacyWorkerExpectation {
+                generic_project: true,
+                default_workstation_id: Some("my-workstation"),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy default workstation"));
+    }
+
+    #[test]
+    fn generic_legacy_project_is_accepted_only_when_health_proved_it() {
+        let error = validate_existing_worker_settings(
+            &legacy_template_settings("my-workstation"),
+            LEGACY_SCRIPT,
+            LEGACY_ORIGIN,
+            "0.1.0",
+            &LegacyWorkerExpectation::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("EDGE_PROJECT"));
+    }
+
+    #[test]
+    fn worker_update_refuses_invalid_or_duplicate_default_workstation() {
+        let mut invalid = legacy_template_settings("bad/id");
+        assert!(
+            validate_existing_worker_settings(
+                &invalid,
+                LEGACY_SCRIPT,
+                LEGACY_ORIGIN,
+                "0.1.0",
+                &LegacyWorkerExpectation {
+                    generic_project: true,
+                    default_workstation_id: None,
+                },
+            )
+            .unwrap_err()
+            .contains("DEFAULT_WORKSTATION_ID is invalid")
+        );
+        assert!(
+            worker_update_metadata(LEGACY_SCRIPT, LEGACY_ORIGIN, "1.0.3", &invalid, &[])
+                .unwrap_err()
+                .contains("DEFAULT_WORKSTATION_ID")
+        );
+
+        invalid = legacy_template_settings("my-workstation");
+        invalid["bindings"].as_array_mut().unwrap().push(
+            json!({"type": "plain_text", "name": "DEFAULT_WORKSTATION_ID", "text": "second"}),
+        );
+        assert!(
+            worker_update_metadata(LEGACY_SCRIPT, LEGACY_ORIGIN, "1.0.3", &invalid, &[])
+                .unwrap_err()
+                .contains("more than one")
+        );
+    }
+
     #[test]
     fn worker_update_readback_waits_only_for_same_identity_stale_version() {
         let previous = ExistingWorkerStatus {
@@ -3923,6 +4298,7 @@ mod tests {
             worker_name: "herdr-edge-mac".to_owned(),
             edge_version: "1.0.0-alpha.8".to_owned(),
             target_version: "1.0.0-alpha.9".to_owned(),
+            legacy_generic_project: false,
         };
         let stale = previous.clone();
         assert!(!worker_update_readback_converged(&previous, &stale, "1.0.0-alpha.9").unwrap());
