@@ -1025,7 +1025,7 @@ test("refresh_token rotates: new pair issued, old token rejected on replay", asy
   assert.equal(again.status, 200);
 });
 
-test("refresh_token migrates a proven workers.dev resource to the custom-domain identity", async () => {
+test("user migrates an existing Connector refresh token | Given a proven workers.dev resource and a configured custom domain | When the legacy refresh token is exchanged | Then the replacement pair uses the custom-domain identity", async () => {
   const legacyIdentity = createOAuthIdentity("https://herdr-edge-nathan.example.workers.dev");
   const opts = makeOptions({ identity: legacyIdentity });
   const { client_id } = await registerClient(opts, { token_endpoint_auth_method: "none" });

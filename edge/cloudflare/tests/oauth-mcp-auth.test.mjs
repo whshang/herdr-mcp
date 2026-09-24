@@ -124,7 +124,7 @@ test("migrated public-PEM JWT obeys the injected legacy client grant fence", asy
   }), { ok: false, code: "mcp_auth_failed" });
 });
 
-test("proven legacy issuer alias keeps existing PEM access JWT valid after custom-domain cutover", async () => {
+test("user keeps the existing Connector session | Given a Cloudflare-proven legacy workers.dev issuer alias | When the custom-domain cutover verifies an existing PEM access JWT | Then the JWT remains valid without re-adding the Connector", async () => {
   const kp = await keyPair();
   const pem = await publicPem(kp.publicKey);
   const now = Math.floor(Date.now() / 1000);

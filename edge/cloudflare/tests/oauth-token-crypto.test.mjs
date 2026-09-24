@@ -270,7 +270,7 @@ test("assertion: wrong aud -> bad_audience", async () => {
   assert.deepEqual(verdict, { ok: false, code: "bad_audience" });
 });
 
-test("assertion: exact migration audience is accepted only when explicitly supplied", async () => {
+test("user preserves private-key JWT authentication during issuer migration | Given the exact proven legacy token endpoint audience | When that migration audience is explicitly supplied | Then the assertion is accepted and unrelated audiences remain rejected", async () => {
   const kp = await generateRsaKeyPair();
   const jwk = await exportJwk(kp.publicKey, "kid-legacy-aud");
   const now = 1_700_000_000;

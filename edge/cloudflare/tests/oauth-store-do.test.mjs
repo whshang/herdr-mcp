@@ -1041,7 +1041,7 @@ test("token issue + refresh exchange uses Edge signing key and rotates one-time 
   assert.equal((await body(replay)).code, "invalid_grant");
 });
 
-test("custom-domain migration accepts old issuer JWT and atomically rotates old refresh resource", async () => {
+test("user keeps OAuth continuity during custom-domain migration | Given an old issuer JWT and refresh resource for the same proven Worker | When the Durable Object verifies and rotates them | Then access stays valid and the replacement refresh uses the custom-domain resource", async () => {
   const legacyIssuer = "https://herdr-edge-nathan.example.workers.dev";
   const currentIssuer = "https://mcp.example.com";
   const env = { OAUTH_ISSUER: legacyIssuer };
