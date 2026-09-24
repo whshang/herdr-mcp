@@ -46,6 +46,10 @@ scrub_test_environment() {
     HERDR_STATE_DIR \
     HERDR_INSTALL_DIR \
     XDG_CONFIG_HOME
+  # The v0.4.x Skill compatibility tests validate the release-bundled policy
+  # document. Do not let a newer Pages deployment change this maintenance
+  # line's test input after the source/tag has been frozen.
+  export HERDR_SKILL_NETWORK=0
 }
 
 cleanup() {

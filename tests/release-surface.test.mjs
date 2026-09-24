@@ -129,6 +129,7 @@ test("shared gate scrubs production overrides and isolates the live Herdr test r
   assert.match(gate, /HERDR_STATE_DIR=/);
   assert.match(gate, /HERDR_SOCKET_PATH=/);
   assert.match(gate, /HERDR_INSTALL_DIR=/);
+  assert.match(gate, /export HERDR_SKILL_NETWORK=0/);
 });
 
 test("pinned Herdr bootstrap supports CI Linux and local macOS", async () => {
