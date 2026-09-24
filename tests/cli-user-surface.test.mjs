@@ -40,6 +40,21 @@ test("README keeps the exhaustive runtime CLI out of the primary user path", () 
   }
 });
 
+test("user keeps README support context | Given the concise GA landing pages | When README cleanup runs | Then FAQ and acknowledgements remain in every maintained language", () => {
+  const cases = [
+    ["README.md", /## 常见问题/, /## 相关项目与致谢/],
+    ["README.en.md", /## FAQ/, /## Related projects and acknowledgements/],
+    ["README.ja.md", /## よくある質問/, /## 関連プロジェクトと謝辞/],
+  ];
+  for (const [rel, faq, thanks] of cases) {
+    const doc = read(rel);
+    assert.match(doc, faq);
+    assert.match(doc, thanks);
+    assert.match(doc, /github\.com\/herdrdev\/herdr/);
+    assert.match(doc, /github\.com\/openai\/tunnel-client/);
+  }
+});
+
 test("cargo-built herdr-mcp --help lists the user path ahead of service", () => {
   // Only the worktree build artifact reflects this PR. Do not query runtime/current.
   const candidates = [

@@ -126,6 +126,61 @@ macOS Apple Silicon、Linux x86_64、Linux ARM64 は Production。Windows x86_64
 
 [Platform support](docs/i18n/ja/platform-support-matrix.md) · [CLI reference](docs/i18n/ja/cli-reference.md) · [全ドキュメント](https://whshang.github.io/herdr-mcp/ja/)
 
+## よくある質問
+
+### なぜ Cloudflare を使うのですか？
+
+ChatGPT は公開インターネット上で動作しますが、開発マシンは通常 NAT、firewall、変動するネットワーク、社内ネットワークの内側にあります。Herdr-MCP は workstation の受信ポートを公開せず、各 device から安定した Cloudflare entry へ outbound 接続します。
+
+Cloudflare は公開 MCP/OAuth endpoint、device routing、再接続調整、複数 device に必要な少量の共有 state も担当します。
+
+### Port forwarding、Tailscale、別の tunnel を使えますか？
+
+代替 transport が完全な代替になるには、ChatGPT から到達できる公開 HTTPS MCP endpoint、信頼できる TLS、認証/OAuth、安全な device routing、確実な再接続、明確な mutation delivery semantics を同時に提供する必要があります。
+
+private IP や Tailscale-only address は ChatGPT cloud から直接到達できません。現時点で正式にサポート・検証している経路は Cloudflare です。
+
+### 初回インストール後に Herdr window / Server が見つからない場合は？
+
+**v1.0.1** 以降、`herdr-mcp install` は既存 Herdr を自動検出・検証し、stable update を試みます。Herdr が存在しない場合は公式 installer を実行し、Herdr Server/API が実際に到達可能になるまで installation 完了とはみなしません。
+
+問題が残る場合：
+
+```bash
+herdr-mcp status
+herdr-mcp doctor
+```
+
+shell PATH から `herdr` が見えないだけで二つ目の Herdr を再インストールせず、`doctor` の repair path に従ってください。
+
+### `workstation_offline` が出たら？
+
+Edge は応答できても、対象 computer に validated live connection がない状態です。短い切断は自動再接続を待ちます。
+
+mutation では返された `delivery_state` / retry metadata に従い、delivery が uncertain の操作を盲目的に再実行しないでください。[トラブルシューティング](docs/i18n/ja/troubleshooting.md)も参照してください。
+
+### Chrome 拡張は必須ですか？
+
+いいえ。基本の ChatGPT → MCP → workstation 接続には不要です。Project binding、Control Center、browser continuity、次ターン queue、WebChat handoff が必要な場合に追加します。
+
+### 特定の Coding Agent が必須ですか？
+
+いいえ。決定的な作業は直接実行でき、複雑な作業は対象 computer 上の利用可能な互換 Agent に委譲できます。
+
+## 関連プロジェクトと謝辞
+
+Herdr-MCP は複数のオープンプロジェクトから成熟した考え方を参考にしています。
+
+- [Herdr](https://github.com/herdrdev/herdr) — 永続 workspace、terminal、Agent 環境。
+- [coding-tools-mcp](https://github.com/xyTom/coding-tools-mcp) — 決定的な Coding MCP tools。
+- [MCPX](https://github.com/opentokenz/mcpx) — 永続 remote MCP session と recovery。
+- [AgenticGPT](https://github.com/slhaf/AgenticGPT) — Remote Worker / managed jobs architecture。
+- [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) — Web planner / Codex executor collaboration。
+- [codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) — Codex harness + Web-model inference。
+- [OpenAI tunnel-client](https://github.com/openai/tunnel-client) — MCP-compatible service を ChatGPT に安全に公開する参考実装。
+
+これらはアイデアの出典と ecosystem context を示すもので、Herdr-MCP への依存や各 project / author による endorsement を意味しません。詳しくは [Ecosystem comparison](docs/i18n/ja/herdr-vs-ecosystem.md) を参照してください。
+
 ## License
 
 MIT
