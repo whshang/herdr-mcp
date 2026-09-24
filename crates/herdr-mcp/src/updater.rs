@@ -47,6 +47,7 @@ const MAJOR_TARGET_CONTRACT_EPOCH: u32 = 4;
 const MAJOR_TARGET_TOOL_COUNT: u32 = 18;
 const MAJOR_TARGET_CONTRACT_HASH: &str =
     "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135";
+const MIN_FINAL_RUNTIME_VERSION: &str = "1.0.3";
 const RELEASES_MAX_BYTES: usize = 1024 * 1024;
 const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 const ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -523,7 +524,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
                     )
                 } else {
                     format!(
-                        "migration bridge failed before a verified 1.0 activation: {error}; the v0.4.8 Runtime remains authoritative"
+                        "migration bridge failed before a verified 1.0 activation: {error}; the schema-5 source Runtime remains authoritative"
                     )
                 };
                 let _ =
@@ -560,7 +561,7 @@ fn run_major_update_bridge(
             job_id,
             "installing",
             Some(
-                "final Runtime verified; preserving the exact v0.4.8 binary and schema-5 snapshot before migration",
+                "final Runtime verified; preserving the exact schema-5 source Runtime binary and snapshot before migration",
             ),
             None,
             now_ms_i64(),
@@ -704,7 +705,7 @@ fn fetch_runtime_transition_plan() -> Result<RuntimeTransitionPlan, String> {
         return Ok(plan);
     }
     Err(
-        "no attested stable Runtime release is compatible with the v0.4.8 -> v1.0 migration bridge"
+        "no attested stable Runtime release is compatible with the schema-5 v0.4.x -> v1.0.3+ migration bridge"
             .to_owned(),
     )
 }
@@ -734,7 +735,12 @@ fn transition_manifest_subject(url: &Url) -> Result<&'static str, String> {
     }
 }
 
-fn runtime_manifest_is_bridge_compatible(value: &Value) -> bool {
+fn minimum_final_runtime_version() -> Version {
+    Version::parse(MIN_FINAL_RUNTIME_VERSION)
+        .expect("minimum final Runtime version must be valid semver")
+}
+
+fn runtime_manifest_matches_bridge_contract(value: &Value) -> bool {
     value.get("state_schema").and_then(Value::as_i64) == Some(MAJOR_TARGET_SCHEMA)
         && value.pointer("/contract/epoch").and_then(Value::as_u64)
             == Some(u64::from(MAJOR_TARGET_CONTRACT_EPOCH))
@@ -744,6 +750,15 @@ fn runtime_manifest_is_bridge_compatible(value: &Value) -> bool {
             .pointer("/contract/tool_count")
             .and_then(Value::as_u64)
             == Some(u64::from(MAJOR_TARGET_TOOL_COUNT))
+}
+
+fn runtime_manifest_is_bridge_compatible(value: &Value) -> bool {
+    runtime_manifest_matches_bridge_contract(value)
+        && value
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(|raw| Version::parse(raw).ok())
+            .is_some_and(|version| version >= minimum_final_runtime_version())
 }
 
 fn parse_runtime_transition_plan(
@@ -756,8 +771,10 @@ fn parse_runtime_transition_plan(
     {
         return Err("Runtime release manifest identity is invalid".to_owned());
     }
-    if !runtime_manifest_is_bridge_compatible(value) {
-        return Err("Runtime release is outside the qualified v0.4.8 -> v1.0 bridge".to_owned());
+    if !runtime_manifest_matches_bridge_contract(value) {
+        return Err(
+            "Runtime release is outside the qualified schema-5 v0.4.x -> v1.0.3+ bridge".to_owned(),
+        );
     }
     let version_text = value
         .get("version")
@@ -765,6 +782,12 @@ fn parse_runtime_transition_plan(
         .ok_or_else(|| "Runtime release manifest is missing version".to_owned())?;
     let version = Version::parse(version_text)
         .map_err(|_| "Runtime release manifest version is not semver".to_owned())?;
+    let minimum = minimum_final_runtime_version();
+    if version < minimum {
+        return Err(format!(
+            "Runtime release {version} predates minimum safe migration target v{MIN_FINAL_RUNTIME_VERSION}"
+        ));
+    }
     if version <= Version::parse(env!("CARGO_PKG_VERSION")).unwrap() {
         return Err("Runtime transition target is not newer than the migration bridge".to_owned());
     }
@@ -1934,14 +1957,31 @@ mod tests {
     #[test]
     fn migration_bridge_accepts_only_the_qualified_runtime_contract() {
         let target = current_target().unwrap();
-        let manifest = runtime_manifest_for(target, "1.0.0");
+        let manifest = runtime_manifest_for(target, "1.0.3");
         assert!(runtime_manifest_is_bridge_compatible(&manifest));
         let plan = parse_runtime_transition_plan(&manifest, target).unwrap();
-        assert_eq!(plan.version, Version::parse("1.0.0").unwrap());
+        assert_eq!(plan.version, Version::parse("1.0.3").unwrap());
         assert_eq!(plan.state_schema, MAJOR_TARGET_SCHEMA);
         assert_eq!(plan.contract_epoch, MAJOR_TARGET_CONTRACT_EPOCH);
         assert_eq!(plan.contract_hash, MAJOR_TARGET_CONTRACT_HASH);
         assert_eq!(plan.contract_tool_count, MAJOR_TARGET_TOOL_COUNT);
+
+        let too_old = runtime_manifest_for(target, "1.0.2");
+        assert!(!runtime_manifest_is_bridge_compatible(&too_old));
+        assert!(
+            parse_runtime_transition_plan(&too_old, target)
+                .unwrap_err()
+                .contains("minimum safe migration target v1.0.3")
+        );
+
+        let future_compatible = runtime_manifest_for(target, "1.0.4");
+        assert!(runtime_manifest_is_bridge_compatible(&future_compatible));
+        assert_eq!(
+            parse_runtime_transition_plan(&future_compatible, target)
+                .unwrap()
+                .version,
+            Version::parse("1.0.4").unwrap()
+        );
 
         let mut wrong_schema = manifest.clone();
         wrong_schema["state_schema"] = json!(MAJOR_TARGET_SCHEMA + 1);
@@ -2002,14 +2042,14 @@ mod tests {
         fs::write(
             &binary,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' 'herdr-mcp 1.0.0' 'contract epoch {} / {} tools' 'state schema {}'\n",
+                "#!/bin/sh\nprintf '%s\\n' 'herdr-mcp 1.0.3' 'contract epoch {} / {} tools' 'state schema {}'\n",
                 MAJOR_TARGET_CONTRACT_EPOCH, MAJOR_TARGET_TOOL_COUNT, MAJOR_TARGET_SCHEMA
             ),
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let plan = parse_runtime_transition_plan(
-            &runtime_manifest_for(current_target().unwrap(), "1.0.0"),
+            &runtime_manifest_for(current_target().unwrap(), "1.0.3"),
             current_target().unwrap(),
         )
         .unwrap();
@@ -2017,7 +2057,7 @@ mod tests {
 
         fs::write(
             &binary,
-            "#!/bin/sh\nprintf '%s\\n' 'herdr-mcp 1.0.0' 'contract epoch 3 / 18 tools' 'state schema 15'\n",
+            "#!/bin/sh\nprintf '%s\\n' 'herdr-mcp 1.0.3' 'contract epoch 3 / 18 tools' 'state schema 15'\n",
         )
         .unwrap();
         assert!(probe_runtime_transition_binary(&binary, &plan).is_err());
@@ -2166,6 +2206,31 @@ mod tests {
         assert_eq!(
             select_release_tag(&releases, UpdateChannel::Stable).unwrap(),
             "v0.3.0"
+        );
+
+        let bridge_releases = json!([
+            {
+                "draft": false,
+                "prerelease": false,
+                "tag_name": "v1.0.3",
+                "assets": [{"name": "runtime-manifest.json"}]
+            },
+            {
+                "draft": false,
+                "prerelease": false,
+                "tag_name": "v0.4.10",
+                "assets": [{"name": "release-manifest.json"}]
+            },
+            {
+                "draft": false,
+                "prerelease": false,
+                "tag_name": "v0.4.9",
+                "assets": [{"name": "release-manifest.json"}]
+            }
+        ]);
+        assert_eq!(
+            select_release_tag(&bridge_releases, UpdateChannel::Stable).unwrap(),
+            "v0.4.10"
         );
 
         assert!(

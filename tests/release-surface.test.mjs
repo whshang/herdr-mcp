@@ -103,6 +103,14 @@ test("Node schema reflection uses the explicit pinned Herdr binary when provided
   assert.match(gate, /export HERDR_BIN="\$\{HERDR_INSTALL_DIR\}\/herdr"/);
 });
 
+test("Rust release verification checks out full history for pinned maintenance evidence", async () => {
+  const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
+  assert.match(
+    release,
+    /verify:[\s\S]*?actions\/checkout@[0-9a-f]+[\s\S]*?fetch-depth:\s*0[\s\S]*?scripts\/release-gate\.sh full/,
+  );
+});
+
 test("shared gate scrubs production overrides and isolates the live Herdr test runtime", async () => {
   const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
   for (const name of [
@@ -164,6 +172,9 @@ test("migration bridge keeps Herdr recovery internal and delegates activation to
   assert.match(updater, /run_major_update_bridge/);
   assert.match(updater, /&\["update", "major-apply"\]/);
   assert.match(updater, /&\["worker", "update"\]/);
+  assert.match(updater, /MIN_FINAL_RUNTIME_VERSION: &str = "1\.0\.3"/);
+  assert.match(updater, /schema-5 source Runtime remains authoritative/);
+  assert.doesNotMatch(updater, /v0\.4\.8 Runtime remains authoritative/);
   assert.doesNotMatch(updater, /service_lifecycle::run\(ServiceCommand::Install/);
   assert.match(runtimeMeta, /MIGRATED_TOOLS: \[&str; 18\]/);
   assert.doesNotMatch(runtimeMeta, /herdr_supervisor/);
