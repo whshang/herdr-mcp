@@ -74,6 +74,7 @@ const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const rustNativeHostSource = readFileSync(path.join(EXT, "..", "crates", "herdr-mcp", "src", "native_host.rs"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
+const jsonBridgeControllerSource = readFileSync(path.join(EXT, "background", "json-bridge.js"), "utf8");
 const chatGptPerfMainSource = readFileSync(path.join(EXT, "content", "chatgpt-perf-main.js"), "utf8");
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
@@ -382,8 +383,10 @@ ok(
     && jsonBridgeSource.includes("if (calls.length > MAX_BATCH_CALLS)")
     && !jsonBridgeSource.includes("Promise.all(chunk.map(callTool))")
     && backgroundSource.includes('msg?.type === "h2w_json_bridge_call_batch"')
-    && backgroundSource.includes("const JSON_BRIDGE_MAX_PARALLEL = 4")
-    && backgroundSource.includes("jsonBridgeNativeBatch")
+    && backgroundSource.includes('from "./background/json-bridge.js"')
+    && backgroundSource.includes("runJsonBridgeBatch(CFG.herdrMcpUrl, batch.calls)")
+    && jsonBridgeControllerSource.includes("const JSON_BRIDGE_MAX_PARALLEL = 4")
+    && jsonBridgeControllerSource.includes("jsonBridgeNativeBatch")
     && localAuthSource.includes("localHerdrBatchFetch")
     && rustNativeHostSource.includes('"request_batch"')
     && rustNativeHostSource.includes("MAX_NATIVE_REQUEST_BATCH_PARALLEL"),
@@ -1199,7 +1202,7 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
   "handoff commit migrates queued user messages to every supported target cutover path");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
+const fixed = ["background.js", "background/json-bridge.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/gemini.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {

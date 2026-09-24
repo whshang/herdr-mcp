@@ -38,9 +38,9 @@ import {
   bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
 } from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
-import { callMcpJsonRpc, parseMcpJsonResponseText } from "./mcp-json-rpc.js";
+import { jsonBridgeRpc, normalizeJsonBridgeBatch, runJsonBridgeBatch } from "./background/json-bridge.js";
 import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
-import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrBatchFetch, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
+import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
   originToMatchPattern,
   parseAllowedOrigins,
@@ -174,169 +174,6 @@ const FALLBACK_PARTIAL_TEMPLATE =
   "herdr workspace {workspace_label}: focus {agent} @ {pane} stopped ({status}); {working_count} still working in this space.\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nThis is a partial finish, not a full round settle. Keep watching or schedule the remaining workers.";
 const FALLBACK_MANUAL_CONTINUE_MESSAGE =
   "Continue the current task according to the current goal and your previous plan. Do not repeat work that is already complete. If live state may have changed, re-check the necessary current state before continuing. Finish the remaining work, then perform the necessary validation and cleanup instead of only reporting a plan.";
-
-// ---- Browser JSON bridge (z.ai / DeepSeek without MCP Connector) ----
-// The page only receives tool schemas and results. The bearer token stays inside
-// the extension service worker.
-const JSON_BRIDGE_MAX_BATCH_CALLS = 24;
-const JSON_BRIDGE_MAX_PARALLEL = 4;
-const JSON_BRIDGE_NATIVE_BATCH_REPROBE_MS = 60_000;
-let jsonBridgeNativeBatchUnsupportedUntil = 0;
-async function jsonBridgeRpc(method, params = {}, nativeTimeoutMs = 90_000) {
-  return callMcpJsonRpc({
-    baseUrl: CFG.herdrMcpUrl,
-    method,
-    params,
-    fetchFn: (url, init) => localHerdrFetch(url, { ...init, nativeTimeoutMs }),
-  });
-}
-
-async function jsonBridgeNativeBatch(calls, nativeTimeoutMs = 90_000) {
-  if (Date.now() < jsonBridgeNativeBatchUnsupportedUntil) {
-    return { ok: false, error: "unsupported_message" };
-  }
-  const base = String(CFG.herdrMcpUrl || "").trim().replace(/\/+$/, "");
-  if (!base) return { ok: false, error: "mcp-url-missing" };
-  const prefix = `browser-json-batch-${Date.now()}`;
-  const requests = calls.map((call, index) => ({
-    input: `${base}/mcp`,
-    init: {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        "Mcp-Protocol-Version": "2025-11-25",
-        "X-Herdr-Client": "browser-json-bridge/1",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: `${prefix}-${index}`,
-        method: "tools/call",
-        params: { name: call.tool, arguments: call.args },
-      }),
-      nativeTimeoutMs,
-    },
-  }));
-  const batch = await localHerdrBatchFetch(requests);
-  if (!batch?.ok) {
-    if (batch?.error === "unsupported_message") {
-      jsonBridgeNativeBatchUnsupportedUntil = Date.now() + JSON_BRIDGE_NATIVE_BATCH_REPROBE_MS;
-    }
-    return batch || { ok: false, error: "native-host-request-batch-failed" };
-  }
-  jsonBridgeNativeBatchUnsupportedUntil = 0;
-  const responses = [];
-  for (const item of batch.responses) {
-    if (!item?.ok || !item.response) {
-      responses.push(item || { ok: false, error: "native-host-request-failed" });
-      continue;
-    }
-    const response = item.response;
-    const text = await response.text();
-    let payload = null;
-    try {
-      payload = parseMcpJsonResponseText(text);
-    } catch (error) {
-      responses.push({ ok: false, error: "mcp-malformed-response", status: response.status, detail: String(error?.message || error) });
-      continue;
-    }
-    if (!response.ok) {
-      responses.push({ ok: false, error: `mcp-http-${response.status}`, status: response.status, detail: payload?.error?.message || "" });
-      continue;
-    }
-    if (payload?.error) {
-      responses.push({
-        ok: false,
-        error: `mcp-rpc-${payload.error.code ?? "error"}`,
-        detail: String(payload.error.message || ""),
-        data: payload.error.data,
-      });
-      continue;
-    }
-    responses.push({ ok: true, result: payload?.result ?? null });
-  }
-  return { ok: true, responses };
-}
-
-function normalizeJsonBridgeBatch(calls) {
-  if (!Array.isArray(calls) || calls.length === 0) {
-    return { ok: false, error: "json-bridge-batch-empty" };
-  }
-  if (calls.length > JSON_BRIDGE_MAX_BATCH_CALLS) {
-    return { ok: false, error: "json-bridge-batch-too-large" };
-  }
-  const normalized = [];
-  for (const call of calls) {
-    const tool = String(call?.tool || "").trim();
-    const args = call?.args;
-    if (!tool || tool.length > 128 || !args || typeof args !== "object" || Array.isArray(args)) {
-      return { ok: false, error: "json-bridge-batch-invalid" };
-    }
-    normalized.push({ tool, args });
-  }
-  return { ok: true, calls: normalized };
-}
-
-const JSON_BRIDGE_DEDUPE_READ_TOOLS = new Set([
-  "herdr_inspect",
-  "herdr_since",
-  "herdr_fs_read",
-  "herdr_fs_list",
-  "herdr_fs_grep",
-  "herdr_fs_image",
-  "herdr_methods",
-  "herdr_skill",
-]);
-
-async function runJsonBridgeBatch(calls) {
-  const responses = new Array(calls.length);
-  const uniqueCalls = [];
-  const indexesByKey = new Map();
-  let previousRead = null;
-  calls.forEach((call, index) => {
-    const dedupe = JSON_BRIDGE_DEDUPE_READ_TOOLS.has(call.tool);
-    const serialized = dedupe ? `${call.tool}\n${JSON.stringify(call.args)}` : null;
-    if (dedupe && previousRead?.serialized === serialized) {
-      indexesByKey.get(previousRead.key)?.push(index);
-      return;
-    }
-    const key = `${index}\n${call.tool}`;
-    indexesByKey.set(key, [index]);
-    uniqueCalls.push({ key, call });
-    previousRead = dedupe ? { serialized, key } : null;
-  });
-  const nativeBatch = await jsonBridgeNativeBatch(uniqueCalls.map(({ call }) => call));
-  if (nativeBatch?.ok && Array.isArray(nativeBatch.responses)) {
-    uniqueCalls.forEach(({ key }, uniqueIndex) => {
-      const response = nativeBatch.responses[uniqueIndex];
-      for (const index of indexesByKey.get(key) || []) responses[index] = response;
-    });
-    return responses;
-  }
-  const fallbackAllowed = ["unsupported_message", "native_message_too_large"].includes(String(nativeBatch?.error || ""));
-  if (!fallbackAllowed) {
-    const failure = nativeBatch || { ok: false, error: "native-host-request-batch-failed" };
-    uniqueCalls.forEach(({ key }) => {
-      for (const index of indexesByKey.get(key) || []) responses[index] = failure;
-    });
-    return responses;
-  }
-  for (let offset = 0; offset < uniqueCalls.length; offset += JSON_BRIDGE_MAX_PARALLEL) {
-    const chunk = uniqueCalls.slice(offset, offset + JSON_BRIDGE_MAX_PARALLEL);
-    const chunkResponses = await Promise.all(chunk.map(async ({ call }) => {
-      const result = await jsonBridgeRpc("tools/call", {
-        name: call.tool,
-        arguments: call.args,
-      });
-      return result.ok ? { ok: true, result: result.result } : result;
-    }));
-    chunk.forEach(({ key }, chunkIndex) => {
-      const response = chunkResponses[chunkIndex];
-      for (const index of indexesByKey.get(key) || []) responses[index] = response;
-    });
-  }
-  return responses;
-}
 
 function localizedText(key, vars = null, fallback = "") {
   const value = i18nText(key, vars || undefined);
@@ -2720,7 +2557,7 @@ async function prepareCanonicalBrowserHandoff({ transferId, continuityId, source
     source_url: String(sourceUrl || "").trim(),
     handoff_id: String(transferId || "").trim(),
   };
-  const call = await jsonBridgeRpc("tools/call", {
+  const call = await jsonBridgeRpc(CFG.herdrMcpUrl, "tools/call", {
     name: "herdr_call",
     arguments: {
       method: "herdr_mcp.browser_handoff.prepare",
@@ -5148,7 +4985,7 @@ function rememberSupervisorCarry(convKey, entry) {
 
 /** Call a private herdr_call method through the existing trusted bridge. */
 async function supervisorCallHerdr(method, params, timeoutMs = 15_000) {
-  const call = await jsonBridgeRpc("tools/call", {
+  const call = await jsonBridgeRpc(CFG.herdrMcpUrl, "tools/call", {
     name: "herdr_call",
     arguments: { method, params: JSON.stringify(params) },
   }, timeoutMs).catch((error) => ({ ok: false, error: error?.message || "herdr_call_failed" }));
@@ -7688,7 +7525,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       const lines = Math.max(1, Math.min(80, Number(msg.lines) || 40));
       const maxChars = Math.max(256, Math.min(8192, Number(msg.max_chars) || 4096));
-      const call = await jsonBridgeRpc("tools/call", {
+      const call = await jsonBridgeRpc(CFG.herdrMcpUrl, "tools/call", {
         name: "herdr_call",
         arguments: {
           method: "pane.read",
@@ -7721,7 +7558,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(access);
         return;
       }
-      const result = await jsonBridgeRpc("tools/list", {});
+      const result = await jsonBridgeRpc(CFG.herdrMcpUrl, "tools/list", {});
       sendResponse(result.ok
         ? { ok: true, tools: result.result?.tools || [] }
         : result);
@@ -7741,7 +7578,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(batch);
         return;
       }
-      const responses = await runJsonBridgeBatch(batch.calls);
+      const responses = await runJsonBridgeBatch(CFG.herdrMcpUrl, batch.calls);
       sendResponse({ ok: true, responses });
     })();
     return true;
@@ -7754,7 +7591,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(access);
         return;
       }
-      const result = await jsonBridgeRpc("tools/call", {
+      const result = await jsonBridgeRpc(CFG.herdrMcpUrl, "tools/call", {
         name: String(msg.tool || ""),
         arguments: msg.args || {},
       });
