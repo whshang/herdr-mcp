@@ -99,6 +99,8 @@ fn run_install_command(
 ) -> Result<ExitCode, String> {
     herdr_dependency::prepare_for_service_install()?;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let _ = language;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let result = service_manager::run(ServiceCommand::Install { adopt_node })?;
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let result = run_install(adopt_node, language)?;
