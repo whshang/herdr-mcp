@@ -1346,18 +1346,25 @@ fn recover_major_upgrade(paths: &RuntimePaths, record: &MajorUpgradeRecord) -> R
     let state_path = paths.config_dir.join("state.db");
     restore_state_backup(record, &state_path)?;
     // The source installer below renders LaunchAgents/units from the legacy
-    // config, so it must see the pre-upgrade file. Best effort: a restore
-    // failure must not abort putting the source Runtime back.
-    match restore_legacy_toml_config(&paths.config_dir) {
-        Ok(Some(path)) => eprintln!(
-            "restored released 0.4.x configuration {} from config.toml.migrated",
-            path.display()
-        ),
-        Ok(None) => {}
-        Err(error) => eprintln!(
-            "warning: could not restore released 0.4.x config.toml before source reinstall: {error}"
-        ),
-    }
+    // config, so it should see the pre-upgrade file. A restore failure must not
+    // prevent the source Runtime/schema from being put back, but it also must
+    // not be reported as a complete rollback or retire the rollback evidence.
+    let legacy_config_restore_error = match restore_legacy_toml_config(&paths.config_dir) {
+        Ok(Some(path)) => {
+            eprintln!(
+                "restored released 0.4.x configuration {} from config.toml.migrated",
+                path.display()
+            );
+            None
+        }
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!(
+                "warning: could not restore released 0.4.x config.toml before source reinstall: {error}"
+            );
+            Some(error)
+        }
+    };
     let source_install_error = run_service_command(
         Path::new(&record.source_binary),
         paths,
@@ -1390,6 +1397,12 @@ fn recover_major_upgrade(paths: &RuntimePaths, record: &MajorUpgradeRecord) -> R
     if schema != record.source_state_schema {
         return Err(format!(
             "restored runtime changed state schema unexpectedly: expected {}, got {schema}",
+            record.source_state_schema
+        ));
+    }
+    if let Some(error) = legacy_config_restore_error {
+        return Err(format!(
+            "major rollback restored source Runtime and schema {}, but legacy config.toml recovery is incomplete: {error}; rollback material was retained",
             record.source_state_schema
         ));
     }
