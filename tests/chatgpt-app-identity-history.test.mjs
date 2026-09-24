@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const SOURCE_FILES = {
   background: "extension/background.js",
@@ -9,17 +10,29 @@ const SOURCE_FILES = {
   adapter: "extension/content/injector/chatgpt.js",
 };
 
-function historicalSource(ref) {
-  return Object.fromEntries(Object.entries(SOURCE_FILES).map(([key, path]) => [
-    key,
-    execFileSync("git", ["show", `${ref}:${path}`], { encoding: "utf8" }),
-  ]));
+const FIXTURE_ROOT = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "fixtures",
+  "chatgpt-app-identity-history",
+);
+
+function fixtureDir(version) {
+  return path.join(FIXTURE_ROOT, version);
+}
+
+function historicalSource(version) {
+  const dir = fixtureDir(version);
+  return {
+    background: fs.readFileSync(path.join(dir, "background.js"), "utf8"),
+    wake: fs.readFileSync(path.join(dir, "wake.js"), "utf8"),
+    adapter: fs.readFileSync(path.join(dir, "chatgpt.js"), "utf8"),
+  };
 }
 
 function currentSource() {
-  return Object.fromEntries(Object.entries(SOURCE_FILES).map(([key, path]) => [
+  return Object.fromEntries(Object.entries(SOURCE_FILES).map(([key, filePath]) => [
     key,
-    fs.readFileSync(path, "utf8"),
+    fs.readFileSync(filePath, "utf8"),
   ]));
 }
 
@@ -29,8 +42,8 @@ function sourceSlice(source, startMarker, endMarker) {
   return start >= 0 && end > start ? source.slice(start, end) : "";
 }
 
-function manifestVersion(ref) {
-  const raw = execFileSync("git", ["show", `${ref}:extension/manifest.json`], { encoding: "utf8" });
+function manifestVersion(version) {
+  const raw = fs.readFileSync(path.join(fixtureDir(version), "manifest.json"), "utf8");
   return JSON.parse(raw).version;
 }
 
@@ -139,6 +152,8 @@ const probes = {
   },
 };
 
+// Scenario table keeps the historical SHAs for documentation; fixtures are keyed by version.
+// See tests/fixtures/chatgpt-app-identity-history/provenance.json.
 const cases = [
   ["initial_learning", "991569b3", "0.1.121", "fd5d89ef", "0.1.122",
     "user keeps the real App identity | Given a bound ChatGPT turn with one provider-owned pill | When identity is first learned | Then the exact keyword is persisted instead of a configured display name"],
@@ -164,17 +179,17 @@ const current = currentSource();
 
 for (const scenario of cases) {
   test(scenario.title, () => {
-    assert.equal(manifestVersion(scenario.brokenRef), scenario.brokenVersion);
-    assert.equal(manifestVersion(scenario.fixedRef), scenario.fixedVersion);
+    assert.equal(manifestVersion(scenario.brokenVersion), scenario.brokenVersion);
+    assert.equal(manifestVersion(scenario.fixedVersion), scenario.fixedVersion);
 
     const probe = probes[scenario.name];
     assert.equal(
-      probe(historicalSource(scenario.brokenRef)),
+      probe(historicalSource(scenario.brokenVersion)),
       false,
       `${scenario.brokenVersion} must reproduce the historical boundary before its fix`,
     );
     assert.equal(
-      probe(historicalSource(scenario.fixedRef)),
+      probe(historicalSource(scenario.fixedVersion)),
       true,
       `${scenario.fixedVersion} must contain the boundary fix recorded for that release`,
     );
