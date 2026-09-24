@@ -686,18 +686,67 @@ fn major_apply() -> Result<ExitCode, String> {
         }
 
         let install_detail = match install {
+            Ok(code) if code == ExitCode::SUCCESS => format!(
+                "service install reported success but the state database is not schema {SCHEMA_VERSION}"
+            ),
             Ok(code) => format!("service install exited with {code:?}"),
             Err(error) => error,
         };
         let recovery = recover_major_upgrade(&paths, &record);
-        Err(match recovery {
+        let message = match recovery {
             Ok(()) => format!(
                 "major update did not complete ({install_detail}); schema-{MAJOR_SOURCE_SCHEMA} state and the previous runtime were restored"
             ),
             Err(recovery_error) => format!(
                 "major update did not complete ({install_detail}); automatic recovery also failed: {recovery_error}"
             ),
+        };
+        Err(match record_major_failure(&paths.config_dir, &message) {
+            Some(path) => format!("{message}; full detail: {}", path.display()),
+            None => message,
         })
+    }
+}
+
+/// Fixed location of the last `major-apply` failure. The v0.4.8 updater keeps
+/// only the first 512 bytes of an update job detail and the v0.4.9 bridge
+/// deletes its captured `major-apply.log`, while the verbose install report is
+/// printed before the failure reason. Without this file a field failure has no
+/// recoverable cause (`cat ~/.config/herdr-mcp/major-upgrade-last-failure.log`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAJOR_FAILURE_LOG_NAME: &str = "major-upgrade-last-failure.log";
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn record_major_failure(config_dir: &Path, message: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = config_dir.join(MAJOR_FAILURE_LOG_NAME);
+    let temp = config_dir.join(format!(
+        ".{MAJOR_FAILURE_LOG_NAME}.{}.tmp",
+        std::process::id()
+    ));
+    let body = format!(
+        "herdr-mcp {} update major-apply failed at unix_ms={}\n{message}\n",
+        crate::runtime_meta::runtime_version(),
+        now_ms_i64()
+    );
+    let written = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, &path)
+    })();
+    match written {
+        Ok(()) => Some(path),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            eprintln!("warning: could not record major-apply failure detail: {error}");
+            None
+        }
     }
 }
 
@@ -2413,6 +2462,27 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_failure_detail_survives_in_a_fixed_private_file() {
+        let root = legacy_config_test_root("failure-log");
+        let first = record_major_failure(&root, "first failure").unwrap();
+        let second = record_major_failure(&root, "Link sidecar refused the Edge").unwrap();
+
+        assert_eq!(first, root.join(MAJOR_FAILURE_LOG_NAME));
+        assert_eq!(first, second);
+        let text = fs::read_to_string(&second).unwrap();
+        // Only the latest failure is kept, with the full, untruncated reason.
+        assert!(text.contains("update major-apply failed"));
+        assert!(text.contains("Link sidecar refused the Edge"));
+        assert!(!text.contains("first failure"));
+        assert_eq!(
+            fs::metadata(&second).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
