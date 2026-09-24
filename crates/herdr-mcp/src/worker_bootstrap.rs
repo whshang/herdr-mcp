@@ -151,6 +151,11 @@ struct Script {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerDomain {
+    service: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExistingWorkerStatus {
     pub edge_origin: String,
     pub worker_name: String,
@@ -160,6 +165,10 @@ pub(crate) struct ExistingWorkerStatus {
     /// `EDGE_PROJECT = "herdr-edge"`; the script name came from its workers.dev
     /// origin. An in-place update rewrites EDGE_PROJECT to the script name.
     pub legacy_generic_project: bool,
+    /// A legacy generic health identity is served through a custom domain, so
+    /// the real Cloudflare script name must be proven through the account's
+    /// custom-domain mapping before any mutation can be attempted.
+    pub legacy_custom_domain: bool,
 }
 
 impl ExistingWorkerStatus {
@@ -416,6 +425,45 @@ impl<'a> Cloudflare<'a> {
         Ok(scripts)
     }
 
+    fn worker_domains_for_hostname(
+        &self,
+        account_id: &str,
+        hostname: &str,
+    ) -> Result<Vec<WorkerDomain>, String> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("hostname", hostname)
+            .finish();
+        let result = self.request(
+            reqwest::Method::GET,
+            &format!("accounts/{account_id}/workers/domains?{query}"),
+            None,
+        )?;
+        let array = result.as_array().ok_or_else(|| {
+            "Cloudflare Worker custom-domain inventory returned an invalid result".to_owned()
+        })?;
+        let mut domains = Vec::new();
+        for item in array {
+            let Some(row_hostname) = item.get("hostname").and_then(Value::as_str) else {
+                continue;
+            };
+            if row_hostname != hostname {
+                continue;
+            }
+            let service = item
+                .get("service")
+                .and_then(Value::as_str)
+                .filter(|value| valid_worker_name(value))
+                .ok_or_else(|| {
+                    "Cloudflare Worker custom-domain mapping has no valid service identity; no mutation was attempted"
+                        .to_owned()
+                })?;
+            domains.push(WorkerDomain {
+                service: service.to_owned(),
+            });
+        }
+        Ok(domains)
+    }
+
     fn script_settings(&self, account_id: &str, worker_name: &str) -> Result<Value, String> {
         self.request(
             reqwest::Method::GET,
@@ -665,6 +713,7 @@ pub(crate) fn existing_worker_status(
         edge_version,
         target_version: target_version.to_owned(),
         legacy_generic_project: identity.legacy_generic_project,
+        legacy_custom_domain: identity.legacy_custom_domain,
     }))
 }
 
@@ -735,7 +784,7 @@ pub(crate) fn update_existing_worker_for_release(
             })?;
         Some(workstation)
     };
-    let Some(current) = existing_worker_status(paths, target_version)? else {
+    let Some(mut current) = existing_worker_status(paths, target_version)? else {
         return Ok(json!({
             "ok": true,
             "code": "worker_update_skipped",
@@ -760,7 +809,14 @@ pub(crate) fn update_existing_worker_for_release(
     let bundle = prepare_edge_bundle(source_commit, target_version)?;
     let (token, refresh_token) = acquire_cloudflare_credential()?;
     let cloudflare = Cloudflare::new(&token)?;
-    let account = select_existing_worker_account(&cloudflare, &current.worker_name)?;
+    let account = if current.legacy_custom_domain {
+        let (account, worker_name) =
+            select_legacy_custom_domain_worker(&cloudflare, &current.edge_origin)?;
+        current.worker_name = worker_name;
+        account
+    } else {
+        select_existing_worker_account(&cloudflare, &current.worker_name)?
+    };
     let scripts = cloudflare.scripts(&account.id)?;
     if !scripts
         .iter()
@@ -827,17 +883,33 @@ fn worker_update_readback_converged(
     observed: &ExistingWorkerStatus,
     target_version: &str,
 ) -> Result<bool, String> {
-    if observed.worker_name != previous.worker_name || observed.edge_origin != previous.edge_origin
-    {
+    if observed.edge_origin != previous.edge_origin {
         return Err(
             "Worker update readback changed Worker/public origin identity; refusing to continue"
                 .to_owned(),
         );
     }
     if observed.edge_version == target_version {
+        if observed.worker_name != previous.worker_name {
+            return Err(
+                "Worker update readback changed Worker/public origin identity; refusing to continue"
+                    .to_owned(),
+            );
+        }
         return Ok(true);
     }
     if observed.edge_version == previous.edge_version {
+        let same_worker = observed.worker_name == previous.worker_name
+            || (previous.legacy_custom_domain
+                && observed.legacy_custom_domain
+                && observed.legacy_generic_project
+                && observed.worker_name == LEGACY_GENERIC_WORKER_SERVICE);
+        if !same_worker {
+            return Err(
+                "Worker update readback changed Worker/public origin identity; refusing to continue"
+                    .to_owned(),
+            );
+        }
         return Ok(false);
     }
     Err(format!(
@@ -1530,6 +1602,73 @@ fn select_existing_worker_account(
     choose_unique_worker_account(matches, worker_name)
 }
 
+fn select_legacy_custom_domain_worker(
+    cloudflare: &Cloudflare<'_>,
+    edge_origin: &str,
+) -> Result<(Account, String), String> {
+    let hostname = edge_origin_host(edge_origin)?;
+    let accounts = cloudflare.accounts()?;
+    if accounts.is_empty() {
+        return Err("Cloudflare authorization can access no accounts".to_owned());
+    }
+    let selected = std::env::var("CLOUDFLARE_ACCOUNT_ID").ok();
+    if let Some(selected) = selected.as_deref()
+        && !accounts.iter().any(|account| account.id == selected)
+    {
+        return Err(
+            "CLOUDFLARE_ACCOUNT_ID is not accessible with this temporary credential".to_owned(),
+        );
+    }
+    let mut matches = Vec::new();
+    for account in accounts {
+        if selected.as_deref().is_some_and(|value| value != account.id) {
+            continue;
+        }
+        let domains = cloudflare.worker_domains_for_hostname(&account.id, &hostname)?;
+        if domains.len() > 1 {
+            return Err(format!(
+                "Cloudflare account {} has more than one exact custom-domain mapping for {hostname}; no mutation was attempted",
+                account.id
+            ));
+        }
+        let Some(domain) = domains.into_iter().next() else {
+            continue;
+        };
+        let scripts = cloudflare.scripts(&account.id)?;
+        if !scripts.iter().any(|script| script.name == domain.service) {
+            return Err(format!(
+                "Cloudflare custom domain {hostname} points to Worker '{}' but that script is absent from the same account; no mutation was attempted",
+                domain.service
+            ));
+        }
+        matches.push((account, domain.service));
+    }
+    choose_unique_legacy_custom_domain_match(matches, &hostname, selected.as_deref())
+}
+
+fn choose_unique_legacy_custom_domain_match(
+    matches: Vec<(Account, String)>,
+    hostname: &str,
+    selected_account_id: Option<&str>,
+) -> Result<(Account, String), String> {
+    if let Some(selected) = selected_account_id
+        && !matches.iter().any(|(account, _)| account.id == selected)
+    {
+        return Err(format!(
+            "CLOUDFLARE_ACCOUNT_ID has no exact custom-domain mapping for {hostname}; no mutation was attempted"
+        ));
+    }
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("one custom-domain match")),
+        0 => Err(format!(
+            "no accessible Cloudflare account proves which Worker owns custom domain {hostname}; no mutation was attempted"
+        )),
+        count => Err(format!(
+            "{count} accessible Cloudflare accounts claim custom domain {hostname}; set non-secret CLOUDFLARE_ACCOUNT_ID and rerun"
+        )),
+    }
+}
+
 fn choose_unique_worker_account(
     matches: Vec<Account>,
     worker_name: &str,
@@ -2084,6 +2223,15 @@ fn validate_existing_worker_settings(
     require_plain("EDGE_VERSION", edge_version)?;
     require_plain("OAUTH_ISSUER", edge_origin)?;
     let default_workstation = legacy_default_workstation_binding(bindings)?;
+    if default_workstation.is_some()
+        && !legacy.generic_project
+        && legacy.default_workstation_id.is_none()
+    {
+        return Err(
+            "Cloudflare Worker has legacy DEFAULT_WORKSTATION_ID without legacy ownership proof; no mutation was attempted"
+                .to_owned(),
+        );
+    }
     if let Some(expected) = legacy.default_workstation_id
         && default_workstation.as_deref() != Some(expected)
     {
@@ -2503,6 +2651,7 @@ const LEGACY_GENERIC_WORKER_SERVICE: &str = "herdr-edge";
 struct WorkerServiceIdentity {
     script_name: String,
     legacy_generic_project: bool,
+    legacy_custom_domain: bool,
 }
 
 fn resolve_worker_service_identity(
@@ -2516,19 +2665,23 @@ fn resolve_worker_service_identity(
         .ok_or_else(|| "Worker HTTP preflight returned no service identity".to_owned())?;
     let expected = expected_worker_service_from_origin(edge_origin)?;
     if service == LEGACY_GENERIC_WORKER_SERVICE {
-        // Only a workers.dev origin (`<script>.<account>.workers.dev`) names
-        // the script unambiguously. A custom domain gives no such proof, so a
-        // generic legacy identity there is refused rather than guessed.
-        let Some(script_name) = expected else {
-            return Err(
-                "Worker HTTP preflight reports the generic legacy Herdr project on a custom domain; the Cloudflare script cannot be identified safely"
-                    .to_owned(),
-            );
-        };
-        let legacy_generic_project = script_name != LEGACY_GENERIC_WORKER_SERVICE;
+        if let Some(script_name) = expected {
+            let legacy_generic_project = script_name != LEGACY_GENERIC_WORKER_SERVICE;
+            return Ok(WorkerServiceIdentity {
+                script_name,
+                legacy_generic_project,
+                legacy_custom_domain: false,
+            });
+        }
+        // A custom domain does not encode the script name. The frozen legacy
+        // Herdr contract is enough for a read-only management probe, but never
+        // enough for mutation. `worker update` must later prove the exact
+        // hostname -> service mapping through Cloudflare before opening its
+        // mutation gate.
         return Ok(WorkerServiceIdentity {
-            script_name,
-            legacy_generic_project,
+            script_name: service.to_owned(),
+            legacy_generic_project: true,
+            legacy_custom_domain: true,
         });
     }
     match expected {
@@ -2538,6 +2691,7 @@ fn resolve_worker_service_identity(
         Some(expected) => Ok(WorkerServiceIdentity {
             script_name: expected,
             legacy_generic_project: false,
+            legacy_custom_domain: false,
         }),
         None if !valid_worker_name(service) || !service.starts_with("herdr-edge-") => {
             Err("Worker HTTP preflight service identity is not a Herdr Worker".to_owned())
@@ -2545,6 +2699,7 @@ fn resolve_worker_service_identity(
         None => Ok(WorkerServiceIdentity {
             script_name: service.to_owned(),
             legacy_generic_project: false,
+            legacy_custom_domain: false,
         }),
     }
 }
@@ -4126,15 +4281,61 @@ mod tests {
         let identity = resolve_worker_service_identity(&payload, LEGACY_ORIGIN).unwrap();
         assert_eq!(identity.script_name, LEGACY_SCRIPT);
         assert!(identity.legacy_generic_project);
+        assert!(!identity.legacy_custom_domain);
         validate_edge_transport_payload(&payload, LEGACY_ORIGIN).unwrap();
     }
 
     #[test]
-    fn legacy_generic_identity_is_refused_on_a_custom_domain() {
-        let error =
+    fn legacy_generic_identity_on_custom_domain_requires_cloudflare_resolution() {
+        let identity =
             resolve_worker_service_identity(&legacy_template_health(), "https://mcp.example.com")
-                .unwrap_err();
-        assert!(error.contains("custom domain"));
+                .unwrap();
+        assert_eq!(identity.script_name, LEGACY_GENERIC_WORKER_SERVICE);
+        assert!(identity.legacy_generic_project);
+        assert!(identity.legacy_custom_domain);
+        validate_edge_transport_payload(&legacy_template_health(), "https://mcp.example.com")
+            .unwrap();
+    }
+
+    #[test]
+    fn custom_domain_worker_selection_requires_one_exact_account_mapping() {
+        let account = |id: &str| Account {
+            id: id.to_owned(),
+            name: format!("account-{id}"),
+        };
+        let one = choose_unique_legacy_custom_domain_match(
+            vec![(account("a1"), "herdr-edge-cyan".to_owned())],
+            "mcp.example.com",
+            None,
+        )
+        .unwrap();
+        assert_eq!(one.0.id, "a1");
+        assert_eq!(one.1, "herdr-edge-cyan");
+
+        let none = choose_unique_legacy_custom_domain_match(Vec::new(), "mcp.example.com", None)
+            .unwrap_err();
+        assert!(none.contains("no accessible Cloudflare account"));
+        assert!(none.contains("no mutation"));
+
+        let ambiguous = choose_unique_legacy_custom_domain_match(
+            vec![
+                (account("a1"), "herdr-edge-cyan".to_owned()),
+                (account("a2"), "herdr-edge-other".to_owned()),
+            ],
+            "mcp.example.com",
+            None,
+        )
+        .unwrap_err();
+        assert!(ambiguous.contains("2 accessible Cloudflare accounts"));
+
+        let wrong_selected = choose_unique_legacy_custom_domain_match(
+            vec![(account("a1"), "herdr-edge-cyan".to_owned())],
+            "mcp.example.com",
+            Some("a2"),
+        )
+        .unwrap_err();
+        assert!(wrong_selected.contains("CLOUDFLARE_ACCOUNT_ID"));
+        assert!(wrong_selected.contains("no mutation"));
     }
 
     #[test]
@@ -4145,6 +4346,7 @@ mod tests {
         let identity = resolve_worker_service_identity(&payload, origin).unwrap();
         assert_eq!(identity.script_name, "herdr-edge-mac");
         assert!(!identity.legacy_generic_project);
+        assert!(!identity.legacy_custom_domain);
 
         payload["service"] = json!("herdr-edge-other");
         assert!(
@@ -4245,6 +4447,26 @@ mod tests {
     }
 
     #[test]
+    fn modern_worker_refuses_legacy_default_workstation_without_proof() {
+        let mut settings = legacy_template_settings("my-workstation");
+        for binding in settings["bindings"].as_array_mut().unwrap() {
+            if binding["name"] == "EDGE_PROJECT" {
+                binding["text"] = json!(LEGACY_SCRIPT);
+            }
+        }
+        let error = validate_existing_worker_settings(
+            &settings,
+            LEGACY_SCRIPT,
+            LEGACY_ORIGIN,
+            "0.1.0",
+            &LegacyWorkerExpectation::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("DEFAULT_WORKSTATION_ID"));
+        assert!(error.contains("no mutation"));
+    }
+
+    #[test]
     fn generic_legacy_project_is_accepted_only_when_health_proved_it() {
         let error = validate_existing_worker_settings(
             &legacy_template_settings("my-workstation"),
@@ -4299,6 +4521,7 @@ mod tests {
             edge_version: "1.0.0-alpha.8".to_owned(),
             target_version: "1.0.0-alpha.9".to_owned(),
             legacy_generic_project: false,
+            legacy_custom_domain: false,
         };
         let stale = previous.clone();
         assert!(!worker_update_readback_converged(&previous, &stale, "1.0.0-alpha.9").unwrap());
@@ -4321,6 +4544,45 @@ mod tests {
             worker_update_readback_converged(&previous, &unexpected, "1.0.0-alpha.9")
                 .unwrap_err()
                 .contains("unexpected Edge version")
+        );
+    }
+
+    #[test]
+    fn custom_domain_readback_accepts_only_the_proven_legacy_stale_identity() {
+        let previous = ExistingWorkerStatus {
+            edge_origin: "https://mcp.example.com".to_owned(),
+            worker_name: "herdr-edge-cyan".to_owned(),
+            edge_version: "0.1.0".to_owned(),
+            target_version: "1.0.3".to_owned(),
+            legacy_generic_project: true,
+            legacy_custom_domain: true,
+        };
+        let stale = ExistingWorkerStatus {
+            edge_origin: previous.edge_origin.clone(),
+            worker_name: LEGACY_GENERIC_WORKER_SERVICE.to_owned(),
+            edge_version: previous.edge_version.clone(),
+            target_version: previous.target_version.clone(),
+            legacy_generic_project: true,
+            legacy_custom_domain: true,
+        };
+        assert!(!worker_update_readback_converged(&previous, &stale, "1.0.3").unwrap());
+
+        let converged = ExistingWorkerStatus {
+            edge_origin: previous.edge_origin.clone(),
+            worker_name: previous.worker_name.clone(),
+            edge_version: "1.0.3".to_owned(),
+            target_version: "1.0.3".to_owned(),
+            legacy_generic_project: false,
+            legacy_custom_domain: false,
+        };
+        assert!(worker_update_readback_converged(&previous, &converged, "1.0.3").unwrap());
+
+        let mut wrong = stale;
+        wrong.worker_name = "other-worker".to_owned();
+        assert!(
+            worker_update_readback_converged(&previous, &wrong, "1.0.3")
+                .unwrap_err()
+                .contains("changed Worker/public origin identity")
         );
     }
 
