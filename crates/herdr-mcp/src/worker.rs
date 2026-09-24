@@ -2570,6 +2570,53 @@ fn production_link_environment_if_present()
     ))
 }
 
+/// Identity a pre-1.0 installation may keep only in its production Link
+/// environment. Early 0.4.x installs were deployed from the wrangler user
+/// template, never enrolled a device id, and recorded the Edge origin only as
+/// the Link's `HERDR_EDGE_URL`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ProductionLinkIdentity {
+    pub(crate) workstation_id: Option<String>,
+    pub(crate) edge_origin: Option<String>,
+}
+
+/// Read-only view of the owned production Link identity. `Ok(None)` when no
+/// production Link is installed (or on platforms without a launchd Link).
+pub(crate) fn production_link_identity() -> Result<Option<ProductionLinkIdentity>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(env) = production_link_environment_if_present()? else {
+            return Ok(None);
+        };
+        production_link_identity_from_env(&env).map(Some)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn production_link_identity_from_env(
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<ProductionLinkIdentity, String> {
+    let workstation_id = env
+        .get("HERDR_WORKSTATION_ID")
+        .map(|value| value.trim())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .map(ToOwned::to_owned);
+    let edge_origin = match env.get("HERDR_EDGE_URL") {
+        Some(url) => Some(origin_from_ws_url(url)?),
+        None => None,
+    };
+    Ok(ProductionLinkIdentity {
+        workstation_id,
+        edge_origin,
+    })
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn resolve_owner_link_fields(
     config: &Config,
@@ -3078,6 +3125,32 @@ fn print_json(value: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn production_link_identity_reads_legacy_single_device_link_environment() {
+        let env = std::collections::BTreeMap::from([
+            (
+                "HERDR_WORKSTATION_ID".to_owned(),
+                " my-workstation ".to_owned(),
+            ),
+            (
+                "HERDR_EDGE_URL".to_owned(),
+                "wss://herdr-edge-cyandemacbook-air-local.herdr-6a888316.workers.dev/ws".to_owned(),
+            ),
+        ]);
+        let identity = production_link_identity_from_env(&env).unwrap();
+        assert_eq!(identity.workstation_id.as_deref(), Some("my-workstation"));
+        assert_eq!(
+            identity.edge_origin.as_deref(),
+            Some("https://herdr-edge-cyandemacbook-air-local.herdr-6a888316.workers.dev")
+        );
+
+        let empty = production_link_identity_from_env(&std::collections::BTreeMap::from([(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            "   ".to_owned(),
+        )]))
+        .unwrap();
+        assert_eq!(empty, ProductionLinkIdentity::default());
+    }
     #[test]
     fn unsupported_linux_subenvironments_allow_only_worker_inventory_reads() {
         assert!(!worker_command_requires_supported_workstation(
