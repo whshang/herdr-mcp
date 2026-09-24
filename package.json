@@ -1,6 +1,6 @@
 {
   "name": "herdr-mcp",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Herdr MCP bridge for Web AI and local agents: gated workstation control, Edge routing, browser continuity, and handoff",
   "type": "module",
   "main": "dist/server.js",
