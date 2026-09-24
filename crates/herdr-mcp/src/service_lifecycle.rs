@@ -28,6 +28,12 @@ enum RollbackSupervisorStrategy {
     Remove,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrReadinessPolicy {
+    Required,
+    BestEffort,
+}
+
 fn retry_sidecar_once<F>(label: &str, mut operation: F) -> Result<(), String>
 where
     F: FnMut() -> Result<(), String>,
@@ -50,15 +56,7 @@ pub(crate) fn run_with_locale(
 ) -> Result<ExitCode, String> {
     match command {
         ServiceCommand::Install { adopt_node } => {
-            herdr_dependency::prepare_for_service_install()?;
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            let result = service_manager::run(ServiceCommand::Install { adopt_node })?;
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-            let result = run_install(adopt_node, language)?;
-            if result == ExitCode::SUCCESS {
-                herdr_dependency::ensure_server_ready_after_install()?;
-            }
-            Ok(result)
+            run_install_command(adopt_node, language, HerdrReadinessPolicy::Required)
         }
         ServiceCommand::Rollback => {
             #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -83,6 +81,49 @@ pub(crate) fn run_with_locale(
             }
         }
         other => service_manager::run(other),
+    }
+}
+
+pub(crate) fn run_major_upgrade_install() -> Result<ExitCode, String> {
+    run_install_command(
+        false,
+        crate::locale::resolve(None),
+        HerdrReadinessPolicy::BestEffort,
+    )
+}
+
+fn run_install_command(
+    adopt_node: bool,
+    language: Locale,
+    herdr_readiness: HerdrReadinessPolicy,
+) -> Result<ExitCode, String> {
+    herdr_dependency::prepare_for_service_install()?;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let result = service_manager::run(ServiceCommand::Install { adopt_node })?;
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let result = run_install(adopt_node, language)?;
+    if result == ExitCode::SUCCESS {
+        apply_herdr_readiness_policy(
+            herdr_readiness,
+            herdr_dependency::ensure_server_ready_after_install(),
+        )?;
+    }
+    Ok(result)
+}
+
+fn apply_herdr_readiness_policy(
+    policy: HerdrReadinessPolicy,
+    readiness: Result<(), String>,
+) -> Result<(), String> {
+    match (policy, readiness) {
+        (_, Ok(())) => Ok(()),
+        (HerdrReadinessPolicy::Required, Err(error)) => Err(error),
+        (HerdrReadinessPolicy::BestEffort, Err(error)) => {
+            eprintln!(
+                "warning: major Runtime migration committed, but Herdr Server readiness still needs repair: {error}"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -586,6 +627,19 @@ mod tests {
         assert_eq!(failed_attempts, 2);
         assert!(error.contains("failure-1"));
         assert!(error.contains("failure-2"));
+    }
+
+    #[test]
+    fn major_upgrade_keeps_committed_runtime_when_only_herdr_readiness_is_pending() {
+        let error = "Herdr server did not become reachable".to_owned();
+        assert!(
+            apply_herdr_readiness_policy(HerdrReadinessPolicy::BestEffort, Err(error.clone()),)
+                .is_ok()
+        );
+        assert_eq!(
+            apply_herdr_readiness_policy(HerdrReadinessPolicy::Required, Err(error)).unwrap_err(),
+            "Herdr server did not become reachable"
+        );
     }
 
     #[test]

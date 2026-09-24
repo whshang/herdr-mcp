@@ -667,7 +667,7 @@ fn major_apply() -> Result<ExitCode, String> {
 
         let record = prepare_major_upgrade_record(&paths, &state_path)?;
 
-        let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
+        let install = crate::service_lifecycle::run_major_upgrade_install();
         let install_ok = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
         let migrated = read_raw_state_schema(&state_path).ok().flatten() == Some(SCHEMA_VERSION);
         if install_ok && migrated {
