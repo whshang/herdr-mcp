@@ -211,10 +211,15 @@ impl Config {
                     format!("invalid legacy config {}: {error}", legacy_path.display())
                 })?;
                 write_json_config(path, &config)?;
-                let backup = path.with_file_name("config.toml.migrated");
-                if !backup.exists() {
-                    let _ = fs::rename(&legacy_path, &backup);
-                }
+                // Keep the released 0.4.x `config.toml` in place. A schema-5
+                // Runtime (the v0.4.x service that stays authoritative until a
+                // major migration commits, and the source restored by
+                // `update major-rollback`) reads only this file for its Edge
+                // origin, device id, Link upstream, update channel and ports.
+                // Renaming it on first 1.x load silently reset those settings
+                // on every failed or rolled-back 0.4.x -> 1.x upgrade. 1.x
+                // prefers `config.json` once it exists, so the legacy file is
+                // never re-migrated or treated as authoritative by 1.x.
                 return Ok(config);
             }
             Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
@@ -792,22 +797,23 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let json_path = root.join("config.json");
         let legacy_path = root.join("config.toml");
-        fs::write(
-            &legacy_path,
-            r#"[runtime]
+        let legacy_text = r#"[runtime]
 port = 9000
 
 [edge]
 public_origin = "https://herdr.example.com"
-"#,
-        )
-        .unwrap();
+device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+"#;
+        fs::write(&legacy_path, legacy_text).unwrap();
 
         let config =
             Config::load_for_instance(&json_path, &InstanceId::default_instance()).unwrap();
         assert_eq!(config.runtime_port, 9000);
+        assert_eq!(
+            config.edge_device_id.as_deref(),
+            Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
         assert!(json_path.is_file());
-        assert!(root.join("config.toml.migrated").is_file());
         let migrated = fs::read_to_string(&json_path).unwrap();
         assert!(migrated.starts_with("{\n"));
         assert!(config.semantic.routes.is_empty());
@@ -816,6 +822,35 @@ public_origin = "https://herdr.example.com"
             fs::metadata(&json_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A schema-5 v0.4.x Runtime reads only `config.toml`. The first 1.x load
+    /// (a version probe, `major-apply`, a manually run `worker update`, or any
+    /// other command) must never move or rewrite it, otherwise a failed or
+    /// rolled-back major upgrade leaves the restored v0.4.x service without its
+    /// Edge origin, device id, Link upstream and update channel.
+    #[test]
+    fn legacy_toml_survives_json_migration_byte_for_byte() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-config-legacy-preserved-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let json_path = root.join("config.json");
+        let legacy_path = root.join("config.toml");
+        let legacy_text = "[edge]\npublic_origin = \"https://herdr.example.com\"\n";
+        fs::write(&legacy_path, legacy_text).unwrap();
+
+        Config::load_for_instance(&json_path, &InstanceId::default_instance()).unwrap();
+        // A second 1.x load reads the JSON file and still leaves TOML alone.
+        Config::load_for_instance(&json_path, &InstanceId::default_instance()).unwrap();
+
+        assert_eq!(fs::read_to_string(&legacy_path).unwrap(), legacy_text);
+        assert!(!root.join("config.toml.migrated").exists());
+        assert!(json_path.is_file());
 
         let _ = fs::remove_dir_all(&root);
     }
