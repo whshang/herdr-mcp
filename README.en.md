@@ -126,6 +126,61 @@ macOS Apple Silicon, Linux x86_64, and Linux ARM64 are Production. Windows x86_6
 
 [Platform support](docs/i18n/en/platform-support-matrix.md) · [CLI reference](docs/i18n/en/cli-reference.md) · [Full documentation](https://whshang.github.io/herdr-mcp/)
 
+## FAQ
+
+### Why Cloudflare?
+
+ChatGPT runs on the public Internet while development machines are usually behind NAT, firewalls, changing networks, or corporate gateways. Herdr-MCP keeps workstations inbound-closed: each device makes an authenticated outbound connection to a stable Cloudflare entry.
+
+Cloudflare also provides the public MCP/OAuth endpoint, device routing, reconnect coordination, and the small amount of shared state needed for multi-device access.
+
+### Can I use port forwarding, Tailscale, or another tunnel?
+
+Another transport is a complete substitute only if it also provides a public HTTPS MCP endpoint reachable by ChatGPT, trusted TLS, authentication/OAuth, safe device routing, reliable reconnect behavior, and explicit mutation-delivery semantics.
+
+Private IPs and Tailscale-only addresses are not directly reachable from ChatGPT's cloud service. Raw port forwarding increases exposure. Cloudflare is the currently supported and qualified path.
+
+### What if the first install cannot find Herdr windows or the Herdr Server?
+
+Starting with **v1.0.1**, `herdr-mcp install` discovers and verifies installed Herdr, attempts a stable Herdr update, invokes the official Herdr installer when Herdr is absent, and requires the local Herdr Server/API to become reachable before installation is considered complete.
+
+If something still looks wrong, run:
+
+```bash
+herdr-mcp status
+herdr-mcp doctor
+```
+
+Do not install a second Herdr copy just because the current shell PATH cannot resolve `herdr`; follow the repair path reported by `doctor`.
+
+### What do I do when I see `workstation_offline`?
+
+It means Edge can still answer, but the selected computer did not have a validated live connection at that moment. Short interruptions get an automatic reconnect grace period.
+
+For mutations, follow the returned `delivery_state` / retry metadata and do not blindly repeat an operation whose delivery is uncertain. See [Troubleshooting](docs/i18n/en/troubleshooting.md).
+
+### Do I need the Chrome extension?
+
+No. The core ChatGPT → MCP → workstation connection works without it. Install the extension for Project binding, Control Center, browser continuity, queued next turns, or WebChat handoff.
+
+### Does Herdr-MCP require a specific coding agent?
+
+No. Deterministic work can run directly, and complex work can be delegated to whichever compatible agents are available on the selected computer.
+
+## Related projects and acknowledgements
+
+Herdr-MCP builds on ideas demonstrated by several open projects:
+
+- [Herdr](https://github.com/herdrdev/herdr) — persistent workspace, terminal, and agent environment.
+- [coding-tools-mcp](https://github.com/xyTom/coding-tools-mcp) — focused deterministic coding-MCP tools.
+- [MCPX](https://github.com/opentokenz/mcpx) — durable remote MCP sessions and recovery ideas.
+- [AgenticGPT](https://github.com/slhaf/AgenticGPT) — remote-worker architecture and managed jobs.
+- [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) — Web planner / Codex executor collaboration.
+- [codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) — Codex harness with Web-model inference.
+- [OpenAI tunnel-client](https://github.com/openai/tunnel-client) — secure exposure of MCP-compatible services to ChatGPT.
+
+These references acknowledge sources of ideas and ecosystem context; they do not imply dependency on Herdr-MCP or endorsement by the listed projects or authors. See [Ecosystem comparison](docs/i18n/en/herdr-vs-ecosystem.md) for architectural trade-offs.
+
 ## License
 
 MIT

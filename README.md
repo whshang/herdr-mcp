@@ -134,6 +134,61 @@ macOS Apple Silicon、Linux x86_64 和 Linux ARM64 为 Production。Windows x86_
 
 [平台支持](docs/i18n/zh-CN/platform-support-matrix.md) · [CLI 参考](docs/i18n/zh-CN/cli-reference.md) · [完整文档](https://whshang.github.io/herdr-mcp/zh-CN/)
 
+## 常见问题
+
+### 为什么使用 Cloudflare？
+
+ChatGPT 在公网运行，而开发机通常位于 NAT、防火墙、动态网络或公司网络之后。Herdr-MCP 让工作站保持无公网入站端口，由每台设备主动连接到稳定的 Cloudflare 入口。
+
+Cloudflare 同时承担公网 MCP/OAuth 地址、设备路由、重连协调，以及多设备所需的少量共享状态。
+
+### 能不能用端口映射、Tailscale 或其它内网穿透？
+
+其它传输方式只有在同时提供公网 HTTPS MCP 地址、可信 TLS、认证/OAuth、安全设备路由、可靠重连和明确的 mutation 交付语义时，才可以完整替代当前路径。
+
+私网 IP 或仅 Tailscale 可见的地址无法直接被 ChatGPT 云端访问；裸端口映射会扩大暴露面。Cloudflare 是当前正式支持并完成验证的方案。
+
+### 首次安装后找不到 Herdr 窗口或 Server 怎么办？
+
+从 **v1.0.1** 开始，`herdr-mcp install` 会自动发现、验证并尝试更新已安装的 Herdr；完全找不到 Herdr 时会调用官方安装器，并在安装完成前确认本机 Herdr Server/API 真正可达。
+
+如果仍异常，先运行：
+
+```bash
+herdr-mcp status
+herdr-mcp doctor
+```
+
+不要因为 shell PATH 暂时找不到 `herdr` 就重复安装第二份 Herdr。按 `doctor` 输出修复路径即可。
+
+### 遇到 `workstation_offline` 怎么办？
+
+它表示 Edge 仍能响应，但目标电脑当时没有有效在线连接。短暂断线会先等待自动重连。
+
+涉及修改操作时，按错误中的 `delivery_state` / retry 信息处理；交付状态不确定的 mutation 不要直接重复。详细见[故障排查](docs/i18n/zh-CN/troubleshooting.md)。
+
+### 必须安装 Chrome 扩展吗？
+
+不需要。核心 ChatGPT → MCP → 工作站连接可以独立使用。需要 Project 绑定、Control Center、浏览器连续工作、排队下一轮或 WebChat 接力时再安装。
+
+### Herdr-MCP 必须绑定某个 Coding Agent 吗？
+
+不需要。确定性工作可以直接执行，复杂任务可以交给目标电脑上任意兼容且可用的 Agent。
+
+## 相关项目与致谢
+
+Herdr-MCP 从多个开源项目中吸收了成熟思路：
+
+- [Herdr](https://github.com/herdrdev/herdr) — 持久 workspace、终端和 Agent 环境。
+- [coding-tools-mcp](https://github.com/xyTom/coding-tools-mcp) — 聚焦确定性 Coding MCP 工具。
+- [MCPX](https://github.com/opentokenz/mcpx) — 持久远程 MCP Session 与恢复思路。
+- [AgenticGPT](https://github.com/slhaf/AgenticGPT) — Remote Worker 与 managed jobs 架构。
+- [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) — Web planner / Codex executor 协作。
+- [codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) — Codex harness + Web 模型推理。
+- [OpenAI tunnel-client](https://github.com/openai/tunnel-client) — 安全暴露 MCP 服务给 ChatGPT 的参考实现。
+
+这些项目用于说明来源、启发和生态关系，不表示它们依赖 Herdr-MCP，也不表示其作者对 Herdr-MCP 背书。更多架构取舍见[生态对比](docs/i18n/zh-CN/herdr-vs-ecosystem.md)。
+
 ## License
 
 MIT
