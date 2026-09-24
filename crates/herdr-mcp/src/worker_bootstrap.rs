@@ -828,17 +828,18 @@ pub(crate) fn update_existing_worker_for_release(
         ));
     }
     let settings = cloudflare.script_settings(&account.id, &current.worker_name)?;
-    let legacy_oauth_issuer = if current.legacy_custom_domain {
-        legacy_custom_domain_oauth_issuer(
-            &cloudflare,
-            &account.id,
-            &current.worker_name,
-            &current.edge_origin,
-            &settings,
-        )?
-    } else {
-        None
-    };
+    let legacy_oauth_issuer =
+        if expected_worker_service_from_origin(&current.edge_origin)?.is_none() {
+            legacy_custom_domain_oauth_issuer(
+                &cloudflare,
+                &account.id,
+                &current.worker_name,
+                &current.edge_origin,
+                &settings,
+            )?
+        } else {
+            None
+        };
     validate_existing_worker_settings(
         &settings,
         &current.worker_name,
@@ -851,13 +852,10 @@ pub(crate) fn update_existing_worker_for_release(
         },
     )?;
     let secret_names = cloudflare.list_secret_names(&account.id, &current.worker_name)?;
-    let oauth_issuer = legacy_oauth_issuer
-        .as_deref()
-        .unwrap_or(&current.edge_origin);
     let metadata = worker_update_metadata(
         &current.worker_name,
         &current.edge_origin,
-        oauth_issuer,
+        legacy_oauth_issuer.as_deref(),
         target_version,
         &settings,
         &secret_names,
@@ -1706,6 +1704,45 @@ fn plain_text_binding_value<'a>(bindings: &'a [Value], name: &str) -> Result<&'a
         })
 }
 
+fn optional_plain_text_binding_value<'a>(
+    bindings: &'a [Value],
+    name: &str,
+) -> Result<Option<&'a str>, String> {
+    let matches = bindings
+        .iter()
+        .filter(|binding| {
+            binding.get("type").and_then(Value::as_str) == Some("plain_text")
+                && binding.get("name").and_then(Value::as_str) == Some(name)
+        })
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => matches[0]
+            .get("text")
+            .and_then(Value::as_str)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "Cloudflare Worker setting {name} has no text value; no mutation was attempted"
+                )
+            }),
+        _ => Err(format!(
+            "Cloudflare Worker setting {name} has more than one plain_text binding; no mutation was attempted"
+        )),
+    }
+}
+
+fn valid_legacy_workers_dev_issuer(value: &str) -> bool {
+    let Some(host) = value.strip_prefix("https://") else {
+        return false;
+    };
+    !host.is_empty()
+        && host.ends_with(".workers.dev")
+        && !host
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b':'))
+}
+
 fn valid_workers_subdomain(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
@@ -1749,17 +1786,23 @@ fn legacy_custom_domain_oauth_issuer(
         .and_then(Value::as_array)
         .ok_or_else(|| "Cloudflare Worker settings are missing bindings".to_owned())?;
     let issuer = plain_text_binding_value(bindings, "OAUTH_ISSUER")?;
-    if issuer == edge_origin {
-        return Ok(None);
-    }
+    let stored_legacy = optional_plain_text_binding_value(bindings, "OAUTH_LEGACY_ISSUER")?;
+    let candidate = if issuer == edge_origin {
+        let Some(stored_legacy) = stored_legacy else {
+            return Ok(None);
+        };
+        stored_legacy
+    } else {
+        issuer
+    };
     let subdomain = cloudflare.workers_subdomain(account_id)?.ok_or_else(|| {
         "Cloudflare account has no workers.dev subdomain to prove the legacy OAuth issuer; no mutation was attempted"
             .to_owned()
     })?;
     let expected = canonical_workers_dev_origin(worker_name, &subdomain)?;
-    if issuer != expected {
+    if candidate != expected || stored_legacy.is_some_and(|value| value != expected) {
         return Err(
-            "Cloudflare Worker OAUTH_ISSUER is neither the configured custom domain nor this account/script's canonical workers.dev origin; no mutation was attempted"
+            "Cloudflare Worker legacy OAuth issuer is not this account/script's canonical workers.dev origin; no mutation was attempted"
                 .to_owned(),
         );
     }
@@ -2108,24 +2151,15 @@ fn worker_upload_metadata(
 fn worker_update_metadata(
     worker_name: &str,
     edge_origin: &str,
-    oauth_issuer: &str,
+    legacy_oauth_issuer: Option<&str>,
     runtime_version: &str,
     current_settings: &Value,
     secret_names: &[String],
 ) -> Result<Value, String> {
+    // The configured custom domain is always the canonical OAuth issuer. A
+    // proven pre-1.0 workers.dev issuer is carried only as a compatibility
+    // alias so existing Connector credentials can migrate without re-add.
     let mut metadata = worker_upload_metadata(worker_name, edge_origin, runtime_version, false)?;
-    if !oauth_issuer.starts_with("https://") {
-        return Err("invalid OAuth issuer for direct Edge upload".to_owned());
-    }
-    let upload_bindings = metadata
-        .get_mut("bindings")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| "cannot construct Worker update bindings".to_owned())?;
-    let oauth_binding = upload_bindings
-        .iter_mut()
-        .find(|binding| binding.get("name").and_then(Value::as_str) == Some("OAUTH_ISSUER"))
-        .ok_or_else(|| "cannot construct Worker OAuth issuer binding".to_owned())?;
-    oauth_binding["text"] = Value::String(oauth_issuer.to_owned());
     let Some(bindings) = current_settings.get("bindings") else {
         return Err(
             "Cloudflare Worker settings are missing bindings; refusing an in-place update"
@@ -2141,6 +2175,20 @@ fn worker_update_metadata(
         .and_then(Value::as_array_mut)
         .ok_or_else(|| "cannot construct Worker update bindings".to_owned())?;
     let mut inherited_names = BTreeSet::new();
+    if let Some(legacy_issuer) = legacy_oauth_issuer {
+        if !valid_legacy_workers_dev_issuer(legacy_issuer) {
+            return Err(
+                "proven legacy OAuth issuer is not a canonical HTTPS workers.dev origin; no mutation was attempted"
+                    .to_owned(),
+            );
+        }
+        desired.push(json!({
+            "type": "plain_text",
+            "name": "OAUTH_LEGACY_ISSUER",
+            "text": legacy_issuer,
+        }));
+        inherited_names.insert("OAUTH_LEGACY_ISSUER".to_owned());
+    }
     for binding in bindings {
         let binding_type = binding
             .get("type")
@@ -2156,6 +2204,31 @@ fn worker_update_metadata(
                 "WORKSTATION_DO" | "OAUTH_STORE_DO" | "DEVICE_REGISTRY_DO",
             )
             | ("plain_text", "EDGE_ENV" | "EDGE_PROJECT" | "EDGE_VERSION" | "OAUTH_ISSUER") => {}
+            ("plain_text", "OAUTH_LEGACY_ISSUER") => {
+                let text = binding
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|value| valid_legacy_workers_dev_issuer(value))
+                    .ok_or_else(|| {
+                        "Worker OAUTH_LEGACY_ISSUER is invalid; refusing an update that could preserve an unproven OAuth alias"
+                            .to_owned()
+                    })?;
+                if let Some(proven) = legacy_oauth_issuer
+                    && text != proven
+                {
+                    return Err(
+                        "Worker OAUTH_LEGACY_ISSUER does not match the Cloudflare-proven workers.dev identity; no mutation was attempted"
+                            .to_owned(),
+                    );
+                }
+                if inherited_names.insert(name.to_owned()) {
+                    desired.push(json!({
+                        "type": "plain_text",
+                        "name": "OAUTH_LEGACY_ISSUER",
+                        "text": text,
+                    }));
+                }
+            }
             // Pre-1.0 wrangler-template Workers authenticate their single
             // non-enrolled Link as this workstation id, and the 1.x Edge still
             // honours it for legacy-default routing/auth. It must survive the
@@ -4284,7 +4357,7 @@ mod tests {
         let metadata = worker_update_metadata(
             "herdr-edge-mac",
             "https://mcp.example.com",
-            "https://mcp.example.com",
+            None,
             "1.0.0",
             &settings,
             &["LINK_SHARED_SECRET".to_owned()],
@@ -4350,7 +4423,7 @@ mod tests {
         let error = worker_update_metadata(
             "herdr-edge-mac",
             "https://mcp.example.com",
-            "https://mcp.example.com",
+            None,
             "1.0.0",
             &settings,
             &[],
@@ -4486,7 +4559,7 @@ mod tests {
         let metadata = worker_update_metadata(
             "herdr-edge-nathandemacbook-air-local",
             custom_origin,
-            legacy_issuer,
+            Some(legacy_issuer),
             "1.0.4",
             &settings,
             &["LINK_SHARED_SECRET".to_owned()],
@@ -4495,6 +4568,10 @@ mod tests {
         let bindings = metadata["bindings"].as_array().unwrap();
         assert!(bindings.iter().any(|binding| {
             binding.get("name").and_then(Value::as_str) == Some("OAUTH_ISSUER")
+                && binding.get("text").and_then(Value::as_str) == Some(custom_origin)
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.get("name").and_then(Value::as_str) == Some("OAUTH_LEGACY_ISSUER")
                 && binding.get("text").and_then(Value::as_str) == Some(legacy_issuer)
         }));
         assert!(bindings.iter().any(|binding| {
@@ -4585,7 +4662,7 @@ mod tests {
         let metadata = worker_update_metadata(
             LEGACY_SCRIPT,
             LEGACY_ORIGIN,
-            LEGACY_ORIGIN,
+            None,
             "1.0.3",
             &settings,
             &["LINK_SHARED_SECRET".to_owned()],
@@ -4710,7 +4787,7 @@ mod tests {
             worker_update_metadata(
                 LEGACY_SCRIPT,
                 LEGACY_ORIGIN,
-                LEGACY_ORIGIN,
+                Some(LEGACY_ORIGIN),
                 "1.0.3",
                 &invalid,
                 &[]
@@ -4727,7 +4804,7 @@ mod tests {
             worker_update_metadata(
                 LEGACY_SCRIPT,
                 LEGACY_ORIGIN,
-                LEGACY_ORIGIN,
+                Some(LEGACY_ORIGIN),
                 "1.0.3",
                 &invalid,
                 &[]

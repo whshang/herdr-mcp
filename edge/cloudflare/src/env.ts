@@ -25,8 +25,13 @@ export interface Env {
   STATIC_MCP_BEARER_SECRET?: string;
   /** Optional absolute Unix-ms expiry fence for a temporary static bearer. */
   STATIC_MCP_BEARER_EXPIRES_AT_MS?: string;
-  /** Exact production OAuth issuer used to validate already-issued access JWTs. */
+  /** Canonical production OAuth issuer. Custom Domain wins when configured. */
   OAUTH_ISSUER?: string;
+  /**
+   * Proven pre-1.0 workers.dev OAuth issuer retained only as a migration alias.
+   * New discovery/token issuance never uses this value.
+   */
+  OAUTH_LEGACY_ISSUER?: string;
   /** Existing production OAuth RS256 public key, supplied as a Worker secret. */
   OAUTH_JWT_PUBLIC_PEM?: string;
   /** Temporary one-time admin bearer used only while importing OAuth state. */

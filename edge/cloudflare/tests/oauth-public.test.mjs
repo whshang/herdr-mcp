@@ -1025,6 +1025,46 @@ test("refresh_token rotates: new pair issued, old token rejected on replay", asy
   assert.equal(again.status, 200);
 });
 
+test("refresh_token migrates a proven workers.dev resource to the custom-domain identity", async () => {
+  const legacyIdentity = createOAuthIdentity("https://herdr-edge-nathan.example.workers.dev");
+  const opts = makeOptions({ identity: legacyIdentity });
+  const { client_id } = await registerClient(opts, { token_endpoint_auth_method: "none" });
+  const { code, verifier } = await makeAuthCode(opts, client_id);
+  const first = await POST(
+    "/oauth/token",
+    tokenBody(client_id, code, verifier, { resource: legacyIdentity.resource }),
+    opts,
+  );
+  assert.equal(first.status, 200);
+  const pair = await first.json();
+
+  // Upgrade switches discovery/issuance to the custom domain while retaining
+  // only the exact workers.dev identity as a migration alias.
+  opts.identity = IDENTITY;
+  opts.legacyIdentity = legacyIdentity;
+  const discovery = await GET("/.well-known/oauth-authorization-server", opts);
+  assert.equal((await discovery.json()).issuer, ISSUER);
+
+  const migrated = await POST("/oauth/token", {
+    grant_type: "refresh_token",
+    refresh_token: pair.refresh_token,
+    client_id,
+    resource: legacyIdentity.resource,
+  }, opts);
+  assert.equal(migrated.status, 200);
+  const next = await migrated.json();
+  assert.notEqual(next.refresh_token, pair.refresh_token);
+
+  // The replacement credential has converged to the custom-domain resource.
+  const again = await POST("/oauth/token", {
+    grant_type: "refresh_token",
+    refresh_token: next.refresh_token,
+    client_id,
+    resource: IDENTITY.resource,
+  }, opts);
+  assert.equal(again.status, 200);
+});
+
 test("refresh_token: missing token is invalid_grant", async () => {
   const opts = makeOptions();
   const { client_id } = await registerClient(opts, { token_endpoint_auth_method: "none" });

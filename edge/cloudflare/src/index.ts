@@ -1399,8 +1399,14 @@ async function handleEdgeOAuthPublic(request: Request, env: Env): Promise<Respon
     }
   }
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const identity = createOAuthIdentity(env.OAUTH_ISSUER);
+  const legacyIssuer = env.OAUTH_LEGACY_ISSUER?.trim();
+  const legacyIdentity = legacyIssuer && legacyIssuer.replace(/\/+$/, "") !== identity.issuer
+    ? createOAuthIdentity(legacyIssuer)
+    : undefined;
   return handleOAuthPublic(request, {
-    identity: createOAuthIdentity(env.OAUTH_ISSUER),
+    identity,
+    ...(legacyIdentity ? { legacyIdentity } : {}),
     store: createOAuthPublicStore(stub),
     approvalSecret: env.LINK_SHARED_SECRET ?? "",
     fetchFn: globalThis.fetch,

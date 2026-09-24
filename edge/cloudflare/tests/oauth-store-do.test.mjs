@@ -1041,6 +1041,71 @@ test("token issue + refresh exchange uses Edge signing key and rotates one-time 
   assert.equal((await body(replay)).code, "invalid_grant");
 });
 
+test("custom-domain migration accepts old issuer JWT and atomically rotates old refresh resource", async () => {
+  const legacyIssuer = "https://herdr-edge-nathan.example.workers.dev";
+  const currentIssuer = "https://mcp.example.com";
+  const env = { OAUTH_ISSUER: legacyIssuer };
+  const h = harness(env);
+
+  const issued = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "c1",
+    resource: `${legacyIssuer}/mcp`,
+    now_sec: 1000,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  }));
+  assert.equal(issued.ok, true);
+
+  env.OAUTH_ISSUER = currentIssuer;
+  env.OAUTH_LEGACY_ISSUER = legacyIssuer;
+
+  const oldAccess = await body(await h.post("/internal/oauth/access/verify", {
+    token: issued.token.access_token,
+    now_sec: 1001,
+  }));
+  assert.equal(oldAccess.ok, true);
+  assert.equal(oldAccess.source, "edge_jwt_legacy_issuer");
+
+  const oldHash = await hashOpaqueToken(issued.token.refresh_token);
+  const mismatch = await h.post("/internal/oauth/refresh/exchange", {
+    hash: oldHash,
+    client_id: "c1",
+    resource: "https://unrelated.example/mcp",
+    now_sec: 1100,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  });
+  assert.equal(mismatch.status, 400);
+  assert.equal((await body(mismatch)).code, "invalid_grant");
+
+  // A resource mismatch must not burn the still-valid refresh token. The next
+  // exact migration consumes it once and mints a custom-domain pair.
+  const migrated = await body(await h.post("/internal/oauth/refresh/exchange", {
+    hash: oldHash,
+    client_id: "c1",
+    resource: `${currentIssuer}/mcp`,
+    legacy_resource: `${legacyIssuer}/mcp`,
+    now_sec: 1101,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  }));
+  assert.equal(migrated.ok, true);
+  assert.notEqual(migrated.token.refresh_token, issued.token.refresh_token);
+
+  const signing = await body(await h.post("/internal/oauth/signing/ensure", {}));
+  const publicKey = await crypto.subtle.importKey(
+    "jwk",
+    signing.public_jwk,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  const verifier = createRs256AccessTokenVerifier(createOAuthIdentity(currentIssuer), publicKey);
+  const verdict = await verifier.verify(migrated.token.access_token, 1102);
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.clientId, "c1");
+});
+
 test("bulk import is bounded, validates, and is idempotent without overwrite", async () => {
   const h = harness();
   const payload = {

@@ -119,7 +119,11 @@ export interface TokenIssueInput {
   refresh_ttl_sec: number;
 }
 
-export type RefreshExchangeInput = TokenIssueInput & { hash: string };
+export type RefreshExchangeInput = TokenIssueInput & {
+  hash: string;
+  /** Exact old protected resource accepted once for custom-domain migration. */
+  legacy_resource?: string;
+};
 
 /**
  * The full store surface this handler needs. Backed by `createOAuthPublicStore`
@@ -167,8 +171,10 @@ export interface OAuthPublicStore {
 }
 
 export interface OAuthPublicOptions {
-  /** Exact production issuer/resource identity (see createOAuthIdentity). */
+  /** Canonical production issuer/resource identity (see createOAuthIdentity). */
   identity: OAuthEdgeIdentity;
+  /** Proven workers.dev identity accepted only for credential migration. */
+  legacyIdentity?: OAuthEdgeIdentity;
   store: OAuthPublicStore;
   /** Existing deployment secret used only to HMAC short fleet-approval codes. */
   approvalSecret: string;
@@ -835,6 +841,7 @@ async function authenticateClient(
 
 interface HandlerCtx {
   identity: OAuthEdgeIdentity;
+  legacyIdentity?: OAuthEdgeIdentity;
   store: OAuthPublicStore;
   approvalSecret: string;
   fetchFn: typeof globalThis.fetch;
@@ -1203,7 +1210,16 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
     }
   }
 
-  const resource = normalizeResource(ctx.identity, first("resource") ?? "");
+  const requestedResource = first("resource") ?? "";
+  let resource = normalizeResource(ctx.identity, requestedResource);
+  if (!resource && grantType === "refresh_token" && ctx.legacyIdentity) {
+    // An existing Connector may still refresh against its pre-1.0 workers.dev
+    // resource. Accept only that exact proven alias, then mint the replacement
+    // pair for the canonical custom-domain resource.
+    if (normalizeResource(ctx.legacyIdentity, requestedResource)) {
+      resource = ctx.identity.resource;
+    }
+  }
   if (!resource) {
     return tokenError(
       ctx,
@@ -1237,6 +1253,9 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
       ctx.identity.issuer,
       nowSec,
       ctx.fetchFn,
+      grantType === "refresh_token" && ctx.legacyIdentity
+        ? [ctx.legacyIdentity.issuer, `${ctx.legacyIdentity.issuer}/oauth/token`]
+        : [],
     );
     if (!verdict.ok) {
       return tokenError(ctx, "invalid_client", "client_assertion verification failed");
@@ -1333,6 +1352,7 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
       now_sec: nowSec,
       access_ttl_sec: ctx.accessTtlSec,
       refresh_ttl_sec: ctx.refreshTtlSec,
+      ...(ctx.legacyIdentity ? { legacy_resource: ctx.legacyIdentity.resource } : {}),
     });
     if (!pair) {
       return tokenError(ctx, "invalid_grant", "unknown, expired or already-used refresh_token");
@@ -1445,6 +1465,7 @@ export async function handleOAuthPublic(
   const maxParamBytes = options.maxParamBytes ?? DEFAULT_MAX_PARAM_BYTES;
   const hctx: HandlerCtx = {
     identity,
+    ...(options.legacyIdentity ? { legacyIdentity: options.legacyIdentity } : {}),
     store,
     approvalSecret: options.approvalSecret,
     fetchFn,
@@ -1741,6 +1762,7 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
         now_sec: input.now_sec,
         access_ttl_sec: input.access_ttl_sec,
         refresh_ttl_sec: input.refresh_ttl_sec,
+        ...(input.legacy_resource ? { legacy_resource: input.legacy_resource } : {}),
       });
       return tokenPair(resp);
     },
