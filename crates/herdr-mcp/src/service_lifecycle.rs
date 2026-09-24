@@ -28,6 +28,18 @@ enum RollbackSupervisorStrategy {
     Remove,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrReadinessPolicy {
+    Required,
+    BestEffort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostCommitSidecarPolicy {
+    Required,
+    BestEffort,
+}
+
 fn retry_sidecar_once<F>(label: &str, mut operation: F) -> Result<(), String>
 where
     F: FnMut() -> Result<(), String>,
@@ -49,17 +61,12 @@ pub(crate) fn run_with_locale(
     language: Locale,
 ) -> Result<ExitCode, String> {
     match command {
-        ServiceCommand::Install { adopt_node } => {
-            herdr_dependency::prepare_for_service_install()?;
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            let result = service_manager::run(ServiceCommand::Install { adopt_node })?;
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-            let result = run_install(adopt_node, language)?;
-            if result == ExitCode::SUCCESS {
-                herdr_dependency::ensure_server_ready_after_install()?;
-            }
-            Ok(result)
-        }
+        ServiceCommand::Install { adopt_node } => run_install_command(
+            adopt_node,
+            language,
+            HerdrReadinessPolicy::Required,
+            PostCommitSidecarPolicy::Required,
+        ),
         ServiceCommand::Rollback => {
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
@@ -86,18 +93,90 @@ pub(crate) fn run_with_locale(
     }
 }
 
+pub(crate) fn run_major_upgrade_install() -> Result<ExitCode, String> {
+    run_install_command(
+        false,
+        crate::locale::resolve(None),
+        HerdrReadinessPolicy::BestEffort,
+        PostCommitSidecarPolicy::BestEffort,
+    )
+}
+
+fn run_install_command(
+    adopt_node: bool,
+    language: Locale,
+    herdr_readiness: HerdrReadinessPolicy,
+    sidecars: PostCommitSidecarPolicy,
+) -> Result<ExitCode, String> {
+    herdr_dependency::prepare_for_service_install()?;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let _ = (language, sidecars);
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let result = service_manager::run(ServiceCommand::Install { adopt_node })?;
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let result = run_install(adopt_node, language, sidecars)?;
+    if result == ExitCode::SUCCESS {
+        apply_herdr_readiness_policy(
+            herdr_readiness,
+            herdr_dependency::ensure_server_ready_after_install(),
+        )?;
+    }
+    Ok(result)
+}
+
+fn apply_herdr_readiness_policy(
+    policy: HerdrReadinessPolicy,
+    readiness: Result<(), String>,
+) -> Result<(), String> {
+    match (policy, readiness) {
+        (_, Ok(())) => Ok(()),
+        (HerdrReadinessPolicy::Required, Err(error)) => Err(error),
+        (HerdrReadinessPolicy::BestEffort, Err(error)) => {
+            eprintln!(
+                "warning: major Runtime migration committed, but Herdr Server readiness still needs repair: {error}"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn keep_committed_runtime_on_sidecar_failure(
+    policy: PostCommitSidecarPolicy,
+    label: &str,
+    error: &str,
+) -> bool {
+    if policy != PostCommitSidecarPolicy::BestEffort {
+        return false;
+    }
+    eprintln!(
+        "warning: major Runtime migration committed, but {label} still needs repair: {error}"
+    );
+    true
+}
+
 /// Shared install lifecycle for the public `service install` path. The
 /// orchestrator is the executing binary; the installed payload is the same
 /// executable (`current_exe` inside `service_manager`).
-fn run_install(adopt_node: bool, language: Locale) -> Result<ExitCode, String> {
-    let result = run_install_lifecycle(language, |mutation_lock| {
+fn run_install(
+    adopt_node: bool,
+    language: Locale,
+    sidecars: PostCommitSidecarPolicy,
+) -> Result<ExitCode, String> {
+    let result = run_install_lifecycle(language, sidecars, |mutation_lock| {
         service_manager::run_with_mutation_lock(
             ServiceCommand::Install { adopt_node },
             mutation_lock,
         )
     })?;
-    if result == ExitCode::SUCCESS {
-        crate::dev::reconcile_after_public_prod_install()?;
+    if result == ExitCode::SUCCESS
+        && let Err(error) = crate::dev::reconcile_after_public_prod_install()
+        && !keep_committed_runtime_on_sidecar_failure(
+            sidecars,
+            "DEV/PROD channel state reconcile",
+            &error,
+        )
+    {
+        return Err(error);
     }
     Ok(result)
 }
@@ -113,9 +192,13 @@ pub(crate) fn run_install_from_payload(
     payload_binary: &Path,
 ) -> Result<ExitCode, String> {
     refuse_sidecar_mutation_inside_managed_exec()?;
-    run_install_lifecycle(crate::locale::resolve(None), |mutation_lock| {
-        service_manager::run_install_from_payload(adopt_node, payload_binary, mutation_lock)
-    })
+    run_install_lifecycle(
+        crate::locale::resolve(None),
+        PostCommitSidecarPolicy::Required,
+        |mutation_lock| {
+            service_manager::run_install_from_payload(adopt_node, payload_binary, mutation_lock)
+        },
+    )
 }
 
 /// One shared install lifecycle. The mutation lock is acquired, the pre-commit
@@ -124,7 +207,11 @@ pub(crate) fn run_install_from_payload(
 /// post-commit sidecar orchestration (Herdr supervisor, product identity/update
 /// fence, production Link generation reconcile, native-host sync, compensation)
 /// completes inside `finish_install_lifecycle`.
-fn run_install_lifecycle<Install>(language: Locale, install: Install) -> Result<ExitCode, String>
+fn run_install_lifecycle<Install>(
+    language: Locale,
+    sidecars: PostCommitSidecarPolicy,
+    install: Install,
+) -> Result<ExitCode, String>
 where
     Install: FnOnce(&service_manager::ServiceMutationLease) -> Result<ExitCode, String>,
 {
@@ -152,6 +239,7 @@ where
         &mutation_lock,
         result,
         language,
+        sidecars,
     )
 }
 
@@ -165,6 +253,7 @@ fn finish_install_lifecycle(
     mutation_lock: &service_manager::ServiceMutationLease,
     result: ExitCode,
     language: Locale,
+    sidecars: PostCommitSidecarPolicy,
 ) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     let _ = language;
@@ -173,7 +262,13 @@ fn finish_install_lifecycle(
         return Ok(result);
     }
 
-    if let Err(supervisor_error) = herdr_supervisor::ensure_installed_for_service() {
+    if let Err(supervisor_error) = herdr_supervisor::ensure_installed_for_service()
+        && !keep_committed_runtime_on_sidecar_failure(
+            sidecars,
+            "Herdr supervisor activation",
+            &supervisor_error,
+        )
+    {
         let after_service = service_snapshot()?;
         let recovery = install_recovery(&before_service, &after_service);
         let cleanup_error = herdr_supervisor::remove_for_service().err();
@@ -219,7 +314,13 @@ fn finish_install_lifecycle(
     }
 
     let paths = RuntimePaths::discover()?;
-    if let Err(link_error) = link::reconcile_after_service_generation_change(&paths) {
+    if let Err(link_error) = link::reconcile_after_service_generation_change(&paths)
+        && !keep_committed_runtime_on_sidecar_failure(
+            sidecars,
+            "production Link generation reconcile",
+            &link_error,
+        )
+    {
         let after_service = service_snapshot()?;
         let recovery = install_recovery(&before_service, &after_service);
         let service_recovery = match recovery {
@@ -278,6 +379,11 @@ fn finish_install_lifecycle(
     {
         if !paths.instance.is_named()
             && let Err(native_host_error) = native_host_install::sync_owned_runtime_from_active()
+            && !keep_committed_runtime_on_sidecar_failure(
+                sidecars,
+                "owned native-host runtime sync",
+                &native_host_error,
+            )
         {
             let after_service = service_snapshot()?;
             let recovery = install_recovery(&before_service, &after_service);
@@ -586,6 +692,40 @@ mod tests {
         assert_eq!(failed_attempts, 2);
         assert!(error.contains("failure-1"));
         assert!(error.contains("failure-2"));
+    }
+
+    #[test]
+    fn major_upgrade_keeps_committed_runtime_when_only_herdr_readiness_is_pending() {
+        let error = "Herdr server did not become reachable".to_owned();
+        assert!(
+            apply_herdr_readiness_policy(HerdrReadinessPolicy::BestEffort, Err(error.clone()),)
+                .is_ok()
+        );
+        assert_eq!(
+            apply_herdr_readiness_policy(HerdrReadinessPolicy::Required, Err(error)).unwrap_err(),
+            "Herdr server did not become reachable"
+        );
+    }
+
+    #[test]
+    fn major_upgrade_keeps_committed_runtime_when_repairable_sidecar_is_pending() {
+        for label in [
+            "Herdr supervisor activation",
+            "production Link generation reconcile",
+            "owned native-host runtime sync",
+            "DEV/PROD channel state reconcile",
+        ] {
+            assert!(keep_committed_runtime_on_sidecar_failure(
+                PostCommitSidecarPolicy::BestEffort,
+                label,
+                "synthetic sidecar failure",
+            ));
+            assert!(!keep_committed_runtime_on_sidecar_failure(
+                PostCommitSidecarPolicy::Required,
+                label,
+                "synthetic sidecar failure",
+            ));
+        }
     }
 
     #[test]
