@@ -8,28 +8,28 @@ The goal is to connect a local workstation to ChatGPT / Web AI while keeping sou
 
 ## Before installation
 
-### 1. Herdr must be available
+### 1. Herdr dependency is self-repaired by `herdr-mcp install`
+
+You may inspect Herdr manually with:
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
 ```
 
-If Herdr is missing, use the official stable installer.
+but those commands are diagnostic, not a first-install prerequisite. The normal `herdr-mcp install` path now resolves Herdr from `HERDR_BIN`, the stable per-user location, Homebrew/`/usr/local`, or the current PATH. If Herdr is already installed, herdr-mcp verifies the CLI/API and attempts `herdr update` (using live handoff when a server is already running). If Herdr cannot be found, herdr-mcp downloads and runs the official installer from <https://herdr.dev/>. After the herdr-mcp service is installed it also verifies that the local Herdr Server/API is reachable; macOS uses the owned Supervisor/TCC-broker path, while Linux/Windows start the current-user Herdr server when needed.
 
-macOS / Linux:
+The official installer remains the manual fallback for troubleshooting:
 
 ```bash
+# macOS / Linux
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
-Windows:
-
 ```powershell
+# Windows
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
-
-Then run `herdr --version` again. Herdr's own install behavior is authoritative at <https://herdr.dev/docs/install/>.
 
 ### 2. Decide which client path you need
 
@@ -39,7 +39,7 @@ Then run `herdr --version` again. Herdr's own install behavior is authoritative 
 
 ## Supported platform boundary
 
-Use the GitHub `Latest` stable Release at <https://github.com/whshang/herdr-mcp/releases>. First-device `worker bootstrap` and existing-fleet `worker connect` are production-qualified on Apple Silicon macOS and native Debian-class Linux on both x86_64 and ARM64. Herdr-MCP 1.0 also enables first-device `worker bootstrap` on native Windows, including canonical device enrollment, Windows Credential Manager persistence, managed runtime activation, and Link reconciliation. Windows x86_64 and Windows ARM64 remain published 1.0 candidates rather than Production platforms: Windows x86_64 has been exercised on physical hardware for install/recovery and a real Connector conversation, while the exact final 1.0 candidate still requires a fresh first-device bootstrap record plus the remaining #394 promotion evidence. Windows ARM64 still has hosted-runner qualification only. Windows uses Herdr named pipes, Windows Credential Manager, current-user Startup-folder shortcut autostart, and detached user processes. When that managed Windows runtime starts, it probes the configured Herdr API and best-effort starts an already-installed `herdr server` if needed; it does not install or remove Herdr itself. Browser Native Messaging and product-level reinstall/uninstall remain outside the Windows physical-UAT claim. See the [platform support matrix](platform-support-matrix.md) for the exact tested/not-yet-tested boundary.
+Use the GitHub `Latest` stable Release at <https://github.com/whshang/herdr-mcp/releases>. First-device `worker bootstrap` and existing-fleet `worker connect` are production-qualified on Apple Silicon macOS and native Debian-class Linux on both x86_64 and ARM64. Herdr-MCP 1.0 also enables first-device `worker bootstrap` on native Windows, including canonical device enrollment, Windows Credential Manager persistence, managed runtime activation, and Link reconciliation. Windows x86_64 and Windows ARM64 remain published 1.0 candidates rather than Production platforms: Windows x86_64 has been exercised on physical hardware for install/recovery and a real Connector conversation, while the exact final 1.0 candidate still requires a fresh first-device bootstrap record plus the remaining #394 promotion evidence. Windows ARM64 still has hosted-runner qualification only. Windows uses Herdr named pipes, Windows Credential Manager, current-user Startup-folder shortcut autostart, and detached user processes. The explicit `herdr-mcp install` path now owns Herdr dependency recovery on Windows too: it resolves or installs the official Herdr CLI, attempts the stable update, and verifies that the current-user `herdr server` is reachable. Herdr uninstall remains independent. Browser Native Messaging and product-level reinstall/uninstall remain outside the Windows physical-UAT claim. See the [platform support matrix](platform-support-matrix.md) for the exact tested/not-yet-tested boundary.
 
 For an older installation, follow [Runtime self-upgrade](runtime-self-upgrade.md). Upgrade the runtime in place; do not recreate a healthy Worker, device relationship, or ChatGPT Connector just to move to the current release.
 

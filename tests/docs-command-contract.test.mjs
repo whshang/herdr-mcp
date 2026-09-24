@@ -8,9 +8,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(path.join(ROOT, p), "utf8");
 
 const README_PRIMARY = [
-  ["README.md", "## Install"],
-  ["README.zh.md", "## 安装"],
-  ["README.ja.md", "## インストール"],
+  ["README.md", "## 一句话安装"],
+  ["README.en.md", "## One-sentence install"],
+  ["README.ja.md", "## 一文でインストール"],
 ];
 
 const INSTALL_PRIMARY = [
@@ -117,7 +117,7 @@ test("release model keeps publication and ownership boundaries explicit", () => 
 });
 
 test("source-development docs expose DEV/PROD dogfood without the retired npm rebuild path", () => {
-  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
+  for (const rel of ["README.md", "README.en.md", "README.ja.md"]) {
     const doc = read(rel);
     assert.doesNotMatch(doc, /herdr-mcp dev sync/, `${rel} keeps contributor DEV activation out of the top-level user path`);
   }
@@ -132,12 +132,6 @@ test("source-development docs expose DEV/PROD dogfood without the retired npm re
 });
 
 test("standalone extension path drift diagnosis stays documented", () => {
-  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
-    const doc = read(rel);
-    assert.match(doc, /standalone-extension-load state=drift/);
-    assert.match(doc, /~\/.config\/herdr-mcp\/extensions\/standalone\/current/);
-  }
-
   for (const rel of ["docs/i18n/en/extension.md", "docs/i18n/zh-CN/extension.md", "docs/i18n/ja/extension.md"]) {
     const doc = read(rel);
     assert.match(doc, /herdr-mcp doctor/);
@@ -190,7 +184,7 @@ test("continuity guide stays no-ID and fail-closed while README only links the f
     assert.match(doc, noId, `${rel} must require confirmation for text-only selection`);
     assert.match(doc, failClosed, `${rel} must keep heuristic selection fail-closed`);
   }
-  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
+  for (const rel of ["README.md", "README.en.md", "README.ja.md"]) {
     assert.match(read(rel), /browser-continuity\.md/);
   }
 });

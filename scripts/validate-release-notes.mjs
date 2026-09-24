@@ -32,10 +32,18 @@ export function validateReleaseNotes(tag, text) {
     errors.push(`first line must be exactly: ${expectedTitle}`);
   }
 
-  const upgrade = section(lines, (line) => /^##\s+Upgrade\b/i.test(line));
-  const mainChanges = section(lines, (line) => /^##\s+Main changes\b/i.test(line));
-  const knownIssues = section(lines, (line) => /^##\s+Known issues?\b/i.test(line));
-  const compatibility = section(lines, (line) => /^##\s+Compatibility\b/i.test(line));
+  const upgrade = section(lines, (line) =>
+    /^(?:##\s+Upgrade\b|##\s+升级(?:\s|$)|##\s+从.+升级(?:\s|$))/i.test(line),
+  );
+  const mainChanges = section(lines, (line) =>
+    /^(?:##\s+Main changes\b|##\s+主要变更(?:\s|$))/i.test(line),
+  );
+  const knownIssues = section(lines, (line) =>
+    /^(?:##\s+Known issues?\b|##\s+已知限制(?:\s|$)|##\s+已知问题(?:\s|$))/i.test(line),
+  );
+  const compatibility = section(lines, (line) =>
+    /^(?:##\s+Compatibility\b|##\s+兼容性(?:\s|$))/i.test(line),
+  );
 
   if (!upgrade) {
     errors.push("missing non-empty `## Upgrade...` section");

@@ -25,21 +25,15 @@ Resolve this in order without repeatedly questioning the user:
 
 ## 3. Local installation phase
 
-Check `herdr` first. If it is missing, install the official stable build:
-
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
-```
-
-On Windows use `install.ps1`; verify `herdr --version` and `herdr api schema`. Windows Candidate UAT uses the exact candidate artifact, never an ad-hoc source build.
-
-Download the **Latest stable** platform binary from <https://github.com/whshang/herdr-mcp/releases>, place it on the user `PATH` (normally `~/.local/bin/herdr-mcp`), then run:
+Do not stop the installation just because `herdr` is missing or its Server is not running. Download the **Latest stable** herdr-mcp platform binary from <https://github.com/whshang/herdr-mcp/releases>, place it on the user `PATH` (normally `~/.local/bin/herdr-mcp`), then run:
 
 ```bash
 herdr-mcp --version
 herdr-mcp install
 herdr-mcp doctor
 ```
+
+`herdr-mcp install` owns Herdr dependency recovery: it resolves `HERDR_BIN`, stable user/Homebrew/`/usr/local` paths and PATH; verifies and updates an installed Herdr; runs the official <https://herdr.dev/> installer when Herdr is absent; and verifies that the Herdr Server/API becomes reachable. Do not duplicate that flow with a second manual Herdr installation unless the command reports an explicit dependency-recovery failure. On Windows Candidate UAT still use the exact candidate herdr-mcp artifact, never an ad-hoc source build.
 
 If `~/.local/bin/herdr-mcp` exists but the shell cannot resolve it, classify `installed_but_not_on_shell_path`, repair PATH, verify a fresh shell, and do not reinstall or create a second PATH owner.
 

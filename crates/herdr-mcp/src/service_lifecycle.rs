@@ -4,7 +4,7 @@ use crate::cli::ServiceCommand;
 use crate::locale::Locale;
 #[cfg(target_os = "macos")]
 use crate::native_host_install;
-use crate::{herdr_supervisor, link, paths::RuntimePaths, service_manager};
+use crate::{herdr_dependency, herdr_supervisor, link, paths::RuntimePaths, service_manager};
 use serde_json::Value;
 use std::path::Path;
 use std::process::ExitCode;
@@ -48,17 +48,40 @@ pub(crate) fn run_with_locale(
     command: ServiceCommand,
     language: Locale,
 ) -> Result<ExitCode, String> {
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    {
-        let _ = language;
-        service_manager::run(command)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     match command {
-        ServiceCommand::Install { adopt_node } => run_install(adopt_node, language),
-        ServiceCommand::Rollback => run_rollback(),
-        ServiceCommand::Uninstall => run_uninstall(),
+        ServiceCommand::Install { adopt_node } => {
+            herdr_dependency::prepare_for_service_install()?;
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            let result = service_manager::run(ServiceCommand::Install { adopt_node })?;
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            let result = run_install(adopt_node, language)?;
+            if result == ExitCode::SUCCESS {
+                herdr_dependency::ensure_server_ready_after_install()?;
+            }
+            Ok(result)
+        }
+        ServiceCommand::Rollback => {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                let _ = language;
+                service_manager::run(ServiceCommand::Rollback)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            {
+                run_rollback()
+            }
+        }
+        ServiceCommand::Uninstall => {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                let _ = language;
+                service_manager::run(ServiceCommand::Uninstall)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            {
+                run_uninstall()
+            }
+        }
         other => service_manager::run(other),
     }
 }

@@ -66,6 +66,15 @@ pub(crate) fn ensure_installed_for_service() -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn ensure_ready_for_service() -> Result<(), String> {
+    let paths = RuntimePaths::discover()?;
+    if !service_should_manage_supervisor(&paths)? {
+        return Ok(());
+    }
+    platform::ensure_ready()
+}
+
 pub(crate) fn capture_install_state_for_service() -> Result<InstallState, String> {
     #[cfg(target_os = "macos")]
     {
@@ -549,6 +558,19 @@ mod platform {
 
     pub(super) fn ensure_installed() -> Result<(), String> {
         ensure_plist(true)
+    }
+
+    pub(super) fn ensure_ready() -> Result<(), String> {
+        ensure_installed()?;
+        let value = run_once()?;
+        if value.get("health_state").and_then(Value::as_str) == Some("healthy") {
+            Ok(())
+        } else {
+            Err(format!(
+                "Herdr supervisor did not make the local server ready: {}",
+                value
+            ))
+        }
     }
 
     pub(super) fn preflight_install() -> Result<(), String> {

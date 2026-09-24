@@ -4881,7 +4881,7 @@ mod tests {
             "changed_files": [
                 "crates/herdr-mcp/src/mcp.rs",
                 "extension/background.js",
-                "docs/_wip/v1.0-status.md"
+                "docs/herdr-architecture-roadmap.md"
             ],
             "changed_symbols": ["local_call", "background wake"]
         });
