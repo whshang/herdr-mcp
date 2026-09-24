@@ -996,6 +996,25 @@ fn refresh_prod_plist_generation(
         "HERDR_RUNTIME_GENERATION".to_owned(),
         PlistValue::String(generation.to_owned()),
     );
+    let config_dir = home.join(".config").join("herdr-mcp");
+    env_out.insert(
+        "HERDR_RUNTIME_CONTROL_PATH".to_owned(),
+        PlistValue::String(
+            config_dir
+                .join("runtime-control-prod.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    env_out.insert(
+        "HERDR_RUNTIME_STATUS_PATH".to_owned(),
+        PlistValue::String(
+            config_dir
+                .join("runtime-status-prod.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
     match runtime_version {
         Some(version) if !version.trim().is_empty() => {
             env_out.insert(
@@ -1410,6 +1429,24 @@ mod tests {
             env.get("HERDR_LINK_KEYCHAIN_SERVICE")
                 .and_then(PlistValue::as_string),
             Some(crate::link::run::MACOS_LINK_KEYCHAIN_SERVICE)
+        );
+        assert_eq!(
+            env.get("HERDR_RUNTIME_CONTROL_PATH")
+                .and_then(PlistValue::as_string),
+            Some(
+                root.join(".config/herdr-mcp/runtime-control-prod.json")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            env.get("HERDR_RUNTIME_STATUS_PATH")
+                .and_then(PlistValue::as_string),
+            Some(
+                root.join(".config/herdr-mcp/runtime-status-prod.json")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
         std::fs::remove_dir_all(root).unwrap();
     }
