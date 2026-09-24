@@ -68,6 +68,8 @@ const MAJOR_SOURCE_SCHEMA: i64 = 5;
 const MAJOR_UPGRADE_RECORD_VERSION: u64 = 1;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const MAJOR_BACKUP_MAX_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const LEGACY_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseAsset {
@@ -1059,6 +1061,43 @@ fn copy_regular_file_with_mode(
     Ok(())
 }
 
+/// v1.0.0-v1.0.2 renamed the released 0.4.x `config.toml` to
+/// `config.toml.migrated` the first time any 1.x command loaded configuration.
+/// The schema-5 source Runtime reads only `config.toml`, so a failed or
+/// rolled-back major upgrade silently lost its Edge origin, device id, Link
+/// upstream and update channel. Before the source Runtime is reinstalled, put
+/// the preserved legacy file back when (and only when) `config.toml` is absent.
+///
+/// Returns the restored path, or `None` when nothing needed restoring. Never
+/// overwrites an existing `config.toml`, and refuses symlinks/non-regular files.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn restore_legacy_toml_config(config_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let legacy = config_dir.join("config.toml");
+    if fs::symlink_metadata(&legacy).is_ok() {
+        return Ok(None);
+    }
+    let migrated = config_dir.join("config.toml.migrated");
+    if fs::symlink_metadata(&migrated).is_err() {
+        return Ok(None);
+    }
+    let temp = config_dir.join(format!(".config.toml.restore-{}.tmp", std::process::id()));
+    if fs::symlink_metadata(&temp).is_ok() {
+        fs::remove_file(&temp)
+            .map_err(|error| format!("cannot clear stale legacy config restore file: {error}"))?;
+    }
+    copy_regular_file_with_mode(&migrated, &temp, LEGACY_CONFIG_MAX_BYTES, 0o600)?;
+    if fs::symlink_metadata(&legacy).is_ok() {
+        // Someone recreated config.toml while we copied; never overwrite it.
+        let _ = fs::remove_file(&temp);
+        return Ok(None);
+    }
+    fs::rename(&temp, &legacy).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("cannot restore legacy config {}: {error}", legacy.display())
+    })?;
+    Ok(Some(legacy))
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn sha256_file(path: &Path, max_bytes: u64) -> Result<String, String> {
     let meta = fs::symlink_metadata(path)
@@ -1257,6 +1296,19 @@ fn recover_major_upgrade(paths: &RuntimePaths, record: &MajorUpgradeRecord) -> R
         .map_err(|error| format!("cannot stop service before major state restore: {error}"))?;
     let state_path = paths.config_dir.join("state.db");
     restore_state_backup(record, &state_path)?;
+    // The source installer below renders LaunchAgents/units from the legacy
+    // config, so it must see the pre-upgrade file. Best effort: a restore
+    // failure must not abort putting the source Runtime back.
+    match restore_legacy_toml_config(&paths.config_dir) {
+        Ok(Some(path)) => eprintln!(
+            "restored released 0.4.x configuration {} from config.toml.migrated",
+            path.display()
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "warning: could not restore released 0.4.x config.toml before source reinstall: {error}"
+        ),
+    }
     let source_install_error = run_service_command(
         Path::new(&record.source_binary),
         paths,
@@ -2320,6 +2372,85 @@ mod tests {
         .unwrap();
         conn.execute("INSERT INTO sentinel(value) VALUES (?1)", [sentinel])
             .unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn legacy_config_test_root(label: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "herdr-legacy-config-{label}-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_recovery_restores_legacy_toml_renamed_by_earlier_1x() {
+        let root = legacy_config_test_root("restore");
+        let text = "[edge]\npublic_origin = \"https://herdr-edge-mac.example.workers.dev\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n";
+        fs::write(root.join("config.toml.migrated"), text).unwrap();
+
+        let restored = restore_legacy_toml_config(&root).unwrap();
+
+        assert_eq!(restored, Some(root.join("config.toml")));
+        assert_eq!(fs::read_to_string(root.join("config.toml")).unwrap(), text);
+        assert_eq!(
+            fs::metadata(root.join("config.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        // The preserved copy stays as evidence; no temp file is left behind.
+        assert!(root.join("config.toml.migrated").is_file());
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_recovery_never_overwrites_existing_legacy_toml() {
+        let root = legacy_config_test_root("keep");
+        fs::write(root.join("config.toml"), "current\n").unwrap();
+        fs::write(root.join("config.toml.migrated"), "older\n").unwrap();
+
+        assert_eq!(restore_legacy_toml_config(&root).unwrap(), None);
+        assert_eq!(
+            fs::read_to_string(root.join("config.toml")).unwrap(),
+            "current\n"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_recovery_legacy_toml_restore_is_a_noop_without_evidence() {
+        let root = legacy_config_test_root("none");
+        assert_eq!(restore_legacy_toml_config(&root).unwrap(), None);
+        assert!(!root.join("config.toml").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn major_recovery_refuses_symlinked_legacy_toml_backup() {
+        let root = legacy_config_test_root("symlink");
+        let outside = root.join("outside.toml");
+        fs::write(&outside, "[edge]\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("config.toml.migrated")).unwrap();
+
+        assert!(restore_legacy_toml_config(&root).is_err());
+        assert!(!root.join("config.toml").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
