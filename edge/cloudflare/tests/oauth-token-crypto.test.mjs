@@ -270,6 +270,33 @@ test("assertion: wrong aud -> bad_audience", async () => {
   assert.deepEqual(verdict, { ok: false, code: "bad_audience" });
 });
 
+test("user preserves private-key JWT authentication during issuer migration | Given the exact proven legacy token endpoint audience | When that migration audience is explicitly supplied | Then the assertion is accepted and unrelated audiences remain rejected", async () => {
+  const kp = await generateRsaKeyPair();
+  const jwk = await exportJwk(kp.publicKey, "kid-legacy-aud");
+  const now = 1_700_000_000;
+  const legacyAudience = "https://herdr-edge-nathan.example.workers.dev/oauth/token";
+  const assertion = await signCompact(
+    { alg: "RS256", kid: "kid-legacy-aud" },
+    clientAssertionPayload(CLIENT_ID, legacyAudience, now),
+    kp.privateKey,
+  );
+  assert.deepEqual(
+    await verifyChatgptPrivateKeyJwt(assertion, CLIENT_ID, ISSUER, now, makeFetch([jwk])),
+    { ok: false, code: "bad_audience" },
+  );
+  assert.deepEqual(
+    await verifyChatgptPrivateKeyJwt(
+      assertion,
+      CLIENT_ID,
+      ISSUER,
+      now,
+      makeFetch([jwk]),
+      [legacyAudience],
+    ),
+    { ok: true, clientId: CLIENT_ID },
+  );
+});
+
 test("assertion: aud accepts bare issuer and array forms", async () => {
   const kp = await generateRsaKeyPair();
   const jwk = await exportJwk(kp.publicKey, "kid-1");

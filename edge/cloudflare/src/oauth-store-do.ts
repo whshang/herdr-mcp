@@ -2035,18 +2035,23 @@ export class OAuthStoreDO {
     if (!issuer) return json({ ok: false, code: "oauth_not_configured" }, 503);
 
     if (token.includes(".")) {
-      try {
-        const signing = await this.ensureSigningKey();
-        const publicKey = await crypto.subtle.importKey(
-          "jwk",
-          signing.public_jwk,
-          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-          false,
-          ["verify"],
-        );
-        const verifier = createRs256AccessTokenVerifier(createOAuthIdentity(issuer), publicKey);
-        const verdict = await verifier.verify(token, nowSec);
-        if (verdict.ok) {
+      const signing = await this.ensureSigningKey();
+      const publicKey = await crypto.subtle.importKey(
+        "jwk",
+        signing.public_jwk,
+        { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+        false,
+        ["verify"],
+      );
+      const legacyIssuer = this.env.OAUTH_LEGACY_ISSUER?.replace(/\/+$/, "");
+      const issuers = [issuer, legacyIssuer]
+        .filter((value): value is string => Boolean(value))
+        .filter((value, index, values) => values.indexOf(value) === index);
+      for (const candidate of issuers) {
+        try {
+          const verifier = createRs256AccessTokenVerifier(createOAuthIdentity(candidate), publicKey);
+          const verdict = await verifier.verify(token, nowSec);
+          if (!verdict.ok) continue;
           if (!verdict.clientId) return json({ ok: false, code: "invalid_token" }, 401);
           if (verdict.principalType === "automation") {
             if (!(await this.automationAllowsAccess(verdict.clientId, verdict.deviceId))) {
@@ -2066,11 +2071,11 @@ export class OAuthStoreDO {
             principal_type: verdict.principalType ?? null,
             device_id: verdict.deviceId ?? null,
             ...controls,
-            source: "edge_jwt",
+            source: candidate === issuer ? "edge_jwt" : "edge_jwt_legacy_issuer",
           });
+        } catch {
+          // Try the next exact issuer, then opaque compatibility state.
         }
-      } catch {
-        // Continue to the opaque compatibility lookup below.
       }
     }
 
@@ -2272,16 +2277,33 @@ export class OAuthStoreDO {
     const input = this.parseIssueInput(body);
     if (!boundedString(hash, 4096) || !input) return json({ ok: false, code: "bad_request" }, 400);
     const key = REFRESH_PREFIX + hash;
+    const legacyResource = boundedString(body?.legacy_resource, 4096)
+      ? body!.legacy_resource as string
+      : undefined;
     let previous: OAuthTokenRecord | undefined;
+    let accepted = false;
     await this.state.storage.transaction(async (txn) => {
       previous = await txn.get<OAuthTokenRecord>(key);
-      if (previous !== undefined) await txn.delete(key);
+      if (!previous) return;
+      if (previous.expires_at <= input.now_sec) {
+        await txn.delete(key);
+        return;
+      }
+      if (previous.client_id !== input.client_id) {
+        await txn.delete(key);
+        return;
+      }
+      const resourceMatches = previous.resource === input.resource
+        || (legacyResource !== undefined && previous.resource === legacyResource);
+      if (!resourceMatches) {
+        // Do not burn a valid refresh token merely because the caller supplied
+        // an unrelated resource. This is required for safe issuer migration.
+        return;
+      }
+      await txn.delete(key);
+      accepted = true;
     });
-    if (!previous) return json({ ok: false, code: "invalid_grant" }, 400);
-    if (previous.expires_at <= input.now_sec) return json({ ok: false, code: "invalid_grant" }, 400);
-    if (previous.client_id !== input.client_id || previous.resource !== input.resource) {
-      return json({ ok: false, code: "invalid_grant" }, 400);
-    }
+    if (!previous || !accepted) return json({ ok: false, code: "invalid_grant" }, 400);
     if (!(await this.connectorAllowsAccess(previous.client_id, previous.connector_id, previous.grant_generation))) {
       return json({ ok: false, code: "invalid_grant" }, 400);
     }

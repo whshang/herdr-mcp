@@ -199,7 +199,7 @@ herdr-mcp は一部の read パスを、より狭い evidence ソースへ degra
 
 ### `herdr_exec`
 
-コマンドがすでに可視の pane に配送されている場合、後からの control-plane タイムアウトは、そのコマンドを再送してよい許可ではありません。pane、Git 状態、ファイル、テストを inspect してください。
+コマンドがすでに可視の pane に配送されている場合、後からの control-plane タイムアウトは、そのコマンドを再送してよい許可ではありません。pane、Git 状態、ファイル、テストを inspect してください。timeout 応答に `session_id` が含まれる場合は `herdr_exec_read` でその正確な operation を引き続き観測し、task が実行中のコマンドをもう必要としないことを確認したら `herdr_exec_kill` でその session だけを終了して、再利用可能な utility pane を解放してください。
 
 「クライアントに成功応答が届かなかった」ことは「何も起きなかった」ことを意味しません。
 

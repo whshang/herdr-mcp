@@ -124,6 +124,39 @@ test("migrated public-PEM JWT obeys the injected legacy client grant fence", asy
   }), { ok: false, code: "mcp_auth_failed" });
 });
 
+test("user keeps the existing Connector session | Given a Cloudflare-proven legacy workers.dev issuer alias | When the custom-domain cutover verifies an existing PEM access JWT | Then the JWT remains valid without re-adding the Connector", async () => {
+  const kp = await keyPair();
+  const pem = await publicPem(kp.publicKey);
+  const now = Math.floor(Date.now() / 1000);
+  const legacyIssuer = "https://herdr-edge-nathan.example.workers.dev";
+  const token = await jwt(kp.privateKey, {
+    iss: legacyIssuer,
+    aud: `${legacyIssuer}/mcp`,
+    sub: "legacy-client",
+    client_id: "legacy-client",
+    iat: now,
+    exp: now + 3600,
+  });
+  const env = {
+    OAUTH_ISSUER: ISSUER,
+    OAUTH_LEGACY_ISSUER: legacyIssuer,
+    OAUTH_JWT_PUBLIC_PEM: pem,
+  };
+  const accepted = await authenticateMcpRequest(request(token), env, {
+    verifyLegacyClient: async (clientId) => clientId === "legacy-client",
+  });
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.source, "oauth_jwt");
+  assert.equal(accepted.clientId, "legacy-client");
+
+  assert.deepEqual(
+    await authenticateMcpRequest(request(token), { OAUTH_ISSUER: ISSUER, OAUTH_JWT_PUBLIC_PEM: pem }, {
+      verifyLegacyClient: async () => true,
+    }),
+    { ok: false, code: "mcp_auth_failed" },
+  );
+});
+
 test("new-shaped PEM JWT cannot bypass Edge principal and device verification", async () => {
   const kp = await keyPair();
   const pem = await publicPem(kp.publicKey);
