@@ -82,7 +82,8 @@ test("first Worker handoff stays complete for a non-developer Mac user", () => {
     assert.match(doc, /workers\.dev\/mcp/);
     assert.match(doc, /ChatGPT Project|ChatGPT の Project/);
     assert.match(doc, /`\+` button|`\+` 加号|`\+` ボタン/);
-    assert.match(doc, /first message|第一条消息|最初のメッセージ/);
+    assert.match(doc, /message-scoped|按消息生效|メッセージ単位/);
+    assert.match(doc, /select\/reference that App again|再次.*选择或引用|もう一度選択または参照/);
   }
 });
 
