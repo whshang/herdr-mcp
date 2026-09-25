@@ -108,7 +108,7 @@ Combine read-only checks into one final verification wave. Installation is compl
 - the machine has a canonical `dev_<ULID>` device identity;
 - one real authenticated MCP request completes from the public origin to this workstation and back.
 
-Then open ChatGPT **Settings → Account security & login** and enable **Developer mode**. Open **Plugins → Browse plugins**, click the top-right **+ → Create APP**, create an MCP app with the complete `https://…workers.dev/mcp` address, and finish OAuth. `herdr` is the recommended example App name; custom names are supported. Work inside a ChatGPT Project. In each new chat, use the `+` button in the first message that needs workstation access to select/reference that App. The extension learns its provider-owned keyword and reuses it for later Herdr turns.
+Then open ChatGPT **Settings → Account security & login** and enable **Developer mode**. Open **Plugins → Browse plugins**, click the top-right **+ → Create APP**, create an MCP app with the complete `https://…workers.dev/mcp` address, and finish OAuth. `herdr` is the recommended example App name; custom names are supported. Work inside a ChatGPT Project. ChatGPT App selection is message-scoped, so every user-authored message that needs workstation access should use the `+` button to select/reference that App again. The extension learns its provider-owned keyword and Herdr-generated turns reselect that observed identity through `required_apps`.
 
 Chrome extension / Native Messaging is optional for browser continuity, handoff, and Control Center; see [extension guide](extension.md).
 
