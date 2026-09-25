@@ -2,7 +2,7 @@
 
 ## v1.0.4 — 2026-09-24
 
-- 自定义域名现在是 1.x 的 canonical MCP/OAuth origin：旧安装若仍保存同一 Cloudflare account、同一 Worker script 的 workers.dev OAuth issuer，updater 会先通过 Cloudflare account subdomain + script identity 严格证明归属，再把 Custom Domain 设为主身份，并仅把 workers.dev 保留为迁移 alias。已有 workers.dev access JWT 在过渡期继续可验，旧 refresh token 第一次刷新时原子迁移到 Custom Domain resource，避免仅因域名身份收敛而要求重新添加 Connector。历史 Rust production Link 缺少 `HERDR_RUNTIME_CONTROL_PATH` / `HERDR_RUNTIME_STATUS_PATH` 时，generation refresh 也会补齐 canonical `runtime-control-prod.json` / `runtime-status-prod.json`，避免恢复流程等待错误状态文件而超时。 [PR #569](https://github.com/whshang/herdr-mcp/pull/569)
+- 自定义域名现在是 1.x 的 canonical MCP/OAuth origin：旧安装若仍保存同一 Cloudflare account、同一 Worker script 的 workers.dev OAuth issuer，updater 会先通过 Cloudflare account subdomain + script identity 严格证明归属，再把 Custom Domain 设为主身份，并仅把 workers.dev 保留为迁移 alias。已有 workers.dev access JWT 在过渡期继续可验，旧 refresh token 第一次刷新时原子迁移到 Custom Domain resource，避免仅因域名身份收敛而要求重新添加 Connector。历史 Rust production Link 缺少 `HERDR_RUNTIME_CONTROL_PATH` / `HERDR_RUNTIME_STATUS_PATH` 时，generation refresh 也会补齐 canonical `runtime-control-prod.json` / `runtime-status-prod.json`，避免恢复流程等待错误状态文件而超时。 [PR #569](https://github.com/whshang/herdr-mcp/pull/569) 远程 `pane.wait_for_output` 同时改为只读分类并限制单次等待不超过 20 秒，避免超过 Edge 请求预算后误报 mutation delivery unknown。 [PR #569](https://github.com/whshang/herdr-mcp/pull/569)
 
 ## v1.0.3 — 2026-09-24
 

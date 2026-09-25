@@ -141,6 +141,25 @@ const GENERATION_SUPERSEDE_RETRY_BACKOFF_MS = [100, 400, 1_000, 1_500] as const;
 const GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS = 1_000;
 const TRANSIENT_EDGE_HTTP_RETRY_BACKOFF_MS = [100, 400] as const;
 const TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS = 2_000;
+const REMOTE_PANE_WAIT_TIMEOUT_MS = 20_000;
+
+function normalizeRemoteHerdrCallArgs(args: Record<string, unknown>): Record<string, unknown> {
+  if (args.method !== "pane.wait_for_output" || typeof args.params !== "string") return args;
+  try {
+    const parsed = JSON.parse(args.params);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return args;
+    const params = parsed as Record<string, unknown>;
+    const requested = params.timeout_ms;
+    if (requested !== undefined && (typeof requested !== "number" || !Number.isFinite(requested))) return args;
+    if (typeof requested === "number" && requested <= REMOTE_PANE_WAIT_TIMEOUT_MS) return args;
+    return {
+      ...args,
+      params: JSON.stringify({ ...params, timeout_ms: REMOTE_PANE_WAIT_TIMEOUT_MS }),
+    };
+  } catch {
+    return args;
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -1309,7 +1328,7 @@ export async function handleMcp(
     // Unwrap device-aware opaque refs before forwarding to the runtime;
     // the runtime contract remains epoch 2 without device metadata.
     const { unwrapDeviceRefs, wrapResultWithDevice } = await import("./device-refs.js");
-    const runtimeArgs = unwrapDeviceRefs(args);
+    const runtimeArgs = normalizeRemoteHerdrCallArgs(unwrapDeviceRefs(args));
     // runtimeArgs already strips device and binding fields
 
     const now = deps.now?.() ?? Date.now();

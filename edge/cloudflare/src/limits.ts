@@ -218,7 +218,7 @@ export function classifyOp(op: string): OpClass {
 export function classifyRequestOp(op: string, args: unknown): OpClass {
   if (op === "herdr_call" && args !== null && typeof args === "object" && !Array.isArray(args)) {
     const method = (args as Record<string, unknown>).method;
-    if (method === "herdr_mcp.exec.wait") return "read";
+    if (method === "herdr_mcp.exec.wait" || method === "pane.wait_for_output") return "read";
   }
   return classifyOp(op);
 }
