@@ -1,0 +1,92 @@
+{
+  "0.1.121": {
+    "ref": "991569b3",
+    "sha": "991569b3161420574b40584eb3edd5affea704b5",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  },
+  "0.1.122": {
+    "ref": "fd5d89ef",
+    "sha": "fd5d89ef483fb101b8c985267a087daaff53b464",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  },
+  "0.1.123": {
+    "ref": "e3d9ffa0",
+    "sha": "e3d9ffa026cd8c1baf1e9d1fbd611afc3ff8995a",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  },
+  "0.1.124": {
+    "ref": "b1be2d13",
+    "sha": "b1be2d133b455fadf60e04ac307f7bb56609053a",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  },
+  "0.1.125": {
+    "ref": "d5b0a78e",
+    "sha": "d5b0a78e0def64c3f463b4f180b2daa9baca5ec1",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  },
+  "0.1.126": {
+    "ref": "79a39bbf",
+    "sha": "79a39bbfdbaa4e64cb1e174d6055f330dcaaf579",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  },
+  "0.1.127": {
+    "ref": "73c55dfb",
+    "sha": "73c55dfb9455cf733a369162374d899a9dae9498",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  },
+  "0.1.128": {
+    "ref": "c42b420a",
+    "sha": "c42b420afb1c3e94279f58920a3d25a8008a75ac",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  },
+  "0.1.129": {
+    "ref": "2804d821",
+    "sha": "2804d821ef320fa3402e9514df04e196139181dc",
+    "sources": [
+      "extension/background.js",
+      "extension/content/wake.js",
+      "extension/content/injector/chatgpt.js",
+      "extension/manifest.json"
+    ]
+  }
+}
