@@ -120,6 +120,12 @@ test("Gemini adapter observes user/assistant baselines without inventing provide
   );
 });
 
+test("Gemini adapter keeps the existing browser actuation capabilities", () => {
+  const h = harness();
+  assert.equal(h.adapter.capabilities.browserActuation, true);
+  assert.equal(h.adapter.capabilities.stopGeneration, true);
+});
+
 test("Gemini adapter hashes Google account email before returning native identity", async () => {
   const h = harness();
   const account = element({

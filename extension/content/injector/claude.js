@@ -1,8 +1,14 @@
 // injector/claude.js — claude.ai Browser Registry adapter
 // Keep provider-specific URL/DOM/account details here. Browser Registry, consent,
 // dispatch fencing, and idempotency remain provider-neutral in background/runtime.
+const CLAUDE_ADAPTER_CAPABILITIES = Object.freeze({
+  browserActuation: true,
+  stopGeneration: true,
+});
+
 class ClaudeAdapter extends BaseAdapter {
   get name() { return "claude"; }
+  get capabilities() { return CLAUDE_ADAPTER_CAPABILITIES; }
   get needsMainWorldInsert() { return true; }
 
   getSessionIdentity() {

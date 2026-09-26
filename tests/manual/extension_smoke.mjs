@@ -706,7 +706,12 @@ ok(
     console,
   });
   vm.runInContext(baseCode, rootCtx);
+  ok(vm.runInContext("new BaseAdapter().supportsCapability('browserActuation')", rootCtx) === false,
+    "BaseAdapter capabilities fail closed by default");
   vm.runInContext(chatgptCode, rootCtx);
+  ok(vm.runInContext("Object.isFrozen(window.__H2W_ADAPTER__.capabilities)", rootCtx) === true
+      && vm.runInContext("window.__H2W_ADAPTER__.supportsCapability('sessionCreate')", rootCtx) === true,
+    "ChatGPT adapter exposes an immutable explicit capability descriptor");
   ok(vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", rootCtx) === "https://chatgpt.com",
     "ChatGPT root exposes a pending binding key before a conversation exists");
 

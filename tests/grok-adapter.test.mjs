@@ -326,9 +326,13 @@ test("Grok must reuse provider-neutral account and single-attempt browser actuat
   assert.match(accountSource, /\["gemini",\s*"claude",\s*"grok"\]\.includes\(ADAPTER\.name\)/);
   assert.match(accountSource, /ADAPTER\.getAccountNativeIdentity/);
 
+  assert.equal(harness().adapter.capabilities.browserActuation, true);
+  assert.equal(harness().adapter.capabilities.stopGeneration, true);
+
   const actuationStart = wakeSource.indexOf("async function performBrowserActuationCommand(command)");
   const actuationEnd = wakeSource.indexOf("chrome.runtime.onMessage.addListener", actuationStart);
   const actuationSource = wakeSource.slice(actuationStart, actuationEnd);
-  assert.match(actuationSource, /\["chatgpt",\s*"gemini",\s*"claude",\s*"grok"\]\.includes\(ADAPTER\.name\)/);
+  assert.match(actuationSource, /adapterSupports\("browserActuation"\)/);
+  assert.match(actuationSource, /adapterSupports\("stopGeneration"\)/);
   assert.doesNotMatch(actuationSource, /ADAPTER\.name\s*===\s*"grok"/);
 });

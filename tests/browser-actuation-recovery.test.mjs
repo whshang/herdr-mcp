@@ -1036,8 +1036,22 @@ test("user Given unavailable browser actuation When the content script rejects i
 
   function makeActuator(ctx = {}) {
     return new Function("ctx", `
+      const adapterName = ctx.adapterName || "chatgpt";
+      const capabilities = adapterName === "chatgpt"
+        ? {
+            browserActuation: true,
+            stopGeneration: true,
+            sessionCreate: true,
+            sessionOpen: true,
+            chatModeGuard: true,
+          }
+        : (["gemini", "claude", "grok"].includes(adapterName)
+          ? { browserActuation: true, stopGeneration: true }
+          : {});
       const ADAPTER = {
-        name: ctx.adapterName || "chatgpt",
+        name: adapterName,
+        capabilities,
+        prepareBrowserActuation: async () => ({ ok: true, switched: false }),
         getConversationKey: () => ctx.currentConvKey || "conv-current",
         getCanonicalConversationUrl: () => ctx.canonicalObserved === false ? "" : "https://chatgpt.com/c/current",
       };
@@ -1141,6 +1155,7 @@ test("user can stop a live answer | Given an explicit visible stop control while
     };
     const ADAPTER = {
       name: "chatgpt",
+      capabilities: { browserActuation: true, stopGeneration: true },
       getConversationKey: () => "conv-current",
       getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
       getStopButtonCandidates: () => ctx.clicked ? [] : [stopButton],
@@ -1258,6 +1273,12 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   const act = new Function("ctx", `
     const ADAPTER = {
       name: "chatgpt",
+      capabilities: {
+        browserActuation: true,
+        sessionCreate: true,
+        chatModeGuard: true,
+      },
+      prepareBrowserActuation: async () => ({ ok: true, switched: false }),
       getConversationKey: () => "https://chatgpt.com/c/current",
       getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
       getInputEl: () => ({}),
@@ -1276,7 +1297,6 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
-    const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
     const isTurnInProgress = () => false;
     const runtimeAlive = () => true;
     const wait = async () => {};
@@ -1348,6 +1368,12 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
   const act = new Function("ctx", `
     const ADAPTER = {
       name: "chatgpt",
+      capabilities: {
+        browserActuation: true,
+        sessionCreate: true,
+        chatModeGuard: true,
+      },
+      prepareBrowserActuation: async () => ({ ok: true, switched: false }),
       getConversationKey: () => "https://chatgpt.com/g/g-p-test/project",
       getCanonicalConversationUrl: () => "",
       getInputEl: () => ({}),
@@ -1366,7 +1392,6 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
     const currentHerdrRequiredApps = () => [];
     const providerCanonicalConversationObserved = () => false;
     const document = { hidden: false };
-    const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
     const isTurnInProgress = () => {
       const value = ctx.busySequence[ctx.busyChecks] ?? false;
       ctx.busyChecks += 1;
@@ -1418,6 +1443,13 @@ test("user receives exact content rejection reasons | Given browser controls rej
     return new Function("ctx", `
       const ADAPTER = {
         name: "chatgpt",
+        capabilities: {
+          browserActuation: true,
+          stopGeneration: true,
+          sessionCreate: true,
+          chatModeGuard: true,
+        },
+        prepareBrowserActuation: async () => ({ ok: true, switched: false }),
         getConversationKey: () => "conv-current",
         getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
         getInputEl: () => (ctx.inputAvailable === false ? null : {}),
@@ -1434,7 +1466,6 @@ test("user receives exact content rejection reasons | Given browser controls rej
       const currentHerdrRequiredApps = () => ["herdr"];
       const providerCanonicalConversationObserved = () => true;
       const document = { hidden: false };
-      const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
       const isTurnInProgress = () => ctx.turnInProgress === true;
       const runtimeAlive = () => true;
       const Date = { now: () => ctx.now || 0 };
@@ -2314,11 +2345,13 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);
   const createSegment = wakeSource.slice(createStart, createEnd);
   assert.match(createSegment, /sessionStorage\.setItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef\)/);
-  assert.match(createSegment, /const chatMode = await ensureChatGptChatMode\(\)/);
-  assert.match(createSegment, /result: \{ error: chatMode\.error \}/);
+  assert.match(createSegment, /adapterSupports\("sessionCreate"\)/);
+  assert.match(createSegment, /adapterSupports\("chatModeGuard"\)/);
+  assert.match(createSegment, /const ready = await ADAPTER\.prepareBrowserActuation\(\)/);
+  assert.match(createSegment, /result: \{ error: ready\?\.error \|\| "browser_adapter_not_ready" \}/);
   assert.ok(
-    createSegment.indexOf("const chatMode = await ensureChatGptChatMode()") < createSegment.indexOf("const composerReadyDeadline"),
-    "fresh-session actuation must enter Chat mode before waiting for the composer",
+    createSegment.indexOf("const ready = await ADAPTER.prepareBrowserActuation()") < createSegment.indexOf("const composerReadyDeadline"),
+    "fresh-session actuation must prepare the provider before waiting for the composer",
   );
   assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 20000/);
   assert.match(createSegment, /let freshCreateStableIdleSamples = 0/);
@@ -2360,23 +2393,23 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
 });
 
-test("ChatGPT browser actuation switches Work mode to Chat mode through the visible radio control", () => {
-  const visibleHelperStart = wakeSource.indexOf("function visibleChatGptModeRadio(pattern)");
-  const helperStart = wakeSource.indexOf("async function ensureChatGptChatMode()");
-  const helperEnd = wakeSource.indexOf("\n  async function performBrowserActuationCommand", helperStart);
-  assert.ok(visibleHelperStart >= 0 && helperStart > visibleHelperStart && helperEnd > helperStart, "Chat mode helpers must exist before browser actuation");
-  const helper = wakeSource.slice(visibleHelperStart, helperEnd);
-  assert.match(helper, /button\[role="radio"\]/);
-  assert.match(helper, /getBoundingClientRect\(\)/);
-  assert.match(helper, /rect\.width > 0/);
-  assert.match(helper, /rect\.height > 0/);
-  assert.match(helper, /聊天\|Chat\|チャット/);
-  assert.match(helper, /工作\|Work\|作業/);
-  assert.match(helper, /work\.getAttribute\("aria-checked"\) !== "true"/);
-  assert.match(helper, /chat\.click\(\)/);
-  assert.match(helper, /chat\.getAttribute\("aria-checked"\) === "true"/);
-  assert.match(helper, /work\.getAttribute\("aria-checked"\) === "false"/);
-  assert.match(helper, /chat_mode_switch_timeout/);
+test("ChatGPT browser actuation switches Work mode to Chat mode through the provider adapter", () => {
+  assert.match(chatGptAdapterSource, /chatModeGuard:\s*true/);
+  assert.match(chatGptAdapterSource, /async prepareBrowserActuation\(\)/);
+  assert.match(chatGptAdapterSource, /button\[role="radio"\]/);
+  assert.match(chatGptAdapterSource, /getBoundingClientRect\(\)/);
+  assert.match(chatGptAdapterSource, /rect\.width > 0/);
+  assert.match(chatGptAdapterSource, /rect\.height > 0/);
+  assert.match(chatGptAdapterSource, /聊天\|Chat\|チャット/);
+  assert.match(chatGptAdapterSource, /工作\|Work\|作業/);
+  assert.match(chatGptAdapterSource, /work\.getAttribute\("aria-checked"\) !== "true"/);
+  assert.match(chatGptAdapterSource, /chat\.click\(\)/);
+  assert.match(chatGptAdapterSource, /chat\.getAttribute\("aria-checked"\) === "true"/);
+  assert.match(chatGptAdapterSource, /work\.getAttribute\("aria-checked"\) === "false"/);
+  assert.match(chatGptAdapterSource, /chat_mode_switch_timeout/);
+  assert.match(wakeSource, /adapterSupports\("chatModeGuard"\)/);
+  assert.match(wakeSource, /await ADAPTER\.prepareBrowserActuation\(\)/);
+  assert.doesNotMatch(wakeSource, /function visibleChatGptModeRadio|function ensureChatGptChatMode/);
 });
 
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {

@@ -1566,6 +1566,13 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  function adapterSupports(capability) {
+    if (typeof ADAPTER.supportsCapability === "function") {
+      return ADAPTER.supportsCapability(capability);
+    }
+    return ADAPTER.capabilities?.[String(capability || "")] === true;
+  }
+
   function browserUnavailableEvidence(evidence, reason) {
     const safeReason = typeof reason === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(reason)
       ? reason
@@ -1991,50 +1998,12 @@ function normalizeHerdrMentionAlias(value) {
     return evidence;
   }
 
-  function visibleChatGptModeRadio(pattern) {
-    return [...document.querySelectorAll('button[role="radio"]')].find((button) => {
-      if (!ADAPTER.elementVisible(button)) return false;
-      const rect = button.getBoundingClientRect();
-      return rect.width > 0
-        && rect.height > 0
-        && pattern.test(normText(button.innerText || button.textContent || ""));
-    }) || null;
-  }
-
-  async function ensureChatGptChatMode() {
-    if (ADAPTER.name !== "chatgpt") return { ok: true, switched: false };
-    const chat = visibleChatGptModeRadio(/^(?:聊天|Chat|チャット)$/i);
-    const work = visibleChatGptModeRadio(/^(?:工作|Work|作業)$/i);
-    if (!chat && !work) return { ok: true, switched: false };
-    if (!chat || !work) return { ok: false, error: "chat_mode_ambiguous" };
-    if (chat.getAttribute("aria-checked") === "true") {
-      return { ok: true, switched: false };
-    }
-    if (work.getAttribute("aria-checked") !== "true") {
-      return { ok: false, error: "chat_mode_ambiguous" };
-    }
-    try {
-      chat.click();
-    } catch (_) {
-      return { ok: false, error: "chat_mode_switch_failed" };
-    }
-    const deadline = Date.now() + 3000;
-    do {
-      if (chat.getAttribute("aria-checked") === "true"
-          && work.getAttribute("aria-checked") === "false") {
-        return { ok: true, switched: true };
-      }
-      await wait(100);
-    } while (Date.now() < deadline);
-    return { ok: false, error: "chat_mode_switch_timeout" };
-  }
-
   async function performBrowserActuationCommand(command) {
     const dispatchId = typeof command?.dispatch_id === "string" ? command.dispatch_id : "";
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
     const creatingSession = command?.operation === "herdr_mcp.browser_session.create";
-    if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)
+    if (!adapterSupports("browserActuation")
         || !Number.isSafeInteger(expectedGeneration)
         || expectedGeneration < 1) {
       return browserUnavailableEvidence(evidence, "browser_actuation_context_unavailable");
@@ -2045,7 +2014,7 @@ function normalizeHerdrMentionAlias(value) {
     if (creatingSession) {
       const params = command?.params && typeof command.params === "object" ? command.params : {};
       const reservationRef = typeof params.reservation_ref === "string" ? params.reservation_ref : "";
-      if (ADAPTER.name !== "chatgpt" || !/^bsr_[0-9a-f]{64}$/.test(reservationRef)) {
+      if (!adapterSupports("sessionCreate") || !/^bsr_[0-9a-f]{64}$/.test(reservationRef)) {
         return browserUnavailableEvidence(evidence, "browser_create_reservation_invalid");
       }
       try {
@@ -2058,7 +2027,7 @@ function normalizeHerdrMentionAlias(value) {
       evidence.canonical_url_observed = false;
     }
     if (command?.operation === "herdr_mcp.browser_session.open") {
-      if (ADAPTER.name !== "chatgpt") {
+      if (!adapterSupports("sessionOpen")) {
         return browserUnavailableEvidence(evidence, "browser_open_provider_unavailable");
       }
       const params = command?.params && typeof command.params === "object" ? command.params : {};
@@ -2093,10 +2062,10 @@ function normalizeHerdrMentionAlias(value) {
     if (command?.operation === "herdr_mcp.browser_session.archive") {
       return performChatGptSessionArchive(command, evidence);
     }
-    if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)) {
-      return browserUnavailableEvidence(evidence, "browser_actuation_provider_unavailable");
-    }
     if (command?.operation === "herdr_mcp.browser_dispatch.stop") {
+      if (!adapterSupports("stopGeneration")) {
+        return browserRejectedEvidence(evidence, "browser_stop_control_unavailable");
+      }
       const candidates = typeof ADAPTER.getStopButtonCandidates === "function"
         ? ADAPTER.getStopButtonCandidates()
         : [];
@@ -2144,13 +2113,13 @@ function normalizeHerdrMentionAlias(value) {
         creatingSession ? "browser_create_params_invalid" : "browser_dispatch_params_invalid",
       );
     }
-    if (ADAPTER.name === "chatgpt") {
-      const chatMode = await ensureChatGptChatMode();
-      if (!chatMode.ok) {
+    if (adapterSupports("chatModeGuard")) {
+      const ready = await ADAPTER.prepareBrowserActuation();
+      if (!ready?.ok) {
         if (creatingSession) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         }
-        return { ...evidence, rejected: true, result: { error: chatMode.error } };
+        return { ...evidence, rejected: true, result: { error: ready?.error || "browser_adapter_not_ready" } };
       }
     }
     if (creatingSession) {

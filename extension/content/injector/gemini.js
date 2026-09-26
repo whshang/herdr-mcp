@@ -2,8 +2,14 @@
 // Alpha 5 intentionally proves only the minimum plain-submit vertical.
 // Provider-native selectors and ids stay inside this adapter and never become
 // Herdr core mutation inputs or portable resource identity.
+const GEMINI_ADAPTER_CAPABILITIES = Object.freeze({
+  browserActuation: true,
+  stopGeneration: true,
+});
+
 class GeminiAdapter extends BaseAdapter {
   get name() { return "gemini"; }
+  get capabilities() { return GEMINI_ADAPTER_CAPABILITIES; }
   get needsMainWorldInsert() { return true; }
 
   getConversationKey() {

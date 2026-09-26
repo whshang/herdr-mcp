@@ -1,7 +1,24 @@
 // base.js — adapter base class for locating, filling, submitting, and identifying chats
 // Direction: herdr → web. The extension writes only on wake and does not run an agent loop.
+const H2W_BASE_ADAPTER_CAPABILITIES = Object.freeze({
+  browserActuation: false,
+  stopGeneration: false,
+  sessionCreate: false,
+  sessionOpen: false,
+  chatModeGuard: false,
+});
+
 class BaseAdapter {
   get name() { return "base"; }
+  get capabilities() { return H2W_BASE_ADAPTER_CAPABILITIES; }
+
+  supportsCapability(name) {
+    return this.capabilities?.[String(name || "")] === true;
+  }
+
+  async prepareBrowserActuation() {
+    return { ok: true, switched: false };
+  }
 
   // ---- Site-specific declarations ----
 
