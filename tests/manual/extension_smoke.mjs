@@ -715,6 +715,25 @@ ok(
   ok(vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", rootCtx) === "https://chatgpt.com",
     "ChatGPT root exposes a pending binding key before a conversation exists");
 
+  const accountCtx = vm.createContext({
+    window: {},
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    fetch: async (url, options) => ({
+      ok: url === "/backend-api/me"
+        && options?.method === "GET"
+        && options?.credentials === "include"
+        && options?.cache === "no-store",
+      json: async () => ({ id: "  chatgpt-user-123  " }),
+    }),
+    console,
+  });
+  vm.runInContext(baseCode, accountCtx);
+  vm.runInContext(chatgptCode, accountCtx);
+  ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", accountCtx)
+      === "chatgpt-user-123",
+    "ChatGPT account identity is observed through the provider adapter hook");
+
   const composerStop = { id: "composer-stop" };
   const unrelatedStop = { id: "unrelated-stop" };
   const composerScope = {

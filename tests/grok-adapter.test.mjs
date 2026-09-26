@@ -321,10 +321,10 @@ test("user recovers an older Grok settled result | Given a newer turn is already
 
 test("Grok must reuse provider-neutral account and single-attempt browser actuation paths", () => {
   const accountStart = wakeSource.indexOf("async function browserAccountNativeIdentity()");
-  const accountEnd = wakeSource.indexOf("async function registerCurrentConversation", accountStart);
+  const accountEnd = wakeSource.indexOf("async function chatGptProjectCatalog", accountStart);
   const accountSource = wakeSource.slice(accountStart, accountEnd);
-  assert.match(accountSource, /\["gemini",\s*"claude",\s*"grok"\]\.includes\(ADAPTER\.name\)/);
-  assert.match(accountSource, /ADAPTER\.getAccountNativeIdentity/);
+  assert.match(accountSource, /const value = await ADAPTER\.getAccountNativeIdentity\(\)/);
+  assert.doesNotMatch(accountSource, /ADAPTER\.name/);
 
   assert.equal(harness().adapter.capabilities.browserActuation, true);
   assert.equal(harness().adapter.capabilities.stopGeneration, true);

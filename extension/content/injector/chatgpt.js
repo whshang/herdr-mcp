@@ -52,6 +52,23 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
+  async getAccountNativeIdentity() {
+    try {
+      const response = await fetch("/backend-api/me", {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
+      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   getConversationKey() {
     try {
       const origin = location.origin;

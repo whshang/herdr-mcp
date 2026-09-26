@@ -20,6 +20,10 @@ class BaseAdapter {
     return { ok: true, switched: false };
   }
 
+  async getAccountNativeIdentity() {
+    return null;
+  }
+
   // ---- Site-specific declarations ----
 
   // Conversation key for restoring bindings after page refresh or browser restart.

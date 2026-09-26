@@ -257,11 +257,10 @@ test("Claude adapter falls back to two matching validated account UUID hints", a
 
 test("Claude reuses the provider-neutral account and single-attempt browser actuation path", () => {
   const accountStart = wakeSource.indexOf("async function browserAccountNativeIdentity()");
-  const accountEnd = wakeSource.indexOf("async function registerCurrentConversation", accountStart);
+  const accountEnd = wakeSource.indexOf("async function chatGptProjectCatalog", accountStart);
   const accountSource = wakeSource.slice(accountStart, accountEnd);
-  assert.match(accountSource, /\[[^\]]*"claude"[^\]]*\]\.includes\(ADAPTER\.name\)/);
-  assert.match(accountSource, /ADAPTER\.getAccountNativeIdentity/);
-  assert.doesNotMatch(accountSource, /ADAPTER\.name\s*===\s*"claude"/);
+  assert.match(accountSource, /const value = await ADAPTER\.getAccountNativeIdentity\(\)/);
+  assert.doesNotMatch(accountSource, /ADAPTER\.name/);
 
   assert.equal(harness().adapter.capabilities.browserActuation, true);
   assert.equal(harness().adapter.capabilities.stopGeneration, true);

@@ -2974,32 +2974,12 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function browserAccountNativeIdentity() {
-    if (ADAPTER.name === "chatgpt") {
-      try {
-        const response = await fetch("/backend-api/me", {
-          method: "GET",
-          credentials: "include",
-          cache: "no-store",
-          headers: { accept: "application/json" },
-        });
-        if (!response.ok) return null;
-        const payload = await response.json();
-        const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-      } catch (_) {
-        return null;
-      }
+    try {
+      const value = await ADAPTER.getAccountNativeIdentity();
+      return typeof value === "string" && value.trim() ? value.trim() : null;
+    } catch (_) {
+      return null;
     }
-    if (["gemini", "claude", "grok"].includes(ADAPTER.name)
-        && typeof ADAPTER.getAccountNativeIdentity === "function") {
-      try {
-        const value = await ADAPTER.getAccountNativeIdentity();
-        return typeof value === "string" && value.trim() ? value.trim() : null;
-      } catch (_) {
-        return null;
-      }
-    }
-    return null;
   }
 
   async function chatGptProjectCatalog(accountNativeIdentity) {
