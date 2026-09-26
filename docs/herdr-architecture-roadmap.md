@@ -87,6 +87,7 @@ Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint
 - Adapter authoring 采用 draft -> real try -> atomic activate，失败 trial 不覆盖当前 active Adapter；
 - Adapter 命令通过现有 Progressive SkillService 按需引导 search/describe/run，不把所有站点命令永久塞进 MCP schema，也不建立第二套 Skill registry；
 - Browser mutation 继续复用一个 Runtime reservation、`not_applied / applied / uncertain` 与 verify-before-retry；Adapter 不得建立第二套 retry/idempotency/wait 权威；
+- **Jev 作为可选本地快速决策层**：Runtime 只把有界 BrowserPage observation 和确定性候选动作交给现有 `SemanticService`，Jev 只能选择下一步 typed action / done / blocked / escalate；权限、generation/ref、幂等、delivery、敏感字段、人工边界与资源清理仍由 Runtime 决定。Jev 未配置、超时、异常或 uncertain 时直接回到普通 planner 路径，Generic Web 仍完整可用；
 - Chrome 用户 tab 与 Herdr-created tab 明确区分 ownership；Service Worker restart 后通过 Extension session ownership + Runtime operation evidence 恢复/清理 Herdr-owned resources，finalize 不得误关用户 tab；
 - 正常 Store 扩展继续使用按 origin 请求的 optional host permissions；origin grant 只能由 HUD/Options 用户手势授予，1.1 核心执行不要求给所有用户增加 mandatory `debugger` 权限。
 
@@ -99,14 +100,16 @@ Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint
 1.1 的核心阶段顺序：
 
 ```text
-alpha.1  Browser ownership + Alpha 8 Page Assist absorption
-alpha.2  Generic Web minimum vertical
+alpha.1  Provider plugin boundary + Browser ownership + Alpha 8 Page Assist absorption
+alpha.2  Generic Web typed BrowserPage + screenshot + optional Jev fast path + real-browser UAT
 alpha.3  Bilibili / X / Doubao reviewed builtin Adapter real-browser UAT
 alpha.4  Local Adapter registry + minimal declarative package
-beta.1   Adapter draft / try / activate / rollback + authoring Skill
+beta.1   Adapter draft / try / activate / repair / rollback + authoring Skill
 beta.2   ChatGPT / Grok / Claude convergence on shared Browser Kernel
-rc.1     permissions / migration / package / rollback / multi-device browser acceptance
+rc.1     packaging / permissions / compatibility / rollback / multi-device acceptance
 ```
+
+2026-09-26 本地 `main` 已完成 alpha.1 与 alpha.2 的确定性主体：provider capability/identity/project/policy 插件边界、共享 Browser Page Kernel、opaque `page_ref`、owned/claimed lifecycle、`browser_session.open` 失败页清理，以及 `browser_page.action` 的 observe/click/fill/expect。alpha.2 剩余项是 screenshot、三类真实网页 UAT 与 Jev 可选快路径；这些完成前不冻结 Adapter package schema。
 
 1.1 不把“任意网页”解释为无限制 RPA。普通生产路径继续禁止 local Adapter 任意 JS/eval、cookie/storage secret 导出、任意 shell/filesystem 访问与隐式接管用户 tab；高影响发布、支付、删除、授权等动作继续走确定性 human-boundary。
 
