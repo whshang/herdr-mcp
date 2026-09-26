@@ -811,6 +811,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "condition": {"type": ["string", "null"], "enum": ["document_ready", "url_equals", "text_present", "text_absent", null]},
                     "timeout_ms": {"type": ["integer", "null"], "minimum": 0, "maximum": 5000},
                     "idempotency_key": {"type": ["string", "null"], "maxLength": 256},
+                    "objective": {"type": ["string", "null"], "maxLength": 1024},
                 },
                 "required": ["endpoint_ref", "page_ref", "action"],
                 "oneOf": [
@@ -4836,6 +4837,10 @@ mod tests {
         assert_eq!(
             methods[20]["params"]["properties"]["action"]["enum"],
             json!(["observe", "click", "fill", "expect", "screenshot"])
+        );
+        assert_eq!(
+            methods[20]["params"]["properties"]["objective"]["maxLength"],
+            1024
         );
         assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 5);
         assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);

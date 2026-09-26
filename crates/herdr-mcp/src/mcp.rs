@@ -22,7 +22,9 @@ use crate::progressive_skills::{
     WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
-use crate::semantic::{SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService};
+use crate::semantic::{
+    DEFAULT_DECISION_THRESHOLD, SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService,
+};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
@@ -6606,6 +6608,215 @@ fn continuity_search_string<'a>(
     }
 }
 
+const BROWSER_FAST_PATH_MAX_CLICK_CANDIDATES: usize = 20;
+const BROWSER_FAST_PATH_TEXT_LIMIT: usize = 8 * 1024;
+const BROWSER_FAST_PATH_DECISION_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(1800);
+
+fn browser_fast_path_advisory(
+    semantic: &SemanticService,
+    objective: &str,
+    observation: &Value,
+) -> Value {
+    let capability = semantic.capability_json();
+    let objective = objective.trim();
+    if objective.is_empty() || objective.len() > 1024 || objective.chars().any(char::is_control) {
+        return json!({
+            "attempted": false,
+            "used": false,
+            "advisory_only": true,
+            "reason": "objective_invalid",
+            "capability": capability,
+        });
+    }
+    if observation.get("ok").and_then(Value::as_bool) != Some(true) {
+        return json!({
+            "attempted": false,
+            "used": false,
+            "advisory_only": true,
+            "reason": "observation_unavailable",
+            "capability": capability,
+        });
+    }
+    if !semantic.configured() {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "not_configured",
+            "capability": capability,
+        });
+    }
+
+    let mut criteria = std::collections::BTreeMap::from([
+        (
+            "done".to_owned(),
+            Some("The objective is already satisfied by the current visible page evidence".to_owned()),
+        ),
+        (
+            "blocked".to_owned(),
+            Some("The objective cannot continue because the current page is blocked by an external or human-required condition".to_owned()),
+        ),
+        (
+            "escalate".to_owned(),
+            Some("The bounded page evidence is insufficient or ambiguous; return control to the main planner without mutating the page".to_owned()),
+        ),
+    ]);
+    let mut actions = std::collections::BTreeMap::from([
+        ("done".to_owned(), json!({"action": "done"})),
+        ("blocked".to_owned(), json!({"action": "blocked"})),
+        ("escalate".to_owned(), json!({"action": "escalate"})),
+    ]);
+    let mut elements = Vec::new();
+
+    for element in observation
+        .get("elements")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if elements.len() >= BROWSER_FAST_PATH_MAX_CLICK_CANDIDATES {
+            break;
+        }
+        let Some(element_ref) = element.get("ref").and_then(Value::as_str) else {
+            continue;
+        };
+        let role = element
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(role.as_str(), "button" | "link" | "checkbox") {
+            continue;
+        }
+        if element_ref.is_empty()
+            || element_ref.len() > 256
+            || element_ref.chars().any(char::is_control)
+        {
+            continue;
+        }
+        let label = element
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        let candidate_id = format!("click_{}", elements.len());
+        let descriptor = json!({
+            "action": "click",
+            "ref": element_ref,
+            "role": role,
+            "label": label,
+        });
+        criteria.insert(
+            candidate_id.clone(),
+            Some(format!(
+                "Click only this already-observed opaque element: {}",
+                descriptor
+            )),
+        );
+        actions.insert(
+            candidate_id.clone(),
+            json!({"action": "click", "ref": element_ref}),
+        );
+        elements.push(json!({
+            "candidate_id": candidate_id,
+            "ref": element_ref,
+            "role": role,
+            "text": label,
+        }));
+    }
+
+    let text = observation
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(BROWSER_FAST_PATH_TEXT_LIMIT)
+        .collect::<String>();
+    let state = json!({
+        "objective": objective,
+        "observation": {
+            "url": observation.get("url").and_then(Value::as_str).unwrap_or(""),
+            "origin": observation.get("origin").and_then(Value::as_str).unwrap_or(""),
+            "title": observation.get("title").and_then(Value::as_str).unwrap_or(""),
+            "generation": observation.get("generation").and_then(Value::as_str).unwrap_or(""),
+            "text": text,
+            "elements": elements,
+        },
+        "candidate_count": actions.len(),
+        "authority": "advisory candidate selection only; no browser action is executed here",
+    });
+    let request = SemanticRequest::new(state).ask(
+        "next_action",
+        SemanticQuestion::choice(
+            "Choose exactly one candidate that best advances the objective using only the bounded visible page evidence. Choose done only when the objective is visibly satisfied, blocked for an external/human-required blocker, and escalate whenever evidence is ambiguous. Never invent an action or element reference.",
+            criteria,
+        ),
+    );
+    let response = match semantic.evaluate_with_timeout(&request, BROWSER_FAST_PATH_DECISION_BUDGET)
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "advisory_only": true,
+                "reason": error.code(),
+                "capability": capability,
+            });
+        }
+    };
+    let Some((choice, probabilities, confidence)) = response
+        .answer("next_action")
+        .and_then(SemanticAnswer::choice_value)
+    else {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "bad_response",
+            "capability": capability,
+        });
+    };
+    let Some(action) = actions.get(choice) else {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "candidate_mismatch",
+            "capability": capability,
+        });
+    };
+    let choice_probability = probabilities.get(choice).copied().unwrap_or(0.0);
+    if confidence < DEFAULT_DECISION_THRESHOLD || choice_probability < DEFAULT_DECISION_THRESHOLD {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "uncertain",
+            "confidence": confidence,
+            "choice_probability": choice_probability,
+            "capability": capability,
+        });
+    }
+
+    json!({
+        "attempted": true,
+        "used": true,
+        "advisory_only": true,
+        "action": action,
+        "candidate_id": choice,
+        "confidence": confidence,
+        "choice_probability": choice_probability,
+        "provider": response.provider,
+        "model": response.model,
+        "capability": capability,
+        "authority": "advisory only; Runtime/browser action validation and idempotency remain authoritative",
+    })
+}
+
 fn browser_page_action_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
@@ -6626,6 +6837,7 @@ fn browser_page_action_call(
         "condition",
         "timeout_ms",
         "idempotency_key",
+        "objective",
     ];
     if let Some(key) = object
         .keys()
@@ -6704,6 +6916,7 @@ fn browser_page_action_call(
     });
     let mutation = matches!(action, "click" | "fill");
     let mut mutation_key: Option<&str> = None;
+    let mut semantic_objective: Option<&str> = None;
 
     match action {
         "observe" | "screenshot" => {
@@ -6723,12 +6936,36 @@ fn browser_page_action_call(
                     });
                 }
             }
-            if action == "screenshot" && object.contains_key("max_chars") {
+            if action == "screenshot"
+                && (object.contains_key("max_chars") || object.contains_key("objective"))
+            {
                 return json!({
                     "ok": false,
                     "code": "invalid_params",
-                    "message": "max_chars is not accepted for screenshot",
+                    "message": "max_chars and objective are not accepted for screenshot",
                 });
+            }
+            if action == "observe"
+                && let Some(objective) = object.get("objective")
+            {
+                let Some(objective) = objective.as_str().map(str::trim) else {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "objective must be a string",
+                    });
+                };
+                if objective.is_empty()
+                    || objective.len() > 1024
+                    || objective.chars().any(char::is_control)
+                {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "objective must be 1..1024 non-control characters",
+                    });
+                }
+                semantic_objective = Some(objective);
             }
             if action == "observe"
                 && let Some(max_chars) = object.get("max_chars")
@@ -6743,7 +6980,13 @@ fn browser_page_action_call(
             }
         }
         "expect" => {
-            for disallowed in ["generation", "ref", "max_chars", "idempotency_key"] {
+            for disallowed in [
+                "generation",
+                "ref",
+                "max_chars",
+                "idempotency_key",
+                "objective",
+            ] {
                 if object.contains_key(disallowed) {
                     return json!({
                         "ok": false,
@@ -6809,7 +7052,7 @@ fn browser_page_action_call(
             }
         }
         "click" | "fill" => {
-            for disallowed in ["max_chars", "condition", "timeout_ms"] {
+            for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
                 if object.contains_key(disallowed) {
                     return json!({
                         "ok": false,
@@ -6918,10 +7161,24 @@ fn browser_page_action_call(
         ) {
             Ok(evidence) => {
                 if let Some(mut result) = evidence.result {
+                    let fast_path_advisory = if action == "observe" {
+                        semantic_objective.map(|objective| {
+                            browser_fast_path_advisory(
+                                &SemanticService::from_config(),
+                                objective,
+                                &result,
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     if let Some(object) = result.as_object_mut() {
                         object
                             .entry("page_ref".to_owned())
                             .or_insert_with(|| json!(page_ref));
+                        if let Some(advisory) = fast_path_advisory {
+                            object.insert("fast_path_advisory".to_owned(), advisory);
+                        }
                         if !object.contains_key("code")
                             && let Some(code) = object
                                 .get("error")
@@ -14130,6 +14387,58 @@ mod tests {
 
         std::fs::remove_dir_all(&config_dir).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn browser_fast_path_advisory_is_optional_and_fails_back_across_semantic_states() {
+        let observation = json!({
+            "ok": true,
+            "url": "https://example.com/app",
+            "origin": "https://example.com",
+            "title": "Example App",
+            "generation": "pa_gen_1_test",
+            "text": "Ready. Continue to the next view.",
+            "elements": [
+                {"ref": "ref_pa_gen_1_test_0", "role": "button", "text": "Continue"},
+                {"ref": "ref_pa_gen_1_test_1", "role": "textbox", "text": "Search"},
+                {"ref": "ref_pa_gen_1_test_2", "role": "link", "text": "Details"}
+            ],
+            "cookie": "must-not-be-consumed"
+        });
+        let objective = "Open the next visible view";
+
+        let unconfigured =
+            browser_fast_path_advisory(&SemanticService::test_empty(), objective, &observation);
+        assert_eq!(unconfigured["used"], false);
+        assert_eq!(unconfigured["reason"], "not_configured");
+        assert_eq!(unconfigured["advisory_only"], true);
+
+        let provider_error = browser_fast_path_advisory(
+            &SemanticService::test_error("browser-fast-path-error", "timeout"),
+            objective,
+            &observation,
+        );
+        assert_eq!(provider_error["used"], false);
+        assert_eq!(provider_error["reason"], "timeout");
+        assert_eq!(provider_error["advisory_only"], true);
+
+        let url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"next_action":{"type":"choice","choice":"click_0","probabilities":{"click_0":0.91,"click_1":0.01,"done":0.03,"blocked":0.02,"escalate":0.03},"confidence":0.91}}}"#,
+        );
+        let configured =
+            SemanticService::test_decision_route("browser-fast-path-ok", &url).unwrap();
+        let advised = browser_fast_path_advisory(&configured, objective, &observation);
+        assert_eq!(advised["used"], true, "{advised}");
+        assert_eq!(advised["advisory_only"], true);
+        assert_eq!(advised["candidate_id"], "click_0");
+        assert_eq!(advised["action"]["action"], "click");
+        assert_eq!(advised["action"]["ref"], "ref_pa_gen_1_test_0");
+        assert_eq!(advised["confidence"], 0.91);
+        assert_eq!(advised["choice_probability"], 0.91);
+        assert_eq!(
+            advised["authority"],
+            "advisory only; Runtime/browser action validation and idempotency remain authoritative"
+        );
     }
 
     #[test]
