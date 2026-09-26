@@ -1603,6 +1603,9 @@ test("user resumes an exact ChatGPT session | Given service-worker target cache 
   assert.doesNotMatch(segment, /sendBrowserActuationTabMessage\(targetOpen\.tabId/);
   assert.match(segment, /chrome\.tabs\.update.*active:\s*true.*autoDiscardable:\s*false/);
   assert.match(segment, /protectBoundTab/);
+  assert.match(segment, /browser_open_target_register_timeout/);
+  assert.match(segment, /chrome\.tabs\.remove\(createdTab\.id\)/);
+  assert.match(segment, /tab_cleanup_verified:\s*tabCleanupVerified/);
   assert.doesNotMatch(segment, /insertMainWorld|performWake|executeScript/);
   assert.match(segment, /observedGenerationOpen/);
   assert.match(segment, /providerOpen !== "chatgpt"/);

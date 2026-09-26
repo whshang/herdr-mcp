@@ -3951,6 +3951,17 @@ async function handleBrowserActuation(command) {
           await new Promise((resolve) => setTimeout(resolve, 200));
         } while (Date.now() < deadline);
         if (!targetOpen) {
+          let tabClosed = false;
+          let tabCleanupVerified = false;
+          try {
+            await chrome.tabs.remove(createdTab.id);
+            tabClosed = true;
+          } catch (_) {}
+          try {
+            await chrome.tabs.get(createdTab.id);
+          } catch (_) {
+            tabCleanupVerified = true;
+          }
           await postBrowserActuationEvidence(actuationId, {
             ...unavailableBrowserActuationEvidence(
               expectedGeneration,
@@ -3958,6 +3969,12 @@ async function handleBrowserActuation(command) {
             ),
             command_accepted: true,
             resource_available: true,
+            result: {
+              error: "browser_open_target_register_timeout",
+              tab_opened: true,
+              tab_closed: tabClosed,
+              tab_cleanup_verified: tabCleanupVerified,
+            },
           }).catch(() => {});
           return;
         }
