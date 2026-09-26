@@ -22,8 +22,12 @@ function browserPageLifecycleHarness({
   tabs = new Map(),
   contentResponder = null,
   permissionAllowed = true,
+  screenshotResponder = null,
+  artifactResponder = null,
 } = {}) {
   let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
+  const activatedListeners = new Set();
+  const focusListeners = new Set();
   const storageArea = {
     async get(key) { return { [key]: structuredClone(sessionStorage[key] || []) }; },
     async set(value) { Object.assign(sessionStorage, structuredClone(value)); },
@@ -36,11 +40,19 @@ function browserPageLifecycleHarness({
         if (!tab) throw new Error("tab missing");
         return { ...tab };
       },
-      async query() {
-        return [...tabs.values()].map((tab) => ({ ...tab }));
+      async query(query = {}) {
+        return [...tabs.values()]
+          .filter((tab) => query.windowId == null || tab.windowId === query.windowId)
+          .filter((tab) => query.active !== true || tab.active === true)
+          .map((tab) => ({ ...tab }));
       },
       async create(info) {
-        const tab = { id: nextTabId++, url: info.url, active: info.active === true };
+        const tab = {
+          id: nextTabId++,
+          windowId: 1,
+          url: info.url,
+          active: info.active === true,
+        };
         tabs.set(tab.id, tab);
         return { ...tab };
       },
@@ -50,6 +62,34 @@ function browserPageLifecycleHarness({
       async sendMessage(tabId, payload) {
         if (!contentResponder) throw new Error("Receiving end does not exist");
         return contentResponder(tabId, payload);
+      },
+      async captureVisibleTab(windowId, options) {
+        if (!screenshotResponder) throw new Error("capture unavailable");
+        return screenshotResponder(windowId, options, {
+          activate(tabId) {
+            for (const tab of tabs.values()) {
+              if (tab.windowId === windowId) tab.active = tab.id === tabId;
+            }
+            for (const listener of activatedListeners) {
+              listener({ tabId, windowId });
+            }
+          },
+        });
+      },
+      onActivated: {
+        addListener(listener) { activatedListeners.add(listener); },
+        removeListener(listener) { activatedListeners.delete(listener); },
+      },
+    },
+    windows: {
+      async get(windowId) {
+        const anyTab = [...tabs.values()].some((tab) => tab.windowId === windowId);
+        if (!anyTab) throw new Error("window missing");
+        return { id: windowId, focused: true };
+      },
+      onFocusChanged: {
+        addListener(listener) { focusListeners.add(listener); },
+        removeListener(listener) { focusListeners.delete(listener); },
       },
     },
     scripting: {
@@ -75,6 +115,7 @@ function browserPageLifecycleHarness({
     "const getBrowserObservationGeneration = async () => 17;",
     "const registerLocalBrowserEndpoint = async () => ({ endpoint_ref: 'bep_test' });",
     "const browserEndpointView = (endpoint) => endpoint;",
+    "const captureImageArtifactNative = async (artifact) => ctx.captureImageArtifactNative(artifact);",
     browserPageLifecycleSource,
     "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, browserPagesByRef };",
   ].join("\n");
@@ -84,6 +125,10 @@ function browserPageLifecycleHarness({
     URL,
     Date,
     permissionAllowed,
+    captureImageArtifactNative: async (artifact) => {
+      if (!artifactResponder) throw new Error("artifact capture unavailable");
+      return artifactResponder(artifact);
+    },
   });
   return { ...api, sessionStorage, tabs };
 }
@@ -520,6 +565,115 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.delivery_state, "delivery_unknown");
   assert.equal(uncertain.retry_safe, false);
   assert.equal(uncertain.mutation_submitted, true);
+});
+
+test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
+  const sessionStorage = {};
+  const tabs = new Map([
+    [61, {
+      id: 61,
+      windowId: 7,
+      url: "https://example.com/app",
+      active: true,
+    }],
+  ]);
+  let artifactCalls = 0;
+  const h = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    screenshotResponder(windowId, options) {
+      assert.equal(windowId, 7);
+      assert.deepEqual(options, { format: "jpeg", quality: 80 });
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder(artifact) {
+      artifactCalls += 1;
+      assert.match(artifact.source_id, /^bp_[0-9a-f]{64}$/);
+      assert.match(artifact.artifact_key, /^screenshot_[0-9]+_[0-9a-f]{16}$/);
+      assert.equal(artifact.mime, "image/jpeg");
+      assert.equal(artifact.bytes_b64, "/9j/4AAQSkZJRg==");
+      return {
+        ok: true,
+        artifact: {
+          artifact_id: "0123456789abcdef0123456789abcdef",
+          conversation_id: artifact.source_id,
+          file_id: artifact.artifact_key,
+          mime: "image/jpeg",
+          bytes: 42,
+          sha256: "b".repeat(64),
+          captured_at: 100,
+          expires_at: 200,
+        },
+      };
+    },
+  });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "claim-screenshot-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const screenshot = await h.performBrowserPageActionRequest({
+    action: "screenshot",
+    pageRef: claimed.page_ref,
+  });
+  assert.equal(screenshot.ok, true);
+  assert.equal(screenshot.capture_scope, "visible_tab");
+  assert.equal(screenshot.page_ref, claimed.page_ref);
+  assert.equal(screenshot.origin, "https://example.com");
+  assert.equal(screenshot.canonical_url, "https://example.com/app");
+  assert.deepEqual(screenshot.artifact, {
+    artifact_id: "0123456789abcdef0123456789abcdef",
+    mime: "image/jpeg",
+    bytes: 42,
+    sha256: "b".repeat(64),
+    captured_at: 100,
+    expires_at: 200,
+  });
+  assert.equal(Object.hasOwn(screenshot.artifact, "bytes_b64"), false);
+  assert.equal(Object.hasOwn(screenshot, "tab_id"), false);
+  assert.equal(artifactCalls, 1);
+
+  tabs.get(61).active = false;
+  const hidden = await h.performBrowserPageActionRequest({
+    action: "screenshot",
+    pageRef: claimed.page_ref,
+  });
+  assert.equal(hidden.ok, false);
+  assert.equal(hidden.error, "browser_page_screenshot_not_visible");
+  assert.equal(hidden.retryable, true);
+  assert.equal(artifactCalls, 1);
+
+  tabs.get(61).active = true;
+  tabs.set(62, {
+    id: 62,
+    windowId: 7,
+    url: "https://example.com/other",
+    active: false,
+  });
+  const raced = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    screenshotResponder(_windowId, _options, control) {
+      control.activate(62);
+      control.activate(61);
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder() {
+      artifactCalls += 1;
+      throw new Error("raced screenshot must never reach artifact capture");
+    },
+  });
+  const racedResult = await raced.performBrowserPageActionRequest({
+    action: "screenshot",
+    pageRef: claimed.page_ref,
+  });
+  assert.equal(racedResult.ok, false);
+  assert.equal(racedResult.error, "browser_page_screenshot_view_changed");
+  assert.equal(racedResult.retryable, true);
+  assert.equal(artifactCalls, 1);
 });
 
 test("user sees WebChat control on Claude and Grok project homes | Given supported provider project URLs without conversations | When project page identity is parsed | Then project context exists without a conversation key", () => {

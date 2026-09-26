@@ -6688,12 +6688,12 @@ fn browser_page_action_call(
         }
     };
     let action = match object.get("action").and_then(Value::as_str) {
-        Some(value @ ("observe" | "click" | "fill" | "expect")) => value,
+        Some(value @ ("observe" | "click" | "fill" | "expect" | "screenshot")) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, fill, or expect",
+                "message": "action must be observe, click, fill, expect, or screenshot",
             });
         }
     };
@@ -6706,7 +6706,7 @@ fn browser_page_action_call(
     let mut mutation_key: Option<&str> = None;
 
     match action {
-        "observe" => {
+        "observe" | "screenshot" => {
             for disallowed in [
                 "generation",
                 "ref",
@@ -6719,11 +6719,20 @@ fn browser_page_action_call(
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": format!("{disallowed} is not accepted for observe"),
+                        "message": format!("{disallowed} is not accepted for {action}"),
                     });
                 }
             }
-            if let Some(max_chars) = object.get("max_chars") {
+            if action == "screenshot" && object.contains_key("max_chars") {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "max_chars is not accepted for screenshot",
+                });
+            }
+            if action == "observe"
+                && let Some(max_chars) = object.get("max_chars")
+            {
                 let Some(max_chars) = max_chars.as_u64() else {
                     return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be an integer"});
                 };
@@ -14231,6 +14240,93 @@ mod tests {
         let conflict = browser_page_action_call(&store, &conflict, &grants, Some(&actuator));
         assert_eq!(conflict["code"], "idempotency_key_conflict");
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_screenshot_routes_read_only_without_operation_reservation() {
+        use std::sync::{Arc, Mutex};
+
+        struct ScreenshotActuator;
+        impl BrowserActuator for ScreenshotActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage screenshot must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(expected_generation, 1);
+                assert_eq!(params["action"], "screenshot");
+                assert!(params.get("max_chars").is_none());
+                assert!(params.get("idempotency_key").is_none());
+
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "capture_scope": "visible_tab",
+                    "artifact": {
+                        "artifact_id": "0123456789abcdef0123456789abcdef",
+                        "mime": "image/jpeg",
+                        "bytes": 42,
+                        "sha256": "b".repeat(64),
+                        "captured_at": 100,
+                        "expires_at": 200,
+                    }
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let page_ref = format!("bp_{}", "a".repeat(64));
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "screenshot",
+        });
+        let result = browser_page_action_call(&store, &params, &grants, Some(&ScreenshotActuator));
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["page_ref"], page_ref);
+        assert_eq!(result["capture_scope"], "visible_tab");
+        assert_eq!(
+            result["artifact"]["artifact_id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+
+        let invalid = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": format!("bp_{}", "c".repeat(64)),
+                "action": "screenshot",
+                "max_chars": 128
+            }),
+            &grants,
+            Some(&ScreenshotActuator),
+        );
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["code"], "invalid_params");
     }
 
     #[test]

@@ -40,7 +40,7 @@ import {
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc, parseMcpJsonResponseText } from "./mcp-json-rpc.js";
 import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
-import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrBatchFetch, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
+import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrBatchFetch, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
   originToMatchPattern,
   parseAllowedOrigins,
@@ -8094,10 +8094,147 @@ function browserPageMutationEnvelope(result, page, sendAttempted) {
   };
 }
 
+function browserPageScreenshotArtifact(response) {
+  const artifact = response?.artifact;
+  if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) return null;
+  const artifactId = String(artifact.artifact_id || "");
+  const mime = String(artifact.mime || "");
+  const sha256 = String(artifact.sha256 || "");
+  const bytes = Number(artifact.bytes);
+  const capturedAt = Number(artifact.captured_at);
+  const expiresAt = Number(artifact.expires_at);
+  if (!/^[0-9a-f]{32}$/.test(artifactId)
+      || !["image/png", "image/jpeg"].includes(mime)
+      || !/^[0-9a-f]{64}$/i.test(sha256)
+      || !Number.isSafeInteger(bytes) || bytes <= 0
+      || !Number.isSafeInteger(capturedAt) || capturedAt <= 0
+      || !Number.isSafeInteger(expiresAt) || expiresAt <= capturedAt) {
+    return null;
+  }
+  return {
+    artifact_id: artifactId,
+    mime,
+    bytes,
+    sha256: sha256.toLowerCase(),
+    captured_at: capturedAt,
+    expires_at: expiresAt,
+  };
+}
+
+async function captureBrowserPageScreenshot(page, tab) {
+  if (!page || !tab?.id || !Number.isInteger(tab.windowId)
+      || !chrome.tabs?.onActivated?.addListener
+      || !chrome.tabs?.onActivated?.removeListener
+      || !chrome.windows?.get
+      || !chrome.windows?.onFocusChanged?.addListener
+      || !chrome.windows?.onFocusChanged?.removeListener) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "browser_page_screenshot_not_visible",
+      retryable: true,
+      capture_scope: "visible_tab",
+    }, page);
+  }
+
+  const exactTargetIsVisible = async () => {
+    let window = null;
+    let activeTabs = [];
+    try {
+      window = await chrome.windows.get(tab.windowId);
+      activeTabs = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+    } catch (_) {}
+    return window?.focused === true
+      && activeTabs.length === 1
+      && activeTabs[0]?.id === tab.id;
+  };
+
+  if (!await exactTargetIsVisible()) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "browser_page_screenshot_not_visible",
+      retryable: true,
+      capture_scope: "visible_tab",
+    }, page);
+  }
+
+  let viewChanged = false;
+  const onActivated = (activeInfo) => {
+    if (activeInfo?.windowId === tab.windowId) viewChanged = true;
+  };
+  const onFocusChanged = (windowId) => {
+    if (windowId !== tab.windowId) viewChanged = true;
+  };
+  chrome.tabs.onActivated.addListener(onActivated);
+  chrome.windows.onFocusChanged.addListener(onFocusChanged);
+
+  let dataUrl = "";
+  try {
+    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+      format: "jpeg",
+      quality: 80,
+    });
+    if (viewChanged || !await exactTargetIsVisible()) {
+      return withBrowserPageIdentity({
+        ok: false,
+        error: "browser_page_screenshot_view_changed",
+        retryable: true,
+        capture_scope: "visible_tab",
+      }, page);
+    }
+  } catch (error) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "browser_page_screenshot_failed",
+      retryable: true,
+      detail: String(error?.message || error || ""),
+      capture_scope: "visible_tab",
+    }, page);
+  } finally {
+    chrome.tabs.onActivated.removeListener(onActivated);
+    chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+  }
+
+  const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ""));
+  if (!match) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "browser_page_screenshot_invalid",
+      retryable: false,
+      capture_scope: "visible_tab",
+    }, page);
+  }
+
+  const nonce = crypto.getRandomValues(new Uint8Array(8));
+  const nonceHex = Array.from(nonce, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const artifactKey = `screenshot_${Date.now()}_${nonceHex}`;
+  const response = await captureImageArtifactNative({
+    source_id: page.page_ref,
+    artifact_key: artifactKey,
+    mime: match[1],
+    bytes_b64: match[2],
+  });
+  const artifact = browserPageScreenshotArtifact(response);
+  if (!artifact) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: String(response?.error || "browser_page_screenshot_artifact_failed"),
+      retryable: true,
+      capture_scope: "visible_tab",
+    }, page);
+  }
+  return withBrowserPageIdentity({
+    ok: true,
+    capture_scope: "visible_tab",
+    origin: page.origin,
+    canonical_url: page.canonical_url,
+    artifact,
+  }, page);
+}
+
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect"].includes(action)) {
+  if (!["observe", "click", "fill", "expect", "screenshot"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8157,6 +8294,9 @@ async function performBrowserPageActionRequest(msg) {
       : withBrowserPageIdentity(resolved, record);
   }
   const page = resolved.page;
+  if (action === "screenshot") {
+    return captureBrowserPageScreenshot(page, resolved.tab);
+  }
   const tabId = resolved.tab.id;
   const payload = {
     type: "h2w_page_assist",

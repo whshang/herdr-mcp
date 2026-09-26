@@ -803,7 +803,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 "properties": {
                     "endpoint_ref": {"type": "string", "maxLength": 96},
                     "page_ref": {"type": "string", "maxLength": 67},
-                    "action": {"type": "string", "enum": ["observe", "click", "fill", "expect"]},
+                    "action": {"type": "string", "enum": ["observe", "click", "fill", "expect", "screenshot"]},
                     "max_chars": {"type": ["integer", "null"], "minimum": 1, "maximum": 100000},
                     "generation": {"type": ["string", "null"], "maxLength": 256},
                     "ref": {"type": ["string", "null"], "maxLength": 256},
@@ -828,6 +828,9 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     {
                         "properties": {"action": {"enum": ["expect"]}},
                         "required": ["condition"],
+                    },
+                    {
+                        "properties": {"action": {"enum": ["screenshot"]}},
                     },
                 ],
                 "empty": false,
@@ -4832,9 +4835,9 @@ mod tests {
         );
         assert_eq!(
             methods[20]["params"]["properties"]["action"]["enum"],
-            json!(["observe", "click", "fill", "expect"])
+            json!(["observe", "click", "fill", "expect", "screenshot"])
         );
-        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 4);
+        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 5);
         assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
         assert_eq!(methods[21]["access"], "read_only");
         assert_eq!(
