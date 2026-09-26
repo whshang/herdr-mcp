@@ -296,11 +296,78 @@
     }
   }
 
+  function pageText() {
+    const doc = global.document;
+    const rawBody = doc?.body ? (doc.body.innerText || doc.body.textContent || "") : "";
+    return cleanText(rawBody, MAX_CHARS_CEILING);
+  }
+
+  function expectCondition(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location) {
+      if (String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+        return { ok: false, error: "origin_mismatch" };
+      }
+    }
+
+    const condition = String(params.condition || "").toLowerCase();
+    const value = typeof params.value === "string" ? params.value : "";
+    if (!["document_ready", "url_equals", "text_present", "text_absent"].includes(condition)) {
+      return { ok: false, error: "unsupported_expect_condition" };
+    }
+    if (condition === "document_ready") {
+      return { ok: global.document?.readyState === "complete", condition };
+    }
+    if (!value || value.length > 4096) {
+      return { ok: false, error: "expect_value_invalid", condition };
+    }
+    if (condition === "url_equals") {
+      return {
+        ok: String(global.location?.href || "") === value,
+        condition,
+        value,
+      };
+    }
+    const text = pageText();
+    const present = text.includes(value);
+    return {
+      ok: condition === "text_present" ? present : !present,
+      condition,
+      value,
+    };
+  }
+
+  async function executeExpect(params = {}) {
+    const timeoutMs = Math.max(0, Math.min(Number(params.timeoutMs) || 0, 5000));
+    const startedAt = Date.now();
+    while (true) {
+      const observed = expectCondition(params);
+      if (observed.error) return observed;
+      if (observed.ok) {
+        return {
+          ...observed,
+          elapsed_ms: Math.max(0, Date.now() - startedAt),
+        };
+      }
+      if (Date.now() - startedAt >= timeoutMs) {
+        return {
+          ok: false,
+          error: "expect_timeout",
+          condition: observed.condition,
+          elapsed_ms: Math.max(0, Date.now() - startedAt),
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   function handleAction(msg) {
     const action = String(msg?.action || "").toLowerCase();
-    if (action === "inspect") return scanDocument(msg);
+    if (action === "inspect" || action === "observe") return scanDocument(msg);
     if (action === "click") return executeClick(msg);
     if (action === "fill") return executeFill(msg);
+    if (action === "expect") return executeExpect(msg);
     return { ok: false, error: "unsupported_action" };
   }
 

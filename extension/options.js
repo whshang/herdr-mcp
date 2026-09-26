@@ -1,6 +1,7 @@
 // options.js — settings + locale
 import { detectOrLoadLocale, setLocale, getLocale, t, onLocaleReady } from "./i18n.js";
 import { nativeHostFailure } from "./native-host-diagnostics.js";
+import { originToMatchPattern, parseAllowedOrigins } from "./page-assist-core.js";
 
 const $ = (id) => document.getElementById(id);
 const KEYS = [
@@ -8,6 +9,7 @@ const KEYS = [
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
+  "pageAssistOrigins",
 ];
 let loadedHostPermissionOrigins = [];
 const TEMPLATE_FIELDS = [
@@ -21,6 +23,10 @@ function configuredHostPermissionOrigins(config) {
   if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
   if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
   if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
+  for (const origin of parseAllowedOrigins(config.pageAssistOrigins).slice(0, 64)) {
+    const pattern = originToMatchPattern(origin);
+    if (pattern) origins.push(pattern);
+  }
   return [...new Set(origins)];
 }
 
@@ -75,6 +81,10 @@ function applyI18n() {
   $("hint_progress").textContent = t("hint_progress_template");
   $("lab_automation_mode").textContent = t("label_automation_mode");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
+  $("title_generic_web").textContent = t("options_generic_web_section");
+  $("hint_generic_web").textContent = t("options_generic_web_hint");
+  $("lab_page_assist_origins").textContent = t("label_generic_web_origins");
+  $("hint_page_assist_origins").textContent = t("hint_generic_web_origins");
   $("title_experimental").textContent = t("label_experimental_section");
   $("experimental_badge").textContent = t("experimental_badge");
   $("hint_experimental").textContent = t("hint_experimental_section");
@@ -123,6 +133,7 @@ async function loadForm() {
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
   $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
+  $("pageAssistOrigins").value = parseAllowedOrigins(cfg.pageAssistOrigins).join("\n");
   loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg);
 }
 
@@ -201,6 +212,7 @@ $("save").addEventListener("click", async () => {
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
+    pageAssistOrigins: parseAllowedOrigins($("pageAssistOrigins").value).slice(0, 64),
     uiLocale: getLocale(),
   };
   const nextPermissionOrigins = configuredHostPermissionOrigins(config);

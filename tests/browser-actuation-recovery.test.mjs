@@ -12,12 +12,17 @@ const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
-const browserPageLifecycleEnd = backgroundSource.indexOf("\nfunction withBrowserPageIdentity", browserPageLifecycleStart);
+const browserPageLifecycleEnd = backgroundSource.indexOf("\nasync function performPageAssistRequest", browserPageLifecycleStart);
 assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,
   "BrowserPage lifecycle helpers must remain extractable");
 const browserPageLifecycleSource = backgroundSource.slice(browserPageLifecycleStart, browserPageLifecycleEnd);
 
-function browserPageLifecycleHarness({ sessionStorage = {}, tabs = new Map() } = {}) {
+function browserPageLifecycleHarness({
+  sessionStorage = {},
+  tabs = new Map(),
+  contentResponder = null,
+  permissionAllowed = true,
+} = {}) {
   let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
   const storageArea = {
     async get(key) { return { [key]: structuredClone(sessionStorage[key] || []) }; },
@@ -42,6 +47,13 @@ function browserPageLifecycleHarness({ sessionStorage = {}, tabs = new Map() } =
       async remove(tabId) {
         if (!tabs.delete(tabId)) throw new Error("tab missing");
       },
+      async sendMessage(tabId, payload) {
+        if (!contentResponder) throw new Error("Receiving end does not exist");
+        return contentResponder(tabId, payload);
+      },
+    },
+    scripting: {
+      async executeScript() {},
     },
   };
   const code = [
@@ -59,14 +71,20 @@ function browserPageLifecycleHarness({ sessionStorage = {}, tabs = new Map() } =
     "const CFG = { pageAssistOrigins: ['https://example.com'] };",
     "const parseAllowedOrigins = (input) => input;",
     "const originToMatchPattern = (origin) => origin + '/*';",
-    "const hasHostPermission = async () => true;",
+    "const hasHostPermission = async () => ctx.permissionAllowed;",
     "const getBrowserObservationGeneration = async () => 17;",
     "const registerLocalBrowserEndpoint = async () => ({ endpoint_ref: 'bep_test' });",
     "const browserEndpointView = (endpoint) => endpoint;",
     browserPageLifecycleSource,
-    "return { performBrowserPageLifecycleRequest, browserPagesByRef };",
+    "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, browserPagesByRef };",
   ].join("\n");
-  const api = new Function("ctx", code)({ crypto: webcrypto, chrome, URL, Date });
+  const api = new Function("ctx", code)({
+    crypto: webcrypto,
+    chrome,
+    URL,
+    Date,
+    permissionAllowed,
+  });
   return { ...api, sessionStorage, tabs };
 }
 
@@ -411,6 +429,98 @@ function recoveryHarness(tabRecords) {
   );
   return { recover, browserSessionTargets, queryArgs };
 }
+
+test("user acts on an opaque generic page | Given one claimed BrowserPage and a current DOM generation | When observe and click run through the shared kernel route | Then raw tab identity stays local and lost mutation response is uncertain", async () => {
+  const sessionStorage = {};
+  const tabs = new Map([
+    [51, { id: 51, url: "https://example.com/app", active: true }],
+  ]);
+  let failMutationTransport = false;
+  const contentResponder = (_tabId, payload) => {
+    if (failMutationTransport && payload.action === "click") {
+      throw new Error("response channel lost");
+    }
+    if (payload.action === "observe") {
+      return {
+        ok: true,
+        origin: "https://example.com",
+        url: "https://example.com/app",
+        generation: "pa_gen_test",
+        text: "Ready",
+        elements: [{ ref: "ref_pa_gen_test_0", role: "button", text: "Run" }],
+      };
+    }
+    if (payload.action === "click") {
+      return {
+        ok: true,
+        generation: payload.generation,
+        ref: payload.ref,
+      };
+    }
+    throw new Error(`unexpected action ${payload.action}`);
+  };
+  const h = browserPageLifecycleHarness({ sessionStorage, tabs, contentResponder });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "claim-action-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const observed = await h.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: claimed.page_ref,
+    maxChars: 128,
+  });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.page_ref, claimed.page_ref);
+  assert.equal(observed.generation, "pa_gen_test");
+  assert.equal(Object.hasOwn(observed, "tab_id"), false);
+
+  const restricted = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    contentResponder,
+    permissionAllowed: false,
+  });
+  const denied = await restricted.performBrowserPageActionRequest({
+    action: "click",
+    pageRef: claimed.page_ref,
+    generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.error, "permission_required");
+  assert.equal(denied.reason, "host_permission_missing");
+  assert.equal(denied.delivery_state, "not_applied");
+  assert.equal(denied.retry_safe, true);
+  assert.equal(denied.mutation_submitted, false);
+
+  const applied = await h.performBrowserPageActionRequest({
+    action: "click",
+    pageRef: claimed.page_ref,
+    generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.delivery_state, "applied");
+  assert.equal(applied.retry_safe, false);
+  assert.equal(applied.mutation_submitted, true);
+  assert.equal(Object.hasOwn(applied, "tab_id"), false);
+
+  failMutationTransport = true;
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "click",
+    pageRef: claimed.page_ref,
+    generation: "pa_gen_next",
+    ref: "ref_pa_gen_next_0",
+  });
+  assert.equal(uncertain.ok, false);
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+});
 
 test("user sees WebChat control on Claude and Grok project homes | Given supported provider project URLs without conversations | When project page identity is parsed | Then project context exists without a conversation key", () => {
   const claude = browserProjectPageInfoFromSupportedUrl(

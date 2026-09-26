@@ -811,6 +811,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     ];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
+    CFG.pageAssistOrigins = parseAllowedOrigins(CFG.pageAssistOrigins).slice(0, 64);
     delete CFG.experimentalGrokEnabled;
     delete CFG.jevJudgeMode;
     delete CFG.jevJudgeThreshold;
@@ -3580,6 +3581,33 @@ async function handleBrowserActuation(command) {
       ),
       resource_available: true,
       rejected: true,
+    }).catch(() => {});
+    return;
+  }
+  if (operation === "herdr_mcp.browser_page.action") {
+    let result;
+    try {
+      result = await performBrowserPageActionRequest({
+        pageRef: params.page_ref,
+        action: params.action,
+        maxChars: params.max_chars,
+        generation: params.generation,
+        ref: params.ref,
+        value: params.value,
+        condition: params.condition,
+        timeoutMs: params.timeout_ms,
+      });
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = { ok: false, error: "browser_page_invalid_result" };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "browser_page_unavailable"),
+      command_accepted: true,
+      resource_available: true,
+      result,
     }).catch(() => {});
     return;
   }
@@ -7833,11 +7861,21 @@ async function performBrowserPageLifecycleRequest(msg) {
     }
     const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
     if (!allowed.includes(targetOrigin)) {
-      return { ok: false, error: "origin_not_permitted" };
+      return {
+        ok: false,
+        error: "permission_required",
+        reason: "origin_not_approved",
+        origin: targetOrigin,
+      };
     }
     const pattern = originToMatchPattern(targetOrigin);
     if (!pattern || !await hasHostPermission(pattern)) {
-      return { ok: false, error: "origin_permission_missing" };
+      return {
+        ok: false,
+        error: "permission_required",
+        reason: "host_permission_missing",
+        origin: targetOrigin,
+      };
     }
 
     const prior = await browserPageByOperation(endpointRef, idempotencyKey, action === "open" ? "owned" : "claimed");
@@ -7997,6 +8035,206 @@ async function performBrowserPageLifecycleRequest(msg) {
     tab_closed: true,
     tab_cleanup_verified: true,
   });
+}
+
+const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
+  "browser_page_ref_invalid",
+  "browser_page_endpoint_unavailable",
+  "browser_page_not_found",
+  "browser_page_endpoint_mismatch",
+  "browser_page_origin_mismatch",
+  "browser_page_stale",
+  "permission_required",
+  "origin_not_permitted",
+  "origin_permission_missing",
+  "origin_mismatch",
+  "disallowed_parameter",
+  "cross_origin_iframe_blocked",
+  "stale_generation",
+  "invalid_ref",
+  "element_detached",
+  "element_disabled",
+  "element_hidden",
+  "unsupported_element",
+  "sensitive_field_prohibited",
+  "element_not_fillable",
+  "value_required",
+]);
+
+function browserPageMutationEnvelope(result, page, sendAttempted) {
+  const base = withBrowserPageIdentity(
+    result && typeof result === "object" ? result : { ok: false, error: "browser_page_invalid_result" },
+    page,
+  );
+  if (base?.ok === true) {
+    return {
+      ...base,
+      delivery_state: "applied",
+      retry_safe: false,
+      mutation_submitted: true,
+      postcondition_observed: false,
+    };
+  }
+  const error = String(base?.error || "browser_page_action_failed");
+  if (!sendAttempted || BROWSER_PAGE_SAFE_MUTATION_REJECTIONS.has(error)) {
+    return {
+      ...base,
+      delivery_state: "not_applied",
+      retry_safe: true,
+      mutation_submitted: false,
+      postcondition_observed: false,
+    };
+  }
+  return {
+    ...base,
+    delivery_state: "delivery_unknown",
+    retry_safe: false,
+    mutation_submitted: true,
+    postcondition_observed: false,
+  };
+}
+
+async function performBrowserPageActionRequest(msg) {
+  await configReady;
+  const action = String(msg?.action || "").toLowerCase();
+  if (!["observe", "click", "fill", "expect"].includes(action)) {
+    return { ok: false, error: "browser_page_action_invalid" };
+  }
+
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+  if (!endpointRef) return { ok: false, error: "browser_page_endpoint_unavailable" };
+
+  const pageRef = String(msg?.pageRef || "");
+  if (!validBrowserPageRef(pageRef)) {
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
+      : { ok: false, error: "browser_page_ref_invalid" };
+  }
+
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) {
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
+      : { ok: false, error: "browser_page_not_found" };
+  }
+  if (record.endpoint_ref !== endpointRef) {
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
+      : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
+  }
+
+  const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
+  if (!allowed.includes(record.origin)) {
+    const denied = {
+      ok: false,
+      error: "permission_required",
+      reason: "origin_not_approved",
+      origin: record.origin,
+    };
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope(denied, record, false)
+      : withBrowserPageIdentity(denied, record);
+  }
+  const pattern = originToMatchPattern(record.origin);
+  if (!pattern || !await hasHostPermission(pattern)) {
+    const denied = {
+      ok: false,
+      error: "permission_required",
+      reason: "host_permission_missing",
+      origin: record.origin,
+    };
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope(denied, record, false)
+      : withBrowserPageIdentity(denied, record);
+  }
+
+  const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
+  if (!resolved.ok) {
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope(resolved, record, false)
+      : withBrowserPageIdentity(resolved, record);
+  }
+  const page = resolved.page;
+  const tabId = resolved.tab.id;
+  const payload = {
+    type: "h2w_page_assist",
+    action,
+    expectedOrigin: page.origin,
+    maxChars: msg?.maxChars,
+    generation: msg?.generation,
+    ref: msg?.ref,
+    value: msg?.value,
+    condition: msg?.condition,
+    timeoutMs: msg?.timeoutMs,
+  };
+
+  const mutation = action === "click" || action === "fill";
+  let sendAttempted = false;
+  const send = async () => {
+    sendAttempted = true;
+    return chrome.tabs.sendMessage(tabId, payload);
+  };
+
+  try {
+    const response = await send();
+    if (mutation) return browserPageMutationEnvelope(response, page, true);
+    return withBrowserPageIdentity(
+      response || { ok: false, error: "empty_content_response" },
+      page,
+    );
+  } catch (error) {
+    if (mutation) {
+      return browserPageMutationEnvelope(
+        {
+          ok: false,
+          error: "browser_page_action_transport_failed",
+          detail: String(error?.message || error || ""),
+        },
+        page,
+        sendAttempted,
+      );
+    }
+  }
+
+  if (!["observe", "expect"].includes(action)) {
+    return withBrowserPageIdentity({ ok: false, error: "browser_page_action_unavailable" }, page);
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/browser-page-kernel.js", "content/page-assist.js"],
+      world: "ISOLATED",
+    });
+  } catch (error) {
+    return withBrowserPageIdentity(
+      {
+        ok: false,
+        error: "script_injection_failed",
+        detail: String(error?.message || error || ""),
+      },
+      page,
+    );
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, payload);
+    return withBrowserPageIdentity(
+      response || { ok: false, error: "empty_content_response" },
+      page,
+    );
+  } catch (error) {
+    return withBrowserPageIdentity(
+      {
+        ok: false,
+        error: "browser_page_action_unavailable",
+        detail: String(error?.message || error || ""),
+      },
+      page,
+    );
+  }
 }
 
 function withBrowserPageIdentity(result, page) {
@@ -8781,6 +9019,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_set_config") {
     void (async () => {
       const incoming = { ...(msg.config || {}) };
+      if (Object.prototype.hasOwnProperty.call(incoming, "pageAssistOrigins")) {
+        const optionsUrl = chrome.runtime?.getURL ? chrome.runtime.getURL("options.html") : "";
+        const senderUrl = String(sender?.url || "").split(/[?#]/, 1)[0];
+        const optionsSender = Boolean(
+          sender?.id
+          && chrome.runtime?.id
+          && sender.id === chrome.runtime.id
+          && optionsUrl
+          && senderUrl === optionsUrl
+        );
+        if (!optionsSender) {
+          sendResponse({ ok: false, error: "generic_web_origin_update_denied" });
+          return;
+        }
+      }
       // Current extension builds never persist or consume HERDR_MCP_TOKEN.
       delete incoming.token;
       delete incoming.idleNudgeCooldownSec;
@@ -8803,6 +9056,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (Object.prototype.hasOwnProperty.call(incoming, "manualContinueMessage")) {
         incoming.manualContinueMessage = String(incoming.manualContinueMessage || "").trim().slice(0, 4000)
           || defaultManualContinueMessage();
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "pageAssistOrigins")) {
+        incoming.pageAssistOrigins = parseAllowedOrigins(incoming.pageAssistOrigins).slice(0, 64);
       }
       // Retired semantic-policy inputs are ignored even when a stale Options
       // page or older content script submits them during an extension update.

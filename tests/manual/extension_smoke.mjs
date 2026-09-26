@@ -176,9 +176,12 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
 ok(!manifest.content_scripts.some((entry) => (entry.js || []).some((script) =>
       script === "content/page-assist.js" || script === "content/browser-page-kernel.js"))
     && backgroundSource.includes("pageAssistOrigins: []")
-    && !optionsHtml.includes('id="pageAssistOrigins"')
-    && !optionsSource.includes("pageAssistOrigins"),
-  "Page Assist stays default-off and is not exposed as an extension setting");
+    && optionsHtml.includes('id="pageAssistOrigins"')
+    && optionsSource.includes("parseAllowedOrigins")
+    && optionsSource.includes("requestHostPermissions(nextPermissionOrigins)")
+    && optionsSource.includes("pageAssistOrigins")
+    && !backgroundSource.includes("chrome.permissions.request"),
+  "Generic Web stays default-off and only local Settings save can request approved host permissions");
 const pageAssistDispatchSource = backgroundSource.match(
   /async function performPageAssistRequest\(msg\) \{[\s\S]*?\n}\n/,
 )?.[0] || "";

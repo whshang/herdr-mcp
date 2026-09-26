@@ -3526,12 +3526,36 @@ console.log("\n[page-assist injection idempotency]");
   tabs.set(paTabId, { id: paTabId, url: paUrl, status: "complete", active: true, listener: null });
 
   const trustedExtSender = { id: "test-ext", url: "chrome-extension://test-ext/control-center.html" };
+  const optionsSender = {
+    id: "test-ext",
+    url: "chrome-extension://test-ext/options.html",
+    tab: { id: 990, url: "chrome-extension://test-ext/options.html" },
+  };
   const contentScriptSender = { id: "test-ext", tab: { id: paTabId }, url: paUrl };
+
+  let resolveDeniedConfig;
+  const deniedConfigP = new Promise((resolve) => { resolveDeniedConfig = resolve; });
+  onMsg(
+    { type: "h2w_set_config", config: { pageAssistOrigins: [paOrigin] } },
+    trustedExtSender,
+    (response) => resolveDeniedConfig(response),
+  );
+  const deniedConfig = await deniedConfigP;
+  ok(deniedConfig?.ok === false && deniedConfig?.error === "generic_web_origin_update_denied",
+    "non-Options extension pages cannot widen the Generic Web approved-origin set",
+    JSON.stringify(deniedConfig));
 
   let resolvePaConfig;
   const paConfigP = new Promise((resolve) => { resolvePaConfig = resolve; });
-  onMsg({ type: "h2w_set_config", config: { pageAssistOrigins: [paOrigin] } }, {}, (response) => resolvePaConfig(response));
-  await paConfigP;
+  onMsg(
+    { type: "h2w_set_config", config: { pageAssistOrigins: [paOrigin] } },
+    optionsSender,
+    (response) => resolvePaConfig(response),
+  );
+  const paConfig = await paConfigP;
+  ok(paConfig?.ok === true,
+    "Options user-gesture path can persist the approved Generic Web origin",
+    JSON.stringify(paConfig));
 
   const scriptCallsBefore = executeScriptCalls.length;
 

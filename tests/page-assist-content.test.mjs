@@ -70,6 +70,7 @@ function harness({
   const location = new URL(url);
   const document = {
     title,
+    readyState: "complete",
     body: { innerText: bodyText, textContent: bodyText },
     querySelectorAll() { return elements; },
   };
@@ -80,6 +81,7 @@ function harness({
     URL,
     Date,
     Event: TestEvent,
+    setTimeout,
     document,
     location,
     chrome: {
@@ -114,6 +116,12 @@ function harness({
       const handled = listener(message, {}, (value) => { response = value; });
       assert.equal(handled, false);
       return response;
+    },
+    sendAsync(message) {
+      return new Promise((resolve) => {
+        const handled = listener(message, {}, resolve);
+        assert.equal(handled, true);
+      });
     },
   };
 }
@@ -223,6 +231,52 @@ test("Page Assist fill is bounded and invalidates the generation", () => {
   });
   assert.equal(replay.ok, false);
   assert.equal(replay.error, "stale_generation");
+});
+
+test("user verifies a generic page postcondition | Given an observed same-origin page | When a bounded expect runs | Then document, URL, and text conditions settle without a mutation", async () => {
+  const h = harness({
+    url: "https://app.test/orders",
+    bodyText: "Orders ready",
+  });
+  const observed = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+    maxChars: 64,
+  });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.url, "https://app.test/orders");
+
+  const ready = await h.sendAsync({
+    type: "h2w_page_assist",
+    action: "expect",
+    expectedOrigin: "https://app.test",
+    condition: "document_ready",
+    timeoutMs: 100,
+  });
+  assert.equal(ready.ok, true);
+  assert.equal(ready.condition, "document_ready");
+
+  const text = await h.sendAsync({
+    type: "h2w_page_assist",
+    action: "expect",
+    expectedOrigin: "https://app.test",
+    condition: "text_present",
+    value: "Orders ready",
+    timeoutMs: 100,
+  });
+  assert.equal(text.ok, true);
+
+  const missing = await h.sendAsync({
+    type: "h2w_page_assist",
+    action: "expect",
+    expectedOrigin: "https://app.test",
+    condition: "text_present",
+    value: "never here",
+    timeoutMs: 0,
+  });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.error, "expect_timeout");
 });
 
 test("Page Assist fails closed inside a cross-origin iframe", () => {

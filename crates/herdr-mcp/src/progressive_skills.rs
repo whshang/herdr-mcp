@@ -64,6 +64,7 @@ pub const BROWSER_DISPATCH_SUBMIT_METHOD: &str = "herdr_mcp.browser_dispatch.sub
 pub const BROWSER_DISPATCH_STATUS_METHOD: &str = "herdr_mcp.browser_dispatch.status";
 pub const BROWSER_DISPATCH_STOP_METHOD: &str = "herdr_mcp.browser_dispatch.stop";
 pub const BROWSER_PAGE_LIFECYCLE_METHOD: &str = "herdr_mcp.browser_page.lifecycle";
+pub const BROWSER_PAGE_ACTION_METHOD: &str = "herdr_mcp.browser_page.action";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
@@ -788,6 +789,45 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     {
                         "properties": {"action": {"enum": ["release", "finalize"]}},
                         "required": ["page_ref"],
+                    },
+                ],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_PAGE_ACTION_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "page_ref": {"type": "string", "maxLength": 67},
+                    "action": {"type": "string", "enum": ["observe", "click", "fill", "expect"]},
+                    "max_chars": {"type": ["integer", "null"], "minimum": 1, "maximum": 100000},
+                    "generation": {"type": ["string", "null"], "maxLength": 256},
+                    "ref": {"type": ["string", "null"], "maxLength": 256},
+                    "value": {"type": ["string", "null"], "maxLength": 10000},
+                    "condition": {"type": ["string", "null"], "enum": ["document_ready", "url_equals", "text_present", "text_absent", null]},
+                    "timeout_ms": {"type": ["integer", "null"], "minimum": 0, "maximum": 5000},
+                    "idempotency_key": {"type": ["string", "null"], "maxLength": 256},
+                },
+                "required": ["endpoint_ref", "page_ref", "action"],
+                "oneOf": [
+                    {
+                        "properties": {"action": {"enum": ["observe"]}},
+                    },
+                    {
+                        "properties": {"action": {"enum": ["click"]}},
+                        "required": ["generation", "ref", "idempotency_key"],
+                    },
+                    {
+                        "properties": {"action": {"enum": ["fill"]}},
+                        "required": ["generation", "ref", "value", "idempotency_key"],
+                    },
+                    {
+                        "properties": {"action": {"enum": ["expect"]}},
+                        "required": ["condition"],
                     },
                 ],
                 "empty": false,
@@ -4713,7 +4753,7 @@ mod tests {
         assert_eq!(methods[5]["params"]["oneOf"].as_array().unwrap().len(), 2);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
-        assert_eq!(methods.len(), 21);
+        assert_eq!(methods.len(), 22);
         assert_eq!(methods[0]["method"], BROWSER_ENDPOINT_LIST_METHOD);
         assert_eq!(methods[1]["method"], BROWSER_ENDPOINT_INSPECT_METHOD);
         assert_eq!(methods[2]["method"], BROWSER_RESOURCE_LIST_METHOD);
@@ -4784,10 +4824,21 @@ mod tests {
             json!(["open", "claim", "release", "finalize"])
         );
         assert_eq!(methods[19]["params"]["oneOf"].as_array().unwrap().len(), 2);
-        assert_eq!(methods[20]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
-        assert_eq!(methods[20]["access"], "read_only");
+        assert_eq!(methods[20]["method"], BROWSER_PAGE_ACTION_METHOD);
+        assert_eq!(methods[20]["access"], "mutation");
         assert_eq!(
             methods[20]["params"]["required"],
+            json!(["endpoint_ref", "page_ref", "action"])
+        );
+        assert_eq!(
+            methods[20]["params"]["properties"]["action"]["enum"],
+            json!(["observe", "click", "fill", "expect"])
+        );
+        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 4);
+        assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
+        assert_eq!(methods[21]["access"], "read_only");
+        assert_eq!(
+            methods[21]["params"]["required"],
             json!(["continuity_id", "source_url"])
         );
         assert_eq!(

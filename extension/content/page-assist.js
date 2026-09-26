@@ -12,6 +12,12 @@
     const result = kernel?.handleAction
       ? kernel.handleAction(msg)
       : { ok: false, error: "browser_page_kernel_unavailable" };
+    if (result && typeof result.then === "function") {
+      result
+        .then((value) => sendResponse(value))
+        .catch(() => sendResponse({ ok: false, error: "browser_page_kernel_failed" }));
+      return true;
+    }
     sendResponse(result);
     return false;
   });
