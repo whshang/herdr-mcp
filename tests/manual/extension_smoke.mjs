@@ -87,6 +87,7 @@ const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), 
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
+const browserPageKernelSource = readFileSync(path.join(EXT, "content", "browser-page-kernel.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
 const hudStateViewSource = readFileSync(path.join(EXT, "content", "hud", "state-view.js"), "utf8");
 const hudRendererSource = readFileSync(path.join(EXT, "content", "hud", "renderer.js"), "utf8");
@@ -172,7 +173,8 @@ ok(!manifest.host_permissions?.includes("<all_urls>")
     && manifest.optional_host_permissions?.includes("https://*/*")
     && manifest.optional_host_permissions?.includes("http://*/*"),
   "broad network access is optional while supported WebChat origins are explicit required permissions");
-ok(!manifest.content_scripts.some((entry) => (entry.js || []).includes("content/page-assist.js"))
+ok(!manifest.content_scripts.some((entry) => (entry.js || []).some((script) =>
+      script === "content/page-assist.js" || script === "content/browser-page-kernel.js"))
     && backgroundSource.includes("pageAssistOrigins: []")
     && !optionsHtml.includes('id="pageAssistOrigins"')
     && !optionsSource.includes("pageAssistOrigins"),
@@ -181,16 +183,18 @@ const pageAssistDispatchSource = backgroundSource.match(
   /async function performPageAssistRequest\(msg\) \{[\s\S]*?\n}\n/,
 )?.[0] || "";
 ok(pageAssistDispatchSource.includes('validation.action !== "inspect"')
-    && pageAssistDispatchSource.includes('files: ["content/page-assist.js"]')
+    && pageAssistDispatchSource.includes('files: ["content/browser-page-kernel.js", "content/page-assist.js"]')
     && pageAssistDispatchSource.indexOf('validation.action !== "inspect"') < pageAssistDispatchSource.indexOf("chrome.scripting.executeScript")
     && pageAssistDispatchSource.includes("tabOrigin !== validation.targetOrigin"),
-  "Page Assist may inject only for inspect recovery; click/fill fail closed and the live tab origin is rechecked");
-ok(!/\beval\s*\(/.test(pageAssistSource)
-    && !/new\s+Function\b/.test(pageAssistSource)
-    && !/document\.cookie/.test(pageAssistSource)
-    && !/localStorage|sessionStorage/.test(pageAssistSource)
-    && !/XPath|evaluate\s*\(/.test(pageAssistSource),
-  "Page Assist content code does not expose script evaluation, cookies/storage, or XPath control");
+  "Page Assist compatibility injects the shared Browser Page Kernel only for inspect recovery; click/fill fail closed and the live tab origin is rechecked");
+ok(pageAssistSource.includes("H2W_BROWSER_PAGE_KERNEL")
+    && pageAssistSource.includes("kernel.handleAction(msg)")
+    && !/\beval\s*\(/.test(browserPageKernelSource)
+    && !/new\s+Function\b/.test(browserPageKernelSource)
+    && !/document\.cookie/.test(browserPageKernelSource)
+    && !/localStorage|sessionStorage/.test(browserPageKernelSource)
+    && !/XPath|evaluate\s*\(/.test(browserPageKernelSource),
+  "Browser Page Kernel owns Page Assist execution without exposing script evaluation, cookies/storage, or XPath control");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
@@ -1252,7 +1256,8 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
 // ---- 2. JavaScript syntax for the fixed file list ----
 const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/gemini.js", "content/injector/claude.js",
-  "content/injector/grok.js", "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
+  "content/injector/grok.js", "content/injector/chatgpt.js", "content/browser-page-kernel.js", "content/page-assist.js",
+  "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {
   const p = path.join(EXT, f);
   const r = spawnSync(process.execPath, ["--check", p], { encoding: "utf8" });

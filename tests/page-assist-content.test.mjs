@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
-const source = readFileSync(new URL("../extension/content/page-assist.js", import.meta.url), "utf8");
+const kernelSource = readFileSync(new URL("../extension/content/browser-page-kernel.js", import.meta.url), "utf8");
+const compatibilitySource = readFileSync(new URL("../extension/content/page-assist.js", import.meta.url), "utf8");
 
 class TestEvent {
   constructor(type, options = {}) {
@@ -102,7 +103,9 @@ function harness({
   context.top = topOrigin
     ? { location: { origin: topOrigin } }
     : context;
-  vm.runInContext(source, context, { filename: "page-assist.js" });
+  vm.runInContext(kernelSource, context, { filename: "browser-page-kernel.js" });
+  assert.equal(typeof context.H2W_BROWSER_PAGE_KERNEL?.handleAction, "function");
+  vm.runInContext(compatibilitySource, context, { filename: "page-assist.js" });
   assert.equal(typeof listener, "function");
 
   return {

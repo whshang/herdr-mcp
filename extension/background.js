@@ -7552,7 +7552,7 @@ async function performPageAssistRequest(msg) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content/page-assist.js"],
+      files: ["content/browser-page-kernel.js", "content/page-assist.js"],
       world: "ISOLATED",
     });
   } catch (error) {
