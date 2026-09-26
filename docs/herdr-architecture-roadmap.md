@@ -74,10 +74,11 @@ Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint
 
 ## 1.1 核心：Browser Adapter Platform
 
-1.1 的主轴是把 1.0 已验证的 WebChat Browser Registry、generation fencing、idempotency、delivery evidence、Page Assist 与 Extension/Native Messaging 链路推广成一个**有界、可扩展、可自开发 Adapter 的浏览器执行平台**。详细设计见 [`docs/_wip/v1.1-browser-adapter-platform.md`](./_wip/v1.1-browser-adapter-platform.md)。
+1.1 的主轴是把 1.0 已验证的 WebChat Browser Registry、generation fencing、idempotency、delivery evidence、Page Assist 与 Extension/Native Messaging 链路推广成一个**有界、可扩展、可自开发 Adapter 的浏览器执行平台**。OpenCLI / opencli-mcp 作为场景和能力模型参考，目标覆盖 Generic Browser Use、登录态内容提取、社交搜索/读取、AI 网页生成、下载/artifact、站点 Adapter 与 Adapter author/repair 这类能力范式，不要求首版复制其全部站点命令。详细设计见 [`docs/_wip/v1.1-browser-adapter-platform.md`](./_wip/v1.1-browser-adapter-platform.md)。
 
 产品目标：
 
+- **Browser Extension 是 1.1 唯一 Web/browser 执行面**；2026-09-26 起停止 ChatGPT Desktop tweak 路线，不把 Electron preload/renderer 注入、桌面客户端 patch/install/update/restore 纳入 1.1；桌面应用仍可作为 MCP/CLI client 使用 Herdr，但网页控制统一经过 Herdr Extension；
 - ChatGPT / Grok / Claude 继续保留冻结的 provider/session/result/Continuity 语义，只下沉共享 tab/page lifecycle、observe/act/verify/finalize 基础，不改走 generic Adapter catalog；
 - Alpha 8 Page Assist 吸收到同一 Generic Web kernel；未知用户授权网站先拥有 open/claim/observe/click/fill/expect/screenshot/finalize 最小纵向，额外 typed primitive 由真实 reference Adapter 证明后再加；
 - `BrowserPage` 只是短生命周期、generation-fenced view handle；Browser Registry 继续独占 WebChat durable identity，不新增第二套持久 page catalog；
@@ -378,6 +379,7 @@ Continuity 2.0 是 `v0.4.2` 之后的正式未来版本目标之一，但**当�
 - 第二套 Web Agent 编排系统；
 - 为所有操作强制引入 Task/Project/Workflow 对象；
 - 浏览器之外的通用桌面 GUI/RPA 平台；
+- ChatGPT Desktop preload/renderer tweak、Electron 客户端 patch/install/update/restore 路线；该 2026-09-21 spike 已于 2026-09-26 决定退役，1.1 网页执行统一走 Herdr Browser Extension；
 - 把任意 JavaScript/CDP/cookie/storage 权限作为 1.1 普通 Store 用户的默认浏览器能力。
 
 浏览器 Adapter Platform 已进入 1.1 主线；其它跨桌面/跨应用自动化只有在真实使用数据证明现有 Herdr + fs/Git/exec + Browser Adapter + 可替换 worker 无法表达需求时，再通过 adapter/plugin 或新的 contract epoch 评估。
