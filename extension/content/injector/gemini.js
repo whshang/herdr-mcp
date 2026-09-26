@@ -6,10 +6,17 @@ const GEMINI_ADAPTER_CAPABILITIES = Object.freeze({
   browserActuation: true,
   stopGeneration: true,
 });
+const GEMINI_ADAPTER_POLICY = Object.freeze({
+  experimentalStorageFlag: "experimentalGeminiEnabled",
+  operationalHud: false,
+  submitAckTimeoutMs: 4000,
+  jsonBridge: false,
+});
 
 class GeminiAdapter extends BaseAdapter {
   get name() { return "gemini"; }
   get capabilities() { return GEMINI_ADAPTER_CAPABILITIES; }
+  get policy() { return GEMINI_ADAPTER_POLICY; }
   get needsMainWorldInsert() { return true; }
 
   getConversationKey() {
@@ -184,4 +191,4 @@ class GeminiAdapter extends BaseAdapter {
   }
 }
 
-window.__H2W_ADAPTER__ = new GeminiAdapter();
+registerH2WAdapter(new GeminiAdapter());

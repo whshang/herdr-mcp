@@ -30,8 +30,13 @@ function harness(url = "https://gemini.google.com/app/abc123") {
   class BaseAdapter {
     elementVisible(candidate) { return Boolean(candidate?.visible); }
   }
+  const registerH2WAdapter = (adapter) => {
+    window.__H2W_ADAPTER__ = adapter;
+    return adapter;
+  };
   const context = vm.createContext({
     BaseAdapter,
+    registerH2WAdapter,
     URL,
     TextEncoder,
     Uint8Array,

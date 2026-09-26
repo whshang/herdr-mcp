@@ -10,10 +10,17 @@ const CHATGPT_ADAPTER_CAPABILITIES = Object.freeze({
   sessionOpen: true,
   chatModeGuard: true,
 });
+const CHATGPT_ADAPTER_POLICY = Object.freeze({
+  experimentalStorageFlag: null,
+  operationalHud: true,
+  submitAckTimeoutMs: 8000,
+  jsonBridge: false,
+});
 
 class ChatGPTAdapter extends BaseAdapter {
   get name() { return "chatgpt"; }
   get capabilities() { return CHATGPT_ADAPTER_CAPABILITIES; }
+  get policy() { return CHATGPT_ADAPTER_POLICY; }
   get needsMainWorldInsert() { return true; }
 
   getVisibleModeRadio(pattern) {
@@ -271,4 +278,4 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 }
 
-window.__H2W_ADAPTER__ = new ChatGPTAdapter();
+registerH2WAdapter(new ChatGPTAdapter());

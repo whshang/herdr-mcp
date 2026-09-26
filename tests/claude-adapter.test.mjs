@@ -35,8 +35,13 @@ function harness(url = "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174
   class BaseAdapter {
     elementVisible(candidate) { return Boolean(candidate?.visible); }
   }
+  const registerH2WAdapter = (adapter) => {
+    window.__H2W_ADAPTER__ = adapter;
+    return adapter;
+  };
   const context = vm.createContext({
     BaseAdapter,
+    registerH2WAdapter,
     URL,
     TextEncoder,
     Uint8Array,

@@ -306,4 +306,4 @@ class ClaudeAdapter extends BaseAdapter {
   }
 }
 
-window.__H2W_ADAPTER__ = new ClaudeAdapter();
+registerH2WAdapter(new ClaudeAdapter());

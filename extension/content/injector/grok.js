@@ -298,4 +298,4 @@ class GrokAdapter extends BaseAdapter {
   }
 }
 
-window.__H2W_ADAPTER__ = new GrokAdapter();
+registerH2WAdapter(new GrokAdapter());

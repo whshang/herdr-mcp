@@ -58,11 +58,7 @@ function normalizeHerdrMentionAlias(value) {
   const ADAPTER = window.__H2W_ADAPTER__;
   const CORE = window.HerdrChatGptArtifactCore;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
-  const experimentalFlag = ADAPTER.name === "z.ai"
-    ? "experimentalZAiEnabled"
-    : (ADAPTER.name === "deepseek"
-      ? "experimentalDeepSeekEnabled"
-      : (ADAPTER.name === "gemini" ? "experimentalGeminiEnabled" : null));
+  const experimentalFlag = ADAPTER.policy?.experimentalStorageFlag || null;
   if (experimentalFlag) {
     try {
       const cfg = await chrome.storage.local.get([experimentalFlag]);
@@ -127,7 +123,7 @@ function normalizeHerdrMentionAlias(value) {
     try { return !!chrome.runtime?.id; } catch { return false; }
   }
   function usesOperationalHud() {
-    return ["chatgpt", "z.ai", "deepseek"].includes(ADAPTER.name);
+    return ADAPTER.policy?.operationalHud === true;
   }
   function sendBg(msg) {
     return new Promise((resolve) => {
@@ -1017,7 +1013,7 @@ function normalizeHerdrMentionAlias(value) {
     if (isSendButton(btn)) {
       const baseline = captureSubmitAckBaseline(btn);
       btn.click();
-      if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
+      if (await waitForSubmitAck(baseline, ADAPTER.policy?.submitAckTimeoutMs ?? 4000)) return true;
     }
     const enterBaseline = captureSubmitAckBaseline(findSendButton());
     dispatchEnterSubmit(ADAPTER.getInputEl());
@@ -1033,7 +1029,7 @@ function normalizeHerdrMentionAlias(value) {
       if (isSendButton(btn)) {
         const baseline = captureSubmitAckBaseline(btn);
         btn.click();
-        if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
+        if (await waitForSubmitAck(baseline, ADAPTER.policy?.submitAckTimeoutMs ?? 4000)) return true;
       }
       const enterBaseline = captureSubmitAckBaseline(findSendButton());
       dispatchEnterSubmit(ADAPTER.getInputEl());
@@ -4631,7 +4627,7 @@ function normalizeHerdrMentionAlias(value) {
     syncAutomationPermissionWatch();
     // The operational HUD is shared by ChatGPT and the JSON-bridge sites.
     // ChatGPT-only idle/recovery watchers remain scoped to ChatGPT below.
-    if (["chatgpt", "z.ai", "deepseek"].includes(ADAPTER.name)) {
+    if (usesOperationalHud()) {
       startPageHud();
     }
     // Talk-without-tools: watch turn boundaries and ask background to check MCP activity.
