@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +10,175 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
+
+const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
+const browserPageLifecycleEnd = backgroundSource.indexOf("\nfunction withBrowserPageIdentity", browserPageLifecycleStart);
+assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,
+  "BrowserPage lifecycle helpers must remain extractable");
+const browserPageLifecycleSource = backgroundSource.slice(browserPageLifecycleStart, browserPageLifecycleEnd);
+
+function browserPageLifecycleHarness({ sessionStorage = {}, tabs = new Map() } = {}) {
+  let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
+  const storageArea = {
+    async get(key) { return { [key]: structuredClone(sessionStorage[key] || []) }; },
+    async set(value) { Object.assign(sessionStorage, structuredClone(value)); },
+  };
+  const chrome = {
+    storage: { session: storageArea },
+    tabs: {
+      async get(tabId) {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error("tab missing");
+        return { ...tab };
+      },
+      async query() {
+        return [...tabs.values()].map((tab) => ({ ...tab }));
+      },
+      async create(info) {
+        const tab = { id: nextTabId++, url: info.url, active: info.active === true };
+        tabs.set(tab.id, tab);
+        return { ...tab };
+      },
+      async remove(tabId) {
+        if (!tabs.delete(tabId)) throw new Error("tab missing");
+      },
+    },
+  };
+  const code = [
+    "const crypto = ctx.crypto;",
+    "const chrome = ctx.chrome;",
+    "const URL = ctx.URL;",
+    "const Date = ctx.Date;",
+    "const BROWSER_PAGE_SESSION_STORAGE_KEY = 'herdrBrowserPagesV1';",
+    "const BROWSER_PAGE_MAX_RECORDS = 128;",
+    "const browserPagesByRef = new Map();",
+    "let browserPagesLoaded = false;",
+    "let browserPagesLoadPromise = null;",
+    "let browserEndpoint = null;",
+    "const configReady = Promise.resolve();",
+    "const CFG = { pageAssistOrigins: ['https://example.com'] };",
+    "const parseAllowedOrigins = (input) => input;",
+    "const originToMatchPattern = (origin) => origin + '/*';",
+    "const hasHostPermission = async () => true;",
+    "const getBrowserObservationGeneration = async () => 17;",
+    "const registerLocalBrowserEndpoint = async () => ({ endpoint_ref: 'bep_test' });",
+    "const browserEndpointView = (endpoint) => endpoint;",
+    browserPageLifecycleSource,
+    "return { performBrowserPageLifecycleRequest, browserPagesByRef };",
+  ].join("\n");
+  const api = new Function("ctx", code)({ crypto: webcrypto, chrome, URL, Date });
+  return { ...api, sessionStorage, tabs };
+}
+
+test("user finalizes one owned generic page | Given open is retried across a service-worker restart | When the same idempotency key and then page_ref are used | Then one tab is reused and the exact owned tab is closed", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const first = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const opened = await first.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-owned-1",
+  });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.ownership, "owned");
+  assert.equal(opened.reused, false);
+  assert.match(opened.page_ref, /^bp_[0-9a-f]{64}$/);
+  assert.equal(tabs.size, 1);
+  assert.equal([...tabs.values()][0].active, false);
+  assert.equal(sessionStorage.herdrBrowserPagesV1.length, 1);
+
+  const restarted = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const replayed = await restarted.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-owned-1",
+  });
+  assert.equal(replayed.ok, true);
+  assert.equal(replayed.reused, true);
+  assert.equal(replayed.page_ref, opened.page_ref);
+  assert.equal(tabs.size, 1);
+
+  const finalized = await restarted.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+    idempotencyKey: "finalize-owned-1",
+  });
+  assert.equal(finalized.ok, true);
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.tab_closed, true);
+  assert.equal(finalized.tab_cleanup_verified, true);
+  assert.equal(tabs.size, 0);
+  assert.deepEqual(sessionStorage.herdrBrowserPagesV1, []);
+
+  const capacityStorage = {};
+  const capacityTabs = new Map();
+  const capacity = browserPageLifecycleHarness({
+    sessionStorage: capacityStorage,
+    tabs: capacityTabs,
+  });
+  for (let index = 0; index < 128; index += 1) {
+    const result = await capacity.performBrowserPageLifecycleRequest({
+      action: "open",
+      targetOrigin: "https://example.com",
+      url: `https://example.com/page-${index}`,
+      idempotencyKey: `open-capacity-${index}`,
+    });
+    assert.equal(result.ok, true);
+  }
+  const overCapacity = await capacity.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/page-over-capacity",
+    idempotencyKey: "open-capacity-overflow",
+  });
+  assert.equal(overCapacity.ok, false);
+  assert.equal(overCapacity.error, "browser_page_storage_unavailable");
+  assert.equal(overCapacity.tab_cleanup_verified, true);
+  assert.equal(capacityTabs.size, 128);
+  assert.equal(capacityStorage.herdrBrowserPagesV1.length, 128);
+  assert.ok(capacityStorage.herdrBrowserPagesV1.every((record) => record.ownership === "owned"));
+});
+
+test("user releases a claimed generic page | Given one exact user tab and another unrelated tab | When claim and release run | Then the user tab survives and ambiguous duplicate claims fail closed", async () => {
+  const tabs = new Map([
+    [41, { id: 41, url: "https://example.com/app", active: true }],
+    [42, { id: 42, url: "https://example.com/other", active: false }],
+  ]);
+  const h = browserPageLifecycleHarness({ tabs });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "claim-user-1",
+  });
+  assert.equal(claimed.ok, true);
+  assert.equal(claimed.ownership, "claimed");
+  assert.equal(tabs.has(41), true);
+
+  const released = await h.performBrowserPageLifecycleRequest({
+    action: "release",
+    pageRef: claimed.page_ref,
+    idempotencyKey: "release-user-1",
+  });
+  assert.equal(released.ok, true);
+  assert.equal(released.released, true);
+  assert.equal(released.tab_closed, false);
+  assert.equal(tabs.has(41), true);
+
+  tabs.set(43, { id: 43, url: "https://example.com/app", active: false });
+  const ambiguous = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "claim-user-2",
+  });
+  assert.equal(ambiguous.ok, false);
+  assert.equal(ambiguous.error, "target_tab_ambiguous");
+  assert.equal(tabs.has(41), true);
+  assert.equal(tabs.has(43), true);
+});
 
 const projectPageInfoStart = backgroundSource.indexOf("function browserProjectPageInfoFromSupportedUrl(");
 const projectPageInfoEnd = backgroundSource.indexOf("\nfunction browserPageContextInfoFromSupportedUrl", projectPageInfoStart);

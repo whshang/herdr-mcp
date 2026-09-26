@@ -63,6 +63,7 @@ pub const BROWSER_COMPOSER_SET_APPS_METHOD: &str = "herdr_mcp.browser_composer.s
 pub const BROWSER_DISPATCH_SUBMIT_METHOD: &str = "herdr_mcp.browser_dispatch.submit";
 pub const BROWSER_DISPATCH_STATUS_METHOD: &str = "herdr_mcp.browser_dispatch.status";
 pub const BROWSER_DISPATCH_STOP_METHOD: &str = "herdr_mcp.browser_dispatch.stop";
+pub const BROWSER_PAGE_LIFECYCLE_METHOD: &str = "herdr_mcp.browser_page.lifecycle";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
@@ -761,6 +762,34 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "idempotency_key": {"type": "string", "maxLength": 256},
                 },
                 "required": ["dispatch_id", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_PAGE_LIFECYCLE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "action": {"type": "string", "enum": ["open", "claim", "release", "finalize"]},
+                    "target_origin": {"type": ["string", "null"], "maxLength": 4096},
+                    "url": {"type": ["string", "null"], "maxLength": 4096},
+                    "page_ref": {"type": ["string", "null"], "maxLength": 67},
+                    "idempotency_key": {"type": ["string", "null"], "maxLength": 256},
+                },
+                "required": ["endpoint_ref", "action"],
+                "oneOf": [
+                    {
+                        "properties": {"action": {"enum": ["open", "claim"]}},
+                        "required": ["target_origin", "url", "idempotency_key"],
+                    },
+                    {
+                        "properties": {"action": {"enum": ["release", "finalize"]}},
+                        "required": ["page_ref"],
+                    },
+                ],
                 "empty": false,
             },
         }),
@@ -4684,7 +4713,7 @@ mod tests {
         assert_eq!(methods[5]["params"]["oneOf"].as_array().unwrap().len(), 2);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
-        assert_eq!(methods.len(), 20);
+        assert_eq!(methods.len(), 21);
         assert_eq!(methods[0]["method"], BROWSER_ENDPOINT_LIST_METHOD);
         assert_eq!(methods[1]["method"], BROWSER_ENDPOINT_INSPECT_METHOD);
         assert_eq!(methods[2]["method"], BROWSER_RESOURCE_LIST_METHOD);
@@ -4744,10 +4773,21 @@ mod tests {
         assert_eq!(methods[16]["method"], BROWSER_DISPATCH_SUBMIT_METHOD);
         assert_eq!(methods[17]["method"], BROWSER_DISPATCH_STATUS_METHOD);
         assert_eq!(methods[18]["method"], BROWSER_DISPATCH_STOP_METHOD);
-        assert_eq!(methods[19]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
-        assert_eq!(methods[19]["access"], "read_only");
+        assert_eq!(methods[19]["method"], BROWSER_PAGE_LIFECYCLE_METHOD);
+        assert_eq!(methods[19]["access"], "mutation");
         assert_eq!(
             methods[19]["params"]["required"],
+            json!(["endpoint_ref", "action"])
+        );
+        assert_eq!(
+            methods[19]["params"]["properties"]["action"]["enum"],
+            json!(["open", "claim", "release", "finalize"])
+        );
+        assert_eq!(methods[19]["params"]["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(methods[20]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
+        assert_eq!(methods[20]["access"], "read_only");
+        assert_eq!(
+            methods[20]["params"]["required"],
             json!(["continuity_id", "source_url"])
         );
         assert_eq!(

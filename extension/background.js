@@ -3583,6 +3583,30 @@ async function handleBrowserActuation(command) {
     }).catch(() => {});
     return;
   }
+  if (operation === "herdr_mcp.browser_page.lifecycle") {
+    let result;
+    try {
+      result = await performBrowserPageLifecycleRequest({
+        action: params.action,
+        targetOrigin: params.target_origin,
+        url: params.url,
+        pageRef: params.page_ref,
+        idempotencyKey: params.idempotency_key,
+      });
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = { ok: false, error: "browser_page_invalid_result" };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "browser_page_unavailable"),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
+    return;
+  }
   if (operation === "herdr_mcp.page_assist") {
     let result;
     try {
@@ -7562,7 +7586,7 @@ function normalizeBrowserPageRecord(raw) {
     return null;
   }
   const createdByOperation = typeof raw.created_by_operation === "string"
-    && raw.created_by_operation.length <= 128
+    && raw.created_by_operation.length <= 256
     ? raw.created_by_operation
     : null;
   return {
@@ -7609,17 +7633,30 @@ async function loadBrowserPages() {
 async function persistBrowserPages() {
   const storageArea = chrome.storage?.session;
   if (!storageArea?.set) return false;
-  const records = [...browserPagesByRef.values()]
-    .sort((left, right) => left.last_seen_at - right.last_seen_at)
-    .slice(-BROWSER_PAGE_MAX_RECORDS);
-  browserPagesByRef.clear();
-  for (const record of records) browserPagesByRef.set(record.page_ref, record);
+  const allRecords = [...browserPagesByRef.values()];
+  const owned = allRecords.filter((record) => record.ownership === "owned");
+  if (owned.length > BROWSER_PAGE_MAX_RECORDS) return false;
+  const claimedSlots = BROWSER_PAGE_MAX_RECORDS - owned.length;
+  const claimed = claimedSlots > 0
+    ? allRecords
+      .filter((record) => record.ownership === "claimed")
+      .sort((left, right) => left.last_seen_at - right.last_seen_at)
+      .slice(-claimedSlots)
+    : [];
+  const records = [...owned, ...claimed]
+    .sort((left, right) => left.last_seen_at - right.last_seen_at);
   try {
     await storageArea.set({ [BROWSER_PAGE_SESSION_STORAGE_KEY]: records });
-    return true;
   } catch (_) {
     return false;
   }
+  const retained = new Set(records.map((record) => record.page_ref));
+  for (const record of allRecords) {
+    if (record.ownership === "claimed" && !retained.has(record.page_ref)) {
+      browserPagesByRef.delete(record.page_ref);
+    }
+  }
+  return true;
 }
 
 function browserPageOrigin(rawUrl) {
@@ -7631,24 +7668,61 @@ function browserPageOrigin(rawUrl) {
   }
 }
 
-async function claimBrowserPage(endpointRef, tab, targetOrigin, createdByOperation = null) {
-  if (!endpointRef || !tab?.id || !tab?.url) return null;
+function browserPageCanonicalUrl(rawUrl, targetOrigin = null) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    const origin = parsed.origin.toLowerCase();
+    if (targetOrigin && origin !== targetOrigin) return null;
+    return parsed.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserPageView(page, extra = {}) {
+  if (!page) return null;
+  return {
+    ok: true,
+    page_ref: page.page_ref,
+    origin: page.origin,
+    canonical_url: page.canonical_url,
+    ownership: page.ownership,
+    page_generation: page.page_generation,
+    ...extra,
+  };
+}
+
+async function rememberBrowserPage(
+  endpointRef,
+  tab,
+  targetOrigin,
+  ownership = "claimed",
+  createdByOperation = null,
+) {
+  if (!endpointRef || !tab?.id || !tab?.url || !["claimed", "owned"].includes(ownership)) return null;
   const origin = browserPageOrigin(tab.url);
-  if (!origin || origin !== targetOrigin) return null;
+  const canonicalUrl = browserPageCanonicalUrl(tab.url, targetOrigin);
+  if (!origin || origin !== targetOrigin || !canonicalUrl) return null;
   await loadBrowserPages();
   const observationGeneration = await getBrowserObservationGeneration();
-  const canonicalUrl = String(tab.url);
   const existing = [...browserPagesByRef.values()].find((record) =>
     record.endpoint_ref === endpointRef
       && record.tab_id === tab.id
       && record.origin === origin
       && record.canonical_url === canonicalUrl
-      && record.ownership === "claimed");
+      && record.ownership === ownership
+      && (ownership === "claimed"
+        || createdByOperation == null
+        || record.created_by_operation === createdByOperation));
   const now = Date.now();
   if (existing) {
     existing.last_seen_at = now;
     existing.observation_generation = observationGeneration;
-    await persistBrowserPages();
+    if (ownership === "claimed" && !existing.created_by_operation && createdByOperation) {
+      existing.created_by_operation = createdByOperation;
+    }
+    if (!await persistBrowserPages()) return null;
     return existing;
   }
   const record = {
@@ -7657,15 +7731,22 @@ async function claimBrowserPage(endpointRef, tab, targetOrigin, createdByOperati
     tab_id: tab.id,
     origin,
     canonical_url: canonicalUrl,
-    ownership: "claimed",
+    ownership,
     observation_generation: observationGeneration,
     page_generation: 1,
     created_by_operation: createdByOperation,
     last_seen_at: now,
   };
   browserPagesByRef.set(record.page_ref, record);
-  await persistBrowserPages();
+  if (!await persistBrowserPages()) {
+    browserPagesByRef.delete(record.page_ref);
+    return null;
+  }
   return record;
+}
+
+async function claimBrowserPage(endpointRef, tab, targetOrigin, createdByOperation = null) {
+  return rememberBrowserPage(endpointRef, tab, targetOrigin, "claimed", createdByOperation);
 }
 
 async function resolveBrowserPage(pageRef, endpointRef, targetOrigin) {
@@ -7710,6 +7791,212 @@ async function resolveBrowserPage(pageRef, endpointRef, targetOrigin) {
   record.last_seen_at = Date.now();
   await persistBrowserPages();
   return { ok: true, page: record, tab };
+}
+
+async function browserPageByOperation(endpointRef, idempotencyKey, ownership = null) {
+  await loadBrowserPages();
+  return [...browserPagesByRef.values()].find((record) =>
+    record.endpoint_ref === endpointRef
+      && record.created_by_operation === idempotencyKey
+      && (ownership == null || record.ownership === ownership)) || null;
+}
+
+async function removeBrowserPageRecord(pageRef) {
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) return true;
+  browserPagesByRef.delete(pageRef);
+  if (await persistBrowserPages()) return true;
+  browserPagesByRef.set(pageRef, record);
+  return false;
+}
+
+async function performBrowserPageLifecycleRequest(msg) {
+  await configReady;
+  const action = String(msg?.action || "");
+  const idempotencyKey = String(msg?.idempotencyKey || "");
+  if (!["open", "claim", "release", "finalize"].includes(action)
+      || idempotencyKey.length > 256
+      || (["open", "claim"].includes(action) && !idempotencyKey)) {
+    return { ok: false, error: "browser_page_params_invalid" };
+  }
+
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+  if (!endpointRef) return { ok: false, error: "browser_page_endpoint_unavailable" };
+
+  if (action === "open" || action === "claim") {
+    const targetOrigin = String(msg?.targetOrigin || "").toLowerCase();
+    const canonicalUrl = browserPageCanonicalUrl(msg?.url, targetOrigin);
+    if (!targetOrigin || !canonicalUrl || browserPageOrigin(targetOrigin) !== targetOrigin) {
+      return { ok: false, error: "browser_page_url_invalid" };
+    }
+    const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
+    if (!allowed.includes(targetOrigin)) {
+      return { ok: false, error: "origin_not_permitted" };
+    }
+    const pattern = originToMatchPattern(targetOrigin);
+    if (!pattern || !await hasHostPermission(pattern)) {
+      return { ok: false, error: "origin_permission_missing" };
+    }
+
+    const prior = await browserPageByOperation(endpointRef, idempotencyKey, action === "open" ? "owned" : "claimed");
+    if (prior) {
+      let priorTab = null;
+      try { priorTab = await chrome.tabs.get(prior.tab_id); } catch (_) {}
+      if (!priorTab?.url) {
+        await removeBrowserPageRecord(prior.page_ref);
+      } else {
+        const liveUrl = browserPageCanonicalUrl(priorTab.url, targetOrigin);
+        if (liveUrl === canonicalUrl && prior.canonical_url === canonicalUrl) {
+          prior.last_seen_at = Date.now();
+          if (!await persistBrowserPages()) {
+            return { ok: false, error: "browser_page_storage_unavailable" };
+          }
+          return browserPageView(prior, { reused: true });
+        }
+        return {
+          ok: false,
+          error: "browser_page_operation_stale",
+          page_ref: prior.page_ref,
+          ownership: prior.ownership,
+        };
+      }
+    }
+
+    if (action === "claim") {
+      let tabs = [];
+      try { tabs = await chrome.tabs.query({ url: pattern }); } catch (_) {}
+      const matches = tabs.filter((tab) =>
+        tab?.id && browserPageCanonicalUrl(tab.url, targetOrigin) === canonicalUrl);
+      if (matches.length === 0) return { ok: false, error: "target_tab_not_found" };
+      if (matches.length !== 1) return { ok: false, error: "target_tab_ambiguous" };
+      const page = await rememberBrowserPage(
+        endpointRef,
+        matches[0],
+        targetOrigin,
+        "claimed",
+        idempotencyKey,
+      );
+      return page
+        ? browserPageView(page, { reused: false })
+        : { ok: false, error: "browser_page_storage_unavailable" };
+    }
+
+    let createdTab = null;
+    try {
+      createdTab = await chrome.tabs.create({ url: canonicalUrl, active: false });
+    } catch (_) {}
+    if (!createdTab?.id) return { ok: false, error: "browser_page_open_failed" };
+    const page = await rememberBrowserPage(
+      endpointRef,
+      createdTab,
+      targetOrigin,
+      "owned",
+      idempotencyKey,
+    );
+    if (page) return browserPageView(page, { reused: false });
+
+    let tabClosed = false;
+    let tabCleanupVerified = false;
+    try {
+      await chrome.tabs.remove(createdTab.id);
+      tabClosed = true;
+    } catch (_) {}
+    try {
+      await chrome.tabs.get(createdTab.id);
+    } catch (_) {
+      tabCleanupVerified = true;
+    }
+    return {
+      ok: false,
+      error: "browser_page_storage_unavailable",
+      tab_opened: true,
+      tab_closed: tabClosed,
+      tab_cleanup_verified: tabCleanupVerified,
+    };
+  }
+
+  const pageRef = String(msg?.pageRef || "");
+  if (!validBrowserPageRef(pageRef)) return { ok: false, error: "browser_page_ref_invalid" };
+  await loadBrowserPages();
+  const page = browserPagesByRef.get(pageRef);
+  if (!page) return { ok: false, error: "browser_page_not_found" };
+  if (page.endpoint_ref !== endpointRef) {
+    return { ok: false, error: "browser_page_endpoint_mismatch" };
+  }
+
+  if (action === "release") {
+    if (page.ownership !== "claimed") {
+      return { ok: false, error: "browser_page_owned_requires_finalize" };
+    }
+    if (!await removeBrowserPageRecord(pageRef)) {
+      return { ok: false, error: "browser_page_storage_unavailable" };
+    }
+    return browserPageView(page, {
+      released: true,
+      tab_closed: false,
+      tab_cleanup_verified: true,
+    });
+  }
+
+  if (page.ownership === "claimed") {
+    if (!await removeBrowserPageRecord(pageRef)) {
+      return { ok: false, error: "browser_page_storage_unavailable" };
+    }
+    return browserPageView(page, {
+      finalized: true,
+      tab_closed: false,
+      tab_cleanup_verified: true,
+    });
+  }
+
+  let liveTab = null;
+  try { liveTab = await chrome.tabs.get(page.tab_id); } catch (_) {}
+  if (!liveTab) {
+    if (!await removeBrowserPageRecord(pageRef)) {
+      return { ok: false, error: "browser_page_storage_unavailable" };
+    }
+    return browserPageView(page, {
+      finalized: true,
+      tab_closed: true,
+      tab_cleanup_verified: true,
+      already_closed: true,
+    });
+  }
+
+  let tabClosed = false;
+  try {
+    await chrome.tabs.remove(page.tab_id);
+    tabClosed = true;
+  } catch (_) {}
+  let tabCleanupVerified = false;
+  try {
+    await chrome.tabs.get(page.tab_id);
+  } catch (_) {
+    tabCleanupVerified = true;
+  }
+  if (!tabCleanupVerified) {
+    return browserPageView(page, {
+      ok: false,
+      error: "browser_page_close_failed",
+      tab_closed: tabClosed,
+      tab_cleanup_verified: false,
+    });
+  }
+  if (!await removeBrowserPageRecord(pageRef)) {
+    return browserPageView(page, {
+      ok: false,
+      error: "browser_page_storage_unavailable",
+      tab_closed: true,
+      tab_cleanup_verified: true,
+    });
+  }
+  return browserPageView(page, {
+    finalized: true,
+    tab_closed: true,
+    tab_cleanup_verified: true,
+  });
 }
 
 function withBrowserPageIdentity(result, page) {

@@ -12,8 +12,8 @@ use crate::progressive_skills::{
     BROWSER_COMPOSER_SET_APPS_METHOD, BROWSER_COMPOSER_SET_REASONING_METHOD,
     BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_STOP_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD,
     BROWSER_ENDPOINT_INSPECT_METHOD, BROWSER_ENDPOINT_LIST_METHOD, BROWSER_HANDOFF_PREPARE_METHOD,
-    BROWSER_MESSAGE_APPEND_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
-    BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD,
+    BROWSER_MESSAGE_APPEND_METHOD, BROWSER_PAGE_LIFECYCLE_METHOD, BROWSER_RESOURCE_INSPECT_METHOD,
+    BROWSER_RESOURCE_LIST_METHOD, BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD,
     BROWSER_SESSION_ARCHIVE_STATUS_METHOD, BROWSER_SESSION_CREATE_METHOD,
     BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
     BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD,
@@ -353,6 +353,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
                 browser_handoff_prepare(context.state_store, &params)
+            } else if method == BROWSER_PAGE_LIFECYCLE_METHOD {
+                browser_page_lifecycle_call(
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
             } else if method == "herdr_mcp.page_assist" {
                 page_assist_call(
                     &params,
@@ -6590,6 +6596,248 @@ fn continuity_search_string<'a>(
             "code": "continuity_search_params_invalid",
             "message": format!("{key} must be a string when provided"),
         })),
+    }
+}
+
+fn browser_page_lifecycle_call(
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "browser page lifecycle params must be an object"});
+    };
+    const ALLOWED_KEYS: &[&str] = &[
+        "endpoint_ref",
+        "action",
+        "target_origin",
+        "url",
+        "page_ref",
+        "idempotency_key",
+    ];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": format!("unknown browser page lifecycle parameter '{key}'"),
+        });
+    }
+
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+
+    let action = match object.get("action").and_then(Value::as_str) {
+        Some(value @ ("open" | "claim" | "release" | "finalize")) => value,
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "action must be open, claim, release, or finalize",
+            });
+        }
+    };
+    let idempotency_key = match object.get("idempotency_key") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if !value.trim().is_empty()
+                && value.len() <= 256
+                && !value.chars().any(char::is_control) =>
+        {
+            Some(value.trim())
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "idempotency_key is invalid",
+            });
+        }
+    };
+
+    let mut bridge_params = json!({
+        "action": action,
+    });
+
+    if matches!(action, "open" | "claim") {
+        let Some(idempotency_key) = idempotency_key else {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "idempotency_key is required for open or claim",
+            });
+        };
+        bridge_params["idempotency_key"] = json!(idempotency_key);
+        if object.contains_key("page_ref") {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "page_ref is not accepted for open or claim",
+            });
+        }
+        let target_origin_raw = match object
+            .get("target_origin")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
+            Some(value) if !value.is_empty() && value.len() <= 4096 => value,
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "target_origin is required for open or claim",
+                });
+            }
+        };
+        let target_origin_url = match url::Url::parse(target_origin_raw) {
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.host_str().is_some() =>
+            {
+                url
+            }
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "target_origin must be a valid http or https origin",
+                });
+            }
+        };
+        let target_origin = target_origin_url.origin().ascii_serialization();
+        let raw_url = match object.get("url").and_then(Value::as_str).map(str::trim) {
+            Some(value) if !value.is_empty() && value.len() <= 4096 => value,
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "url is required for open or claim",
+                });
+            }
+        };
+        let target_url = match url::Url::parse(raw_url) {
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.host_str().is_some()
+                    && url.origin().ascii_serialization() == target_origin =>
+            {
+                url
+            }
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "url must be a valid http or https URL on target_origin",
+                });
+            }
+        };
+        bridge_params["target_origin"] = json!(target_origin);
+        bridge_params["url"] = json!(target_url.to_string());
+    } else {
+        if object.contains_key("target_origin") || object.contains_key("url") {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "target_origin and url are not accepted for release or finalize",
+            });
+        }
+        let page_ref = match object
+            .get("page_ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
+            Some(value)
+                if value.strip_prefix("bp_").is_some_and(|suffix| {
+                    suffix.len() == 64
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) =>
+            {
+                value
+            }
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "page_ref must be an opaque bp_ reference",
+                });
+            }
+        };
+        bridge_params["page_ref"] = json!(page_ref);
+    }
+
+    let Some(actuator) = browser_actuator else {
+        return json!({
+            "ok": false,
+            "code": "browser_page_unavailable",
+            "retryable": true,
+            "delivery_state": "not_delivered",
+        });
+    };
+
+    match actuator.actuate_for_endpoint(
+        BROWSER_PAGE_LIFECYCLE_METHOD,
+        &bridge_params,
+        1,
+        Some(endpoint_ref),
+        None,
+    ) {
+        Ok(evidence) => {
+            if let Some(result) = evidence.result {
+                return result;
+            }
+            if !evidence.browser_online || !evidence.command_accepted {
+                return json!({
+                    "ok": false,
+                    "code": "browser_page_unavailable",
+                    "retryable": true,
+                    "delivery_state": "not_delivered",
+                });
+            }
+            json!({
+                "ok": false,
+                "code": "browser_page_delivery_unknown",
+                "retryable": false,
+                "delivery_state": "delivery_unknown",
+            })
+        }
+        Err(error) => json!({
+            "ok": false,
+            "code": "browser_page_unavailable",
+            "message": error,
+            "retryable": true,
+            "delivery_state": "not_delivered",
+        }),
     }
 }
 
@@ -13309,6 +13557,139 @@ mod tests {
 
         std::fs::remove_dir_all(&config_dir).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn browser_page_lifecycle_reuses_page_assist_grant_and_routes_exact_endpoint() {
+        struct PanicActuator;
+        impl BrowserActuator for PanicActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("caller grant rejection must happen before browser actuation")
+            }
+        }
+
+        let open = json!({
+            "endpoint_ref": "bep_test",
+            "action": "open",
+            "target_origin": "https://example.com",
+            "url": "https://example.com/app",
+            "idempotency_key": "page-open-1"
+        });
+        let denied = browser_page_lifecycle_call(&open, &[], Some(&PanicActuator));
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["code"], "caller_grant_missing");
+        assert_eq!(denied["delivery_state"], "not_delivered");
+
+        struct ResultActuator;
+        impl BrowserActuator for ResultActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("lifecycle routing must use the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_LIFECYCLE_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(expected_generation, 1);
+                assert_eq!(params["action"], "open");
+                assert_eq!(params["target_origin"], "https://example.com");
+                assert_eq!(params["url"], "https://example.com/app");
+                assert_eq!(params["idempotency_key"], "page-open-1");
+                assert!(params.get("endpoint_ref").is_none());
+
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "page_ref": format!("bp_{}", "a".repeat(64)),
+                    "ownership": "owned",
+                    "canonical_url": "https://example.com/app"
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let allowed = browser_page_lifecycle_call(&open, &grants, Some(&ResultActuator));
+        assert_eq!(allowed["ok"], true);
+        assert_eq!(allowed["ownership"], "owned");
+
+        let invalid_origin = browser_page_lifecycle_call(
+            &json!({
+                "endpoint_ref": "bep_test",
+                "action": "open",
+                "target_origin": "https://example.com",
+                "url": "https://other.example/app",
+                "idempotency_key": "page-open-2"
+            }),
+            &grants,
+            Some(&PanicActuator),
+        );
+        assert_eq!(invalid_origin["ok"], false);
+        assert_eq!(invalid_origin["code"], "invalid_params");
+
+        let invalid_ref = browser_page_lifecycle_call(
+            &json!({
+                "endpoint_ref": "bep_test",
+                "action": "finalize",
+                "page_ref": "bp_not-opaque"
+            }),
+            &grants,
+            Some(&PanicActuator),
+        );
+        assert_eq!(invalid_ref["ok"], false);
+        assert_eq!(invalid_ref["code"], "invalid_params");
+
+        let unavailable = browser_page_lifecycle_call(&open, &grants, None);
+        assert_eq!(unavailable["code"], "browser_page_unavailable");
+        assert_eq!(unavailable["retryable"], true);
+        assert_eq!(unavailable["delivery_state"], "not_delivered");
+
+        struct UncertainActuator;
+        impl BrowserActuator for UncertainActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                Ok(evidence)
+            }
+        }
+        let uncertain = browser_page_lifecycle_call(&open, &grants, Some(&UncertainActuator));
+        assert_eq!(uncertain["code"], "browser_page_delivery_unknown");
+        assert_eq!(uncertain["retryable"], false);
+        assert_eq!(uncertain["delivery_state"], "delivery_unknown");
     }
 
     #[test]

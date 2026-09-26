@@ -205,6 +205,19 @@ ok(backgroundSource.includes('BROWSER_PAGE_SESSION_STORAGE_KEY = "herdrBrowserPa
     && pageAssistDispatchSource.includes("claimBrowserPage(endpointRef, targetTab")
     && !pageAssistDispatchSource.includes("chrome.tabs.remove"),
   "Page Assist uses session-persisted claimed BrowserPage refs while legacy tab_id remains compatibility-only");
+const browserPageLifecycleSource = backgroundSource.match(
+  /async function performBrowserPageLifecycleRequest\(msg\) \{[\s\S]*?\n}\n\nfunction withBrowserPageIdentity/,
+)?.[0] || "";
+ok(backgroundSource.includes('operation === "herdr_mcp.browser_page.lifecycle"')
+    && browserPageLifecycleSource.includes('chrome.tabs.create({ url: canonicalUrl, active: false })')
+    && browserPageLifecycleSource.includes('page.ownership !== "claimed"')
+    && browserPageLifecycleSource.includes('browser_page_owned_requires_finalize')
+    && browserPageLifecycleSource.includes('await chrome.tabs.remove(page.tab_id)')
+    && browserPageLifecycleSource.includes('tab_cleanup_verified: true')
+    && backgroundSource.includes("function browserPageView(page, extra = {})")
+    && backgroundSource.includes('ownership: page.ownership')
+    && !backgroundSource.includes('tab_id: page.tab_id'),
+  "BrowserPage lifecycle opens inactive owned tabs, preserves claimed user tabs, and keeps raw tab ids extension-local");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
