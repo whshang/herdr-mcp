@@ -48,21 +48,20 @@ const projectIdentityEnd = wakeSource.indexOf(
 assert.ok(projectIdentityStart >= 0 && projectIdentityEnd > projectIdentityStart, "provider project identity helper must remain extractable");
 const projectIdentitySource = wakeSource.slice(projectIdentityStart, projectIdentityEnd);
 
-function delayedClaudeProjectIdentityHarness(sequence) {
-  let index = 0;
+function projectIdentityDelegationHarness(project) {
+  const calls = [];
   const convKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
   const ADAPTER = {
-    name: "claude",
-    getConversationKey: () => convKey,
-    getProjectIdentity: () => sequence[Math.min(index, sequence.length - 1)] ?? null,
+    resolveProjectIdentity: async (value) => {
+      calls.push(value);
+      return project;
+    },
   };
-  const wait = async () => { index += 1; };
   const observe = new Function(
     "ADAPTER",
-    "wait",
     `${projectIdentitySource}; return currentAdapterProjectIdentity;`,
-  )(ADAPTER, wait);
-  return { observe, convKey, calls: () => index + 1 };
+  )(ADAPTER);
+  return { observe, convKey, calls };
 }
 
 function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) {
@@ -388,7 +387,11 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     let registeredBrowserGeneration = 1;
     let browserRegistrationAttempt = 0;
     const pending = [];
-    const ADAPTER = { name: "claude", getConversationKey: () => currentConvKey };
+    const ADAPTER = {
+      name: "claude",
+      getConversationKey: () => currentConvKey,
+      resolveProjectIdentity: () => null,
+    };
     const location = { get href() { return currentUrl; } };
     const runtimeAlive = () => true;
     const browserAccountNativeIdentity = async () => "opaque-account";
@@ -946,15 +949,16 @@ test("terminal stale session reservations do not block ordinary browser identity
   assert.doesNotMatch(segment, /browser_session_materialization_conflict[\s\S]*reservationRef:\s*null/);
 });
 
-test("user keeps one Claude Browser Registry session across reload | Given the Project breadcrumb renders after the chat route | When registration resolves the provider scope | Then it waits for the Project identity before choosing the parent", async () => {
+test("user keeps provider-specific Project resolution inside the adapter | Given one exact conversation key | When registration resolves provider scope | Then it delegates that key without provider branching", async () => {
   const project = {
     id: "01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
     name: "herdr-mcp",
     key: "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
   };
-  const harness = delayedClaudeProjectIdentityHarness([null, null, project]);
+  const harness = projectIdentityDelegationHarness(project);
   assert.deepEqual(await harness.observe(harness.convKey), project);
-  assert.equal(harness.calls(), 3);
+  assert.deepEqual(harness.calls, [harness.convKey]);
+  assert.doesNotMatch(projectIdentitySource, /ADAPTER\.name/);
 });
 
 test("conversation registration fences route changes before and after async background registration", () => {

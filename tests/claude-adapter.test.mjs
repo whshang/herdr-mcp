@@ -48,6 +48,7 @@ function harness(url = "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174
       getItem(key) { return localStorageValues.get(String(key)) ?? null; },
     },
     window,
+    setTimeout: (fn) => { fn(); return 0; },
     fetch: async (input) => {
       assert.equal(String(input), "/api/auth/current_account");
       return {
@@ -121,6 +122,25 @@ test("user keeps Claude Project identity exact | Given sidebar Project links and
     }),
   ]);
   assert.equal(h.adapter.getProjectIdentity(), null);
+});
+
+test("user keeps one Claude Browser Registry session across reload | Given the Project breadcrumb renders after the chat route | When the adapter resolves Project identity | Then it waits boundedly before choosing the parent", async () => {
+  const h = harness();
+  const project = {
+    id: "01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+    name: "herdr-mcp",
+    key: "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
+  };
+  let calls = 0;
+  h.adapter.getProjectIdentity = () => {
+    calls += 1;
+    return calls >= 3 ? project : null;
+  };
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await h.adapter.resolveProjectIdentity(h.adapter.getConversationKey()))),
+    project,
+  );
+  assert.equal(calls, 3);
 });
 
 test("Claude adapter uses bounded semantic composer, message, and generation selectors", () => {

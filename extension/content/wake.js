@@ -3046,23 +3046,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function currentAdapterProjectIdentity(convKey) {
-    if (typeof ADAPTER.getProjectIdentity !== "function") return null;
-    let project = ADAPTER.getProjectIdentity();
-    if (project || ADAPTER.name !== "claude") return project;
-
-    // Claude renders the stable /chat/<uuid> route before its chat header.
-    // Give the header breadcrumb one bounded observation window so the same
-    // conversation cannot alternate between account- and Project-parented
-    // Browser Registry sessions across reloads. A real non-Project chat still
-    // registers after the window expires; route drift cancels the observation.
-    const deadline = Date.now() + 2500;
-    while (Date.now() < deadline) {
-      await wait(100);
-      if (ADAPTER.getConversationKey() !== convKey) return null;
-      project = ADAPTER.getProjectIdentity();
-      if (project) return project;
-    }
-    return null;
+    return ADAPTER.resolveProjectIdentity(convKey);
   }
 
   async function registerCurrentConversation(reason = "startup") {

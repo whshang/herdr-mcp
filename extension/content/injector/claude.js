@@ -35,6 +35,22 @@ class ClaudeAdapter extends BaseAdapter {
     return this.getConversationKey();
   }
 
+  async resolveProjectIdentity(convKey) {
+    let project = this.getProjectIdentity();
+    if (project) return project;
+
+    // Claude renders the stable /chat/<uuid> route before its chat header.
+    // Wait boundedly for the breadcrumb so reload cannot alternate parent scope.
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (this.getConversationKey() !== convKey) return null;
+      project = this.getProjectIdentity();
+      if (project) return project;
+    }
+    return null;
+  }
+
   getProjectIdentity() {
     if (!this.getSessionIdentity()) return null;
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

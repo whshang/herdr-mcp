@@ -24,6 +24,10 @@ class BaseAdapter {
     return null;
   }
 
+  async resolveProjectIdentity() {
+    return typeof this.getProjectIdentity === "function" ? this.getProjectIdentity() : null;
+  }
+
   // ---- Site-specific declarations ----
 
   // Conversation key for restoring bindings after page refresh or browser restart.
