@@ -60,6 +60,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 
 // ---- chrome mock ----
 const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", chatgptPerfScriptVersion: "8", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true, experimentalGeminiEnabled: true, experimentalGrokEnabled: true };
+const sessionStorage = {};
 const listeners = {
   onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
   onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [], onPermissionAdded: [], onPermissionRemoved: [],
@@ -653,6 +654,20 @@ globalThis.chrome = {
       },
       async remove(keys) {
         for (const key of Array.isArray(keys) ? keys : [keys]) delete storage[key];
+      },
+    },
+    session: {
+      async get(keys) {
+        if (typeof keys === "string") keys = [keys];
+        const out = {};
+        for (const key of keys) out[key] = sessionStorage[key];
+        return out;
+      },
+      async set(obj) {
+        Object.assign(sessionStorage, structuredClone(obj));
+      },
+      async remove(keys) {
+        for (const key of Array.isArray(keys) ? keys : [keys]) delete sessionStorage[key];
       },
     },
   },
@@ -3534,9 +3549,22 @@ console.log("\n[page-assist injection idempotency]");
   const inspectP = new Promise((resolve) => { resolveInspect = resolve; });
   onMsg({ type: "h2w_page_assist", action: "inspect", targetOrigin: paOrigin, tabId: paTabId }, trustedExtSender, (response) => resolveInspect(response));
   const inspectRes = await inspectP;
-  ok(inspectRes?.ok === true && inspectRes?.generation === "gen_test_1",
-    "inspect dynamically injects page-assist when listener is absent and returns inspect result",
+  ok(inspectRes?.ok === true
+      && inspectRes?.generation === "gen_test_1"
+      && /^bp_[0-9a-f]{64}$/.test(inspectRes?.page_ref || "")
+      && inspectRes?.page_generation === 1
+      && inspectRes?.ownership === "claimed",
+    "inspect dynamically injects Page Assist through Browser Page Kernel and returns a claimed opaque page_ref",
     JSON.stringify(inspectRes));
+  const pageRef = inspectRes.page_ref;
+  ok(Array.isArray(sessionStorage.herdrBrowserPagesV1)
+      && sessionStorage.herdrBrowserPagesV1.some((record) =>
+        record.page_ref === pageRef
+          && record.tab_id === paTabId
+          && record.origin === paOrigin
+          && record.ownership === "claimed"),
+    "claimed BrowserPage is persisted in extension session storage for service-worker restart recovery",
+    JSON.stringify(sessionStorage.herdrBrowserPagesV1));
   ok(executeScriptCalls.length === scriptCallsBefore + 1,
     "inspect triggers exactly one script injection call");
 
@@ -3546,16 +3574,104 @@ console.log("\n[page-assist injection idempotency]");
     type: "h2w_page_assist",
     action: "click",
     targetOrigin: paOrigin,
-    tabId: paTabId,
+    pageRef,
     ref: "ref_gen_test_1_0",
     generation: "gen_test_1",
   }, trustedExtSender, (response) => resolveClick(response));
   const clickRes = await clickP;
-  ok(clickRes?.ok === true && clickRes?.ref === "ref_gen_test_1_0",
-    "click succeeds using existing listener without reinjecting page-assist",
+  ok(clickRes?.ok === true
+      && clickRes?.ref === "ref_gen_test_1_0"
+      && clickRes?.page_ref === pageRef,
+    "click resolves the exact claimed tab through page_ref without raw tab_id",
     JSON.stringify(clickRes));
   ok(executeScriptCalls.length === scriptCallsBefore + 1,
-    "subsequent click does not reinject page-assist");
+    "subsequent page_ref click does not reinject Page Assist");
+
+  const mismatchTabId = 993;
+  tabs.set(mismatchTabId, { id: mismatchTabId, url: paUrl, status: "complete", active: false, listener: targetListener({ id: mismatchTabId, url: paUrl }) });
+  let resolveMismatch;
+  const mismatchP = new Promise((resolve) => { resolveMismatch = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "click",
+    targetOrigin: paOrigin,
+    pageRef,
+    tabId: mismatchTabId,
+    ref: "ref_gen_test_1_0",
+    generation: "gen_test_1",
+  }, trustedExtSender, (response) => resolveMismatch(response));
+  const mismatchRes = await mismatchP;
+  ok(mismatchRes?.ok === false && mismatchRes?.error === "browser_page_tab_mismatch",
+    "page_ref and legacy tab_id must resolve to the same exact tab",
+    JSON.stringify(mismatchRes));
+  tabs.delete(mismatchTabId);
+
+  tabs.get(paTabId).url = `${paOrigin}/navigated`;
+  let resolveStalePage;
+  const stalePageP = new Promise((resolve) => { resolveStalePage = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "click",
+    targetOrigin: paOrigin,
+    pageRef,
+    ref: "ref_gen_test_1_0",
+    generation: "gen_test_1",
+  }, trustedExtSender, (response) => resolveStalePage(response));
+  const stalePageRes = await stalePageP;
+  ok(stalePageRes?.ok === false && stalePageRes?.error === "browser_page_stale",
+    "same-origin navigation invalidates the old BrowserPage handle before mutation",
+    JSON.stringify(stalePageRes));
+  tabs.get(paTabId).url = paUrl;
+
+  let resolveReinspect;
+  const reinspectP = new Promise((resolve) => { resolveReinspect = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "inspect",
+    targetOrigin: paOrigin,
+    tabId: paTabId,
+  }, trustedExtSender, (response) => resolveReinspect(response));
+  const reinspectRes = await reinspectP;
+  const crossOriginPageRef = reinspectRes?.page_ref;
+  const crossOriginGeneration = reinspectRes?.generation;
+  const crossOriginElementRef = reinspectRes?.elements?.[0]?.ref;
+  ok(reinspectRes?.ok === true
+      && /^bp_[0-9a-f]{64}$/.test(crossOriginPageRef || "")
+      && crossOriginPageRef !== pageRef,
+    "re-inspect after route drift claims a fresh BrowserPage handle",
+    JSON.stringify(reinspectRes));
+
+  tabs.get(paTabId).url = "https://other.example/path";
+  let resolveCrossOrigin;
+  const crossOriginP = new Promise((resolve) => { resolveCrossOrigin = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "click",
+    targetOrigin: paOrigin,
+    pageRef: crossOriginPageRef,
+    ref: crossOriginElementRef,
+    generation: crossOriginGeneration,
+  }, trustedExtSender, (response) => resolveCrossOrigin(response));
+  const crossOriginRes = await crossOriginP;
+  ok(crossOriginRes?.ok === false && crossOriginRes?.error === "browser_page_origin_mismatch",
+    "cross-origin navigation invalidates the claimed BrowserPage handle before mutation",
+    JSON.stringify(crossOriginRes));
+  tabs.get(paTabId).url = paUrl;
+
+  let resolveRevived;
+  const revivedP = new Promise((resolve) => { resolveRevived = resolve; });
+  onMsg({
+    type: "h2w_page_assist",
+    action: "click",
+    targetOrigin: paOrigin,
+    pageRef: crossOriginPageRef,
+    ref: crossOriginElementRef,
+    generation: crossOriginGeneration,
+  }, trustedExtSender, (response) => resolveRevived(response));
+  const revivedRes = await revivedP;
+  ok(revivedRes?.ok === false && revivedRes?.error === "browser_page_not_found",
+    "a page_ref invalidated by cross-origin navigation cannot revive after navigating back",
+    JSON.stringify(revivedRes));
 
   const noListenerTabId = 992;
   tabs.set(noListenerTabId, { id: noListenerTabId, url: paUrl, status: "complete", active: true, listener: null });

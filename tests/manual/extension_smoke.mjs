@@ -195,6 +195,16 @@ ok(pageAssistSource.includes("H2W_BROWSER_PAGE_KERNEL")
     && !/localStorage|sessionStorage/.test(browserPageKernelSource)
     && !/XPath|evaluate\s*\(/.test(browserPageKernelSource),
   "Browser Page Kernel owns Page Assist execution without exposing script evaluation, cookies/storage, or XPath control");
+ok(backgroundSource.includes('BROWSER_PAGE_SESSION_STORAGE_KEY = "herdrBrowserPagesV1"')
+    && backgroundSource.includes("chrome.storage?.session")
+    && backgroundSource.includes("async function claimBrowserPage(")
+    && backgroundSource.includes("async function resolveBrowserPage(")
+    && pageAssistDispatchSource.includes("requestedPageRef")
+    && pageAssistDispatchSource.includes("resolveBrowserPage(requestedPageRef")
+    && pageAssistDispatchSource.includes('error: "browser_page_tab_mismatch"')
+    && pageAssistDispatchSource.includes("claimBrowserPage(endpointRef, targetTab")
+    && !pageAssistDispatchSource.includes("chrome.tabs.remove"),
+  "Page Assist uses session-persisted claimed BrowserPage refs while legacy tab_id remains compatibility-only");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),

@@ -6605,6 +6605,7 @@ fn page_assist_call(
         "endpoint_ref",
         "action",
         "target_origin",
+        "page_ref",
         "tab_id",
         "max_chars",
         "generation",
@@ -6673,6 +6674,25 @@ fn page_assist_call(
         }
     };
     let target_origin = target_url.origin().ascii_serialization();
+    let page_ref = match object.get("page_ref") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            let valid = value.strip_prefix("bp_").is_some_and(|suffix| {
+                suffix.len() == 64
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+            if !valid {
+                return json!({"ok": false, "code": "invalid_params", "message": "page_ref must be an opaque bp_ reference"});
+            }
+            Some(value.to_owned())
+        }
+        Some(_) => {
+            return json!({"ok": false, "code": "invalid_params", "message": "page_ref must be an opaque bp_ reference"});
+        }
+    };
     let tab_id = match object.get("tab_id") {
         None | Some(Value::Null) => None,
         Some(Value::Number(value)) => match value.as_i64() {
@@ -6730,6 +6750,9 @@ fn page_assist_call(
         "action": action,
         "target_origin": target_origin,
     });
+    if let Some(page_ref) = page_ref {
+        bridge_params["page_ref"] = json!(page_ref);
+    }
     if let Some(tab_id) = tab_id {
         bridge_params["tab_id"] = json!(tab_id);
     }
@@ -13302,10 +13325,12 @@ mod tests {
                 panic!("caller grant rejection must happen before browser actuation")
             }
         }
+        let page_ref = format!("bp_{}", "a".repeat(64));
         let params = json!({
             "endpoint_ref": "bep_test",
             "action": "inspect",
             "target_origin": "https://example.com",
+            "page_ref": page_ref,
             "max_chars": 4096
         });
         let denied = page_assist_call(&params, &[], Some(&PanicActuator));
@@ -13325,6 +13350,7 @@ mod tests {
                 assert_eq!(operation, "herdr_mcp.page_assist");
                 assert!(dispatch_id.is_none());
                 assert_eq!(params["target_origin"], "https://example.com");
+                assert_eq!(params["page_ref"], format!("bp_{}", "a".repeat(64)));
                 assert_eq!(params["max_chars"], 4096);
                 let mut evidence =
                     BrowserPostconditionEvidence::resource_unavailable(expected_generation);
@@ -13342,6 +13368,12 @@ mod tests {
         let grants = [PageAssistCallerGrant {
             endpoint_ref: "bep_test".to_owned(),
         }];
+        let mut invalid_page_ref = params.clone();
+        invalid_page_ref["page_ref"] = json!("bp_not-opaque");
+        let invalid = page_assist_call(&invalid_page_ref, &grants, Some(&PanicActuator));
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["code"], "invalid_params");
+
         let allowed = page_assist_call(&params, &grants, Some(&ResultActuator));
         assert_eq!(allowed["ok"], true);
         assert_eq!(allowed["generation"], "pa:test");
