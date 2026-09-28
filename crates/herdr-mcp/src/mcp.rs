@@ -6618,8 +6618,10 @@ fn continuity_search_string<'a>(
 const BROWSER_FAST_PATH_MAX_CLICK_CANDIDATES: usize = 20;
 const BROWSER_FAST_PATH_MAX_STEPS: usize = 8;
 const BROWSER_FAST_PATH_TEXT_LIMIT: usize = 8 * 1024;
+const BROWSER_FAST_PATH_ROUTE_ATTEMPT_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(1800);
 const BROWSER_FAST_PATH_DECISION_BUDGET: std::time::Duration =
-    std::time::Duration::from_millis(2500);
+    std::time::Duration::from_millis(3600);
 const BROWSER_PAGE_FAST_PATH_METHOD: &str = "herdr_mcp.browser_page.fast_path";
 
 fn browser_fast_path_low_risk_click(action_class: &str, label: &str) -> bool {
@@ -6814,8 +6816,11 @@ fn browser_fast_path_decision(
             ),
         );
     }
-    let response = match semantic.evaluate_with_timeout(&request, BROWSER_FAST_PATH_DECISION_BUDGET)
-    {
+    let response = match semantic.evaluate_with_route_budget(
+        &request,
+        BROWSER_FAST_PATH_ROUTE_ATTEMPT_BUDGET,
+        BROWSER_FAST_PATH_DECISION_BUDGET,
+    ) {
         Ok(response) => response,
         Err(error) => {
             return json!({
