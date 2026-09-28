@@ -45,6 +45,7 @@ function createElement({
       if (name === "contenteditable" && contentEditable) return "true";
       return attributes.get(name) ?? null;
     },
+    hasAttribute(name) { return attributes.has(name); },
     getBoundingClientRect() {
       return visible ? { width: 120, height: 28 } : { width: 0, height: 0 };
     },
@@ -127,7 +128,16 @@ function harness({
 }
 
 test("Page Assist inspect exposes only visible non-sensitive elements through opaque refs", () => {
-  const safeButton = createElement({ tag: "button", text: "Continue" });
+  const safeButton = createElement({ tag: "button", type: "submit", text: "Continue" });
+  const safeLink = createElement({ tag: "a", text: "Details", attrs: { href: "/details" } });
+  const newTabLink = createElement({ tag: "a", text: "More details", attrs: { href: "/more", target: "_blank" } });
+  const logoutLink = createElement({ tag: "a", text: "Account", attrs: { href: "/logout" } });
+  const reveal = createElement({
+    tag: "button",
+    type: "button",
+    text: "More",
+    attrs: { "aria-expanded": "false" },
+  });
   const safeInput = createElement({ tag: "input", type: "text", attrs: { placeholder: "Name" } });
   const password = createElement({ tag: "input", type: "password", attrs: { placeholder: "Password" } });
   const otp = createElement({ tag: "input", type: "text", attrs: { autocomplete: "one-time-code" } });
@@ -136,7 +146,7 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   const disabled = createElement({ tag: "button", text: "Disabled", disabled: true });
   const h = harness({
     bodyText: "x".repeat(200),
-    elements: [safeButton, safeInput, password, otp, card, hidden, disabled],
+    elements: [safeButton, safeLink, newTabLink, logoutLink, reveal, safeInput, password, otp, card, hidden, disabled],
   });
 
   const result = h.send({
@@ -148,8 +158,14 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   assert.equal(result.ok, true);
   assert.equal(result.origin, "https://app.test");
   assert.equal(result.text.length, 32);
-  assert.equal(result.elements.length, 2);
-  assert.equal(result.elements.map((item) => item.text).join("|"), "Continue|Name");
+  assert.equal(result.elements.length, 6);
+  assert.equal(result.elements.map((item) => item.text).join("|"), "Continue|Details|More details|Account|More|Name");
+  assert.equal(result.elements[0].type, "submit");
+  assert.equal(result.elements[0].fast_path, undefined);
+  assert.equal(result.elements[1].fast_path, "same_origin_navigation");
+  assert.equal(result.elements[2].fast_path, undefined);
+  assert.equal(result.elements[3].fast_path, undefined);
+  assert.equal(result.elements[4].fast_path, "reveal");
   assert.ok(result.elements.every((item) => item.ref.startsWith(`ref_${result.generation}_`)));
   assert.ok(result.elements.every((item) => !Object.hasOwn(item, "selector") && !Object.hasOwn(item, "path")));
 });

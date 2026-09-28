@@ -95,6 +95,44 @@
     return text.slice(0, limit);
   }
 
+  function fastPathActionClass(el, tag) {
+    if (tag === "a") {
+      if (el.hasAttribute?.("download")) return undefined;
+      const target = String(el.getAttribute("target") || "").trim().toLowerCase();
+      if (target && target !== "_self") return undefined;
+      if (el.getAttribute("onclick") !== null) return undefined;
+      try {
+        const url = new URL(el.getAttribute("href") || "", global.location?.href);
+        const unsafePath = /(^|\/)(logout|signout|delete|remove|unsubscribe|purchase|checkout|pay|submit|confirm|approve|reject|authorize|grant|install|download|upload)(\/|$)/i;
+        const unsafeQuery = /(?:^|[?&])(?:action|do|op|operation)=(?:logout|signout|delete|remove|unsubscribe|purchase|checkout|pay|submit|confirm|approve|reject|authorize|grant|install|download|upload)(?:&|$)/i;
+        if (
+          (url.protocol === "http:" || url.protocol === "https:")
+          && url.origin === global.location?.origin
+          && !unsafePath.test(url.pathname)
+          && !unsafeQuery.test(url.search)
+        ) {
+          return "same_origin_navigation";
+        }
+      } catch (_) {}
+      return undefined;
+    }
+    if (
+      el.getAttribute("aria-haspopup") !== null
+      || el.getAttribute("aria-expanded") !== null
+      || el.getAttribute("aria-controls") !== null
+    ) {
+      if (
+        tag === "button"
+        && el.form
+        && ["submit", "reset"].includes(String(el.type || "submit").toLowerCase())
+      ) {
+        return undefined;
+      }
+      return "reveal";
+    }
+    return undefined;
+  }
+
   function hasForbiddenKeys(obj) {
     if (!obj || typeof obj !== "object") return false;
     for (const key of Object.keys(obj)) {
@@ -154,8 +192,11 @@
       elements.push({
         ref: ref.slice(0, 256),
         role: String(role || "").slice(0, 64),
-        type: tag === "input" ? String(el.type || "text").slice(0, 64) : undefined,
+        type: (tag === "input" || tag === "button")
+          ? String(el.type || (tag === "input" ? "text" : "")).slice(0, 64)
+          : undefined,
         text: label,
+        fast_path: fastPathActionClass(el, tag),
       });
     }
 
