@@ -168,6 +168,16 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   assert.equal(result.elements[4].fast_path, "reveal");
   assert.ok(result.elements.every((item) => item.ref.startsWith(`ref_${result.generation}_`)));
   assert.ok(result.elements.every((item) => !Object.hasOwn(item, "selector") && !Object.hasOwn(item, "path")));
+
+  const linkClick = h.send({
+    type: "h2w_page_assist",
+    action: "click",
+    expectedOrigin: "https://app.test",
+    generation: result.generation,
+    ref: result.elements[1].ref,
+  });
+  assert.equal(linkClick.ok, true);
+  assert.equal(linkClick.navigation_url, "https://app.test/details");
 });
 
 test("Page Assist click requires the current generation and invalidates refs after one action", () => {

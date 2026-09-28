@@ -8087,6 +8087,34 @@ function browserPageMutationEnvelope(result, page, sendAttempted) {
   };
 }
 
+async function adoptAppliedBrowserPageNavigation(page, tabId, rawNavigationUrl, timeoutMs = 5000) {
+  const expectedUrl = browserPageCanonicalUrl(rawNavigationUrl, page?.origin);
+  if (!page || !Number.isInteger(tabId) || !expectedUrl || expectedUrl === page.canonical_url) {
+    return false;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let tab = null;
+    try { tab = await chrome.tabs.get(tabId); } catch (_) { return false; }
+    const liveOrigin = browserPageOrigin(tab?.url);
+    if (liveOrigin && liveOrigin !== page.origin) return false;
+    const liveUrl = browserPageCanonicalUrl(tab?.url, page.origin);
+    if (liveUrl && liveUrl !== page.canonical_url && liveUrl !== expectedUrl) return false;
+    if (tab?.status === "complete" && liveUrl === expectedUrl) {
+      page.canonical_url = expectedUrl;
+      page.page_generation = Number.isSafeInteger(page.page_generation)
+        ? page.page_generation + 1
+        : 1;
+      page.observation_generation = await getBrowserObservationGeneration();
+      page.last_seen_at = Date.now();
+      await persistBrowserPages();
+      return true;
+    }
+    await sleep(100);
+  }
+  return false;
+}
+
 function browserPageScreenshotArtifact(response) {
   const artifact = response?.artifact;
   if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) return null;
@@ -8300,7 +8328,15 @@ async function performBrowserPageActionRequest(msg) {
 
   try {
     const response = await send();
-    if (mutation) return browserPageMutationEnvelope(response, page, true);
+    if (mutation) {
+      let mutationResponse = response;
+      if (action === "click" && response?.ok === true && typeof response?.navigation_url === "string") {
+        await adoptAppliedBrowserPageNavigation(page, tabId, response.navigation_url);
+        mutationResponse = { ...response };
+        delete mutationResponse.navigation_url;
+      }
+      return browserPageMutationEnvelope(mutationResponse, page, true);
+    }
     return withBrowserPageIdentity(
       response || { ok: false, error: "empty_content_response" },
       page,

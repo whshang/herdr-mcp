@@ -256,10 +256,22 @@
     } catch (_) {}
 
     try {
+      let navigationUrl;
+      const tag = (el.tagName || "").toLowerCase();
+      if (fastPathActionClass(el, tag) === "same_origin_navigation") {
+        try {
+          navigationUrl = new URL(el.getAttribute("href") || "", global.location?.href).href.slice(0, 4096);
+        } catch (_) {}
+      }
       el.focus?.();
       el.click?.();
       invalidateGeneration();
-      return { ok: true, ref, generation: gen };
+      return {
+        ok: true,
+        ref,
+        generation: gen,
+        ...(navigationUrl ? { navigation_url: navigationUrl } : {}),
+      };
     } catch (err) {
       return { ok: false, error: String(err?.message || err || "click_failed") };
     }

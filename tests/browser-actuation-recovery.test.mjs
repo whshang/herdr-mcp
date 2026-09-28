@@ -511,7 +511,7 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
     [51, { id: 51, url: "https://example.com/app", active: true }],
   ]);
   let failMutationTransport = false;
-  const contentResponder = (_tabId, payload) => {
+  const contentResponder = (tabId, payload) => {
     if (failMutationTransport && payload.action === "click") {
       throw new Error("response channel lost");
     }
@@ -526,10 +526,14 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
       };
     }
     if (payload.action === "click") {
+      const tab = tabs.get(tabId);
+      tab.url = "https://example.com/next";
+      tab.status = "complete";
       return {
         ok: true,
         generation: payload.generation,
         ref: payload.ref,
+        navigation_url: "https://example.com/next",
       };
     }
     throw new Error(`unexpected action ${payload.action}`);
@@ -583,6 +587,11 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(applied.retry_safe, false);
   assert.equal(applied.mutation_submitted, true);
   assert.equal(Object.hasOwn(applied, "tab_id"), false);
+  assert.equal(Object.hasOwn(applied, "navigation_url"), false);
+  assert.equal(applied.page_generation, 2);
+  const rebound = h.browserPagesByRef.get(claimed.page_ref);
+  assert.equal(rebound.canonical_url, "https://example.com/next");
+  assert.equal(rebound.page_generation, 2);
 
   failMutationTransport = true;
   const uncertain = await h.performBrowserPageActionRequest({
