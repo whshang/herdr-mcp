@@ -1,7 +1,6 @@
 // options.js — settings + locale
 import { detectOrLoadLocale, setLocale, getLocale, t, onLocaleReady } from "./i18n.js";
 import { nativeHostFailure } from "./native-host-diagnostics.js";
-import { originToMatchPattern, parseAllowedOrigins } from "./page-assist-core.js";
 
 const $ = (id) => document.getElementById(id);
 const KEYS = [
@@ -9,37 +8,12 @@ const KEYS = [
   "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
-  "pageAssistOrigins",
 ];
-let loadedHostPermissionOrigins = [];
 const TEMPLATE_FIELDS = [
   ["template", "wakeTemplate", "default_wake_template"],
   ["manualContinueMessage", "manualContinueMessage", "manual_continue_message"],
   ["progressTemplate", "progressTemplate", "default_progress_template"],
 ];
-
-function configuredHostPermissionOrigins(config) {
-  const origins = [];
-  if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
-  if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
-  if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
-  for (const origin of parseAllowedOrigins(config.pageAssistOrigins).slice(0, 64)) {
-    const pattern = originToMatchPattern(origin);
-    if (pattern) origins.push(pattern);
-  }
-  return [...new Set(origins)];
-}
-
-async function requestHostPermissions(origins) {
-  if (!origins.length) return true;
-  if (!chrome.permissions?.request) return false;
-  return chrome.permissions.request({ origins });
-}
-
-async function removeHostPermissions(origins) {
-  if (!origins.length || !chrome.permissions?.remove) return;
-  try { await chrome.permissions.remove({ origins }); } catch (_) {}
-}
 
 function runtimeMessage(message) {
   return new Promise((resolve) => {
@@ -81,10 +55,6 @@ function applyI18n() {
   $("hint_progress").textContent = t("hint_progress_template");
   $("lab_automation_mode").textContent = t("label_automation_mode");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
-  $("title_generic_web").textContent = t("options_generic_web_section");
-  $("hint_generic_web").textContent = t("options_generic_web_hint");
-  $("lab_page_assist_origins").textContent = t("label_generic_web_origins");
-  $("hint_page_assist_origins").textContent = t("hint_generic_web_origins");
   $("title_experimental").textContent = t("label_experimental_section");
   $("experimental_badge").textContent = t("experimental_badge");
   $("hint_experimental").textContent = t("hint_experimental_section");
@@ -133,8 +103,6 @@ async function loadForm() {
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
   $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
-  $("pageAssistOrigins").value = parseAllowedOrigins(cfg.pageAssistOrigins).join("\n");
-  loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg);
 }
 
 function templateDefaults() {
@@ -212,24 +180,13 @@ $("save").addEventListener("click", async () => {
     experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
-    pageAssistOrigins: parseAllowedOrigins($("pageAssistOrigins").value).slice(0, 64),
     uiLocale: getLocale(),
   };
-  const nextPermissionOrigins = configuredHostPermissionOrigins(config);
-  let granted = false;
-  try { granted = await requestHostPermissions(nextPermissionOrigins); } catch (_) { granted = false; }
-  if (!granted) {
-    setStatus(`${t("save_failed")}: ${t("host_permission_denied")}`, "err");
-    return;
-  }
   const { resp, error } = await runtimeMessage({ type: "h2w_set_config", config });
   if (error || !resp?.ok) {
     setStatus(`${t("save_failed")}: ${error}`, "err");
     return;
   }
-  const staleOrigins = loadedHostPermissionOrigins.filter((origin) => !nextPermissionOrigins.includes(origin));
-  await removeHostPermissions(staleOrigins);
-  loadedHostPermissionOrigins = nextPermissionOrigins;
   setStatus(`✓ ${t("saved")}`, "ok");
   $("manualContinueMessage").value = config.manualContinueMessage;
 });

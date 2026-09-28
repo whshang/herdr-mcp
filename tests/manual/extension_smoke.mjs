@@ -96,7 +96,7 @@ const hudRendererSource = readFileSync(path.join(EXT, "content", "hud", "rendere
 // alignment contracts silently stale.
 const manifestVersion = String(manifest.version || "");
 ok(/^\d+\.\d+\.\d+$/.test(manifestVersion), "manifest version stays aligned with the browser product build");
-ok(manifest.permissions?.includes("activeTab"), "Control Center can identify the user-invoked active WebChat tab before optional site access is granted");
+ok(manifest.permissions?.includes("activeTab"), "Control Center can identify the user-invoked active tab while all-site browser access is granted at install/load time");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
 ok(backgroundSource.includes(`const H2W_SCRIPT_VERSION = "${manifestVersion}"`), "background version matches manifest");
 ok(backgroundSource.includes('routeAgentTaskInboxWake')
@@ -165,23 +165,20 @@ ok(ownerGateIndex >= 0
     && wakeSource.includes("A later page refresh can retry after MV3 recovers")
     && wakeSource.includes('[h2w] extension standby; skipping page control'),
   "inactive sibling extension exits before claiming shared page UI ownership");
-ok(!manifest.host_permissions?.includes("<all_urls>")
-    && manifest.host_permissions?.includes("http://127.0.0.1:8772/*")
-    && manifest.host_permissions?.includes("https://chatgpt.com/*")
-    && manifest.host_permissions?.includes("https://claude.ai/*")
-    && manifest.host_permissions?.includes("https://grok.com/*")
-    && manifest.optional_host_permissions?.includes("https://*/*")
-    && manifest.optional_host_permissions?.includes("http://*/*"),
-  "broad network access is optional while supported WebChat origins are explicit required permissions");
+ok(manifest.host_permissions?.length === 1
+    && manifest.host_permissions[0] === "<all_urls>"
+    && !Object.prototype.hasOwnProperty.call(manifest, "optional_host_permissions"),
+  "browser access is granted once at install/load time with required all-sites permission");
 ok(!manifest.content_scripts.some((entry) => (entry.js || []).some((script) =>
       script === "content/page-assist.js" || script === "content/browser-page-kernel.js"))
-    && backgroundSource.includes("pageAssistOrigins: []")
-    && optionsHtml.includes('id="pageAssistOrigins"')
-    && optionsSource.includes("parseAllowedOrigins")
-    && optionsSource.includes("requestHostPermissions(nextPermissionOrigins)")
-    && optionsSource.includes("pageAssistOrigins")
-    && !backgroundSource.includes("chrome.permissions.request"),
-  "Generic Web stays default-off and only local Settings save can request approved host permissions");
+    && !optionsHtml.includes('id="pageAssistOrigins"')
+    && !optionsSource.includes("chrome.permissions.request")
+    && !optionsSource.includes("chrome.permissions.remove")
+    && !backgroundSource.includes("chrome.permissions.request")
+    && !backgroundSource.includes("chrome.permissions.remove")
+    && backgroundSource.includes("delete incoming.pageAssistOrigins")
+    && backgroundSource.includes('"pageAssistOrigins",'),
+  "Generic Web has no per-site approval state or runtime permission mutation and retires the old origin list");
 const pageAssistDispatchSource = backgroundSource.match(
   /async function performPageAssistRequest\(msg\) \{[\s\S]*?\n}\n/,
 )?.[0] || "";
@@ -224,15 +221,15 @@ ok(backgroundSource.includes('operation === "herdr_mcp.browser_page.lifecycle"')
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
-  "experimental content-script registration requires an explicitly granted site permission");
+  "experimental content-script registration requires its feature flag and live Chrome access to the target origin");
 ok(backgroundSource.includes("SUPPORTED_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('grok: "https://grok.com/*"')
     && backgroundSource.includes('id: "herdr-supported-grok"')
     && backgroundSource.includes('RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS = ["herdr-experimental-grok"]')
     && backgroundSource.includes("await hasHostPermission(permissionPattern)")
-    && !backgroundSource.includes("supportedOptionalSiteAccess")
-    && manifest.host_permissions?.includes("https://grok.com/*"),
-  "supported Grok uses the required Chrome site permission as the runtime authority");
+    && !backgroundSource.includes("syncSupportedOptionalContentScripts")
+    && manifest.host_permissions?.includes("<all_urls>"),
+  "supported Grok inherits install-time all-site access and still fails closed if Chrome restricts its origin");
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";

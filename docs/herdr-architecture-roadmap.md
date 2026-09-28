@@ -89,7 +89,7 @@ Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint
 - Browser mutation 继续复用一个 Runtime reservation、`not_applied / applied / uncertain` 与 verify-before-retry；Adapter 不得建立第二套 retry/idempotency/wait 权威；
 - **Jev 作为可选本地快速决策层**：Runtime 只把有界 BrowserPage observation 和确定性候选动作交给现有 `SemanticService`，Jev 只能选择下一步 typed action / done / blocked / escalate；权限、generation/ref、幂等、delivery、敏感字段、人工边界与资源清理仍由 Runtime 决定。Jev 未配置、超时、异常或 uncertain 时直接回到普通 planner 路径，Generic Web 仍完整可用；
 - Chrome 用户 tab 与 Herdr-created tab 明确区分 ownership；Service Worker restart 后通过 Extension session ownership + Runtime operation evidence 恢复/清理 Herdr-owned resources，finalize 不得误关用户 tab；
-- 正常 Store 扩展继续使用按 origin 请求的 optional host permissions；origin grant 只能由 HUD/Options 用户手势授予，1.1 核心执行不要求给所有用户增加 mandatory `debugger` 权限。
+- 正常 Store 扩展在安装/加载时一次申请 required `<all_urls>` host access，Generic Web 后续不再逐站弹出 Herdr 权限请求；每次 BrowserPage 访问前仍检查 Chrome 对目标 origin 的实时权限，用户在 Chrome 里限制站点后继续 fail closed。1.1 核心执行不增加 mandatory `debugger` 权限。
 
 首批真实参考场景：
 

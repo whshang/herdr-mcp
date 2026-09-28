@@ -107,18 +107,15 @@ test("Options waits for locale before showing fallback English copy", () => {
   assert.match(optionsJs, /classList\.remove\("i18n-pending"\)/);
 });
 
-test("Options requests optional host access only from explicit user settings", () => {
-  assert.match(optionsJs, /chrome\.permissions\?\.request/);
-  assert.match(optionsJs, /https:\/\/chat\.z\.ai\/\*/);
-  assert.match(optionsJs, /https:\/\/chat\.deepseek\.com\/\*/);
-  assert.match(optionsJs, /https:\/\/gemini\.google\.com\/\*/);
-  assert.doesNotMatch(optionsJs, /https:\/\/grok\.com\/\*/);
+test("user avoids per-site host prompts | Given install-time all-sites access | When Options is inspected | Then no runtime host permission request, origin allowlist, or removal path remains", () => {
+  assert.doesNotMatch(optionsJs, /chrome\.permissions\?\.(request|remove)/);
+  assert.doesNotMatch(optionsJs, /configuredHostPermissionOrigins|requestHostPermissions|removeHostPermissions/);
   assert.doesNotMatch(optionsHtml, /id="grokSiteAccess"/);
   assert.doesNotMatch(optionsHtml, /id="experimentalGrokEnabled"/);
   assert.doesNotMatch(optionsHtml, /id="pageAssistOrigins"/);
-  assert.match(optionsJs, /removeHostPermissions/);
+  assert.doesNotMatch(optionsJs, /pageAssistOrigins|parseAllowedOrigins|originToMatchPattern/);
   assert.doesNotMatch(optionsJs, /llmJudge|jevJudge/);
-  assert.equal(typeof zh.host_permission_denied, "string");
+  assert.equal(zh.host_permission_denied, undefined);
 });
 
 test("user keeps default templates aligned with the selected language | Given localized template defaults | When the locale changes or Reset templates is clicked | Then untouched defaults follow the locale and custom text is not blindly replaced", () => {

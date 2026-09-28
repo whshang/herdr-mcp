@@ -43,7 +43,6 @@ import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-ho
 import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrBatchFetch, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
   originToMatchPattern,
-  parseAllowedOrigins,
   validatePageAssistRequest,
 } from "./page-assist-core.js";
 import {
@@ -434,7 +433,6 @@ let CFG = {
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
   experimentalGeminiEnabled: false,
-  pageAssistOrigins: [],
 };
 let PROJECT_AUTOMATION = {};
 let CONVERSATION_AUTOMATION = {};
@@ -565,7 +563,7 @@ async function syncExperimentalContentScripts() {
   }
 }
 
-async function syncSupportedOptionalContentScripts() {
+async function syncSupportedContentScripts() {
   if (!chrome.scripting?.getRegisteredContentScripts
     || !chrome.scripting?.registerContentScripts
     || !chrome.scripting?.unregisterContentScripts) return;
@@ -607,7 +605,7 @@ async function syncSupportedOptionalContentScripts() {
 
 async function syncDynamicContentScripts() {
   await syncExperimentalContentScripts();
-  await syncSupportedOptionalContentScripts();
+  await syncSupportedContentScripts();
 }
 
 function conversationAutomationSiteForConversation(convKey) {
@@ -806,12 +804,13 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       "jevJudgeBaseUrl",
       "jevJudgeApiKey",
       "jevJudgeModel",
+      "pageAssistOrigins",
       PROJECT_AUTOMATION_STORAGE_KEY,
       CONVERSATION_AUTOMATION_STORAGE_KEY,
     ];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
-    CFG.pageAssistOrigins = parseAllowedOrigins(CFG.pageAssistOrigins).slice(0, 64);
+    delete CFG.pageAssistOrigins;
     delete CFG.experimentalGrokEnabled;
     delete CFG.jevJudgeMode;
     delete CFG.jevJudgeThreshold;
@@ -869,16 +868,10 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   }
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
-  // during upgrade. Semantic provider credentials are owned by Runtime/Edge;
-  // browser copies and their optional host permissions are migration tombstones.
+  // during upgrade. Semantic provider credentials are owned by Runtime/Edge.
+  // Browser host access is one required install/load-time permission, so
+  // migration never mutates per-site Chrome permissions.
   try {
-    const retiredProviderOrigins = [
-      hostPermissionPatternForUrl(stored.llmJudgeBaseUrl),
-      hostPermissionPatternForUrl(stored.jevJudgeBaseUrl),
-    ].filter(Boolean);
-    if (retiredProviderOrigins.length && chrome.permissions?.remove) {
-      try { await chrome.permissions.remove({ origins: [...new Set(retiredProviderOrigins)] }); } catch (_) {}
-    }
     await chrome.storage.local.remove([
       "autoAllow",
       "token",
@@ -893,6 +886,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       "jevJudgeBaseUrl",
       "jevJudgeApiKey",
       "jevJudgeModel",
+      "pageAssistOrigins",
     ]);
   } catch (e) {}
   await syncDynamicContentScripts();
@@ -900,10 +894,10 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
 })();
 
 if (chrome.permissions?.onAdded?.addListener) {
-  chrome.permissions.onAdded.addListener(() => { void syncSupportedOptionalContentScripts(); });
+  chrome.permissions.onAdded.addListener(() => { void syncSupportedContentScripts(); });
 }
 if (chrome.permissions?.onRemoved?.addListener) {
-  chrome.permissions.onRemoved.addListener(() => { void syncSupportedOptionalContentScripts(); });
+  chrome.permissions.onRemoved.addListener(() => { void syncSupportedContentScripts(); });
 }
 
 // ---- Toolbar badge (replaces the ambiguous in-page status dot) ----
@@ -7859,15 +7853,6 @@ async function performBrowserPageLifecycleRequest(msg) {
     if (!targetOrigin || !canonicalUrl || browserPageOrigin(targetOrigin) !== targetOrigin) {
       return { ok: false, error: "browser_page_url_invalid" };
     }
-    const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
-    if (!allowed.includes(targetOrigin)) {
-      return {
-        ok: false,
-        error: "permission_required",
-        reason: "origin_not_approved",
-        origin: targetOrigin,
-      };
-    }
     const pattern = originToMatchPattern(targetOrigin);
     if (!pattern || !await hasHostPermission(pattern)) {
       return {
@@ -7926,13 +7911,21 @@ async function performBrowserPageLifecycleRequest(msg) {
       createdTab = await chrome.tabs.create({ url: canonicalUrl, active: false });
     } catch (_) {}
     if (!createdTab?.id) return { ok: false, error: "browser_page_open_failed" };
-    const page = await rememberBrowserPage(
-      endpointRef,
-      createdTab,
-      targetOrigin,
-      "owned",
-      idempotencyKey,
-    );
+    // Real Chromium commonly returns a newly-created tab with only
+    // `pendingUrl` while navigation is still loading. Wait for the existing
+    // bounded completion fence before binding an owned BrowserPage record so
+    // we persist the live URL/document rather than treating normal navigation
+    // latency as a storage failure.
+    const readyTab = await waitForTabComplete(createdTab.id, 15000);
+    const page = readyTab
+      ? await rememberBrowserPage(
+        endpointRef,
+        readyTab,
+        targetOrigin,
+        "owned",
+        idempotencyKey,
+      )
+      : null;
     if (page) return browserPageView(page, { reused: false });
 
     let tabClosed = false;
@@ -8262,18 +8255,6 @@ async function performBrowserPageActionRequest(msg) {
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
 
-  const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
-  if (!allowed.includes(record.origin)) {
-    const denied = {
-      ok: false,
-      error: "permission_required",
-      reason: "origin_not_approved",
-      origin: record.origin,
-    };
-    return action === "click" || action === "fill"
-      ? browserPageMutationEnvelope(denied, record, false)
-      : withBrowserPageIdentity(denied, record);
-  }
   const pattern = originToMatchPattern(record.origin);
   if (!pattern || !await hasHostPermission(pattern)) {
     const denied = {
@@ -8389,8 +8370,7 @@ function withBrowserPageIdentity(result, page) {
 
 async function performPageAssistRequest(msg) {
   await configReady;
-  const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
-  const validation = validatePageAssistRequest(msg, allowed);
+  const validation = validatePageAssistRequest(msg);
   if (!validation.ok) return validation;
 
   const pattern = originToMatchPattern(validation.targetOrigin);
@@ -9159,21 +9139,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_set_config") {
     void (async () => {
       const incoming = { ...(msg.config || {}) };
-      if (Object.prototype.hasOwnProperty.call(incoming, "pageAssistOrigins")) {
-        const optionsUrl = chrome.runtime?.getURL ? chrome.runtime.getURL("options.html") : "";
-        const senderUrl = String(sender?.url || "").split(/[?#]/, 1)[0];
-        const optionsSender = Boolean(
-          sender?.id
-          && chrome.runtime?.id
-          && sender.id === chrome.runtime.id
-          && optionsUrl
-          && senderUrl === optionsUrl
-        );
-        if (!optionsSender) {
-          sendResponse({ ok: false, error: "generic_web_origin_update_denied" });
-          return;
-        }
-      }
       // Current extension builds never persist or consume HERDR_MCP_TOKEN.
       delete incoming.token;
       delete incoming.idleNudgeCooldownSec;
@@ -9197,9 +9162,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         incoming.manualContinueMessage = String(incoming.manualContinueMessage || "").trim().slice(0, 4000)
           || defaultManualContinueMessage();
       }
-      if (Object.prototype.hasOwnProperty.call(incoming, "pageAssistOrigins")) {
-        incoming.pageAssistOrigins = parseAllowedOrigins(incoming.pageAssistOrigins).slice(0, 64);
-      }
+      delete incoming.pageAssistOrigins;
       // Retired semantic-policy inputs are ignored even when a stale Options
       // page or older content script submits them during an extension update.
       delete incoming.jevJudgeMode;

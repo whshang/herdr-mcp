@@ -24,6 +24,7 @@ function browserPageLifecycleHarness({
   permissionAllowed = true,
   screenshotResponder = null,
   artifactResponder = null,
+  deferredCreate = false,
 } = {}) {
   let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
   const activatedListeners = new Set();
@@ -50,7 +51,9 @@ function browserPageLifecycleHarness({
         const tab = {
           id: nextTabId++,
           windowId: 1,
-          url: info.url,
+          url: deferredCreate ? null : info.url,
+          pendingUrl: deferredCreate ? info.url : null,
+          status: deferredCreate ? "loading" : "complete",
           active: info.active === true,
         };
         tabs.set(tab.id, tab);
@@ -108,11 +111,10 @@ function browserPageLifecycleHarness({
     "let browserPagesLoadPromise = null;",
     "let browserEndpoint = null;",
     "const configReady = Promise.resolve();",
-    "const CFG = { pageAssistOrigins: ['https://example.com'] };",
-    "const parseAllowedOrigins = (input) => input;",
     "const originToMatchPattern = (origin) => origin + '/*';",
     "const hasHostPermission = async () => ctx.permissionAllowed;",
     "const getBrowserObservationGeneration = async () => 17;",
+    "const waitForTabComplete = async (tabId) => ctx.waitForTabComplete(tabId);",
     "const registerLocalBrowserEndpoint = async () => ({ endpoint_ref: 'bep_test' });",
     "const browserEndpointView = (endpoint) => endpoint;",
     "const captureImageArtifactNative = async (artifact) => ctx.captureImageArtifactNative(artifact);",
@@ -125,6 +127,16 @@ function browserPageLifecycleHarness({
     URL,
     Date,
     permissionAllowed,
+    waitForTabComplete: async (tabId) => {
+      const tab = tabs.get(tabId);
+      if (!tab) return null;
+      if (tab.pendingUrl) {
+        tab.url = tab.pendingUrl;
+        tab.pendingUrl = null;
+        tab.status = "complete";
+      }
+      return { ...tab };
+    },
     captureImageArtifactNative: async (artifact) => {
       if (!artifactResponder) throw new Error("artifact capture unavailable");
       return artifactResponder(artifact);
@@ -132,6 +144,24 @@ function browserPageLifecycleHarness({
   });
   return { ...api, sessionStorage, tabs };
 }
+
+test("user opens a loading generic page | Given Chrome returns only pendingUrl from tabs.create | When BrowserPage waits for navigation completion | Then the owned page is bound to the live URL and retained", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({ sessionStorage, tabs, deferredCreate: true });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-pending-url-1",
+  });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.ownership, "owned");
+  assert.equal(opened.canonical_url, "https://example.com/app");
+  assert.equal(tabs.size, 1);
+  assert.equal([...tabs.values()][0].url, "https://example.com/app");
+  assert.equal(sessionStorage.herdrBrowserPagesV1.length, 1);
+});
 
 test("user finalizes one owned generic page | Given open is retried across a service-worker restart | When the same idempotency key and then page_ref are used | Then one tab is reused and the exact owned tab is closed", async () => {
   const sessionStorage = {};
