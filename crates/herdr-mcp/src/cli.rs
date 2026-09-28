@@ -306,6 +306,7 @@ pub enum AgentCommand {
 pub enum BrowserPageCommand {
     Lifecycle { params_json: String },
     Action { params_json: String },
+    FastPath { params_json: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -898,7 +899,8 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
 }
 
 fn parse_browser_page(args: &[String]) -> Result<Command, String> {
-    const USAGE: &str = "usage: herdr-mcp browser-page <lifecycle|action> --params-json JSON";
+    const USAGE: &str =
+        "usage: herdr-mcp browser-page <lifecycle|action|fast-path> --params-json JSON";
     let Some(kind) = args.first().map(String::as_str) else {
         return Err(USAGE.to_owned());
     };
@@ -913,6 +915,9 @@ fn parse_browser_page(args: &[String]) -> Result<Command, String> {
             params_json: args[2].clone(),
         })),
         "action" => Ok(Command::BrowserPage(BrowserPageCommand::Action {
+            params_json: args[2].clone(),
+        })),
+        "fast-path" => Ok(Command::BrowserPage(BrowserPageCommand::FastPath {
             params_json: args[2].clone(),
         })),
         _ => Err(USAGE.to_owned()),
@@ -2719,7 +2724,7 @@ Advanced / internal:\n\
   herdr-mcp link cutover [--dry-run|--execute|--rollback]\n\
   herdr-mcp link seal [status|record --dual-uat|record --rollback-uat|adopt-existing-rust --ack --reason REASON|--dry-run|--execute]\n\
   herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n\
-  herdr-mcp browser-page <lifecycle|action> --params-json JSON  (advanced trusted-local Generic Web control; Runtime validates typed params)\n\
+  herdr-mcp browser-page <lifecycle|action|fast-path> --params-json JSON  (advanced trusted-local Generic Web control; Runtime validates typed params)\n\
   herdr-mcp tcc-broker <install [--force]|status|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp native-host dev <enable [PATH]|disable>\n\
@@ -2909,6 +2914,21 @@ mod tests {
                 .command,
             Command::BrowserPage(BrowserPageCommand::Action {
                 params_json: action.to_owned(),
+            })
+        );
+
+        let fast_path = r#"{"endpoint_ref":"bep_test","page_ref":"bp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","objective":"Reach Goal Complete","idempotency_key":"fast-1"}"#;
+        assert_eq!(
+            parse(args(&[
+                "browser-page",
+                "fast-path",
+                "--params-json",
+                fast_path,
+            ]))
+            .unwrap()
+            .command,
+            Command::BrowserPage(BrowserPageCommand::FastPath {
+                params_json: fast_path.to_owned(),
             })
         );
 

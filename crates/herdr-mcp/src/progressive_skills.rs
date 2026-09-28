@@ -65,6 +65,7 @@ pub const BROWSER_DISPATCH_STATUS_METHOD: &str = "herdr_mcp.browser_dispatch.sta
 pub const BROWSER_DISPATCH_STOP_METHOD: &str = "herdr_mcp.browser_dispatch.stop";
 pub const BROWSER_PAGE_LIFECYCLE_METHOD: &str = "herdr_mcp.browser_page.lifecycle";
 pub const BROWSER_PAGE_ACTION_METHOD: &str = "herdr_mcp.browser_page.action";
+pub const BROWSER_PAGE_FAST_PATH_METHOD: &str = "herdr_mcp.browser_page.fast_path";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
