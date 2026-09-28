@@ -1,4 +1,6 @@
-use crate::cli::{AgentCommand, ContinuityCommand, MemoryCommand, WebChatCommand};
+use crate::cli::{
+    AgentCommand, BrowserPageCommand, ContinuityCommand, MemoryCommand, WebChatCommand,
+};
 use crate::link::local_mcp::{
     LinkRuntimeTransport, LocalMcpConfig, LocalMcpTransport, RuntimeToolResult,
 };
@@ -6,10 +8,11 @@ use crate::link::request_core::RuntimeRequest;
 use crate::paths::RuntimePaths;
 use crate::progressive_skills::{
     BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD, BROWSER_ENDPOINT_LIST_METHOD,
-    BROWSER_HANDOFF_PREPARE_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
-    BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
-    BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
-    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    BROWSER_HANDOFF_PREPARE_METHOD, BROWSER_PAGE_ACTION_METHOD, BROWSER_PAGE_LIFECYCLE_METHOD,
+    BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD, BROWSER_SESSION_ARCHIVE_METHOD,
+    BROWSER_SESSION_ARCHIVE_STATUS_METHOD, BROWSER_SESSION_CREATE_METHOD,
+    BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD, WORK_MEMORY_RESUME_METHOD,
+    WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
@@ -148,6 +151,32 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
             None,
         )?),
     }
+}
+
+pub(crate) fn run_browser_page(command: BrowserPageCommand) -> Result<ExitCode, String> {
+    let (method, params_json) = match command {
+        BrowserPageCommand::Lifecycle { params_json } => {
+            (BROWSER_PAGE_LIFECYCLE_METHOD, params_json)
+        }
+        BrowserPageCommand::Action { params_json } => (BROWSER_PAGE_ACTION_METHOD, params_json),
+    };
+    let params: Value = serde_json::from_str(&params_json)
+        .map_err(|error| format!("browser-page --params-json is invalid JSON: {error}"))?;
+    let object = params
+        .as_object()
+        .ok_or_else(|| "browser-page --params-json must encode an object".to_owned())?;
+    let endpoint_ref = object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| "browser-page params require a valid endpoint_ref".to_owned())?;
+    let grant = PageAssistGrant {
+        endpoint_ref: endpoint_ref.to_owned(),
+    };
+    print_private_result(call_private_page_assist(method, params, &grant)?)
 }
 
 pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
@@ -521,6 +550,11 @@ struct BrowserGrant {
     account_ref: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageAssistGrant {
+    endpoint_ref: String,
+}
+
 fn grant_for_source_url(source_url: &str) -> Result<BrowserGrant, String> {
     let result = call_private_trusted_read(
         BROWSER_SOURCE_RESOLVE_METHOD,
@@ -598,22 +632,55 @@ fn grant_for_resource(resource_ref: &str) -> Result<BrowserGrant, String> {
     Err("browser resource parent chain exceeds supported depth".to_owned())
 }
 
+fn private_call_trace(
+    webchat_grant: Option<&BrowserGrant>,
+    page_assist_grant: Option<&PageAssistGrant>,
+) -> Option<Map<String, Value>> {
+    let mut trace = Map::new();
+    if let Some(grant) = webchat_grant {
+        trace.insert(
+            "webchat_control_grants".to_owned(),
+            json!([{
+                "endpoint_ref": grant.endpoint_ref,
+                "provider": grant.provider,
+                "account_ref": grant.account_ref,
+            }]),
+        );
+    }
+    if let Some(grant) = page_assist_grant {
+        trace.insert(
+            "page_assist_grants".to_owned(),
+            json!([{"endpoint_ref": grant.endpoint_ref}]),
+        );
+    }
+    (!trace.is_empty()).then_some(trace)
+}
+
 fn call_private(
     method: &str,
     params: Value,
     webchat_grant: Option<&BrowserGrant>,
 ) -> Result<Value, String> {
-    call_private_with_context(method, params, webchat_grant, false)
+    call_private_with_context(method, params, webchat_grant, None, false)
+}
+
+fn call_private_page_assist(
+    method: &str,
+    params: Value,
+    page_assist_grant: &PageAssistGrant,
+) -> Result<Value, String> {
+    call_private_with_context(method, params, None, Some(page_assist_grant), false)
 }
 
 fn call_private_trusted_read(method: &str, params: Value) -> Result<Value, String> {
-    call_private_with_context(method, params, None, true)
+    call_private_with_context(method, params, None, None, true)
 }
 
 fn call_private_with_context(
     method: &str,
     params: Value,
     webchat_grant: Option<&BrowserGrant>,
+    page_assist_grant: Option<&PageAssistGrant>,
     trusted_local_read: bool,
 ) -> Result<Value, String> {
     if !params.is_object() {
@@ -639,18 +706,7 @@ fn call_private_with_context(
     .as_object()
     .cloned()
     .ok_or_else(|| "cannot construct local private call".to_owned())?;
-    let mut trace = Map::new();
-    if let Some(grant) = webchat_grant {
-        trace.insert(
-            "webchat_control_grants".to_owned(),
-            json!([{
-                "endpoint_ref": grant.endpoint_ref,
-                "provider": grant.provider,
-                "account_ref": grant.account_ref,
-            }]),
-        );
-    }
-    let trace = (!trace.is_empty()).then_some(trace);
+    let trace = private_call_trace(webchat_grant, page_assist_grant);
     let timeout_ms = local_private_timeout_ms(method);
     let request = RuntimeRequest {
         workstation_id: "local-agent-cli".to_owned(),
@@ -855,21 +911,31 @@ mod tests {
     }
 
     #[test]
-    fn grant_trace_contains_only_browser_scope() {
-        let grant = BrowserGrant {
+    fn grant_trace_contains_only_the_requested_browser_scope() {
+        let webchat = BrowserGrant {
             endpoint_ref: "ep_test".to_owned(),
             provider: "chatgpt".to_owned(),
             account_ref: "br_test".to_owned(),
         };
-        let trace = json!({
-            "webchat_control_grants": [{
-                "endpoint_ref": grant.endpoint_ref,
-                "provider": grant.provider,
-                "account_ref": grant.account_ref,
-            }]
-        });
-        assert_eq!(trace["webchat_control_grants"][0]["provider"], "chatgpt");
-        assert!(trace.get("bearer_token").is_none());
+        let webchat_trace = private_call_trace(Some(&webchat), None).unwrap();
+        assert_eq!(
+            webchat_trace["webchat_control_grants"][0]["provider"],
+            "chatgpt"
+        );
+        assert!(webchat_trace.get("page_assist_grants").is_none());
+        assert!(webchat_trace.get("bearer_token").is_none());
+
+        let page_assist = PageAssistGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        };
+        let page_trace = private_call_trace(None, Some(&page_assist)).unwrap();
+        assert_eq!(
+            page_trace["page_assist_grants"][0]["endpoint_ref"],
+            "bep_test"
+        );
+        assert!(page_trace.get("webchat_control_grants").is_none());
+        assert!(page_trace.get("webchat_authorization").is_none());
+        assert!(page_trace.get("bearer_token").is_none());
     }
 
     #[test]

@@ -302,6 +302,7 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Memory(command) => local_agent_cli::run_memory(command),
         cli::Command::Agent(command) => local_agent_cli::run_agent(command),
         cli::Command::WebChat(command) => local_agent_cli::run_webchat(command),
+        cli::Command::BrowserPage(command) => local_agent_cli::run_browser_page(command),
         cli::Command::Dev(command) => dev::run(command),
         cli::Command::ProfileCheck { file } => workstation_profile::check(&file),
         cli::Command::Candidate { port } => {
