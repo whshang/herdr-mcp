@@ -6687,25 +6687,6 @@ fn browser_fast_path_decision(
         });
     }
 
-    let mut operation_criteria = std::collections::BTreeMap::from([
-        (
-            "done".to_owned(),
-            Some("The objective is already satisfied by the current visible page evidence".to_owned()),
-        ),
-        (
-            "blocked".to_owned(),
-            Some("The objective cannot continue because the current page is blocked by an external or human-required condition".to_owned()),
-        ),
-        (
-            "escalate".to_owned(),
-            Some("The bounded page evidence is insufficient or ambiguous; return control to the main planner without mutating the page".to_owned()),
-        ),
-    ]);
-    let terminal_actions = std::collections::BTreeMap::from([
-        ("done".to_owned(), json!({"action": "done"})),
-        ("blocked".to_owned(), json!({"action": "blocked"})),
-        ("escalate".to_owned(), json!({"action": "escalate"})),
-    ]);
     let mut click_criteria = std::collections::BTreeMap::new();
     let mut click_actions = std::collections::BTreeMap::new();
     let mut elements = Vec::new();
@@ -6767,13 +6748,6 @@ fn browser_fast_path_decision(
             "text": label,
         }));
     }
-    if !click_actions.is_empty() {
-        operation_criteria.insert(
-            "click".to_owned(),
-            Some("Click one of the currently observed click targets".to_owned()),
-        );
-    }
-
     let text = observation
         .get("text")
         .and_then(Value::as_str)
@@ -6800,18 +6774,38 @@ fn browser_fast_path_decision(
         "candidate_count": click_actions.len(),
         "authority": "advisory candidate selection only; no browser action is executed here",
     });
-    let mut request = SemanticRequest::new(state).ask(
-        "operation",
-        SemanticQuestion::choice(
-            "Choose exactly one operation that best advances the objective using only the bounded visible page evidence. Choose done only when the objective is visibly satisfied, blocked for an external/human-required blocker, and escalate whenever evidence is ambiguous. Never invent an operation.",
-            operation_criteria,
-        ),
-    );
+    let mut request = SemanticRequest::new(state)
+        .ask(
+            "objective_done",
+            SemanticQuestion::noul(
+                "Does the current visible page itself prove that the objective is already satisfied?",
+                "The current page visibly proves the objective is satisfied",
+                "The current page does not yet visibly prove the objective is satisfied",
+            ),
+        )
+        .ask(
+            "external_blocked",
+            SemanticQuestion::noul(
+                "Is further progress blocked by an external or human-required condition on the current page?",
+                "Further progress requires an external or human action",
+                "No external or human-required blocker is visible",
+            ),
+        );
+    if !click_actions.is_empty() {
+        request = request.ask(
+            "safe_click_supported",
+            SemanticQuestion::noul(
+                "Is at least one Runtime-offered low-risk click a sufficiently supported next step for the objective on the current page? Answer yes only when an offered target's visible label or semantics directly match the requested next step. Judge only the next step; the page reached by the click does not need to satisfy the final objective yet.",
+                "At least one offered low-risk click directly matches the requested next step",
+                "No offered low-risk click is sufficiently supported by the current evidence",
+            ),
+        );
+    }
     if click_criteria.len() >= 2 {
         request = request.ask(
             "click_target",
             SemanticQuestion::choice(
-                "If click is the selected operation, choose exactly one offered observed target. Another question decides the operation. Never invent an element reference.",
+                "If a low-risk click is supported, choose exactly one offered observed target whose visible label or semantics best match the requested next step. Never invent an element reference.",
                 click_criteria,
             ),
         );
@@ -6832,9 +6826,9 @@ fn browser_fast_path_decision(
             });
         }
     };
-    let Some((operation, operation_probabilities, operation_confidence)) = response
-        .answer("operation")
-        .and_then(SemanticAnswer::choice_value)
+    let Some(done_probability) = response
+        .answer("objective_done")
+        .and_then(SemanticAnswer::noul_probability)
     else {
         return json!({
             "attempted": true,
@@ -6844,24 +6838,96 @@ fn browser_fast_path_decision(
             "capability": capability,
         });
     };
-    let operation_probability = operation_probabilities
-        .get(operation)
-        .copied()
-        .unwrap_or(0.0);
-    if operation_confidence < DEFAULT_DECISION_THRESHOLD
-        || operation_probability < DEFAULT_DECISION_THRESHOLD
+    let Some(blocked_probability) = response
+        .answer("external_blocked")
+        .and_then(SemanticAnswer::noul_probability)
+    else {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "bad_response",
+            "capability": capability,
+        });
+    };
+    let click_probability = if click_actions.is_empty() {
+        None
+    } else {
+        let Some(probability) = response
+            .answer("safe_click_supported")
+            .and_then(SemanticAnswer::noul_probability)
+        else {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "advisory_only": true,
+                "reason": "bad_response",
+                "capability": capability,
+            });
+        };
+        Some(probability)
+    };
+
+    let head_probabilities = json!({
+        "objective_done": done_probability,
+        "external_blocked": blocked_probability,
+        "safe_click_supported": click_probability,
+    });
+    let negative_threshold = 1.0 - DEFAULT_DECISION_THRESHOLD;
+    if done_probability >= DEFAULT_DECISION_THRESHOLD
+        && blocked_probability >= DEFAULT_DECISION_THRESHOLD
     {
         return json!({
             "attempted": true,
             "used": false,
             "advisory_only": true,
-            "reason": "uncertain",
-            "operation": operation,
-            "confidence": operation_confidence,
-            "choice_probability": operation_probability,
+            "reason": "conflicting_response",
+            "operation": "escalate",
+            "head_probabilities": head_probabilities,
             "capability": capability,
         });
     }
+    let (operation, operation_probability) = if done_probability >= DEFAULT_DECISION_THRESHOLD {
+        ("done", done_probability)
+    } else if blocked_probability >= DEFAULT_DECISION_THRESHOLD {
+        ("blocked", blocked_probability)
+    } else if done_probability > negative_threshold || blocked_probability > negative_threshold {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "uncertain",
+            "operation": "escalate",
+            "confidence": 1.0 - done_probability.max(blocked_probability),
+            "choice_probability": 1.0 - done_probability.max(blocked_probability),
+            "head_probabilities": head_probabilities,
+            "capability": capability,
+        });
+    } else if let Some(probability) = click_probability {
+        if probability >= DEFAULT_DECISION_THRESHOLD {
+            ("click", probability)
+        } else if probability <= negative_threshold {
+            (
+                "escalate",
+                1.0 - done_probability.max(blocked_probability).max(probability),
+            )
+        } else {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "advisory_only": true,
+                "reason": "uncertain",
+                "operation": "escalate",
+                "confidence": probability.max(1.0 - probability),
+                "choice_probability": probability.max(1.0 - probability),
+                "head_probabilities": head_probabilities,
+                "capability": capability,
+            });
+        }
+    } else {
+        ("escalate", 1.0 - done_probability.max(blocked_probability))
+    };
+    let operation_confidence = operation_probability;
 
     let (action, target_id, target_confidence, target_probability) = if operation == "click" {
         if click_actions.is_empty() {
@@ -6921,16 +6987,8 @@ fn browser_fast_path_decision(
                 Some(target_probability),
             )
         }
-    } else if let Some(action) = terminal_actions.get(operation) {
-        (action.clone(), None, None, None)
     } else {
-        return json!({
-            "attempted": true,
-            "used": false,
-            "advisory_only": true,
-            "reason": "candidate_mismatch",
-            "capability": capability,
-        });
+        (json!({"action": operation}), None, None, None)
     };
 
     json!({
@@ -6942,6 +7000,7 @@ fn browser_fast_path_decision(
         "target": target_id,
         "confidence": operation_confidence,
         "choice_probability": operation_probability,
+        "head_probabilities": head_probabilities,
         "target_confidence": target_confidence,
         "target_probability": target_probability,
         "provider": response.provider,
@@ -14988,7 +15047,7 @@ mod tests {
         assert_eq!(provider_error["advisory_only"], true);
 
         let url = semantic_test_server(
-            r#"{"model":"jev-test","answers":{"operation":{"type":"choice","choice":"click","probabilities":{"blocked":0.02,"click":0.91,"done":0.03,"escalate":0.04},"confidence":0.91},"click_target":{"type":"choice","choice":"target_0","probabilities":{"target_0":0.94,"target_1":0.06},"confidence":0.94}}}"#,
+            r#"{"model":"jev-test","answers":{"objective_done":{"type":"noul","noul":0.03},"external_blocked":{"type":"noul","noul":0.02},"safe_click_supported":{"type":"noul","noul":0.93},"click_target":{"type":"choice","choice":"target_0","probabilities":{"target_0":0.94,"target_1":0.06},"confidence":0.94}}}"#,
         );
         let configured =
             SemanticService::test_decision_route("browser-fast-path-ok", &url).unwrap();
@@ -14999,13 +15058,31 @@ mod tests {
         assert_eq!(advised["target"], "target_0");
         assert_eq!(advised["action"]["action"], "click");
         assert_eq!(advised["action"]["ref"], "ref_pa_gen_1_test_0");
-        assert_eq!(advised["confidence"], 0.91);
-        assert_eq!(advised["choice_probability"], 0.91);
+        assert_eq!(advised["confidence"], 0.93);
+        assert_eq!(advised["choice_probability"], 0.93);
+        assert_eq!(advised["head_probabilities"]["objective_done"], 0.03);
+        assert_eq!(advised["head_probabilities"]["external_blocked"], 0.02);
+        assert_eq!(advised["head_probabilities"]["safe_click_supported"], 0.93);
         assert_eq!(advised["target_confidence"], 0.94);
         assert_eq!(advised["target_probability"], 0.94);
         assert_eq!(
             advised["authority"],
             "advisory only; Runtime/browser action validation and idempotency remain authoritative"
+        );
+
+        let uncertain_url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"objective_done":{"type":"noul","noul":0.03},"external_blocked":{"type":"noul","noul":0.02},"safe_click_supported":{"type":"noul","noul":0.50},"click_target":{"type":"choice","choice":"target_0","probabilities":{"target_0":0.94,"target_1":0.06},"confidence":0.94}}}"#,
+        );
+        let uncertain_semantic =
+            SemanticService::test_decision_route("browser-fast-path-uncertain", &uncertain_url)
+                .unwrap();
+        let uncertain = browser_fast_path_advisory(&uncertain_semantic, objective, &observation);
+        assert_eq!(uncertain["used"], false);
+        assert_eq!(uncertain["reason"], "uncertain");
+        assert_eq!(uncertain["operation"], "escalate");
+        assert_eq!(
+            uncertain["head_probabilities"]["safe_click_supported"],
+            0.50
         );
     }
 
@@ -15119,8 +15196,8 @@ mod tests {
             }
         }
 
-        const CLICK: &str = r#"{"model":"jev-test","answers":{"operation":{"type":"choice","choice":"click","probabilities":{"blocked":0.02,"click":0.92,"done":0.03,"escalate":0.03},"confidence":0.92}}}"#;
-        const DONE: &str = r#"{"model":"jev-test","answers":{"operation":{"type":"choice","choice":"done","probabilities":{"blocked":0.02,"done":0.94,"escalate":0.04},"confidence":0.94}}}"#;
+        const CLICK: &str = r#"{"model":"jev-test","answers":{"objective_done":{"type":"noul","noul":0.03},"external_blocked":{"type":"noul","noul":0.02},"safe_click_supported":{"type":"noul","noul":0.92}}}"#;
+        const DONE: &str = r#"{"model":"jev-test","answers":{"objective_done":{"type":"noul","noul":0.94},"external_blocked":{"type":"noul","noul":0.02}}}"#;
         let semantic_url = semantic_test_server_sequence(vec![CLICK, CLICK, CLICK, DONE]);
         let semantic =
             SemanticService::test_decision_route("browser-fast-path-loop", &semantic_url).unwrap();
