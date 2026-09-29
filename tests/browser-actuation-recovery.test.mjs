@@ -2873,7 +2873,7 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
 });
 
-test("ChatGPT browser actuation switches Work mode to Chat mode through the provider adapter", () => {
+test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is active | When browser actuation runs | Then the provider adapter switches to Chat mode", () => {
   assert.match(chatGptAdapterSource, /chatModeGuard:\s*true/);
   assert.match(chatGptAdapterSource, /async prepareBrowserActuation\(\)/);
   assert.match(chatGptAdapterSource, /button\[role="radio"\]/);

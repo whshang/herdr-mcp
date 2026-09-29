@@ -125,7 +125,7 @@ test("Gemini adapter observes user/assistant baselines without inventing provide
   );
 });
 
-test("Gemini adapter keeps the existing browser actuation capabilities", () => {
+test("user keeps Gemini browser actuation capabilities | Given the Gemini adapter is loaded | When capabilities are read | Then the existing browser actuation capabilities remain available", () => {
   const h = harness();
   assert.equal(h.adapter.capabilities.browserActuation, true);
   assert.equal(h.adapter.capabilities.stopGeneration, true);
