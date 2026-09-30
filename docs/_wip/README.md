@@ -9,7 +9,7 @@ Lifecycle:
 - reusable current product guidance → promote into `docs/i18n/<locale>/`, an ADR/current architecture document, or another maintained SSOT;
 - one-off local data that may contain credentials or machine-specific state → keep outside the repository.
 
-Current active WIP is limited to unresolved work: browser control-plane settlement, DEV/STANDALONE/STORE extension distribution, and modular progressive skills.
+Current active WIP is limited to unresolved work: the 1.1 Browser Adapter Platform, browser control-plane settlement, DEV/STANDALONE/STORE extension distribution, and modular progressive skills.
 
 ## Current index
 
@@ -18,6 +18,7 @@ Current active WIP is limited to unresolved work: browser control-plane settleme
 - Archived 1.0 closeout ledger: [`../history/architecture/v1.0-status-closeout-20260923.md`](../history/architecture/v1.0-status-closeout-20260923.md).
 - Archived beta.2 orchestration design: [`../history/architecture/v1.0-beta2-webchat-orchestration.md`](../history/architecture/v1.0-beta2-webchat-orchestration.md).
 - Archived 1.0 performance/resource plan: [`../history/architecture/v1.0-performance-resource-plan.md`](../history/architecture/v1.0-performance-resource-plan.md).
+- 1.1 core Browser Adapter Platform: [`v1.1-browser-adapter-platform.md`](v1.1-browser-adapter-platform.md).
 - Active browser control-plane work: [`browser-control-plane.md`](browser-control-plane.md).
 - Active progressive-skills work: [`modular-progressive-skills.md`](modular-progressive-skills.md).
 - Active browser-extension package/Store work: [`browser-extension-development-and-store-release.md`](browser-extension-development-and-store-release.md). Historical pre-1.0 Store rollout detail lives under [`../history/architecture/browser-extension-development-and-store-release-20260829.md`](../history/architecture/browser-extension-development-and-store-release-20260829.md).

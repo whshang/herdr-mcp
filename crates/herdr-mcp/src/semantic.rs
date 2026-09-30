@@ -771,6 +771,19 @@ impl SemanticService {
         )
     }
 
+    pub(crate) fn evaluate_with_route_budget(
+        &self,
+        request: &SemanticRequest,
+        attempt_timeout: Duration,
+        total_timeout: Duration,
+    ) -> Result<SemanticResponse, SemanticError> {
+        let total_timeout = total_timeout.min(DECISION_POOL_BUDGET);
+        let attempt_timeout = attempt_timeout
+            .min(DECISION_ATTEMPT_TIMEOUT)
+            .min(total_timeout);
+        self.evaluate_with_budget(request, RouteBudget::split(attempt_timeout, total_timeout))
+    }
+
     fn evaluate_with_budget(
         &self,
         request: &SemanticRequest,
@@ -1985,6 +1998,65 @@ mod tests {
             capability["trace"]["typed_decision"]["fallback_reason"],
             "timeout"
         );
+    }
+
+    #[test]
+    fn explicit_route_budget_fails_over_before_total_timeout() {
+        let _guard = crate::test_env::lock();
+        ROUTE_CURSOR.store(0, Ordering::Relaxed);
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
+
+        let slow = one_shot_slow_server(
+            Duration::from_millis(120),
+            r#"{"model":"jev-slow","answers":{"q":{"type":"noul","noul":0.91}}}"#,
+        );
+        let backup = one_shot_server(
+            r#"{"model":"jev-backup","answers":{"q":{"type":"noul","noul":0.92}}}"#,
+        );
+        let request = SemanticRequest::new(json!({"task":"budget-failover"})).ask(
+            "q",
+            SemanticQuestion::noul("Can work continue?", "yes", "no"),
+        );
+        let service = SemanticService {
+            providers: vec![
+                Box::new(
+                    HttpSemanticProvider::new(
+                        "route-slow".to_owned(),
+                        SemanticProtocol::Decision,
+                        "key-slow".to_owned(),
+                        slow,
+                        "jev-slow".to_owned(),
+                    )
+                    .unwrap(),
+                ),
+                Box::new(
+                    HttpSemanticProvider::new(
+                        "route-backup".to_owned(),
+                        SemanticProtocol::Decision,
+                        "key-backup".to_owned(),
+                        backup,
+                        "jev-backup".to_owned(),
+                    )
+                    .unwrap(),
+                ),
+            ],
+            chat_providers: Vec::new(),
+        };
+
+        let response = service
+            .evaluate_with_route_budget(
+                &request,
+                Duration::from_millis(40),
+                Duration::from_millis(250),
+            )
+            .unwrap();
+        assert_eq!(response.provider, "route-backup");
+
+        if let Ok(mut cooldowns) = route_cooldowns().lock() {
+            cooldowns.clear();
+        }
     }
 
     #[test]
