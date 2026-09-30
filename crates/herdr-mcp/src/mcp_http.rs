@@ -79,6 +79,7 @@ const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
 #[derive(Clone)]
 struct BrowserActuationBroker {
     inner: Arc<(Mutex<BrowserActuationState>, Condvar)>,
+    wake_tx: tokio::sync::watch::Sender<u64>,
     timeout: Duration,
     create_timeout: Duration,
     late_completion_ttl: Duration,
@@ -101,8 +102,10 @@ struct PendingBrowserActuation {
 
 impl Default for BrowserActuationBroker {
     fn default() -> Self {
+        let (wake_tx, _) = tokio::sync::watch::channel(0_u64);
         Self {
             inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
+            wake_tx,
             timeout: BROWSER_ACTUATION_TIMEOUT,
             create_timeout: BROWSER_SESSION_CREATE_ACTUATION_TIMEOUT,
             late_completion_ttl: BROWSER_LATE_COMPLETION_TTL,
@@ -113,12 +116,18 @@ impl Default for BrowserActuationBroker {
 impl BrowserActuationBroker {
     #[cfg(test)]
     fn with_durations(timeout: Duration, late_completion_ttl: Duration) -> Self {
+        let (wake_tx, _) = tokio::sync::watch::channel(0_u64);
         Self {
             inner: Arc::new((Mutex::new(BrowserActuationState::default()), Condvar::new())),
+            wake_tx,
             timeout,
             create_timeout: timeout,
             late_completion_ttl,
         }
+    }
+
+    fn subscribe_wake(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.wake_tx.subscribe()
     }
 
     fn prune_expired(&self, state: &mut BrowserActuationState) {
@@ -270,6 +279,9 @@ impl BrowserActuator for BrowserActuationBroker {
             "params": command_params,
         }));
         ready.notify_all();
+        self.wake_tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
 
         let timeout = if operation == "herdr_mcp.browser_session.create" {
             self.create_timeout
@@ -1969,6 +1981,7 @@ struct PushFilters {
 struct PushStreamState {
     cache: Arc<EventCache>,
     cursor_rx: tokio::sync::watch::Receiver<u64>,
+    browser_actuation_rx: tokio::sync::watch::Receiver<u64>,
     cursor: u64,
     filters: PushFilters,
     statuses: HashMap<String, String>,
@@ -2201,6 +2214,7 @@ fn push_events_response(
     // cannot be missed. At worst an already-included event causes one harmless
     // immediate no-op wake on the first loop iteration.
     let cursor_rx = cache.subscribe_cursor();
+    let browser_actuation_rx = browser_actuation.subscribe_wake();
     let digest = cache.digest_since(u64::MAX);
     let agents = push_agent_views(&digest.agents);
     let statuses = agents
@@ -2215,6 +2229,7 @@ fn push_events_response(
     let state = PushStreamState {
         cache,
         cursor_rx,
+        browser_actuation_rx,
         cursor: digest.cursor,
         filters,
         statuses,
@@ -2258,7 +2273,14 @@ fn push_events_response(
                 "agents": agents,
                 "workspaces": workspaces,
             });
-            let body = format!("retry: 2000\n\n{}", sse_event("hello", &hello));
+            let mut body = format!("retry: 2000\n\n{}", sse_event("hello", &hello));
+            if state.trusted_extension_ipc
+                && let Some(command) = state
+                    .browser_actuation
+                    .take_next_for_extension(state.browser_endpoint_ref.as_deref())
+            {
+                body.push_str(&sse_event("browser_actuation", &command));
+            }
             return Some((Ok::<Bytes, Infallible>(Bytes::from(body)), state));
         }
 
@@ -2266,6 +2288,11 @@ fn push_events_response(
             let heartbeat_wait = SSE_HEARTBEAT.saturating_sub(state.last_heartbeat.elapsed());
             tokio::select! {
                 changed = state.cursor_rx.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                changed = state.browser_actuation_rx.changed(), if state.trusted_extension_ipc => {
                     if changed.is_err() {
                         return None;
                     }
@@ -4481,6 +4508,7 @@ mod tests {
         let endpoint_b = format!("bep_{}", "b".repeat(64));
         broker.note_extension_poll(Some(&endpoint_a));
         broker.note_extension_poll(Some(&endpoint_b));
+        let mut wake_rx = broker.subscribe_wake();
 
         let task_broker = broker.clone();
         let task_endpoint = endpoint_a.clone();
@@ -4493,12 +4521,10 @@ mod tests {
                 None,
             )
         });
-        loop {
-            if !broker.inner.0.lock().unwrap().queued.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        tokio::time::timeout(Duration::from_millis(100), wake_rx.changed())
+            .await
+            .expect("actuation enqueue must wake push far before the 15s heartbeat")
+            .expect("browser actuation wake channel stays open");
 
         assert!(
             broker.take_next_for_extension(Some(&endpoint_b)).is_none(),
@@ -5123,15 +5149,18 @@ mod tests {
     fn push_transition_emits_only_new_work_and_working_to_settled() {
         let cache = Arc::new(EventCache::from_snapshot_for_test(json!({})));
         let cursor_rx = cache.subscribe_cursor();
+        let browser_actuation = BrowserActuationBroker::default();
+        let browser_actuation_rx = browser_actuation.subscribe_wake();
         let mut state = PushStreamState {
             cache,
             cursor_rx,
+            browser_actuation_rx,
             cursor: 0,
             filters: PushFilters::default(),
             statuses: HashMap::new(),
             first: false,
             last_heartbeat: Instant::now(),
-            browser_actuation: BrowserActuationBroker::default(),
+            browser_actuation,
             trusted_extension_ipc: false,
             browser_endpoint_ref: None,
         };

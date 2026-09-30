@@ -9,31 +9,11 @@ const KEYS = [
   "idleNudgeEnabled",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled", "experimentalGeminiEnabled",
 ];
-let loadedHostPermissionOrigins = [];
 const TEMPLATE_FIELDS = [
   ["template", "wakeTemplate", "default_wake_template"],
   ["manualContinueMessage", "manualContinueMessage", "manual_continue_message"],
   ["progressTemplate", "progressTemplate", "default_progress_template"],
 ];
-
-function configuredHostPermissionOrigins(config) {
-  const origins = [];
-  if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
-  if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
-  if (config.experimentalGeminiEnabled === true) origins.push("https://gemini.google.com/*");
-  return [...new Set(origins)];
-}
-
-async function requestHostPermissions(origins) {
-  if (!origins.length) return true;
-  if (!chrome.permissions?.request) return false;
-  return chrome.permissions.request({ origins });
-}
-
-async function removeHostPermissions(origins) {
-  if (!origins.length || !chrome.permissions?.remove) return;
-  try { await chrome.permissions.remove({ origins }); } catch (_) {}
-}
 
 function runtimeMessage(message) {
   return new Promise((resolve) => {
@@ -123,7 +103,6 @@ async function loadForm() {
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
   $("experimentalGeminiEnabled").checked = cfg.experimentalGeminiEnabled === true;
-  loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg);
 }
 
 function templateDefaults() {
@@ -203,21 +182,11 @@ $("save").addEventListener("click", async () => {
     experimentalGeminiEnabled: $("experimentalGeminiEnabled").checked,
     uiLocale: getLocale(),
   };
-  const nextPermissionOrigins = configuredHostPermissionOrigins(config);
-  let granted = false;
-  try { granted = await requestHostPermissions(nextPermissionOrigins); } catch (_) { granted = false; }
-  if (!granted) {
-    setStatus(`${t("save_failed")}: ${t("host_permission_denied")}`, "err");
-    return;
-  }
   const { resp, error } = await runtimeMessage({ type: "h2w_set_config", config });
   if (error || !resp?.ok) {
     setStatus(`${t("save_failed")}: ${error}`, "err");
     return;
   }
-  const staleOrigins = loadedHostPermissionOrigins.filter((origin) => !nextPermissionOrigins.includes(origin));
-  await removeHostPermissions(staleOrigins);
-  loadedHostPermissionOrigins = nextPermissionOrigins;
   setStatus(`✓ ${t("saved")}`, "ok");
   $("manualContinueMessage").value = config.manualContinueMessage;
 });

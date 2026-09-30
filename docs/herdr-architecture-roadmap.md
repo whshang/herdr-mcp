@@ -15,7 +15,7 @@
 - **first-party DEV/PROD 公共 Edge contract 为 epoch 7 / 19 actions，workstation Runtime Execution Contract 为 epoch 4 / 18 tools**；第 19 个 `herdr_devices` 由 Edge 本地执行，不转发到 workstation；Runtime epoch 2/3 与公共 Edge epoch 3 仅作为有界的 rollback/compatibility 身份保留。
 - **浏览器控制面是有界的**：不宣称 browser true-steer；普通终端只开放有 target fencing 的窄化 `Run command -> pane.send_input + Enter`，任意 Herdr method 仍保持 preview-only。
 - **Semantic/Jev 是 Runtime 统一的 advisory decision plane，不是第二执行权威**：浏览器 Auto 的普通 post-turn 顺序保持 deterministic safety/scope gates → Runtime typed-evaluation route（Jev）→ Runtime chat route（LLM）→ bounded script fallback；Goal Supervisor 可消费 Jev 五信号 prior，但 Work Memory/TODO 与 deterministic guards 仍独占完成、等待、接力、人工边界和 uncertain-delivery 的执行许可。Parent orchestration 复用同一个 `SemanticService`：非平凡 dispatch 可用 planning advice；durable inbox 只在出现未 acknowledge terminal 时，对最多 16 个 child summary 做一次 1.5 s bounded attention batch；`verify_completion` 进入确定性 validation，`continue_unobserved` 让独立 child 继续；validation 只能重排冻结检查，closeout 只做 post-validation 分类，cleanup advice 不能改变 `safe_to_delete`。缺少/超时/失败的 semantic route 必须保持原确定性流程，Browser 不再维护第二套 semantic wait/阈值。扩展只消费 Runtime 语义能力，不保存 Provider endpoint/model/key；Provider 配置只有 mode-`0600` 的单机 `config.json` 与 Cloudflare Worker 全局 route pool 两层，并统一使用 `name / protocol / url / model / api_key` JSON route；typed evaluation/chat 模式由 `protocol` 推导。不得重新引入浏览器侧 Provider 配置、环境变量 Provider 配置、用户可选语义策略、可调概率边界、可编辑 judge prompt/completion token 或第二套 orchestration/Goal authority。
-- **`v0.4.8` 是当前稳定 0.4.x 产品基线**；1.0 未发布能力仍必须描述为 development/upcoming，不能提前写成当前产品能力。
+- **1.0 已于 2026-09-23 正式发布**；`v0.4.8` 保留为历史 0.4.x 升级基线。1.1 尚未发布的 Browser Adapter Platform 能力必须继续描述为 development/upcoming。
 
 ## 总体目标
 
@@ -71,6 +71,47 @@ rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 2. **Cross-WebChat Delegation**：ChatGPT 保持 Planner Lease，把有界任务委派给 Gemini Web Chat execution lane，Gemini 结果回写同一 Work Chain，Gemini 不成为第二 Planner。
 
 Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint 状态合同；Gemini DOM adapter、Browser Endpoint Registry 与 External Dispatch 均留到后续阶段。
+
+## 1.1 核心：Browser Adapter Platform
+
+1.1 的主轴是把 1.0 已验证的 WebChat Browser Registry、generation fencing、idempotency、delivery evidence、Page Assist 与 Extension/Native Messaging 链路推广成一个**有界、可扩展、可自开发 Adapter 的浏览器执行平台**。OpenCLI / opencli-mcp 作为场景和能力模型参考，目标覆盖 Generic Browser Use、登录态内容提取、社交搜索/读取、AI 网页生成、下载/artifact、站点 Adapter 与 Adapter author/repair 这类能力范式，不要求首版复制其全部站点命令。详细设计见 [`docs/_wip/v1.1-browser-adapter-platform.md`](./_wip/v1.1-browser-adapter-platform.md)。
+
+产品目标：
+
+- **Browser Extension 是 1.1 唯一 Web/browser 执行面**；2026-09-26 起停止 ChatGPT Desktop tweak 路线，不把 Electron preload/renderer 注入、桌面客户端 patch/install/update/restore 纳入 1.1；桌面应用仍可作为 MCP/CLI client 使用 Herdr，但网页控制统一经过 Herdr Extension；
+- ChatGPT / Grok / Claude 继续保留冻结的 provider/session/result/Continuity 语义，只下沉共享 tab/page lifecycle、observe/act/verify/finalize 基础，不改走 generic Adapter catalog；
+- Alpha 8 Page Assist 吸收到同一 Generic Web kernel；未知用户授权网站先拥有 open/claim/observe/click/fill/expect/screenshot/finalize 最小纵向，额外 typed primitive 由真实 reference Adapter 证明后再加；
+- `BrowserPage` 只是短生命周期、generation-fenced view handle；Browser Registry 继续独占 WebChat durable identity，不新增第二套持久 page catalog；
+- 提供 reviewed builtin + user-local Browser Adapter；Bilibili/X/Doubao 先以 builtin Adapter 验证签名、鉴权和长任务边界，再冻结 local `adapter.json`；
+- 本地 Adapter 使用 version/digest、显式 origin/access、声明式 typed Browser operations，不要求 Rust Runtime 内嵌第二套 JavaScript 执行引擎；
+- Adapter authoring 采用 draft -> real try -> atomic activate，失败 trial 不覆盖当前 active Adapter；
+- Adapter 命令通过现有 Progressive SkillService 按需引导 search/describe/run，不把所有站点命令永久塞进 MCP schema，也不建立第二套 Skill registry；
+- Browser mutation 继续复用一个 Runtime reservation、`not_applied / applied / uncertain` 与 verify-before-retry；Adapter 不得建立第二套 retry/idempotency/wait 权威；
+- **Jev 作为可选本地快速决策层**：Runtime 只把有界 BrowserPage observation 和确定性候选动作交给现有 `SemanticService`，Jev 只能选择下一步 typed action / done / blocked / escalate；权限、generation/ref、幂等、delivery、敏感字段、人工边界与资源清理仍由 Runtime 决定。Jev 未配置、超时、异常或 uncertain 时直接回到普通 planner 路径，Generic Web 仍完整可用；
+- Chrome 用户 tab 与 Herdr-created tab 明确区分 ownership；Service Worker restart 后通过 Extension session ownership + Runtime operation evidence 恢复/清理 Herdr-owned resources，finalize 不得误关用户 tab；
+- 正常 Store 扩展在安装/加载时一次申请 required `<all_urls>` host access，Generic Web 后续不再逐站弹出 Herdr 权限请求；每次 BrowserPage 访问前仍检查 Chrome 对目标 origin 的实时权限，用户在 Chrome 里限制站点后继续 fail closed。1.1 核心执行不增加 mandatory `debugger` 权限。
+
+首批真实参考场景：
+
+1. **Bilibili transcript**：reviewed builtin Adapter 处理已验证的视频/字幕 identity 与站点签名边界，返回结构化字幕/分段与来源 URL，再交给模型总结；
+2. **X search/read**：reviewed builtin Adapter 使用当前浏览器登录态与已验证的 page-origin request/UI strategy，返回结构化帖子与 canonical URLs，再由模型总结；
+3. **Doubao image generation**：reviewed builtin UI Adapter 只提交一次图片生成 mutation，立即保留稳定 operation/dispatch identity，后续通过 status/reconciliation 等待完成并返回 artifact evidence / deliverable tab；uncertain 时禁止重复提交。
+
+1.1 的核心阶段顺序：
+
+```text
+alpha.1  Provider plugin boundary + Browser ownership + Alpha 8 Page Assist absorption
+alpha.2  Generic Web typed BrowserPage + screenshot + optional Jev fast path + real-browser UAT
+alpha.3  Bilibili / X / Doubao reviewed builtin Adapter real-browser UAT
+alpha.4  Local Adapter registry + minimal declarative package
+beta.1   Adapter draft / try / activate / repair / rollback + authoring Skill
+beta.2   ChatGPT / Grok / Claude convergence on shared Browser Kernel
+rc.1     packaging / permissions / compatibility / rollback / multi-device acceptance
+```
+
+2026-09-26 本地 `main` 已完成 alpha.1 与 alpha.2 的确定性主体：provider capability/identity/project/policy 插件边界、共享 Browser Page Kernel、opaque `page_ref`、owned/claimed lifecycle、`browser_session.open` 失败页清理，以及 `browser_page.action` 的 observe/click/fill/expect。alpha.2 剩余项是 screenshot、三类真实网页 UAT 与 Jev 可选快路径；这些完成前不冻结 Adapter package schema。
+
+1.1 不把“任意网页”解释为无限制 RPA。普通生产路径继续禁止 local Adapter 任意 JS/eval、cookie/storage secret 导出、任意 shell/filesystem 访问与隐式接管用户 tab；高影响发布、支付、删除、授权等动作继续走确定性 human-boundary。
 
 ## 已完成并验收
 
@@ -340,6 +381,8 @@ Continuity 2.0 是 `v0.4.2` 之后的正式未来版本目标之一，但**当�
 - 绑定单一 Coding Agent 或要求本机必须安装某个 Agent；
 - 第二套 Web Agent 编排系统；
 - 为所有操作强制引入 Task/Project/Workflow 对象；
-- 通用浏览器自动化平台。
+- 浏览器之外的通用桌面 GUI/RPA 平台；
+- ChatGPT Desktop preload/renderer tweak、Electron 客户端 patch/install/update/restore 路线；该 2026-09-21 spike 已于 2026-09-26 决定退役，1.1 网页执行统一走 Herdr Browser Extension；
+- 把任意 JavaScript/CDP/cookie/storage 权限作为 1.1 普通 Store 用户的默认浏览器能力。
 
-未来只有在真实使用数据证明现有 Herdr + fs/Git/exec + 可替换 worker 无法表达需求时，再通过 adapter/plugin 或新的 contract epoch 评估。
+浏览器 Adapter Platform 已进入 1.1 主线；其它跨桌面/跨应用自动化只有在真实使用数据证明现有 Herdr + fs/Git/exec + Browser Adapter + 可替换 worker 无法表达需求时，再通过 adapter/plugin 或新的 contract epoch 评估。

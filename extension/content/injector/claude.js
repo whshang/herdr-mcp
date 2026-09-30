@@ -1,8 +1,14 @@
 // injector/claude.js — claude.ai Browser Registry adapter
 // Keep provider-specific URL/DOM/account details here. Browser Registry, consent,
 // dispatch fencing, and idempotency remain provider-neutral in background/runtime.
+const CLAUDE_ADAPTER_CAPABILITIES = Object.freeze({
+  browserActuation: true,
+  stopGeneration: true,
+});
+
 class ClaudeAdapter extends BaseAdapter {
   get name() { return "claude"; }
+  get capabilities() { return CLAUDE_ADAPTER_CAPABILITIES; }
   get needsMainWorldInsert() { return true; }
 
   getSessionIdentity() {
@@ -27,6 +33,22 @@ class ClaudeAdapter extends BaseAdapter {
 
   getCanonicalConversationUrl() {
     return this.getConversationKey();
+  }
+
+  async resolveProjectIdentity(convKey) {
+    let project = this.getProjectIdentity();
+    if (project) return project;
+
+    // Claude renders the stable /chat/<uuid> route before its chat header.
+    // Wait boundedly for the breadcrumb so reload cannot alternate parent scope.
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (this.getConversationKey() !== convKey) return null;
+      project = this.getProjectIdentity();
+      if (project) return project;
+    }
+    return null;
   }
 
   getProjectIdentity() {
@@ -284,4 +306,4 @@ class ClaudeAdapter extends BaseAdapter {
   }
 }
 
-window.__H2W_ADAPTER__ = new ClaudeAdapter();
+registerH2WAdapter(new ClaudeAdapter());

@@ -1192,11 +1192,14 @@ export async function handleMcp(
     if (selectorValue !== undefined && typeof selectorValue !== "string") {
       return rpcError(id, -32602, "Invalid params", { reason: "device must be a string" });
     }
+    const isPageAssistPrivateMethod = localMethod === "herdr_mcp.page_assist"
+      || localMethod === "herdr_mcp.browser_page.lifecycle"
+      || localMethod === "herdr_mcp.browser_page.action";
     const isBrowserPrivateMethod = typeof localMethod === "string"
-      && localMethod.startsWith("herdr_mcp.browser_");
+      && localMethod.startsWith("herdr_mcp.browser_")
+      && !isPageAssistPrivateMethod;
     const isAgentTaskCaller = name === "herdr_prompt"
       || localMethod === "herdr_mcp.agent.task.dispatch";
-    const isPageAssistPrivateMethod = localMethod === "herdr_mcp.page_assist";
     if (isBrowserPrivateMethod || isPageAssistPrivateMethod) {
       if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {
         return rpcResult(id, callToolResult({

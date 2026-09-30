@@ -6,24 +6,24 @@
   const ADAPTER = window.__H2W_ADAPTER__;
   const SPEAKS = window.__H2W_SPEAKS_JSON__;
   const CORE = globalThis.H2W_JSON_BRIDGE_CORE;
-  if (!ADAPTER || !SPEAKS?.enabled || !CORE || !["z.ai", "deepseek"].includes(ADAPTER.name)) {
+  if (!ADAPTER || !SPEAKS?.enabled || !CORE || ADAPTER.policy?.jsonBridge !== true) {
     window.__H2W_JSON_BRIDGE__ = null;
     return;
   }
 
-  const experimentalFlag = ADAPTER.name === "z.ai"
-    ? "experimentalZAiEnabled"
-    : "experimentalDeepSeekEnabled";
-  try {
-    const cfg = await chrome.storage.local.get([experimentalFlag]);
-    if (cfg?.[experimentalFlag] !== true) {
-      console.log(`[h2w-json] ${ADAPTER.name} integration is experimental and disabled`);
+  const experimentalFlag = ADAPTER.policy?.experimentalStorageFlag || null;
+  if (experimentalFlag) {
+    try {
+      const cfg = await chrome.storage.local.get([experimentalFlag]);
+      if (cfg?.[experimentalFlag] !== true) {
+        console.log(`[h2w-json] ${ADAPTER.name} integration is experimental and disabled`);
+        window.__H2W_JSON_BRIDGE__ = null;
+        return;
+      }
+    } catch (_) {
       window.__H2W_JSON_BRIDGE__ = null;
       return;
     }
-  } catch (_) {
-    window.__H2W_JSON_BRIDGE__ = null;
-    return;
   }
 
   const ROUND_YIELD_INTERVAL = 12;
