@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +10,268 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
+
+const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
+const browserPageLifecycleEnd = backgroundSource.indexOf("\nasync function performPageAssistRequest", browserPageLifecycleStart);
+assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,
+  "BrowserPage lifecycle helpers must remain extractable");
+const browserPageLifecycleSource = backgroundSource.slice(browserPageLifecycleStart, browserPageLifecycleEnd);
+
+function browserPageLifecycleHarness({
+  sessionStorage = {},
+  tabs = new Map(),
+  contentResponder = null,
+  permissionAllowed = true,
+  screenshotResponder = null,
+  artifactResponder = null,
+  deferredCreate = false,
+} = {}) {
+  let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
+  const activatedListeners = new Set();
+  const focusListeners = new Set();
+  const storageArea = {
+    async get(key) { return { [key]: structuredClone(sessionStorage[key] || []) }; },
+    async set(value) { Object.assign(sessionStorage, structuredClone(value)); },
+  };
+  const chrome = {
+    storage: { session: storageArea },
+    tabs: {
+      async get(tabId) {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error("tab missing");
+        return { ...tab };
+      },
+      async query(query = {}) {
+        return [...tabs.values()]
+          .filter((tab) => query.windowId == null || tab.windowId === query.windowId)
+          .filter((tab) => query.active !== true || tab.active === true)
+          .map((tab) => ({ ...tab }));
+      },
+      async create(info) {
+        const tab = {
+          id: nextTabId++,
+          windowId: 1,
+          url: deferredCreate ? null : info.url,
+          pendingUrl: deferredCreate ? info.url : null,
+          status: deferredCreate ? "loading" : "complete",
+          active: info.active === true,
+        };
+        tabs.set(tab.id, tab);
+        return { ...tab };
+      },
+      async remove(tabId) {
+        if (!tabs.delete(tabId)) throw new Error("tab missing");
+      },
+      async sendMessage(tabId, payload) {
+        if (!contentResponder) throw new Error("Receiving end does not exist");
+        return contentResponder(tabId, payload);
+      },
+      async captureVisibleTab(windowId, options) {
+        if (!screenshotResponder) throw new Error("capture unavailable");
+        return screenshotResponder(windowId, options, {
+          activate(tabId) {
+            for (const tab of tabs.values()) {
+              if (tab.windowId === windowId) tab.active = tab.id === tabId;
+            }
+            for (const listener of activatedListeners) {
+              listener({ tabId, windowId });
+            }
+          },
+        });
+      },
+      onActivated: {
+        addListener(listener) { activatedListeners.add(listener); },
+        removeListener(listener) { activatedListeners.delete(listener); },
+      },
+    },
+    windows: {
+      async get(windowId) {
+        const anyTab = [...tabs.values()].some((tab) => tab.windowId === windowId);
+        if (!anyTab) throw new Error("window missing");
+        return { id: windowId, focused: true };
+      },
+      onFocusChanged: {
+        addListener(listener) { focusListeners.add(listener); },
+        removeListener(listener) { focusListeners.delete(listener); },
+      },
+    },
+    scripting: {
+      async executeScript() {},
+    },
+  };
+  const code = [
+    "const crypto = ctx.crypto;",
+    "const chrome = ctx.chrome;",
+    "const URL = ctx.URL;",
+    "const Date = ctx.Date;",
+    "const BROWSER_PAGE_SESSION_STORAGE_KEY = 'herdrBrowserPagesV1';",
+    "const BROWSER_PAGE_MAX_RECORDS = 128;",
+    "const browserPagesByRef = new Map();",
+    "let browserPagesLoaded = false;",
+    "let browserPagesLoadPromise = null;",
+    "let browserEndpoint = null;",
+    "const configReady = Promise.resolve();",
+    "const originToMatchPattern = (origin) => origin + '/*';",
+    "const hasHostPermission = async () => ctx.permissionAllowed;",
+    "const getBrowserObservationGeneration = async () => 17;",
+    "const waitForTabComplete = async (tabId) => ctx.waitForTabComplete(tabId);",
+    "const registerLocalBrowserEndpoint = async () => ({ endpoint_ref: 'bep_test' });",
+    "const browserEndpointView = (endpoint) => endpoint;",
+    "const captureImageArtifactNative = async (artifact) => ctx.captureImageArtifactNative(artifact);",
+    browserPageLifecycleSource,
+    "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, browserPagesByRef };",
+  ].join("\n");
+  const api = new Function("ctx", code)({
+    crypto: webcrypto,
+    chrome,
+    URL,
+    Date,
+    permissionAllowed,
+    waitForTabComplete: async (tabId) => {
+      const tab = tabs.get(tabId);
+      if (!tab) return null;
+      if (tab.pendingUrl) {
+        tab.url = tab.pendingUrl;
+        tab.pendingUrl = null;
+        tab.status = "complete";
+      }
+      return { ...tab };
+    },
+    captureImageArtifactNative: async (artifact) => {
+      if (!artifactResponder) throw new Error("artifact capture unavailable");
+      return artifactResponder(artifact);
+    },
+  });
+  return { ...api, sessionStorage, tabs };
+}
+
+test("user opens a loading generic page | Given Chrome returns only pendingUrl from tabs.create | When BrowserPage waits for navigation completion | Then the owned page is bound to the live URL and retained", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const h = browserPageLifecycleHarness({ sessionStorage, tabs, deferredCreate: true });
+  const opened = await h.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-pending-url-1",
+  });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.ownership, "owned");
+  assert.equal(opened.canonical_url, "https://example.com/app");
+  assert.equal(tabs.size, 1);
+  assert.equal([...tabs.values()][0].url, "https://example.com/app");
+  assert.equal(sessionStorage.herdrBrowserPagesV1.length, 1);
+});
+
+test("user finalizes one owned generic page | Given open is retried across a service-worker restart | When the same idempotency key and then page_ref are used | Then one tab is reused and the exact owned tab is closed", async () => {
+  const sessionStorage = {};
+  const tabs = new Map();
+  const first = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const opened = await first.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-owned-1",
+  });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.ownership, "owned");
+  assert.equal(opened.reused, false);
+  assert.match(opened.page_ref, /^bp_[0-9a-f]{64}$/);
+  assert.equal(tabs.size, 1);
+  assert.equal([...tabs.values()][0].active, false);
+  assert.equal(sessionStorage.herdrBrowserPagesV1.length, 1);
+
+  const restarted = browserPageLifecycleHarness({ sessionStorage, tabs });
+  const replayed = await restarted.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "open-owned-1",
+  });
+  assert.equal(replayed.ok, true);
+  assert.equal(replayed.reused, true);
+  assert.equal(replayed.page_ref, opened.page_ref);
+  assert.equal(tabs.size, 1);
+
+  const finalized = await restarted.performBrowserPageLifecycleRequest({
+    action: "finalize",
+    pageRef: opened.page_ref,
+    idempotencyKey: "finalize-owned-1",
+  });
+  assert.equal(finalized.ok, true);
+  assert.equal(finalized.finalized, true);
+  assert.equal(finalized.tab_closed, true);
+  assert.equal(finalized.tab_cleanup_verified, true);
+  assert.equal(tabs.size, 0);
+  assert.deepEqual(sessionStorage.herdrBrowserPagesV1, []);
+
+  const capacityStorage = {};
+  const capacityTabs = new Map();
+  const capacity = browserPageLifecycleHarness({
+    sessionStorage: capacityStorage,
+    tabs: capacityTabs,
+  });
+  for (let index = 0; index < 128; index += 1) {
+    const result = await capacity.performBrowserPageLifecycleRequest({
+      action: "open",
+      targetOrigin: "https://example.com",
+      url: `https://example.com/page-${index}`,
+      idempotencyKey: `open-capacity-${index}`,
+    });
+    assert.equal(result.ok, true);
+  }
+  const overCapacity = await capacity.performBrowserPageLifecycleRequest({
+    action: "open",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/page-over-capacity",
+    idempotencyKey: "open-capacity-overflow",
+  });
+  assert.equal(overCapacity.ok, false);
+  assert.equal(overCapacity.error, "browser_page_storage_unavailable");
+  assert.equal(overCapacity.tab_cleanup_verified, true);
+  assert.equal(capacityTabs.size, 128);
+  assert.equal(capacityStorage.herdrBrowserPagesV1.length, 128);
+  assert.ok(capacityStorage.herdrBrowserPagesV1.every((record) => record.ownership === "owned"));
+});
+
+test("user releases a claimed generic page | Given one exact user tab and another unrelated tab | When claim and release run | Then the user tab survives and ambiguous duplicate claims fail closed", async () => {
+  const tabs = new Map([
+    [41, { id: 41, url: "https://example.com/app", active: true }],
+    [42, { id: 42, url: "https://example.com/other", active: false }],
+  ]);
+  const h = browserPageLifecycleHarness({ tabs });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "claim-user-1",
+  });
+  assert.equal(claimed.ok, true);
+  assert.equal(claimed.ownership, "claimed");
+  assert.equal(tabs.has(41), true);
+
+  const released = await h.performBrowserPageLifecycleRequest({
+    action: "release",
+    pageRef: claimed.page_ref,
+    idempotencyKey: "release-user-1",
+  });
+  assert.equal(released.ok, true);
+  assert.equal(released.released, true);
+  assert.equal(released.tab_closed, false);
+  assert.equal(tabs.has(41), true);
+
+  tabs.set(43, { id: 43, url: "https://example.com/app", active: false });
+  const ambiguous = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "claim-user-2",
+  });
+  assert.equal(ambiguous.ok, false);
+  assert.equal(ambiguous.error, "target_tab_ambiguous");
+  assert.equal(tabs.has(41), true);
+  assert.equal(tabs.has(43), true);
+});
 
 const projectPageInfoStart = backgroundSource.indexOf("function browserProjectPageInfoFromSupportedUrl(");
 const projectPageInfoEnd = backgroundSource.indexOf("\nfunction browserPageContextInfoFromSupportedUrl", projectPageInfoStart);
@@ -48,21 +311,20 @@ const projectIdentityEnd = wakeSource.indexOf(
 assert.ok(projectIdentityStart >= 0 && projectIdentityEnd > projectIdentityStart, "provider project identity helper must remain extractable");
 const projectIdentitySource = wakeSource.slice(projectIdentityStart, projectIdentityEnd);
 
-function delayedClaudeProjectIdentityHarness(sequence) {
-  let index = 0;
+function projectIdentityDelegationHarness(project) {
+  const calls = [];
   const convKey = "https://claude.ai/chat/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
   const ADAPTER = {
-    name: "claude",
-    getConversationKey: () => convKey,
-    getProjectIdentity: () => sequence[Math.min(index, sequence.length - 1)] ?? null,
+    resolveProjectIdentity: async (value) => {
+      calls.push(value);
+      return project;
+    },
   };
-  const wait = async () => { index += 1; };
   const observe = new Function(
     "ADAPTER",
-    "wait",
     `${projectIdentitySource}; return currentAdapterProjectIdentity;`,
-  )(ADAPTER, wait);
-  return { observe, convKey, calls: () => index + 1 };
+  )(ADAPTER);
+  return { observe, convKey, calls };
 }
 
 function canonicalIdentityRecoveryHarness(tabRecords, scopeRecords = new Map()) {
@@ -243,6 +505,216 @@ function recoveryHarness(tabRecords) {
   return { recover, browserSessionTargets, queryArgs };
 }
 
+test("user acts on an opaque generic page | Given one claimed BrowserPage and a current DOM generation | When observe and click run through the shared kernel route | Then raw tab identity stays local and lost mutation response is uncertain", async () => {
+  const sessionStorage = {};
+  const tabs = new Map([
+    [51, { id: 51, url: "https://example.com/app", active: true }],
+  ]);
+  let failMutationTransport = false;
+  const contentResponder = (tabId, payload) => {
+    if (failMutationTransport && payload.action === "click") {
+      throw new Error("response channel lost");
+    }
+    if (payload.action === "observe") {
+      return {
+        ok: true,
+        origin: "https://example.com",
+        url: "https://example.com/app",
+        generation: "pa_gen_test",
+        text: "Ready",
+        elements: [{ ref: "ref_pa_gen_test_0", role: "button", text: "Run" }],
+      };
+    }
+    if (payload.action === "click") {
+      const tab = tabs.get(tabId);
+      tab.url = "https://example.com/next";
+      tab.status = "complete";
+      return {
+        ok: true,
+        generation: payload.generation,
+        ref: payload.ref,
+        navigation_url: "https://example.com/next",
+      };
+    }
+    throw new Error(`unexpected action ${payload.action}`);
+  };
+  const h = browserPageLifecycleHarness({ sessionStorage, tabs, contentResponder });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "claim-action-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const observed = await h.performBrowserPageActionRequest({
+    action: "observe",
+    pageRef: claimed.page_ref,
+    maxChars: 128,
+  });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.page_ref, claimed.page_ref);
+  assert.equal(observed.generation, "pa_gen_test");
+  assert.equal(Object.hasOwn(observed, "tab_id"), false);
+
+  const restricted = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    contentResponder,
+    permissionAllowed: false,
+  });
+  const denied = await restricted.performBrowserPageActionRequest({
+    action: "click",
+    pageRef: claimed.page_ref,
+    generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.error, "permission_required");
+  assert.equal(denied.reason, "host_permission_missing");
+  assert.equal(denied.delivery_state, "not_applied");
+  assert.equal(denied.retry_safe, true);
+  assert.equal(denied.mutation_submitted, false);
+
+  const applied = await h.performBrowserPageActionRequest({
+    action: "click",
+    pageRef: claimed.page_ref,
+    generation: observed.generation,
+    ref: observed.elements[0].ref,
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.delivery_state, "applied");
+  assert.equal(applied.retry_safe, false);
+  assert.equal(applied.mutation_submitted, true);
+  assert.equal(Object.hasOwn(applied, "tab_id"), false);
+  assert.equal(Object.hasOwn(applied, "navigation_url"), false);
+  assert.equal(applied.page_generation, 2);
+  const rebound = h.browserPagesByRef.get(claimed.page_ref);
+  assert.equal(rebound.canonical_url, "https://example.com/next");
+  assert.equal(rebound.page_generation, 2);
+
+  failMutationTransport = true;
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "click",
+    pageRef: claimed.page_ref,
+    generation: "pa_gen_next",
+    ref: "ref_pa_gen_next_0",
+  });
+  assert.equal(uncertain.ok, false);
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  assert.equal(uncertain.mutation_submitted, true);
+});
+
+test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
+  const sessionStorage = {};
+  const tabs = new Map([
+    [61, {
+      id: 61,
+      windowId: 7,
+      url: "https://example.com/app",
+      active: true,
+    }],
+  ]);
+  let artifactCalls = 0;
+  const h = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    screenshotResponder(windowId, options) {
+      assert.equal(windowId, 7);
+      assert.deepEqual(options, { format: "jpeg", quality: 80 });
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder(artifact) {
+      artifactCalls += 1;
+      assert.match(artifact.source_id, /^bp_[0-9a-f]{64}$/);
+      assert.match(artifact.artifact_key, /^screenshot_[0-9]+_[0-9a-f]{16}$/);
+      assert.equal(artifact.mime, "image/jpeg");
+      assert.equal(artifact.bytes_b64, "/9j/4AAQSkZJRg==");
+      return {
+        ok: true,
+        artifact: {
+          artifact_id: "0123456789abcdef0123456789abcdef",
+          conversation_id: artifact.source_id,
+          file_id: artifact.artifact_key,
+          mime: "image/jpeg",
+          bytes: 42,
+          sha256: "b".repeat(64),
+          captured_at: 100,
+          expires_at: 200,
+        },
+      };
+    },
+  });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/app",
+    idempotencyKey: "claim-screenshot-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const screenshot = await h.performBrowserPageActionRequest({
+    action: "screenshot",
+    pageRef: claimed.page_ref,
+  });
+  assert.equal(screenshot.ok, true);
+  assert.equal(screenshot.capture_scope, "visible_tab");
+  assert.equal(screenshot.page_ref, claimed.page_ref);
+  assert.equal(screenshot.origin, "https://example.com");
+  assert.equal(screenshot.canonical_url, "https://example.com/app");
+  assert.deepEqual(screenshot.artifact, {
+    artifact_id: "0123456789abcdef0123456789abcdef",
+    mime: "image/jpeg",
+    bytes: 42,
+    sha256: "b".repeat(64),
+    captured_at: 100,
+    expires_at: 200,
+  });
+  assert.equal(Object.hasOwn(screenshot.artifact, "bytes_b64"), false);
+  assert.equal(Object.hasOwn(screenshot, "tab_id"), false);
+  assert.equal(artifactCalls, 1);
+
+  tabs.get(61).active = false;
+  const hidden = await h.performBrowserPageActionRequest({
+    action: "screenshot",
+    pageRef: claimed.page_ref,
+  });
+  assert.equal(hidden.ok, false);
+  assert.equal(hidden.error, "browser_page_screenshot_not_visible");
+  assert.equal(hidden.retryable, true);
+  assert.equal(artifactCalls, 1);
+
+  tabs.get(61).active = true;
+  tabs.set(62, {
+    id: 62,
+    windowId: 7,
+    url: "https://example.com/other",
+    active: false,
+  });
+  const raced = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    screenshotResponder(_windowId, _options, control) {
+      control.activate(62);
+      control.activate(61);
+      return "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    },
+    artifactResponder() {
+      artifactCalls += 1;
+      throw new Error("raced screenshot must never reach artifact capture");
+    },
+  });
+  const racedResult = await raced.performBrowserPageActionRequest({
+    action: "screenshot",
+    pageRef: claimed.page_ref,
+  });
+  assert.equal(racedResult.ok, false);
+  assert.equal(racedResult.error, "browser_page_screenshot_view_changed");
+  assert.equal(racedResult.retryable, true);
+  assert.equal(artifactCalls, 1);
+});
+
 test("user sees WebChat control on Claude and Grok project homes | Given supported provider project URLs without conversations | When project page identity is parsed | Then project context exists without a conversation key", () => {
   const claude = browserProjectPageInfoFromSupportedUrl(
     "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
@@ -388,7 +860,11 @@ function registrationHarness(initialConvKey = "https://claude.ai/chat/aaaaaaaa-a
     let registeredBrowserGeneration = 1;
     let browserRegistrationAttempt = 0;
     const pending = [];
-    const ADAPTER = { name: "claude", getConversationKey: () => currentConvKey };
+    const ADAPTER = {
+      name: "claude",
+      getConversationKey: () => currentConvKey,
+      resolveProjectIdentity: () => null,
+    };
     const location = { get href() { return currentUrl; } };
     const runtimeAlive = () => true;
     const browserAccountNativeIdentity = async () => "opaque-account";
@@ -946,15 +1422,16 @@ test("terminal stale session reservations do not block ordinary browser identity
   assert.doesNotMatch(segment, /browser_session_materialization_conflict[\s\S]*reservationRef:\s*null/);
 });
 
-test("user keeps one Claude Browser Registry session across reload | Given the Project breadcrumb renders after the chat route | When registration resolves the provider scope | Then it waits for the Project identity before choosing the parent", async () => {
+test("user keeps provider-specific Project resolution inside the adapter | Given one exact conversation key | When registration resolves provider scope | Then it delegates that key without provider branching", async () => {
   const project = {
     id: "01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
     name: "herdr-mcp",
     key: "https://claude.ai/project/01a0606c-0d44-773b-b0b5-f4ed8ebf78c4",
   };
-  const harness = delayedClaudeProjectIdentityHarness([null, null, project]);
+  const harness = projectIdentityDelegationHarness(project);
   assert.deepEqual(await harness.observe(harness.convKey), project);
-  assert.equal(harness.calls(), 3);
+  assert.deepEqual(harness.calls, [harness.convKey]);
+  assert.doesNotMatch(projectIdentitySource, /ADAPTER\.name/);
 });
 
 test("conversation registration fences route changes before and after async background registration", () => {
@@ -1036,8 +1513,22 @@ test("user Given unavailable browser actuation When the content script rejects i
 
   function makeActuator(ctx = {}) {
     return new Function("ctx", `
+      const adapterName = ctx.adapterName || "chatgpt";
+      const capabilities = adapterName === "chatgpt"
+        ? {
+            browserActuation: true,
+            stopGeneration: true,
+            sessionCreate: true,
+            sessionOpen: true,
+            chatModeGuard: true,
+          }
+        : (["gemini", "claude", "grok"].includes(adapterName)
+          ? { browserActuation: true, stopGeneration: true }
+          : {});
       const ADAPTER = {
-        name: ctx.adapterName || "chatgpt",
+        name: adapterName,
+        capabilities,
+        prepareBrowserActuation: async () => ({ ok: true, switched: false }),
         getConversationKey: () => ctx.currentConvKey || "conv-current",
         getCanonicalConversationUrl: () => ctx.canonicalObserved === false ? "" : "https://chatgpt.com/c/current",
       };
@@ -1141,6 +1632,7 @@ test("user can stop a live answer | Given an explicit visible stop control while
     };
     const ADAPTER = {
       name: "chatgpt",
+      capabilities: { browserActuation: true, stopGeneration: true },
       getConversationKey: () => "conv-current",
       getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
       getStopButtonCandidates: () => ctx.clicked ? [] : [stopButton],
@@ -1258,6 +1750,12 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
   const act = new Function("ctx", `
     const ADAPTER = {
       name: "chatgpt",
+      capabilities: {
+        browserActuation: true,
+        sessionCreate: true,
+        chatModeGuard: true,
+      },
+      prepareBrowserActuation: async () => ({ ok: true, switched: false }),
       getConversationKey: () => "https://chatgpt.com/c/current",
       getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
       getInputEl: () => ({}),
@@ -1276,7 +1774,6 @@ test("user keeps an unconfirmed ChatGPT submit fail-closed | Given one dispatch 
     const currentHerdrRequiredApps = () => ["herdr"];
     const providerCanonicalConversationObserved = () => true;
     const document = { hidden: false };
-    const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
     const isTurnInProgress = () => false;
     const runtimeAlive = () => true;
     const wait = async () => {};
@@ -1348,6 +1845,12 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
   const act = new Function("ctx", `
     const ADAPTER = {
       name: "chatgpt",
+      capabilities: {
+        browserActuation: true,
+        sessionCreate: true,
+        chatModeGuard: true,
+      },
+      prepareBrowserActuation: async () => ({ ok: true, switched: false }),
       getConversationKey: () => "https://chatgpt.com/g/g-p-test/project",
       getCanonicalConversationUrl: () => "",
       getInputEl: () => ({}),
@@ -1366,7 +1869,6 @@ test("user waits through transient fresh ChatGPT composer busy without a second 
     const currentHerdrRequiredApps = () => [];
     const providerCanonicalConversationObserved = () => false;
     const document = { hidden: false };
-    const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
     const isTurnInProgress = () => {
       const value = ctx.busySequence[ctx.busyChecks] ?? false;
       ctx.busyChecks += 1;
@@ -1418,6 +1920,13 @@ test("user receives exact content rejection reasons | Given browser controls rej
     return new Function("ctx", `
       const ADAPTER = {
         name: "chatgpt",
+        capabilities: {
+          browserActuation: true,
+          stopGeneration: true,
+          sessionCreate: true,
+          chatModeGuard: true,
+        },
+        prepareBrowserActuation: async () => ({ ok: true, switched: false }),
         getConversationKey: () => "conv-current",
         getCanonicalConversationUrl: () => "https://chatgpt.com/c/current",
         getInputEl: () => (ctx.inputAvailable === false ? null : {}),
@@ -1434,7 +1943,6 @@ test("user receives exact content rejection reasons | Given browser controls rej
       const currentHerdrRequiredApps = () => ["herdr"];
       const providerCanonicalConversationObserved = () => true;
       const document = { hidden: false };
-      const ensureChatGptChatMode = async () => ({ ok: true, switched: false });
       const isTurnInProgress = () => ctx.turnInProgress === true;
       const runtimeAlive = () => true;
       const Date = { now: () => ctx.now || 0 };
@@ -1568,6 +2076,9 @@ test("user resumes an exact ChatGPT session | Given service-worker target cache 
   assert.doesNotMatch(segment, /sendBrowserActuationTabMessage\(targetOpen\.tabId/);
   assert.match(segment, /chrome\.tabs\.update.*active:\s*true.*autoDiscardable:\s*false/);
   assert.match(segment, /protectBoundTab/);
+  assert.match(segment, /browser_open_target_register_timeout/);
+  assert.match(segment, /chrome\.tabs\.remove\(createdTab\.id\)/);
+  assert.match(segment, /tab_cleanup_verified:\s*tabCleanupVerified/);
   assert.doesNotMatch(segment, /insertMainWorld|performWake|executeScript/);
   assert.match(segment, /observedGenerationOpen/);
   assert.match(segment, /providerOpen !== "chatgpt"/);
@@ -2314,11 +2825,13 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const createEnd = wakeSource.indexOf("\n  // Browser Registry identity cached by the page script", createStart);
   const createSegment = wakeSource.slice(createStart, createEnd);
   assert.match(createSegment, /sessionStorage\.setItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY, reservationRef\)/);
-  assert.match(createSegment, /const chatMode = await ensureChatGptChatMode\(\)/);
-  assert.match(createSegment, /result: \{ error: chatMode\.error \}/);
+  assert.match(createSegment, /adapterSupports\("sessionCreate"\)/);
+  assert.match(createSegment, /adapterSupports\("chatModeGuard"\)/);
+  assert.match(createSegment, /const ready = await ADAPTER\.prepareBrowserActuation\(\)/);
+  assert.match(createSegment, /result: \{ error: ready\?\.error \|\| "browser_adapter_not_ready" \}/);
   assert.ok(
-    createSegment.indexOf("const chatMode = await ensureChatGptChatMode()") < createSegment.indexOf("const composerReadyDeadline"),
-    "fresh-session actuation must enter Chat mode before waiting for the composer",
+    createSegment.indexOf("const ready = await ADAPTER.prepareBrowserActuation()") < createSegment.indexOf("const composerReadyDeadline"),
+    "fresh-session actuation must prepare the provider before waiting for the composer",
   );
   assert.match(createSegment, /const composerReadyDeadline = Date\.now\(\) \+ 20000/);
   assert.match(createSegment, /let freshCreateStableIdleSamples = 0/);
@@ -2360,23 +2873,23 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
 });
 
-test("ChatGPT browser actuation switches Work mode to Chat mode through the visible radio control", () => {
-  const visibleHelperStart = wakeSource.indexOf("function visibleChatGptModeRadio(pattern)");
-  const helperStart = wakeSource.indexOf("async function ensureChatGptChatMode()");
-  const helperEnd = wakeSource.indexOf("\n  async function performBrowserActuationCommand", helperStart);
-  assert.ok(visibleHelperStart >= 0 && helperStart > visibleHelperStart && helperEnd > helperStart, "Chat mode helpers must exist before browser actuation");
-  const helper = wakeSource.slice(visibleHelperStart, helperEnd);
-  assert.match(helper, /button\[role="radio"\]/);
-  assert.match(helper, /getBoundingClientRect\(\)/);
-  assert.match(helper, /rect\.width > 0/);
-  assert.match(helper, /rect\.height > 0/);
-  assert.match(helper, /聊天\|Chat\|チャット/);
-  assert.match(helper, /工作\|Work\|作業/);
-  assert.match(helper, /work\.getAttribute\("aria-checked"\) !== "true"/);
-  assert.match(helper, /chat\.click\(\)/);
-  assert.match(helper, /chat\.getAttribute\("aria-checked"\) === "true"/);
-  assert.match(helper, /work\.getAttribute\("aria-checked"\) === "false"/);
-  assert.match(helper, /chat_mode_switch_timeout/);
+test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is active | When browser actuation runs | Then the provider adapter switches to Chat mode", () => {
+  assert.match(chatGptAdapterSource, /chatModeGuard:\s*true/);
+  assert.match(chatGptAdapterSource, /async prepareBrowserActuation\(\)/);
+  assert.match(chatGptAdapterSource, /button\[role="radio"\]/);
+  assert.match(chatGptAdapterSource, /getBoundingClientRect\(\)/);
+  assert.match(chatGptAdapterSource, /rect\.width > 0/);
+  assert.match(chatGptAdapterSource, /rect\.height > 0/);
+  assert.match(chatGptAdapterSource, /聊天\|Chat\|チャット/);
+  assert.match(chatGptAdapterSource, /工作\|Work\|作業/);
+  assert.match(chatGptAdapterSource, /work\.getAttribute\("aria-checked"\) !== "true"/);
+  assert.match(chatGptAdapterSource, /chat\.click\(\)/);
+  assert.match(chatGptAdapterSource, /chat\.getAttribute\("aria-checked"\) === "true"/);
+  assert.match(chatGptAdapterSource, /work\.getAttribute\("aria-checked"\) === "false"/);
+  assert.match(chatGptAdapterSource, /chat_mode_switch_timeout/);
+  assert.match(wakeSource, /adapterSupports\("chatModeGuard"\)/);
+  assert.match(wakeSource, /await ADAPTER\.prepareBrowserActuation\(\)/);
+  assert.doesNotMatch(wakeSource, /function visibleChatGptModeRadio|function ensureChatGptChatMode/);
 });
 
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {

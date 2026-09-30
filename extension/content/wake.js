@@ -58,11 +58,7 @@ function normalizeHerdrMentionAlias(value) {
   const ADAPTER = window.__H2W_ADAPTER__;
   const CORE = window.HerdrChatGptArtifactCore;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
-  const experimentalFlag = ADAPTER.name === "z.ai"
-    ? "experimentalZAiEnabled"
-    : (ADAPTER.name === "deepseek"
-      ? "experimentalDeepSeekEnabled"
-      : (ADAPTER.name === "gemini" ? "experimentalGeminiEnabled" : null));
+  const experimentalFlag = ADAPTER.policy?.experimentalStorageFlag || null;
   if (experimentalFlag) {
     try {
       const cfg = await chrome.storage.local.get([experimentalFlag]);
@@ -127,7 +123,7 @@ function normalizeHerdrMentionAlias(value) {
     try { return !!chrome.runtime?.id; } catch { return false; }
   }
   function usesOperationalHud() {
-    return ["chatgpt", "z.ai", "deepseek"].includes(ADAPTER.name);
+    return ADAPTER.policy?.operationalHud === true;
   }
   function sendBg(msg) {
     return new Promise((resolve) => {
@@ -1017,7 +1013,7 @@ function normalizeHerdrMentionAlias(value) {
     if (isSendButton(btn)) {
       const baseline = captureSubmitAckBaseline(btn);
       btn.click();
-      if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
+      if (await waitForSubmitAck(baseline, ADAPTER.policy?.submitAckTimeoutMs ?? 4000)) return true;
     }
     const enterBaseline = captureSubmitAckBaseline(findSendButton());
     dispatchEnterSubmit(ADAPTER.getInputEl());
@@ -1033,7 +1029,7 @@ function normalizeHerdrMentionAlias(value) {
       if (isSendButton(btn)) {
         const baseline = captureSubmitAckBaseline(btn);
         btn.click();
-        if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
+        if (await waitForSubmitAck(baseline, ADAPTER.policy?.submitAckTimeoutMs ?? 4000)) return true;
       }
       const enterBaseline = captureSubmitAckBaseline(findSendButton());
       dispatchEnterSubmit(ADAPTER.getInputEl());
@@ -1566,6 +1562,13 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  function adapterSupports(capability) {
+    if (typeof ADAPTER.supportsCapability === "function") {
+      return ADAPTER.supportsCapability(capability);
+    }
+    return ADAPTER.capabilities?.[String(capability || "")] === true;
+  }
+
   function browserUnavailableEvidence(evidence, reason) {
     const safeReason = typeof reason === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(reason)
       ? reason
@@ -1991,50 +1994,12 @@ function normalizeHerdrMentionAlias(value) {
     return evidence;
   }
 
-  function visibleChatGptModeRadio(pattern) {
-    return [...document.querySelectorAll('button[role="radio"]')].find((button) => {
-      if (!ADAPTER.elementVisible(button)) return false;
-      const rect = button.getBoundingClientRect();
-      return rect.width > 0
-        && rect.height > 0
-        && pattern.test(normText(button.innerText || button.textContent || ""));
-    }) || null;
-  }
-
-  async function ensureChatGptChatMode() {
-    if (ADAPTER.name !== "chatgpt") return { ok: true, switched: false };
-    const chat = visibleChatGptModeRadio(/^(?:聊天|Chat|チャット)$/i);
-    const work = visibleChatGptModeRadio(/^(?:工作|Work|作業)$/i);
-    if (!chat && !work) return { ok: true, switched: false };
-    if (!chat || !work) return { ok: false, error: "chat_mode_ambiguous" };
-    if (chat.getAttribute("aria-checked") === "true") {
-      return { ok: true, switched: false };
-    }
-    if (work.getAttribute("aria-checked") !== "true") {
-      return { ok: false, error: "chat_mode_ambiguous" };
-    }
-    try {
-      chat.click();
-    } catch (_) {
-      return { ok: false, error: "chat_mode_switch_failed" };
-    }
-    const deadline = Date.now() + 3000;
-    do {
-      if (chat.getAttribute("aria-checked") === "true"
-          && work.getAttribute("aria-checked") === "false") {
-        return { ok: true, switched: true };
-      }
-      await wait(100);
-    } while (Date.now() < deadline);
-    return { ok: false, error: "chat_mode_switch_timeout" };
-  }
-
   async function performBrowserActuationCommand(command) {
     const dispatchId = typeof command?.dispatch_id === "string" ? command.dispatch_id : "";
     const expectedGeneration = Number(command?.expected_generation || 0);
     const evidence = browserActuationEvidence(expectedGeneration);
     const creatingSession = command?.operation === "herdr_mcp.browser_session.create";
-    if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)
+    if (!adapterSupports("browserActuation")
         || !Number.isSafeInteger(expectedGeneration)
         || expectedGeneration < 1) {
       return browserUnavailableEvidence(evidence, "browser_actuation_context_unavailable");
@@ -2045,7 +2010,7 @@ function normalizeHerdrMentionAlias(value) {
     if (creatingSession) {
       const params = command?.params && typeof command.params === "object" ? command.params : {};
       const reservationRef = typeof params.reservation_ref === "string" ? params.reservation_ref : "";
-      if (ADAPTER.name !== "chatgpt" || !/^bsr_[0-9a-f]{64}$/.test(reservationRef)) {
+      if (!adapterSupports("sessionCreate") || !/^bsr_[0-9a-f]{64}$/.test(reservationRef)) {
         return browserUnavailableEvidence(evidence, "browser_create_reservation_invalid");
       }
       try {
@@ -2058,7 +2023,7 @@ function normalizeHerdrMentionAlias(value) {
       evidence.canonical_url_observed = false;
     }
     if (command?.operation === "herdr_mcp.browser_session.open") {
-      if (ADAPTER.name !== "chatgpt") {
+      if (!adapterSupports("sessionOpen")) {
         return browserUnavailableEvidence(evidence, "browser_open_provider_unavailable");
       }
       const params = command?.params && typeof command.params === "object" ? command.params : {};
@@ -2093,10 +2058,10 @@ function normalizeHerdrMentionAlias(value) {
     if (command?.operation === "herdr_mcp.browser_session.archive") {
       return performChatGptSessionArchive(command, evidence);
     }
-    if (!["chatgpt", "gemini", "claude", "grok"].includes(ADAPTER.name)) {
-      return browserUnavailableEvidence(evidence, "browser_actuation_provider_unavailable");
-    }
     if (command?.operation === "herdr_mcp.browser_dispatch.stop") {
+      if (!adapterSupports("stopGeneration")) {
+        return browserRejectedEvidence(evidence, "browser_stop_control_unavailable");
+      }
       const candidates = typeof ADAPTER.getStopButtonCandidates === "function"
         ? ADAPTER.getStopButtonCandidates()
         : [];
@@ -2144,13 +2109,13 @@ function normalizeHerdrMentionAlias(value) {
         creatingSession ? "browser_create_params_invalid" : "browser_dispatch_params_invalid",
       );
     }
-    if (ADAPTER.name === "chatgpt") {
-      const chatMode = await ensureChatGptChatMode();
-      if (!chatMode.ok) {
+    if (adapterSupports("chatModeGuard")) {
+      const ready = await ADAPTER.prepareBrowserActuation();
+      if (!ready?.ok) {
         if (creatingSession) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         }
-        return { ...evidence, rejected: true, result: { error: chatMode.error } };
+        return { ...evidence, rejected: true, result: { error: ready?.error || "browser_adapter_not_ready" } };
       }
     }
     if (creatingSession) {
@@ -3005,32 +2970,12 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function browserAccountNativeIdentity() {
-    if (ADAPTER.name === "chatgpt") {
-      try {
-        const response = await fetch("/backend-api/me", {
-          method: "GET",
-          credentials: "include",
-          cache: "no-store",
-          headers: { accept: "application/json" },
-        });
-        if (!response.ok) return null;
-        const payload = await response.json();
-        const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-        return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-      } catch (_) {
-        return null;
-      }
+    try {
+      const value = await ADAPTER.getAccountNativeIdentity();
+      return typeof value === "string" && value.trim() ? value.trim() : null;
+    } catch (_) {
+      return null;
     }
-    if (["gemini", "claude", "grok"].includes(ADAPTER.name)
-        && typeof ADAPTER.getAccountNativeIdentity === "function") {
-      try {
-        const value = await ADAPTER.getAccountNativeIdentity();
-        return typeof value === "string" && value.trim() ? value.trim() : null;
-      } catch (_) {
-        return null;
-      }
-    }
-    return null;
   }
 
   async function chatGptProjectCatalog(accountNativeIdentity) {
@@ -3097,23 +3042,7 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   async function currentAdapterProjectIdentity(convKey) {
-    if (typeof ADAPTER.getProjectIdentity !== "function") return null;
-    let project = ADAPTER.getProjectIdentity();
-    if (project || ADAPTER.name !== "claude") return project;
-
-    // Claude renders the stable /chat/<uuid> route before its chat header.
-    // Give the header breadcrumb one bounded observation window so the same
-    // conversation cannot alternate between account- and Project-parented
-    // Browser Registry sessions across reloads. A real non-Project chat still
-    // registers after the window expires; route drift cancels the observation.
-    const deadline = Date.now() + 2500;
-    while (Date.now() < deadline) {
-      await wait(100);
-      if (ADAPTER.getConversationKey() !== convKey) return null;
-      project = ADAPTER.getProjectIdentity();
-      if (project) return project;
-    }
-    return null;
+    return ADAPTER.resolveProjectIdentity(convKey);
   }
 
   async function registerCurrentConversation(reason = "startup") {
@@ -4698,7 +4627,7 @@ function normalizeHerdrMentionAlias(value) {
     syncAutomationPermissionWatch();
     // The operational HUD is shared by ChatGPT and the JSON-bridge sites.
     // ChatGPT-only idle/recovery watchers remain scoped to ChatGPT below.
-    if (["chatgpt", "z.ai", "deepseek"].includes(ADAPTER.name)) {
+    if (usesOperationalHud()) {
       startPageHud();
     }
     // Talk-without-tools: watch turn boundaries and ask background to check MCP activity.

@@ -61,6 +61,8 @@ herdr-mcp native-host status
 
 active なチャネル、拡張 identity、Native Host、現在の runtime generation が一致している必要があります。STORE は Chrome Web Store、STANDALONE は正式な独立パッケージ、DEV は開発者による明示的な Reload で更新されます。拡張の更新後は、長時間開いている Web ページを更新して現在の content script を受け取らせてください。
 
+現在の 1.1 開発版は、拡張のインストールまたは読み込み時に必須の `<all_urls>` host access を要求し、Generic Web BrowserPage が新しいサイトごとに追加の権限ダイアログを出さずに動作できるようにします。より狭い host permission を使っていた旧版から更新する場合、Chrome が追加権限について一度だけ確認を求めることがあります。承認後、Herdr は実行時にサイトごとの host permission を要求しません。
+
 ## 入口と状態オブジェクト
 
 | 概念 / 入口 | 単一の責務 |

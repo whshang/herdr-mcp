@@ -59,6 +59,9 @@ pub const BROWSER_COMPOSER_SET_APPS_METHOD: &str = "herdr_mcp.browser_composer.s
 pub const BROWSER_DISPATCH_SUBMIT_METHOD: &str = "herdr_mcp.browser_dispatch.submit";
 pub const BROWSER_DISPATCH_STATUS_METHOD: &str = "herdr_mcp.browser_dispatch.status";
 pub const BROWSER_DISPATCH_STOP_METHOD: &str = "herdr_mcp.browser_dispatch.stop";
+pub const BROWSER_PAGE_LIFECYCLE_METHOD: &str = "herdr_mcp.browser_page.lifecycle";
+pub const BROWSER_PAGE_ACTION_METHOD: &str = "herdr_mcp.browser_page.action";
+pub const BROWSER_PAGE_FAST_PATH_METHOD: &str = "herdr_mcp.browser_page.fast_path";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
@@ -93,6 +96,8 @@ const ENGINEERING_ROBUSTNESS: &str =
     include_str!("../../../assets/herdr/skills/engineering-robustness/SKILL.md");
 const REQUIREMENTS_GRILLING: &str =
     include_str!("../../../assets/herdr/skills/requirements-grilling/SKILL.md");
+const BROWSER_ADAPTER_AUTHOR: &str =
+    include_str!("../../../assets/herdr/skills/browser-adapter-author/SKILL.md");
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Digest(String);
@@ -157,7 +162,7 @@ struct BuiltinSkillSpec {
     owned_tools: &'static [&'static str],
 }
 
-const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
+const BUILTIN_SKILLS: [BuiltinSkillSpec; 10] = [
     BuiltinSkillSpec {
         id: "workstation-control",
         description: "Control live Herdr workspaces, panes, agents, incremental state, and native methods.",
@@ -319,6 +324,24 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
         requires_capabilities: &[],
         related_skills: &["workstation-control", "development-orchestration"],
         risk_domains: &[],
+        owned_tools: &[],
+    },
+    BuiltinSkillSpec {
+        id: "browser-adapter-author",
+        description: "Teach Herdr a website by exploring it with BrowserPage and persisting the verified workflow as an ordinary project-local Skill.",
+        content: BROWSER_ADAPTER_AUTHOR,
+        triggers: &[
+            "generic web",
+            "teach herdr this website",
+            "browser adapter",
+            "site adapter",
+            "site automation",
+            "browserpage",
+            "adapter drift",
+        ],
+        requires_capabilities: &["consented browser endpoint", "live origin permission"],
+        related_skills: &["workstation-control", "files-mutation"],
+        risk_domains: &["browser-mutation"],
         owned_tools: &[],
     },
 ];
@@ -2965,11 +2988,12 @@ mod tests {
     fn catalog_is_stable_and_covers_all_non_skill_tools_once() {
         let service = ProgressiveSkillService::new();
         let catalog = service.catalog();
-        assert_eq!(catalog.len(), 9);
+        assert_eq!(catalog.len(), 10);
         assert_eq!(catalog[0].id, "workstation-control");
         assert_eq!(catalog[6].id, "development-orchestration");
         assert_eq!(catalog[7].id, "engineering-robustness");
         assert_eq!(catalog[8].id, "requirements-grilling");
+        assert_eq!(catalog[9].id, "browser-adapter-author");
         let tools = catalog
             .iter()
             .flat_map(|item| item.owned_tools.iter().cloned())
@@ -3100,13 +3124,49 @@ mod tests {
     }
 
     #[test]
+    fn browser_adapter_author_is_catalogued_and_loadable() {
+        let service = ProgressiveSkillService::new();
+        let descriptor = service
+            .catalog()
+            .into_iter()
+            .find(|item| item.id == "browser-adapter-author")
+            .expect("browser-adapter-author must be in the builtin catalog");
+        assert!(
+            descriptor
+                .triggers
+                .iter()
+                .any(|trigger| trigger == "teach herdr this website")
+        );
+        assert!(descriptor.owned_tools.is_empty());
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["browser-adapter-author"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["ok"], true);
+        let content = loaded["skills"][0]["content"].as_str().unwrap();
+        assert!(content.contains(BROWSER_PAGE_LIFECYCLE_METHOD));
+        assert!(content.contains(BROWSER_PAGE_ACTION_METHOD));
+        assert!(content.contains("herdr_mcp.skill.list"));
+        assert!(content.contains(".agents/skills/herdr-browser-"));
+        assert!(content.contains("page_ref"));
+        assert!(content.contains("BrowserPage kernel"));
+        assert!(content.contains("permission_required / host_permission_missing"));
+        assert!(content.contains("text_present"));
+        assert!(content.contains("screenshot"));
+        assert!(content.contains("Do not add another manifest, `adapter.json`"));
+    }
+
+    #[test]
     fn discovery_does_not_load_and_batched_load_hits_immutable_cache() {
         with_isolated_home(|| {
             let service = ProgressiveSkillService::new();
             let listed = service
                 .local_call(LOCAL_LIST_METHOD, &json!({}), &snapshot())
                 .unwrap();
-            assert_eq!(listed["count"], 9);
+            assert_eq!(listed["count"], 10);
             assert_eq!(service.cache_len(), 0);
             let first = service
                 .local_call(
@@ -3256,7 +3316,7 @@ mod tests {
         let result = service.bootstrap_with_inventory(&snapshot(), &[]);
         assert_eq!(result["ok"], true);
         assert_eq!(result["mode"], "progressive");
-        assert_eq!(result["catalog"].as_array().unwrap().len(), 9);
+        assert_eq!(result["catalog"].as_array().unwrap().len(), 10);
         assert_eq!(result["load"]["method"], LOCAL_LOAD_METHOD);
         assert_eq!(result["planning_advice"]["method"], PLANNING_ADVISE_METHOD);
         assert_eq!(result["planning_advice"]["decision_owner"], "web_planner");
@@ -3915,7 +3975,7 @@ mod tests {
         assert_eq!(methods[5]["params"]["oneOf"].as_array().unwrap().len(), 2);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
-        assert_eq!(methods.len(), 20);
+        assert_eq!(methods.len(), 22);
         assert_eq!(methods[0]["method"], BROWSER_ENDPOINT_LIST_METHOD);
         assert_eq!(methods[1]["method"], BROWSER_ENDPOINT_INSPECT_METHOD);
         assert_eq!(methods[2]["method"], BROWSER_RESOURCE_LIST_METHOD);
@@ -3975,10 +4035,36 @@ mod tests {
         assert_eq!(methods[16]["method"], BROWSER_DISPATCH_SUBMIT_METHOD);
         assert_eq!(methods[17]["method"], BROWSER_DISPATCH_STATUS_METHOD);
         assert_eq!(methods[18]["method"], BROWSER_DISPATCH_STOP_METHOD);
-        assert_eq!(methods[19]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
-        assert_eq!(methods[19]["access"], "read_only");
+        assert_eq!(methods[19]["method"], BROWSER_PAGE_LIFECYCLE_METHOD);
+        assert_eq!(methods[19]["access"], "mutation");
         assert_eq!(
             methods[19]["params"]["required"],
+            json!(["endpoint_ref", "action"])
+        );
+        assert_eq!(
+            methods[19]["params"]["properties"]["action"]["enum"],
+            json!(["open", "claim", "release", "finalize"])
+        );
+        assert_eq!(methods[19]["params"]["oneOf"].as_array().unwrap().len(), 2);
+        assert_eq!(methods[20]["method"], BROWSER_PAGE_ACTION_METHOD);
+        assert_eq!(methods[20]["access"], "mutation");
+        assert_eq!(
+            methods[20]["params"]["required"],
+            json!(["endpoint_ref", "page_ref", "action"])
+        );
+        assert_eq!(
+            methods[20]["params"]["properties"]["action"]["enum"],
+            json!(["observe", "click", "fill", "expect", "screenshot"])
+        );
+        assert_eq!(
+            methods[20]["params"]["properties"]["objective"]["maxLength"],
+            1024
+        );
+        assert_eq!(methods[20]["params"]["oneOf"].as_array().unwrap().len(), 5);
+        assert_eq!(methods[21]["method"], BROWSER_HANDOFF_PREPARE_METHOD);
+        assert_eq!(methods[21]["access"], "read_only");
+        assert_eq!(
+            methods[21]["params"]["required"],
             json!(["continuity_id", "source_url"])
         );
         assert_eq!(
@@ -4357,7 +4443,7 @@ description: \"user ego\"
             )
             .unwrap();
         assert_eq!(listed["ok"], true);
-        assert_eq!(listed["count"], 10); // 9 builtin + 1 unique project alpha
+        assert_eq!(listed["count"], 11); // 10 builtin + 1 unique project alpha
         let skills = listed["skills"].as_array().unwrap();
         let alpha = skills
             .iter()
@@ -4398,7 +4484,7 @@ description: \"user ego\"
                 )
                 .unwrap();
             assert_eq!(listed["ok"], true);
-            assert_eq!(listed["count"], 9);
+            assert_eq!(listed["count"], 10);
         });
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&project);
@@ -4595,7 +4681,7 @@ description: \"user ego\"
                 &snapshot(),
             )
             .unwrap();
-        assert_eq!(listed["count"], 9, "oversized skill is skipped");
+        assert_eq!(listed["count"], 10, "oversized skill is skipped");
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("HOME", value),

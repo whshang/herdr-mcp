@@ -30,8 +30,13 @@ function harness(url = "https://gemini.google.com/app/abc123") {
   class BaseAdapter {
     elementVisible(candidate) { return Boolean(candidate?.visible); }
   }
+  const registerH2WAdapter = (adapter) => {
+    window.__H2W_ADAPTER__ = adapter;
+    return adapter;
+  };
   const context = vm.createContext({
     BaseAdapter,
+    registerH2WAdapter,
     URL,
     TextEncoder,
     Uint8Array,
@@ -118,6 +123,12 @@ test("Gemini adapter observes user/assistant baselines without inventing provide
     JSON.parse(JSON.stringify(h.adapter.getMessageSnapshot("assistant"))),
     { messageId: "local-dom-id", text: "answer", count: 1 },
   );
+});
+
+test("user keeps Gemini browser actuation capabilities | Given the Gemini adapter is loaded | When capabilities are read | Then the existing browser actuation capabilities remain available", () => {
+  const h = harness();
+  assert.equal(h.adapter.capabilities.browserActuation, true);
+  assert.equal(h.adapter.capabilities.stopGeneration, true);
 });
 
 test("Gemini adapter hashes Google account email before returning native identity", async () => {
