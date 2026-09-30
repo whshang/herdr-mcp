@@ -61,6 +61,8 @@ herdr-mcp native-host status
 
 The active channel, extension identity, Native Host, and current runtime generation must agree. STORE updates through Chrome Web Store, STANDALONE through formal independent packages, and DEV through an explicit developer Reload. Refresh long-lived Web pages after an extension update so they receive the current content script.
 
+Current 1.1 development builds request required `<all_urls>` host access when the extension is installed or loaded so Generic Web BrowserPage tasks do not need a separate permission prompt for every new site. Upgrading from an older build with narrower host permissions may therefore require one Chrome permission acknowledgment. After that acknowledgment, Herdr does not request per-site host permissions at runtime.
+
 ## Entrypoints and state objects
 
 | Concept / entrypoint | One responsibility |

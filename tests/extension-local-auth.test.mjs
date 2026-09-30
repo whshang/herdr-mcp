@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
+import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
 import { nativeHostFailure } from "../extension/native-host-diagnostics.js";
 
 test("extension proxies localhost requests through Native Messaging without forwarding bearer auth", async () => {
@@ -374,6 +374,60 @@ test("shared native-host diagnostics keep missing, inactive, and unrelated failu
   assert.equal(nativeHostFailure("native-host-request-failed"), null);
   assert.equal(nativeHostFailure(""), null);
   assert.equal(nativeHostFailure(undefined), null);
+});
+
+test("user captures one generic image artifact | Given a bounded source and image payload | When native capture runs | Then only the strict artifact boundary crosses Native Messaging", async () => {
+  const oldChrome = globalThis.chrome;
+  let seen = null;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(host, message, callback) {
+        assert.equal(host, HERDR_NATIVE_HOST);
+        seen = message;
+        callback({
+          ok: true,
+          artifact: {
+            artifact_id: "0123456789abcdef0123456789abcdef",
+            mime: "image/jpeg",
+            bytes: 42,
+            sha256: "a".repeat(64),
+            captured_at: 1,
+            expires_at: 2,
+          },
+        });
+      },
+    },
+  };
+  try {
+    const result = await captureImageArtifactNative({
+      source_id: "bp_" + "a".repeat(64),
+      artifact_key: "screenshot_1_deadbeef",
+      mime: "image/jpeg",
+      bytes_b64: "/9j/4AAQSkZJRg==",
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(
+      Object.keys(seen).sort(),
+      ["bytes_b64", "conversation_id", "file_id", "mime", "type"],
+    );
+    assert.equal(seen.type, "artifact_capture");
+    assert.equal(seen.conversation_id, "bp_" + "a".repeat(64));
+    assert.equal(seen.file_id, "screenshot_1_deadbeef");
+    assert.equal(JSON.stringify(seen).includes("cookie"), false);
+    assert.equal(JSON.stringify(seen).includes("authorization"), false);
+
+    const denied = await captureImageArtifactNative({
+      source_id: "bp_" + "a".repeat(64),
+      artifact_key: "screenshot_1_deadbeef",
+      mime: "image/jpeg",
+      bytes_b64: "/9j/4AAQSkZJRg==",
+      cookie: "secret",
+    });
+    assert.deepEqual(denied, { ok: false, error: "artifact-capture-invalid" });
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
 });
 
 test("generated-image capture forwards only the strict non-secret artifact shape", async () => {
