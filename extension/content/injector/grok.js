@@ -1,8 +1,14 @@
 // injector/grok.js — grok.com Browser Registry adapter
 // Keep Grok-specific URL/DOM/account details here. Browser Registry, consent,
 // generation fencing, and typed dispatch remain provider-neutral.
+const GROK_ADAPTER_CAPABILITIES = Object.freeze({
+  browserActuation: true,
+  stopGeneration: true,
+});
+
 class GrokAdapter extends BaseAdapter {
   get name() { return "grok"; }
+  get capabilities() { return GROK_ADAPTER_CAPABILITIES; }
   get needsMainWorldInsert() { return true; }
 
   getConversationIdentity() {
@@ -292,4 +298,4 @@ class GrokAdapter extends BaseAdapter {
   }
 }
 
-window.__H2W_ADAPTER__ = new GrokAdapter();
+registerH2WAdapter(new GrokAdapter());

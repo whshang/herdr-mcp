@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
-const source = readFileSync(new URL("../extension/content/page-assist.js", import.meta.url), "utf8");
+const kernelSource = readFileSync(new URL("../extension/content/browser-page-kernel.js", import.meta.url), "utf8");
+const compatibilitySource = readFileSync(new URL("../extension/content/page-assist.js", import.meta.url), "utf8");
 
 class TestEvent {
   constructor(type, options = {}) {
@@ -44,6 +45,7 @@ function createElement({
       if (name === "contenteditable" && contentEditable) return "true";
       return attributes.get(name) ?? null;
     },
+    hasAttribute(name) { return attributes.has(name); },
     getBoundingClientRect() {
       return visible ? { width: 120, height: 28 } : { width: 0, height: 0 };
     },
@@ -69,6 +71,7 @@ function harness({
   const location = new URL(url);
   const document = {
     title,
+    readyState: "complete",
     body: { innerText: bodyText, textContent: bodyText },
     querySelectorAll() { return elements; },
   };
@@ -79,6 +82,7 @@ function harness({
     URL,
     Date,
     Event: TestEvent,
+    setTimeout,
     document,
     location,
     chrome: {
@@ -102,7 +106,9 @@ function harness({
   context.top = topOrigin
     ? { location: { origin: topOrigin } }
     : context;
-  vm.runInContext(source, context, { filename: "page-assist.js" });
+  vm.runInContext(kernelSource, context, { filename: "browser-page-kernel.js" });
+  assert.equal(typeof context.H2W_BROWSER_PAGE_KERNEL?.handleAction, "function");
+  vm.runInContext(compatibilitySource, context, { filename: "page-assist.js" });
   assert.equal(typeof listener, "function");
 
   return {
@@ -112,11 +118,26 @@ function harness({
       assert.equal(handled, false);
       return response;
     },
+    sendAsync(message) {
+      return new Promise((resolve) => {
+        const handled = listener(message, {}, resolve);
+        assert.equal(handled, true);
+      });
+    },
   };
 }
 
 test("Page Assist inspect exposes only visible non-sensitive elements through opaque refs", () => {
-  const safeButton = createElement({ tag: "button", text: "Continue" });
+  const safeButton = createElement({ tag: "button", type: "submit", text: "Continue" });
+  const safeLink = createElement({ tag: "a", text: "Details", attrs: { href: "/details" } });
+  const newTabLink = createElement({ tag: "a", text: "More details", attrs: { href: "/more", target: "_blank" } });
+  const logoutLink = createElement({ tag: "a", text: "Account", attrs: { href: "/logout" } });
+  const reveal = createElement({
+    tag: "button",
+    type: "button",
+    text: "More",
+    attrs: { "aria-expanded": "false" },
+  });
   const safeInput = createElement({ tag: "input", type: "text", attrs: { placeholder: "Name" } });
   const password = createElement({ tag: "input", type: "password", attrs: { placeholder: "Password" } });
   const otp = createElement({ tag: "input", type: "text", attrs: { autocomplete: "one-time-code" } });
@@ -125,7 +146,7 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   const disabled = createElement({ tag: "button", text: "Disabled", disabled: true });
   const h = harness({
     bodyText: "x".repeat(200),
-    elements: [safeButton, safeInput, password, otp, card, hidden, disabled],
+    elements: [safeButton, safeLink, newTabLink, logoutLink, reveal, safeInput, password, otp, card, hidden, disabled],
   });
 
   const result = h.send({
@@ -137,10 +158,26 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   assert.equal(result.ok, true);
   assert.equal(result.origin, "https://app.test");
   assert.equal(result.text.length, 32);
-  assert.equal(result.elements.length, 2);
-  assert.equal(result.elements.map((item) => item.text).join("|"), "Continue|Name");
+  assert.equal(result.elements.length, 6);
+  assert.equal(result.elements.map((item) => item.text).join("|"), "Continue|Details|More details|Account|More|Name");
+  assert.equal(result.elements[0].type, "submit");
+  assert.equal(result.elements[0].fast_path, undefined);
+  assert.equal(result.elements[1].fast_path, "same_origin_navigation");
+  assert.equal(result.elements[2].fast_path, undefined);
+  assert.equal(result.elements[3].fast_path, undefined);
+  assert.equal(result.elements[4].fast_path, "reveal");
   assert.ok(result.elements.every((item) => item.ref.startsWith(`ref_${result.generation}_`)));
   assert.ok(result.elements.every((item) => !Object.hasOwn(item, "selector") && !Object.hasOwn(item, "path")));
+
+  const linkClick = h.send({
+    type: "h2w_page_assist",
+    action: "click",
+    expectedOrigin: "https://app.test",
+    generation: result.generation,
+    ref: result.elements[1].ref,
+  });
+  assert.equal(linkClick.ok, true);
+  assert.equal(linkClick.navigation_url, "https://app.test/details");
 });
 
 test("Page Assist click requires the current generation and invalidates refs after one action", () => {
@@ -220,6 +257,52 @@ test("Page Assist fill is bounded and invalidates the generation", () => {
   });
   assert.equal(replay.ok, false);
   assert.equal(replay.error, "stale_generation");
+});
+
+test("user verifies a generic page postcondition | Given an observed same-origin page | When a bounded expect runs | Then document, URL, and text conditions settle without a mutation", async () => {
+  const h = harness({
+    url: "https://app.test/orders",
+    bodyText: "Orders ready",
+  });
+  const observed = h.send({
+    type: "h2w_page_assist",
+    action: "observe",
+    expectedOrigin: "https://app.test",
+    maxChars: 64,
+  });
+  assert.equal(observed.ok, true);
+  assert.equal(observed.url, "https://app.test/orders");
+
+  const ready = await h.sendAsync({
+    type: "h2w_page_assist",
+    action: "expect",
+    expectedOrigin: "https://app.test",
+    condition: "document_ready",
+    timeoutMs: 100,
+  });
+  assert.equal(ready.ok, true);
+  assert.equal(ready.condition, "document_ready");
+
+  const text = await h.sendAsync({
+    type: "h2w_page_assist",
+    action: "expect",
+    expectedOrigin: "https://app.test",
+    condition: "text_present",
+    value: "Orders ready",
+    timeoutMs: 100,
+  });
+  assert.equal(text.ok, true);
+
+  const missing = await h.sendAsync({
+    type: "h2w_page_assist",
+    action: "expect",
+    expectedOrigin: "https://app.test",
+    condition: "text_present",
+    value: "never here",
+    timeoutMs: 0,
+  });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.error, "expect_timeout");
 });
 
 test("Page Assist fails closed inside a cross-origin iframe", () => {

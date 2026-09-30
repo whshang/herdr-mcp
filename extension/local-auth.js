@@ -139,35 +139,55 @@ export async function getNativeExtensionOwnerStatus() {
   return nativeMessage({ type: "identity" }, 5_000);
 }
 
-// Dedicated ChatGPT Web generated-image capture over Native Messaging.
-// Accepts ONLY the strict native-boundary artifact shape
-// { conversation_id, file_id, mime, bytes_b64, sha256? }. Any extra field
-// (token, cookie, authorization, download URL, ...) is rejected before the
-// message is sent, so secrets can never cross to the native host.
+// Generic image capture over the existing strict Native Messaging artifact boundary.
+// source_id and artifact_key stay local identifiers; raw image bytes never enter MCP
+// results. The native host recomputes digest/magic and stores the bounded artifact.
+export async function captureImageArtifactNative(artifact) {
+  if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) {
+    return { ok: false, error: "artifact-capture-invalid" };
+  }
+  const allowed = ["source_id", "artifact_key", "mime", "bytes_b64", "sha256"];
+  const keys = Object.keys(artifact);
+  if (keys.length > allowed.length || keys.some((key) => !allowed.includes(key))) {
+    return { ok: false, error: "artifact-capture-invalid" };
+  }
+  for (const key of ["source_id", "artifact_key", "mime", "bytes_b64"]) {
+    if (typeof artifact[key] !== "string" || !artifact[key]) {
+      return { ok: false, error: "artifact-capture-invalid" };
+    }
+  }
+  if (artifact.sha256 != null
+      && (typeof artifact.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(artifact.sha256))) {
+    return { ok: false, error: "artifact-capture-invalid" };
+  }
+  const strict = {
+    conversation_id: artifact.source_id,
+    file_id: artifact.artifact_key,
+    mime: artifact.mime,
+    bytes_b64: artifact.bytes_b64,
+  };
+  if (artifact.sha256 != null) strict.sha256 = artifact.sha256;
+  return nativeMessage({ type: "artifact_capture", ...strict }, 60_000);
+}
+
+// ChatGPT generated-image capture keeps its existing public helper and wire shape.
 export async function captureWebArtifactNative(artifact) {
   if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) {
     return { ok: false, error: "artifact-capture-invalid" };
   }
   const allowed = ["conversation_id", "file_id", "mime", "bytes_b64", "sha256"];
   const keys = Object.keys(artifact);
-  if (keys.length > allowed.length) return { ok: false, error: "artifact-capture-invalid" };
-  for (const key of keys) {
-    if (!allowed.includes(key)) return { ok: false, error: "artifact-capture-invalid" };
-  }
-  for (const key of ["conversation_id", "file_id", "mime", "bytes_b64"]) {
-    if (typeof artifact[key] !== "string" || !artifact[key]) return { ok: false, error: "artifact-capture-invalid" };
-  }
-  if (artifact.sha256 != null && (typeof artifact.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(artifact.sha256))) {
+  if (keys.length > allowed.length || keys.some((key) => !allowed.includes(key))) {
     return { ok: false, error: "artifact-capture-invalid" };
   }
-  const strict = {
-    conversation_id: artifact.conversation_id,
-    file_id: artifact.file_id,
+  const generic = {
+    source_id: artifact.conversation_id,
+    artifact_key: artifact.file_id,
     mime: artifact.mime,
     bytes_b64: artifact.bytes_b64,
   };
-  if (artifact.sha256 != null) strict.sha256 = artifact.sha256;
-  return nativeMessage({ type: "artifact_capture", ...strict }, 60_000);
+  if (artifact.sha256 != null) generic.sha256 = artifact.sha256;
+  return captureImageArtifactNative(generic);
 }
 
 

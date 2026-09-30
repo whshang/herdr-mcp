@@ -53,7 +53,8 @@ edge/cloudflare/
 │   ├── state.ts              ← persisted session schema + sanitized summaries
 │   ├── logger.ts             ← redacting structured logger
 │   ├── mcp-handler.ts        ← public initialize/discover/tools/list/tools/call handler
-│   └── mcp-chatgpt-transport.ts ← ChatGPT/OpenAI stateless framing helpers
+│   ├── mcp-chatgpt-transport.ts ← ChatGPT/OpenAI stateless framing helpers
+│   └── semantic-proxy.ts     ← optional enrolled-device semantic provider proxy (/semantic/*)
 └── tests/
     ├── *.test.mjs            ← pure-logic unit tests (node --test, no wrangler)
     └── manual/dev-link-smoke.mjs ← optional end-to-end smoke (needs wrangler dev)

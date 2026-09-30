@@ -407,7 +407,6 @@
   "options_runtime_config_routes_hint": "在 semantic.routes 中按优先级顺序配置。decision / decision-vercel 用于类型化判断，openai-chat 用于对话模型。",
   "open_runtime_config_guide": "查看完整 config.json 配置说明",
   "open_github_setup_guide": "打开 Herdr GitHub 新手配置指南",
-  "host_permission_denied": "未授予站点访问权限。Herdr 只会请求你明确启用的站点。",
   "api_base_url_duplicate_slash": "接口路径包含重复斜杠，请修改为 {suggestion} 后再保存。",
   "hud_reason_llm_permission": "未授予小模型站点访问权限",
   "hud_reason_fallback_continue": "自动兜底已发送“继续”",

@@ -41,6 +41,8 @@ local herdr-mcp Rust runtime
 
 ## 2. 范围定义
 
+本文中的“Browser Control Plane”仍专指**浏览器里查看/控制本地 Herdr 工作现场**。1.1 新增的任意网页执行、Browser Kernel 与站点 Adapter 另见 [`v1.1-browser-adapter-platform.md`](v1.1-browser-adapter-platform.md)，两者复用可靠性/权限原则，但不混成同一状态模型。
+
 本文中的“本地开的每一个窗口”指 **Herdr 已知的工作现场**：
 
 ```text

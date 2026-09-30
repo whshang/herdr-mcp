@@ -67,34 +67,6 @@ export function originToMatchPattern(raw) {
 }
 
 /**
- * Parses multiline string or array of origins into a unique normalized list.
- */
-export function parseAllowedOrigins(input) {
-  if (!input) return [];
-  const list = Array.isArray(input)
-    ? input
-    : String(input).split(/[\r\n,]+/);
-  const out = [];
-  for (const item of list) {
-    const origin = normalizeOrigin(item);
-    if (origin && !out.includes(origin)) {
-      out.push(origin);
-    }
-  }
-  return out;
-}
-
-/**
- * Checks if a target origin is included in the allowed list.
- */
-export function isOriginAllowed(targetOrigin, allowedOrigins) {
-  const normalizedTarget = normalizeOrigin(targetOrigin);
-  if (!normalizedTarget) return false;
-  const allowed = parseAllowedOrigins(allowedOrigins);
-  return allowed.includes(normalizedTarget);
-}
-
-/**
  * Recursively checks if an object contains any forbidden parameter names.
  */
 export function hasDisallowedParameters(obj) {
@@ -161,9 +133,10 @@ export function clampVisibleText(rawText, maxChars = DEFAULT_PAGE_ASSIST_MAX_CHA
 
 /**
  * Validates a page assist request fail-closed against allowed operations,
- * parameters, and origin permissions.
+ * parameters, and web-origin shape. Chrome host permission is checked by the
+ * background worker immediately before page access.
  */
-export function validatePageAssistRequest(request, allowedOrigins) {
+export function validatePageAssistRequest(request) {
   if (!request || typeof request !== "object") {
     return { ok: false, error: "invalid_request" };
   }
@@ -182,11 +155,6 @@ export function validatePageAssistRequest(request, allowedOrigins) {
   if (!targetOrigin) {
     return { ok: false, error: "target_origin_required" };
   }
-
-  if (!isOriginAllowed(targetOrigin, allowedOrigins)) {
-    return { ok: false, error: "origin_not_permitted" };
-  }
-
 
   if (action === "inspect") {
     const maxChars = Math.max(

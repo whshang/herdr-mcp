@@ -3,9 +3,78 @@
 //   - composer: div#prompt-textarea[contenteditable="true"] (ProseMirror, role=textbox)
 //   - send button: button[data-testid="send-button"]
 //   - insertion: MAIN-world execCommand insertText commits to the ProseMirror model
+const CHATGPT_ADAPTER_CAPABILITIES = Object.freeze({
+  browserActuation: true,
+  stopGeneration: true,
+  sessionCreate: true,
+  sessionOpen: true,
+  chatModeGuard: true,
+});
+const CHATGPT_ADAPTER_POLICY = Object.freeze({
+  experimentalStorageFlag: null,
+  operationalHud: true,
+  submitAckTimeoutMs: 8000,
+  jsonBridge: false,
+});
+
 class ChatGPTAdapter extends BaseAdapter {
   get name() { return "chatgpt"; }
+  get capabilities() { return CHATGPT_ADAPTER_CAPABILITIES; }
+  get policy() { return CHATGPT_ADAPTER_POLICY; }
   get needsMainWorldInsert() { return true; }
+
+  getVisibleModeRadio(pattern) {
+    return [...document.querySelectorAll('button[role="radio"]')].find((button) => {
+      if (!this.elementVisible(button)) return false;
+      const rect = button.getBoundingClientRect();
+      const label = String(button.innerText || button.textContent || "").replace(/\s+/g, " ").trim();
+      return rect.width > 0 && rect.height > 0 && pattern.test(label);
+    }) || null;
+  }
+
+  async prepareBrowserActuation() {
+    const chat = this.getVisibleModeRadio(/^(?:聊天|Chat|チャット)$/i);
+    const work = this.getVisibleModeRadio(/^(?:工作|Work|作業)$/i);
+    if (!chat && !work) return { ok: true, switched: false };
+    if (!chat || !work) return { ok: false, error: "chat_mode_ambiguous" };
+    if (chat.getAttribute("aria-checked") === "true") {
+      return { ok: true, switched: false };
+    }
+    if (work.getAttribute("aria-checked") !== "true") {
+      return { ok: false, error: "chat_mode_ambiguous" };
+    }
+    try {
+      chat.click();
+    } catch (_) {
+      return { ok: false, error: "chat_mode_switch_failed" };
+    }
+    const deadline = Date.now() + 3000;
+    do {
+      if (chat.getAttribute("aria-checked") === "true"
+          && work.getAttribute("aria-checked") === "false") {
+        return { ok: true, switched: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } while (Date.now() < deadline);
+    return { ok: false, error: "chat_mode_switch_timeout" };
+  }
+
+  async getAccountNativeIdentity() {
+    try {
+      const response = await fetch("/backend-api/me", {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
+      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+    } catch (_) {
+      return null;
+    }
+  }
 
   getConversationKey() {
     try {
@@ -209,4 +278,4 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 }
 
-window.__H2W_ADAPTER__ = new ChatGPTAdapter();
+registerH2WAdapter(new ChatGPTAdapter());
