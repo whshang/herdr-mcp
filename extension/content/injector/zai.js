@@ -1,6 +1,14 @@
 // injector/zai.js — z.ai adapter, selectors and insertion verified on 2026-08-03
+const ZAI_ADAPTER_POLICY = Object.freeze({
+  experimentalStorageFlag: "experimentalZAiEnabled",
+  operationalHud: true,
+  submitAckTimeoutMs: 4000,
+  jsonBridge: true,
+});
+
 class ZaiAdapter extends BaseAdapter {
   get name() { return "z.ai"; }
+  get policy() { return ZAI_ADAPTER_POLICY; }
 
   get replySelector() {
     return ".markdown-prose, [class*=chat-assistant] [class*=markdown], [class*=chat-assistant] [class*=message-content], [class*=assistant] [class*=prose], [class*=message-content], [class*=prose]";
@@ -52,4 +60,4 @@ class ZaiAdapter extends BaseAdapter {
   // temporary root binding to the newly created chat id after first submit.
 }
 
-window.__H2W_ADAPTER__ = new ZaiAdapter();
+registerH2WAdapter(new ZaiAdapter());
