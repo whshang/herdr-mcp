@@ -6699,18 +6699,18 @@ fn browser_fast_path_decision(
         .ask(
             "external_blocked",
             SemanticQuestion::noul(
-                "Is further progress blocked by an external or human-required condition on the current page?",
-                "Further progress requires an external or human action",
-                "No external or human-required blocker is visible",
+                "Does the current visible page require a human or external action before Herdr can safely continue autonomously? Treat login or sign-in, CAPTCHA or challenge, consent or approval, permission, payment, and waiting for an external result as blocked. Do not call the page blocked when the visible evidence allows an offered low-risk action to make autonomous progress.",
+                "A visible human or external boundary prevents autonomous progress",
+                "No visible human or external boundary prevents autonomous progress",
             ),
         );
     if !click_actions.is_empty() {
         request = request.ask(
             "safe_click_supported",
             SemanticQuestion::noul(
-                "Is at least one Runtime-offered low-risk click a sufficiently supported next step for the objective on the current page? Answer yes only when an offered target's visible label or semantics directly match the requested next step. Judge only the next step; the page reached by the click does not need to satisfy the final objective yet.",
-                "At least one offered low-risk click directly matches the requested next step",
-                "No offered low-risk click is sufficiently supported by the current evidence",
+                "Considering only the Runtime-offered low-risk click candidates shown in the current observation, is at least one candidate a reasonable next action that advances toward the stated objective? Evaluate progress, not final completion.",
+                "At least one offered candidate reasonably advances toward the objective",
+                "None of the offered candidates reasonably advances toward the objective",
             ),
         );
     }

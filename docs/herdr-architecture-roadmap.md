@@ -109,7 +109,7 @@ beta.2   ChatGPT / Grok / Claude convergence on shared Browser Kernel
 rc.1     packaging / permissions / compatibility / rollback / multi-device acceptance
 ```
 
-2026-09-26 本地 `main` 已完成 alpha.1 与 alpha.2 的确定性主体：provider capability/identity/project/policy 插件边界、共享 Browser Page Kernel、opaque `page_ref`、owned/claimed lifecycle、`browser_session.open` 失败页清理，以及 `browser_page.action` 的 observe/click/fill/expect。alpha.2 剩余项是 screenshot、三类真实网页 UAT 与 Jev 可选快路径；这些完成前不冻结 Adapter package schema。
+2026-10-01 当前 1.1 DEV 线已完成 alpha.1 与 alpha.2 的确定性主体及 Jev bounded fast path：provider capability/identity/project/policy 插件边界、共享 Browser Page Kernel、opaque `page_ref`、owned/claimed lifecycle、`browser_session.open` 失败页清理、`browser_page.action` 的 observe/click/fill/expect/screenshot，以及 trusted-local multi-step fast path。真实 Ego UAT 已覆盖 owned static 页、claimed SPA 路由漂移/re-claim、Bilibili 普通页面读取、非可见 screenshot fail-closed 与 owned/claimed cleanup；2026-10-01 Jev 重验在不降低 `0.80` 阈值的前提下修正 `safe_click_supported` / `external_blocked` 问句语义，同一三步 fixture 从旧问句 0/5 第一跳 uncertain 恢复到 5/5 完成。alpha.2 仍需一条真实 signed-in unrelated-page UAT、focused-visible screenshot 正向 artifact UAT，以及剩余 caller-class qualification；这些完成前不冻结新增 typed primitive。
 
 1.1 不把“任意网页”解释为无限制 RPA。普通生产路径继续禁止 local Adapter 任意 JS/eval、cookie/storage secret 导出、任意 shell/filesystem 访问与隐式接管用户 tab；高影响发布、支付、删除、授权等动作继续走确定性 human-boundary。
 
