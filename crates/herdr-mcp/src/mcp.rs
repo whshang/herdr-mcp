@@ -12,7 +12,8 @@ use crate::progressive_skills::{
     BROWSER_COMPOSER_SET_APPS_METHOD, BROWSER_COMPOSER_SET_REASONING_METHOD,
     BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_STOP_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD,
     BROWSER_ENDPOINT_INSPECT_METHOD, BROWSER_ENDPOINT_LIST_METHOD, BROWSER_HANDOFF_PREPARE_METHOD,
-    BROWSER_MESSAGE_APPEND_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
+    BROWSER_MESSAGE_APPEND_METHOD, BROWSER_PAGE_ACTION_METHOD, BROWSER_PAGE_FAST_PATH_METHOD,
+    BROWSER_PAGE_LIFECYCLE_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
     BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD,
     BROWSER_SESSION_ARCHIVE_STATUS_METHOD, BROWSER_SESSION_CREATE_METHOD,
     BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
@@ -22,7 +23,9 @@ use crate::progressive_skills::{
     WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
-use crate::semantic::{SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService};
+use crate::semantic::{
+    DEFAULT_DECISION_THRESHOLD, SemanticAnswer, SemanticQuestion, SemanticRequest, SemanticService,
+};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
@@ -357,6 +360,26 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 browser_source_resolve(context.state_store, &params, context.trusted_local_ipc)
             } else if method == BROWSER_HANDOFF_PREPARE_METHOD {
                 browser_handoff_prepare(context.state_store, &params)
+            } else if method == BROWSER_PAGE_ACTION_METHOD {
+                browser_page_action_call(
+                    context.state_store,
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
+            } else if method == BROWSER_PAGE_FAST_PATH_METHOD {
+                browser_fast_path_call(
+                    context.state_store,
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
+            } else if method == BROWSER_PAGE_LIFECYCLE_METHOD {
+                browser_page_lifecycle_call(
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
             } else if method == "herdr_mcp.page_assist" {
                 page_assist_call(
                     &params,
@@ -6506,6 +6529,1663 @@ fn continuity_search_string<'a>(
     }
 }
 
+const BROWSER_FAST_PATH_MAX_CLICK_CANDIDATES: usize = 20;
+const BROWSER_FAST_PATH_MAX_STEPS: usize = 8;
+const BROWSER_FAST_PATH_TEXT_LIMIT: usize = 8 * 1024;
+const BROWSER_FAST_PATH_ROUTE_ATTEMPT_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(1800);
+const BROWSER_FAST_PATH_DECISION_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(3600);
+
+fn browser_fast_path_low_risk_click(action_class: &str, label: &str) -> bool {
+    if !matches!(action_class, "same_origin_navigation" | "reveal") || label.trim().is_empty() {
+        return false;
+    }
+    const SIDE_EFFECT_LABELS: &str = concat!(
+        "delete|remove|buy|purchase|checkout|pay|order|book|reserve|submit|send|publish|post|",
+        "approve|reject|confirm|save|install|subscribe|follow|like|login|sign in|sign out|",
+        "authorize|allow|grant|verify|accept|agree|download|upload|",
+        "删除|移除|购买|付款|支付|下单|预订|预约|提交|发送|发布|批准|拒绝|确认|保存|安装|",
+        "订阅|关注|点赞|登录|授权|允许|验证|同意|下载|上传|退出登录|",
+        "削除|購入|支払|注文|予約|送信|投稿|公開|承認|拒否|確認|保存|インストール|",
+        "フォロー|いいね|ログイン|ログアウト|認証|許可|同意|ダウンロード|アップロード"
+    );
+    let label = label.to_lowercase();
+    !SIDE_EFFECT_LABELS
+        .split('|')
+        .any(|candidate| label.contains(candidate))
+}
+
+fn browser_fast_path_advisory(
+    semantic: &SemanticService,
+    objective: &str,
+    observation: &Value,
+) -> Value {
+    browser_fast_path_decision(semantic, objective, observation, &[])
+}
+
+fn browser_fast_path_decision(
+    semantic: &SemanticService,
+    objective: &str,
+    observation: &Value,
+    recent_actions: &[Value],
+) -> Value {
+    let capability = semantic.capability_json();
+    let objective = objective.trim();
+    if objective.is_empty() || objective.len() > 1024 || objective.chars().any(char::is_control) {
+        return json!({
+            "attempted": false,
+            "used": false,
+            "advisory_only": true,
+            "reason": "objective_invalid",
+            "capability": capability,
+        });
+    }
+    if observation.get("ok").and_then(Value::as_bool) != Some(true) {
+        return json!({
+            "attempted": false,
+            "used": false,
+            "advisory_only": true,
+            "reason": "observation_unavailable",
+            "capability": capability,
+        });
+    }
+    if !semantic.configured() {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "not_configured",
+            "capability": capability,
+        });
+    }
+
+    let mut click_criteria = std::collections::BTreeMap::new();
+    let mut click_actions = std::collections::BTreeMap::new();
+    let mut elements = Vec::new();
+
+    for element in observation
+        .get("elements")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if elements.len() >= BROWSER_FAST_PATH_MAX_CLICK_CANDIDATES {
+            break;
+        }
+        let Some(element_ref) = element.get("ref").and_then(Value::as_str) else {
+            continue;
+        };
+        if element_ref.is_empty()
+            || element_ref.len() > 256
+            || element_ref.chars().any(char::is_control)
+        {
+            continue;
+        }
+        let action_class = element
+            .get("fast_path")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let label = element
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        if !browser_fast_path_low_risk_click(action_class, &label) {
+            continue;
+        }
+        let candidate_id = format!("target_{}", elements.len());
+        let descriptor = json!({
+            "action": "click",
+            "ref": element_ref,
+            "class": action_class,
+            "label": label,
+        });
+        click_criteria.insert(
+            candidate_id.clone(),
+            Some(format!(
+                "Click only this already-observed opaque element: {}",
+                descriptor
+            )),
+        );
+        click_actions.insert(
+            candidate_id.clone(),
+            json!({"action": "click", "ref": element_ref}),
+        );
+        elements.push(json!({
+            "candidate_id": candidate_id,
+            "ref": element_ref,
+            "class": action_class,
+            "text": label,
+        }));
+    }
+    let text = observation
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(BROWSER_FAST_PATH_TEXT_LIMIT)
+        .collect::<String>();
+    let state = json!({
+        "objective": objective,
+        "observation": {
+            "url": observation.get("url").and_then(Value::as_str).unwrap_or(""),
+            "origin": observation.get("origin").and_then(Value::as_str).unwrap_or(""),
+            "title": observation.get("title").and_then(Value::as_str).unwrap_or(""),
+            "generation": observation.get("generation").and_then(Value::as_str).unwrap_or(""),
+            "text": text,
+            "elements": elements,
+        },
+        "recent_actions": recent_actions.iter().rev().take(6).map(|step| json!({
+            "action": step.pointer("/decision/action/action").and_then(Value::as_str),
+            "target": step.pointer("/decision/target").and_then(Value::as_str),
+            "result_ok": step.pointer("/result/ok").and_then(Value::as_bool),
+            "delivery_state": step.pointer("/result/delivery_state").and_then(Value::as_str),
+        })).collect::<Vec<_>>(),
+        "candidate_count": click_actions.len(),
+        "authority": "advisory candidate selection only; no browser action is executed here",
+    });
+    let mut request = SemanticRequest::new(state)
+        .ask(
+            "objective_done",
+            SemanticQuestion::noul(
+                "Does the current visible page itself prove that the objective is already satisfied?",
+                "The current page visibly proves the objective is satisfied",
+                "The current page does not yet visibly prove the objective is satisfied",
+            ),
+        )
+        .ask(
+            "external_blocked",
+            SemanticQuestion::noul(
+                "Is further progress blocked by an external or human-required condition on the current page?",
+                "Further progress requires an external or human action",
+                "No external or human-required blocker is visible",
+            ),
+        );
+    if !click_actions.is_empty() {
+        request = request.ask(
+            "safe_click_supported",
+            SemanticQuestion::noul(
+                "Is at least one Runtime-offered low-risk click a sufficiently supported next step for the objective on the current page? Answer yes only when an offered target's visible label or semantics directly match the requested next step. Judge only the next step; the page reached by the click does not need to satisfy the final objective yet.",
+                "At least one offered low-risk click directly matches the requested next step",
+                "No offered low-risk click is sufficiently supported by the current evidence",
+            ),
+        );
+    }
+    if click_criteria.len() >= 2 {
+        request = request.ask(
+            "click_target",
+            SemanticQuestion::choice(
+                "If a low-risk click is supported, choose exactly one offered observed target whose visible label or semantics best match the requested next step. Never invent an element reference.",
+                click_criteria,
+            ),
+        );
+    }
+    let response = match semantic.evaluate_with_route_budget(
+        &request,
+        BROWSER_FAST_PATH_ROUTE_ATTEMPT_BUDGET,
+        BROWSER_FAST_PATH_DECISION_BUDGET,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "advisory_only": true,
+                "reason": error.code(),
+                "capability": capability,
+            });
+        }
+    };
+    let Some(done_probability) = response
+        .answer("objective_done")
+        .and_then(SemanticAnswer::noul_probability)
+    else {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "bad_response",
+            "capability": capability,
+        });
+    };
+    let Some(blocked_probability) = response
+        .answer("external_blocked")
+        .and_then(SemanticAnswer::noul_probability)
+    else {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "bad_response",
+            "capability": capability,
+        });
+    };
+    let click_probability = if click_actions.is_empty() {
+        None
+    } else {
+        let Some(probability) = response
+            .answer("safe_click_supported")
+            .and_then(SemanticAnswer::noul_probability)
+        else {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "advisory_only": true,
+                "reason": "bad_response",
+                "capability": capability,
+            });
+        };
+        Some(probability)
+    };
+
+    let head_probabilities = json!({
+        "objective_done": done_probability,
+        "external_blocked": blocked_probability,
+        "safe_click_supported": click_probability,
+    });
+    let negative_threshold = 1.0 - DEFAULT_DECISION_THRESHOLD;
+    if done_probability >= DEFAULT_DECISION_THRESHOLD
+        && blocked_probability >= DEFAULT_DECISION_THRESHOLD
+    {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "conflicting_response",
+            "operation": "escalate",
+            "head_probabilities": head_probabilities,
+            "capability": capability,
+        });
+    }
+    let (operation, operation_probability) = if done_probability >= DEFAULT_DECISION_THRESHOLD {
+        ("done", done_probability)
+    } else if blocked_probability >= DEFAULT_DECISION_THRESHOLD {
+        ("blocked", blocked_probability)
+    } else if done_probability > negative_threshold || blocked_probability > negative_threshold {
+        return json!({
+            "attempted": true,
+            "used": false,
+            "advisory_only": true,
+            "reason": "uncertain",
+            "operation": "escalate",
+            "confidence": 1.0 - done_probability.max(blocked_probability),
+            "choice_probability": 1.0 - done_probability.max(blocked_probability),
+            "head_probabilities": head_probabilities,
+            "capability": capability,
+        });
+    } else if let Some(probability) = click_probability {
+        if probability >= DEFAULT_DECISION_THRESHOLD {
+            ("click", probability)
+        } else if probability <= negative_threshold {
+            (
+                "escalate",
+                1.0 - done_probability.max(blocked_probability).max(probability),
+            )
+        } else {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "advisory_only": true,
+                "reason": "uncertain",
+                "operation": "escalate",
+                "confidence": probability.max(1.0 - probability),
+                "choice_probability": probability.max(1.0 - probability),
+                "head_probabilities": head_probabilities,
+                "capability": capability,
+            });
+        }
+    } else {
+        ("escalate", 1.0 - done_probability.max(blocked_probability))
+    };
+    let operation_confidence = operation_probability;
+
+    let (action, target_id, target_confidence, target_probability) = if operation == "click" {
+        if click_actions.is_empty() {
+            return json!({
+                "attempted": true,
+                "used": false,
+                "advisory_only": true,
+                "reason": "candidate_mismatch",
+                "capability": capability,
+            });
+        }
+        if click_actions.len() == 1 {
+            let (target_id, action) = click_actions.iter().next().expect("one click target");
+            (action.clone(), Some(target_id.clone()), None, None)
+        } else {
+            let Some((target_id, target_probabilities, target_confidence)) = response
+                .answer("click_target")
+                .and_then(SemanticAnswer::choice_value)
+            else {
+                return json!({
+                    "attempted": true,
+                    "used": false,
+                    "advisory_only": true,
+                    "reason": "bad_response",
+                    "capability": capability,
+                });
+            };
+            let Some(action) = click_actions.get(target_id) else {
+                return json!({
+                    "attempted": true,
+                    "used": false,
+                    "advisory_only": true,
+                    "reason": "candidate_mismatch",
+                    "capability": capability,
+                });
+            };
+            let target_probability = target_probabilities.get(target_id).copied().unwrap_or(0.0);
+            if target_confidence < DEFAULT_DECISION_THRESHOLD
+                || target_probability < DEFAULT_DECISION_THRESHOLD
+            {
+                return json!({
+                    "attempted": true,
+                    "used": false,
+                    "advisory_only": true,
+                    "reason": "uncertain_target",
+                    "operation": operation,
+                    "target": target_id,
+                    "confidence": target_confidence,
+                    "choice_probability": target_probability,
+                    "capability": capability,
+                });
+            }
+            (
+                action.clone(),
+                Some(target_id.to_owned()),
+                Some(target_confidence),
+                Some(target_probability),
+            )
+        }
+    } else {
+        (json!({"action": operation}), None, None, None)
+    };
+
+    json!({
+        "attempted": true,
+        "used": true,
+        "advisory_only": true,
+        "action": action,
+        "operation": operation,
+        "target": target_id,
+        "confidence": operation_confidence,
+        "choice_probability": operation_probability,
+        "head_probabilities": head_probabilities,
+        "target_confidence": target_confidence,
+        "target_probability": target_probability,
+        "provider": response.provider,
+        "model": response.model,
+        "capability": capability,
+        "authority": "advisory only; Runtime/browser action validation and idempotency remain authoritative",
+    })
+}
+
+fn browser_fast_path_observation_digest(observation: &Value) -> String {
+    let elements = observation
+        .get("elements")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(BROWSER_FAST_PATH_MAX_CLICK_CANDIDATES)
+        .map(|element| {
+            json!({
+                "role": element.get("role").and_then(Value::as_str).unwrap_or(""),
+                "type": element.get("type").and_then(Value::as_str).unwrap_or(""),
+                "text": element.get("text").and_then(Value::as_str).unwrap_or(""),
+                "fast_path": element.get("fast_path").and_then(Value::as_str).unwrap_or(""),
+            })
+        })
+        .collect::<Vec<_>>();
+    let text = observation
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(BROWSER_FAST_PATH_TEXT_LIMIT)
+        .collect::<String>();
+    browser_sha256(
+        &json!({
+            "url": observation.get("url").and_then(Value::as_str).unwrap_or(""),
+            "origin": observation.get("origin").and_then(Value::as_str).unwrap_or(""),
+            "title": observation.get("title").and_then(Value::as_str).unwrap_or(""),
+            "text": text,
+            "elements": elements,
+        })
+        .to_string(),
+    )
+}
+
+fn browser_fast_path_hard_boundary(observation: &Value) -> Option<&'static str> {
+    let mut visible = String::new();
+    for value in [
+        observation.get("title").and_then(Value::as_str),
+        observation.get("text").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        visible.extend(value.chars().take(BROWSER_FAST_PATH_TEXT_LIMIT));
+        visible.push(' ');
+    }
+    let text = visible.to_ascii_lowercase();
+    let contains_any = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    if contains_any(&[
+        "verify you are human",
+        "captcha",
+        "security verification",
+        "checking your browser",
+        "turnstile",
+    ]) {
+        return Some("bot_challenge");
+    }
+    if contains_any(&[
+        "sign in to continue",
+        "log in to continue",
+        "authentication required",
+        "session expired",
+    ]) {
+        return Some("login_required");
+    }
+    if contains_any(&[
+        "permission required to continue",
+        "authorization required",
+        "grant access to continue",
+    ]) {
+        return Some("permission_required");
+    }
+    None
+}
+
+fn browser_fast_path_result(
+    status: &str,
+    reason: &str,
+    observation: &Value,
+    decision: Option<&Value>,
+    steps: &[Value],
+    semantic_decisions: usize,
+    mutations: usize,
+) -> Value {
+    json!({
+        "ok": true,
+        "status": status,
+        "reason": reason,
+        "observation": observation,
+        "decision": decision,
+        "steps": steps,
+        "semantic_decisions": semantic_decisions,
+        "mutations": mutations,
+        "requires_planner": true,
+        "authority": "Runtime-internal bounded controller; BrowserPage validation, idempotency, delivery state, and human boundaries remain authoritative",
+    })
+}
+
+fn browser_fast_path_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let semantic = SemanticService::from_config();
+    browser_fast_path_call_with_semantic(store, params, caller_grants, browser_actuator, &semantic)
+}
+
+fn browser_fast_path_call_with_semantic(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+    semantic: &SemanticService,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": "browser fast path params must be an object",
+        });
+    };
+    const ALLOWED_KEYS: &[&str] = &[
+        "endpoint_ref",
+        "page_ref",
+        "objective",
+        "idempotency_key",
+        "max_steps",
+        "max_chars",
+    ];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": format!("unknown browser fast path parameter '{key}'"),
+        });
+    }
+
+    let endpoint_ref = match browser_required_string(params, "endpoint_ref", 96) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let page_ref = match browser_required_string(params, "page_ref", 96) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if !page_ref.strip_prefix("bp_").is_some_and(|suffix| {
+        suffix.len() == 64
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": "page_ref must be an opaque bp_ reference",
+        });
+    }
+    let objective = match browser_required_string(params, "objective", 1024) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let base_idempotency_key = match browser_required_string(params, "idempotency_key", 128) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let max_steps = match object.get("max_steps") {
+        None | Some(Value::Null) => BROWSER_FAST_PATH_MAX_STEPS,
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(value) if (1..=BROWSER_FAST_PATH_MAX_STEPS).contains(&value) => value,
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": format!("max_steps must be between 1 and {BROWSER_FAST_PATH_MAX_STEPS}"),
+                });
+            }
+        },
+    };
+    let max_chars = match object.get("max_chars") {
+        None | Some(Value::Null) => BROWSER_FAST_PATH_TEXT_LIMIT,
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(value) if (1..=100_000).contains(&value) => value,
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "max_chars must be between 1 and 100000",
+                });
+            }
+        },
+    };
+
+    let mut steps = Vec::new();
+    let mut semantic_decisions = 0_usize;
+    let mut mutations = 0_usize;
+    let run_digest = browser_sha256(base_idempotency_key);
+
+    for step_index in 0..=max_steps {
+        let observation = browser_page_action_call(
+            store,
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "page_ref": page_ref,
+                "action": "observe",
+                "max_chars": max_chars,
+            }),
+            caller_grants,
+            browser_actuator,
+        );
+        if observation.get("ok").and_then(Value::as_bool) != Some(true) {
+            return json!({
+                "ok": false,
+                "code": "browser_fast_path_observation_failed",
+                "status": "escalate",
+                "reason": observation.get("code").and_then(Value::as_str).unwrap_or("observation_failed"),
+                "observation": observation,
+                "steps": steps,
+                "semantic_decisions": semantic_decisions,
+                "mutations": mutations,
+                "requires_planner": true,
+            });
+        }
+        if let Some(reason) = browser_fast_path_hard_boundary(&observation) {
+            return browser_fast_path_result(
+                "blocked",
+                reason,
+                &observation,
+                None,
+                &steps,
+                semantic_decisions,
+                mutations,
+            );
+        }
+
+        let decision = browser_fast_path_decision(semantic, objective, &observation, &steps);
+        if decision.get("attempted").and_then(Value::as_bool) == Some(true) {
+            semantic_decisions += 1;
+        }
+        if decision.get("used").and_then(Value::as_bool) != Some(true) {
+            let reason = decision
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("semantic_unavailable");
+            return browser_fast_path_result(
+                "escalate",
+                reason,
+                &observation,
+                Some(&decision),
+                &steps,
+                semantic_decisions,
+                mutations,
+            );
+        }
+
+        let action = decision
+            .pointer("/action/action")
+            .and_then(Value::as_str)
+            .unwrap_or("escalate");
+        match action {
+            "done" => {
+                return browser_fast_path_result(
+                    "verification_required",
+                    "done_candidate",
+                    &observation,
+                    Some(&decision),
+                    &steps,
+                    semantic_decisions,
+                    mutations,
+                );
+            }
+            "blocked" => {
+                return browser_fast_path_result(
+                    "blocked_candidate",
+                    "semantic_blocked",
+                    &observation,
+                    Some(&decision),
+                    &steps,
+                    semantic_decisions,
+                    mutations,
+                );
+            }
+            "escalate" => {
+                return browser_fast_path_result(
+                    "escalate",
+                    "semantic_escalate",
+                    &observation,
+                    Some(&decision),
+                    &steps,
+                    semantic_decisions,
+                    mutations,
+                );
+            }
+            "click" => {}
+            _ => {
+                return browser_fast_path_result(
+                    "escalate",
+                    "unsupported_semantic_action",
+                    &observation,
+                    Some(&decision),
+                    &steps,
+                    semantic_decisions,
+                    mutations,
+                );
+            }
+        }
+
+        if step_index >= max_steps {
+            return browser_fast_path_result(
+                "budget_exhausted",
+                "max_steps",
+                &observation,
+                Some(&decision),
+                &steps,
+                semantic_decisions,
+                mutations,
+            );
+        }
+
+        let Some(generation) = observation.get("generation").and_then(Value::as_str) else {
+            return browser_fast_path_result(
+                "escalate",
+                "generation_missing",
+                &observation,
+                Some(&decision),
+                &steps,
+                semantic_decisions,
+                mutations,
+            );
+        };
+        let Some(element_ref) = decision.pointer("/action/ref").and_then(Value::as_str) else {
+            return browser_fast_path_result(
+                "escalate",
+                "target_missing",
+                &observation,
+                Some(&decision),
+                &steps,
+                semantic_decisions,
+                mutations,
+            );
+        };
+
+        let semantic_state_digest = browser_fast_path_observation_digest(&observation);
+        let selected_target = decision
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("single");
+        let mutation_digest = browser_sha256(
+            &json!({
+                "page_ref": page_ref,
+                "state": semantic_state_digest,
+                "operation": "click",
+                "target": selected_target,
+            })
+            .to_string(),
+        );
+        let mutation_key = format!("bpf:{}:{}", &run_digest[..16], &mutation_digest[..32]);
+        let result = browser_page_action_call(
+            store,
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "page_ref": page_ref,
+                "action": "click",
+                "generation": generation,
+                "ref": element_ref,
+                "idempotency_key": mutation_key,
+            }),
+            caller_grants,
+            browser_actuator,
+        );
+        mutations += 1;
+        steps.push(json!({
+            "step": step_index + 1,
+            "decision": decision,
+            "result": result,
+        }));
+
+        let mutation_result = steps.last().and_then(|step| step.get("result"));
+        let applied = mutation_result
+            .and_then(|result| result.get("delivery_state"))
+            .and_then(Value::as_str)
+            == Some("applied");
+        let mutation_ok = mutation_result
+            .and_then(|result| result.get("ok"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if !applied || !mutation_ok {
+            let result = mutation_result.cloned().unwrap_or(Value::Null);
+            return json!({
+                "ok": false,
+                "code": "browser_fast_path_mutation_stopped",
+                "status": "escalate",
+                "reason": result.get("code").and_then(Value::as_str).unwrap_or("mutation_not_applied"),
+                "mutation": result,
+                "steps": steps,
+                "semantic_decisions": semantic_decisions,
+                "mutations": mutations,
+                "requires_planner": true,
+            });
+        }
+    }
+
+    unreachable!("bounded browser fast path loop always returns")
+}
+
+fn browser_page_action_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "browser page action params must be an object"});
+    };
+    const ALLOWED_KEYS: &[&str] = &[
+        "endpoint_ref",
+        "page_ref",
+        "action",
+        "max_chars",
+        "generation",
+        "ref",
+        "value",
+        "condition",
+        "timeout_ms",
+        "idempotency_key",
+        "objective",
+    ];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": format!("unknown browser page action parameter '{key}'"),
+        });
+    }
+
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+
+    let page_ref = match object
+        .get("page_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if value.strip_prefix("bp_").is_some_and(|suffix| {
+                suffix.len() == 64
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) =>
+        {
+            value
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "page_ref must be an opaque bp_ reference",
+            });
+        }
+    };
+    let action = match object.get("action").and_then(Value::as_str) {
+        Some(value @ ("observe" | "click" | "fill" | "expect" | "screenshot")) => value,
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "action must be observe, click, fill, expect, or screenshot",
+            });
+        }
+    };
+
+    let mut bridge_params = json!({
+        "page_ref": page_ref,
+        "action": action,
+    });
+    let mutation = matches!(action, "click" | "fill");
+    let mut mutation_key: Option<&str> = None;
+    let mut semantic_objective: Option<&str> = None;
+
+    match action {
+        "observe" | "screenshot" => {
+            for disallowed in [
+                "generation",
+                "ref",
+                "value",
+                "condition",
+                "timeout_ms",
+                "idempotency_key",
+            ] {
+                if object.contains_key(disallowed) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": format!("{disallowed} is not accepted for {action}"),
+                    });
+                }
+            }
+            if action == "screenshot"
+                && (object.contains_key("max_chars") || object.contains_key("objective"))
+            {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "max_chars and objective are not accepted for screenshot",
+                });
+            }
+            if action == "observe"
+                && let Some(objective) = object.get("objective")
+            {
+                let Some(objective) = objective.as_str().map(str::trim) else {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "objective must be a string",
+                    });
+                };
+                if objective.is_empty()
+                    || objective.len() > 1024
+                    || objective.chars().any(char::is_control)
+                {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "objective must be 1..1024 non-control characters",
+                    });
+                }
+                semantic_objective = Some(objective);
+            }
+            if action == "observe"
+                && let Some(max_chars) = object.get("max_chars")
+            {
+                let Some(max_chars) = max_chars.as_u64() else {
+                    return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be an integer"});
+                };
+                if !(1..=100_000).contains(&max_chars) {
+                    return json!({"ok": false, "code": "invalid_params", "message": "max_chars must be between 1 and 100000"});
+                }
+                bridge_params["max_chars"] = json!(max_chars);
+            }
+        }
+        "expect" => {
+            for disallowed in [
+                "generation",
+                "ref",
+                "max_chars",
+                "idempotency_key",
+                "objective",
+            ] {
+                if object.contains_key(disallowed) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": format!("{disallowed} is not accepted for expect"),
+                    });
+                }
+            }
+            let condition = match object.get("condition").and_then(Value::as_str) {
+                Some(
+                    value @ ("document_ready" | "url_equals" | "text_present" | "text_absent"),
+                ) => value,
+                _ => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "condition must be document_ready, url_equals, text_present, or text_absent",
+                    });
+                }
+            };
+            bridge_params["condition"] = json!(condition);
+            match object.get("timeout_ms") {
+                None | Some(Value::Null) => {}
+                Some(value) => {
+                    let Some(timeout_ms) = value.as_u64() else {
+                        return json!({"ok": false, "code": "invalid_params", "message": "timeout_ms must be an integer"});
+                    };
+                    if timeout_ms > 5000 {
+                        return json!({"ok": false, "code": "invalid_params", "message": "timeout_ms must be <= 5000"});
+                    }
+                    bridge_params["timeout_ms"] = json!(timeout_ms);
+                }
+            }
+            match condition {
+                "document_ready" => {
+                    if object.contains_key("value") {
+                        return json!({
+                            "ok": false,
+                            "code": "invalid_params",
+                            "message": "value is not accepted for document_ready",
+                        });
+                    }
+                }
+                _ => {
+                    let value = match object.get("value").and_then(Value::as_str) {
+                        Some(value)
+                            if !value.is_empty()
+                                && value.len() <= 4096
+                                && !value.chars().any(char::is_control) =>
+                        {
+                            value
+                        }
+                        _ => {
+                            return json!({
+                                "ok": false,
+                                "code": "invalid_params",
+                                "message": "value is required for this expect condition",
+                            });
+                        }
+                    };
+                    bridge_params["value"] = json!(value);
+                }
+            }
+        }
+        "click" | "fill" => {
+            for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
+                if object.contains_key(disallowed) {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": format!("{disallowed} is not accepted for {action}"),
+                    });
+                }
+            }
+            let generation = match object
+                .get("generation")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "generation is required for click/fill",
+                    });
+                }
+            };
+            let element_ref = match object.get("ref").and_then(Value::as_str).map(str::trim) {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "ref is required for click/fill",
+                    });
+                }
+            };
+            let idempotency_key = match object
+                .get("idempotency_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({
+                        "ok": false,
+                        "code": "invalid_params",
+                        "message": "idempotency_key is required for click/fill",
+                    });
+                }
+            };
+            bridge_params["generation"] = json!(generation);
+            bridge_params["ref"] = json!(element_ref);
+            if action == "fill" {
+                let value = match object.get("value").and_then(Value::as_str) {
+                    Some(value) if value.len() <= 10_000 => value,
+                    _ => {
+                        return json!({
+                            "ok": false,
+                            "code": "invalid_params",
+                            "message": "fill value must be a string of at most 10000 bytes",
+                        });
+                    }
+                };
+                bridge_params["value"] = json!(value);
+            } else if object.contains_key("value") {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "value is not accepted for click",
+                });
+            }
+            mutation_key = Some(idempotency_key);
+        }
+        _ => unreachable!(),
+    }
+
+    if !mutation {
+        let Some(actuator) = browser_actuator else {
+            return json!({
+                "ok": false,
+                "code": "browser_page_unavailable",
+                "retryable": true,
+                "delivery_state": "not_delivered",
+            });
+        };
+        return match actuator.actuate_for_endpoint(
+            BROWSER_PAGE_ACTION_METHOD,
+            &bridge_params,
+            1,
+            Some(endpoint_ref),
+            None,
+        ) {
+            Ok(evidence) => {
+                if let Some(mut result) = evidence.result {
+                    let fast_path_advisory = if action == "observe" {
+                        semantic_objective.map(|objective| {
+                            browser_fast_path_advisory(
+                                &SemanticService::from_config(),
+                                objective,
+                                &result,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(object) = result.as_object_mut() {
+                        object
+                            .entry("page_ref".to_owned())
+                            .or_insert_with(|| json!(page_ref));
+                        if let Some(advisory) = fast_path_advisory {
+                            object.insert("fast_path_advisory".to_owned(), advisory);
+                        }
+                        if !object.contains_key("code")
+                            && let Some(code) = object
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        {
+                            object.insert("code".to_owned(), json!(code));
+                        }
+                    }
+                    result
+                } else {
+                    json!({
+                        "ok": false,
+                        "code": "browser_page_unavailable",
+                        "retryable": true,
+                        "delivery_state": "not_delivered",
+                        "page_ref": page_ref,
+                    })
+                }
+            }
+            Err(error) => json!({
+                "ok": false,
+                "code": "browser_page_unavailable",
+                "message": error,
+                "retryable": true,
+                "delivery_state": "not_delivered",
+            }),
+        };
+    }
+
+    let idempotency_key = mutation_key.expect("mutation key validated above");
+    let idempotency_digest = browser_sha256(idempotency_key);
+    let request_hash = browser_sha256(
+        &json!({
+            "operation": BROWSER_PAGE_ACTION_METHOD,
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "action": action,
+            "generation": bridge_params["generation"],
+            "ref": bridge_params["ref"],
+            "value_digest": if action == "fill" {
+                bridge_params.get("value").and_then(Value::as_str).map(browser_sha256)
+            } else {
+                None
+            },
+        })
+        .to_string(),
+    );
+    let op_id = format!("op:browser_page_action:{}", &idempotency_digest[..32]);
+    let now = browser_epoch_ms();
+    let expires_at = now.saturating_add(10 * 60 * 1000);
+
+    {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match guard.reserve_operation(
+            "browser_page.action",
+            &idempotency_digest,
+            &request_hash,
+            &op_id,
+            now,
+            expires_at,
+        ) {
+            Ok(OperationReservation::Reserved) => {}
+            Ok(OperationReservation::Existing(record)) => {
+                if record.request_hash != request_hash {
+                    return json!({
+                        "ok": false,
+                        "code": "idempotency_key_conflict",
+                        "op_id": record.op_id,
+                    });
+                }
+                match record.state.as_deref() {
+                    Some("pending") => {
+                        return json!({
+                            "ok": false,
+                            "code": "idempotency_in_flight",
+                            "op_id": record.op_id,
+                            "retry_safe": false,
+                        });
+                    }
+                    Some("complete") => {
+                        let Some(result_json) = record.result_json else {
+                            return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                        };
+                        let mut replay: Value = match serde_json::from_str(&result_json) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                            }
+                        };
+                        if let Some(result) = replay.as_object_mut() {
+                            result.insert("idempotent_replay".to_owned(), json!(true));
+                            result.insert("op_id".to_owned(), json!(record.op_id));
+                        }
+                        return replay;
+                    }
+                    _ => {
+                        return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": record.op_id});
+                    }
+                }
+            }
+            Err(error) => return browser_store_error(error),
+        }
+    }
+
+    let release_retryable = |result: Value| -> Value {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        if let Err(error) = guard.release_operation_reservation(
+            "browser_page.action",
+            &idempotency_digest,
+            &request_hash,
+            &op_id,
+        ) {
+            return browser_store_error(error);
+        }
+        result
+    };
+
+    let Some(actuator) = browser_actuator else {
+        return release_retryable(json!({
+            "ok": false,
+            "code": "browser_page_unavailable",
+            "retryable": true,
+            "retry_safe": true,
+            "delivery_state": "not_delivered",
+            "op_id": op_id,
+            "idempotent_replay": false,
+        }));
+    };
+
+    let evidence = match actuator.actuate_for_endpoint(
+        BROWSER_PAGE_ACTION_METHOD,
+        &bridge_params,
+        1,
+        Some(endpoint_ref),
+        Some(&op_id),
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            let result = json!({
+                "ok": false,
+                "code": "browser_page_delivery_unknown",
+                "message": error,
+                "retryable": false,
+                "retry_safe": false,
+                "delivery_state": "delivery_unknown",
+                "op_id": op_id,
+                "idempotent_replay": false,
+            });
+            let Ok(mut guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            if let Err(error) = guard.complete_operation(
+                "browser_page.action",
+                &idempotency_digest,
+                &request_hash,
+                &result.to_string(),
+                browser_epoch_ms(),
+                expires_at,
+            ) {
+                return browser_store_error(error);
+            }
+            return result;
+        }
+    };
+
+    if !evidence.browser_online || !evidence.command_accepted {
+        return release_retryable(json!({
+            "ok": false,
+            "code": "browser_page_unavailable",
+            "retryable": true,
+            "retry_safe": true,
+            "delivery_state": "not_delivered",
+            "op_id": op_id,
+            "idempotent_replay": false,
+        }));
+    }
+
+    let mut result = evidence.result.unwrap_or_else(|| {
+        json!({
+            "ok": false,
+            "code": "browser_page_delivery_unknown",
+            "retryable": false,
+            "retry_safe": false,
+            "delivery_state": "delivery_unknown",
+        })
+    });
+    if let Some(object) = result.as_object_mut() {
+        object
+            .entry("page_ref".to_owned())
+            .or_insert_with(|| json!(page_ref));
+        if !object.contains_key("code")
+            && let Some(code) = object
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        {
+            object.insert("code".to_owned(), json!(code));
+        }
+    }
+    let delivery_state = result
+        .get("delivery_state")
+        .and_then(Value::as_str)
+        .unwrap_or("delivery_unknown")
+        .to_owned();
+    let retry_safe = result
+        .get("retry_safe")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("op_id".to_owned(), json!(op_id));
+        object.insert("idempotent_replay".to_owned(), json!(false));
+    }
+
+    if delivery_state == "not_applied" && retry_safe {
+        return release_retryable(result);
+    }
+
+    if !matches!(delivery_state.as_str(), "applied" | "delivery_unknown") {
+        result = json!({
+            "ok": false,
+            "code": "browser_page_delivery_unknown",
+            "retryable": false,
+            "retry_safe": false,
+            "delivery_state": "delivery_unknown",
+            "op_id": op_id,
+            "idempotent_replay": false,
+        });
+    }
+
+    let Ok(mut guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    if let Err(error) = guard.complete_operation(
+        "browser_page.action",
+        &idempotency_digest,
+        &request_hash,
+        &result.to_string(),
+        browser_epoch_ms(),
+        expires_at,
+    ) {
+        return browser_store_error(error);
+    }
+    result
+}
+
+fn browser_page_lifecycle_call(
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "browser page lifecycle params must be an object"});
+    };
+    const ALLOWED_KEYS: &[&str] = &[
+        "endpoint_ref",
+        "action",
+        "target_origin",
+        "url",
+        "page_ref",
+        "idempotency_key",
+    ];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": format!("unknown browser page lifecycle parameter '{key}'"),
+        });
+    }
+
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+
+    let action = match object.get("action").and_then(Value::as_str) {
+        Some(value @ ("open" | "claim" | "release" | "finalize")) => value,
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "action must be open, claim, release, or finalize",
+            });
+        }
+    };
+    let idempotency_key = match object.get("idempotency_key") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value))
+            if !value.trim().is_empty()
+                && value.len() <= 256
+                && !value.chars().any(char::is_control) =>
+        {
+            Some(value.trim())
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "idempotency_key is invalid",
+            });
+        }
+    };
+
+    let mut bridge_params = json!({
+        "action": action,
+    });
+
+    if matches!(action, "open" | "claim") {
+        let Some(idempotency_key) = idempotency_key else {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "idempotency_key is required for open or claim",
+            });
+        };
+        bridge_params["idempotency_key"] = json!(idempotency_key);
+        if object.contains_key("page_ref") {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "page_ref is not accepted for open or claim",
+            });
+        }
+        let target_origin_raw = match object
+            .get("target_origin")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
+            Some(value) if !value.is_empty() && value.len() <= 4096 => value,
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "target_origin is required for open or claim",
+                });
+            }
+        };
+        let target_origin_url = match url::Url::parse(target_origin_raw) {
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.host_str().is_some() =>
+            {
+                url
+            }
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "target_origin must be a valid http or https origin",
+                });
+            }
+        };
+        let target_origin = target_origin_url.origin().ascii_serialization();
+        let raw_url = match object.get("url").and_then(Value::as_str).map(str::trim) {
+            Some(value) if !value.is_empty() && value.len() <= 4096 => value,
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "url is required for open or claim",
+                });
+            }
+        };
+        let target_url = match url::Url::parse(raw_url) {
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.host_str().is_some()
+                    && url.origin().ascii_serialization() == target_origin =>
+            {
+                url
+            }
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "url must be a valid http or https URL on target_origin",
+                });
+            }
+        };
+        bridge_params["target_origin"] = json!(target_origin);
+        bridge_params["url"] = json!(target_url.to_string());
+    } else {
+        if object.contains_key("target_origin") || object.contains_key("url") {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "target_origin and url are not accepted for release or finalize",
+            });
+        }
+        let page_ref = match object
+            .get("page_ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        {
+            Some(value)
+                if value.strip_prefix("bp_").is_some_and(|suffix| {
+                    suffix.len() == 64
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) =>
+            {
+                value
+            }
+            _ => {
+                return json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "page_ref must be an opaque bp_ reference",
+                });
+            }
+        };
+        bridge_params["page_ref"] = json!(page_ref);
+    }
+
+    let Some(actuator) = browser_actuator else {
+        return json!({
+            "ok": false,
+            "code": "browser_page_unavailable",
+            "retryable": true,
+            "delivery_state": "not_delivered",
+        });
+    };
+
+    match actuator.actuate_for_endpoint(
+        BROWSER_PAGE_LIFECYCLE_METHOD,
+        &bridge_params,
+        1,
+        Some(endpoint_ref),
+        None,
+    ) {
+        Ok(evidence) => {
+            if let Some(result) = evidence.result {
+                return result;
+            }
+            if !evidence.browser_online || !evidence.command_accepted {
+                return json!({
+                    "ok": false,
+                    "code": "browser_page_unavailable",
+                    "retryable": true,
+                    "delivery_state": "not_delivered",
+                });
+            }
+            json!({
+                "ok": false,
+                "code": "browser_page_delivery_unknown",
+                "retryable": false,
+                "delivery_state": "delivery_unknown",
+            })
+        }
+        Err(error) => json!({
+            "ok": false,
+            "code": "browser_page_unavailable",
+            "message": error,
+            "retryable": true,
+            "delivery_state": "not_delivered",
+        }),
+    }
+}
+
 fn page_assist_call(
     params: &Value,
     caller_grants: &[PageAssistCallerGrant],
@@ -6518,6 +8198,7 @@ fn page_assist_call(
         "endpoint_ref",
         "action",
         "target_origin",
+        "page_ref",
         "tab_id",
         "max_chars",
         "generation",
@@ -6586,6 +8267,25 @@ fn page_assist_call(
         }
     };
     let target_origin = target_url.origin().ascii_serialization();
+    let page_ref = match object.get("page_ref") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            let valid = value.strip_prefix("bp_").is_some_and(|suffix| {
+                suffix.len() == 64
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+            if !valid {
+                return json!({"ok": false, "code": "invalid_params", "message": "page_ref must be an opaque bp_ reference"});
+            }
+            Some(value.to_owned())
+        }
+        Some(_) => {
+            return json!({"ok": false, "code": "invalid_params", "message": "page_ref must be an opaque bp_ reference"});
+        }
+    };
     let tab_id = match object.get("tab_id") {
         None | Some(Value::Null) => None,
         Some(Value::Number(value)) => match value.as_i64() {
@@ -6643,6 +8343,9 @@ fn page_assist_call(
         "action": action,
         "target_origin": target_origin,
     });
+    if let Some(page_ref) = page_ref {
+        bridge_params["page_ref"] = json!(page_ref);
+    }
     if let Some(tab_id) = tab_id {
         bridge_params["tab_id"] = json!(tab_id);
     }
@@ -7147,6 +8850,25 @@ mod tests {
                 body.len()
             );
             stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://127.0.0.1:{}/v1", address.port())
+    }
+
+    fn semantic_test_server_sequence(bodies: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 16 * 1024];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
         });
         format!("http://127.0.0.1:{}/v1", address.port())
     }
@@ -13137,6 +14859,655 @@ mod tests {
     }
 
     #[test]
+    fn browser_fast_path_advisory_is_optional_and_fails_back_across_semantic_states() {
+        let observation = json!({
+            "ok": true,
+            "url": "https://example.com/app",
+            "origin": "https://example.com",
+            "title": "Example App",
+            "generation": "pa_gen_1_test",
+            "text": "Ready. Continue to the next view.",
+            "elements": [
+                {"ref": "ref_pa_gen_1_test_0", "role": "button", "text": "Continue", "fast_path": "reveal"},
+                {"ref": "ref_pa_gen_1_test_1", "role": "textbox", "text": "Search"},
+                {"ref": "ref_pa_gen_1_test_2", "role": "link", "text": "Details", "fast_path": "same_origin_navigation"},
+                {"ref": "ref_pa_gen_1_test_3", "role": "button", "type": "submit", "text": "Submit order"},
+                {"ref": "ref_pa_gen_1_test_4", "role": "button", "text": "Delete account", "fast_path": "reveal"},
+                {"ref": "ref_pa_gen_1_test_5", "role": "link", "text": "Sign in", "fast_path": "same_origin_navigation"}
+            ],
+            "cookie": "must-not-be-consumed"
+        });
+        let objective = "Open the next visible view";
+
+        let unconfigured =
+            browser_fast_path_advisory(&SemanticService::test_empty(), objective, &observation);
+        assert_eq!(unconfigured["used"], false);
+        assert_eq!(unconfigured["reason"], "not_configured");
+        assert_eq!(unconfigured["advisory_only"], true);
+
+        let provider_error = browser_fast_path_advisory(
+            &SemanticService::test_error("browser-fast-path-error", "timeout"),
+            objective,
+            &observation,
+        );
+        assert_eq!(provider_error["used"], false);
+        assert_eq!(provider_error["reason"], "timeout");
+        assert_eq!(provider_error["advisory_only"], true);
+
+        let url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"objective_done":{"type":"noul","noul":0.03},"external_blocked":{"type":"noul","noul":0.02},"safe_click_supported":{"type":"noul","noul":0.93},"click_target":{"type":"choice","choice":"target_0","probabilities":{"target_0":0.94,"target_1":0.06},"confidence":0.94}}}"#,
+        );
+        let configured =
+            SemanticService::test_decision_route("browser-fast-path-ok", &url).unwrap();
+        let advised = browser_fast_path_advisory(&configured, objective, &observation);
+        assert_eq!(advised["used"], true, "{advised}");
+        assert_eq!(advised["advisory_only"], true);
+        assert_eq!(advised["operation"], "click");
+        assert_eq!(advised["target"], "target_0");
+        assert_eq!(advised["action"]["action"], "click");
+        assert_eq!(advised["action"]["ref"], "ref_pa_gen_1_test_0");
+        assert_eq!(advised["confidence"], 0.93);
+        assert_eq!(advised["choice_probability"], 0.93);
+        assert_eq!(advised["head_probabilities"]["objective_done"], 0.03);
+        assert_eq!(advised["head_probabilities"]["external_blocked"], 0.02);
+        assert_eq!(advised["head_probabilities"]["safe_click_supported"], 0.93);
+        assert_eq!(advised["target_confidence"], 0.94);
+        assert_eq!(advised["target_probability"], 0.94);
+        assert_eq!(
+            advised["authority"],
+            "advisory only; Runtime/browser action validation and idempotency remain authoritative"
+        );
+
+        let uncertain_url = semantic_test_server(
+            r#"{"model":"jev-test","answers":{"objective_done":{"type":"noul","noul":0.03},"external_blocked":{"type":"noul","noul":0.02},"safe_click_supported":{"type":"noul","noul":0.50},"click_target":{"type":"choice","choice":"target_0","probabilities":{"target_0":0.94,"target_1":0.06},"confidence":0.94}}}"#,
+        );
+        let uncertain_semantic =
+            SemanticService::test_decision_route("browser-fast-path-uncertain", &uncertain_url)
+                .unwrap();
+        let uncertain = browser_fast_path_advisory(&uncertain_semantic, objective, &observation);
+        assert_eq!(uncertain["used"], false);
+        assert_eq!(uncertain["reason"], "uncertain");
+        assert_eq!(uncertain["operation"], "escalate");
+        assert_eq!(
+            uncertain["head_probabilities"]["safe_click_supported"],
+            0.50
+        );
+    }
+
+    #[test]
+    fn browser_fast_path_executes_three_clicks_then_requires_done_verification() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct FastPathActuator {
+            phase: AtomicUsize,
+        }
+
+        impl FastPathActuator {
+            fn evidence(result: Value, expected_generation: i64) -> BrowserPostconditionEvidence {
+                BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: Some(result),
+                }
+            }
+        }
+
+        impl BrowserActuator for FastPathActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("Browser fast path must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_fast_path_test"));
+                let phase = self.phase.load(Ordering::SeqCst);
+                match params.get("action").and_then(Value::as_str) {
+                    Some("observe") => {
+                        let generation = format!("pa_gen_{}_test", phase + 1);
+                        let elements = if phase < 3 {
+                            vec![json!({
+                                "ref": format!("ref_{generation}_0"),
+                                "role": "button",
+                                "text": format!("Continue {}", phase + 1),
+                                "fast_path": "reveal",
+                            })]
+                        } else {
+                            Vec::new()
+                        };
+                        Ok(Self::evidence(
+                            json!({
+                                "ok": true,
+                                "url": format!("https://example.com/stage/{phase}"),
+                                "origin": "https://example.com",
+                                "title": "Fast path fixture",
+                                "generation": generation,
+                                "text": if phase < 3 {
+                                    format!("Stage {phase}. Continue.")
+                                } else {
+                                    "Complete".to_owned()
+                                },
+                                "elements": elements,
+                            }),
+                            expected_generation,
+                        ))
+                    }
+                    Some("click") => {
+                        let generation = format!("pa_gen_{}_test", phase + 1);
+                        assert_eq!(
+                            params.get("generation").and_then(Value::as_str),
+                            Some(generation.as_str())
+                        );
+                        assert_eq!(
+                            params.get("ref").and_then(Value::as_str),
+                            Some(format!("ref_{generation}_0").as_str())
+                        );
+                        self.phase.fetch_add(1, Ordering::SeqCst);
+                        Ok(Self::evidence(
+                            json!({
+                                "ok": true,
+                                "delivery_state": "applied",
+                                "retry_safe": false,
+                                "mutation_submitted": true,
+                            }),
+                            expected_generation,
+                        ))
+                    }
+                    other => panic!("unexpected fast path action: {other:?}"),
+                }
+            }
+        }
+
+        const CLICK: &str = r#"{"model":"jev-test","answers":{"objective_done":{"type":"noul","noul":0.03},"external_blocked":{"type":"noul","noul":0.02},"safe_click_supported":{"type":"noul","noul":0.92}}}"#;
+        const DONE: &str = r#"{"model":"jev-test","answers":{"objective_done":{"type":"noul","noul":0.94},"external_blocked":{"type":"noul","noul":0.02}}}"#;
+        let semantic_url = semantic_test_server_sequence(vec![CLICK, CLICK, CLICK, DONE]);
+        let semantic =
+            SemanticService::test_decision_route("browser-fast-path-loop", &semantic_url).unwrap();
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let actuator = FastPathActuator {
+            phase: AtomicUsize::new(0),
+        };
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_fast_path_test".to_owned(),
+        }];
+        let page_ref = format!("bp_{}", "a".repeat(64));
+        let result = browser_fast_path_call_with_semantic(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_fast_path_test",
+                "page_ref": page_ref,
+                "objective": "Advance through all three visible stages",
+                "idempotency_key": "fast-path-three-clicks",
+                "max_steps": 4,
+            }),
+            &grants,
+            Some(&actuator),
+            &semantic,
+        );
+
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["status"], "verification_required", "{result}");
+        assert_eq!(result["reason"], "done_candidate");
+        assert_eq!(result["mutations"], 3);
+        assert_eq!(result["semantic_decisions"], 4);
+        assert_eq!(result["steps"].as_array().unwrap().len(), 3);
+        assert_eq!(result["requires_planner"], true);
+        assert_eq!(actuator.phase.load(Ordering::SeqCst), 3);
+        for step in result["steps"].as_array().unwrap() {
+            assert_eq!(step["result"]["ok"], true);
+            assert_eq!(step["result"]["delivery_state"], "applied");
+            assert!(step["result"]["op_id"].as_str().is_some());
+        }
+    }
+
+    #[test]
+    fn browser_fast_path_semantic_failure_returns_current_observation_without_mutation() {
+        use std::sync::{Arc, Mutex};
+
+        struct ObserveOnlyActuator;
+        impl BrowserActuator for ObserveOnlyActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("Browser fast path must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_fast_path_error"));
+                assert_eq!(
+                    params.get("action").and_then(Value::as_str),
+                    Some("observe")
+                );
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                    result: Some(json!({
+                        "ok": true,
+                        "url": "https://example.com/app",
+                        "origin": "https://example.com",
+                        "title": "Example",
+                        "generation": "pa_gen_error_test",
+                        "text": "Continue",
+                        "elements": [{
+                            "ref": "ref_pa_gen_error_test_0",
+                            "role": "button",
+                            "text": "Continue",
+                            "fast_path": "reveal"
+                        }],
+                    })),
+                })
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_fast_path_error".to_owned(),
+        }];
+        let page_ref = format!("bp_{}", "b".repeat(64));
+        let result = browser_fast_path_call_with_semantic(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_fast_path_error",
+                "page_ref": page_ref,
+                "objective": "Continue",
+                "idempotency_key": "fast-path-provider-error",
+            }),
+            &grants,
+            Some(&ObserveOnlyActuator),
+            &SemanticService::test_error("browser-fast-path-loop-error", "timeout"),
+        );
+
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["status"], "escalate");
+        assert_eq!(result["reason"], "timeout");
+        assert_eq!(result["mutations"], 0);
+        assert_eq!(result["semantic_decisions"], 1);
+        assert_eq!(result["steps"].as_array().unwrap().len(), 0);
+        assert_eq!(result["observation"]["generation"], "pa_gen_error_test");
+    }
+
+    #[test]
+    fn browser_page_action_reserves_mutation_and_replays_only_terminal_delivery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct SequencedActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for SequencedActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage action must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert_eq!(expected_generation, 1);
+                assert!(dispatch_id.is_some());
+                assert_eq!(params["action"], "click");
+                assert!(params.get("endpoint_ref").is_none());
+
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(if call == 0 {
+                    json!({
+                        "ok": false,
+                        "error": "stale_generation",
+                        "delivery_state": "not_applied",
+                        "retry_safe": true,
+                        "mutation_submitted": false,
+                        "postcondition_observed": false,
+                    })
+                } else {
+                    json!({
+                        "ok": true,
+                        "page_ref": params["page_ref"],
+                        "delivery_state": "applied",
+                        "retry_safe": false,
+                        "mutation_submitted": true,
+                        "postcondition_observed": false,
+                    })
+                });
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = SequencedActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let page_ref = format!("bp_{}", "a".repeat(64));
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "click",
+            "generation": "pa_gen_1_test",
+            "ref": "ref_pa_gen_1_test_0",
+            "idempotency_key": "page-click-1",
+        });
+
+        let rejected = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["delivery_state"], "not_applied");
+        assert_eq!(rejected["retry_safe"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+
+        let applied = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(applied["ok"], true);
+        assert_eq!(applied["delivery_state"], "applied");
+        assert_eq!(applied["idempotent_replay"], false);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+
+        let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["delivery_state"], "applied");
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["op_id"], applied["op_id"]);
+        assert_eq!(
+            actuator.calls.load(Ordering::SeqCst),
+            2,
+            "terminal mutation replay must not actuate twice"
+        );
+
+        let mut conflict = params.clone();
+        conflict["ref"] = json!("ref_pa_gen_1_test_1");
+        let conflict = browser_page_action_call(&store, &conflict, &grants, Some(&actuator));
+        assert_eq!(conflict["code"], "idempotency_key_conflict");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_screenshot_routes_read_only_without_operation_reservation() {
+        use std::sync::{Arc, Mutex};
+
+        struct ScreenshotActuator;
+        impl BrowserActuator for ScreenshotActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage screenshot must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(expected_generation, 1);
+                assert_eq!(params["action"], "screenshot");
+                assert!(params.get("max_chars").is_none());
+                assert!(params.get("idempotency_key").is_none());
+
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "capture_scope": "visible_tab",
+                    "artifact": {
+                        "artifact_id": "0123456789abcdef0123456789abcdef",
+                        "mime": "image/jpeg",
+                        "bytes": 42,
+                        "sha256": "b".repeat(64),
+                        "captured_at": 100,
+                        "expires_at": 200,
+                    }
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let page_ref = format!("bp_{}", "a".repeat(64));
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "action": "screenshot",
+        });
+        let result = browser_page_action_call(&store, &params, &grants, Some(&ScreenshotActuator));
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["page_ref"], page_ref);
+        assert_eq!(result["capture_scope"], "visible_tab");
+        assert_eq!(
+            result["artifact"]["artifact_id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+
+        let invalid = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": format!("bp_{}", "c".repeat(64)),
+                "action": "screenshot",
+                "max_chars": 128
+            }),
+            &grants,
+            Some(&ScreenshotActuator),
+        );
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["code"], "invalid_params");
+    }
+
+    #[test]
+    fn browser_page_lifecycle_reuses_page_assist_grant_and_routes_exact_endpoint() {
+        struct PanicActuator;
+        impl BrowserActuator for PanicActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("caller grant rejection must happen before browser actuation")
+            }
+        }
+
+        let open = json!({
+            "endpoint_ref": "bep_test",
+            "action": "open",
+            "target_origin": "https://example.com",
+            "url": "https://example.com/app",
+            "idempotency_key": "page-open-1"
+        });
+        let denied = browser_page_lifecycle_call(&open, &[], Some(&PanicActuator));
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["code"], "caller_grant_missing");
+        assert_eq!(denied["delivery_state"], "not_delivered");
+
+        struct ResultActuator;
+        impl BrowserActuator for ResultActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("lifecycle routing must use the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_LIFECYCLE_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(expected_generation, 1);
+                assert_eq!(params["action"], "open");
+                assert_eq!(params["target_origin"], "https://example.com");
+                assert_eq!(params["url"], "https://example.com/app");
+                assert_eq!(params["idempotency_key"], "page-open-1");
+                assert!(params.get("endpoint_ref").is_none());
+
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "page_ref": format!("bp_{}", "a".repeat(64)),
+                    "ownership": "owned",
+                    "canonical_url": "https://example.com/app"
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let allowed = browser_page_lifecycle_call(&open, &grants, Some(&ResultActuator));
+        assert_eq!(allowed["ok"], true);
+        assert_eq!(allowed["ownership"], "owned");
+
+        let invalid_origin = browser_page_lifecycle_call(
+            &json!({
+                "endpoint_ref": "bep_test",
+                "action": "open",
+                "target_origin": "https://example.com",
+                "url": "https://other.example/app",
+                "idempotency_key": "page-open-2"
+            }),
+            &grants,
+            Some(&PanicActuator),
+        );
+        assert_eq!(invalid_origin["ok"], false);
+        assert_eq!(invalid_origin["code"], "invalid_params");
+
+        let invalid_ref = browser_page_lifecycle_call(
+            &json!({
+                "endpoint_ref": "bep_test",
+                "action": "finalize",
+                "page_ref": "bp_not-opaque"
+            }),
+            &grants,
+            Some(&PanicActuator),
+        );
+        assert_eq!(invalid_ref["ok"], false);
+        assert_eq!(invalid_ref["code"], "invalid_params");
+
+        let unavailable = browser_page_lifecycle_call(&open, &grants, None);
+        assert_eq!(unavailable["code"], "browser_page_unavailable");
+        assert_eq!(unavailable["retryable"], true);
+        assert_eq!(unavailable["delivery_state"], "not_delivered");
+
+        struct UncertainActuator;
+        impl BrowserActuator for UncertainActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                Ok(evidence)
+            }
+        }
+        let uncertain = browser_page_lifecycle_call(&open, &grants, Some(&UncertainActuator));
+        assert_eq!(uncertain["code"], "browser_page_delivery_unknown");
+        assert_eq!(uncertain["retryable"], false);
+        assert_eq!(uncertain["delivery_state"], "delivery_unknown");
+    }
+
+    #[test]
     fn page_assist_requires_exact_caller_grant_and_returns_extension_result() {
         struct PanicActuator;
         impl BrowserActuator for PanicActuator {
@@ -13150,10 +15521,12 @@ mod tests {
                 panic!("caller grant rejection must happen before browser actuation")
             }
         }
+        let page_ref = format!("bp_{}", "a".repeat(64));
         let params = json!({
             "endpoint_ref": "bep_test",
             "action": "inspect",
             "target_origin": "https://example.com",
+            "page_ref": page_ref,
             "max_chars": 4096
         });
         let denied = page_assist_call(&params, &[], Some(&PanicActuator));
@@ -13173,6 +15546,7 @@ mod tests {
                 assert_eq!(operation, "herdr_mcp.page_assist");
                 assert!(dispatch_id.is_none());
                 assert_eq!(params["target_origin"], "https://example.com");
+                assert_eq!(params["page_ref"], format!("bp_{}", "a".repeat(64)));
                 assert_eq!(params["max_chars"], 4096);
                 let mut evidence =
                     BrowserPostconditionEvidence::resource_unavailable(expected_generation);
@@ -13190,6 +15564,12 @@ mod tests {
         let grants = [PageAssistCallerGrant {
             endpoint_ref: "bep_test".to_owned(),
         }];
+        let mut invalid_page_ref = params.clone();
+        invalid_page_ref["page_ref"] = json!("bp_not-opaque");
+        let invalid = page_assist_call(&invalid_page_ref, &grants, Some(&PanicActuator));
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["code"], "invalid_params");
+
         let allowed = page_assist_call(&params, &grants, Some(&ResultActuator));
         assert_eq!(allowed["ok"], true);
         assert_eq!(allowed["generation"], "pa:test");

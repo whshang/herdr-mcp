@@ -1295,6 +1295,8 @@ test("browser and Page Assist private methods require explicit enrolled device s
     "herdr_mcp.browser_resource.resolve",
     "browser_session.archive",
     "herdr_mcp.page_assist",
+    "herdr_mcp.browser_page.lifecycle",
+    "herdr_mcp.browser_page.action",
   ]) {
     const missing = await handleMcp(
       req(1, "tools/call", { name: "herdr_call", arguments: { method, params: JSON.stringify({ limit: 10 }) } }),
@@ -1421,6 +1423,58 @@ test("browser and Page Assist private methods require explicit enrolled device s
     }],
   }, "Page Assist receives only endpoint grants for the routed device and no WebChat grant tuple");
 
+  const pageLifecycle = await handleMcp(
+    req(51, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.browser_page.lifecycle",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          action: "open",
+          target_origin: "https://example.com",
+          url: "https://example.com/",
+          idempotency_key: "browser-page-lifecycle-edge-grant",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(pageLifecycle.body.result.isError, undefined);
+  assert.equal(d.calls.length, 5, "BrowserPage lifecycle forwards with Page Assist authority");
+  assert.equal(d.calls[4].args.method, "herdr_mcp.browser_page.lifecycle");
+  assert.deepEqual(d.calls[4].trace, {
+    page_assist_grants: [{
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    }],
+  });
+
+  const pageAction = await handleMcp(
+    req(52, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.browser_page.action",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          page_ref: `bp_${"a".repeat(64)}`,
+          action: "observe",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(pageAction.body.result.isError, undefined);
+  assert.equal(d.calls.length, 6, "BrowserPage action forwards with Page Assist authority");
+  assert.equal(d.calls[5].args.method, "herdr_mcp.browser_page.action");
+  assert.deepEqual(d.calls[5].trace, {
+    page_assist_grants: [{
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    }],
+  });
+
   const agentPrompt = await handleMcp(
     req(6, "tools/call", {
       name: "herdr_prompt",
@@ -1436,8 +1490,8 @@ test("browser and Page Assist private methods require explicit enrolled device s
     d.value,
   );
   assert.equal(agentPrompt.body.result.isError, undefined);
-  assert.equal(d.calls.length, 5, "agent prompt forwards once to the selected workstation");
-  assert.deepEqual(d.calls[4].trace, {
+  assert.equal(d.calls.length, 7, "agent prompt forwards once to the selected workstation");
+  assert.deepEqual(d.calls[6].trace, {
     webchat_authorization: {
       principal_ref: "connector:conn_auditconnector123",
       connector_id: "conn_auditconnector123",
