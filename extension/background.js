@@ -40,10 +40,9 @@ import {
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc, parseMcpJsonResponseText } from "./mcp-json-rpc.js";
 import { NATIVE_HOST_NOT_INSTALLED, NATIVE_ORIGIN_NOT_ACTIVE } from "./native-host-diagnostics.js";
-import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrBatchFetch, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
+import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrBatchFetch, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
   originToMatchPattern,
-  parseAllowedOrigins,
   validatePageAssistRequest,
 } from "./page-assist-core.js";
 import {
@@ -150,10 +149,15 @@ const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation";
 const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation";
 const BROWSER_PROFILE_SEED_STORAGE_KEY = "herdrBrowserProfileSeedV1";
 const BROWSER_OBSERVATION_GENERATION_STORAGE_KEY = "herdrBrowserObservationGenerationV1";
+const BROWSER_PAGE_SESSION_STORAGE_KEY = "herdrBrowserPagesV1";
+const BROWSER_PAGE_MAX_RECORDS = 128;
 const DURABLE_ARCHIVE_RETRY_MS = 1000;
 const DURABLE_ARCHIVE_CLAIM_RECOVERY_MS = 35000;
 const browserSessionTargets = new Map();
 const browserTabScopes = new Map();
+const browserPagesByRef = new Map();
+let browserPagesLoaded = false;
+let browserPagesLoadPromise = null;
 const archiveTabCloseInFlight = new Set();
 let browserEndpoint = null;
 let browserObservationGeneration = null;
@@ -429,7 +433,6 @@ let CFG = {
   experimentalZAiEnabled: false,
   experimentalDeepSeekEnabled: false,
   experimentalGeminiEnabled: false,
-  pageAssistOrigins: [],
 };
 let PROJECT_AUTOMATION = {};
 let CONVERSATION_AUTOMATION = {};
@@ -560,7 +563,7 @@ async function syncExperimentalContentScripts() {
   }
 }
 
-async function syncSupportedOptionalContentScripts() {
+async function syncSupportedContentScripts() {
   if (!chrome.scripting?.getRegisteredContentScripts
     || !chrome.scripting?.registerContentScripts
     || !chrome.scripting?.unregisterContentScripts) return;
@@ -602,7 +605,7 @@ async function syncSupportedOptionalContentScripts() {
 
 async function syncDynamicContentScripts() {
   await syncExperimentalContentScripts();
-  await syncSupportedOptionalContentScripts();
+  await syncSupportedContentScripts();
 }
 
 function conversationAutomationSiteForConversation(convKey) {
@@ -801,11 +804,13 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       "jevJudgeBaseUrl",
       "jevJudgeApiKey",
       "jevJudgeModel",
+      "pageAssistOrigins",
       PROJECT_AUTOMATION_STORAGE_KEY,
       CONVERSATION_AUTOMATION_STORAGE_KEY,
     ];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
+    delete CFG.pageAssistOrigins;
     delete CFG.experimentalGrokEnabled;
     delete CFG.jevJudgeMode;
     delete CFG.jevJudgeThreshold;
@@ -863,16 +868,10 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   }
   // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
-  // during upgrade. Semantic provider credentials are owned by Runtime/Edge;
-  // browser copies and their optional host permissions are migration tombstones.
+  // during upgrade. Semantic provider credentials are owned by Runtime/Edge.
+  // Browser host access is one required install/load-time permission, so
+  // migration never mutates per-site Chrome permissions.
   try {
-    const retiredProviderOrigins = [
-      hostPermissionPatternForUrl(stored.llmJudgeBaseUrl),
-      hostPermissionPatternForUrl(stored.jevJudgeBaseUrl),
-    ].filter(Boolean);
-    if (retiredProviderOrigins.length && chrome.permissions?.remove) {
-      try { await chrome.permissions.remove({ origins: [...new Set(retiredProviderOrigins)] }); } catch (_) {}
-    }
     await chrome.storage.local.remove([
       "autoAllow",
       "token",
@@ -887,6 +886,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       "jevJudgeBaseUrl",
       "jevJudgeApiKey",
       "jevJudgeModel",
+      "pageAssistOrigins",
     ]);
   } catch (e) {}
   await syncDynamicContentScripts();
@@ -894,10 +894,10 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
 })();
 
 if (chrome.permissions?.onAdded?.addListener) {
-  chrome.permissions.onAdded.addListener(() => { void syncSupportedOptionalContentScripts(); });
+  chrome.permissions.onAdded.addListener(() => { void syncSupportedContentScripts(); });
 }
 if (chrome.permissions?.onRemoved?.addListener) {
-  chrome.permissions.onRemoved.addListener(() => { void syncSupportedOptionalContentScripts(); });
+  chrome.permissions.onRemoved.addListener(() => { void syncSupportedContentScripts(); });
 }
 
 // ---- Toolbar badge (replaces the ambiguous in-page status dot) ----
@@ -3578,6 +3578,57 @@ async function handleBrowserActuation(command) {
     }).catch(() => {});
     return;
   }
+  if (operation === "herdr_mcp.browser_page.action") {
+    let result;
+    try {
+      result = await performBrowserPageActionRequest({
+        pageRef: params.page_ref,
+        action: params.action,
+        maxChars: params.max_chars,
+        generation: params.generation,
+        ref: params.ref,
+        value: params.value,
+        condition: params.condition,
+        timeoutMs: params.timeout_ms,
+      });
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = { ok: false, error: "browser_page_invalid_result" };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "browser_page_unavailable"),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
+    return;
+  }
+  if (operation === "herdr_mcp.browser_page.lifecycle") {
+    let result;
+    try {
+      result = await performBrowserPageLifecycleRequest({
+        action: params.action,
+        targetOrigin: params.target_origin,
+        url: params.url,
+        pageRef: params.page_ref,
+        idempotencyKey: params.idempotency_key,
+      });
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = { ok: false, error: "browser_page_invalid_result" };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "browser_page_unavailable"),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
+    return;
+  }
   if (operation === "herdr_mcp.page_assist") {
     let result;
     try {
@@ -3589,8 +3640,10 @@ async function handleBrowserActuation(command) {
       } else {
         result = await performPageAssistRequest({
           type: "h2w_page_assist",
+          endpointRef: current.endpoint_ref,
           action: params.action,
           targetOrigin: params.target_origin,
+          pageRef: params.page_ref,
           tabId: params.tab_id,
           maxChars: params.max_chars,
           generation: params.generation,
@@ -3944,6 +3997,17 @@ async function handleBrowserActuation(command) {
           await new Promise((resolve) => setTimeout(resolve, 200));
         } while (Date.now() < deadline);
         if (!targetOpen) {
+          let tabClosed = false;
+          let tabCleanupVerified = false;
+          try {
+            await chrome.tabs.remove(createdTab.id);
+            tabClosed = true;
+          } catch (_) {}
+          try {
+            await chrome.tabs.get(createdTab.id);
+          } catch (_) {
+            tabCleanupVerified = true;
+          }
           await postBrowserActuationEvidence(actuationId, {
             ...unavailableBrowserActuationEvidence(
               expectedGeneration,
@@ -3951,6 +4015,12 @@ async function handleBrowserActuation(command) {
             ),
             command_accepted: true,
             resource_available: true,
+            result: {
+              error: "browser_open_target_register_timeout",
+              tab_opened: true,
+              tab_closed: tabClosed,
+              tab_cleanup_verified: tabCleanupVerified,
+            },
           }).catch(() => {});
           return;
         }
@@ -7500,39 +7570,902 @@ async function handleWebArtifactCapture(msg, sender) {
     : { ok: false, error: "artifact-capture-native-empty" };
 }
 
+function validBrowserPageRef(value) {
+  return typeof value === "string" && /^bp_[0-9a-f]{64}$/.test(value);
+}
+
+function createBrowserPageRef() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return `bp_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function normalizeBrowserPageRecord(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const pageRef = String(raw.page_ref || "");
+  const endpointRef = String(raw.endpoint_ref || "");
+  const tabId = Number(raw.tab_id);
+  const origin = String(raw.origin || "");
+  const canonicalUrl = String(raw.canonical_url || "");
+  const ownership = raw.ownership === "owned" ? "owned" : (raw.ownership === "claimed" ? "claimed" : null);
+  const observationGeneration = Number(raw.observation_generation);
+  const pageGeneration = Number(raw.page_generation);
+  const lastSeenAt = Number(raw.last_seen_at);
+  if (!validBrowserPageRef(pageRef)
+      || !endpointRef || endpointRef.length > 96
+      || !Number.isInteger(tabId) || tabId <= 0
+      || !ownership
+      || !Number.isSafeInteger(observationGeneration) || observationGeneration <= 0
+      || !Number.isSafeInteger(pageGeneration) || pageGeneration <= 0
+      || !Number.isFinite(lastSeenAt) || lastSeenAt <= 0) {
+    return null;
+  }
+  try {
+    const parsed = new URL(canonicalUrl);
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.origin.toLowerCase() !== origin.toLowerCase()) {
+      return null;
+    }
+  } catch (_) {
+    return null;
+  }
+  const createdByOperation = typeof raw.created_by_operation === "string"
+    && raw.created_by_operation.length <= 256
+    ? raw.created_by_operation
+    : null;
+  return {
+    page_ref: pageRef,
+    endpoint_ref: endpointRef,
+    tab_id: tabId,
+    origin: origin.toLowerCase(),
+    canonical_url: canonicalUrl,
+    ownership,
+    observation_generation: observationGeneration,
+    page_generation: pageGeneration,
+    created_by_operation: createdByOperation,
+    last_seen_at: lastSeenAt,
+  };
+}
+
+async function loadBrowserPages() {
+  if (browserPagesLoaded) return;
+  if (browserPagesLoadPromise) return browserPagesLoadPromise;
+  browserPagesLoadPromise = (async () => {
+    browserPagesByRef.clear();
+    const storageArea = chrome.storage?.session;
+    if (!storageArea?.get) {
+      browserPagesLoaded = true;
+      return;
+    }
+    try {
+      const stored = (await storageArea.get(BROWSER_PAGE_SESSION_STORAGE_KEY))[BROWSER_PAGE_SESSION_STORAGE_KEY];
+      const records = Array.isArray(stored) ? stored : [];
+      for (const raw of records.slice(-BROWSER_PAGE_MAX_RECORDS)) {
+        const record = normalizeBrowserPageRecord(raw);
+        if (record) browserPagesByRef.set(record.page_ref, record);
+      }
+      browserPagesLoaded = true;
+    } catch (_) {}
+  })();
+  try {
+    await browserPagesLoadPromise;
+  } finally {
+    browserPagesLoadPromise = null;
+  }
+}
+
+async function persistBrowserPages() {
+  const storageArea = chrome.storage?.session;
+  if (!storageArea?.set) return false;
+  const allRecords = [...browserPagesByRef.values()];
+  const owned = allRecords.filter((record) => record.ownership === "owned");
+  if (owned.length > BROWSER_PAGE_MAX_RECORDS) return false;
+  const claimedSlots = BROWSER_PAGE_MAX_RECORDS - owned.length;
+  const claimed = claimedSlots > 0
+    ? allRecords
+      .filter((record) => record.ownership === "claimed")
+      .sort((left, right) => left.last_seen_at - right.last_seen_at)
+      .slice(-claimedSlots)
+    : [];
+  const records = [...owned, ...claimed]
+    .sort((left, right) => left.last_seen_at - right.last_seen_at);
+  try {
+    await storageArea.set({ [BROWSER_PAGE_SESSION_STORAGE_KEY]: records });
+  } catch (_) {
+    return false;
+  }
+  const retained = new Set(records.map((record) => record.page_ref));
+  for (const record of allRecords) {
+    if (record.ownership === "claimed" && !retained.has(record.page_ref)) {
+      browserPagesByRef.delete(record.page_ref);
+    }
+  }
+  return true;
+}
+
+function browserPageOrigin(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.origin.toLowerCase() : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserPageCanonicalUrl(rawUrl, targetOrigin = null) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    const origin = parsed.origin.toLowerCase();
+    if (targetOrigin && origin !== targetOrigin) return null;
+    return parsed.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+function browserPageView(page, extra = {}) {
+  if (!page) return null;
+  return {
+    ok: true,
+    page_ref: page.page_ref,
+    origin: page.origin,
+    canonical_url: page.canonical_url,
+    ownership: page.ownership,
+    page_generation: page.page_generation,
+    ...extra,
+  };
+}
+
+async function rememberBrowserPage(
+  endpointRef,
+  tab,
+  targetOrigin,
+  ownership = "claimed",
+  createdByOperation = null,
+) {
+  if (!endpointRef || !tab?.id || !tab?.url || !["claimed", "owned"].includes(ownership)) return null;
+  const origin = browserPageOrigin(tab.url);
+  const canonicalUrl = browserPageCanonicalUrl(tab.url, targetOrigin);
+  if (!origin || origin !== targetOrigin || !canonicalUrl) return null;
+  await loadBrowserPages();
+  const observationGeneration = await getBrowserObservationGeneration();
+  const existing = [...browserPagesByRef.values()].find((record) =>
+    record.endpoint_ref === endpointRef
+      && record.tab_id === tab.id
+      && record.origin === origin
+      && record.canonical_url === canonicalUrl
+      && record.ownership === ownership
+      && (ownership === "claimed"
+        || createdByOperation == null
+        || record.created_by_operation === createdByOperation));
+  const now = Date.now();
+  if (existing) {
+    existing.last_seen_at = now;
+    existing.observation_generation = observationGeneration;
+    if (ownership === "claimed" && !existing.created_by_operation && createdByOperation) {
+      existing.created_by_operation = createdByOperation;
+    }
+    if (!await persistBrowserPages()) return null;
+    return existing;
+  }
+  const record = {
+    page_ref: createBrowserPageRef(),
+    endpoint_ref: endpointRef,
+    tab_id: tab.id,
+    origin,
+    canonical_url: canonicalUrl,
+    ownership,
+    observation_generation: observationGeneration,
+    page_generation: 1,
+    created_by_operation: createdByOperation,
+    last_seen_at: now,
+  };
+  browserPagesByRef.set(record.page_ref, record);
+  if (!await persistBrowserPages()) {
+    browserPagesByRef.delete(record.page_ref);
+    return null;
+  }
+  return record;
+}
+
+async function claimBrowserPage(endpointRef, tab, targetOrigin, createdByOperation = null) {
+  return rememberBrowserPage(endpointRef, tab, targetOrigin, "claimed", createdByOperation);
+}
+
+async function resolveBrowserPage(pageRef, endpointRef, targetOrigin) {
+  if (!validBrowserPageRef(pageRef)) {
+    return { ok: false, error: "browser_page_ref_invalid" };
+  }
+  if (!endpointRef) {
+    return { ok: false, error: "browser_page_endpoint_unavailable" };
+  }
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) return { ok: false, error: "browser_page_not_found" };
+  if (record.endpoint_ref !== endpointRef) {
+    return { ok: false, error: "browser_page_endpoint_mismatch" };
+  }
+  if (record.origin !== targetOrigin) {
+    return { ok: false, error: "browser_page_origin_mismatch" };
+  }
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(record.tab_id);
+  } catch (_) {}
+  if (!tab?.url) {
+    browserPagesByRef.delete(pageRef);
+    await persistBrowserPages();
+    return { ok: false, error: "browser_page_not_found" };
+  }
+  const liveOrigin = browserPageOrigin(tab.url);
+  if (liveOrigin !== record.origin) {
+    browserPagesByRef.delete(pageRef);
+    await persistBrowserPages();
+    return { ok: false, error: "browser_page_origin_mismatch" };
+  }
+  if (liveOrigin !== targetOrigin) {
+    return { ok: false, error: "browser_page_origin_mismatch" };
+  }
+  if (String(tab.url) !== record.canonical_url) {
+    browserPagesByRef.delete(pageRef);
+    await persistBrowserPages();
+    return { ok: false, error: "browser_page_stale" };
+  }
+  record.last_seen_at = Date.now();
+  await persistBrowserPages();
+  return { ok: true, page: record, tab };
+}
+
+async function browserPageByOperation(endpointRef, idempotencyKey, ownership = null) {
+  await loadBrowserPages();
+  return [...browserPagesByRef.values()].find((record) =>
+    record.endpoint_ref === endpointRef
+      && record.created_by_operation === idempotencyKey
+      && (ownership == null || record.ownership === ownership)) || null;
+}
+
+async function removeBrowserPageRecord(pageRef) {
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) return true;
+  browserPagesByRef.delete(pageRef);
+  if (await persistBrowserPages()) return true;
+  browserPagesByRef.set(pageRef, record);
+  return false;
+}
+
+async function performBrowserPageLifecycleRequest(msg) {
+  await configReady;
+  const action = String(msg?.action || "");
+  const idempotencyKey = String(msg?.idempotencyKey || "");
+  if (!["open", "claim", "release", "finalize"].includes(action)
+      || idempotencyKey.length > 256
+      || (["open", "claim"].includes(action) && !idempotencyKey)) {
+    return { ok: false, error: "browser_page_params_invalid" };
+  }
+
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+  if (!endpointRef) return { ok: false, error: "browser_page_endpoint_unavailable" };
+
+  if (action === "open" || action === "claim") {
+    const targetOrigin = String(msg?.targetOrigin || "").toLowerCase();
+    const canonicalUrl = browserPageCanonicalUrl(msg?.url, targetOrigin);
+    if (!targetOrigin || !canonicalUrl || browserPageOrigin(targetOrigin) !== targetOrigin) {
+      return { ok: false, error: "browser_page_url_invalid" };
+    }
+    const pattern = originToMatchPattern(targetOrigin);
+    if (!pattern || !await hasHostPermission(pattern)) {
+      return {
+        ok: false,
+        error: "permission_required",
+        reason: "host_permission_missing",
+        origin: targetOrigin,
+      };
+    }
+
+    const prior = await browserPageByOperation(endpointRef, idempotencyKey, action === "open" ? "owned" : "claimed");
+    if (prior) {
+      let priorTab = null;
+      try { priorTab = await chrome.tabs.get(prior.tab_id); } catch (_) {}
+      if (!priorTab?.url) {
+        await removeBrowserPageRecord(prior.page_ref);
+      } else {
+        const liveUrl = browserPageCanonicalUrl(priorTab.url, targetOrigin);
+        if (liveUrl === canonicalUrl && prior.canonical_url === canonicalUrl) {
+          prior.last_seen_at = Date.now();
+          if (!await persistBrowserPages()) {
+            return { ok: false, error: "browser_page_storage_unavailable" };
+          }
+          return browserPageView(prior, { reused: true });
+        }
+        return {
+          ok: false,
+          error: "browser_page_operation_stale",
+          page_ref: prior.page_ref,
+          ownership: prior.ownership,
+        };
+      }
+    }
+
+    if (action === "claim") {
+      let tabs = [];
+      try { tabs = await chrome.tabs.query({ url: pattern }); } catch (_) {}
+      const matches = tabs.filter((tab) =>
+        tab?.id && browserPageCanonicalUrl(tab.url, targetOrigin) === canonicalUrl);
+      if (matches.length === 0) return { ok: false, error: "target_tab_not_found" };
+      if (matches.length !== 1) return { ok: false, error: "target_tab_ambiguous" };
+      const page = await rememberBrowserPage(
+        endpointRef,
+        matches[0],
+        targetOrigin,
+        "claimed",
+        idempotencyKey,
+      );
+      return page
+        ? browserPageView(page, { reused: false })
+        : { ok: false, error: "browser_page_storage_unavailable" };
+    }
+
+    let createdTab = null;
+    try {
+      createdTab = await chrome.tabs.create({ url: canonicalUrl, active: false });
+    } catch (_) {}
+    if (!createdTab?.id) return { ok: false, error: "browser_page_open_failed" };
+    // Real Chromium commonly returns a newly-created tab with only
+    // `pendingUrl` while navigation is still loading. Wait for the existing
+    // bounded completion fence before binding an owned BrowserPage record so
+    // we persist the live URL/document rather than treating normal navigation
+    // latency as a storage failure.
+    const readyTab = await waitForTabComplete(createdTab.id, 15000);
+    const page = readyTab
+      ? await rememberBrowserPage(
+        endpointRef,
+        readyTab,
+        targetOrigin,
+        "owned",
+        idempotencyKey,
+      )
+      : null;
+    if (page) return browserPageView(page, { reused: false });
+
+    let tabClosed = false;
+    let tabCleanupVerified = false;
+    try {
+      await chrome.tabs.remove(createdTab.id);
+      tabClosed = true;
+    } catch (_) {}
+    try {
+      await chrome.tabs.get(createdTab.id);
+    } catch (_) {
+      tabCleanupVerified = true;
+    }
+    return {
+      ok: false,
+      error: "browser_page_storage_unavailable",
+      tab_opened: true,
+      tab_closed: tabClosed,
+      tab_cleanup_verified: tabCleanupVerified,
+    };
+  }
+
+  const pageRef = String(msg?.pageRef || "");
+  if (!validBrowserPageRef(pageRef)) return { ok: false, error: "browser_page_ref_invalid" };
+  await loadBrowserPages();
+  const page = browserPagesByRef.get(pageRef);
+  if (!page) return { ok: false, error: "browser_page_not_found" };
+  if (page.endpoint_ref !== endpointRef) {
+    return { ok: false, error: "browser_page_endpoint_mismatch" };
+  }
+
+  if (action === "release") {
+    if (page.ownership !== "claimed") {
+      return { ok: false, error: "browser_page_owned_requires_finalize" };
+    }
+    if (!await removeBrowserPageRecord(pageRef)) {
+      return { ok: false, error: "browser_page_storage_unavailable" };
+    }
+    return browserPageView(page, {
+      released: true,
+      tab_closed: false,
+      tab_cleanup_verified: true,
+    });
+  }
+
+  if (page.ownership === "claimed") {
+    if (!await removeBrowserPageRecord(pageRef)) {
+      return { ok: false, error: "browser_page_storage_unavailable" };
+    }
+    return browserPageView(page, {
+      finalized: true,
+      tab_closed: false,
+      tab_cleanup_verified: true,
+    });
+  }
+
+  let liveTab = null;
+  try { liveTab = await chrome.tabs.get(page.tab_id); } catch (_) {}
+  if (!liveTab) {
+    if (!await removeBrowserPageRecord(pageRef)) {
+      return { ok: false, error: "browser_page_storage_unavailable" };
+    }
+    return browserPageView(page, {
+      finalized: true,
+      tab_closed: true,
+      tab_cleanup_verified: true,
+      already_closed: true,
+    });
+  }
+
+  let tabClosed = false;
+  try {
+    await chrome.tabs.remove(page.tab_id);
+    tabClosed = true;
+  } catch (_) {}
+  let tabCleanupVerified = false;
+  try {
+    await chrome.tabs.get(page.tab_id);
+  } catch (_) {
+    tabCleanupVerified = true;
+  }
+  if (!tabCleanupVerified) {
+    return browserPageView(page, {
+      ok: false,
+      error: "browser_page_close_failed",
+      tab_closed: tabClosed,
+      tab_cleanup_verified: false,
+    });
+  }
+  if (!await removeBrowserPageRecord(pageRef)) {
+    return browserPageView(page, {
+      ok: false,
+      error: "browser_page_storage_unavailable",
+      tab_closed: true,
+      tab_cleanup_verified: true,
+    });
+  }
+  return browserPageView(page, {
+    finalized: true,
+    tab_closed: true,
+    tab_cleanup_verified: true,
+  });
+}
+
+const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
+  "browser_page_ref_invalid",
+  "browser_page_endpoint_unavailable",
+  "browser_page_not_found",
+  "browser_page_endpoint_mismatch",
+  "browser_page_origin_mismatch",
+  "browser_page_stale",
+  "permission_required",
+  "origin_not_permitted",
+  "origin_permission_missing",
+  "origin_mismatch",
+  "disallowed_parameter",
+  "cross_origin_iframe_blocked",
+  "stale_generation",
+  "invalid_ref",
+  "element_detached",
+  "element_disabled",
+  "element_hidden",
+  "unsupported_element",
+  "sensitive_field_prohibited",
+  "element_not_fillable",
+  "value_required",
+]);
+
+function browserPageMutationEnvelope(result, page, sendAttempted) {
+  const base = withBrowserPageIdentity(
+    result && typeof result === "object" ? result : { ok: false, error: "browser_page_invalid_result" },
+    page,
+  );
+  if (base?.ok === true) {
+    return {
+      ...base,
+      delivery_state: "applied",
+      retry_safe: false,
+      mutation_submitted: true,
+      postcondition_observed: false,
+    };
+  }
+  const error = String(base?.error || "browser_page_action_failed");
+  if (!sendAttempted || BROWSER_PAGE_SAFE_MUTATION_REJECTIONS.has(error)) {
+    return {
+      ...base,
+      delivery_state: "not_applied",
+      retry_safe: true,
+      mutation_submitted: false,
+      postcondition_observed: false,
+    };
+  }
+  return {
+    ...base,
+    delivery_state: "delivery_unknown",
+    retry_safe: false,
+    mutation_submitted: true,
+    postcondition_observed: false,
+  };
+}
+
+async function adoptAppliedBrowserPageNavigation(page, tabId, rawNavigationUrl, timeoutMs = 5000) {
+  const expectedUrl = browserPageCanonicalUrl(rawNavigationUrl, page?.origin);
+  if (!page || !Number.isInteger(tabId) || !expectedUrl || expectedUrl === page.canonical_url) {
+    return false;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let tab = null;
+    try { tab = await chrome.tabs.get(tabId); } catch (_) { return false; }
+    const liveOrigin = browserPageOrigin(tab?.url);
+    if (liveOrigin && liveOrigin !== page.origin) return false;
+    const liveUrl = browserPageCanonicalUrl(tab?.url, page.origin);
+    if (liveUrl && liveUrl !== page.canonical_url && liveUrl !== expectedUrl) return false;
+    if (tab?.status === "complete" && liveUrl === expectedUrl) {
+      page.canonical_url = expectedUrl;
+      page.page_generation = Number.isSafeInteger(page.page_generation)
+        ? page.page_generation + 1
+        : 1;
+      page.observation_generation = await getBrowserObservationGeneration();
+      page.last_seen_at = Date.now();
+      await persistBrowserPages();
+      return true;
+    }
+    await sleep(100);
+  }
+  return false;
+}
+
+function browserPageScreenshotArtifact(response) {
+  const artifact = response?.artifact;
+  if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) return null;
+  const artifactId = String(artifact.artifact_id || "");
+  const mime = String(artifact.mime || "");
+  const sha256 = String(artifact.sha256 || "");
+  const bytes = Number(artifact.bytes);
+  const capturedAt = Number(artifact.captured_at);
+  const expiresAt = Number(artifact.expires_at);
+  if (!/^[0-9a-f]{32}$/.test(artifactId)
+      || !["image/png", "image/jpeg"].includes(mime)
+      || !/^[0-9a-f]{64}$/i.test(sha256)
+      || !Number.isSafeInteger(bytes) || bytes <= 0
+      || !Number.isSafeInteger(capturedAt) || capturedAt <= 0
+      || !Number.isSafeInteger(expiresAt) || expiresAt <= capturedAt) {
+    return null;
+  }
+  return {
+    artifact_id: artifactId,
+    mime,
+    bytes,
+    sha256: sha256.toLowerCase(),
+    captured_at: capturedAt,
+    expires_at: expiresAt,
+  };
+}
+
+async function captureBrowserPageScreenshot(page, tab) {
+  if (!page || !tab?.id || !Number.isInteger(tab.windowId)
+      || !chrome.tabs?.onActivated?.addListener
+      || !chrome.tabs?.onActivated?.removeListener
+      || !chrome.windows?.get
+      || !chrome.windows?.onFocusChanged?.addListener
+      || !chrome.windows?.onFocusChanged?.removeListener) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "browser_page_screenshot_not_visible",
+      retryable: true,
+      capture_scope: "visible_tab",
+    }, page);
+  }
+
+  const exactTargetIsVisible = async () => {
+    let window = null;
+    let activeTabs = [];
+    try {
+      window = await chrome.windows.get(tab.windowId);
+      activeTabs = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+    } catch (_) {}
+    return window?.focused === true
+      && activeTabs.length === 1
+      && activeTabs[0]?.id === tab.id;
+  };
+
+  if (!await exactTargetIsVisible()) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "browser_page_screenshot_not_visible",
+      retryable: true,
+      capture_scope: "visible_tab",
+    }, page);
+  }
+
+  let viewChanged = false;
+  const onActivated = (activeInfo) => {
+    if (activeInfo?.windowId === tab.windowId) viewChanged = true;
+  };
+  const onFocusChanged = (windowId) => {
+    if (windowId !== tab.windowId) viewChanged = true;
+  };
+  chrome.tabs.onActivated.addListener(onActivated);
+  chrome.windows.onFocusChanged.addListener(onFocusChanged);
+
+  let dataUrl = "";
+  try {
+    dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+      format: "jpeg",
+      quality: 80,
+    });
+    if (viewChanged || !await exactTargetIsVisible()) {
+      return withBrowserPageIdentity({
+        ok: false,
+        error: "browser_page_screenshot_view_changed",
+        retryable: true,
+        capture_scope: "visible_tab",
+      }, page);
+    }
+  } catch (error) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "browser_page_screenshot_failed",
+      retryable: true,
+      detail: String(error?.message || error || ""),
+      capture_scope: "visible_tab",
+    }, page);
+  } finally {
+    chrome.tabs.onActivated.removeListener(onActivated);
+    chrome.windows.onFocusChanged.removeListener(onFocusChanged);
+  }
+
+  const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ""));
+  if (!match) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "browser_page_screenshot_invalid",
+      retryable: false,
+      capture_scope: "visible_tab",
+    }, page);
+  }
+
+  const nonce = crypto.getRandomValues(new Uint8Array(8));
+  const nonceHex = Array.from(nonce, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const artifactKey = `screenshot_${Date.now()}_${nonceHex}`;
+  const response = await captureImageArtifactNative({
+    source_id: page.page_ref,
+    artifact_key: artifactKey,
+    mime: match[1],
+    bytes_b64: match[2],
+  });
+  const artifact = browserPageScreenshotArtifact(response);
+  if (!artifact) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: String(response?.error || "browser_page_screenshot_artifact_failed"),
+      retryable: true,
+      capture_scope: "visible_tab",
+    }, page);
+  }
+  return withBrowserPageIdentity({
+    ok: true,
+    capture_scope: "visible_tab",
+    origin: page.origin,
+    canonical_url: page.canonical_url,
+    artifact,
+  }, page);
+}
+
+async function performBrowserPageActionRequest(msg) {
+  await configReady;
+  const action = String(msg?.action || "").toLowerCase();
+  if (!["observe", "click", "fill", "expect", "screenshot"].includes(action)) {
+    return { ok: false, error: "browser_page_action_invalid" };
+  }
+
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+  if (!endpointRef) return { ok: false, error: "browser_page_endpoint_unavailable" };
+
+  const pageRef = String(msg?.pageRef || "");
+  if (!validBrowserPageRef(pageRef)) {
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
+      : { ok: false, error: "browser_page_ref_invalid" };
+  }
+
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) {
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
+      : { ok: false, error: "browser_page_not_found" };
+  }
+  if (record.endpoint_ref !== endpointRef) {
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
+      : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
+  }
+
+  const pattern = originToMatchPattern(record.origin);
+  if (!pattern || !await hasHostPermission(pattern)) {
+    const denied = {
+      ok: false,
+      error: "permission_required",
+      reason: "host_permission_missing",
+      origin: record.origin,
+    };
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope(denied, record, false)
+      : withBrowserPageIdentity(denied, record);
+  }
+
+  const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
+  if (!resolved.ok) {
+    return action === "click" || action === "fill"
+      ? browserPageMutationEnvelope(resolved, record, false)
+      : withBrowserPageIdentity(resolved, record);
+  }
+  const page = resolved.page;
+  if (action === "screenshot") {
+    return captureBrowserPageScreenshot(page, resolved.tab);
+  }
+  const tabId = resolved.tab.id;
+  const payload = {
+    type: "h2w_page_assist",
+    action,
+    expectedOrigin: page.origin,
+    maxChars: msg?.maxChars,
+    generation: msg?.generation,
+    ref: msg?.ref,
+    value: msg?.value,
+    condition: msg?.condition,
+    timeoutMs: msg?.timeoutMs,
+  };
+
+  const mutation = action === "click" || action === "fill";
+  let sendAttempted = false;
+  const send = async () => {
+    sendAttempted = true;
+    return chrome.tabs.sendMessage(tabId, payload);
+  };
+
+  try {
+    const response = await send();
+    if (mutation) {
+      let mutationResponse = response;
+      if (action === "click" && response?.ok === true && typeof response?.navigation_url === "string") {
+        await adoptAppliedBrowserPageNavigation(page, tabId, response.navigation_url);
+        mutationResponse = { ...response };
+        delete mutationResponse.navigation_url;
+      }
+      return browserPageMutationEnvelope(mutationResponse, page, true);
+    }
+    return withBrowserPageIdentity(
+      response || { ok: false, error: "empty_content_response" },
+      page,
+    );
+  } catch (error) {
+    if (mutation) {
+      return browserPageMutationEnvelope(
+        {
+          ok: false,
+          error: "browser_page_action_transport_failed",
+          detail: String(error?.message || error || ""),
+        },
+        page,
+        sendAttempted,
+      );
+    }
+  }
+
+  if (!["observe", "expect"].includes(action)) {
+    return withBrowserPageIdentity({ ok: false, error: "browser_page_action_unavailable" }, page);
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/browser-page-kernel.js", "content/page-assist.js"],
+      world: "ISOLATED",
+    });
+  } catch (error) {
+    return withBrowserPageIdentity(
+      {
+        ok: false,
+        error: "script_injection_failed",
+        detail: String(error?.message || error || ""),
+      },
+      page,
+    );
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, payload);
+    return withBrowserPageIdentity(
+      response || { ok: false, error: "empty_content_response" },
+      page,
+    );
+  } catch (error) {
+    return withBrowserPageIdentity(
+      {
+        ok: false,
+        error: "browser_page_action_unavailable",
+        detail: String(error?.message || error || ""),
+      },
+      page,
+    );
+  }
+}
+
+function withBrowserPageIdentity(result, page) {
+  if (!result || typeof result !== "object" || Array.isArray(result) || !page) return result;
+  return {
+    ...result,
+    page_ref: page.page_ref,
+    page_generation: page.page_generation,
+    ownership: page.ownership,
+  };
+}
+
 async function performPageAssistRequest(msg) {
   await configReady;
-  const allowed = parseAllowedOrigins(CFG.pageAssistOrigins);
-  const validation = validatePageAssistRequest(msg, allowed);
+  const validation = validatePageAssistRequest(msg);
   if (!validation.ok) return validation;
 
   const pattern = originToMatchPattern(validation.targetOrigin);
   const hasPerm = await hasHostPermission(pattern);
   if (!hasPerm) return { ok: false, error: "origin_permission_missing" };
 
+  const requestedPageRef = typeof msg.pageRef === "string" ? msg.pageRef.trim() : "";
+  let endpointRef = typeof msg.endpointRef === "string" ? msg.endpointRef.trim() : "";
+  let page = null;
+  let targetTab = null;
   let tabId = Number(msg.tabId);
-  if (!Number.isInteger(tabId) || tabId <= 0) {
-    let tabs = [];
+
+  if (requestedPageRef) {
+    if (!endpointRef) {
+      const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+      endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+    }
+    const resolved = await resolveBrowserPage(requestedPageRef, endpointRef, validation.targetOrigin);
+    if (!resolved.ok) return resolved;
+    page = resolved.page;
+    targetTab = resolved.tab;
+    if (Number.isInteger(tabId) && tabId > 0 && tabId !== page.tab_id) {
+      return { ok: false, error: "browser_page_tab_mismatch" };
+    }
+    tabId = page.tab_id;
+  } else {
+    if (!Number.isInteger(tabId) || tabId <= 0) {
+      let tabs = [];
+      try {
+        tabs = await chrome.tabs.query({ url: pattern });
+      } catch (_) {}
+      const activeTab = tabs.find((tab) => tab.active) || tabs[0];
+      if (!activeTab?.id) return { ok: false, error: "target_tab_not_found" };
+      tabId = activeTab.id;
+    }
     try {
-      tabs = await chrome.tabs.query({ url: pattern });
+      targetTab = await chrome.tabs.get(tabId);
     } catch (_) {}
-    const activeTab = tabs.find((tab) => tab.active) || tabs[0];
-    if (!activeTab?.id) return { ok: false, error: "target_tab_not_found" };
-    tabId = activeTab.id;
   }
 
-  let targetTab = null;
-  try {
-    targetTab = await chrome.tabs.get(tabId);
-  } catch (_) {}
   if (!targetTab?.url) return { ok: false, error: "tab_unavailable" };
 
-  try {
-    const tabOrigin = new URL(targetTab.url).origin.toLowerCase();
-    if (tabOrigin !== validation.targetOrigin) return { ok: false, error: "tab_origin_mismatch" };
-  } catch (_) {
-    return { ok: false, error: "tab_origin_invalid" };
-  }
+  const tabOrigin = browserPageOrigin(targetTab.url);
+  if (!tabOrigin) return { ok: false, error: "tab_origin_invalid" };
+  if (tabOrigin !== validation.targetOrigin) return { ok: false, error: "tab_origin_mismatch" };
+
+  const attachPageIdentity = async (response) => {
+    const result = response || { ok: false, error: "empty_content_response" };
+    if (validation.action === "inspect" && result?.ok === true && !page) {
+      if (!endpointRef) {
+        const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+        endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+      }
+      if (endpointRef) {
+        page = await claimBrowserPage(endpointRef, targetTab, validation.targetOrigin);
+      }
+    }
+    return withBrowserPageIdentity(result, page);
+  };
 
   const payload = {
     type: "h2w_page_assist",
@@ -7542,7 +8475,7 @@ async function performPageAssistRequest(msg) {
 
   try {
     const response = await chrome.tabs.sendMessage(tabId, payload);
-    return response || { ok: false, error: "empty_content_response" };
+    return await attachPageIdentity(response);
   } catch (error) {
     if (validation.action !== "inspect") {
       return { ok: false, error: "page_assist_unavailable", detail: error?.message || String(error) };
@@ -7552,7 +8485,7 @@ async function performPageAssistRequest(msg) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content/page-assist.js"],
+      files: ["content/browser-page-kernel.js", "content/page-assist.js"],
       world: "ISOLATED",
     });
   } catch (error) {
@@ -7561,7 +8494,7 @@ async function performPageAssistRequest(msg) {
 
   try {
     const response = await chrome.tabs.sendMessage(tabId, payload);
-    return response || { ok: false, error: "empty_content_response" };
+    return await attachPageIdentity(response);
   } catch (error) {
     return { ok: false, error: error?.message || "content_script_message_failed" };
   }
@@ -8265,6 +9198,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         incoming.manualContinueMessage = String(incoming.manualContinueMessage || "").trim().slice(0, 4000)
           || defaultManualContinueMessage();
       }
+      delete incoming.pageAssistOrigins;
       // Retired semantic-policy inputs are ignored even when a stale Options
       // page or older content script submits them during an extension update.
       delete incoming.jevJudgeMode;
