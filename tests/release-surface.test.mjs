@@ -107,6 +107,11 @@ test("Rust release verification consumes the shared gate with bounded runtime cl
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
   assert.match(release, /scripts\/release-gate\.sh full/);
+  assert.match(
+    release,
+    /verify:[\s\S]*?fetch-depth:\s*0[\s\S]*?scripts\/release-gate\.sh full/,
+    "release verification needs full Git history for pinned history regressions",
+  );
   const start = gate.indexOf("scripts/ci-herdr-runtime.sh start");
   const rootTests = gate.indexOf("npm run test:built");
   const stop = gate.lastIndexOf("scripts/ci-herdr-runtime.sh stop");

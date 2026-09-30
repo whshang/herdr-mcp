@@ -37,8 +37,13 @@ function harness(url = "https://grok.com/c/123e4567-e89b-12d3-a456-426614174000"
   class BaseAdapter {
     elementVisible(candidate) { return Boolean(candidate?.visible); }
   }
+  const registerH2WAdapter = (adapter) => {
+    window.__H2W_ADAPTER__ = adapter;
+    return adapter;
+  };
   const context = vm.createContext({
     BaseAdapter,
+    registerH2WAdapter,
     URL,
     TextEncoder,
     Uint8Array,
@@ -321,14 +326,18 @@ test("user recovers an older Grok settled result | Given a newer turn is already
 
 test("Grok must reuse provider-neutral account and single-attempt browser actuation paths", () => {
   const accountStart = wakeSource.indexOf("async function browserAccountNativeIdentity()");
-  const accountEnd = wakeSource.indexOf("async function registerCurrentConversation", accountStart);
+  const accountEnd = wakeSource.indexOf("async function chatGptProjectCatalog", accountStart);
   const accountSource = wakeSource.slice(accountStart, accountEnd);
-  assert.match(accountSource, /\["gemini",\s*"claude",\s*"grok"\]\.includes\(ADAPTER\.name\)/);
-  assert.match(accountSource, /ADAPTER\.getAccountNativeIdentity/);
+  assert.match(accountSource, /const value = await ADAPTER\.getAccountNativeIdentity\(\)/);
+  assert.doesNotMatch(accountSource, /ADAPTER\.name/);
+
+  assert.equal(harness().adapter.capabilities.browserActuation, true);
+  assert.equal(harness().adapter.capabilities.stopGeneration, true);
 
   const actuationStart = wakeSource.indexOf("async function performBrowserActuationCommand(command)");
   const actuationEnd = wakeSource.indexOf("chrome.runtime.onMessage.addListener", actuationStart);
   const actuationSource = wakeSource.slice(actuationStart, actuationEnd);
-  assert.match(actuationSource, /\["chatgpt",\s*"gemini",\s*"claude",\s*"grok"\]\.includes\(ADAPTER\.name\)/);
+  assert.match(actuationSource, /adapterSupports\("browserActuation"\)/);
+  assert.match(actuationSource, /adapterSupports\("stopGeneration"\)/);
   assert.doesNotMatch(actuationSource, /ADAPTER\.name\s*===\s*"grok"/);
 });

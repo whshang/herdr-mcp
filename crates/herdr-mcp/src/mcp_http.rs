@@ -1662,6 +1662,7 @@ struct PushFilters {
 struct PushStreamState {
     cache: Arc<EventCache>,
     cursor_rx: tokio::sync::watch::Receiver<u64>,
+    browser_actuation_rx: tokio::sync::watch::Receiver<u64>,
     cursor: u64,
     filters: PushFilters,
     statuses: HashMap<String, String>,
@@ -1894,6 +1895,7 @@ fn push_events_response(
     // cannot be missed. At worst an already-included event causes one harmless
     // immediate no-op wake on the first loop iteration.
     let cursor_rx = cache.subscribe_cursor();
+    let browser_actuation_rx = browser_actuation.subscribe_wake();
     let digest = cache.digest_since(u64::MAX);
     let agents = push_agent_views(&digest.agents);
     let statuses = agents
@@ -1908,6 +1910,7 @@ fn push_events_response(
     let state = PushStreamState {
         cache,
         cursor_rx,
+        browser_actuation_rx,
         cursor: digest.cursor,
         filters,
         statuses,
@@ -1951,7 +1954,14 @@ fn push_events_response(
                 "agents": agents,
                 "workspaces": workspaces,
             });
-            let body = format!("retry: 2000\n\n{}", sse_event("hello", &hello));
+            let mut body = format!("retry: 2000\n\n{}", sse_event("hello", &hello));
+            if state.trusted_extension_ipc
+                && let Some(command) = state
+                    .browser_actuation
+                    .take_next_for_extension(state.browser_endpoint_ref.as_deref())
+            {
+                body.push_str(&sse_event("browser_actuation", &command));
+            }
             return Some((Ok::<Bytes, Infallible>(Bytes::from(body)), state));
         }
 
@@ -1959,6 +1969,11 @@ fn push_events_response(
             let heartbeat_wait = SSE_HEARTBEAT.saturating_sub(state.last_heartbeat.elapsed());
             tokio::select! {
                 changed = state.cursor_rx.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                changed = state.browser_actuation_rx.changed(), if state.trusted_extension_ipc => {
                     if changed.is_err() {
                         return None;
                     }
@@ -4600,15 +4615,18 @@ mod tests {
     fn push_transition_emits_only_new_work_and_working_to_settled() {
         let cache = Arc::new(EventCache::from_snapshot_for_test(json!({})));
         let cursor_rx = cache.subscribe_cursor();
+        let browser_actuation = BrowserActuationBroker::default();
+        let browser_actuation_rx = browser_actuation.subscribe_wake();
         let mut state = PushStreamState {
             cache,
             cursor_rx,
+            browser_actuation_rx,
             cursor: 0,
             filters: PushFilters::default(),
             statuses: HashMap::new(),
             first: false,
             last_heartbeat: Instant::now(),
-            browser_actuation: BrowserActuationBroker::default(),
+            browser_actuation,
             trusted_extension_ipc: false,
             browser_endpoint_ref: None,
         };

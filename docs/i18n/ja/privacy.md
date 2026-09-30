@@ -39,7 +39,7 @@
 拡張は、そのユーザー向け機能に必要な範囲でのみ通信します:
 
 1. **同じコンピュータ上のローカル Herdr / herdr-mcp。** Native Messaging を使用して、インストールされた native host と有界の要求および live な workspace 状態をやり取りします。この通信はユーザーのコンピュータ内に留まります。
-2. **対応および実験的な Web AI サイト。** 拡張は、文書化されたブラウザ面で動作して現在の会話状態を観測し、ユーザー向けの continuity/復旧インタラクションを行います。ChatGPT が主要な対応面であり、Claude は文書化されたアダプタを使用します。z.ai と DeepSeek は実験的な統合で、既定では無効であり、ユーザーが Herdr 設定で対応するスイッチを明示的に有効にし、Chrome に対してその正確なサイトへのアクセスを許可した後にのみ、それぞれの content script が登録されます。
+2. **ブラウザページと対応/実験的な Web AI サイト。** 拡張はインストールまたは読み込み時に必須の `<all_urls>` host access を要求し、Generic Web BrowserPage がユーザーの明示的に選択した任意の http/https ページを、サイトごとの追加 Chrome 権限ダイアログなしで操作できるようにします。Page Assist は特定の BrowserPage 要求に対してだけオンデマンドで注入され、Web 全体に常駐する content script として登録されません。ChatGPT が主要な対応 WebChat であり、Claude は文書化されたアダプタを使用します。z.ai と DeepSeek は引き続き既定で無効の実験的な統合で、そのスイッチはパッケージ済み content script の登録だけを制御します。ブラウザ host access 自体はインストール時の権限で提供されます。
 3. **herdr-mcp で設定する semantic route。** 拡張は有界の semantic input をローカル herdr-mcp Runtime にだけ送信します。Runtime は typed evaluation を、ユーザーが設定した TypeSafe System One、OpenRouter Decisions、Vercel Evaluation にルーティングでき、Goal Supervisor / handoff fallback の有界テキストを OpenAI 互換 chat endpoint にルーティングできます。通常の Auto では有界の最新 user/assistant ターン、Goal-aware Auto ではさらに有界の objective/open TODO/runtime 要約と最近の user/assistant テキストを含める場合があります。handoff fallback では有界のソース transcript（現在最大 70,000 文字。切り詰め時は初期タスクの文脈と直近の操作状態を保持）を含める場合があります。Planning、Work Memory、Parent orchestration boundary も同じ Runtime route pool を通じて有界の structured input を送信できます。planning は compatible Agent candidate、attention は freeze 済み child-task summary、validation は freeze 済み check candidate、optional closeout は有界の recent Agent text、cleanup triage は deterministic に計算済みの cleanup safety feature を使います。semantic result は常に advisory で、task/Git/validation/cleanup の基礎 fact を置き換えません。Route はローカルまたは登録済み Cloudflare Worker に設定できます。Worker route を使う場合、Provider credential は Edge に留まり、拡張や workstation には返されず、有界の semantic/chat result だけが返されます。Provider endpoint はユーザーが選択し、各 Provider 自身の privacy と retention 条件が適用されます。
 
 拡張はユーザーデータを販売せず、広告ネットワークへ送信せず、無関係なプロファイリングや信用/融資の判断のためにユーザーデータを移転しません。
@@ -53,7 +53,7 @@
 - `alarms` — Chrome が MV3 service worker を suspend した後に、失われたローカル Herdr 状態ストリームとタイマーを復旧できるよう、定期的に起こします。
 - `nativeMessaging` — ローカルにインストールされた herdr-mcp native host に接続します。
 - `sidePanel` — Herdr Browser Control Center をホストします。
-- host access — 常時有効なアクセスは、文書化された ChatGPT/Claude の面とローカルの herdr-mcp endpoint に限定されます。実験的な z.ai/DeepSeek は、ユーザーが対応する統合を明示的に有効化した後にのみ Chrome の optional host permission を要求します。Semantic provider への接続は Runtime/Edge が行い、拡張は直接接続しないため Provider route 用の Chrome host permission は不要です。Herdr は `<all_urls>` を常時有効な host permission として要求しません。
+- host access — 拡張はインストール/読み込み時に `<all_urls>` を要求し、BrowserPage がユーザーの明示的に選択した任意の http/https ページをサイトごとの追加権限要求なしで操作できるようにします。Generic Page Assist は特定の BrowserPage 対象に対してのみオンデマンドで動作し、ページアクセス直前に Chrome のその正確な origin への実効権限を確認します。ユーザーが Chrome の拡張設定でサイトアクセスを制限した場合、その origin の BrowserPage は fail closed します。Semantic provider への接続は Runtime/Edge が行うため、Provider route 用の追加 Chrome host permission は不要です。
 
 **リモートの実行可能コードは使用していません。** 実行される JavaScript はすべて拡張にパッケージされています。ネットワーク応答はデータとして扱われ、JavaScript や Wasm として評価・import・実行されることはありません。
 
