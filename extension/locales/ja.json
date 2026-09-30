@@ -407,7 +407,6 @@
   "options_runtime_config_routes_hint": "semantic.routes を優先順に設定します。typed evaluation には decision / decision-vercel、chat route には openai-chat を使います。",
   "open_runtime_config_guide": "完全な config.json ガイドを表示",
   "open_github_setup_guide": "Herdr の GitHub セットアップガイドを開く",
-  "host_permission_denied": "サイトアクセスが許可されていません。Herdr は明示的に有効化したサイトだけを要求します。",
   "api_base_url_duplicate_slash": "エンドポイントのパスに重複したスラッシュがあります。保存前に {suggestion} に修正してください。",
   "hud_reason_llm_permission": "LLM サイトアクセス未許可",
   "hud_reason_fallback_continue": "Auto フォールバックで Continue を送信しました",

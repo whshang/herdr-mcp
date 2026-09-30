@@ -107,6 +107,11 @@ test("Rust release verification consumes the shared gate with bounded runtime cl
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
   assert.match(release, /scripts\/release-gate\.sh full/);
+  assert.match(
+    release,
+    /verify:[\s\S]*?fetch-depth:\s*0[\s\S]*?scripts\/release-gate\.sh full/,
+    "release verification needs full Git history for pinned history regressions",
+  );
   const start = gate.indexOf("scripts/ci-herdr-runtime.sh start");
   const rootTests = gate.indexOf("npm run test:built");
   const stop = gate.lastIndexOf("scripts/ci-herdr-runtime.sh stop");
@@ -197,11 +202,14 @@ test("Herdr dependency recovery stays internal and updater activation stays behi
 
 test("request child lifecycle keeps ownership evidence wired without persisting request arguments", async () => {
   const children = await readFile(join(ROOT, "crates/herdr-mcp/src/child_process.rs"), "utf8");
-  const service = await readFile(join(ROOT, "crates/herdr-mcp/src/service_manager.rs"), "utf8");
+  const serviceMacos = await readFile(
+    join(ROOT, "crates/herdr-mcp/src/service_manager/macos.rs"),
+    "utf8",
+  );
   const main = await readFile(join(ROOT, "crates/herdr-mcp/src/main.rs"), "utf8");
   const status = await readFile(join(ROOT, "crates/herdr-mcp/src/status.rs"), "utf8");
 
-  assert.match(service, /HERDR_MCP_CHILD_REGISTRY/);
+  assert.match(serviceMacos, /HERDR_MCP_CHILD_REGISTRY/);
   assert.match(main, /reap_confirmed_orphans_on_boot/);
   assert.match(status, /child_process::doctor_line/);
   assert.match(children, /child-process-reap-last\.json/);
