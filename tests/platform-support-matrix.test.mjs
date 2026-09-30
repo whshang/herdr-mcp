@@ -80,11 +80,11 @@ test("published support matrix tracks the live protocol compatibility identities
 test("matrix records rollback-safe durable-state policy instead of promising arbitrary N+1", () => {
   const en = read("docs/i18n/en/platform-support-matrix.md");
   const zh = read("docs/i18n/zh-CN/platform-support-matrix.md");
-  const updater = read("crates/herdr-mcp/src/updater.rs");
+  const releasePlan = read("crates/herdr-mcp/src/updater/release_plan.rs");
   const store = read("crates/herdr-mcp/src/state_store.rs");
 
-  assert.match(updater, /release state schema is not rollback-compatible with local schema/);
-  assert.match(updater, /release manifest contract identity mismatch/);
+  assert.match(releasePlan, /release state schema is not rollback-compatible with local schema/);
+  assert.match(releasePlan, /release manifest contract identity mismatch/);
   assert.match(store, /higher[\s\S]*refused \(fail-closed, no silent downgrade\)/);
 
   for (const doc of [en, zh]) {
