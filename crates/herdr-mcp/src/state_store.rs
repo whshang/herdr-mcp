@@ -971,6 +971,34 @@ impl StateStore {
             .map_err(|error| format!("cannot commit operation completion: {error}"))
     }
 
+    pub fn release_operation_reservation(
+        &mut self,
+        kind: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+        op_id: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin operation reservation release: {error}"))?;
+        let changed = tx
+            .execute(
+                "DELETE FROM operations
+                 WHERE kind = ?1 AND idempotency_key = ?2 AND request_hash = ?3
+                   AND op_id = ?4 AND state = 'pending'",
+                params![kind, idempotency_key, request_hash, op_id],
+            )
+            .map_err(|error| format!("cannot release operation reservation: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "operation reservation release expected one matching pending row, deleted {changed}"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit operation reservation release: {error}"))
+    }
+
     pub fn put_operation_ledger(&mut self, input: OperationLedgerInput<'_>) -> Result<(), String> {
         if input.op_id.is_empty() || input.kind.is_empty() {
             return Err("operation ledger op_id and kind are required".to_owned());

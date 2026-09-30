@@ -69,6 +69,11 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const performanceCoreSource = readFileSync(path.join(EXT, "performance-core.js"), "utf8");
 const baseSource = readFileSync(path.join(EXT, "content", "base.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(EXT, "content", "injector", "chatgpt.js"), "utf8");
+const claudeAdapterSource = readFileSync(path.join(EXT, "content", "injector", "claude.js"), "utf8");
+const grokAdapterSource = readFileSync(path.join(EXT, "content", "injector", "grok.js"), "utf8");
+const geminiAdapterSource = readFileSync(path.join(EXT, "content", "injector", "gemini.js"), "utf8");
+const zAiAdapterSource = readFileSync(path.join(EXT, "content", "injector", "zai.js"), "utf8");
+const deepSeekAdapterSource = readFileSync(path.join(EXT, "content", "injector", "deepseek.js"), "utf8");
 const queuedInsertCoreSource = readFileSync(path.join(EXT, "queued-insert-core.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
@@ -82,6 +87,7 @@ const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), 
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
+const browserPageKernelSource = readFileSync(path.join(EXT, "content", "browser-page-kernel.js"), "utf8");
 const pageAssistSource = readFileSync(path.join(EXT, "content", "page-assist.js"), "utf8");
 const hudStateViewSource = readFileSync(path.join(EXT, "content", "hud", "state-view.js"), "utf8");
 const hudRendererSource = readFileSync(path.join(EXT, "content", "hud", "renderer.js"), "utf8");
@@ -90,7 +96,7 @@ const hudRendererSource = readFileSync(path.join(EXT, "content", "hud", "rendere
 // alignment contracts silently stale.
 const manifestVersion = String(manifest.version || "");
 ok(/^\d+\.\d+\.\d+$/.test(manifestVersion), "manifest version stays aligned with the browser product build");
-ok(manifest.permissions?.includes("activeTab"), "Control Center can identify the user-invoked active WebChat tab before optional site access is granted");
+ok(manifest.permissions?.includes("activeTab"), "Control Center can identify the user-invoked active tab while all-site browser access is granted at install/load time");
 ok(Number(manifest.minimum_chrome_version) >= 111, "MAIN-world ChatGPT performance hook declares its Chrome 111+ runtime floor");
 ok(backgroundSource.includes(`const H2W_SCRIPT_VERSION = "${manifestVersion}"`), "background version matches manifest");
 ok(backgroundSource.includes('routeAgentTaskInboxWake')
@@ -159,45 +165,71 @@ ok(ownerGateIndex >= 0
     && wakeSource.includes("A later page refresh can retry after MV3 recovers")
     && wakeSource.includes('[h2w] extension standby; skipping page control'),
   "inactive sibling extension exits before claiming shared page UI ownership");
-ok(!manifest.host_permissions?.includes("<all_urls>")
-    && manifest.host_permissions?.includes("http://127.0.0.1:8772/*")
-    && manifest.host_permissions?.includes("https://chatgpt.com/*")
-    && manifest.host_permissions?.includes("https://claude.ai/*")
-    && manifest.host_permissions?.includes("https://grok.com/*")
-    && manifest.optional_host_permissions?.includes("https://*/*")
-    && manifest.optional_host_permissions?.includes("http://*/*"),
-  "broad network access is optional while supported WebChat origins are explicit required permissions");
-ok(!manifest.content_scripts.some((entry) => (entry.js || []).includes("content/page-assist.js"))
-    && backgroundSource.includes("pageAssistOrigins: []")
+ok(manifest.host_permissions?.length === 1
+    && manifest.host_permissions[0] === "<all_urls>"
+    && !Object.prototype.hasOwnProperty.call(manifest, "optional_host_permissions"),
+  "browser access is granted once at install/load time with required all-sites permission");
+ok(!manifest.content_scripts.some((entry) => (entry.js || []).some((script) =>
+      script === "content/page-assist.js" || script === "content/browser-page-kernel.js"))
     && !optionsHtml.includes('id="pageAssistOrigins"')
-    && !optionsSource.includes("pageAssistOrigins"),
-  "Page Assist stays default-off and is not exposed as an extension setting");
+    && !optionsSource.includes("chrome.permissions.request")
+    && !optionsSource.includes("chrome.permissions.remove")
+    && !backgroundSource.includes("chrome.permissions.request")
+    && !backgroundSource.includes("chrome.permissions.remove")
+    && backgroundSource.includes("delete incoming.pageAssistOrigins")
+    && backgroundSource.includes('"pageAssistOrigins",'),
+  "Generic Web has no per-site approval state or runtime permission mutation and retires the old origin list");
 const pageAssistDispatchSource = backgroundSource.match(
   /async function performPageAssistRequest\(msg\) \{[\s\S]*?\n}\n/,
 )?.[0] || "";
 ok(pageAssistDispatchSource.includes('validation.action !== "inspect"')
-    && pageAssistDispatchSource.includes('files: ["content/page-assist.js"]')
+    && pageAssistDispatchSource.includes('files: ["content/browser-page-kernel.js", "content/page-assist.js"]')
     && pageAssistDispatchSource.indexOf('validation.action !== "inspect"') < pageAssistDispatchSource.indexOf("chrome.scripting.executeScript")
     && pageAssistDispatchSource.includes("tabOrigin !== validation.targetOrigin"),
-  "Page Assist may inject only for inspect recovery; click/fill fail closed and the live tab origin is rechecked");
-ok(!/\beval\s*\(/.test(pageAssistSource)
-    && !/new\s+Function\b/.test(pageAssistSource)
-    && !/document\.cookie/.test(pageAssistSource)
-    && !/localStorage|sessionStorage/.test(pageAssistSource)
-    && !/XPath|evaluate\s*\(/.test(pageAssistSource),
-  "Page Assist content code does not expose script evaluation, cookies/storage, or XPath control");
+  "Page Assist compatibility injects the shared Browser Page Kernel only for inspect recovery; click/fill fail closed and the live tab origin is rechecked");
+ok(pageAssistSource.includes("H2W_BROWSER_PAGE_KERNEL")
+    && pageAssistSource.includes("kernel.handleAction(msg)")
+    && !/\beval\s*\(/.test(browserPageKernelSource)
+    && !/new\s+Function\b/.test(browserPageKernelSource)
+    && !/document\.cookie/.test(browserPageKernelSource)
+    && !/localStorage|sessionStorage/.test(browserPageKernelSource)
+    && !/XPath|evaluate\s*\(/.test(browserPageKernelSource),
+  "Browser Page Kernel owns Page Assist execution without exposing script evaluation, cookies/storage, or XPath control");
+ok(backgroundSource.includes('BROWSER_PAGE_SESSION_STORAGE_KEY = "herdrBrowserPagesV1"')
+    && backgroundSource.includes("chrome.storage?.session")
+    && backgroundSource.includes("async function claimBrowserPage(")
+    && backgroundSource.includes("async function resolveBrowserPage(")
+    && pageAssistDispatchSource.includes("requestedPageRef")
+    && pageAssistDispatchSource.includes("resolveBrowserPage(requestedPageRef")
+    && pageAssistDispatchSource.includes('error: "browser_page_tab_mismatch"')
+    && pageAssistDispatchSource.includes("claimBrowserPage(endpointRef, targetTab")
+    && !pageAssistDispatchSource.includes("chrome.tabs.remove"),
+  "Page Assist uses session-persisted claimed BrowserPage refs while legacy tab_id remains compatibility-only");
+const browserPageLifecycleSource = backgroundSource.match(
+  /async function performBrowserPageLifecycleRequest\(msg\) \{[\s\S]*?\n}\n\nfunction withBrowserPageIdentity/,
+)?.[0] || "";
+ok(backgroundSource.includes('operation === "herdr_mcp.browser_page.lifecycle"')
+    && browserPageLifecycleSource.includes('chrome.tabs.create({ url: canonicalUrl, active: false })')
+    && browserPageLifecycleSource.includes('page.ownership !== "claimed"')
+    && browserPageLifecycleSource.includes('browser_page_owned_requires_finalize')
+    && browserPageLifecycleSource.includes('await chrome.tabs.remove(page.tab_id)')
+    && browserPageLifecycleSource.includes('tab_cleanup_verified: true')
+    && backgroundSource.includes("function browserPageView(page, extra = {})")
+    && backgroundSource.includes('ownership: page.ownership')
+    && !backgroundSource.includes('tab_id: page.tab_id'),
+  "BrowserPage lifecycle opens inactive owned tabs, preserves claimed user tabs, and keeps raw tab ids extension-local");
 ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('gemini: "https://gemini.google.com/*"')
     && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
-  "experimental content-script registration requires an explicitly granted site permission");
+  "experimental content-script registration requires its feature flag and live Chrome access to the target origin");
 ok(backgroundSource.includes("SUPPORTED_SITE_PERMISSION_PATTERNS")
     && backgroundSource.includes('grok: "https://grok.com/*"')
     && backgroundSource.includes('id: "herdr-supported-grok"')
     && backgroundSource.includes('RETIRED_DYNAMIC_CONTENT_SCRIPT_IDS = ["herdr-experimental-grok"]')
     && backgroundSource.includes("await hasHostPermission(permissionPattern)")
-    && !backgroundSource.includes("supportedOptionalSiteAccess")
-    && manifest.host_permissions?.includes("https://grok.com/*"),
-  "supported Grok uses the required Chrome site permission as the runtime authority");
+    && !backgroundSource.includes("syncSupportedOptionalContentScripts")
+    && manifest.host_permissions?.includes("<all_urls>"),
+  "supported Grok inherits install-time all-site access and still fails closed if Chrome restricts its origin");
 const browserActuationSendSource = backgroundSource.match(
   /async function sendBrowserActuationTabMessage\([\s\S]*?\n}\n/,
 )?.[0] || "";
@@ -304,8 +336,9 @@ ok(wakeSource.includes("captureSubmitAckBaseline")
     && !wakeSource.includes("!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton)")
     && wakeSource.includes('latestTurnForRole("user")')
     && wakeSource.includes("latestUser !== baseline?.userTurn")
-    && wakeSource.includes('ADAPTER.name === "chatgpt" ? 8000 : 4000'),
-  "ChatGPT submit acknowledgement requires strong provider evidence instead of Send-button rerender alone");
+    && wakeSource.includes("ADAPTER.policy?.submitAckTimeoutMs ?? 4000")
+    && chatGptAdapterSource.includes("submitAckTimeoutMs: 8000"),
+  "ChatGPT submit acknowledgement requires strong provider evidence with adapter-owned timing policy");
 ok(wakeSource.includes("maybeRecoverExplicitChatGptFailure")
     && wakeSource.includes("连接已中断")
     && wakeSource.includes("消息发送超时，请重试")
@@ -706,9 +739,37 @@ ok(
     console,
   });
   vm.runInContext(baseCode, rootCtx);
+  ok(vm.runInContext("new BaseAdapter().supportsCapability('browserActuation')", rootCtx) === false
+      && vm.runInContext("Object.isFrozen(new BaseAdapter().policy)", rootCtx) === true
+      && vm.runInContext("new BaseAdapter().policy.submitAckTimeoutMs", rootCtx) === 4000,
+    "BaseAdapter capabilities and policy fail closed by default");
   vm.runInContext(chatgptCode, rootCtx);
+  ok(vm.runInContext("Object.isFrozen(window.__H2W_ADAPTER__.capabilities)", rootCtx) === true
+      && vm.runInContext("Object.isFrozen(window.__H2W_ADAPTER__.policy)", rootCtx) === true
+      && vm.runInContext("window.__H2W_ADAPTER__.supportsCapability('sessionCreate')", rootCtx) === true
+      && vm.runInContext("window.__H2W_ADAPTER__.policy.submitAckTimeoutMs", rootCtx) === 8000,
+    "ChatGPT adapter exposes immutable explicit capability and policy descriptors");
   ok(vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", rootCtx) === "https://chatgpt.com",
     "ChatGPT root exposes a pending binding key before a conversation exists");
+
+  const accountCtx = vm.createContext({
+    window: {},
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    fetch: async (url, options) => ({
+      ok: url === "/backend-api/me"
+        && options?.method === "GET"
+        && options?.credentials === "include"
+        && options?.cache === "no-store",
+      json: async () => ({ id: "  chatgpt-user-123  " }),
+    }),
+    console,
+  });
+  vm.runInContext(baseCode, accountCtx);
+  vm.runInContext(chatgptCode, accountCtx);
+  ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", accountCtx)
+      === "chatgpt-user-123",
+    "ChatGPT account identity is observed through the provider adapter hook");
 
   const composerStop = { id: "composer-stop" };
   const unrelatedStop = { id: "unrelated-stop" };
@@ -999,13 +1060,30 @@ ok(backgroundSource.includes('experimentalZAiEnabled: false')
     && backgroundSource.includes('"content/injector/grok.js"')
     && backgroundSource.includes('error: "experimental-site-disabled"')
     && backgroundSource.includes('error: "site-access-disabled"')
-    && wakeSource.includes("experimentalZAiEnabled")
-    && wakeSource.includes("experimentalDeepSeekEnabled")
-    && wakeSource.includes("experimentalGeminiEnabled")
+    && zAiAdapterSource.includes('experimentalStorageFlag: "experimentalZAiEnabled"')
+    && deepSeekAdapterSource.includes('experimentalStorageFlag: "experimentalDeepSeekEnabled"')
+    && geminiAdapterSource.includes('experimentalStorageFlag: "experimentalGeminiEnabled"')
+    && zAiAdapterSource.includes("jsonBridge: true")
+    && deepSeekAdapterSource.includes("jsonBridge: true")
+    && geminiAdapterSource.includes("jsonBridge: false")
+    && wakeSource.includes("ADAPTER.policy?.experimentalStorageFlag")
+    && !wakeSource.includes("experimentalZAiEnabled")
+    && !wakeSource.includes("experimentalDeepSeekEnabled")
+    && !wakeSource.includes("experimentalGeminiEnabled")
     && !wakeSource.includes("experimentalGrokEnabled")
-    && jsonBridgeSource.includes("experimentalZAiEnabled")
-    && jsonBridgeSource.includes("experimentalDeepSeekEnabled"),
-  "experimental integrations stay fail-closed while supported Grok remains outside the JSON bridge");
+    && jsonBridgeSource.includes("ADAPTER.policy?.jsonBridge !== true")
+    && jsonBridgeSource.includes("ADAPTER.policy?.experimentalStorageFlag")
+    && !jsonBridgeSource.includes("experimentalZAiEnabled")
+    && !jsonBridgeSource.includes("experimentalDeepSeekEnabled"),
+  "experimental and JSON-bridge policy stays fail-closed inside provider adapters");
+ok(baseSource.includes("function registerH2WAdapter(adapter)")
+    && [chatGptAdapterSource, claudeAdapterSource, grokAdapterSource, geminiAdapterSource, zAiAdapterSource, deepSeekAdapterSource]
+      .every((source) => source.includes("registerH2WAdapter(new "))
+    && wakeSource.includes("ADAPTER.policy?.operationalHud === true")
+    && chatGptAdapterSource.includes("operationalHud: true")
+    && zAiAdapterSource.includes("operationalHud: true")
+    && deepSeekAdapterSource.includes("operationalHud: true"),
+  "provider scripts share one registration boundary and own provider policy");
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation has no separate legacy user preference");
@@ -1201,7 +1279,8 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
 // ---- 2. JavaScript syntax for the fixed file list ----
 const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js", "content/chatgpt-perf-main.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/gemini.js", "content/injector/claude.js",
-  "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
+  "content/injector/grok.js", "content/injector/chatgpt.js", "content/browser-page-kernel.js", "content/page-assist.js",
+  "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {
   const p = path.join(EXT, f);
   const r = spawnSync(process.execPath, ["--check", p], { encoding: "utf8" });

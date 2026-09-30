@@ -39,7 +39,7 @@
 扩展只会为了明确的用户可见功能与以下目标通信：
 
 1. **同一台电脑上的本地 Herdr / herdr-mcp。** 通过 Native Messaging 向已安装的 native host 发送有界请求并读取实时 workspace 状态；这部分通信留在用户自己的电脑上。
-2. **受支持与实验性的 Web AI 网站。** 扩展只在产品文档声明的浏览器页面上运行，用于观察当前对话状态并执行用户可见的连续工作/恢复交互。ChatGPT 是主要支持面，Claude 使用文档所述适配器；z.ai 与 DeepSeek 属于实验性集成，默认关闭，只有用户在 Herdr 设置中显式开启对应开关并授予 Chrome 对该精确站点的访问权限后才会注册其 content script。
+2. **浏览器网页与受支持/实验性的 Web AI 网站。** 扩展在安装或加载时申请必需的 `<all_urls>` host access，使 Generic Web BrowserPage 能操作用户明确选择的任意 http/https 网页，无需每个新网站再次弹出 Chrome 站点授权。Page Assist 只会针对一次明确的 BrowserPage 目标按需注入，不会作为全网常驻 content script 注册。ChatGPT 是主要支持的 WebChat，Claude 使用文档所述适配器；z.ai 与 DeepSeek 仍属于默认关闭的实验性集成，对应开关只控制这些打包 content script 是否注册，浏览器 host access 已由安装时权限提供。
 3. **通过 herdr-mcp 配置的语义 route。** 扩展只把有界语义输入发送给本机 herdr-mcp Runtime。Runtime 可以把 typed evaluation 路由到用户配置的 TypeSafe System One、OpenRouter Decisions 或 Vercel Evaluation，也可以把有界 Goal Supervisor / handoff fallback 文本路由到用户配置的 OpenAI-compatible chat endpoint。普通 Auto 可包含有界的最新 user/assistant 回合；Goal 模式还可包含有界 objective/open TODO/runtime 摘要与近期 user/assistant 文本；handoff fallback 可包含有界的源会话 transcript（当前最多 70,000 字符，需要截断时保留早期任务背景和近期操作状态）。Planning、Work Memory 与 Parent orchestration boundary 也会通过同一 Runtime route pool 发送各自有界的结构化输入：planning 使用兼容 Agent 候选，attention 使用冻结的 child-task summary，validation 使用冻结的检查候选，optional closeout 使用有界近期 Agent 文本，cleanup triage 使用已确定计算出的 cleanup safety feature。语义结果始终只作辅助判断，不替代底层 task/Git/validation/cleanup 事实。Route 可以配置在本机，也可以配置在已注册的 Cloudflare Worker。使用 Worker route 时，Provider 凭证保留在 Edge，不返回扩展或 workstation，只返回有界语义/chat 结果。Provider endpoint 由用户选择，各 Provider 自身的隐私与数据保留条款适用。
 
 扩展不会出售用户数据，不会把用户数据发送给广告网络，也不会为了无关画像、信用评估或放贷目的转移数据。
@@ -53,7 +53,7 @@
 - `alarms` — 周期性唤醒 MV3 service worker，使 Chrome 挂起 worker 后能够恢复本地 Herdr 状态流和 timer；
 - `nativeMessaging` — 连接本机安装的 herdr-mcp native host；
 - `sidePanel` — 承载 Herdr Browser Control Center；
-- host access — 常驻访问仅限文档声明的 ChatGPT/Claude 页面与本机 herdr-mcp endpoint。实验性的 z.ai/DeepSeek 只有用户显式开启对应集成后才申请 Chrome optional host permission。语义 Provider 由 Runtime/Edge 访问，扩展不直接连接这些 Provider，因此 Provider route 不需要 Chrome host permission；Herdr 不把 `<all_urls>` 作为常驻 host permission。
+- host access — 扩展在安装/加载时要求 `<all_urls>`，使 BrowserPage 可以控制用户明确选择的任意 http/https 网页，不再逐站弹出权限请求。Generic Page Assist 仍只针对明确的 BrowserPage 目标按需执行，并在访问页面前检查 Chrome 对该精确 origin 的实时权限。用户若在 Chrome 扩展设置里限制某个站点，BrowserPage 会对该 origin 失败关闭。语义 Provider 由 Runtime/Edge 访问，扩展不直接连接这些 Provider，因此 Provider route 不需要额外的 Chrome host permission。
 
 **扩展不使用远程可执行代码。** 所有可执行 JavaScript 都随扩展包发布；网络返回内容只按数据处理，不会被 `eval`、动态 import 或作为 JavaScript / Wasm 执行。
 

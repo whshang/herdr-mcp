@@ -61,6 +61,8 @@ herdr-mcp native-host status
 
 要求 active channel、extension identity、Native Host 和当前 runtime generation 一致。STORE 由商店更新；STANDALONE 由正式独立 package 更新；DEV 由开发者显式 Reload。旧网页仍运行旧 content script 时，刷新页面即可。
 
+当前 1.1 开发版在安装或加载扩展时申请必需的 `<all_urls>` host access，使 Generic Web BrowserPage 在访问新网站时不再逐站弹出权限请求。从旧版较窄的 host permission 升级时，Chrome 可能要求用户一次确认新增权限；确认后 Herdr 运行时不会再逐站申请 host permission。
+
 ## 入口与状态对象
 
 | 概念 / 入口 | 唯一职责 |

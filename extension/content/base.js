@@ -1,7 +1,39 @@
 // base.js — adapter base class for locating, filling, submitting, and identifying chats
 // Direction: herdr → web. The extension writes only on wake and does not run an agent loop.
+const H2W_BASE_ADAPTER_CAPABILITIES = Object.freeze({
+  browserActuation: false,
+  stopGeneration: false,
+  sessionCreate: false,
+  sessionOpen: false,
+  chatModeGuard: false,
+});
+const H2W_BASE_ADAPTER_POLICY = Object.freeze({
+  experimentalStorageFlag: null,
+  operationalHud: false,
+  submitAckTimeoutMs: 4000,
+  jsonBridge: false,
+});
+
 class BaseAdapter {
   get name() { return "base"; }
+  get capabilities() { return H2W_BASE_ADAPTER_CAPABILITIES; }
+  get policy() { return H2W_BASE_ADAPTER_POLICY; }
+
+  supportsCapability(name) {
+    return this.capabilities?.[String(name || "")] === true;
+  }
+
+  async prepareBrowserActuation() {
+    return { ok: true, switched: false };
+  }
+
+  async getAccountNativeIdentity() {
+    return null;
+  }
+
+  async resolveProjectIdentity() {
+    return typeof this.getProjectIdentity === "function" ? this.getProjectIdentity() : null;
+  }
 
   // ---- Site-specific declarations ----
 
@@ -86,6 +118,18 @@ class BaseAdapter {
       : (el.innerText || el.textContent || "");
     return String(t).replace(/\u200b/g, "").trim().length > 0;
   }
+}
+
+function registerH2WAdapter(adapter) {
+  if (!(adapter instanceof BaseAdapter)) {
+    throw new TypeError("adapter must extend BaseAdapter");
+  }
+  const name = String(adapter.name || "").trim();
+  if (!name || name === "base") {
+    throw new TypeError("adapter must declare a concrete name");
+  }
+  window.__H2W_ADAPTER__ = adapter;
+  return adapter;
 }
 
 // ---- Fail-closed auto-allow for in-page permission dialogs ----
@@ -301,4 +345,4 @@ window.__H2W_PERMISSION__ = {
   BUTTON_SELECTOR,
 };
 
-window.__H2W_ADAPTER__ = null; // Subclasses attach their instance here.
+window.__H2W_ADAPTER__ = null; // Provider scripts register one concrete adapter here.

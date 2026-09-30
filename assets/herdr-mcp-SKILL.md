@@ -57,6 +57,7 @@ Load the domain Skill when its trigger appears:
 | multi-lane development, ownership, validation, cleanup | `development-orchestration` |
 | non-trivial bug/refactor/release reliability | `engineering-robustness` |
 | unresolved product/engineering requirements after facts are read | `requirements-grilling` |
+| Generic Web, "teach Herdr this website", browser/site adapter, adapter drift | `browser-adapter-author` |
 
 When several Skills are needed for one task, load their ids in one bounded request when the runtime supports batched Skill loading.
 
