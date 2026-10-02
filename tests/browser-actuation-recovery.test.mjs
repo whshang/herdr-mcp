@@ -132,7 +132,7 @@ function browserPageLifecycleHarness({
     "const browserEndpointView = (endpoint) => endpoint;",
     "const captureImageArtifactNative = async (artifact) => ctx.captureImageArtifactNative(artifact);",
     browserPageLifecycleSource,
-    "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, performBilibiliVideoTranscriptRequest, browserPagesByRef };",
+    "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, performBilibiliVideoTranscriptRequest, performXReadRequest, browserPagesByRef };",
   ].join("\n");
   const api = new Function("ctx", code)({
     crypto: webcrypto,
@@ -813,6 +813,106 @@ test("user reads a reviewed Bilibili transcript | Given one exact Bilibili Brows
   assert.equal(denied.ok, false);
   assert.equal(denied.error, "bilibili_auth_required");
   assert.equal(denied.source_url, "https://www.bilibili.com/video/BV1fX4y1Q7Ux/");
+});
+
+test("user reads reviewed X search and thread data | Given one exact X BrowserPage | When builtin reads run | Then bounded rows return and auth failures stay typed", async () => {
+  const tabs = new Map([
+    [72, {
+      id: 72,
+      windowId: 10,
+      url: "https://x.com/search?q=from%3AOpenAI&src=typed_query&f=live",
+      active: false,
+    }],
+  ]);
+  const sessionStorage = {};
+  const h = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    scriptResponder(details) {
+      assert.equal(details.target.tabId, 72);
+      assert.equal(details.world, "MAIN");
+      const [mode, query, postId, limit, cursor] = details.args;
+      if (mode === "search") {
+        assert.equal(query, "from:OpenAI");
+        assert.equal(postId, "");
+        assert.equal(limit, 2);
+        assert.equal(cursor, "");
+        return [{ result: {
+          ok: true,
+          query,
+          posts: [
+            { id: "2101", author: "OpenAI", handle: "OpenAI", created_at: "now", text: "first", url: "https://x.com/OpenAI/status/2101", in_reply_to: null },
+            { id: "2102", author: "OpenAI", handle: "OpenAI", created_at: "now", text: "second", url: "https://x.com/OpenAI/status/2102", in_reply_to: null },
+          ],
+          next_cursor: "cursor-2",
+          truncated: true,
+        } }];
+      }
+      assert.equal(mode, "thread");
+      assert.equal(query, "");
+      assert.equal(postId, "2101");
+      assert.equal(limit, 2);
+      assert.equal(cursor, "cursor-thread");
+      return [{ result: {
+        ok: true,
+        root_post_id: postId,
+        posts: [
+          { id: "2101", author: "OpenAI", handle: "OpenAI", created_at: "now", text: "root", url: "https://x.com/OpenAI/status/2101", in_reply_to: null },
+          { id: "2103", author: "Example", handle: "example", created_at: "later", text: "reply", url: "https://x.com/example/status/2103", in_reply_to: "2101" },
+        ],
+        next_cursor: null,
+        truncated: false,
+      } }];
+    },
+  });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://x.com",
+    url: "https://x.com/search?q=from%3AOpenAI&src=typed_query&f=live",
+    idempotencyKey: "claim-x-read-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const search = await h.performXReadRequest({
+    mode: "search",
+    pageRef: claimed.page_ref,
+    query: "from:OpenAI",
+    limit: 2,
+  });
+  assert.equal(search.ok, true);
+  assert.equal(search.posts.length, 2);
+  assert.equal(search.next_cursor, "cursor-2");
+  assert.equal(search.source_url, "https://x.com/search?q=from%3AOpenAI&src=typed_query&f=live");
+  assert.equal(Object.hasOwn(search, "bearer"), false);
+  assert.equal(Object.hasOwn(search, "csrf"), false);
+
+  const thread = await h.performXReadRequest({
+    mode: "thread",
+    pageRef: claimed.page_ref,
+    postId: "2101",
+    limit: 2,
+    cursor: "cursor-thread",
+  });
+  assert.equal(thread.ok, true);
+  assert.equal(thread.root_post_id, "2101");
+  assert.equal(thread.posts[1].in_reply_to, "2101");
+  assert.equal(Object.hasOwn(thread, "authorization"), false);
+
+  const loggedOut = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    scriptResponder() {
+      return [{ result: { ok: false, error: "x_auth_required" } }];
+    },
+  });
+  const denied = await loggedOut.performXReadRequest({
+    mode: "search",
+    pageRef: claimed.page_ref,
+    query: "from:OpenAI",
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.error, "x_auth_required");
+  assert.equal(denied.source_url, "https://x.com/search?q=from%3AOpenAI&src=typed_query&f=live");
 });
 
 test("user sees WebChat control on Claude and Grok project homes | Given supported provider project URLs without conversations | When project page identity is parsed | Then project context exists without a conversation key", () => {

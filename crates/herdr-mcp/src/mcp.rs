@@ -20,7 +20,8 @@ use crate::progressive_skills::{
     BROWSER_SOURCE_RESOLVE_METHOD, BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD,
     BROWSER_SPACE_OPEN_METHOD, EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD,
     WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD,
-    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD,
+    X_THREAD_READ_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::semantic::{
@@ -382,6 +383,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             } else if method == BILIBILI_VIDEO_TRANSCRIPT_METHOD {
                 bilibili_video_transcript_call(
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
+            } else if method == X_SEARCH_POSTS_METHOD || method == X_THREAD_READ_METHOD {
+                x_read_call(
+                    method,
                     &params,
                     context.caller_page_assist_grants,
                     context.browser_actuator,
@@ -7948,6 +7956,204 @@ fn browser_page_action_call(
         return browser_store_error(error);
     }
     result
+}
+
+fn x_read_call(
+    method: &str,
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "X read params must be an object"});
+    };
+    let search = method == X_SEARCH_POSTS_METHOD;
+    let thread = method == X_THREAD_READ_METHOD;
+    if !search && !thread {
+        return json!({"ok": false, "code": "invalid_params", "message": "unsupported X read method"});
+    }
+    const SEARCH_KEYS: &[&str] = &["endpoint_ref", "page_ref", "query", "limit", "cursor"];
+    const THREAD_KEYS: &[&str] = &["endpoint_ref", "page_ref", "post_id", "limit", "cursor"];
+    let allowed_keys = if search { SEARCH_KEYS } else { THREAD_KEYS };
+    if let Some(key) = object
+        .keys()
+        .find(|key| !allowed_keys.contains(&key.as_str()))
+    {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": format!("unknown X read parameter '{key}'"),
+        });
+    }
+
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+
+    let page_ref = match object
+        .get("page_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if value.strip_prefix("bp_").is_some_and(|suffix| {
+                suffix.len() == 64
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) =>
+        {
+            value
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "page_ref must be an opaque bp_ reference",
+            });
+        }
+    };
+    let limit = match object.get("limit") {
+        None | Some(Value::Null) => {
+            if search {
+                15_u64
+            } else {
+                50_u64
+            }
+        }
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(value @ 1..=50) => value,
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "limit must be between 1 and 50"});
+            }
+        },
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "limit must be an integer"});
+        }
+    };
+    let cursor = match object.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.len() > 4096 || value.chars().any(char::is_control) {
+                return json!({"ok": false, "code": "invalid_params", "message": "cursor is invalid"});
+            }
+            (!value.is_empty()).then_some(value)
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "cursor must be a string"});
+        }
+    };
+
+    let mut bridge_params = json!({
+        "page_ref": page_ref,
+        "limit": limit,
+    });
+    if let Some(cursor) = cursor {
+        bridge_params["cursor"] = json!(cursor);
+    }
+    if search {
+        let query = match object.get("query").and_then(Value::as_str).map(str::trim) {
+            Some(value)
+                if !value.is_empty()
+                    && value.len() <= 512
+                    && !value.chars().any(char::is_control) =>
+            {
+                value
+            }
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "query is required"});
+            }
+        };
+        bridge_params["query"] = json!(query);
+    } else {
+        let post_id = match object.get("post_id").and_then(Value::as_str).map(str::trim) {
+            Some(value)
+                if !value.is_empty()
+                    && value.len() <= 32
+                    && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                value
+            }
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "post_id must be numeric"});
+            }
+        };
+        bridge_params["post_id"] = json!(post_id);
+    }
+
+    let Some(actuator) = browser_actuator else {
+        return json!({
+            "ok": false,
+            "code": "x_read_unavailable",
+            "retryable": true,
+            "delivery_state": "not_delivered",
+            "page_ref": page_ref,
+        });
+    };
+    match actuator.actuate_for_endpoint(method, &bridge_params, 1, Some(endpoint_ref), None) {
+        Ok(evidence) if evidence.browser_online && evidence.command_accepted => {
+            let mut result = evidence.result.unwrap_or_else(|| {
+                json!({
+                    "ok": false,
+                    "code": "x_read_unavailable",
+                    "retryable": true,
+                    "delivery_state": "not_delivered",
+                })
+            });
+            if let Some(object) = result.as_object_mut() {
+                object
+                    .entry("page_ref".to_owned())
+                    .or_insert_with(|| json!(page_ref));
+                if !object.contains_key("code")
+                    && let Some(code) = object
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                {
+                    object.insert("code".to_owned(), json!(code));
+                }
+            }
+            result
+        }
+        Ok(_) => json!({
+            "ok": false,
+            "code": "x_read_unavailable",
+            "retryable": true,
+            "delivery_state": "not_delivered",
+            "page_ref": page_ref,
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "code": "x_read_unavailable",
+            "message": error,
+            "retryable": true,
+            "delivery_state": "not_delivered",
+            "page_ref": page_ref,
+        }),
+    }
 }
 
 fn bilibili_video_transcript_call(
@@ -15623,6 +15829,101 @@ mod tests {
         assert_eq!(allowed["page_ref"], page_ref);
         assert_eq!(allowed["bvid"], "BV1fX4y1Q7Ux");
         assert_eq!(allowed["segments"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn x_reads_require_exact_page_assist_grant_and_route_read_only() {
+        struct XReadActuator;
+        impl BrowserActuator for XReadActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("X reads must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(endpoint_ref, Some("bep_x"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(expected_generation, 1);
+                let result = if operation == X_SEARCH_POSTS_METHOD {
+                    assert_eq!(params["query"], "from:OpenAI");
+                    assert_eq!(params["limit"], 3);
+                    json!({
+                        "ok": true,
+                        "query": "from:OpenAI",
+                        "posts": [{"id": "2101", "handle": "OpenAI", "text": "hello", "url": "https://x.com/OpenAI/status/2101"}],
+                        "next_cursor": "cursor-search",
+                        "truncated": true,
+                    })
+                } else {
+                    assert_eq!(operation, X_THREAD_READ_METHOD);
+                    assert_eq!(params["post_id"], "2101");
+                    assert_eq!(params["cursor"], "cursor-thread");
+                    json!({
+                        "ok": true,
+                        "root_post_id": "2101",
+                        "posts": [{"id": "2102", "handle": "example", "text": "reply", "url": "https://x.com/example/status/2102", "in_reply_to": "2101"}],
+                        "next_cursor": null,
+                        "truncated": false,
+                    })
+                };
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(result);
+                Ok(evidence)
+            }
+        }
+
+        let page_ref = format!("bp_{}", "d".repeat(64));
+        let search = json!({
+            "endpoint_ref": "bep_x",
+            "page_ref": page_ref,
+            "query": "from:OpenAI",
+            "limit": 3,
+        });
+        let denied = x_read_call(X_SEARCH_POSTS_METHOD, &search, &[], Some(&XReadActuator));
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["code"], "caller_grant_missing");
+
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_x".to_owned(),
+        }];
+        let search_result = x_read_call(
+            X_SEARCH_POSTS_METHOD,
+            &search,
+            &grants,
+            Some(&XReadActuator),
+        );
+        assert_eq!(search_result["ok"], true);
+        assert_eq!(search_result["page_ref"], page_ref);
+        assert_eq!(search_result["posts"][0]["handle"], "OpenAI");
+
+        let thread = json!({
+            "endpoint_ref": "bep_x",
+            "page_ref": page_ref,
+            "post_id": "2101",
+            "limit": 2,
+            "cursor": "cursor-thread",
+        });
+        let thread_result =
+            x_read_call(X_THREAD_READ_METHOD, &thread, &grants, Some(&XReadActuator));
+        assert_eq!(thread_result["ok"], true);
+        assert_eq!(thread_result["root_post_id"], "2101");
+        assert_eq!(thread_result["posts"][0]["in_reply_to"], "2101");
     }
 
     #[test]

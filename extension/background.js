@@ -3489,6 +3489,31 @@ async function handleBrowserActuation(command) {
     }).catch(() => {});
     return;
   }
+  if (operation === "herdr_mcp.x.search.posts" || operation === "herdr_mcp.x.thread.read") {
+    let result;
+    try {
+      result = await performXReadRequest({
+        mode: operation === "herdr_mcp.x.search.posts" ? "search" : "thread",
+        pageRef: params.page_ref,
+        query: params.query,
+        postId: params.post_id,
+        limit: params.limit,
+        cursor: params.cursor,
+      });
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = { ok: false, error: "x_read_invalid_result" };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "x_read_unavailable"),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
+    return;
+  }
   if (operation === "herdr_mcp.page_assist") {
     let result;
     try {
@@ -8275,6 +8300,363 @@ function withBrowserPageIdentity(result, page) {
     page_generation: page.page_generation,
     ownership: page.ownership,
   };
+}
+
+async function performXReadRequest(msg) {
+  await configReady;
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+  if (!endpointRef) return { ok: false, error: "browser_page_endpoint_unavailable" };
+
+  const pageRef = String(msg?.pageRef || "");
+  if (!validBrowserPageRef(pageRef)) return { ok: false, error: "browser_page_ref_invalid" };
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) return { ok: false, error: "browser_page_not_found" };
+  if (record.endpoint_ref !== endpointRef) {
+    return withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
+  }
+  if (record.origin !== "https://x.com") {
+    return withBrowserPageIdentity({ ok: false, error: "x_origin_invalid" }, record);
+  }
+  const pattern = originToMatchPattern(record.origin);
+  if (!pattern || !await hasHostPermission(pattern)) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "permission_required",
+      reason: "host_permission_missing",
+      origin: record.origin,
+    }, record);
+  }
+  const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
+  if (!resolved.ok) return withBrowserPageIdentity(resolved, record);
+
+  const mode = msg?.mode === "thread" ? "thread" : "search";
+  const query = typeof msg?.query === "string" ? msg.query.trim().slice(0, 512) : "";
+  const postId = typeof msg?.postId === "string" ? msg.postId.trim().slice(0, 32) : "";
+  const limit = Number.isSafeInteger(msg?.limit) && msg.limit >= 1 && msg.limit <= 50
+    ? msg.limit
+    : (mode === "search" ? 15 : 50);
+  const cursor = typeof msg?.cursor === "string" ? msg.cursor.trim().slice(0, 4096) : "";
+  if (mode === "search" && !query) {
+    return withBrowserPageIdentity({ ok: false, error: "x_query_required" }, resolved.page);
+  }
+  if (mode === "thread" && !/^\d{1,32}$/.test(postId)) {
+    return withBrowserPageIdentity({ ok: false, error: "x_post_id_invalid" }, resolved.page);
+  }
+
+  let execution = null;
+  try {
+    execution = await chrome.scripting.executeScript({
+      target: { tabId: resolved.tab.id },
+      world: "MAIN",
+      func: async (readMode, requestedQuery, requestedPostId, requestedLimit, requestedCursor) => {
+        const fail = (error, extra = {}) => ({ ok: false, error, ...extra });
+        const searchFallback = {
+          queryId: "Yw6L66Pw54NHKuq4Dp7b4Q",
+          features: {
+            rweb_video_screen_enabled: true,
+            rweb_cashtags_enabled: true,
+            profile_label_improvements_pcf_label_in_post_enabled: true,
+            responsive_web_profile_redirect_enabled: true,
+            rweb_tipjar_consumption_enabled: true,
+            verified_phone_label_enabled: false,
+            creator_subscriptions_tweet_preview_api_enabled: true,
+            responsive_web_graphql_timeline_navigation_enabled: true,
+            responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+            premium_content_api_read_enabled: false,
+            communities_web_enable_tweet_community_results_fetch: true,
+            c9s_tweet_anatomy_moderator_badge_enabled: true,
+            responsive_web_grok_analyze_button_fetch_trends_enabled: false,
+            responsive_web_grok_analyze_post_followups_enabled: true,
+            rweb_cashtags_composer_attachment_enabled: true,
+            responsive_web_jetfuel_frame: true,
+            responsive_web_grok_share_attachment_enabled: true,
+            responsive_web_grok_annotations_enabled: true,
+            articles_preview_enabled: true,
+            responsive_web_edit_tweet_api_enabled: true,
+            graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
+            view_counts_everywhere_api_enabled: true,
+            longform_notetweets_consumption_enabled: true,
+            responsive_web_twitter_article_tweet_consumption_enabled: true,
+            content_disclosure_indicator_enabled: true,
+            content_disclosure_ai_generated_indicator_enabled: true,
+            responsive_web_grok_show_grok_translated_post: false,
+            responsive_web_grok_analysis_button_from_backend: true,
+            post_ctas_fetch_enabled: false,
+            freedom_of_speech_not_reach_fetch_enabled: true,
+            standardized_nudges_misinfo: true,
+            tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
+            longform_notetweets_rich_text_read_enabled: true,
+            longform_notetweets_inline_media_enabled: true,
+            responsive_web_grok_image_annotation_enabled: true,
+            responsive_web_grok_imagine_annotation_enabled: true,
+            responsive_web_grok_community_note_auto_translation_is_enabled: false,
+            responsive_web_enhance_cards_enabled: false,
+          },
+          fieldToggles: {
+            withPayments: true,
+            withAuxiliaryUserLabels: true,
+            withArticleRichContentState: true,
+            withArticlePlainText: true,
+            withArticleSummaryText: true,
+            withArticleVoiceOver: true,
+            withGrokAnalyze: true,
+            withDisallowedReplyControls: true,
+          },
+        };
+        const threadFallback = {
+          queryId: "nBS-WpgA6ZG0CyNHD517JQ",
+          features: {
+            responsive_web_graphql_exclude_directive_enabled: true,
+            verified_phone_label_enabled: false,
+            creator_subscriptions_tweet_preview_api_enabled: true,
+            responsive_web_graphql_timeline_navigation_enabled: true,
+            responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
+            longform_notetweets_consumption_enabled: true,
+            longform_notetweets_rich_text_read_enabled: true,
+            longform_notetweets_inline_media_enabled: true,
+            freedom_of_speech_not_reach_fetch_enabled: true,
+          },
+          fieldToggles: {
+            withArticleRichContentState: true,
+            withArticlePlainText: false,
+          },
+        };
+
+        const normalizeOperation = (value, fallback) => {
+          const featureCount = value && typeof value === "object"
+            ? Object.keys(value.features || {}).length
+            : 0;
+          return value?.queryId && featureCount >= 3
+            ? {
+                queryId: value.queryId,
+                features: value.features,
+                fieldToggles: Object.keys(value.fieldToggles || {}).length > 0
+                  ? value.fieldToggles
+                  : fallback.fieldToggles,
+              }
+            : fallback;
+        };
+        const parseOperation = (text, operationName) => {
+          if (!text || !operationName) return null;
+          const esc = operationName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const reA = new RegExp(`queryId:\"([A-Za-z0-9_-]+)\"[^}]{0,400}operationName:\"${esc}\"`);
+          const reB = new RegExp(`operationName:\"${esc}\"[^}]{0,400}queryId:\"([A-Za-z0-9_-]+)\"`);
+          const match = text.match(reA) || text.match(reB);
+          if (!match || typeof match.index !== "number") return null;
+          const win = text.slice(Math.max(0, match.index - 500), Math.min(text.length, match.index + 2500));
+          const quotedKeys = (source) => source
+            ? Array.from(source.matchAll(/\"([^\"]+)\"/g)).map((item) => item[1])
+            : [];
+          const flags = (keys) => Object.fromEntries(keys.map((key) => [key, true]));
+          return {
+            queryId: match[1],
+            features: flags(quotedKeys(win.match(/featureSwitches:\[([^\]]*)\]/)?.[1])),
+            fieldToggles: flags(quotedKeys(win.match(/fieldToggles:\[([^\]]*)\]/)?.[1])),
+          };
+        };
+        const resourceNames = performance.getEntriesByType("resource").map((entry) => entry.name);
+        const scripts = Array.from(new Set([
+          ...Array.from(document.scripts).map((script) => script.src).filter(Boolean),
+          ...resourceNames.filter((name) => name.includes("client-web") && name.endsWith(".js")),
+        ]));
+        const candidates = Array.from(new Set([...scripts.slice(0, 15), ...scripts.slice(-15)]));
+        const operationName = readMode === "search" ? "SearchTimeline" : "TweetDetail";
+        const fallback = readMode === "search" ? searchFallback : threadFallback;
+        let bearer = "";
+        let discoveredOperation = null;
+        for (const scriptUrl of candidates) {
+          try {
+            const text = await (await fetch(scriptUrl)).text();
+            if (!bearer) {
+              const match = text.match(/A{10}[A-Za-z0-9%_-]{60,260}/);
+              if (match) bearer = match[0];
+            }
+            if (!discoveredOperation) discoveredOperation = parseOperation(text, operationName);
+            if (bearer && discoveredOperation && Object.keys(discoveredOperation.features || {}).length >= 3) break;
+          } catch (_) {}
+        }
+        if (!bearer) return fail("x_session_metadata_unavailable", { retryable: true });
+        const csrf = document.cookie
+          .split("; ")
+          .find((value) => value.startsWith("ct0="))
+          ?.slice(4) || "";
+        if (!csrf) return fail("x_auth_required");
+        try { bearer = decodeURIComponent(bearer); } catch (_) {}
+        const operation = normalizeOperation(discoveredOperation, fallback);
+        const headers = {
+          Authorization: `Bearer ${bearer}`,
+          "X-Csrf-Token": csrf,
+          "X-Twitter-Auth-Type": "OAuth2Session",
+          "X-Twitter-Active-User": "yes",
+        };
+        const requestJson = async (url, options = {}) => {
+          const response = await fetch(url, { ...options, headers, credentials: "include" });
+          let payload = null;
+          try { payload = await response.json(); } catch (_) {}
+          return { status: response.status, payload };
+        };
+        const mapHttpError = (status) => {
+          if (status === 401) return fail("x_auth_required");
+          if (status === 403) return fail("x_forbidden");
+          if (status === 404) return fail("x_operation_unavailable", { retryable: true });
+          if (status === 429) return fail("x_rate_limited", { retryable: true });
+          if (status >= 500) return fail("x_api_unavailable", { retryable: true });
+          return fail("x_api_error", { retryable: false });
+        };
+        const unwrapTweet = (result) => {
+          if (!result || typeof result !== "object") return null;
+          if (result.__typename === "TweetWithVisibilityResults" && result.tweet) return result.tweet;
+          if (result.tweet) return result.tweet;
+          return result;
+        };
+        const seen = new Set();
+        const toRow = (result) => {
+          const tweet = unwrapTweet(result);
+          const id = String(tweet?.rest_id || "");
+          if (!id || seen.has(id)) return null;
+          seen.add(id);
+          const user = tweet?.core?.user_results?.result || {};
+          const handle = String(user?.core?.screen_name || user?.legacy?.screen_name || "").trim();
+          const author = String(user?.core?.name || user?.legacy?.name || handle).trim().slice(0, 200);
+          const text = String(
+            tweet?.note_tweet?.note_tweet_results?.result?.text
+              || tweet?.legacy?.full_text
+              || "",
+          ).trim().slice(0, 4000);
+          if (!handle && !text) return null;
+          return {
+            id,
+            author,
+            handle,
+            created_at: String(tweet?.legacy?.created_at || "").slice(0, 128),
+            text,
+            url: `https://x.com/${handle || "i"}/status/${id}`,
+            in_reply_to: tweet?.legacy?.in_reply_to_status_id_str
+              ? String(tweet.legacy.in_reply_to_status_id_str)
+              : null,
+          };
+        };
+        const parseTimeline = (payload, root) => {
+          const rows = [];
+          let nextCursor = null;
+          const visit = (value) => {
+            if (!value || typeof value !== "object") return;
+            if (value.tweet_results?.result) {
+              const row = toRow(value.tweet_results.result);
+              if (row) rows.push(row);
+            }
+            if ((value.entryType === "TimelineTimelineCursor" || value.__typename === "TimelineTimelineCursor")
+                && (value.cursorType === "Bottom" || value.cursorType === "ShowMore")
+                && value.value) {
+              nextCursor = String(value.value).slice(0, 4096);
+            }
+            if (Array.isArray(value)) {
+              for (const item of value) visit(item);
+              return;
+            }
+            for (const child of Object.values(value)) {
+              if (child && typeof child === "object") visit(child);
+            }
+          };
+          visit(root(payload));
+          return { rows, nextCursor };
+        };
+
+        if (readMode === "search") {
+          const variables = {
+            rawQuery: requestedQuery,
+            count: Math.min(50, requestedLimit + 10),
+            querySource: "typed_query",
+            product: "Latest",
+          };
+          if (requestedCursor) variables.cursor = requestedCursor;
+          const body = JSON.stringify({
+            variables,
+            features: operation.features,
+            fieldToggles: operation.fieldToggles,
+          });
+          const response = await requestJson(`/i/api/graphql/${operation.queryId}/SearchTimeline`, {
+            method: "POST",
+            body,
+          });
+          if (response.status < 200 || response.status >= 300) return mapHttpError(response.status);
+          const payload = Array.isArray(response.payload)
+            ? response.payload.find((item) => item?.data) || response.payload[0]
+            : response.payload;
+          if (!payload?.data) return fail("x_api_error", { retryable: true });
+          const parsed = parseTimeline(
+            payload,
+            (value) => value?.data?.search_by_raw_query?.search_timeline?.timeline?.instructions || [],
+          );
+          const posts = parsed.rows.slice(0, requestedLimit);
+          if (posts.length === 0) return fail("x_empty_result");
+          return {
+            ok: true,
+            query: requestedQuery,
+            posts,
+            next_cursor: parsed.nextCursor,
+            truncated: Boolean(parsed.nextCursor) || parsed.rows.length > posts.length,
+          };
+        }
+
+        const variables = {
+          focalTweetId: requestedPostId,
+          referrer: "tweet",
+          with_rux_injections: false,
+          includePromotedContent: false,
+          rankingMode: "Recency",
+          withCommunity: true,
+          withQuickPromoteEligibilityTweetFields: true,
+          withBirdwatchNotes: true,
+          withVoice: true,
+        };
+        if (requestedCursor) variables.cursor = requestedCursor;
+        const params = new URLSearchParams({
+          variables: JSON.stringify(variables),
+          features: JSON.stringify(operation.features),
+          fieldToggles: JSON.stringify(operation.fieldToggles),
+        });
+        const response = await requestJson(`/i/api/graphql/${operation.queryId}/TweetDetail?${params}`);
+        if (response.status < 200 || response.status >= 300) return mapHttpError(response.status);
+        const payload = Array.isArray(response.payload)
+          ? response.payload.find((item) => item?.data) || response.payload[0]
+          : response.payload;
+        if (!payload?.data) return fail("x_api_error", { retryable: true });
+        const parsed = parseTimeline(
+          payload,
+          (value) => value?.data?.threaded_conversation_with_injections_v2?.instructions
+            || value?.data?.tweetResult?.result?.timeline?.instructions
+            || [],
+        );
+        const posts = parsed.rows.slice(0, requestedLimit);
+        if (posts.length === 0) return fail("x_empty_result");
+        return {
+          ok: true,
+          root_post_id: requestedPostId,
+          posts,
+          next_cursor: parsed.nextCursor,
+          truncated: Boolean(parsed.nextCursor) || parsed.rows.length > posts.length,
+        };
+      },
+      args: [mode, query, postId, limit, cursor],
+    });
+  } catch (_) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "x_read_unavailable",
+      retryable: true,
+    }, resolved.page);
+  }
+  const result = execution?.[0]?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return withBrowserPageIdentity({ ok: false, error: "x_read_invalid_result" }, resolved.page);
+  }
+  return withBrowserPageIdentity({
+    ...result,
+    source_url: resolved.page.canonical_url,
+  }, resolved.page);
 }
 
 async function performBilibiliVideoTranscriptRequest(msg) {

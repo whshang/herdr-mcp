@@ -18,7 +18,8 @@ use super::{
     LOCAL_LIST_METHOD, LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD, TEXT_READ_METHOD,
     TEXT_WRITE_METHOD, VALIDATION_ADVISE_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD,
     WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD,
-    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
+    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD,
+    X_THREAD_READ_METHOD,
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
@@ -863,6 +864,40 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "language": {"type": ["string", "null"], "maxLength": 32}
                 },
                 "required": ["endpoint_ref", "page_ref"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": X_SEARCH_POSTS_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "page_ref": {"type": "string", "maxLength": 67},
+                    "query": {"type": "string", "maxLength": 512},
+                    "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 50},
+                    "cursor": {"type": ["string", "null"], "maxLength": 4096}
+                },
+                "required": ["endpoint_ref", "page_ref", "query"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": X_THREAD_READ_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "page_ref": {"type": "string", "maxLength": 67},
+                    "post_id": {"type": "string", "pattern": "^[0-9]{1,32}$"},
+                    "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 50},
+                    "cursor": {"type": ["string", "null"], "maxLength": 4096}
+                },
+                "required": ["endpoint_ref", "page_ref", "post_id"],
                 "empty": false
             }
         }),
