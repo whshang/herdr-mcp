@@ -3466,6 +3466,29 @@ async function handleBrowserActuation(command) {
     }).catch(() => {});
     return;
   }
+  if (operation === "herdr_mcp.bilibili.video.transcript") {
+    let result;
+    try {
+      result = await performBilibiliVideoTranscriptRequest({
+        pageRef: params.page_ref,
+        offset: params.offset,
+        limit: params.limit,
+        language: params.language,
+      });
+    } catch (error) {
+      result = { ok: false, error: error?.message || String(error) };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = { ok: false, error: "bilibili_transcript_invalid_result" };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "bilibili_transcript_unavailable"),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
+    return;
+  }
   if (operation === "herdr_mcp.page_assist") {
     let result;
     try {
@@ -8252,6 +8275,202 @@ function withBrowserPageIdentity(result, page) {
     page_generation: page.page_generation,
     ownership: page.ownership,
   };
+}
+
+async function performBilibiliVideoTranscriptRequest(msg) {
+  await configReady;
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+  if (!endpointRef) return { ok: false, error: "browser_page_endpoint_unavailable" };
+
+  const pageRef = String(msg?.pageRef || "");
+  if (!validBrowserPageRef(pageRef)) return { ok: false, error: "browser_page_ref_invalid" };
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) return { ok: false, error: "browser_page_not_found" };
+  if (record.endpoint_ref !== endpointRef) {
+    return withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
+  }
+  if (record.origin !== "https://www.bilibili.com") {
+    return withBrowserPageIdentity({ ok: false, error: "bilibili_origin_invalid" }, record);
+  }
+  const pattern = originToMatchPattern(record.origin);
+  if (!pattern || !await hasHostPermission(pattern)) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "permission_required",
+      reason: "host_permission_missing",
+      origin: record.origin,
+    }, record);
+  }
+  const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
+  if (!resolved.ok) return withBrowserPageIdentity(resolved, record);
+
+  const offset = Number.isSafeInteger(msg?.offset) && msg.offset >= 0 ? msg.offset : 0;
+  const limit = Number.isSafeInteger(msg?.limit) && msg.limit >= 1 && msg.limit <= 100 ? msg.limit : 50;
+  const language = typeof msg?.language === "string" ? msg.language.trim().slice(0, 32) : "";
+  let execution = null;
+  try {
+    execution = await chrome.scripting.executeScript({
+      target: { tabId: resolved.tab.id },
+      world: "MAIN",
+      func: async (requestedOffset, requestedLimit, requestedLanguage) => {
+        const fail = (error, extra = {}) => ({ ok: false, error, ...extra });
+        const state = window.__INITIAL_STATE__ || {};
+        const video = state.videoData || {};
+        const urlMatch = location.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/i);
+        const bvid = String(video.bvid || state.bvid || urlMatch?.[1] || "");
+        const cid = Number(video.cid || state.cid || video.pages?.[0]?.cid || 0);
+        const title = String(video.title || document.title || "").trim();
+        const initialTracks = Array.isArray(video?.subtitle?.list) ? video.subtitle.list : [];
+        if (!bvid || !Number.isFinite(cid) || cid <= 0) {
+          return fail("bilibili_video_identity_unavailable");
+        }
+
+        const fetchJson = async (url, credentials = "include") => {
+          const response = await fetch(url, { credentials });
+          let payload = null;
+          try { payload = await response.json(); } catch (_) {}
+          return { status: response.status, payload };
+        };
+        let player;
+        try {
+          player = await fetchJson(
+            `https://api.bilibili.com/x/player/wbi/v2?bvid=${encodeURIComponent(bvid)}&cid=${encodeURIComponent(cid)}`,
+          );
+        } catch (_) {
+          return fail("bilibili_api_unavailable", { retryable: true });
+        }
+        const playerCode = Number(player?.payload?.code ?? 0);
+        if (player.status === 429 || player.status === 412 || playerCode === -412) {
+          return fail("bilibili_rate_limited", { retryable: true });
+        }
+        if (player.status < 200 || player.status >= 300 || playerCode !== 0) {
+          if (playerCode === -101) return fail("bilibili_auth_required");
+          return fail("bilibili_api_error", { retryable: player.status >= 500 });
+        }
+        const tracks = Array.isArray(player?.payload?.data?.subtitle?.subtitles)
+          ? player.payload.data.subtitle.subtitles
+          : [];
+        if (tracks.length === 0) {
+          let loggedIn = false;
+          try {
+            const nav = await fetchJson("https://api.bilibili.com/x/web-interface/nav");
+            if (nav.status === 429 || nav.status === 412 || Number(nav?.payload?.code ?? 0) === -412) {
+              return fail("bilibili_rate_limited", { retryable: true });
+            }
+            loggedIn = nav.status >= 200
+              && nav.status < 300
+              && Number(nav?.payload?.code ?? -1) === 0
+              && nav?.payload?.data?.isLogin === true;
+          } catch (_) {}
+          if (!loggedIn && initialTracks.length > 0) return fail("bilibili_auth_required");
+          return fail("bilibili_subtitle_unavailable");
+        }
+
+        const requested = String(requestedLanguage || "").trim().toLowerCase();
+        const languageMatches = (track) => {
+          const lan = String(track?.lan || "").toLowerCase();
+          const label = String(track?.lan_doc || "").toLowerCase();
+          return requested && (lan === requested || label === requested);
+        };
+        let selected = requested ? tracks.find(languageMatches) : null;
+        if (requested && !selected) return fail("bilibili_subtitle_language_unavailable");
+        if (!selected) {
+          const preferred = ["zh-cn", "zh-hans", "zh-hant", "zh", "ai-zh"];
+          selected = [...tracks].sort((left, right) => {
+            const leftLan = String(left?.lan || "").toLowerCase();
+            const rightLan = String(right?.lan || "").toLowerCase();
+            const leftIndex = preferred.indexOf(leftLan);
+            const rightIndex = preferred.indexOf(rightLan);
+            const leftScore = leftIndex < 0 ? preferred.length : leftIndex;
+            const rightScore = rightIndex < 0 ? preferred.length : rightIndex;
+            if (leftScore !== rightScore) return leftScore - rightScore;
+            return Number(left?.ai_type || 0) - Number(right?.ai_type || 0);
+          })[0];
+        }
+        const rawSubtitleUrl = String(selected?.subtitle_url || "");
+        if (!rawSubtitleUrl) return fail("bilibili_subtitle_unavailable");
+        let subtitleUrl;
+        try {
+          subtitleUrl = new URL(rawSubtitleUrl.startsWith("//") ? `https:${rawSubtitleUrl}` : rawSubtitleUrl);
+        } catch (_) {
+          return fail("bilibili_subtitle_url_invalid");
+        }
+        if (subtitleUrl.protocol !== "https:"
+            || !(subtitleUrl.hostname === "hdslb.com" || subtitleUrl.hostname.endsWith(".hdslb.com"))) {
+          return fail("bilibili_subtitle_url_invalid");
+        }
+
+        let transcript;
+        try {
+          transcript = await fetchJson(subtitleUrl.href, "omit");
+        } catch (_) {
+          return fail("bilibili_subtitle_fetch_failed", { retryable: true });
+        }
+        if (transcript.status === 429 || transcript.status === 412) {
+          return fail("bilibili_rate_limited", { retryable: true });
+        }
+        if (transcript.status < 200 || transcript.status >= 300) {
+          return fail("bilibili_subtitle_fetch_failed", { retryable: transcript.status >= 500 });
+        }
+        const body = Array.isArray(transcript?.payload?.body) ? transcript.payload.body : [];
+        const segments = body
+          .map((segment, index) => {
+            const start = Number(segment?.from);
+            const end = Number(segment?.to);
+            const text = String(segment?.content || "").trim().slice(0, 2000);
+            if (!Number.isFinite(start) || !Number.isFinite(end) || !text) return null;
+            return {
+              index,
+              start_ms: Math.max(0, Math.round(start * 1000)),
+              end_ms: Math.max(0, Math.round(end * 1000)),
+              text,
+            };
+          })
+          .filter(Boolean);
+        if (segments.length === 0) return fail("bilibili_subtitle_empty");
+        const page = segments.slice(requestedOffset, requestedOffset + requestedLimit);
+        const nextOffset = requestedOffset + page.length < segments.length
+          ? requestedOffset + page.length
+          : null;
+        return {
+          ok: true,
+          title,
+          bvid,
+          cid,
+          subtitle: {
+            language: String(selected?.lan || ""),
+            label: String(selected?.lan_doc || ""),
+            kind: Number(selected?.ai_type || 0) === 0 ? "human" : "ai",
+          },
+          segments: page,
+          total_segments: segments.length,
+          offset: requestedOffset,
+          next_offset: nextOffset,
+          truncated: nextOffset !== null,
+        };
+      },
+      args: [offset, limit, language],
+    });
+  } catch (_) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "bilibili_transcript_unavailable",
+      retryable: true,
+    }, resolved.page);
+  }
+  const result = execution?.[0]?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "bilibili_transcript_invalid_result",
+    }, resolved.page);
+  }
+  return withBrowserPageIdentity({
+    ...result,
+    source_url: resolved.page.canonical_url,
+  }, resolved.page);
 }
 
 async function performPageAssistRequest(msg) {

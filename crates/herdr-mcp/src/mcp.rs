@@ -9,18 +9,18 @@ use crate::git_tools;
 use crate::herdr::HerdrClient;
 use crate::native_tools;
 use crate::progressive_skills::{
-    BROWSER_COMPOSER_SET_APPS_METHOD, BROWSER_COMPOSER_SET_REASONING_METHOD,
-    BROWSER_DISPATCH_STATUS_METHOD, BROWSER_DISPATCH_STOP_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD,
-    BROWSER_ENDPOINT_INSPECT_METHOD, BROWSER_ENDPOINT_LIST_METHOD, BROWSER_HANDOFF_PREPARE_METHOD,
-    BROWSER_MESSAGE_APPEND_METHOD, BROWSER_PAGE_ACTION_METHOD, BROWSER_PAGE_FAST_PATH_METHOD,
-    BROWSER_PAGE_LIFECYCLE_METHOD, BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD,
-    BROWSER_RESOURCE_RESOLVE_METHOD, BROWSER_SESSION_ARCHIVE_METHOD,
-    BROWSER_SESSION_ARCHIVE_STATUS_METHOD, BROWSER_SESSION_CREATE_METHOD,
-    BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD, BROWSER_SOURCE_RESOLVE_METHOD,
-    BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD,
-    EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
-    WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
-    WORK_MEMORY_SEARCH_METHOD,
+    BILIBILI_VIDEO_TRANSCRIPT_METHOD, BROWSER_COMPOSER_SET_APPS_METHOD,
+    BROWSER_COMPOSER_SET_REASONING_METHOD, BROWSER_DISPATCH_STATUS_METHOD,
+    BROWSER_DISPATCH_STOP_METHOD, BROWSER_DISPATCH_SUBMIT_METHOD, BROWSER_ENDPOINT_INSPECT_METHOD,
+    BROWSER_ENDPOINT_LIST_METHOD, BROWSER_HANDOFF_PREPARE_METHOD, BROWSER_MESSAGE_APPEND_METHOD,
+    BROWSER_PAGE_ACTION_METHOD, BROWSER_PAGE_FAST_PATH_METHOD, BROWSER_PAGE_LIFECYCLE_METHOD,
+    BROWSER_RESOURCE_INSPECT_METHOD, BROWSER_RESOURCE_LIST_METHOD, BROWSER_RESOURCE_RESOLVE_METHOD,
+    BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
+    BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD,
+    BROWSER_SOURCE_RESOLVE_METHOD, BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD,
+    BROWSER_SPACE_OPEN_METHOD, EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD,
+    WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD,
+    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::semantic::{
@@ -376,6 +376,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             } else if method == BROWSER_PAGE_LIFECYCLE_METHOD {
                 browser_page_lifecycle_call(
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
+            } else if method == BILIBILI_VIDEO_TRANSCRIPT_METHOD {
+                bilibili_video_transcript_call(
                     &params,
                     context.caller_page_assist_grants,
                     context.browser_actuator,
@@ -7944,6 +7950,180 @@ fn browser_page_action_call(
     result
 }
 
+fn bilibili_video_transcript_call(
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "Bilibili transcript params must be an object"});
+    };
+    const ALLOWED_KEYS: &[&str] = &["endpoint_ref", "page_ref", "offset", "limit", "language"];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": format!("unknown Bilibili transcript parameter '{key}'"),
+        });
+    }
+
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+
+    let page_ref = match object
+        .get("page_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if value.strip_prefix("bp_").is_some_and(|suffix| {
+                suffix.len() == 64
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) =>
+        {
+            value
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "page_ref must be an opaque bp_ reference",
+            });
+        }
+    };
+    let offset = match object.get("offset") {
+        None | Some(Value::Null) => 0_u64,
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(value) if value <= 1_000_000 => value,
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "offset must be between 0 and 1000000"});
+            }
+        },
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "offset must be an integer"});
+        }
+    };
+    let limit = match object.get("limit") {
+        None | Some(Value::Null) => 50_u64,
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(value @ 1..=100) => value,
+            _ => {
+                return json!({"ok": false, "code": "invalid_params", "message": "limit must be between 1 and 100"});
+            }
+        },
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "limit must be an integer"});
+        }
+    };
+    let language = match object.get("language") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.len() > 32 || value.chars().any(char::is_control) {
+                return json!({"ok": false, "code": "invalid_params", "message": "language is invalid"});
+            }
+            (!value.is_empty()).then_some(value)
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "language must be a string"});
+        }
+    };
+
+    let mut bridge_params = json!({
+        "page_ref": page_ref,
+        "offset": offset,
+        "limit": limit,
+    });
+    if let Some(language) = language {
+        bridge_params["language"] = json!(language);
+    }
+
+    let Some(actuator) = browser_actuator else {
+        return json!({
+            "ok": false,
+            "code": "bilibili_transcript_unavailable",
+            "retryable": true,
+            "delivery_state": "not_delivered",
+            "page_ref": page_ref,
+        });
+    };
+    match actuator.actuate_for_endpoint(
+        BILIBILI_VIDEO_TRANSCRIPT_METHOD,
+        &bridge_params,
+        1,
+        Some(endpoint_ref),
+        None,
+    ) {
+        Ok(evidence) if evidence.browser_online && evidence.command_accepted => {
+            let mut result = evidence.result.unwrap_or_else(|| {
+                json!({
+                    "ok": false,
+                    "code": "bilibili_transcript_unavailable",
+                    "retryable": true,
+                    "delivery_state": "not_delivered",
+                })
+            });
+            if let Some(object) = result.as_object_mut() {
+                object
+                    .entry("page_ref".to_owned())
+                    .or_insert_with(|| json!(page_ref));
+                if !object.contains_key("code")
+                    && let Some(code) = object
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                {
+                    object.insert("code".to_owned(), json!(code));
+                }
+            }
+            result
+        }
+        Ok(_) => json!({
+            "ok": false,
+            "code": "bilibili_transcript_unavailable",
+            "retryable": true,
+            "delivery_state": "not_delivered",
+            "page_ref": page_ref,
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "code": "bilibili_transcript_unavailable",
+            "message": error,
+            "retryable": true,
+            "delivery_state": "not_delivered",
+            "page_ref": page_ref,
+        }),
+    }
+}
+
 fn browser_page_lifecycle_call(
     params: &Value,
     caller_grants: &[PageAssistCallerGrant],
@@ -15372,6 +15552,77 @@ mod tests {
         );
         assert_eq!(invalid["ok"], false);
         assert_eq!(invalid["code"], "invalid_params");
+    }
+
+    #[test]
+    fn bilibili_transcript_requires_exact_page_assist_grant_and_routes_read_only() {
+        struct TranscriptActuator;
+        impl BrowserActuator for TranscriptActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("Bilibili transcript must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BILIBILI_VIDEO_TRANSCRIPT_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(expected_generation, 1);
+                assert_eq!(params["offset"], 5);
+                assert_eq!(params["limit"], 2);
+                assert_eq!(params["language"], "zh-CN");
+
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "title": "Example Bilibili video",
+                    "bvid": "BV1fX4y1Q7Ux",
+                    "segments": [{"index": 5, "start_ms": 5000, "end_ms": 6000, "text": "hello"}],
+                    "total_segments": 9,
+                    "offset": 5,
+                    "next_offset": 6,
+                    "truncated": true,
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let page_ref = format!("bp_{}", "a".repeat(64));
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": page_ref,
+            "offset": 5,
+            "limit": 2,
+            "language": "zh-CN",
+        });
+        let denied = bilibili_video_transcript_call(&params, &[], Some(&TranscriptActuator));
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["code"], "caller_grant_missing");
+
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let allowed = bilibili_video_transcript_call(&params, &grants, Some(&TranscriptActuator));
+        assert_eq!(allowed["ok"], true);
+        assert_eq!(allowed["page_ref"], page_ref);
+        assert_eq!(allowed["bvid"], "BV1fX4y1Q7Ux");
+        assert_eq!(allowed["segments"][0]["text"], "hello");
     }
 
     #[test]

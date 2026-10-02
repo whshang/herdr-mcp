@@ -24,6 +24,7 @@ function browserPageLifecycleHarness({
   permissionAllowed = true,
   screenshotResponder = null,
   artifactResponder = null,
+  scriptResponder = null,
   deferredCreate = false,
   windowFocused = true,
   documentFocused = true,
@@ -100,6 +101,7 @@ function browserPageLifecycleHarness({
     },
     scripting: {
       async executeScript(details) {
+        if (scriptResponder) return scriptResponder(details);
         if (typeof details?.func !== "function") return undefined;
         return [{
           result: {
@@ -130,7 +132,7 @@ function browserPageLifecycleHarness({
     "const browserEndpointView = (endpoint) => endpoint;",
     "const captureImageArtifactNative = async (artifact) => ctx.captureImageArtifactNative(artifact);",
     browserPageLifecycleSource,
-    "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, browserPagesByRef };",
+    "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, performBilibiliVideoTranscriptRequest, browserPagesByRef };",
   ].join("\n");
   const api = new Function("ctx", code)({
     crypto: webcrypto,
@@ -742,6 +744,75 @@ test("user captures bounded visual evidence | Given one visible claimed BrowserP
   assert.equal(racedResult.error, "browser_page_screenshot_view_changed");
   assert.equal(racedResult.retryable, true);
   assert.equal(artifactCalls, 1);
+});
+
+test("user reads a reviewed Bilibili transcript | Given one exact Bilibili BrowserPage | When the builtin read runs | Then bounded transcript data is returned and logged-out access fails closed", async () => {
+  const tabs = new Map([
+    [71, {
+      id: 71,
+      windowId: 9,
+      url: "https://www.bilibili.com/video/BV1fX4y1Q7Ux/",
+      active: false,
+    }],
+  ]);
+  const sessionStorage = {};
+  const success = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    scriptResponder(details) {
+      assert.equal(details.target.tabId, 71);
+      assert.equal(details.world, "MAIN");
+      assert.deepEqual(details.args, [0, 2, "zh-CN"]);
+      return [{ result: {
+        ok: true,
+        title: "Example Bilibili video",
+        bvid: "BV1fX4y1Q7Ux",
+        cid: 1029248276,
+        subtitle: { language: "zh-CN", label: "中文（中国）", kind: "human" },
+        segments: [
+          { index: 0, start_ms: 0, end_ms: 1200, text: "first" },
+          { index: 1, start_ms: 1200, end_ms: 2400, text: "second" },
+        ],
+        total_segments: 3,
+        offset: 0,
+        next_offset: 2,
+        truncated: true,
+      } }];
+    },
+  });
+  const claimed = await success.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://www.bilibili.com",
+    url: "https://www.bilibili.com/video/BV1fX4y1Q7Ux/",
+    idempotencyKey: "claim-bilibili-transcript-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const transcript = await success.performBilibiliVideoTranscriptRequest({
+    pageRef: claimed.page_ref,
+    offset: 0,
+    limit: 2,
+    language: "zh-CN",
+  });
+  assert.equal(transcript.ok, true);
+  assert.equal(transcript.page_ref, claimed.page_ref);
+  assert.equal(transcript.source_url, "https://www.bilibili.com/video/BV1fX4y1Q7Ux/");
+  assert.equal(transcript.segments.length, 2);
+  assert.equal(Object.hasOwn(transcript, "subtitle_url"), false);
+
+  const loggedOut = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    scriptResponder() {
+      return [{ result: { ok: false, error: "bilibili_auth_required" } }];
+    },
+  });
+  const denied = await loggedOut.performBilibiliVideoTranscriptRequest({
+    pageRef: claimed.page_ref,
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.error, "bilibili_auth_required");
+  assert.equal(denied.source_url, "https://www.bilibili.com/video/BV1fX4y1Q7Ux/");
 });
 
 test("user sees WebChat control on Claude and Grok project homes | Given supported provider project URLs without conversations | When project page identity is parsed | Then project context exists without a conversation key", () => {

@@ -62,6 +62,7 @@ pub const BROWSER_DISPATCH_STOP_METHOD: &str = "herdr_mcp.browser_dispatch.stop"
 pub const BROWSER_PAGE_LIFECYCLE_METHOD: &str = "herdr_mcp.browser_page.lifecycle";
 pub const BROWSER_PAGE_ACTION_METHOD: &str = "herdr_mcp.browser_page.action";
 pub const BROWSER_PAGE_FAST_PATH_METHOD: &str = "herdr_mcp.browser_page.fast_path";
+pub const BILIBILI_VIDEO_TRANSCRIPT_METHOD: &str = "herdr_mcp.bilibili.video.transcript";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
@@ -4078,6 +4079,15 @@ mod tests {
             let name = method["method"].as_str().unwrap();
             !name.contains("consent") && !name.contains("observe") && !name.contains("register")
         }));
+
+        let methods = local_method_schemas("bilibili");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["method"], BILIBILI_VIDEO_TRANSCRIPT_METHOD);
+        assert_eq!(methods[0]["access"], "read_only");
+        assert_eq!(
+            methods[0]["params"]["required"],
+            json!(["endpoint_ref", "page_ref"])
+        );
     }
 
     #[test]
