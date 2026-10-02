@@ -8001,9 +8001,22 @@ async function captureBrowserPageScreenshot(page, tab) {
       window = await chrome.windows.get(tab.windowId);
       activeTabs = await chrome.tabs.query({ active: true, windowId: tab.windowId });
     } catch (_) {}
-    return window?.focused === true
-      && activeTabs.length === 1
-      && activeTabs[0]?.id === tab.id;
+    if (activeTabs.length !== 1 || activeTabs[0]?.id !== tab.id) return false;
+    if (window?.focused === true) return true;
+    try {
+      const probe = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "ISOLATED",
+        func: () => ({
+          hasFocus: document.hasFocus(),
+          visibilityState: document.visibilityState,
+        }),
+      });
+      return probe?.[0]?.result?.hasFocus === true
+        && probe?.[0]?.result?.visibilityState === "visible";
+    } catch (_) {
+      return false;
+    }
   };
 
   if (!await exactTargetIsVisible()) {

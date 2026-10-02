@@ -25,6 +25,9 @@ function browserPageLifecycleHarness({
   screenshotResponder = null,
   artifactResponder = null,
   deferredCreate = false,
+  windowFocused = true,
+  documentFocused = true,
+  documentVisibilityState = "visible",
 } = {}) {
   let nextTabId = Math.max(100, ...tabs.keys(), 0) + 1;
   const activatedListeners = new Set();
@@ -88,7 +91,7 @@ function browserPageLifecycleHarness({
       async get(windowId) {
         const anyTab = [...tabs.values()].some((tab) => tab.windowId === windowId);
         if (!anyTab) throw new Error("window missing");
-        return { id: windowId, focused: true };
+        return { id: windowId, focused: windowFocused };
       },
       onFocusChanged: {
         addListener(listener) { focusListeners.add(listener); },
@@ -96,7 +99,15 @@ function browserPageLifecycleHarness({
       },
     },
     scripting: {
-      async executeScript() {},
+      async executeScript(details) {
+        if (typeof details?.func !== "function") return undefined;
+        return [{
+          result: {
+            hasFocus: documentFocused,
+            visibilityState: documentVisibilityState,
+          },
+        }];
+      },
     },
   };
   const code = [
@@ -620,6 +631,7 @@ test("user captures bounded visual evidence | Given one visible claimed BrowserP
   const h = browserPageLifecycleHarness({
     sessionStorage,
     tabs,
+    windowFocused: false,
     screenshotResponder(windowId, options) {
       assert.equal(windowId, 7);
       assert.deepEqual(options, { format: "jpeg", quality: 80 });
@@ -674,6 +686,23 @@ test("user captures bounded visual evidence | Given one visible claimed BrowserP
   assert.equal(Object.hasOwn(screenshot.artifact, "bytes_b64"), false);
   assert.equal(Object.hasOwn(screenshot, "tab_id"), false);
   assert.equal(artifactCalls, 1);
+
+  const background = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    windowFocused: false,
+    documentFocused: false,
+    screenshotResponder() {
+      throw new Error("background document must never be captured");
+    },
+  });
+  const backgroundResult = await background.performBrowserPageActionRequest({
+    action: "screenshot",
+    pageRef: claimed.page_ref,
+  });
+  assert.equal(backgroundResult.ok, false);
+  assert.equal(backgroundResult.error, "browser_page_screenshot_not_visible");
+  assert.equal(backgroundResult.retryable, true);
 
   tabs.get(61).active = false;
   const hidden = await h.performBrowserPageActionRequest({
