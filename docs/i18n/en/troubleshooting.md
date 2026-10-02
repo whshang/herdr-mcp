@@ -199,7 +199,7 @@ Normal long-running work should not keep the parent blocked. `herdr_prompt` subm
 
 ### `herdr_exec`
 
-If the command was already delivered to a visible pane, a later control-plane timeout is not permission to send the command again. Inspect the pane, Git state, files and tests.
+If the command was already delivered to a visible pane, a later control-plane timeout is not permission to send the command again. Inspect the pane, Git state, files and tests. If the timeout response includes a `session_id`, continue observing that exact operation with `herdr_exec_read`; when the task no longer needs the still-running command, terminate that exact session with `herdr_exec_kill` so the reusable utility pane is released.
 
 “No success response reached the client” does not mean “nothing happened.”
 

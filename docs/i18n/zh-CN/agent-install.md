@@ -108,7 +108,7 @@ herdr-mcp link status
 - 本机存在 canonical `dev_<ULID>` device identity；
 - 一条真实认证 MCP 请求能够从公网 origin 往返到当前工作站。
 
-随后打开 ChatGPT **设置 → 账户安全与登录**，启用 **开发者模式（Developer mode）**；进入“**插件 → 浏览插件**”，点击右上角 **+ → Create APP** 创建 MCP 应用。地址粘贴完整的 `https://…workers.dev/mcp`，必须包含 `/mcp`，再完成 OAuth。建议名称使用 `herdr`，也支持自定义 App 名称。后续应在 ChatGPT Project 中工作；每个新会话的第一条消息需要访问工作站时，用输入框的 `+` 加号选择或引用这个 App。扩展会学习真实的 provider-owned App keyword，后续 Herdr turn 会复用它，不需要每轮重复 mention。
+随后打开 ChatGPT **设置 → 账户安全与登录**，启用 **开发者模式（Developer mode）**；进入“**插件 → 浏览插件**”，点击右上角 **+ → Create APP** 创建 MCP 应用。地址粘贴完整的 `https://…workers.dev/mcp`，必须包含 `/mcp`，再完成 OAuth。建议名称使用 `herdr`，也支持自定义 App 名称。后续应在 ChatGPT Project 中工作。ChatGPT 的 App 选择按消息生效，因此每条由用户手动发送且需要访问工作站的消息，都应再次用输入框的 `+` 加号选择或引用这个 App。扩展会学习真实的 provider-owned App keyword；Herdr 自动生成的 turn 会通过 `required_apps` 重新选择这个已观察到的身份。
 
 Chrome 扩展 / Native Messaging 是可选增强，不是核心 Connector 安装前置。用户需要浏览器连续工作、接力或 Control Center 时再按[扩展文档](extension.md)安装；扩展分发和开发细节留在扩展文档中。
 

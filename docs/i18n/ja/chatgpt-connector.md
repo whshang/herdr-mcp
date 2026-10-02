@@ -50,7 +50,7 @@ https://<your-edge-origin>/mcp
 ```
 
 4. ブラウザで OAuth を完了します。初回の認可時、Herdr はブラウザの言語から中国語・英語・日本語のいずれかを選択します。ステップ 1 では、ターミナル用に `herdr-mcp connector approve <approval-request-id>` をコピーします。このコマンドはローカルの `herdr-mcp` サービスと Herdr server を確認したうえで、ステップ 2 が 6 桁の承認コードを求めます。承認済みの WebChat Connector はあくまで通常の MCP にすぎず、別の Connector を承認することはできません。
-5. ChatGPT の **Project** を作成または開きます。最初にワークステーション情報の取得や Herdr 操作が必要なメッセージで、この Connector に割り当てた App 名を選択または mention します。既定/例の名前は `herdr` ですが、カスタム名も利用できます。拡張は ChatGPT の実際の App pill にある provider-owned `data-keyword` を読み取り、現在の conversation/Project の既存 binding に保存します。以後の Auto、Agent 結果、recovery、handoff、Browser Actuation はその観測済み identity を再利用するため、同じ会話で毎回 mention する必要はありません。Edge、Link、runtime が正常なのに後から tool が消える場合は attachment の回帰として扱い、App の再選択は復旧 workaround に限ります。
+5. ChatGPT の **Project** を作成または開きます。ChatGPT の App 選択はメッセージ単位です。ユーザーが手動で送る各メッセージで、新しいワークステーション情報の取得や Herdr 操作が必要な場合は、この Connector に割り当てた App 名をもう一度選択または mention します。既定/例の名前は `herdr` ですが、カスタム名も利用できます。拡張は ChatGPT の実際の App pill にある provider-owned `data-keyword` を読み取り、現在の conversation/Project の既存 binding に保存します。Auto、Agent 結果、recovery、handoff、Browser Actuation など Herdr が生成する turn は `required_apps` を使ってその観測済み identity を明示的に再選択します。これにより生成 turn は App 名を推測しませんが、その App が後続の人間入力メッセージへ永続的に付くわけではありません。手動の follow-up で Herdr が必要なら、App を再度選択または mention してください。
 
 `HERDR_MCP_TOKEN` を ChatGPT に貼り付けないでください。公開 ChatGPT アクセスは OAuth を使用します。静的な bearer は curl や Cursor などのローカルクライアント向けです。
 
