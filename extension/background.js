@@ -8564,10 +8564,13 @@ async function performDoubaoImageGenerateRequest(msg) {
         const imageCandidates = () => [...document.images].filter((image) => {
           if (!visible(image)) return false;
           const rect = image.getBoundingClientRect();
-          return image.naturalWidth >= 512
-            && image.naturalHeight >= 512
-            && rect.width >= 180
-            && rect.height >= 180;
+          let path = "";
+          try { path = new URL(String(image.currentSrc || image.src || ""), location.href).pathname; } catch (_) {}
+          return path.includes("/rc_gen_image/")
+            && image.naturalWidth >= 256
+            && image.naturalHeight >= 256
+            && rect.width >= 100
+            && rect.height >= 100;
         });
 
         if (verificationDetected()) {
@@ -8822,10 +8825,13 @@ async function performDoubaoImageStatusRequest(msg) {
         const candidates = [...document.images].filter((image) => {
           if (!visible(image)) return false;
           const rect = image.getBoundingClientRect();
-          return image.naturalWidth >= 512
-            && image.naturalHeight >= 512
-            && rect.width >= 180
-            && rect.height >= 180
+          let path = "";
+          try { path = new URL(String(image.currentSrc || image.src || ""), location.href).pathname; } catch (_) {}
+          return path.includes("/rc_gen_image/")
+            && image.naturalWidth >= 256
+            && image.naturalHeight >= 256
+            && rect.width >= 100
+            && rect.height >= 100
             && Boolean(image.currentSrc || image.src);
         });
         if (candidates.length <= baselineCount) {
