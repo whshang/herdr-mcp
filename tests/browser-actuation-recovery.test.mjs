@@ -132,7 +132,7 @@ function browserPageLifecycleHarness({
     "const browserEndpointView = (endpoint) => endpoint;",
     "const captureImageArtifactNative = async (artifact) => ctx.captureImageArtifactNative(artifact);",
     browserPageLifecycleSource,
-    "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, performBilibiliVideoTranscriptRequest, performXReadRequest, browserPagesByRef };",
+    "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, performBilibiliVideoTranscriptRequest, performDoubaoImageGenerateRequest, performDoubaoImageStatusRequest, performXReadRequest, browserPagesByRef };",
   ].join("\n");
   const api = new Function("ctx", code)({
     crypto: webcrypto,
@@ -913,6 +913,133 @@ test("user reads reviewed X search and thread data | Given one exact X BrowserPa
   assert.equal(denied.ok, false);
   assert.equal(denied.error, "x_auth_required");
   assert.equal(denied.source_url, "https://x.com/search?q=from%3AOpenAI&src=typed_query&f=live");
+});
+
+test("user generates one Doubao image with durable settlement | Given one exact Doubao BrowserPage | When submit and status run | Then submit is bounded and image bytes become artifact metadata", async () => {
+  const tabs = new Map([
+    [73, {
+      id: 73,
+      windowId: 11,
+      url: "https://www.doubao.com/chat/",
+      active: false,
+    }],
+  ]);
+  const sessionStorage = {};
+  let scriptCall = 0;
+  let artifactCalls = 0;
+  const h = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    scriptResponder(details) {
+      assert.equal(details.target.tabId, 73);
+      assert.equal(details.world, "MAIN");
+      scriptCall += 1;
+      if (scriptCall === 1) {
+        assert.deepEqual(details.args, ["draw a small blue robot"]);
+        return [{ result: {
+          ok: true,
+          status: "running",
+          delivery_state: "applied",
+          retry_safe: false,
+          mutation_submitted: true,
+          baseline_image_count: 0,
+          source_url: "https://www.doubao.com/chat/",
+        } }];
+      }
+      assert.equal(scriptCall, 2);
+      assert.deepEqual(details.args, [0]);
+      return [{ result: {
+        ok: true,
+        status: "complete_candidate",
+        source_url: "https://www.doubao.com/chat/123",
+        image: { mime: "image/webp", bytes_b64: "UklGRgAAAAA=" },
+      } }];
+    },
+    artifactResponder(artifact) {
+      artifactCalls += 1;
+      assert.match(artifact.source_id, /^bp_[0-9a-f]{64}$/);
+      assert.equal(artifact.artifact_key, "doubao_0123456789abcdef0123456789abcdef");
+      assert.equal(artifact.mime, "image/webp");
+      assert.equal(artifact.bytes_b64, "UklGRgAAAAA=");
+      return {
+        ok: true,
+        artifact: {
+          artifact_id: "abcdef0123456789abcdef0123456789",
+          conversation_id: artifact.source_id,
+          file_id: artifact.artifact_key,
+          mime: "image/webp",
+          bytes: 8,
+          sha256: "c".repeat(64),
+          captured_at: 300,
+          expires_at: 400,
+        },
+      };
+    },
+  });
+  const claimed = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://www.doubao.com",
+    url: "https://www.doubao.com/chat/",
+    idempotencyKey: "claim-doubao-image-1",
+  });
+  assert.equal(claimed.ok, true);
+
+  const generated = await h.performDoubaoImageGenerateRequest({
+    pageRef: claimed.page_ref,
+    prompt: "draw a small blue robot",
+    promptSha256: "a".repeat(64),
+    opId: "op:doubao_image:0123456789abcdef0123456789abcdef",
+  });
+  assert.equal(generated.ok, true);
+  assert.equal(generated.delivery_state, "applied");
+  assert.equal(generated.status, "running");
+  assert.equal(generated.baseline_image_count, 0);
+  assert.equal(Object.hasOwn(generated, "prompt"), false);
+
+  const status = await h.performDoubaoImageStatusRequest({
+    pageRef: claimed.page_ref,
+    opId: "op:doubao_image:0123456789abcdef0123456789abcdef",
+    baselineImageCount: 0,
+    promptSha256: "a".repeat(64),
+  });
+  assert.equal(status.ok, true);
+  assert.equal(status.status, "complete");
+  assert.deepEqual(status.artifact, {
+    artifact_id: "abcdef0123456789abcdef0123456789",
+    mime: "image/webp",
+    bytes: 8,
+    sha256: "c".repeat(64),
+    captured_at: 300,
+    expires_at: 400,
+  });
+  assert.equal(Object.hasOwn(status.artifact, "bytes_b64"), false);
+  assert.equal(Object.hasOwn(status, "image"), false);
+  assert.equal(artifactCalls, 1);
+
+  const loggedOut = browserPageLifecycleHarness({
+    sessionStorage,
+    tabs,
+    scriptResponder() {
+      return [{ result: {
+        ok: false,
+        error: "doubao_auth_required",
+        delivery_state: "not_applied",
+        retry_safe: true,
+        mutation_submitted: false,
+      } }];
+    },
+  });
+  const denied = await loggedOut.performDoubaoImageGenerateRequest({
+    pageRef: claimed.page_ref,
+    prompt: "draw a small blue robot",
+    promptSha256: "a".repeat(64),
+    opId: "op:doubao_image:fedcba9876543210fedcba9876543210",
+  });
+  assert.equal(denied.ok, false);
+  assert.equal(denied.error, "doubao_auth_required");
+  assert.equal(denied.delivery_state, "not_applied");
+  assert.equal(denied.retry_safe, true);
+  assert.equal(artifactCalls, 1);
 });
 
 test("user sees WebChat control on Claude and Grok project homes | Given supported provider project URLs without conversations | When project page identity is parsed | Then project context exists without a conversation key", () => {

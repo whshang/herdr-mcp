@@ -65,6 +65,8 @@ pub const BROWSER_PAGE_FAST_PATH_METHOD: &str = "herdr_mcp.browser_page.fast_pat
 pub const BILIBILI_VIDEO_TRANSCRIPT_METHOD: &str = "herdr_mcp.bilibili.video.transcript";
 pub const X_SEARCH_POSTS_METHOD: &str = "herdr_mcp.x.search.posts";
 pub const X_THREAD_READ_METHOD: &str = "herdr_mcp.x.thread.read";
+pub const DOUBAO_IMAGE_GENERATE_METHOD: &str = "herdr_mcp.doubao.image.generate";
+pub const DOUBAO_IMAGE_STATUS_METHOD: &str = "herdr_mcp.doubao.image.status";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
@@ -4104,6 +4106,21 @@ mod tests {
         assert_eq!(
             methods[1]["params"]["required"],
             json!(["endpoint_ref", "page_ref", "post_id"])
+        );
+
+        let methods = local_method_schemas("herdr_mcp.doubao.image.");
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0]["method"], DOUBAO_IMAGE_GENERATE_METHOD);
+        assert_eq!(methods[0]["access"], "mutation");
+        assert_eq!(
+            methods[0]["params"]["required"],
+            json!(["endpoint_ref", "page_ref", "prompt", "idempotency_key"])
+        );
+        assert_eq!(methods[1]["method"], DOUBAO_IMAGE_STATUS_METHOD);
+        assert_eq!(methods[1]["access"], "read_only");
+        assert_eq!(
+            methods[1]["params"]["required"],
+            json!(["endpoint_ref", "op_id"])
         );
     }
 

@@ -3489,6 +3489,74 @@ async function handleBrowserActuation(command) {
     }).catch(() => {});
     return;
   }
+  if (operation === "herdr_mcp.doubao.image.generate") {
+    let result;
+    try {
+      result = await performDoubaoImageGenerateRequest({
+        pageRef: params.page_ref,
+        prompt: params.prompt,
+        promptSha256: params.prompt_sha256,
+        opId: params.op_id,
+      });
+    } catch (error) {
+      result = {
+        ok: false,
+        error: "doubao_delivery_unknown",
+        detail: String(error?.message || error || ""),
+        delivery_state: "delivery_unknown",
+        retry_safe: false,
+      };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = {
+        ok: false,
+        error: "doubao_delivery_unknown",
+        delivery_state: "delivery_unknown",
+        retry_safe: false,
+      };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "doubao_image_unavailable"),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
+    return;
+  }
+  if (operation === "herdr_mcp.doubao.image.status") {
+    let result;
+    try {
+      result = await performDoubaoImageStatusRequest({
+        pageRef: params.page_ref,
+        opId: params.op_id,
+        baselineImageCount: params.baseline_image_count,
+        promptSha256: params.prompt_sha256,
+      });
+    } catch (error) {
+      result = {
+        ok: false,
+        error: "doubao_status_unavailable",
+        detail: String(error?.message || error || ""),
+        status: "running",
+        retryable: true,
+      };
+    }
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      result = {
+        ok: false,
+        error: "doubao_status_invalid_result",
+        status: "running",
+        retryable: true,
+      };
+    }
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration, "doubao_status_unavailable"),
+      command_accepted: true,
+      resource_available: true,
+      result,
+    }).catch(() => {});
+    return;
+  }
   if (operation === "herdr_mcp.x.search.posts" || operation === "herdr_mcp.x.thread.read") {
     let result;
     try {
@@ -8000,7 +8068,7 @@ async function adoptAppliedBrowserPageNavigation(page, tabId, rawNavigationUrl, 
   return false;
 }
 
-function browserPageScreenshotArtifact(response) {
+function browserImageArtifactMetadata(response) {
   const artifact = response?.artifact;
   if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) return null;
   const artifactId = String(artifact.artifact_id || "");
@@ -8010,7 +8078,7 @@ function browserPageScreenshotArtifact(response) {
   const capturedAt = Number(artifact.captured_at);
   const expiresAt = Number(artifact.expires_at);
   if (!/^[0-9a-f]{32}$/.test(artifactId)
-      || !["image/png", "image/jpeg"].includes(mime)
+      || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)
       || !/^[0-9a-f]{64}$/i.test(sha256)
       || !Number.isSafeInteger(bytes) || bytes <= 0
       || !Number.isSafeInteger(capturedAt) || capturedAt <= 0
@@ -8132,7 +8200,7 @@ async function captureBrowserPageScreenshot(page, tab) {
     mime: match[1],
     bytes_b64: match[2],
   });
-  const artifact = browserPageScreenshotArtifact(response);
+  const artifact = browserImageArtifactMetadata(response);
   if (!artifact) {
     return withBrowserPageIdentity({
       ok: false,
@@ -8300,6 +8368,428 @@ function withBrowserPageIdentity(result, page) {
     page_generation: page.page_generation,
     ownership: page.ownership,
   };
+}
+
+async function resolveDoubaoImagePage(pageRef) {
+  await configReady;
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+  if (!endpointRef) return { ok: false, error: "browser_page_endpoint_unavailable" };
+  if (!validBrowserPageRef(pageRef)) return { ok: false, error: "browser_page_ref_invalid" };
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) return { ok: false, error: "browser_page_not_found" };
+  if (record.endpoint_ref !== endpointRef) {
+    return withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
+  }
+  if (record.origin !== "https://www.doubao.com") {
+    return withBrowserPageIdentity({ ok: false, error: "doubao_origin_invalid" }, record);
+  }
+  const pattern = originToMatchPattern(record.origin);
+  if (!pattern || !await hasHostPermission(pattern)) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "permission_required",
+      reason: "host_permission_missing",
+      origin: record.origin,
+    }, record);
+  }
+  const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
+  if (!resolved.ok) return withBrowserPageIdentity(resolved, record);
+  return { ok: true, endpointRef, page: resolved.page, tab: resolved.tab };
+}
+
+async function refreshDoubaoPageIdentity(page, tabId) {
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch (_) { return false; }
+  const liveOrigin = browserPageOrigin(tab?.url);
+  if (liveOrigin !== page.origin) return false;
+  const liveUrl = browserPageCanonicalUrl(tab?.url, page.origin);
+  if (!liveUrl || liveUrl === page.canonical_url) return true;
+  page.canonical_url = liveUrl;
+  page.page_generation = Number.isSafeInteger(page.page_generation) ? page.page_generation + 1 : 1;
+  page.observation_generation = await getBrowserObservationGeneration();
+  page.last_seen_at = Date.now();
+  await persistBrowserPages();
+  return true;
+}
+
+async function performDoubaoImageGenerateRequest(msg) {
+  const pageRef = String(msg?.pageRef || "");
+  const prompt = typeof msg?.prompt === "string" ? msg.prompt.trim().slice(0, 4000) : "";
+  const promptSha256 = typeof msg?.promptSha256 === "string" ? msg.promptSha256 : "";
+  const opId = typeof msg?.opId === "string" ? msg.opId : "";
+  const resolved = await resolveDoubaoImagePage(pageRef);
+  if (!resolved.ok) {
+    return {
+      ...resolved,
+      delivery_state: "not_applied",
+      retry_safe: true,
+      mutation_submitted: false,
+    };
+  }
+  if (!prompt || !/^[0-9a-f]{64}$/i.test(promptSha256) || !/^op:doubao_image:[0-9a-f]{32}$/.test(opId)) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "doubao_image_invalid_request",
+      delivery_state: "not_applied",
+      retry_safe: true,
+      mutation_submitted: false,
+    }, resolved.page);
+  }
+
+  let execution = null;
+  try {
+    execution = await chrome.scripting.executeScript({
+      target: { tabId: resolved.tab.id },
+      world: "MAIN",
+      func: async (requestedPrompt) => {
+        const fail = (error, extra = {}) => ({ ok: false, error, ...extra });
+        const visible = (node) => {
+          if (!(node instanceof HTMLElement)) return false;
+          const style = getComputedStyle(node);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+          const rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+        const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+        const verificationDetected = () => {
+          const selectors = [
+            'iframe[src*="captcha"]',
+            'iframe[src*="verify"]',
+            'input[placeholder*="验证码"]',
+            'input[aria-label*="验证码"]',
+          ];
+          if (selectors.some((selector) => [...document.querySelectorAll(selector)].some(visible))) return true;
+          return [...document.querySelectorAll('[role="dialog"], [role="alert"], body *')]
+            .filter(visible)
+            .slice(-300)
+            .some((node) => /请完成验证|安全验证|验证码|captcha/i.test(textOf(node)));
+        };
+        const composerSelectors = [
+          'textarea[data-testid="chat_input_input"]',
+          '[data-testid="chat_input"] textarea',
+          '.chat-input textarea',
+          '.chat-input [contenteditable="true"]',
+          '.chat-editor textarea',
+          '.chat-editor [contenteditable="true"]',
+          'textarea[placeholder*="发消息"]',
+          'textarea[placeholder*="Message"]',
+          '[contenteditable="true"][placeholder*="发消息"]',
+          '[contenteditable="true"][placeholder*="Message"]',
+          '[contenteditable="true"][aria-label*="发消息"]',
+          '[contenteditable="true"][aria-label*="Message"]',
+          'textarea',
+          '[contenteditable="true"]',
+        ];
+        const findComposer = () => composerSelectors
+          .flatMap((selector) => [...document.querySelectorAll(selector)])
+          .find((node) => visible(node) && !node.closest('[aria-hidden="true"]')) || null;
+        const imageCandidates = () => [...document.images].filter((image) => {
+          if (!visible(image)) return false;
+          const rect = image.getBoundingClientRect();
+          return image.naturalWidth >= 512
+            && image.naturalHeight >= 512
+            && rect.width >= 180
+            && rect.height >= 180;
+        });
+
+        if (verificationDetected()) {
+          return fail("doubao_verification_required", {
+            delivery_state: "not_applied",
+            retry_safe: true,
+            mutation_submitted: false,
+          });
+        }
+        const initialComposer = findComposer();
+        const loginVisible = [...document.querySelectorAll('button, [role="button"], a')]
+          .some((node) => visible(node) && /^(登录|登录豆包|log\s*in|sign\s*in)$/i.test(textOf(node)));
+        if (!initialComposer && loginVisible) {
+          return fail("doubao_auth_required", {
+            delivery_state: "not_applied",
+            retry_safe: true,
+            mutation_submitted: false,
+          });
+        }
+
+        const modeCandidates = [...document.querySelectorAll('button, [role="button"], [role="menuitem"], a')]
+          .filter((node) => visible(node) && /图像生成/.test(textOf(node)));
+        const mode = modeCandidates.find((node) => /^图像生成$/.test(textOf(node))) || modeCandidates[0] || null;
+        if (!mode) {
+          return fail("doubao_image_mode_unavailable", {
+            delivery_state: "not_applied",
+            retry_safe: true,
+            mutation_submitted: false,
+          });
+        }
+        mode.click();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        if (verificationDetected()) {
+          return fail("doubao_verification_required", {
+            delivery_state: "not_applied",
+            retry_safe: true,
+            mutation_submitted: false,
+          });
+        }
+
+        const composer = findComposer();
+        if (!composer) {
+          return fail("doubao_composer_unavailable", {
+            delivery_state: "not_applied",
+            retry_safe: true,
+            mutation_submitted: false,
+          });
+        }
+        const normalizedPrompt = requestedPrompt.replace(/\r\n/g, "\n").trim();
+        composer.focus();
+        if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+          const prototype = composer instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+          if (setter) setter.call(composer, requestedPrompt);
+          else composer.value = requestedPrompt;
+        } else {
+          composer.textContent = requestedPrompt;
+        }
+        composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: requestedPrompt }));
+        composer.dispatchEvent(new Event("change", { bubbles: true }));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const composerText = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+          ? composer.value
+          : (composer.innerText || composer.textContent || "");
+        if (composerText.replace(/\r\n/g, "\n").trim() !== normalizedPrompt) {
+          return fail("doubao_prompt_fill_failed", {
+            delivery_state: "not_applied",
+            retry_safe: true,
+            mutation_submitted: false,
+          });
+        }
+
+        const baselineImageCount = imageCandidates().length;
+        const directSelectors = [
+          'button[data-testid*="send"]',
+          '[data-testid="chat_input"] button[type="submit"]',
+          'button[aria-label*="发送"]',
+          'button[aria-label*="Send"]',
+          'button[title*="发送"]',
+          'button[title*="Send"]',
+        ];
+        let sendButton = directSelectors
+          .flatMap((selector) => [...document.querySelectorAll(selector)])
+          .find((node) => visible(node) && !node.disabled && node.getAttribute("aria-disabled") !== "true") || null;
+        if (!sendButton) {
+          const composerRect = composer.getBoundingClientRect();
+          const candidates = [...(composer.closest('form') || composer.parentElement || document).querySelectorAll('button, [role="button"]')]
+            .filter((node) => visible(node) && !node.disabled && node.getAttribute("aria-disabled") !== "true")
+            .filter((node) => {
+              const label = [textOf(node), node.getAttribute("aria-label") || "", node.getAttribute("title") || ""].join(" ");
+              if (/图像生成|视频生成|深入研究|帮我写作|音乐生成|上传|麦克风|模式|更多/i.test(label)) return false;
+              const rect = node.getBoundingClientRect();
+              const dy = Math.abs((rect.top + rect.height / 2) - (composerRect.top + composerRect.height / 2));
+              return dy <= 140 && (/发送|send|提交|发消息/i.test(label) || node.getAttribute("type") === "submit");
+            });
+          sendButton = candidates[0] || null;
+        }
+        if (!sendButton) {
+          return fail("doubao_send_control_unavailable", {
+            delivery_state: "not_applied",
+            retry_safe: true,
+            mutation_submitted: false,
+          });
+        }
+
+        sendButton.click();
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        if (verificationDetected()) {
+          return fail("doubao_delivery_unknown", {
+            delivery_state: "delivery_unknown",
+            retry_safe: false,
+            mutation_submitted: true,
+          });
+        }
+        const currentText = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+          ? composer.value
+          : (composer.innerText || composer.textContent || "");
+        const promptVisible = document.body?.innerText?.includes(normalizedPrompt) === true;
+        if (currentText.replace(/\r\n/g, "\n").trim() === normalizedPrompt && !promptVisible) {
+          return fail("doubao_delivery_unknown", {
+            delivery_state: "delivery_unknown",
+            retry_safe: false,
+            mutation_submitted: true,
+          });
+        }
+        return {
+          ok: true,
+          status: "running",
+          delivery_state: "applied",
+          retry_safe: false,
+          mutation_submitted: true,
+          baseline_image_count: baselineImageCount,
+          source_url: location.href,
+        };
+      },
+      args: [prompt],
+    });
+  } catch (error) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "doubao_delivery_unknown",
+      detail: String(error?.message || error || ""),
+      delivery_state: "delivery_unknown",
+      retry_safe: false,
+      mutation_submitted: true,
+    }, resolved.page);
+  }
+  const result = execution?.[0]?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "doubao_delivery_unknown",
+      delivery_state: "delivery_unknown",
+      retry_safe: false,
+      mutation_submitted: true,
+    }, resolved.page);
+  }
+  if (result.delivery_state === "applied") {
+    await refreshDoubaoPageIdentity(resolved.page, resolved.tab.id);
+  }
+  return withBrowserPageIdentity({ ...result, source_url: resolved.page.canonical_url }, resolved.page);
+}
+
+async function performDoubaoImageStatusRequest(msg) {
+  const pageRef = String(msg?.pageRef || "");
+  const opId = typeof msg?.opId === "string" ? msg.opId : "";
+  const baselineImageCount = Number.isSafeInteger(msg?.baselineImageCount) && msg.baselineImageCount >= 0
+    ? msg.baselineImageCount
+    : 0;
+  const resolved = await resolveDoubaoImagePage(pageRef);
+  if (!resolved.ok) return resolved;
+  if (!/^op:doubao_image:[0-9a-f]{32}$/.test(opId)) {
+    return withBrowserPageIdentity({ ok: false, error: "doubao_operation_invalid", status: "running" }, resolved.page);
+  }
+
+  let execution = null;
+  try {
+    execution = await chrome.scripting.executeScript({
+      target: { tabId: resolved.tab.id },
+      world: "MAIN",
+      func: async (baselineCount) => {
+        const visible = (node) => {
+          if (!(node instanceof HTMLElement)) return false;
+          const style = getComputedStyle(node);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+          const rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+        const textOf = (node) => String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+        const alertText = [...document.querySelectorAll('[role="alert"], [data-testid*="error"], [class*="error"]')]
+          .filter(visible)
+          .map(textOf)
+          .filter(Boolean)
+          .slice(-20)
+          .join("\n");
+        if (/已取消生成|生成已取消|取消生成/.test(alertText)) {
+          return { ok: false, error: "doubao_generation_cancelled", status: "cancelled", source_url: location.href };
+        }
+        if (/生成失败|生成出错|生成错误|请求失败|生成图片失败/.test(alertText)) {
+          return { ok: false, error: "doubao_generation_failed", status: "failed", source_url: location.href };
+        }
+        const candidates = [...document.images].filter((image) => {
+          if (!visible(image)) return false;
+          const rect = image.getBoundingClientRect();
+          return image.naturalWidth >= 512
+            && image.naturalHeight >= 512
+            && rect.width >= 180
+            && rect.height >= 180
+            && Boolean(image.currentSrc || image.src);
+        });
+        if (candidates.length <= baselineCount) {
+          return { ok: false, status: "running", retryable: true, source_url: location.href };
+        }
+        const image = candidates[candidates.length - 1];
+        const rawUrl = String(image.currentSrc || image.src || "");
+        let response;
+        try {
+          response = await fetch(rawUrl, { credentials: "include" });
+        } catch (_) {
+          return { ok: false, error: "doubao_artifact_pending", status: "artifact_pending", retryable: true, source_url: location.href };
+        }
+        if (!response.ok) {
+          return { ok: false, error: "doubao_artifact_pending", status: "artifact_pending", retryable: true, source_url: location.href };
+        }
+        const blob = await response.blob();
+        const mime = String(blob.type || "").toLowerCase();
+        if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)
+            || blob.size <= 0 || blob.size > 12 * 1024 * 1024) {
+          return { ok: false, error: "doubao_artifact_pending", status: "artifact_pending", retryable: true, source_url: location.href };
+        }
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+        }
+        return {
+          ok: true,
+          status: "complete_candidate",
+          source_url: location.href,
+          image: { mime, bytes_b64: btoa(binary) },
+        };
+      },
+      args: [baselineImageCount],
+    });
+  } catch (error) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "doubao_status_unavailable",
+      detail: String(error?.message || error || ""),
+      status: "running",
+      retryable: true,
+    }, resolved.page);
+  }
+  const raw = execution?.[0]?.result;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return withBrowserPageIdentity({ ok: false, error: "doubao_status_invalid_result", status: "running", retryable: true }, resolved.page);
+  }
+  await refreshDoubaoPageIdentity(resolved.page, resolved.tab.id);
+  if (raw.status !== "complete_candidate") {
+    return withBrowserPageIdentity({ ...raw, source_url: resolved.page.canonical_url }, resolved.page);
+  }
+  const mime = String(raw.image?.mime || "");
+  const bytesB64 = String(raw.image?.bytes_b64 || "");
+  if (!bytesB64 || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "doubao_artifact_pending",
+      status: "artifact_pending",
+      retryable: true,
+      source_url: resolved.page.canonical_url,
+    }, resolved.page);
+  }
+  const artifactKey = `doubao_${opId.slice("op:doubao_image:".length)}`;
+  const response = await captureImageArtifactNative({
+    source_id: pageRef,
+    artifact_key: artifactKey,
+    mime,
+    bytes_b64: bytesB64,
+  });
+  const artifact = browserImageArtifactMetadata(response);
+  if (!artifact) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: String(response?.error || "doubao_artifact_pending"),
+      status: "artifact_pending",
+      retryable: true,
+      source_url: resolved.page.canonical_url,
+    }, resolved.page);
+  }
+  return withBrowserPageIdentity({
+    ok: true,
+    status: "complete",
+    source_url: resolved.page.canonical_url,
+    artifact,
+  }, resolved.page);
 }
 
 async function performXReadRequest(msg) {
