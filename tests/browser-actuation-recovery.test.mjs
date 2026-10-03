@@ -972,7 +972,11 @@ test("user generates one Doubao image with durable settlement | Given one exact 
           source_url: "https://www.doubao.com/chat/",
         } }];
       }
-      assert.equal(scriptCall, 3);
+      if (scriptCall === 3) {
+        assert.equal(details.args, undefined);
+        return [{ result: { visibilityState: "visible", hasFocus: true } }];
+      }
+      assert.equal(scriptCall, 4);
       assert.deepEqual(details.args, [0]);
       return [{ result: {
         ok: true,

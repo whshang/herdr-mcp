@@ -8764,6 +8764,35 @@ async function performDoubaoImageStatusRequest(msg) {
     return withBrowserPageIdentity({ ok: false, error: "doubao_operation_invalid", status: "running" }, resolved.page);
   }
 
+  try {
+    await chrome.tabs.update(resolved.tab.id, { active: true });
+    await chrome.windows.update(resolved.tab.windowId, { focused: true });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const visibilityProbe = await chrome.scripting.executeScript({
+      target: { tabId: resolved.tab.id },
+      world: "MAIN",
+      func: () => ({
+        visibilityState: document.visibilityState,
+        hasFocus: document.hasFocus(),
+      }),
+    });
+    if (visibilityProbe?.[0]?.result?.visibilityState !== "visible") {
+      return withBrowserPageIdentity({
+        ok: false,
+        error: "doubao_page_not_visible",
+        status: "running",
+        retryable: true,
+      }, resolved.page);
+    }
+  } catch (_) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "doubao_page_focus_failed",
+      status: "running",
+      retryable: true,
+    }, resolved.page);
+  }
+
   let execution = null;
   try {
     execution = await chrome.scripting.executeScript({
