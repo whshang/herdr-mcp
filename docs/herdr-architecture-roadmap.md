@@ -109,7 +109,7 @@ beta.2   ChatGPT / Grok / Claude convergence on shared Browser Kernel
 rc.1     packaging / permissions / compatibility / rollback / multi-device acceptance
 ```
 
-2026-10-02 当前 1.1 DEV 线已完成 alpha.1、alpha.2，并完成 alpha.3 的 C1 Bilibili transcript/read。alpha.2 的 BrowserPage/Jev/screenshot/caller-class 结论保持不变。C1 的 `herdr_mcp.bilibili.video.transcript` read-only private method 复用 exact Page Assist grant + `page_ref`，字幕 URL 和会话凭据只留在浏览器页内，Runtime 只收到分页后的结构化字幕。源码/全量回归通过后，真实 `BV1fX4y1Q7Ux` UAT 完成双态验收：logged-out 稳定返回 `bilibili_auth_required`；interactive sign-in 后旧 `page_ref` 因导航正确返回 `browser_page_stale`，fresh owned page 随后返回 82 条 human `zh-CN` 字幕，连续分页验证 `0..4` 与 `5..9`，两次结果均无 `subtitle_url`、cookie、token 或 auth material。当前 ChatGPT Connector 仍无该 endpoint 的 Page Assist grant，没有为测试扩大权限。alpha.3 下一项进入 C2 X search/thread read；C1 不再阻塞 X/Doubao。
+2026-10-03 当前 1.1 DEV 线已完成 alpha.1、alpha.2，并完成 alpha.3 的 C1 Bilibili transcript/read 与 C2 X search/thread read。C1 结论保持不变。C2 的 `x.search.posts` / `x.thread.read` 继续复用 exact Page Assist grant + `page_ref`；Generic Web 的真实 X search probe 只能看到 Trends/search shell，因此按设计采用 reviewed page-origin read strategy。源码、全量 Node/Rust、Browser Actuation 和 extension smoke 通过后，Reloaded signed-in product-path UAT 完成：`from:OpenAI` 连续读取两页各 5 条且无重复 id；thread root `2104993966043320759` 返回 root + 9 条 direct replies 并提供 continuation cursor；唯一无结果查询稳定返回 `x_empty_result`；结果均未暴露 bearer、authorization、CSRF/ct0、cookie 或 token。auth/rate-limit 失败态由 deterministic tests 覆盖，没有为验收退出用户会话或主动制造限流。X publish/like/follow 仍未进入首片。alpha.3 下一项进入 C3 Doubao image generation，属于 write/external 边界，需在实现前复核确认策略与产物回收路径。
 
 1.1 不把“任意网页”解释为无限制 RPA。普通生产路径继续禁止 local Adapter 任意 JS/eval、cookie/storage secret 导出、任意 shell/filesystem 访问与隐式接管用户 tab；高影响发布、支付、删除、授权等动作继续走确定性 human-boundary。
 

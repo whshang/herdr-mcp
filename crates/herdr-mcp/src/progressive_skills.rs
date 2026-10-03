@@ -63,6 +63,8 @@ pub const BROWSER_PAGE_LIFECYCLE_METHOD: &str = "herdr_mcp.browser_page.lifecycl
 pub const BROWSER_PAGE_ACTION_METHOD: &str = "herdr_mcp.browser_page.action";
 pub const BROWSER_PAGE_FAST_PATH_METHOD: &str = "herdr_mcp.browser_page.fast_path";
 pub const BILIBILI_VIDEO_TRANSCRIPT_METHOD: &str = "herdr_mcp.bilibili.video.transcript";
+pub const X_SEARCH_POSTS_METHOD: &str = "herdr_mcp.x.search.posts";
+pub const X_THREAD_READ_METHOD: &str = "herdr_mcp.x.thread.read";
 
 /// Task requirements the semantic layer may fill only when the planner left
 /// them unspecified. Semantic inference can add an advisory requirement, but
@@ -4087,6 +4089,21 @@ mod tests {
         assert_eq!(
             methods[0]["params"]["required"],
             json!(["endpoint_ref", "page_ref"])
+        );
+
+        let methods = local_method_schemas("herdr_mcp.x.");
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0]["method"], X_SEARCH_POSTS_METHOD);
+        assert_eq!(methods[0]["access"], "read_only");
+        assert_eq!(
+            methods[0]["params"]["required"],
+            json!(["endpoint_ref", "page_ref", "query"])
+        );
+        assert_eq!(methods[1]["method"], X_THREAD_READ_METHOD);
+        assert_eq!(methods[1]["access"], "read_only");
+        assert_eq!(
+            methods[1]["params"]["required"],
+            json!(["endpoint_ref", "page_ref", "post_id"])
         );
     }
 
