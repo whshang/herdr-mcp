@@ -8512,9 +8512,28 @@ async function performDoubaoImageGenerateRequest(msg) {
           });
         }
 
-        const modeCandidates = [...document.querySelectorAll('button, [role="button"], [role="menuitem"], a')]
-          .filter((node) => visible(node) && /图像生成/.test(textOf(node)));
-        const mode = modeCandidates.find((node) => /^图像生成$/.test(textOf(node))) || modeCandidates[0] || null;
+        const findImageMode = () => {
+          const candidates = [...document.querySelectorAll('button, [role="button"], [role="menuitem"], a')]
+            .filter((node) => visible(node) && /图像生成/.test(textOf(node)));
+          return candidates.find((node) => /^图像生成$/.test(textOf(node))) || candidates[0] || null;
+        };
+        let mode = findImageMode();
+        if (!mode && initialComposer) {
+          const composerRect = initialComposer.getBoundingClientRect();
+          const more = [...document.querySelectorAll('button, [role="button"]')]
+            .filter((node) => visible(node) && textOf(node) === "更多")
+            .map((node) => ({ node, rect: node.getBoundingClientRect() }))
+            .filter(({ rect }) => {
+              const centerY = rect.top + (rect.height / 2);
+              return centerY >= composerRect.top - 180 && centerY <= composerRect.bottom + 180;
+            })
+            .sort((left, right) => Math.abs(left.rect.top - composerRect.top) - Math.abs(right.rect.top - composerRect.top))[0]?.node || null;
+          if (more) {
+            more.click();
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            mode = findImageMode();
+          }
+        }
         if (!mode) {
           return fail("doubao_image_mode_unavailable", {
             delivery_state: "not_applied",
