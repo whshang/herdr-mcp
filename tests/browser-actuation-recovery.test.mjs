@@ -1023,6 +1023,7 @@ test("user generates one Doubao image with durable settlement | Given one exact 
   assert.equal(tabs.get(73).active, true);
   assert.equal(Object.hasOwn(generated, "prompt"), false);
 
+  tabs.get(73).url = "https://www.doubao.com/chat/123";
   const status = await h.performDoubaoImageStatusRequest({
     pageRef: claimed.page_ref,
     opId: "op:doubao_image:0123456789abcdef0123456789abcdef",
@@ -1031,6 +1032,8 @@ test("user generates one Doubao image with durable settlement | Given one exact 
   });
   assert.equal(status.ok, true);
   assert.equal(status.status, "complete");
+  assert.equal(status.source_url, "https://www.doubao.com/chat/123");
+  assert.equal(status.page_generation, 2);
   assert.deepEqual(status.artifact, {
     artifact_id: "abcdef0123456789abcdef0123456789",
     mime: "image/webp",

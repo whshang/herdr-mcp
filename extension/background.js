@@ -8414,6 +8414,51 @@ async function refreshDoubaoPageIdentity(page, tabId) {
   return true;
 }
 
+async function resolveDoubaoImageStatusPage(pageRef) {
+  await configReady;
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  const endpointRef = browserEndpointView(endpoint)?.endpoint_ref || "";
+  if (!endpointRef) return { ok: false, error: "browser_page_endpoint_unavailable" };
+  if (!validBrowserPageRef(pageRef)) return { ok: false, error: "browser_page_ref_invalid" };
+  await loadBrowserPages();
+  const record = browserPagesByRef.get(pageRef);
+  if (!record) return { ok: false, error: "browser_page_not_found" };
+  if (record.endpoint_ref !== endpointRef) {
+    return withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
+  }
+  if (record.origin !== "https://www.doubao.com") {
+    return withBrowserPageIdentity({ ok: false, error: "doubao_origin_invalid" }, record);
+  }
+  const pattern = originToMatchPattern(record.origin);
+  if (!pattern || !await hasHostPermission(pattern)) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "permission_required",
+      reason: "host_permission_missing",
+      origin: record.origin,
+    }, record);
+  }
+  let tab = null;
+  try { tab = await chrome.tabs.get(record.tab_id); } catch (_) {}
+  if (!tab?.url) {
+    browserPagesByRef.delete(pageRef);
+    await persistBrowserPages();
+    return { ok: false, error: "browser_page_not_found" };
+  }
+  const liveOrigin = browserPageOrigin(tab.url);
+  if (liveOrigin !== record.origin) {
+    browserPagesByRef.delete(pageRef);
+    await persistBrowserPages();
+    return { ok: false, error: "browser_page_origin_mismatch" };
+  }
+  if (!await refreshDoubaoPageIdentity(record, tab.id)) {
+    return withBrowserPageIdentity({ ok: false, error: "browser_page_stale" }, record);
+  }
+  record.last_seen_at = Date.now();
+  await persistBrowserPages();
+  return { ok: true, endpointRef, page: record, tab };
+}
+
 async function performDoubaoImageGenerateRequest(msg) {
   const pageRef = String(msg?.pageRef || "");
   const prompt = typeof msg?.prompt === "string" ? msg.prompt.trim().slice(0, 4000) : "";
@@ -8713,7 +8758,7 @@ async function performDoubaoImageStatusRequest(msg) {
   const baselineImageCount = Number.isSafeInteger(msg?.baselineImageCount) && msg.baselineImageCount >= 0
     ? msg.baselineImageCount
     : 0;
-  const resolved = await resolveDoubaoImagePage(pageRef);
+  const resolved = await resolveDoubaoImageStatusPage(pageRef);
   if (!resolved.ok) return resolved;
   if (!/^op:doubao_image:[0-9a-f]{32}$/.test(opId)) {
     return withBrowserPageIdentity({ ok: false, error: "doubao_operation_invalid", status: "running" }, resolved.page);
