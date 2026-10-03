@@ -24,6 +24,7 @@ function browserPageLifecycleHarness({
   permissionAllowed = true,
   screenshotResponder = null,
   artifactResponder = null,
+  fetchResponder = null,
   scriptResponder = null,
   deferredCreate = false,
   windowFocused = true,
@@ -152,6 +153,7 @@ function browserPageLifecycleHarness({
     "const waitForTabComplete = async (tabId) => ctx.waitForTabComplete(tabId);",
     "const registerLocalBrowserEndpoint = async () => ({ endpoint_ref: 'bep_test' });",
     "const browserEndpointView = (endpoint) => endpoint;",
+    "const fetch = (...args) => ctx.fetch(...args);",
     "const captureImageArtifactNative = async (artifact) => ctx.captureImageArtifactNative(artifact);",
     browserPageLifecycleSource,
     "return { performBrowserPageLifecycleRequest, performBrowserPageActionRequest, performBilibiliVideoTranscriptRequest, performDoubaoImageGenerateRequest, performDoubaoImageStatusRequest, performXReadRequest, browserPagesByRef };",
@@ -175,6 +177,10 @@ function browserPageLifecycleHarness({
     captureImageArtifactNative: async (artifact) => {
       if (!artifactResponder) throw new Error("artifact capture unavailable");
       return artifactResponder(artifact);
+    },
+    fetch: async (...args) => {
+      if (!fetchResponder) throw new Error("fetch unavailable");
+      return fetchResponder(...args);
     },
   });
   return { ...api, sessionStorage, tabs };
@@ -982,8 +988,24 @@ test("user generates one Doubao image with durable settlement | Given one exact 
         ok: true,
         status: "complete_candidate",
         source_url: "https://www.doubao.com/chat/123",
-        image: { mime: "image/webp", bytes_b64: "UklGRgAAAAA=" },
+        image_url: "https://p26-flow-imagex-sign.byteimg.com/tos-cn-i-a9rns2rl98/rc_gen_image/test.webp?sig=local",
       } }];
+    },
+    fetchResponder(url, options) {
+      assert.equal(url, "https://p26-flow-imagex-sign.byteimg.com/tos-cn-i-a9rns2rl98/rc_gen_image/test.webp?sig=local");
+      assert.deepEqual(options, { credentials: "omit", cache: "no-store" });
+      return {
+        ok: true,
+        async blob() {
+          return {
+            type: "image/webp",
+            size: 8,
+            async arrayBuffer() {
+              return Uint8Array.from([82, 73, 70, 70, 0, 0, 0, 0]).buffer;
+            },
+          };
+        },
+      };
     },
     artifactResponder(artifact) {
       artifactCalls += 1;

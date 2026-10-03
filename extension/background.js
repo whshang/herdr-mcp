@@ -8839,32 +8839,18 @@ async function performDoubaoImageStatusRequest(msg) {
         }
         const image = candidates[candidates.length - 1];
         const rawUrl = String(image.currentSrc || image.src || "");
-        let response;
-        try {
-          response = await fetch(rawUrl, { credentials: "include" });
-        } catch (_) {
+        let imageUrl = null;
+        try { imageUrl = new URL(rawUrl, location.href); } catch (_) {}
+        if (!imageUrl || imageUrl.protocol !== "https:"
+            || !(imageUrl.hostname === "byteimg.com" || imageUrl.hostname.endsWith(".byteimg.com"))
+            || !imageUrl.pathname.includes("/rc_gen_image/")) {
           return { ok: false, error: "doubao_artifact_pending", status: "artifact_pending", retryable: true, source_url: location.href };
-        }
-        if (!response.ok) {
-          return { ok: false, error: "doubao_artifact_pending", status: "artifact_pending", retryable: true, source_url: location.href };
-        }
-        const blob = await response.blob();
-        const mime = String(blob.type || "").toLowerCase();
-        if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)
-            || blob.size <= 0 || blob.size > 12 * 1024 * 1024) {
-          return { ok: false, error: "doubao_artifact_pending", status: "artifact_pending", retryable: true, source_url: location.href };
-        }
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        let binary = "";
-        const chunkSize = 0x8000;
-        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-          binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
         }
         return {
           ok: true,
           status: "complete_candidate",
           source_url: location.href,
-          image: { mime, bytes_b64: btoa(binary) },
+          image_url: imageUrl.href,
         };
       },
       args: [baselineImageCount],
@@ -8886,9 +8872,11 @@ async function performDoubaoImageStatusRequest(msg) {
   if (raw.status !== "complete_candidate") {
     return withBrowserPageIdentity({ ...raw, source_url: resolved.page.canonical_url }, resolved.page);
   }
-  const mime = String(raw.image?.mime || "");
-  const bytesB64 = String(raw.image?.bytes_b64 || "");
-  if (!bytesB64 || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)) {
+  let imageUrl = null;
+  try { imageUrl = new URL(String(raw.image_url || "")); } catch (_) {}
+  if (!imageUrl || imageUrl.protocol !== "https:"
+      || !(imageUrl.hostname === "byteimg.com" || imageUrl.hostname.endsWith(".byteimg.com"))
+      || !imageUrl.pathname.includes("/rc_gen_image/")) {
     return withBrowserPageIdentity({
       ok: false,
       error: "doubao_artifact_pending",
@@ -8897,6 +8885,29 @@ async function performDoubaoImageStatusRequest(msg) {
       source_url: resolved.page.canonical_url,
     }, resolved.page);
   }
+  let blob = null;
+  try {
+    const artifactResponse = await fetch(imageUrl.href, { credentials: "omit", cache: "no-store" });
+    if (artifactResponse.ok) blob = await artifactResponse.blob();
+  } catch (_) {}
+  const mime = String(blob?.type || "").toLowerCase();
+  if (!blob || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)
+      || blob.size <= 0 || blob.size > 12 * 1024 * 1024) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "doubao_artifact_pending",
+      status: "artifact_pending",
+      retryable: true,
+      source_url: resolved.page.canonical_url,
+    }, resolved.page);
+  }
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  const bytesB64 = btoa(binary);
   const artifactKey = `doubao_${opId.slice("op:doubao_image:".length)}`;
   const response = await captureImageArtifactNative({
     source_id: pageRef,
