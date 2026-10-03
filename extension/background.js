@@ -8438,6 +8438,37 @@ async function performDoubaoImageGenerateRequest(msg) {
     }, resolved.page);
   }
 
+  try {
+    await chrome.tabs.update(resolved.tab.id, { active: true });
+    await chrome.windows.update(resolved.tab.windowId, { focused: true });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const visibilityProbe = await chrome.scripting.executeScript({
+      target: { tabId: resolved.tab.id },
+      world: "MAIN",
+      func: () => ({
+        visibilityState: document.visibilityState,
+        hasFocus: document.hasFocus(),
+      }),
+    });
+    if (visibilityProbe?.[0]?.result?.visibilityState !== "visible") {
+      return withBrowserPageIdentity({
+        ok: false,
+        error: "doubao_page_not_visible",
+        delivery_state: "not_applied",
+        retry_safe: true,
+        mutation_submitted: false,
+      }, resolved.page);
+    }
+  } catch (_) {
+    return withBrowserPageIdentity({
+      ok: false,
+      error: "doubao_page_focus_failed",
+      delivery_state: "not_applied",
+      retry_safe: true,
+      mutation_submitted: false,
+    }, resolved.page);
+  }
+
   let execution = null;
   try {
     execution = await chrome.scripting.executeScript({

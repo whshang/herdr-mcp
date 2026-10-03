@@ -63,6 +63,20 @@ function browserPageLifecycleHarness({
         tabs.set(tab.id, tab);
         return { ...tab };
       },
+      async update(tabId, info = {}) {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error("tab missing");
+        if (info.active === true) {
+          for (const candidate of tabs.values()) {
+            if (candidate.windowId === tab.windowId) candidate.active = candidate.id === tabId;
+          }
+          for (const listener of activatedListeners) {
+            listener({ tabId, windowId: tab.windowId });
+          }
+        }
+        Object.assign(tab, info);
+        return { ...tab };
+      },
       async remove(tabId) {
         if (!tabs.delete(tabId)) throw new Error("tab missing");
       },
@@ -93,6 +107,14 @@ function browserPageLifecycleHarness({
         const anyTab = [...tabs.values()].some((tab) => tab.windowId === windowId);
         if (!anyTab) throw new Error("window missing");
         return { id: windowId, focused: windowFocused };
+      },
+      async update(windowId, info = {}) {
+        const anyTab = [...tabs.values()].some((tab) => tab.windowId === windowId);
+        if (!anyTab) throw new Error("window missing");
+        if (info.focused === true) {
+          for (const listener of focusListeners) listener(windowId);
+        }
+        return { id: windowId, focused: info.focused === true || windowFocused };
       },
       onFocusChanged: {
         addListener(listener) { focusListeners.add(listener); },
@@ -935,6 +957,10 @@ test("user generates one Doubao image with durable settlement | Given one exact 
       assert.equal(details.world, "MAIN");
       scriptCall += 1;
       if (scriptCall === 1) {
+        assert.equal(details.args, undefined);
+        return [{ result: { visibilityState: "visible", hasFocus: true } }];
+      }
+      if (scriptCall === 2) {
         assert.deepEqual(details.args, ["draw a small blue robot"]);
         return [{ result: {
           ok: true,
@@ -946,7 +972,7 @@ test("user generates one Doubao image with durable settlement | Given one exact 
           source_url: "https://www.doubao.com/chat/",
         } }];
       }
-      assert.equal(scriptCall, 2);
+      assert.equal(scriptCall, 3);
       assert.deepEqual(details.args, [0]);
       return [{ result: {
         ok: true,
@@ -994,6 +1020,7 @@ test("user generates one Doubao image with durable settlement | Given one exact 
   assert.equal(generated.delivery_state, "applied");
   assert.equal(generated.status, "running");
   assert.equal(generated.baseline_image_count, 0);
+  assert.equal(tabs.get(73).active, true);
   assert.equal(Object.hasOwn(generated, "prompt"), false);
 
   const status = await h.performDoubaoImageStatusRequest({
@@ -1019,7 +1046,10 @@ test("user generates one Doubao image with durable settlement | Given one exact 
   const loggedOut = browserPageLifecycleHarness({
     sessionStorage,
     tabs,
-    scriptResponder() {
+    scriptResponder(details) {
+      if (details.args === undefined) {
+        return [{ result: { visibilityState: "visible", hasFocus: true } }];
+      }
       return [{ result: {
         ok: false,
         error: "doubao_auth_required",
