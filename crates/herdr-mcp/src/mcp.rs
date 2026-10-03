@@ -18,10 +18,10 @@ use crate::progressive_skills::{
     BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
     BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD,
     BROWSER_SOURCE_RESOLVE_METHOD, BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD,
-    BROWSER_SPACE_OPEN_METHOD, EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD,
-    WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD,
-    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD,
-    X_THREAD_READ_METHOD,
+    BROWSER_SPACE_OPEN_METHOD, DOUBAO_IMAGE_GENERATE_METHOD, DOUBAO_IMAGE_STATUS_METHOD,
+    EXEC_WAIT_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
+    WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{self, PromptRegistry};
 use crate::semantic::{
@@ -34,10 +34,11 @@ use crate::state_store::{
     BrowserDispatchReserveInput, BrowserDispatchUpdateInput, BrowserResourceResolveInput,
     BrowserSessionArchiveIntentReservation, BrowserSessionReservation,
     BrowserSessionReservationInput, BrowserSessionReservationRecord, ContinuitySearchInput,
-    OperationReservation, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
-    WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemorySearchBoundary,
-    WorkMemorySearchHit, WorkMemorySearchPage, WorkMemorySearchPageOptions, WorkMemoryTurnInput,
-    validate_browser_lane_id, validate_browser_work_chain_id,
+    OperationLedgerInput, OperationReservation, StateStore, WorkMemoryBindingInput,
+    WorkMemoryCheckpointInput, WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput,
+    WorkMemorySearchBoundary, WorkMemorySearchHit, WorkMemorySearchPage,
+    WorkMemorySearchPageOptions, WorkMemoryTurnInput, validate_browser_lane_id,
+    validate_browser_work_chain_id,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
@@ -383,6 +384,20 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 )
             } else if method == BILIBILI_VIDEO_TRANSCRIPT_METHOD {
                 bilibili_video_transcript_call(
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
+            } else if method == DOUBAO_IMAGE_GENERATE_METHOD {
+                doubao_image_generate_call(
+                    context.state_store,
+                    &params,
+                    context.caller_page_assist_grants,
+                    context.browser_actuator,
+                )
+            } else if method == DOUBAO_IMAGE_STATUS_METHOD {
+                doubao_image_status_call(
+                    context.state_store,
                     &params,
                     context.caller_page_assist_grants,
                     context.browser_actuator,
@@ -7953,6 +7968,563 @@ fn browser_page_action_call(
         browser_epoch_ms(),
         expires_at,
     ) {
+        return browser_store_error(error);
+    }
+    result
+}
+
+const DOUBAO_IMAGE_OPERATION_KIND: &str = "doubao.image.generate";
+
+fn doubao_image_generate_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "Doubao image params must be an object"});
+    };
+    const ALLOWED_KEYS: &[&str] = &["endpoint_ref", "page_ref", "prompt", "idempotency_key"];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": format!("unknown Doubao image parameter '{key}'"),
+        });
+    }
+
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+    let page_ref = match object
+        .get("page_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if value.strip_prefix("bp_").is_some_and(|suffix| {
+                suffix.len() == 64
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) =>
+        {
+            value
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "page_ref must be an opaque bp_ reference",
+            });
+        }
+    };
+    let prompt = match object.get("prompt").and_then(Value::as_str).map(str::trim) {
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 4000
+                && !value
+                    .chars()
+                    .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t')) =>
+        {
+            value
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "prompt must be 1..4000 characters",
+            });
+        }
+    };
+    let idempotency_key = match object
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "idempotency_key is required",
+            });
+        }
+    };
+
+    let prompt_sha256 = browser_sha256(prompt);
+    let request_hash = browser_sha256(
+        &json!({
+            "operation": DOUBAO_IMAGE_GENERATE_METHOD,
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "prompt_sha256": prompt_sha256,
+        })
+        .to_string(),
+    );
+    let idempotency_digest = browser_sha256(idempotency_key);
+    let op_id = format!("op:doubao_image:{}", &idempotency_digest[..32]);
+    let now = browser_epoch_ms();
+    let expires_at = now.saturating_add(2 * 60 * 60 * 1000);
+
+    {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match guard.reserve_operation(
+            DOUBAO_IMAGE_OPERATION_KIND,
+            &idempotency_digest,
+            &request_hash,
+            &op_id,
+            now,
+            expires_at,
+        ) {
+            Ok(OperationReservation::Reserved) => {}
+            Ok(OperationReservation::Existing(record)) => {
+                if record.request_hash != request_hash {
+                    return json!({
+                        "ok": false,
+                        "code": "idempotency_key_conflict",
+                        "op_id": record.op_id,
+                    });
+                }
+                if let Some(result_json) = record.result_json {
+                    let mut replay: Value = match serde_json::from_str(&result_json) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return json!({
+                                "ok": false,
+                                "code": "idempotency_record_corrupt",
+                                "op_id": record.op_id,
+                            });
+                        }
+                    };
+                    if let Some(result) = replay.as_object_mut() {
+                        result.insert("idempotent_replay".to_owned(), json!(true));
+                        result.insert("op_id".to_owned(), json!(record.op_id));
+                    }
+                    return replay;
+                }
+                return json!({
+                    "ok": false,
+                    "code": "idempotency_in_flight",
+                    "op_id": record.op_id,
+                    "retry_safe": false,
+                });
+            }
+            Err(error) => return browser_store_error(error),
+        }
+    }
+
+    let release_retryable = |result: Value| -> Value {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        if let Err(error) = guard.release_operation_reservation(
+            DOUBAO_IMAGE_OPERATION_KIND,
+            &idempotency_digest,
+            &request_hash,
+            &op_id,
+        ) {
+            return browser_store_error(error);
+        }
+        result
+    };
+
+    let Some(actuator) = browser_actuator else {
+        return release_retryable(json!({
+            "ok": false,
+            "code": "doubao_image_unavailable",
+            "retryable": true,
+            "retry_safe": true,
+            "delivery_state": "not_delivered",
+            "op_id": op_id,
+            "idempotent_replay": false,
+        }));
+    };
+    let bridge_params = json!({
+        "page_ref": page_ref,
+        "prompt": prompt,
+        "prompt_sha256": prompt_sha256,
+        "op_id": op_id,
+    });
+    let evidence = match actuator.actuate_for_endpoint(
+        DOUBAO_IMAGE_GENERATE_METHOD,
+        &bridge_params,
+        1,
+        Some(endpoint_ref),
+        Some(&op_id),
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            let result = json!({
+                "ok": false,
+                "code": "doubao_delivery_unknown",
+                "message": error,
+                "status": "uncertain",
+                "retryable": false,
+                "retry_safe": false,
+                "delivery_state": "delivery_unknown",
+                "op_id": op_id,
+                "endpoint_ref": endpoint_ref,
+                "page_ref": page_ref,
+                "prompt_sha256": prompt_sha256,
+                "idempotent_replay": false,
+            });
+            let Ok(mut guard) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            if let Err(error) = guard.put_operation_ledger(OperationLedgerInput {
+                op_id: &op_id,
+                kind: DOUBAO_IMAGE_OPERATION_KIND,
+                idempotency_key: Some(&idempotency_digest),
+                request_hash: Some(&request_hash),
+                phase: "submitted",
+                state: "uncertain",
+                result_json: &result.to_string(),
+                now_ms: browser_epoch_ms(),
+                expires_at: Some(expires_at),
+            }) {
+                return browser_store_error(error);
+            }
+            return result;
+        }
+    };
+    if !evidence.browser_online || !evidence.command_accepted {
+        return release_retryable(json!({
+            "ok": false,
+            "code": "doubao_image_unavailable",
+            "retryable": true,
+            "retry_safe": true,
+            "delivery_state": "not_delivered",
+            "op_id": op_id,
+            "idempotent_replay": false,
+        }));
+    }
+
+    let raw = evidence.result.unwrap_or_else(|| {
+        json!({
+            "ok": false,
+            "code": "doubao_delivery_unknown",
+            "delivery_state": "delivery_unknown",
+            "retry_safe": false,
+        })
+    });
+    let delivery_state = raw
+        .get("delivery_state")
+        .and_then(Value::as_str)
+        .unwrap_or("delivery_unknown");
+    let retry_safe = raw
+        .get("retry_safe")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if delivery_state == "not_applied" && retry_safe {
+        let code = raw
+            .get("error")
+            .or_else(|| raw.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("doubao_image_not_applied");
+        return release_retryable(json!({
+            "ok": false,
+            "code": code,
+            "status": "not_applied",
+            "retryable": true,
+            "retry_safe": true,
+            "delivery_state": "not_applied",
+            "op_id": op_id,
+            "page_ref": page_ref,
+            "idempotent_replay": false,
+        }));
+    }
+
+    let applied = delivery_state == "applied";
+    let state = if applied { "running" } else { "uncertain" };
+    let status = if applied { "running" } else { "uncertain" };
+    let source_url = raw.get("source_url").and_then(Value::as_str).unwrap_or("");
+    let baseline_image_count = raw
+        .get("baseline_image_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let result = json!({
+        "ok": applied,
+        "code": if applied { Value::Null } else { json!("doubao_delivery_unknown") },
+        "status": status,
+        "retryable": false,
+        "retry_safe": false,
+        "delivery_state": if applied { "applied" } else { "delivery_unknown" },
+        "op_id": op_id,
+        "endpoint_ref": endpoint_ref,
+        "page_ref": page_ref,
+        "source_url": source_url,
+        "prompt_sha256": prompt_sha256,
+        "baseline_image_count": baseline_image_count,
+        "idempotent_replay": false,
+    });
+    let Ok(mut guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    if let Err(error) = guard.put_operation_ledger(OperationLedgerInput {
+        op_id: &op_id,
+        kind: DOUBAO_IMAGE_OPERATION_KIND,
+        idempotency_key: Some(&idempotency_digest),
+        request_hash: Some(&request_hash),
+        phase: "submitted",
+        state,
+        result_json: &result.to_string(),
+        now_ms: browser_epoch_ms(),
+        expires_at: Some(expires_at),
+    }) {
+        return browser_store_error(error);
+    }
+    result
+}
+
+fn doubao_image_status_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    caller_grants: &[PageAssistCallerGrant],
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "invalid_params", "message": "Doubao image status params must be an object"});
+    };
+    const ALLOWED_KEYS: &[&str] = &["endpoint_ref", "op_id"];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": format!("unknown Doubao image status parameter '{key}'"),
+        });
+    }
+    let endpoint_ref = match object
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(value)
+            if !value.is_empty() && value.len() <= 96 && !value.chars().any(char::is_control) =>
+        {
+            value
+        }
+        _ => {
+            return json!({"ok": false, "code": "invalid_params", "message": "endpoint_ref is required"});
+        }
+    };
+    if !caller_grants
+        .iter()
+        .any(|grant| grant.endpoint_ref == endpoint_ref)
+    {
+        return json!({
+            "ok": false,
+            "code": "caller_grant_missing",
+            "retryable": false,
+            "delivery_state": "not_delivered",
+        });
+    }
+    let op_id = match object.get("op_id").and_then(Value::as_str).map(str::trim) {
+        Some(value)
+            if value
+                .strip_prefix("op:doubao_image:")
+                .is_some_and(|suffix| {
+                    suffix.len() == 32
+                        && suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) =>
+        {
+            value
+        }
+        _ => {
+            return json!({
+                "ok": false,
+                "code": "invalid_params",
+                "message": "op_id must be a Doubao image operation reference",
+            });
+        }
+    };
+
+    let record = {
+        let Ok(guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match guard.operation_ledger(op_id) {
+            Ok(Some(record)) if record.kind == DOUBAO_IMAGE_OPERATION_KIND => record,
+            Ok(Some(_)) => return json!({"ok": false, "code": "doubao_operation_kind_mismatch"}),
+            Ok(None) => return json!({"ok": false, "code": "doubao_operation_not_found"}),
+            Err(error) => return browser_store_error(error),
+        }
+    };
+    let mut stored: Value = match record.result_json.as_deref() {
+        Some(value) => match serde_json::from_str(value) {
+            Ok(value) => value,
+            Err(_) => {
+                return json!({"ok": false, "code": "idempotency_record_corrupt", "op_id": op_id});
+            }
+        },
+        None => json!({
+            "ok": false,
+            "code": "idempotency_in_flight",
+            "status": "submitting",
+            "delivery_state": "delivery_unknown",
+            "op_id": op_id,
+            "endpoint_ref": endpoint_ref,
+        }),
+    };
+    if stored
+        .get("endpoint_ref")
+        .and_then(Value::as_str)
+        .is_some_and(|stored_endpoint| stored_endpoint != endpoint_ref)
+    {
+        return json!({"ok": false, "code": "caller_grant_missing", "retryable": false});
+    }
+    if matches!(
+        record.state.as_deref(),
+        Some("complete" | "failed" | "cancelled")
+    ) {
+        if let Some(object) = stored.as_object_mut() {
+            object.insert("reconciled".to_owned(), json!(false));
+        }
+        return stored;
+    }
+    let Some(page_ref) = stored.get("page_ref").and_then(Value::as_str) else {
+        if let Some(object) = stored.as_object_mut() {
+            object.insert("reconciled".to_owned(), json!(false));
+        }
+        return stored;
+    };
+    let baseline_image_count = stored
+        .get("baseline_image_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prompt_sha256 = stored
+        .get("prompt_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Some(actuator) = browser_actuator else {
+        if let Some(object) = stored.as_object_mut() {
+            object.insert("reconciled".to_owned(), json!(false));
+            object.insert("retryable".to_owned(), json!(true));
+        }
+        return stored;
+    };
+    let bridge_params = json!({
+        "page_ref": page_ref,
+        "op_id": op_id,
+        "baseline_image_count": baseline_image_count,
+        "prompt_sha256": prompt_sha256,
+    });
+    let evidence = match actuator.actuate_for_endpoint(
+        DOUBAO_IMAGE_STATUS_METHOD,
+        &bridge_params,
+        1,
+        Some(endpoint_ref),
+        Some(op_id),
+    ) {
+        Ok(evidence) if evidence.browser_online && evidence.command_accepted => evidence,
+        Ok(_) => {
+            if let Some(object) = stored.as_object_mut() {
+                object.insert("reconciled".to_owned(), json!(false));
+                object.insert("retryable".to_owned(), json!(true));
+            }
+            return stored;
+        }
+        Err(error) => {
+            if let Some(object) = stored.as_object_mut() {
+                object.insert("reconciled".to_owned(), json!(false));
+                object.insert("retryable".to_owned(), json!(true));
+                object.insert("message".to_owned(), json!(error));
+            }
+            return stored;
+        }
+    };
+    let Some(raw) = evidence.result else {
+        if let Some(object) = stored.as_object_mut() {
+            object.insert("reconciled".to_owned(), json!(false));
+        }
+        return stored;
+    };
+    let status = raw
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("running");
+    let (state, phase) = match status {
+        "complete" => ("complete", "settled"),
+        "failed" => ("failed", "settled"),
+        "cancelled" => ("cancelled", "settled"),
+        _ => ("running", "settling"),
+    };
+    let source_url = raw
+        .get("source_url")
+        .and_then(Value::as_str)
+        .or_else(|| stored.get("source_url").and_then(Value::as_str))
+        .unwrap_or("");
+    let artifact = raw.get("artifact").cloned().unwrap_or(Value::Null);
+    let code = raw
+        .get("error")
+        .or_else(|| raw.get("code"))
+        .and_then(Value::as_str);
+    let result = json!({
+        "ok": status == "complete",
+        "code": if status == "complete" { Value::Null } else { code.map(Value::from).unwrap_or(Value::Null) },
+        "status": status,
+        "retryable": matches!(status, "running" | "artifact_pending"),
+        "retry_safe": false,
+        "delivery_state": stored.get("delivery_state").cloned().unwrap_or_else(|| json!("applied")),
+        "op_id": op_id,
+        "endpoint_ref": endpoint_ref,
+        "page_ref": page_ref,
+        "source_url": source_url,
+        "prompt_sha256": prompt_sha256,
+        "baseline_image_count": baseline_image_count,
+        "artifact": artifact,
+        "reconciled": true,
+    });
+    let Ok(mut guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    if let Err(error) = guard.put_operation_ledger(OperationLedgerInput {
+        op_id,
+        kind: DOUBAO_IMAGE_OPERATION_KIND,
+        idempotency_key: record.idempotency_key.as_deref(),
+        request_hash: record.request_hash.as_deref(),
+        phase,
+        state,
+        result_json: &result.to_string(),
+        now_ms: browser_epoch_ms(),
+        expires_at: record.expires_at,
+    }) {
         return browser_store_error(error);
     }
     result
@@ -15924,6 +16496,149 @@ mod tests {
         assert_eq!(thread_result["ok"], true);
         assert_eq!(thread_result["root_post_id"], "2101");
         assert_eq!(thread_result["posts"][0]["in_reply_to"], "2101");
+    }
+
+    #[test]
+    fn doubao_image_generation_is_exact_grant_idempotent_and_status_reconciles() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct DoubaoActuator {
+            generate_calls: AtomicUsize,
+            status_calls: AtomicUsize,
+        }
+        impl BrowserActuator for DoubaoActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("Doubao image operations must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(endpoint_ref, Some("bep_doubao"));
+                assert_eq!(expected_generation, 1);
+                assert!(dispatch_id.is_some());
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(match operation {
+                    DOUBAO_IMAGE_GENERATE_METHOD => {
+                        self.generate_calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(params["page_ref"], format!("bp_{}", "d".repeat(64)));
+                        assert_eq!(params["prompt"], "draw a small blue robot");
+                        assert!(params["prompt_sha256"].as_str().is_some());
+                        json!({
+                            "ok": true,
+                            "status": "running",
+                            "delivery_state": "applied",
+                            "retry_safe": false,
+                            "baseline_image_count": 0,
+                            "source_url": "https://www.doubao.com/chat/123",
+                        })
+                    }
+                    DOUBAO_IMAGE_STATUS_METHOD => {
+                        self.status_calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(params["baseline_image_count"], 0);
+                        json!({
+                            "ok": true,
+                            "status": "complete",
+                            "source_url": "https://www.doubao.com/chat/123",
+                            "artifact": {
+                                "artifact_id": "abcdef0123456789abcdef0123456789",
+                                "mime": "image/webp",
+                                "bytes": 1234,
+                                "sha256": "c".repeat(64),
+                                "captured_at": 300,
+                                "expires_at": 400,
+                            },
+                        })
+                    }
+                    other => panic!("unexpected Doubao operation: {other}"),
+                });
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_doubao".to_owned(),
+        }];
+        let actuator = DoubaoActuator {
+            generate_calls: AtomicUsize::new(0),
+            status_calls: AtomicUsize::new(0),
+        };
+        let page_ref = format!("bp_{}", "d".repeat(64));
+        let params = json!({
+            "endpoint_ref": "bep_doubao",
+            "page_ref": page_ref,
+            "prompt": "draw a small blue robot",
+            "idempotency_key": "doubao-image-1",
+        });
+
+        let denied = doubao_image_generate_call(&store, &params, &[], Some(&actuator));
+        assert_eq!(denied["code"], "caller_grant_missing");
+        assert_eq!(actuator.generate_calls.load(Ordering::SeqCst), 0);
+
+        let generated = doubao_image_generate_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(generated["ok"], true, "{generated}");
+        assert_eq!(generated["status"], "running");
+        assert_eq!(generated["delivery_state"], "applied");
+        assert_eq!(generated["idempotent_replay"], false);
+        assert_eq!(actuator.generate_calls.load(Ordering::SeqCst), 1);
+        let op_id = generated["op_id"].as_str().unwrap().to_owned();
+        let stored = store
+            .lock()
+            .unwrap()
+            .operation_ledger(&op_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored
+                .result_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("draw a small blue robot")
+        );
+
+        let replay = doubao_image_generate_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["op_id"], op_id);
+        assert_eq!(actuator.generate_calls.load(Ordering::SeqCst), 1);
+
+        let status = doubao_image_status_call(
+            &store,
+            &json!({"endpoint_ref": "bep_doubao", "op_id": op_id}),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["status"], "complete");
+        assert_eq!(status["artifact"]["mime"], "image/webp");
+        assert_eq!(actuator.status_calls.load(Ordering::SeqCst), 1);
+
+        let terminal = doubao_image_status_call(
+            &store,
+            &json!({"endpoint_ref": "bep_doubao", "op_id": op_id}),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(terminal["status"], "complete");
+        assert_eq!(terminal["reconciled"], false);
+        assert_eq!(actuator.status_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
