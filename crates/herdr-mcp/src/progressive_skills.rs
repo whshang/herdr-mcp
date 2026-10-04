@@ -5213,6 +5213,11 @@ description: \"user ego\"
         ));
     }
 
+    // macOS-only semantics: `is_protected_user_path`/`project_path_needs_protected_transport`
+    // are intentionally `false` off macOS, so a protected-root classification only
+    // exists there. This test asserts that classification, so it is macOS-gated
+    // like `protected_skill_window_never_accepts_a_partial_or_foreign_body`.
+    #[cfg(target_os = "macos")]
     #[test]
     fn user_gets_no_direct_project_scope_for_a_protected_root_without_a_broker() {
         // Given a project root under a macOS privacy-protected folder
