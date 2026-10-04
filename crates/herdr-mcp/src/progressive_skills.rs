@@ -4655,6 +4655,70 @@ description: \"user ego\"
     }
 
     #[test]
+    fn user_gets_no_external_project_skill_when_skills_dir_is_symlinked_out() {
+        // Given a project whose `.agents/skills` directory is itself a symlink to
+        // an external directory holding a valid SKILL.md,
+        // When the caller lists and loads skills for that project root,
+        // Then the external id is neither discovered nor loadable.
+        let home = temp_root("dir-escape-home");
+        let project = temp_root("dir-escape-project");
+        let outside = temp_root("dir-escape-outside");
+        // Valid skill living entirely outside the project root.
+        let outside_skill_dir = outside.join("linked-escape");
+        std::fs::create_dir_all(&outside_skill_dir).unwrap();
+        std::fs::write(
+            outside_skill_dir.join("SKILL.md"),
+            "---\nname: linked-escape\ndescription: outside dir\n---\n# outside body\n",
+        )
+        .unwrap();
+        // `.agents` exists so its child can be a symlink, and `.agents/skills`
+        // itself is the symlink pointing at the external directory.
+        std::fs::create_dir_all(project.join(".agents")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, project.join(".agents/skills")).unwrap();
+        }
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert!(
+            !listed["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "linked-escape"),
+            "a symlinked .agents/skills directory must not expose external skills"
+        );
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["linked-escape"], "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["code"], "unknown_skill");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn local_skill_external_identity_and_digest() {
         let home = temp_root("identity-home");
         let project = temp_root("identity-project");

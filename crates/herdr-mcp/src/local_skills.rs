@@ -50,6 +50,7 @@ impl LocalSkillRegistry {
             let identity = format!("project:{}", canon.display());
             collect_base(
                 &canon.join(".agents/skills"),
+                &canon,
                 &identity,
                 &mut discovery.project,
             );
@@ -58,6 +59,7 @@ impl LocalSkillRegistry {
             let identity = format!("user:{}", home_canon.display());
             collect_base(
                 &home_canon.join(".agents/skills"),
+                &home_canon,
                 &identity,
                 &mut discovery.user,
             );
@@ -67,12 +69,24 @@ impl LocalSkillRegistry {
 }
 
 /// Enumerate `<base>/*/SKILL.md` (or `skill.md`), enforcing canonical-path /
-/// symlink confinement (rejects symlinks that resolve outside `base`), a
-/// per-scope count cap, and a per-file size bound.
-fn collect_base(base: &Path, scope_identity: &str, out: &mut Vec<LocalSkillFile>) {
+/// symlink confinement (rejects symlinks that resolve outside the owning scope),
+/// a per-scope count cap, and a per-file size bound.
+///
+/// `scope_root` is the canonical project root or home the base belongs to. The
+/// base itself must resolve inside it, so a `.agents/skills` directory that is a
+/// symlink to an external directory cannot widen the confinement anchor.
+fn collect_base(
+    base: &Path,
+    scope_root: &Path,
+    scope_identity: &str,
+    out: &mut Vec<LocalSkillFile>,
+) {
     let Ok(canon_base) = fs::canonicalize(base) else {
         return;
     };
+    if !canon_base.starts_with(scope_root) {
+        return;
+    }
     let Ok(entries) = fs::read_dir(&canon_base) else {
         return;
     };
