@@ -87,6 +87,16 @@ const BUILTIN_SOURCE_IDENTITY: &str = "herdr-mcp:builtin";
 const GLOBAL_POLICY_URI: &str = "skill://herdr-mcp/AGENTS.md";
 const GLOBAL_AGENTS: &str = include_str!("../../../assets/herdr/AGENTS.md");
 const MAX_PLANNING_WORKERS: usize = 12;
+/// Byte budget for one protected `fs_read` window. The existing `fs_read` wire
+/// operation caps a response at 256 KiB (`fs_tools::READ_MAX_BYTES`); a larger
+/// request is rejected, so protected Skill reads page within this budget.
+#[cfg(target_os = "macos")]
+const PROTECTED_SKILL_WINDOW_BYTES: usize = 256 * 1024;
+/// Upper bound on `fs_read` windows for one protected Skill file. A 512 KiB
+/// Local Skill needs at most three 256 KiB windows; the extra headroom keeps the
+/// loop provably terminating even for adversarially shaped content.
+#[cfg(target_os = "macos")]
+const PROTECTED_SKILL_MAX_WINDOWS: usize = 8;
 
 const WORKSTATION_CONTROL: &str =
     include_str!("../../../assets/herdr/skills/workstation-control/SKILL.md");
@@ -394,6 +404,28 @@ impl ProgressiveSkillService {
 
     /// Resolve precedence-merged builtin + local entries (metadata only).
     fn effective_entries(&self, project_root: Option<&Path>) -> Vec<LocalEntry> {
+        self.effective_entries_with_snapshot(project_root, None)
+    }
+
+    /// Resolve precedence-merged builtin + local entries (metadata only), with
+    /// an optional live snapshot used to route a protected project scope.
+    ///
+    /// Project-local discovery touches the project checkout. On macOS a project
+    /// root under Documents/Desktop/Downloads is privacy-protected, and the
+    /// rotating runtime must not become the TCC responsible client for it. When
+    /// a live snapshot is supplied and the project root needs the protected
+    /// transport, the project scope is enumerated and read through the existing
+    /// stable TCC broker. Every other case keeps the direct filesystem path:
+    /// non-macOS targets, unprotected roots, and the user-global scope.
+    ///
+    /// Precedence stays builtin > project > user, and canonical/symlink
+    /// confinement plus the byte/count bounds are enforced by the broker's own
+    /// `fs_list`/`fs_read` gates.
+    fn effective_entries_with_snapshot(
+        &self,
+        project_root: Option<&Path>,
+        snapshot: Option<&Value>,
+    ) -> Vec<LocalEntry> {
         let mut entries = Vec::with_capacity(BUILTIN_SKILLS.len() + 8);
         let mut seen = BTreeSet::new();
         for spec in BUILTIN_SKILLS.iter() {
@@ -401,9 +433,41 @@ impl ProgressiveSkillService {
             entries.push(LocalEntry::from_builtin(spec));
         }
 
+        // Project scope next, so it wins over a same-id user skill.
         let home = local_skills::home_dir().unwrap_or_default();
-        let discovery = local_skills::LocalSkillRegistry::discover(project_root, &home);
-        for file in discovery.project.into_iter().chain(discovery.user) {
+        if let Some(root) = project_root {
+            // Decide transport from the raw lexical root FIRST. On macOS this
+            // is a pure lexical check for a root already under
+            // Documents/Desktop/Downloads, so it never becomes a protected
+            // filesystem touch and cannot hang. A protected root must not be
+            // canonicalized, listed or read directly at all.
+            let protected = project_needs_stable_broker(root);
+            let project_entries = if protected {
+                // Fail closed: only the stable broker may serve a protected
+                // root, and a broker failure yields no project scope rather
+                // than a TCC hang or a direct fallback.
+                snapshot
+                    .and_then(|snapshot| Self::protected_project_entries(root, snapshot))
+                    .unwrap_or_default()
+            } else {
+                std::fs::canonicalize(root)
+                    .ok()
+                    .map(|canon| local_skills::LocalSkillRegistry::discover_project(&canon))
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(Self::entry_from_file)
+                    .collect()
+            };
+            for entry in project_entries {
+                if seen.insert(entry.descriptor.id.clone()) {
+                    entries.push(entry);
+                }
+            }
+        }
+
+        // User scope last; it never overrides builtin or project ids.
+        let discovery = local_skills::LocalSkillRegistry::discover(None, &home);
+        for file in discovery.user {
             if !seen.insert(file.id.clone()) {
                 continue;
             }
@@ -414,24 +478,162 @@ impl ProgressiveSkillService {
         entries
     }
 
+    /// Enumerate `<project_root>/.agents/skills/*/SKILL.md` through the existing
+    /// stable TCC broker, returning full entries so the content is read through
+    /// the broker too.
+    ///
+    /// Returns `None` when the broker cannot prove or serve the protected path,
+    /// so the caller fails closed instead of reading it directly. The scope is
+    /// only accepted when the broker reports that its managed root governs the
+    /// requested skills base exactly, and the reported root — not the caller's
+    /// raw string — becomes the `project:<root>` source identity.
+    #[cfg(target_os = "macos")]
+    fn protected_project_entries(project_root: &Path, snapshot: &Value) -> Option<Vec<LocalEntry>> {
+        let requested_base = project_root.join(".agents/skills");
+        // The broker validates this exact path against its managed roots and
+        // canonical/symlink confinement. An absent base, a non-directory, an
+        // unmanaged root, or a truncated listing fails closed.
+        let listed = crate::tcc_broker::fs_list_via_stable_broker(
+            snapshot,
+            &requested_base,
+            // Enumerate every entry the wire allows; accepted skills are capped
+            // separately below, so irrelevant files in the directory cannot
+            // fail the scope closed.
+            crate::fs_tools::LIST_MAX_ENTRIES,
+        )
+        .ok()?;
+        if listed.get("ok").and_then(Value::as_bool) != Some(true)
+            || listed.get("truncated").and_then(Value::as_bool) == Some(true)
+        {
+            return None;
+        }
+        // The broker reports the managed root it validated against and the
+        // resolved path it served. Require the served path to be exactly the
+        // requested skills base directly under that root, so validation against
+        // any other managed root (or a different depth of this one) cannot
+        // authorize the scope.
+        let scope_root = listed.get("root").and_then(Value::as_str)?;
+        let served_base = listed.get("path").and_then(Value::as_str)?;
+        if !same_path(served_base, Path::new(scope_root).join(".agents/skills")) {
+            return None;
+        }
+        // Identity follows the broker's authoritative root.
+        let identity = format!("project:{scope_root}");
+        let base = PathBuf::from(served_base);
+        let mut out = Vec::new();
+        for entry in listed.get("entries").and_then(Value::as_array)? {
+            if out.len() >= local_skills::MAX_LOCAL_SKILLS_PER_SCOPE {
+                break;
+            }
+            // Directory and symlink entries are both candidates: a legitimate
+            // in-scope symlinked skill directory must stay supported, and the
+            // `fs_read` below is authoritative for canonical confinement.
+            let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
+            if kind != "dir" && kind != "symlink" {
+                continue;
+            }
+            let Some(id) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+            for candidate in ["SKILL.md", "skill.md"] {
+                let skill_path = base.join(id).join(candidate);
+                let Some(content) = Self::read_protected_skill(snapshot, &skill_path, scope_root)
+                else {
+                    continue;
+                };
+                if let Some(entry) = Self::entry_from_content(id, &identity, &content) {
+                    out.push(entry);
+                }
+                break;
+            }
+        }
+        Some(out)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn protected_project_entries(
+        _project_root: &Path,
+        _snapshot: &Value,
+    ) -> Option<Vec<LocalEntry>> {
+        None
+    }
+
+    /// Read one protected `SKILL.md` exactly, or not at all.
+    ///
+    /// `fs_read` is line-windowed with a fixed byte budget, so normal
+    /// multi-line Skill files are reconstructed with bounded pagination using
+    /// `next_start_line`. Any window that fails, is truncated without advancing,
+    /// reports a different managed root, or would exceed the Local Skill byte
+    /// ceiling yields `None` — a partial or empty body is never returned and
+    /// never digested.
+    #[cfg(target_os = "macos")]
+    fn read_protected_skill(snapshot: &Value, path: &Path, scope_root: &str) -> Option<String> {
+        // Bound the number of windows so a pathological file cannot loop.
+        let mut windows = 0usize;
+        let mut start_line = 1usize;
+        let mut content = String::new();
+        loop {
+            windows += 1;
+            if windows > PROTECTED_SKILL_MAX_WINDOWS {
+                return None;
+            }
+            // Each request must be a valid inclusive line window, so the end
+            // line follows the current start instead of being pinned at a
+            // constant that would become < start_line after 100k lines.
+            let end_line = start_line.saturating_add(ProtectedWindow::WINDOW_LINES - 1);
+            let window = crate::tcc_broker::fs_read_window_via_stable_broker(
+                snapshot,
+                path,
+                start_line,
+                end_line,
+                PROTECTED_SKILL_WINDOW_BYTES,
+            )
+            .ok()?;
+            match ProtectedWindow::accept(&window, scope_root, start_line, &mut content) {
+                // The final window's own text is already folded in above.
+                ProtectedWindowOutcome::Complete => return Some(content),
+                // A window that fails, is served from another managed root, is
+                // truncated without advancing, or overflows the Skill ceiling
+                // fails closed: partial or empty content is never returned.
+                ProtectedWindowOutcome::Reject => return None,
+                ProtectedWindowOutcome::More { next_start_line } => {
+                    start_line = next_start_line;
+                }
+            }
+        }
+    }
+
     fn entry_from_file(file: &LocalSkillFile) -> Option<LocalEntry> {
         let content = read_file_bounded(&file.path)?;
-        let fm = parse_frontmatter(&content);
+        Self::entry_from_content(&file.id, &file.scope_identity, &content)
+    }
+
+    /// Build one local entry from already-obtained complete content. Shared by
+    /// the direct file path and the stable-broker protected path so identity,
+    /// digest, size and frontmatter handling stay byte-for-byte identical.
+    fn entry_from_content(id: &str, scope_identity: &str, content: &str) -> Option<LocalEntry> {
+        if content.len() > local_skills::MAX_LOCAL_SKILL_BYTES {
+            return None;
+        }
+        let fm = parse_frontmatter(content);
         // Digest the exact raw bytes that load() will verify, mirroring the
         // builtin trim-for-metadata convention but kept internally consistent.
         let body = content.trim();
         let digest = Digest::from_content(body);
         let size = body.len();
-        let name = fm.name.clone().unwrap_or_else(|| file.id.clone());
+        let name = fm.name.clone().unwrap_or_else(|| id.to_owned());
         let description = fm.description.clone().unwrap_or_default();
         let version = fm.version;
         let descriptor = SkillDescriptor {
-            id: file.id.clone(),
+            id: id.to_owned(),
             name,
             description,
             identity: SkillIdentity {
-                source_identity: file.scope_identity.clone(),
-                uri: format!("skill://local/{}", file.id),
+                source_identity: scope_identity.to_owned(),
+                uri: format!("skill://local/{id}"),
                 digest,
                 version,
             },
@@ -571,9 +773,9 @@ impl ProgressiveSkillService {
             return None;
         }
         Some(match method {
-            LOCAL_LIST_METHOD => self.list_method(params),
-            LOCAL_DESCRIBE_METHOD => self.describe_method(params),
-            LOCAL_LOAD_METHOD => self.load_method(params),
+            LOCAL_LIST_METHOD => self.list_method(params, snapshot),
+            LOCAL_DESCRIBE_METHOD => self.describe_method(params, snapshot),
+            LOCAL_LOAD_METHOD => self.load_method(params, snapshot),
             PLANNING_ADVISE_METHOD => self.planning_advise_method(params, snapshot),
             AGENT_CLOSEOUT_ADVISE_METHOD => self.agent_closeout_advise_method(params),
             AGENT_ATTENTION_ADVISE_METHOD => self.agent_attention_advise_method(params),
@@ -1843,7 +2045,7 @@ impl ProgressiveSkillService {
         })
     }
 
-    fn list_method(&self, params: &Value) -> Value {
+    fn list_method(&self, params: &Value, snapshot: &Value) -> Value {
         if let Err(error) = validate_object_keys(params, &["project_root"]) {
             return error;
         }
@@ -1851,7 +2053,11 @@ impl ProgressiveSkillService {
             Ok(value) => value,
             Err(error) => return error,
         };
-        let catalog = self.effective_catalog(project_root.as_deref());
+        let catalog = self
+            .effective_entries_with_snapshot(project_root.as_deref(), Some(snapshot))
+            .into_iter()
+            .map(|entry| entry.descriptor)
+            .collect::<Vec<_>>();
         json!({
             "ok": true,
             "skills": catalog.iter().map(descriptor_json).collect::<Vec<_>>(),
@@ -1860,7 +2066,7 @@ impl ProgressiveSkillService {
         })
     }
 
-    fn describe_method(&self, params: &Value) -> Value {
+    fn describe_method(&self, params: &Value, snapshot: &Value) -> Value {
         if let Err(error) = validate_object_keys(params, &["id", "project_root"]) {
             return error;
         }
@@ -1875,8 +2081,9 @@ impl ProgressiveSkillService {
             Err(error) => return error,
         };
         match self
-            .effective_catalog(project_root.as_deref())
+            .effective_entries_with_snapshot(project_root.as_deref(), Some(snapshot))
             .into_iter()
+            .map(|entry| entry.descriptor)
             .find(|item| item.id == id)
         {
             Some(item) => json!({"ok": true, "skill": descriptor_json(&item), "loaded": false}),
@@ -1884,7 +2091,7 @@ impl ProgressiveSkillService {
         }
     }
 
-    fn load_method(&self, params: &Value) -> Value {
+    fn load_method(&self, params: &Value, snapshot: &Value) -> Value {
         if let Err(error) =
             validate_object_keys(params, &["ids", "expected_digests", "project_root"])
         {
@@ -1920,7 +2127,7 @@ impl ProgressiveSkillService {
             }
         }
 
-        let entries = self.effective_entries(project_root.as_deref());
+        let entries = self.effective_entries_with_snapshot(project_root.as_deref(), Some(snapshot));
         let mut loaded = Vec::with_capacity(requested.len());
         for id in requested {
             let Some(entry) = entries.iter().find(|entry| entry.descriptor.id == id) else {
@@ -2045,6 +2252,104 @@ fn descriptor(spec: &BuiltinSkillSpec) -> SkillDescriptor {
         related_skills: strings(spec.related_skills),
         risk_domains: strings(spec.risk_domains),
         owned_tools: strings(spec.owned_tools),
+    }
+}
+
+/// Whether project-local discovery/load must be served by the stable TCC broker
+/// instead of direct filesystem access for this project root.
+///
+/// This is evaluated on the caller's raw root. For a lexical path already under
+/// macOS Documents/Desktop/Downloads the underlying check is purely lexical, so
+/// deciding transport never itself becomes a protected filesystem touch. It is
+/// a no-op (always `false`) off macOS.
+fn project_needs_stable_broker(project_root: &Path) -> bool {
+    crate::macos_permissions::project_path_needs_protected_transport(project_root)
+}
+
+/// Whether two path spellings denote the same location, compared lexically over
+/// components after dropping a trailing separator. Never touches the filesystem.
+#[cfg(target_os = "macos")]
+fn same_path(left: &str, right: PathBuf) -> bool {
+    let left = PathBuf::from(left);
+    let normalize = |path: &Path| -> Vec<std::ffi::OsString> {
+        path.components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir))
+            .map(|component| component.as_os_str().to_owned())
+            .collect()
+    };
+    normalize(&left) == normalize(&right)
+}
+
+/// Decision for one `fs_read` window of a protected Skill file.
+#[cfg(target_os = "macos")]
+enum ProtectedWindowOutcome {
+    /// The file ended: the accumulated content is now complete and exact.
+    Complete,
+    /// Another window is required at `next_start_line`.
+    More { next_start_line: usize },
+    /// The window cannot be used; callers must fail closed.
+    Reject,
+}
+
+#[cfg(target_os = "macos")]
+struct ProtectedWindow;
+
+#[cfg(target_os = "macos")]
+impl ProtectedWindow {
+    /// Line window size requested per broker call (1-based, inclusive).
+    const WINDOW_LINES: usize = 100_000;
+
+    /// Fold one `fs_read` result into `content`, keeping only decisive facts.
+    ///
+    /// The wire reports the managed `root` it validated against; a window from
+    /// any other root, a failed window, missing content, or a truncation that
+    /// cannot advance (`delivered == 0`, as when one line exceeds the byte
+    /// budget) is rejected. The window's own text is always appended before
+    /// completing, and the accumulated body is refused once it exceeds the
+    /// Local Skill ceiling, so partial or empty content is never surfaced.
+    fn accept(
+        window: &Value,
+        scope_root: &str,
+        current_start_line: usize,
+        content: &mut String,
+    ) -> ProtectedWindowOutcome {
+        if window.get("ok").and_then(Value::as_bool) != Some(true) {
+            return ProtectedWindowOutcome::Reject;
+        }
+        if window.get("root").and_then(Value::as_str) != Some(scope_root) {
+            return ProtectedWindowOutcome::Reject;
+        }
+        let Some(part) = window.get("content").and_then(Value::as_str) else {
+            return ProtectedWindowOutcome::Reject;
+        };
+        if !content.is_empty() && !part.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(part);
+        if content.len() > local_skills::MAX_LOCAL_SKILL_BYTES {
+            return ProtectedWindowOutcome::Reject;
+        }
+        // The wire contract requires `truncated` and `next_start_line` to agree.
+        // Only a non-truncated window with no continuation is complete, and only
+        // a truncated window with a strictly advancing continuation may
+        // continue; any other combination is inconsistent and fails closed
+        // rather than digesting a partial body as complete.
+        let truncated = window.get("truncated").and_then(Value::as_bool);
+        let next = window.get("next_start_line").and_then(Value::as_u64);
+        match (truncated, next) {
+            (Some(false), None) => ProtectedWindowOutcome::Complete,
+            (Some(true), Some(next)) => match usize::try_from(next) {
+                // A window that cannot advance past the current start line would
+                // loop forever (for example a single line larger than the wire
+                // byte budget, where `delivered == 0`). The existing wire cannot
+                // express that file, so fail closed instead of looping.
+                Ok(next) if next > current_start_line => ProtectedWindowOutcome::More {
+                    next_start_line: next,
+                },
+                _ => ProtectedWindowOutcome::Reject,
+            },
+            _ => ProtectedWindowOutcome::Reject,
+        }
     }
 }
 
@@ -4795,6 +5100,172 @@ description: \"user ego\"
         }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn protected_skill_window_never_accepts_a_partial_or_foreign_body() {
+        // Given `fs_read` windows of a protected Skill file,
+        // When they are folded into the exact-content accumulator,
+        // Then a complete window contributes its body, advancing windows
+        // reconstruct the exact text including the boundary newline, and any
+        // failed, foreign-root, content-less, non-advancing, inconsistent or
+        // over-ceiling window is rejected rather than digested.
+        let scope = "/Users/example/Documents/project";
+
+        // A single complete window must return its own body, not an empty one.
+        let mut single = String::new();
+        let complete =
+            json!({"ok": true, "root": scope, "content": "# body\nsecond", "truncated": false});
+        assert!(matches!(
+            ProtectedWindow::accept(&complete, scope, 1, &mut single),
+            ProtectedWindowOutcome::Complete
+        ));
+        assert_eq!(single, "# body\nsecond");
+
+        // Two windows reconstruct the exact text with the boundary newline.
+        let mut paged = String::new();
+        let first = json!({"ok": true, "root": scope, "content": "alpha", "truncated": true, "next_start_line": 2});
+        match ProtectedWindow::accept(&first, scope, 1, &mut paged) {
+            ProtectedWindowOutcome::More { next_start_line } => assert_eq!(next_start_line, 2),
+            _ => panic!("an advancing truncated window must continue"),
+        }
+        let last = json!({"ok": true, "root": scope, "content": "omega", "truncated": false});
+        assert!(matches!(
+            ProtectedWindow::accept(&last, scope, 2, &mut paged),
+            ProtectedWindowOutcome::Complete
+        ));
+        assert_eq!(paged, "alpha\nomega");
+
+        // A window that cannot advance past the current start line must reject
+        // without looping (a single line larger than the wire byte budget).
+        let mut stuck = String::new();
+        let nonadvancing = json!({"ok": true, "root": scope, "content": "huge", "truncated": true, "next_start_line": 1});
+        assert!(matches!(
+            ProtectedWindow::accept(&nonadvancing, scope, 1, &mut stuck),
+            ProtectedWindowOutcome::Reject
+        ));
+
+        // Inconsistent truncation metadata must reject: a body reported truncated
+        // with no continuation is not a complete file.
+        let mut truncated_no_next = String::new();
+        assert!(matches!(
+            ProtectedWindow::accept(
+                &json!({"ok": true, "root": scope, "content": "partial", "truncated": true, "next_start_line": null}),
+                scope,
+                1,
+                &mut truncated_no_next
+            ),
+            ProtectedWindowOutcome::Reject
+        ));
+
+        // A continuation on a non-truncated window is equally inconsistent.
+        let mut next_without_truncated = String::new();
+        assert!(matches!(
+            ProtectedWindow::accept(
+                &json!({"ok": true, "root": scope, "content": "partial", "truncated": false, "next_start_line": 2}),
+                scope,
+                1,
+                &mut next_without_truncated
+            ),
+            ProtectedWindowOutcome::Reject
+        ));
+
+        // A window served from a different managed root must reject.
+        let mut foreign_body = String::new();
+        let foreign =
+            json!({"ok": true, "root": "/Users/example/other", "content": "x", "truncated": false});
+        assert!(matches!(
+            ProtectedWindow::accept(&foreign, scope, 1, &mut foreign_body),
+            ProtectedWindowOutcome::Reject
+        ));
+
+        // A failed response must reject.
+        let mut failed_body = String::new();
+        assert!(matches!(
+            ProtectedWindow::accept(
+                &json!({"ok": false, "code": "not_found"}),
+                scope,
+                1,
+                &mut failed_body
+            ),
+            ProtectedWindowOutcome::Reject
+        ));
+
+        // A response with no content must reject.
+        let mut empty_body = String::new();
+        assert!(matches!(
+            ProtectedWindow::accept(
+                &json!({"ok": true, "root": scope, "truncated": false}),
+                scope,
+                1,
+                &mut empty_body
+            ),
+            ProtectedWindowOutcome::Reject
+        ));
+
+        // Content past the Local Skill ceiling must reject.
+        let mut oversized = "x".repeat(local_skills::MAX_LOCAL_SKILL_BYTES);
+        let over = json!({"ok": true, "root": scope, "content": "y", "truncated": true, "next_start_line": 2});
+        assert!(matches!(
+            ProtectedWindow::accept(&over, scope, 1, &mut oversized),
+            ProtectedWindowOutcome::Reject
+        ));
+    }
+
+    #[test]
+    fn user_gets_no_direct_project_scope_for_a_protected_root_without_a_broker() {
+        // Given a project root under a macOS privacy-protected folder
+        // (`$HOME/Documents/...`) that does contain a valid project Skill,
+        // When the caller lists skills without a live broker snapshot,
+        // Then builtin and user scopes still resolve, the protected project
+        // Skill is never read directly, and no project entry appears.
+        let home = temp_root("protected-home");
+        let project = home.join("Documents").join("protected-project");
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        write_project_skill(
+            &project,
+            "protected-project-skill",
+            "---\nname: protected-project-skill\ndescription: protected\n---\n# protected body\n",
+        );
+        write_user_skill(
+            &home,
+            "user-visible-skill",
+            "---\nname: user-visible-skill\ndescription: user\n---\n# user body\n",
+        );
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        let ids: Vec<&str> = listed["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"user-visible-skill"),
+            "the user scope must keep its direct path"
+        );
+        assert!(
+            !ids.contains(&"protected-project-skill"),
+            "a protected project root must not be read directly"
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

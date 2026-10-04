@@ -39,6 +39,23 @@ pub struct SkillFrontmatter {
 pub struct LocalSkillRegistry;
 
 impl LocalSkillRegistry {
+    /// Discover project-local skills for one already-canonical project root.
+    ///
+    /// Split out from [`Self::discover`] so a caller that has already resolved
+    /// the root can enumerate only the project scope. Other scopes and other
+    /// targets keep the existing [`Self::discover`] behavior unchanged.
+    pub fn discover_project(canon_project_root: &Path) -> Vec<LocalSkillFile> {
+        let identity = format!("project:{}", canon_project_root.display());
+        let mut project = Vec::new();
+        collect_base(
+            &canon_project_root.join(".agents/skills"),
+            canon_project_root,
+            &identity,
+            &mut project,
+        );
+        project
+    }
+
     /// Discover local skills under an optional project root first, then the user
     /// home. Precedence deduplication (builtin > project > user) happens in
     /// [`crate::progressive_skills::ProgressiveSkillService`].
@@ -47,13 +64,7 @@ impl LocalSkillRegistry {
         if let Some(root) = project_root
             && let Ok(canon) = fs::canonicalize(root)
         {
-            let identity = format!("project:{}", canon.display());
-            collect_base(
-                &canon.join(".agents/skills"),
-                &canon,
-                &identity,
-                &mut discovery.project,
-            );
+            discovery.project = Self::discover_project(&canon);
         }
         if let Ok(home_canon) = fs::canonicalize(home) {
             let identity = format!("user:{}", home_canon.display());

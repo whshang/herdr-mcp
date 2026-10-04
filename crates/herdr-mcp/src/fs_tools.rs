@@ -18,7 +18,10 @@ const READ_DEFAULT_LINES: usize = 200;
 const READ_DEFAULT_BYTES: usize = 16 * 1024;
 const READ_MAX_BYTES: usize = 256 * 1024;
 const LIST_DEFAULT_ENTRIES: usize = 200;
-const LIST_MAX_ENTRIES: usize = 2000;
+/// Hard ceiling the `fs_list` wire operation accepts for `max_entries`. Exposed
+/// so the protected project-Skill scope can enumerate every directory entry the
+/// wire allows while still capping accepted skills separately.
+pub(crate) const LIST_MAX_ENTRIES: usize = 2000;
 const GREP_DEFAULT_MATCHES: usize = 50;
 const GREP_MAX_MATCHES: usize = 1000;
 // Keep the default bounded, but large enough for ordinary implementation files.
