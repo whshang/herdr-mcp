@@ -4655,11 +4655,11 @@ description: \"user ego\"
     }
 
     #[test]
-    fn user_gets_no_external_project_skill_when_skills_dir_is_symlinked_out() {
-        // Given a project whose `.agents/skills` directory is itself a symlink to
-        // an external directory holding a valid SKILL.md,
-        // When the caller lists and loads skills for that project root,
-        // Then the external id is neither discovered nor loadable.
+    fn user_gets_only_scope_confined_skills_when_project_skills_dir_is_symlinked() {
+        // Given a project whose `.agents/skills` directory is itself a symlink,
+        // When the caller lists/describes/loads skills for that project root,
+        // Then a base resolving outside the project root exposes nothing, while a
+        // legitimate base resolving inside the same project root still works.
         let home = temp_root("dir-escape-home");
         let project = temp_root("dir-escape-project");
         let outside = temp_root("dir-escape-outside");
@@ -4716,6 +4716,85 @@ description: \"user ego\"
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&project);
         let _ = std::fs::remove_dir_all(&outside);
+        // `test_env::lock` is non-reentrant; release it before the second half.
+        drop(_guard);
+
+        // Legitimate counterpart: a `.agents/skills` base symlinked to a directory
+        // that still resolves inside the same canonical project root must keep
+        // being discovered, described and loadable.
+        let home = temp_root("dir-inscope-home");
+        let project = temp_root("dir-inscope-project");
+        let in_scope_dir = project.join("shared-skills");
+        let in_scope_skill = in_scope_dir.join("linked-inside");
+        std::fs::create_dir_all(&in_scope_skill).unwrap();
+        let body = "---\nname: linked-inside\ndescription: inside dir\n---\n# inside body\n";
+        std::fs::write(in_scope_skill.join("SKILL.md"), body).unwrap();
+        std::fs::create_dir_all(project.join(".agents")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&in_scope_dir, project.join(".agents/skills")).unwrap();
+        }
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert!(
+            listed["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "linked-inside"),
+            "an in-scope symlinked .agents/skills directory must still expose its skills"
+        );
+        let described = service
+            .local_call(
+                LOCAL_DESCRIBE_METHOD,
+                &json!({"id": "linked-inside", "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(described["ok"], true);
+        let expected_digest = Digest::from_content(body.trim()).as_str().to_owned();
+        assert_eq!(described["skill"]["digest"], expected_digest);
+        let expected_source = format!(
+            "project:{}",
+            std::fs::canonicalize(&project).unwrap().display()
+        );
+        assert_eq!(
+            described["skill"]["source_identity"].as_str(),
+            Some(expected_source.as_str())
+        );
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["linked-inside"], "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["ok"], true);
+        assert_eq!(loaded["skills"][0]["digest"], expected_digest);
+        assert!(
+            loaded["skills"][0]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("# inside body"))
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
@@ -4758,6 +4837,45 @@ description: \"user ego\"
         assert_eq!(loaded["skills"][0]["digest"], digest);
         assert_eq!(loaded["skills"][0]["bytes"], body.trim().len() as u64);
         assert!(path.is_file());
+
+        // Author/repair baseline: editing the saved Skill changes what describe/load
+        // report, and restoring the original bytes restores the original digest.
+        let repaired = body.replace("# gamma body", "# gamma body repaired");
+        std::fs::write(&path, &repaired).unwrap();
+        let repaired_digest = Digest::from_content(repaired.trim()).as_str().to_owned();
+        assert_ne!(repaired_digest, digest);
+        let described = service
+            .local_call(
+                LOCAL_DESCRIBE_METHOD,
+                &json!({"id": "gamma", "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(described["ok"], true);
+        assert_eq!(described["skill"]["digest"], repaired_digest);
+        let reloaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["gamma"], "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(reloaded["skills"][0]["digest"], repaired_digest);
+        assert!(
+            reloaded["skills"][0]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("# gamma body repaired"))
+        );
+        // Rollback through the normal file path restores the original identity.
+        std::fs::write(&path, body).unwrap();
+        let restored = service
+            .local_call(
+                LOCAL_DESCRIBE_METHOD,
+                &json!({"id": "gamma", "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(restored["skill"]["digest"], digest);
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("HOME", value),
