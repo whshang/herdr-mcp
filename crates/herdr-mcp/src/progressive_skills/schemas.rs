@@ -14,12 +14,12 @@ use super::{
     BROWSER_SESSION_ARCHIVE_METHOD, BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
     BROWSER_SESSION_CREATE_METHOD, BROWSER_SESSION_INSPECT_METHOD, BROWSER_SESSION_OPEN_METHOD,
     BROWSER_SPACE_CREATE_METHOD, BROWSER_SPACE_INSPECT_METHOD, BROWSER_SPACE_OPEN_METHOD,
-    CLEANUP_PREVIEW_METHOD, EXEC_WAIT_METHOD, GITHUB_STATUS_METHOD, LOCAL_DESCRIBE_METHOD,
-    LOCAL_LIST_METHOD, LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD, TEXT_READ_METHOD,
-    TEXT_WRITE_METHOD, VALIDATION_ADVISE_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD,
-    WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD,
-    WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD,
-    X_THREAD_READ_METHOD,
+    CLEANUP_PREVIEW_METHOD, DOUBAO_IMAGE_GENERATE_METHOD, DOUBAO_IMAGE_STATUS_METHOD,
+    EXEC_WAIT_METHOD, GITHUB_STATUS_METHOD, LOCAL_DESCRIBE_METHOD, LOCAL_LIST_METHOD,
+    LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD, TEXT_READ_METHOD, TEXT_WRITE_METHOD,
+    VALIDATION_ADVISE_METHOD, WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD,
+    WORK_MEMORY_BIND_METHOD, WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD,
+    WORK_MEMORY_SEARCH_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
 };
 use crate::prompt::{
     AGENT_TASK_ACK_METHOD, AGENT_TASK_DISPATCH_METHOD, AGENT_TASK_INBOX_METHOD,
@@ -898,6 +898,36 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "cursor": {"type": ["string", "null"], "maxLength": 4096}
                 },
                 "required": ["endpoint_ref", "page_ref", "post_id"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": DOUBAO_IMAGE_GENERATE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "page_ref": {"type": "string", "maxLength": 67},
+                    "prompt": {"type": "string", "maxLength": 4000},
+                    "idempotency_key": {"type": "string", "maxLength": 256}
+                },
+                "required": ["endpoint_ref", "page_ref", "prompt", "idempotency_key"],
+                "empty": false
+            }
+        }),
+        json!({
+            "method": DOUBAO_IMAGE_STATUS_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "op_id": {"type": "string", "maxLength": 96}
+                },
+                "required": ["endpoint_ref", "op_id"],
                 "empty": false
             }
         }),
