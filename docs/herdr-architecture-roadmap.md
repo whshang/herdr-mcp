@@ -103,13 +103,15 @@ Alpha 2 只实现支撑这两个场景的 Work Memory / compact Fleet checkpoint
 alpha.1  Provider plugin boundary + Browser ownership + Alpha 8 Page Assist absorption
 alpha.2  Generic Web typed BrowserPage + screenshot + optional Jev fast path + real-browser UAT
 alpha.3  Bilibili / X / Doubao reviewed builtin Adapter real-browser UAT
-alpha.4  Local Adapter registry + minimal declarative package
+alpha.4  Project Skill Adapter model (normal project SKILL.md + existing Progressive SkillService)
 beta.1   Adapter draft / try / activate / repair / rollback + authoring Skill
 beta.2   ChatGPT / Grok / Claude convergence on shared Browser Kernel
 rc.1     packaging / permissions / compatibility / rollback / multi-device acceptance
 ```
 
 2026-10-03 当前 1.1 DEV 线已完成 alpha.1、alpha.2 和 alpha.3 的 C1/C2/C3 真实浏览器 UAT，Phase C PASS。C1 Bilibili 与 C2 X 结论保持不变。C3 Doubao image generation 的 `doubao.image.generate` + `doubao.image.status` 复用 exact Page Assist grant、`page_ref`、现有 generic `operations` ledger 和 Web Artifact cache；没有新增表、migration、依赖、CLI 或公共 MCP tool。真实 signed-in UAT 依次修正 composer `More` reveal、exact page focus、same-origin route drift、generated-image detection 和 extension-context artifact capture；这些修复都保持 submit-once/status-only/idempotency 语义不变。最终 durable operation 为 `complete / applied / retry_safe=false`，生成结果被捕获为 `image/png` artifact（`1,300,345` bytes，SHA-256 `375b8e01f045d4b61c3930285c7b5a78d62798977aa522be30b4b39edbbd5c08`），prompt 明文不进入 durable result。此前失败均为 proven `not_applied`，因此同一 idempotency identity 的安全重试没有产生重复生成。最终 owned BrowserPage `finalize` 返回 `tab_cleanup_verified=true`，诊断/reload tabs 和临时文件均清零。`3c6148d7` 上 targeted Doubao、Browser Actuation、extension smoke、全量 `npm test`、fmt 和 1299-test Rust suite 全部通过；air DEV 已同步到该 commit，MacBookPro prod 保持未变。下一步进入 alpha.4 / Phase D 的 Project Skill Adapter model，不再扩 C3 站点能力。
+
+2026-10-04 alpha.4 / Phase D 的 Project Skill Adapter model 在托管 DEV runtime 上完成 live saved-Adapter UAT。可复用的站点工作流就是普通 project Skill：`<project-root>/.agents/skills/herdr-browser-<slug>/SKILL.md`，由现有 Progressive SkillService 发现，没有新增 registry、`adapter.json`、database 或第二 executor，永久 MCP schema 仍是 18 个 tool。UAT 在无害只读页面 `https://example.com` 上走完完整生命周期：builtin `browser-adapter-author` 可 load；写入临时 project Skill 后不重建/重启即被 `skill.list/describe/load` 发现；fresh BrowserPage replay、失败修复不改 saved Skill、最小成功修复更新 digest、Git rollback 恢复原 digest 都通过，owned BrowserPage 与临时资源均已回收。资格过程中修复了两个信任/运行边界：`.agents/skills` symlink-root 解析出 scope 时 fail closed，同时保留合法 in-scope symlink；macOS 受 TCC 保护项目根不再由旋转 runtime 直接 `read_dir`/`open`，改走既有 stable TCC broker 的 `fs_list`/`fs_read`，broker 失败不回退直接读。focused tests、完整 Rust workspace 1301 tests、clippy `-D warnings`、fmt、diff check 全绿。最终 post-fix live 复测在 DEV generation `rust-259a3256039f405e`、source commit `cad63a68` 上直接使用真实 `/Users/qingxian/Documents/herdr-mcp`：`skill.list` 正常返回 59 个 Skills；project-local `typesafe-ai` 的 `source_identity=project:/Users/qingxian/Documents/herdr-mcp`、digest `sha256:577c72513…`；`skill.describe` 与 digest-pinned `skill.load` 返回相同 identity/digest，load 大小 `10,039` bytes。此前 protected-root hang 因而在包含修复的实际 runtime 上关闭。
 
 1.1 不把“任意网页”解释为无限制 RPA。普通生产路径继续禁止 local Adapter 任意 JS/eval、cookie/storage secret 导出、任意 shell/filesystem 访问与隐式接管用户 tab；高影响发布、支付、删除、授权等动作继续走确定性 human-boundary。
 

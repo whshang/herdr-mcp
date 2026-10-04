@@ -39,6 +39,23 @@ pub struct SkillFrontmatter {
 pub struct LocalSkillRegistry;
 
 impl LocalSkillRegistry {
+    /// Discover project-local skills for one already-canonical project root.
+    ///
+    /// Split out from [`Self::discover`] so a caller that has already resolved
+    /// the root can enumerate only the project scope. Other scopes and other
+    /// targets keep the existing [`Self::discover`] behavior unchanged.
+    pub fn discover_project(canon_project_root: &Path) -> Vec<LocalSkillFile> {
+        let identity = format!("project:{}", canon_project_root.display());
+        let mut project = Vec::new();
+        collect_base(
+            &canon_project_root.join(".agents/skills"),
+            canon_project_root,
+            &identity,
+            &mut project,
+        );
+        project
+    }
+
     /// Discover local skills under an optional project root first, then the user
     /// home. Precedence deduplication (builtin > project > user) happens in
     /// [`crate::progressive_skills::ProgressiveSkillService`].
@@ -47,17 +64,13 @@ impl LocalSkillRegistry {
         if let Some(root) = project_root
             && let Ok(canon) = fs::canonicalize(root)
         {
-            let identity = format!("project:{}", canon.display());
-            collect_base(
-                &canon.join(".agents/skills"),
-                &identity,
-                &mut discovery.project,
-            );
+            discovery.project = Self::discover_project(&canon);
         }
         if let Ok(home_canon) = fs::canonicalize(home) {
             let identity = format!("user:{}", home_canon.display());
             collect_base(
                 &home_canon.join(".agents/skills"),
+                &home_canon,
                 &identity,
                 &mut discovery.user,
             );
@@ -67,12 +80,24 @@ impl LocalSkillRegistry {
 }
 
 /// Enumerate `<base>/*/SKILL.md` (or `skill.md`), enforcing canonical-path /
-/// symlink confinement (rejects symlinks that resolve outside `base`), a
-/// per-scope count cap, and a per-file size bound.
-fn collect_base(base: &Path, scope_identity: &str, out: &mut Vec<LocalSkillFile>) {
+/// symlink confinement (rejects symlinks that resolve outside the owning scope),
+/// a per-scope count cap, and a per-file size bound.
+///
+/// `scope_root` is the canonical project root or home the base belongs to. The
+/// base itself must resolve inside it, so a `.agents/skills` directory that is a
+/// symlink to an external directory cannot widen the confinement anchor.
+fn collect_base(
+    base: &Path,
+    scope_root: &Path,
+    scope_identity: &str,
+    out: &mut Vec<LocalSkillFile>,
+) {
     let Ok(canon_base) = fs::canonicalize(base) else {
         return;
     };
+    if !canon_base.starts_with(scope_root) {
+        return;
+    }
     let Ok(entries) = fs::read_dir(&canon_base) else {
         return;
     };

@@ -1066,6 +1066,54 @@ pub(crate) fn fs_read_via_stable_broker(
     )
 }
 
+/// List one bounded directory level through the already-installed stable TCC
+/// broker. This reuses the existing `fs_list` wire operation; the caller must
+/// still provide a live Herdr snapshot so the managed-root, secret-path and
+/// symlink-confinement gates remain identical to an ordinary `herdr_fs_list`.
+/// Like the other stable-broker helpers it deliberately does not depend on
+/// `HERDR_MCP_TCC_BROKER`, so a CLI that never inherited the service's routing
+/// flag still reaches the long-lived broker identity.
+#[cfg(target_os = "macos")]
+pub(crate) fn fs_list_via_stable_broker(
+    snapshot: &Value,
+    path: &Path,
+    max_entries: usize,
+) -> Result<Value, String> {
+    run_stable_broker(
+        "fs_list",
+        snapshot,
+        &json!({
+            "path": path.to_string_lossy(),
+            "recursive": false,
+            "max_entries": max_entries,
+        }),
+    )
+}
+
+/// Read one bounded line window through the existing `fs_read` wire operation.
+/// The caller must pass a live snapshot and an explicit `start_line`, and must
+/// honour the returned `truncated`/`next_start_line` contract instead of
+/// digesting a partial window.
+#[cfg(target_os = "macos")]
+pub(crate) fn fs_read_window_via_stable_broker(
+    snapshot: &Value,
+    path: &Path,
+    start_line: usize,
+    end_line: usize,
+    max_bytes: usize,
+) -> Result<Value, String> {
+    run_stable_broker(
+        "fs_read",
+        snapshot,
+        &json!({
+            "path": path.to_string_lossy(),
+            "start_line": start_line,
+            "end_line": end_line,
+            "max_bytes": max_bytes,
+        }),
+    )
+}
+
 /// Run the already-supported `git status` broker operation even when a direct
 /// CLI/runtime path did not inherit the service's broker-routing flag. This
 /// keeps protected project discovery on the long-lived broker identity without
