@@ -108,13 +108,13 @@ test("tracked Cloudflare epoch-2 catalog stays frozen to the captured 18-tool co
   assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), expected);
 });
 
-test("public epoch 3 evolves independently while runtime execution advances to epoch 4", () => {
+test("public epoch 3 evolves independently while runtime execution advances to epoch 5", () => {
   assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 4);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135");
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 5);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030");
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
-  assert.equal(PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch, 3);
-  assert.equal(PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5");
+  assert.equal(PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch, 4);
+  assert.equal(PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135");
   assert.equal(PREVIOUS_RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
   assert.equal(PUBLIC_CONTRACT.contract_epoch, 3);
   assert.equal(PUBLIC_CONTRACT.tool_count, 19);
@@ -126,13 +126,13 @@ test("public epoch 3 evolves independently while runtime execution advances to e
   assert.equal(Object.hasOwn(runtimeInspect.inputSchema.properties, "device"), false);
   // Edge/Relay acceptance window: current runtime contract plus the previous
   // runtime execution identity and the frozen epoch-2 catalog, and nothing older.
-  assert.equal(isCompatibleRuntimeContract(4, RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
-  assert.equal(isCompatibleRuntimeContract(3, PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
+  assert.equal(isCompatibleRuntimeContract(5, RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
+  assert.equal(isCompatibleRuntimeContract(4, PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH2_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(1, EPOCH1_CONTRACT.contract_hash), false);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH1_CONTRACT.contract_hash), false);
   assert.equal(isCompatibleRuntimeContract(3, EPOCH2_CONTRACT.contract_hash), false);
-  assert.equal(isCompatibleRuntimeContract(4, PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash), false);
+  assert.equal(isCompatibleRuntimeContract(5, PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash), false);
 });
 
 test("public contract resolver enables epoch 7 for explicit first-party dev and prod environments", () => {
@@ -432,37 +432,53 @@ test("public epoch 7 removes safety-sensitive wording without changing tool beha
   assert.equal(EPOCH6_CONTRACT.contract_hash, "sha256:addcde324850f88cd2f87bf38de1edb7fc34e90e8cd178b37cc49694b56636cf");
 });
 
-test("runtime execution epoch 4 neutralizes herdr_exec metadata without changing the tool list", async () => {
+test("runtime execution epoch 5 adds opt-in intent/idempotency_key metadata without changing the tool list", async () => {
   const root = new URL("../", import.meta.url);
   const descriptor = JSON.parse(
-    await readFile(new URL("contracts/runtime-exec-v4.json", root), "utf8"),
+    await readFile(new URL("contracts/runtime-exec-v5.json", root), "utf8"),
   );
   const previous = JSON.parse(
-    await readFile(new URL("contracts/runtime-exec-v3.json", root), "utf8"),
+    await readFile(new URL("contracts/runtime-exec-v4.json", root), "utf8"),
   );
   const base = JSON.parse(
     await readFile(new URL("contracts/epoch2.json", root), "utf8"),
   );
 
-  // Epoch 4 shapes only the herdr_exec description over the frozen catalog.
-  const shaped = base.tools.map((tool) =>
-    tool.name === descriptor.shape.tool
-      ? { ...tool, description: descriptor.shape.set.description }
-      : tool,
-  );
-  assert.equal(descriptor.contract_epoch, 4);
+  // Epoch 5 shapes the herdr_exec description plus exactly the two opt-in
+  // inputSchema properties over the frozen catalog.
+  const shaped = base.tools.map((tool) => {
+    if (tool.name !== descriptor.shape.tool) return tool;
+    return {
+      ...tool,
+      description: descriptor.shape.set.description,
+      inputSchema: {
+        ...tool.inputSchema,
+        properties: {
+          ...tool.inputSchema.properties,
+          ...descriptor.shape.inputSchema_properties,
+        },
+      },
+    };
+  });
+  assert.equal(descriptor.contract_epoch, 5);
   assert.equal(descriptor.tool_count, base.tool_count);
   assert.equal(computeContractHash(shaped), descriptor.contract_hash);
 
-  // The previous epoch-3 descriptor stays byte-frozen with its pinned identity.
-  assert.equal(previous.contract_epoch, 3);
-  assert.equal(previous.contract_hash, "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5");
+  // The previous epoch-4 descriptor stays byte-frozen with its pinned identity.
+  assert.equal(previous.contract_epoch, 4);
+  assert.equal(previous.contract_hash, "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135");
   const previousShaped = base.tools.map((tool) =>
     tool.name === previous.shape.tool
       ? { ...tool, description: previous.shape.set.description }
       : tool,
   );
   assert.equal(computeContractHash(previousShaped), previous.contract_hash);
+  // The epoch-4 runner-up descriptor keeps pinning the second baseline.
+  const frozenEpoch3 = JSON.parse(
+    await readFile(new URL("contracts/runtime-exec-v3.json", root), "utf8"),
+  );
+  assert.equal(frozenEpoch3.contract_epoch, 3);
+  assert.equal(frozenEpoch3.contract_hash, "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5");
   // The frozen epoch-2 catalog hash is unchanged as well.
   assert.equal(computeContractHash(base.tools), base.contract_hash);
 
@@ -489,6 +505,14 @@ test("runtime execution epoch 4 neutralizes herdr_exec metadata without changing
   assert.match(descriptor.shape.set.description, /HERDR_MCP_WRITE_ROOTS/);
   assert.match(descriptor.shape.set.description, /execution\.started/);
   assert.match(descriptor.shape.set.description, /execution\.exit_code/);
+
+  // The opt-in vocabulary is discoverable and bounded.
+  assert.deepEqual(
+    descriptor.shape.inputSchema_properties.intent.enum,
+    ["read_only", "idempotent_write", "non_idempotent_write"],
+  );
+  assert.equal(descriptor.shape.inputSchema_properties.idempotency_key.minLength, 1);
+  assert.equal(descriptor.shape.inputSchema_properties.idempotency_key.maxLength, 256);
 
   // Metadata-only change: the tool list itself is untouched.
   assert.deepEqual(

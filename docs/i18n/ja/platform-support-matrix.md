@@ -23,7 +23,7 @@ Herdr-MCP には互いに独立した複数のプロトコル層があります�
 `N` は、現在デプロイされている Edge 契約と、現在 qualified な runtime generation を意味します。
 
 - **N → N** は通常のプロダクション経路です。Candidate のアクティベーションは、トラフィックを移す前にヘルスと正確な runtime execution contract を確認します。Release 更新のアクティベーションではさらに、release manifest がローカルの durable-state schema と一致することが要求されます。
-- **N-1 runtime execution** は有界な rollback 経路であり、一般的な互換性の約束ではありません。現時点では、直前の凍結された epoch-3 runtime contract、および現場にまだ存在する凍結された epoch-2 catalog が、現在の epoch 4 と並んで受け入れられます。この組は epoch と hash によって検証され、任意の古い catalog が受け入れられるわけではありません。
+- **N-1 runtime execution** は有界な rollback 経路であり、一般的な互換性の約束ではありません。現時点では、直前の凍結された epoch-4 runtime contract、および現場にまだ存在する凍結された epoch-2 catalog が、現在の epoch 5 と並んで受け入れられます。この組は epoch と hash によって検証され、任意の古い catalog が受け入れられるわけではありません。
 - **N+1 runtime または control plane** は推測されません。将来の epoch、relay protocol、durable-state schema は、対応する Edge/runtime マイグレーションが明示的に出荷され qualified になるまで互換ではありません。現在のコードは、ベストエフォートのダウングレードを試みる代わりに、未知の contract pair と将来の durable-state schema を拒否します。
 - **durable state の移行はアップグレード時に一方向です。** 各 SQLite migration は append-only かつトランザクショナルです。rollback が安全なのは、先行するバイナリがその結果の状態をまだ読める場合だけであり、これが自動 Release アクティベーションで宣言された state schema の rollback 互換維持を要求する理由です。runtime の rollback は実行の所有権を変えるものであり、ツール呼び出しによってすでに行われた Git/ファイル/サービスへの副作用を取り消すものではありません。
 

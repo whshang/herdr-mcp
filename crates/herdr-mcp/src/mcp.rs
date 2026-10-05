@@ -543,6 +543,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             context.client,
             &context.cache.snapshot(),
             context.exec,
+            context.state_store,
             &arguments,
         ),
         "herdr_prompt" => {
@@ -4323,7 +4324,7 @@ fn browser_session_open(
             &request_hash,
             &op_id,
             now,
-            expires_at,
+            Some(expires_at),
         ) {
             Ok(value) => value,
             Err(error) => return browser_store_error(error),
@@ -4422,7 +4423,7 @@ fn browser_session_open(
         &request_hash,
         &result_json,
         browser_epoch_ms(),
-        expires_at,
+        Some(expires_at),
     ) {
         return json!({
             "ok": false,
@@ -7785,7 +7786,7 @@ fn browser_page_action_call(
             &request_hash,
             &op_id,
             now,
-            expires_at,
+            Some(expires_at),
         ) {
             Ok(OperationReservation::Reserved) => {}
             Ok(OperationReservation::Existing(record)) => {
@@ -7885,7 +7886,7 @@ fn browser_page_action_call(
                 &request_hash,
                 &result.to_string(),
                 browser_epoch_ms(),
-                expires_at,
+                Some(expires_at),
             ) {
                 return browser_store_error(error);
             }
@@ -7966,7 +7967,7 @@ fn browser_page_action_call(
         &request_hash,
         &result.to_string(),
         browser_epoch_ms(),
-        expires_at,
+        Some(expires_at),
     ) {
         return browser_store_error(error);
     }
@@ -8106,7 +8107,7 @@ fn doubao_image_generate_call(
             &request_hash,
             &op_id,
             now,
-            expires_at,
+            Some(expires_at),
         ) {
             Ok(OperationReservation::Reserved) => {}
             Ok(OperationReservation::Existing(record)) => {
@@ -9855,7 +9856,7 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "herdr-mcp");
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 5);
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("delivery, idempotency, and retryability evidence"));
         assert!(instructions.contains("current-state facts"));
@@ -10320,7 +10321,7 @@ mod tests {
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], SDK_WIRE_PROTOCOL);
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 4);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 5);
     }
 
     #[test]
@@ -11339,7 +11340,7 @@ mod tests {
         assert_eq!(remote_consent["code"], "unknown_local_method");
 
         let identity = contract::identity().unwrap();
-        assert_eq!(identity.epoch, 4);
+        assert_eq!(identity.epoch, 5);
         assert_eq!(identity.tool_count, 18);
     }
 
@@ -13276,7 +13277,7 @@ mod tests {
                     &pending_request,
                     &pending_op_id,
                     now,
-                    expires,
+                    Some(expires),
                 )
                 .unwrap();
         }

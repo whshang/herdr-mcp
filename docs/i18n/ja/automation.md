@@ -81,7 +81,7 @@ CI は、ある commit が他のプレーンを壊していないことを証明
 - package dry-run;
 - `git diff --check`.
 
-パブリック Edge contract は、意図的に runtime implementation よりも安定しています。現在の first-party DEV/PROD パブリック contract は **epoch 7 / 19 actions** であり、ワークステーションの Runtime Execution Contract は **epoch 4 / 18 tools** です。追加のパブリック action である `herdr_devices` は Edge で実行され、ワークステーションへ転送されることはありません。Runtime epoch 2/3 とパブリック Edge epoch-3 identity は、現在の DEV/PROD contract ではなく、境界付きの rollback/compatibility ベースラインとしてのみ保持されています。それらのベースライン向けの互換性テストは存在しますが、通常の runtime 変更がどちらの contract も暗黙に変えてはなりません。
+パブリック Edge contract は、意図的に runtime implementation よりも安定しています。現在の first-party DEV/PROD パブリック contract は **epoch 7 / 19 actions** であり、ワークステーションの Runtime Execution Contract は **epoch 5 / 18 tools** です。追加のパブリック action である `herdr_devices` は Edge で実行され、ワークステーションへ転送されることはありません。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、現在の DEV/PROD contract ではなく、境界付きの rollback/compatibility ベースラインとしてのみ保持されています。epoch 3 は historical only であり、パブリック Edge の epoch-3 identity は非 DEV/PROD の境界付きベースラインとして残ります。それらのベースライン向けの互換性テストは存在しますが、通常の runtime 変更がどちらの contract も暗黙に変えてはなりません。
 
 ### GitLab CI とその他の無人 MCP 呼び出し元
 

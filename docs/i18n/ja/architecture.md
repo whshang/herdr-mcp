@@ -99,7 +99,7 @@ native Herdr method
 
 これにより、すべての Herdr メソッドを恒久的な公開 MCP ABI にすることなく、ネイティブの到達性を保ちます。
 
-ワークステーションの Runtime Execution Contract は **epoch 4 / 18 tools** です。現在の first-party DEV/PROD 公開 Edge 契約は **epoch 7 / 19 actions** です。ワークステーションのツールカタログ変更は付随的な runtime 変更ではなく、明示的な契約移行のままです。Runtime epoch 2/3 と公開 Edge epoch-3 identity は、有界な rollback/互換ベースラインとしてのみ維持されます。
+ワークステーションの Runtime Execution Contract は **epoch 5 / 18 tools** です。現在の first-party DEV/PROD 公開 Edge 契約は **epoch 7 / 19 actions** です。ワークステーションのツールカタログ変更は付随的な runtime 変更ではなく、明示的な契約移行のままです。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、有界な rollback/互換ベースラインとしてのみ維持されます。epoch 3 は historical only であり、公開 Edge の epoch-3 identity は非 DEV/PROD の有界なベースラインとして残ります。
 
 ## Progressive skills と capability truth
 

@@ -160,6 +160,10 @@ herdr-mcp has multiple boundaries:
 - busy/dirty confirmation prevents accidental concurrent edits;
 - `herdr_exec` is a stronger shell boundary and is not a sandbox.
 
+`herdr_exec` also accepts optional `intent` (`read_only`, `idempotent_write`, or `non_idempotent_write`) and `idempotency_key`. A keyed request is recorded in the local operations ledger before it is delivered: repeating the same key returns the first synchronous result with `idempotent_replay=true` and does not execute again; the same key with a different command is refused with `idempotency_key_conflict` and nothing is delivered; a reservation that exists without a settled outcome fails closed and is never re-run automatically. A write intent requires a key, while `read_only` may carry the intent alone. Omitting both fields keeps the exact legacy behavior.
+
+Deciding whether a specific Agent prompt was acknowledged, applied, or superseded by a later prompt is not available today: Herdr 0.9.1 has no exact native prompt-turn identity, so the runtime cannot bind one prompt to that turn's acknowledgement/application outcome. The `herdr_prompt` `idempotency_key` only prevents duplicate delivery of one submission; it does not provide turn-level resolution.
+
 Do not weaken all permissions just to solve one path problem. First determine which gate is actually blocking the operation.
 
 ## 11. Separate deployment planes

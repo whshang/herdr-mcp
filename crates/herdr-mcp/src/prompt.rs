@@ -1223,7 +1223,7 @@ fn begin_persisted(
             fingerprint,
             &op_id,
             i64::try_from(now).unwrap_or(i64::MAX),
-            i64::try_from(expires_at).unwrap_or(i64::MAX),
+            Some(i64::try_from(expires_at).unwrap_or(i64::MAX)),
         )
         .map_err(|error| {
             json!({
@@ -1344,7 +1344,7 @@ fn complete_persisted(
             fingerprint,
             &result_json,
             i64::try_from(now).unwrap_or(i64::MAX),
-            i64::try_from(expires_at).unwrap_or(i64::MAX),
+            Some(i64::try_from(expires_at).unwrap_or(i64::MAX)),
         )
         .map_err(|error| {
             json!({

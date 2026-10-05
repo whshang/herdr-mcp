@@ -118,7 +118,7 @@ Static evidence is kept in a bounded capability inventory under the herdr-mcp co
 
 ### Dynamic planning advice for the Web planner
 
-The current workstation Runtime Execution Contract is epoch 4 / 18 tools and does not add a dedicated planning tool. The first-party public Edge contract is epoch 7 / 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
+The current workstation Runtime Execution Contract is epoch 5 / 18 tools and does not add a dedicated planning tool. The first-party public Edge contract is epoch 7 / 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
 
 ```text
 herdr_call(
