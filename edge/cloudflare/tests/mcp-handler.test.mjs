@@ -396,6 +396,46 @@ test("tool timeout gets transport settlement grace instead of racing the Edge de
   assert.equal(d.calls[0].deadlineMs, 66_000);
 });
 
+test("user keeps long pane waits bounded | Given a remote read wait longer than the Edge budget | When Herdr forwards it | Then the wait stays read-only and is capped before Link delivery", async () => {
+  const d = deps();
+  const r = await handleMcp(req(700, "tools/call", {
+    name: "herdr_call",
+    arguments: {
+      method: "pane.wait_for_output",
+      params: JSON.stringify({
+        pane_id: "w1:p1",
+        source: "recent_unwrapped",
+        match: { type: "substring", value: "done" },
+        timeout_ms: 180_000,
+      }),
+    },
+  }), "w1", d.value);
+
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].opClass, "read");
+  assert.equal(d.calls[0].deadlineMs, 31_000);
+  const forwardedParams = JSON.parse(d.calls[0].args.params);
+  assert.equal(forwardedParams.timeout_ms, 20_000);
+});
+
+test("user keeps an unset or non-numeric pane wait untouched | Given a remote pane wait with no valid numeric timeout | When Herdr forwards it | Then the timeout is not synthesized and the runtime still validates it", async () => {
+  for (const timeout of [undefined, "soon"]) {
+    const d = deps();
+    const params = { pane_id: "w1:p1", match: { type: "substring", value: "done" } };
+    if (timeout !== undefined) params.timeout_ms = timeout;
+    const r = await handleMcp(req(701, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "pane.wait_for_output", params: JSON.stringify(params) },
+    }), "w1", d.value);
+
+    assert.equal(r.body.result.isError, undefined);
+    assert.equal(d.calls.length, 1);
+    const forwardedParams = JSON.parse(d.calls[0].args.params);
+    assert.equal(forwardedParams.timeout_ms, timeout);
+  }
+});
+
 test("read-only call retries across a stale generation window after supersede proved not delivered", async () => {
   let forwards = 0;
   const d = deps({
