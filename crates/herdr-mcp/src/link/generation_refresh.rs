@@ -996,6 +996,30 @@ fn refresh_prod_plist_generation(
         "HERDR_RUNTIME_GENERATION".to_owned(),
         PlistValue::String(generation.to_owned()),
     );
+    // A legacy link-prod plist may predate the explicit production control
+    // paths. Without them the Rust daemon falls back to the plain candidate
+    // files and generation reconciliation observes a different state plane
+    // from the running production Link. Inject the same production paths a
+    // fresh install uses so a refresh converges onto them.
+    let config_dir = home.join(".config").join("herdr-mcp");
+    env_out.insert(
+        "HERDR_RUNTIME_CONTROL_PATH".to_owned(),
+        PlistValue::String(
+            config_dir
+                .join("runtime-control-prod.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    env_out.insert(
+        "HERDR_RUNTIME_STATUS_PATH".to_owned(),
+        PlistValue::String(
+            config_dir
+                .join("runtime-status-prod.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
     match runtime_version {
         Some(version) if !version.trim().is_empty() => {
             env_out.insert(
@@ -1466,6 +1490,24 @@ mod tests {
         assert_eq!(
             env.get("HERDR_EDGE_URL").and_then(PlistValue::as_string),
             Some("wss://backend.workers.dev/ws")
+        );
+        assert_eq!(
+            env.get("HERDR_RUNTIME_CONTROL_PATH")
+                .and_then(PlistValue::as_string),
+            Some(
+                root.join(".config/herdr-mcp/runtime-control-prod.json")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            env.get("HERDR_RUNTIME_STATUS_PATH")
+                .and_then(PlistValue::as_string),
+            Some(
+                root.join(".config/herdr-mcp/runtime-status-prod.json")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
 
         std::fs::remove_dir_all(root).unwrap();

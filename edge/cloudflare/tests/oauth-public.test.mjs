@@ -1045,6 +1045,111 @@ test("refresh_token: wrong client for an active refresh is rejected", async () =
 });
 
 // ---------------------------------------------------------------------------
+// Custom-domain OAuth migration (proven legacy workers.dev alias)
+// ---------------------------------------------------------------------------
+
+const LEGACY_ISSUER = "https://herdr-edge-example.herdr-sub.workers.dev";
+const LEGACY_IDENTITY = createOAuthIdentity(LEGACY_ISSUER);
+
+/**
+ * One DO/store observed through the pre-1.0 workers.dev deployment and the
+ * canonical custom-domain deployment that carries it as a migration alias.
+ */
+function makeMigrationPair() {
+  const shared = makeOptions();
+  return {
+    legacy: { ...shared, identity: LEGACY_IDENTITY },
+    canonical: { ...shared, legacyIdentity: LEGACY_IDENTITY },
+  };
+}
+
+test("user keeps an existing Connector across the custom-domain cutover | Given a refresh token and access JWT issued by the proven legacy workers.dev identity | When the deployment serves the custom domain as canonical | Then the legacy JWT still verifies as an alias and the refresh mints the canonical pair", async () => {
+  const { legacy, canonical } = makeMigrationPair();
+  // Issue while the deployment still served the legacy workers.dev identity.
+  canonical.__do.env.OAUTH_ISSUER = LEGACY_ISSUER;
+  const { client_id } = await registerClient(legacy, { token_endpoint_auth_method: "none" });
+  const { code, verifier } = await makeAuthCode(legacy, client_id);
+  const issued = await POST("/oauth/token", tokenBody(client_id, code, verifier, { resource: LEGACY_IDENTITY.resource }), legacy);
+  assert.equal(issued.status, 200);
+  const { access_token, refresh_token } = await issued.json();
+
+  // Cut over to the custom domain, carrying the proven legacy identity only as
+  // an alias. The already-issued legacy access JWT stays usable and is tagged
+  // as a legacy-issuer token.
+  canonical.__do.env.OAUTH_ISSUER = ISSUER;
+  canonical.__do.env.OAUTH_LEGACY_ISSUER = LEGACY_ISSUER;
+  const legacyAccess = await canonical.__do.fetch(new Request("https://do.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: access_token, now_sec: NOW_SEC + 1 }),
+  }));
+  assert.equal(legacyAccess.status, 200);
+  assert.equal((await legacyAccess.json()).source, "edge_jwt_legacy_issuer");
+
+  // Refreshing against the legacy resource mints the canonical-domain pair.
+  const rotated = await POST("/oauth/token", {
+    grant_type: "refresh_token",
+    refresh_token,
+    client_id,
+    resource: LEGACY_IDENTITY.resource,
+  }, canonical);
+  assert.equal(rotated.status, 200);
+  const pair = await rotated.json();
+  assert.ok(pair.access_token && pair.refresh_token);
+  const verifierCanonical = await doVerifier(canonical);
+  assert.equal((await verifierCanonical.verify(pair.access_token, NOW_SEC + 1)).ok, true);
+});
+
+test("user cannot exchange a canonical refresh token through the legacy alias | Given a refresh token bound to the canonical custom-domain resource | When it is presented with the legacy workers.dev resource or a foreign resource | Then the exchange is rejected and the still-valid token is not burned", async () => {
+  const { legacy, canonical } = makeMigrationPair();
+  const { client_id } = await registerClient(legacy, { token_endpoint_auth_method: "none" });
+  const { code, verifier } = await makeAuthCode(legacy, client_id);
+  const issued = await POST("/oauth/token", tokenBody(client_id, code, verifier, { resource: LEGACY_IDENTITY.resource }), legacy);
+  assert.equal(issued.status, 200);
+  const { refresh_token } = await issued.json();
+
+  const rejected = await POST("/oauth/token", {
+    grant_type: "refresh_token",
+    refresh_token,
+    client_id,
+    resource: "https://foreign.example.com/mcp",
+  }, canonical);
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).error, "invalid_target");
+
+  const refreshHash = await hashOpaqueToken(refresh_token);
+  const stillThere = await canonical.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: refreshHash, now_sec: NOW_SEC + 1 }),
+  }));
+  assert.equal(stillThere.status, 200);
+
+  // A canonical-resource refresh token must not be exchangeable through the
+  // legacy alias: the alias only ever matches its own exact resource.
+  canonical.__do.env.OAUTH_ISSUER = ISSUER;
+  const fresh = await makeAuthCode(canonical, client_id);
+  const canonicalPair = await POST("/oauth/token", tokenBody(client_id, fresh.code, fresh.verifier), canonical);
+  assert.equal(canonicalPair.status, 200);
+  const { refresh_token: canonicalRefresh } = await canonicalPair.json();
+  const crossExchange = await POST("/oauth/token", {
+    grant_type: "refresh_token",
+    refresh_token: canonicalRefresh,
+    client_id,
+    resource: LEGACY_IDENTITY.resource,
+  }, canonical);
+  assert.equal(crossExchange.status, 400);
+  assert.equal((await crossExchange.json()).error, "invalid_grant");
+  const canonicalHash = await hashOpaqueToken(canonicalRefresh);
+  const canonicalStillThere = await canonical.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: canonicalHash, now_sec: NOW_SEC + 1 }),
+  }));
+  assert.equal(canonicalStillThere.status, 200);
+});
+
+// ---------------------------------------------------------------------------
 // 10. RFC 7009 Connector-instance revocation
 // ---------------------------------------------------------------------------
 
