@@ -10,6 +10,7 @@ export interface OAuthMcpAuthEnv {
   STATIC_MCP_BEARER_SECRET?: string;
   STATIC_MCP_BEARER_EXPIRES_AT_MS?: string;
   OAUTH_ISSUER?: string;
+  OAUTH_LEGACY_ISSUER?: string;
   OAUTH_JWT_PUBLIC_PEM?: string;
 }
 
@@ -136,13 +137,27 @@ export async function authenticateMcpRequest(
   const token = presentedBearer(request);
   if (!token) return { ok: false, code: "mcp_auth_failed" };
   const issuer = env.OAUTH_ISSUER?.trim();
+  const legacyIssuer = env.OAUTH_LEGACY_ISSUER?.trim();
   const pem = env.OAUTH_JWT_PUBLIC_PEM;
   if (token.includes(".") && issuer && pem) {
+    let publicKey: CryptoKey | undefined;
     try {
-      const identity = createOAuthIdentity(issuer);
-      const verifier = createRs256AccessTokenVerifier(identity, await publicKeyFor(pem));
-      const verdict = await verifier.verify(token, Math.floor(Date.now() / 1000));
-      if (verdict.ok) {
+      publicKey = await publicKeyFor(pem);
+    } catch {
+      // A corrupt/invalid PEM must not throw out of authentication; fall
+      // through to the Edge-issued / opaque-compatible verification below.
+      publicKey = undefined;
+    }
+    const issuers = [issuer, legacyIssuer]
+      .filter((value): value is string => Boolean(value))
+      .filter((value, index, values) => values.indexOf(value) === index);
+    for (const candidate of issuers) {
+      if (!publicKey) break;
+      try {
+        const identity = createOAuthIdentity(candidate);
+        const verifier = createRs256AccessTokenVerifier(identity, publicKey);
+        const verdict = await verifier.verify(token, Math.floor(Date.now() / 1000));
+        if (!verdict.ok) continue;
         const legacyShape = verdict.principalType === undefined
           && verdict.deviceId === undefined
           && verdict.connectorId === undefined
@@ -165,9 +180,10 @@ export async function authenticateMcpRequest(
             ? { ok: true, source: "oauth_jwt", clientId: result.clientId }
             : { ok: true, source: "oauth_jwt" };
         }
+      } catch {
+        // Try the next exact, deployment-proven issuer. Edge-issued JWTs fall
+        // through to the Durable Object verifier below.
       }
-    } catch {
-      // A token not signed by the legacy key may be an Edge-issued JWT.
     }
   }
 

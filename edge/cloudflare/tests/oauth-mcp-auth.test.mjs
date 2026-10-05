@@ -97,6 +97,46 @@ test("production issuer RS256 JWT validates with migrated public PEM", async () 
   assert.equal(result.ok, true);
   assert.equal(result.source, "oauth_jwt");
   assert.equal(result.clientId, "https://chatgpt.com/client");
+
+  // A proven legacy workers.dev issuer is accepted only while it is carried as
+  // the deployment's migration alias; without it the same JWT fails closed.
+  const legacyIssuer = "https://herdr-edge-example.herdr-sub.workers.dev";
+  const legacyToken = await jwt(kp.privateKey, {
+    iss: legacyIssuer,
+    aud: `${legacyIssuer}/mcp`,
+    client_id: "https://chatgpt.com/client",
+    iat: now,
+    exp: now + 3600,
+  });
+  const carried = await authenticateMcpRequest(request(legacyToken), {
+    OAUTH_ISSUER: ISSUER,
+    OAUTH_LEGACY_ISSUER: legacyIssuer,
+    OAUTH_JWT_PUBLIC_PEM: pem,
+  });
+  assert.equal(carried.ok, true);
+  assert.equal(carried.source, "oauth_jwt");
+  assert.equal(carried.clientId, "https://chatgpt.com/client");
+  assert.deepEqual(
+    await authenticateMcpRequest(request(legacyToken), { OAUTH_ISSUER: ISSUER, OAUTH_JWT_PUBLIC_PEM: pem }),
+    { ok: false, code: "mcp_auth_failed" },
+  );
+
+  // A corrupt public PEM must not throw out of authentication; the request
+  // still reaches the Edge-issued / opaque-compatible verifier.
+  let edgeVerified = false;
+  const fallback = await authenticateMcpRequest(request(token), {
+    OAUTH_ISSUER: ISSUER,
+    OAUTH_JWT_PUBLIC_PEM: "-----BEGIN PUBLIC KEY-----\nnot-a-key\n-----END PUBLIC KEY-----\n",
+  }, {
+    verifyEdgeToken: async (presented) => {
+      assert.equal(presented, token);
+      edgeVerified = true;
+      return { ok: true, clientId: "https://chatgpt.com/client" };
+    },
+  });
+  assert.equal(edgeVerified, true);
+  assert.equal(fallback.source, "oauth_edge");
+  assert.equal(fallback.clientId, "https://chatgpt.com/client");
 });
 
 test("migrated public-PEM JWT obeys the injected legacy client grant fence", async () => {

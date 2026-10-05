@@ -273,6 +273,8 @@ test("limits: classifyOp only marks known-read ops retryable", () => {
   assert.equal(classifyOp("some_mystery_tool"), "mutating");
   assert.equal(classifyOp("herdr_skill"), "read");
   assert.equal(classifyRequestOp("herdr_call", { method: "herdr_mcp.exec.wait" }), "read");
+  assert.equal(classifyRequestOp("herdr_call", { method: "pane.wait_for_output" }), "read");
   assert.equal(classifyRequestOp("herdr_call", { method: "herdr_mcp.exec.wait.extra" }), "mutating");
+  assert.equal(classifyRequestOp("herdr_call", { method: "pane.wait_for_output.extra" }), "mutating");
   assert.equal(classifyRequestOp("herdr_call", { method: "workspace.list" }), "mutating");
 });
