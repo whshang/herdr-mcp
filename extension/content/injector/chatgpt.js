@@ -8,6 +8,7 @@ const CHATGPT_ADAPTER_CAPABILITIES = Object.freeze({
   stopGeneration: true,
   sessionCreate: true,
   sessionOpen: true,
+  titleProjection: true,
   chatModeGuard: true,
 });
 const CHATGPT_ADAPTER_POLICY = Object.freeze({

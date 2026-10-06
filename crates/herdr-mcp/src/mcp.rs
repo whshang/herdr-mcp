@@ -4221,6 +4221,12 @@ fn browser_session_create(
         Ok(value) => value,
         Err(error) => return browser_store_error(error),
     };
+    let title_projection = evidence
+        .result
+        .as_ref()
+        .and_then(|result| result.get("title_projection"))
+        .filter(|value| value.is_object())
+        .cloned();
     let Ok(mut guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
@@ -4235,7 +4241,7 @@ fn browser_session_create(
         Err(error) => return browser_store_error(error),
     };
     if delivery_state == BrowserDeliveryState::Applied {
-        return browser_session_create_success(
+        let mut result = browser_session_create_success(
             &mut guard,
             &updated.reservation_ref,
             params,
@@ -4243,6 +4249,10 @@ fn browser_session_create(
             false,
             caller_authorization,
         );
+        if let (Some(object), Some(title_projection)) = (result.as_object_mut(), title_projection) {
+            object.insert("title_projection".to_owned(), title_projection);
+        }
+        return result;
     }
     if delivery_state == BrowserDeliveryState::Uncertain {
         drop(guard);
@@ -14281,7 +14291,14 @@ mod tests {
                     generation_status_observed: true,
                     generation_stopped: false,
                     result: Some(json!({
-                        "accepted_user_message_ref": "provider-created-session-user"
+                        "accepted_user_message_ref": "provider-created-session-user",
+                        "title_projection": {
+                            "status": "verified",
+                            "changed": true,
+                            "provider": "chatgpt",
+                            "readback_verified": true,
+                            "reason": null
+                        }
                     })),
                 }
             }
@@ -14750,6 +14767,9 @@ mod tests {
         assert_eq!(created["route"]["expected_generation"], 7);
         assert_eq!(created["dispatch"]["delivery_state"], "applied");
         assert_eq!(created["dispatch"]["lane_id"], "lane-worker-a");
+        assert_eq!(created["title_projection"]["status"], "verified");
+        assert_eq!(created["title_projection"]["changed"], true);
+        assert_eq!(created["title_projection"]["readback_verified"], true);
         assert_eq!(immediate.calls.load(Ordering::SeqCst), 1);
         let created_session_ref = created["session_ref"].as_str().unwrap();
         let inspected = browser_operation_call_with_grant(

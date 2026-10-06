@@ -1884,6 +1884,8 @@ test("ChatGPT session.open is the only supported existing-view open", () => {
   assert.match(backgroundSource, /provider_message_chars:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /provider_model_reasoning_combinations:\s*\{\s*status:\s*"unknown"/);
   assert.match(backgroundSource, /"session\.open"/);
+  assert.match(backgroundSource, /"session\.title_projection"/);
+  assert.match(chatGptAdapterSource, /titleProjection:\s*true/);
   assert.match(wakeSource, /herdr_mcp\.browser_session\.open/);
 });
 
@@ -3235,6 +3237,9 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   );
   assert.match(createSegment, /registerCurrentConversation\("browser-session-create"\)/);
   assert.match(createSegment, /registeredBrowserSessionRef/);
+  assert.match(createSegment, /adapterSupports\("titleProjection"\)/);
+  assert.match(createSegment, /projectChatGptConversationTitle\(params\.display_label\)/);
+  assert.match(createSegment, /title_projection:\s*titleProjection/);
   const createRegistration = createSegment.indexOf("registerCurrentConversation(\"browser-session-create\")");
   const createSettlementAssignment = createSegment.indexOf("acceptedDispatchAssignments.set(registeredBrowserSessionRef");
   assert.ok(
@@ -3257,6 +3262,139 @@ test("ChatGPT session.create carries one durable reservation across the new-conv
   const refreshClearStart = wakeSource.indexOf("function clearBrowserPendingDispatchRefresh");
   const refreshClearSegment = wakeSource.slice(refreshClearStart, refreshClearStart + 500);
   assert.match(refreshClearSegment, /sessionStorage\.removeItem\(BROWSER_SESSION_RESERVATION_STORAGE_KEY\)/);
+});
+
+function chatGptTitleProjectionHarness({
+  initialTitle = "Provider title",
+  readbackTitles = [],
+  patchOk = true,
+} = {}) {
+  const start = wakeSource.indexOf("  async function projectChatGptConversationTitle(");
+  const end = wakeSource.indexOf("\n  async function fetchChatGptArchivedConversationList", start);
+  assert.ok(start >= 0 && end > start, "ChatGPT title projection helper must remain extractable");
+  const helperSource = wakeSource.slice(start, end);
+  const ctx = {
+    now: 0,
+    reads: [initialTitle, ...readbackTitles],
+    lastRead: initialTitle,
+    patchCalls: [],
+    patchOk,
+  };
+  const project = new Function("ctx", `
+    const ADAPTER = { name: "chatgpt", capabilities: { titleProjection: true } };
+    const adapterSupports = (capability) => ADAPTER.capabilities?.[capability] === true;
+    const normText = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const chatGptConversationId = () => "conv-123";
+    const fetchChatGptConversation = async () => {
+      const title = ctx.reads.length ? ctx.reads.shift() : ctx.lastRead;
+      ctx.lastRead = title;
+      ctx.now += 100;
+      return { ok: true, body: { title } };
+    };
+    const readChatGptAccessToken = async () => {
+      ctx.now += 100;
+      return "short-lived-test-token";
+    };
+    const fetch = async (url, init) => {
+      ctx.patchCalls.push({ url, init });
+      ctx.now += 100;
+      return { ok: ctx.patchOk };
+    };
+    class AbortController {
+      constructor() { this.signal = {}; }
+      abort() {}
+    }
+    const setTimeout = () => 1;
+    const clearTimeout = () => {};
+    const wait = async (ms) => { ctx.now += ms; };
+    const Date = { now: () => ctx.now };
+    ${helperSource}
+    return projectChatGptConversationTitle;
+  `)(ctx);
+  return { ctx, project };
+}
+
+test("user sees the requested ChatGPT worker title | Given a new conversation has a different provider title | When session.create projects its display label | Then one provider PATCH is accepted only after exact title readback", async () => {
+  const { ctx, project } = chatGptTitleProjectionHarness({
+    initialTitle: "Provider title",
+    readbackTitles: ["Worker A"],
+  });
+  const result = await project("  Worker   A  ");
+
+  assert.deepEqual(result, {
+    status: "verified",
+    changed: true,
+    provider: "chatgpt",
+    readback_verified: true,
+    reason: null,
+  });
+  assert.equal(ctx.patchCalls.length, 1);
+  assert.equal(ctx.patchCalls[0].url, "/backend-api/conversation/conv-123");
+  assert.equal(ctx.patchCalls[0].init.method, "PATCH");
+  assert.equal(ctx.patchCalls[0].init.credentials, "include");
+  assert.equal(ctx.patchCalls[0].init.redirect, "error");
+  assert.equal(ctx.patchCalls[0].init.headers["content-type"], "application/json");
+  assert.equal(ctx.patchCalls[0].init.headers.authorization, "Bearer short-lived-test-token");
+  assert.deepEqual(JSON.parse(ctx.patchCalls[0].init.body), { title: "Worker A" });
+  assert.equal(JSON.stringify(result).includes("short-lived-test-token"), false);
+});
+
+test("user keeps a successful create when title projection cannot be verified | Given the provider keeps returning another title | When session.create attempts projection | Then the projection fails after one PATCH without claiming readback success", async () => {
+  const { ctx, project } = chatGptTitleProjectionHarness({
+    initialTitle: "Provider title",
+    readbackTitles: ["Still provider title"],
+  });
+  const projection = await project("Worker B");
+
+  assert.equal(projection.status, "failed");
+  assert.equal(projection.changed, null);
+  assert.equal(projection.provider, "chatgpt");
+  assert.equal(projection.readback_verified, false);
+  assert.equal(projection.reason, "title_projection_readback_unverified");
+  assert.equal(ctx.patchCalls.length, 1);
+
+  const successStart = wakeSource.indexOf("      if (evidence.accepted_message_observed");
+  const successEnd = wakeSource.indexOf("\n      await wait(200);", successStart);
+  assert.ok(successStart >= 0 && successEnd > successStart, "create success gate must remain extractable");
+  const successGate = wakeSource.slice(successStart, successEnd);
+  const settleCreate = new Function("projection", `
+    return async function settleCreate() {
+      const evidence = {
+        command_accepted: true,
+        resource_available: true,
+        rejected: false,
+        stable_resource_ref_observed: true,
+        lifecycle_observed: true,
+        canonical_url_observed: true,
+        accepted_message_observed: true,
+        generation_status_observed: true,
+        generation_owner: null,
+        result: { accepted_user_message_ref: "provider-user-1" },
+      };
+      const exactChatGptDispatchIdentity = false;
+      const acceptedUserMessageRef = "provider-user-1";
+      const creatingSession = true;
+      const expectedGeneration = 17;
+      const params = { display_label: "Worker B" };
+      const ADAPTER = { name: "chatgpt" };
+      const adapterSupports = (capability) => capability === "titleProjection";
+      const projectChatGptConversationTitle = async () => projection;
+      ${successGate}
+      throw new Error("create success gate did not return");
+    };
+  `)(projection);
+  const evidence = await settleCreate();
+  assert.equal(evidence.command_accepted, true);
+  assert.equal(evidence.resource_available, true);
+  assert.equal(evidence.rejected, false);
+  assert.equal(evidence.stable_resource_ref_observed, true);
+  assert.equal(evidence.lifecycle_observed, true);
+  assert.equal(evidence.canonical_url_observed, true);
+  assert.equal(evidence.accepted_message_observed, true);
+  assert.equal(evidence.generation_status_observed, true);
+  assert.equal(evidence.generation_owner, 17);
+  assert.equal(evidence.result.accepted_user_message_ref, "provider-user-1");
+  assert.deepEqual(evidence.result.title_projection, projection);
 });
 
 test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is active | When browser actuation runs | Then the provider adapter switches to Chat mode", () => {

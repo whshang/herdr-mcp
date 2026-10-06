@@ -2105,7 +2105,7 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
 
 function browserProviderCapabilities(provider) {
   const operations = provider === "chatgpt"
-    ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create"]
+    ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create", "session.title_projection"]
     : ["composer.submit", "generation.status", "generation.stop", "session.inspect"];
   return {
     schema_version: 1,
