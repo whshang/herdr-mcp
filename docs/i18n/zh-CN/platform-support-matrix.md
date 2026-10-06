@@ -23,7 +23,7 @@ Herdr-MCP 有多层彼此独立的协议，它们不会共用一个版本号。
 `N` 表示当前部署的 Edge 契约和当前已验证的 runtime generation。
 
 - **N → N** 是常规生产路径。候选 runtime 只有在健康检查和精确 runtime execution contract 验证通过后才能切换流量；Release 更新还要求 manifest 与本地 durable-state schema 匹配。
-- **N-1 runtime execution** 只是有界 rollback，不是任意历史版本兼容承诺。当前同时接受紧邻上一代冻结的 epoch-3 runtime contract、仍在现场的冻结 epoch-2 catalog 与当前 epoch 4，并且按 epoch + hash 校验；更老的任意 catalog 不会被接收。
+- **N-1 runtime execution** 只是有界 rollback，不是任意历史版本兼容承诺。当前同时接受紧邻上一代冻结的 epoch-4 runtime contract、仍在现场的冻结 epoch-2 catalog 与当前 epoch 5，并且按 epoch + hash 校验；更老的任意 catalog 不会被接收。
 - **N+1 runtime 或 control plane** 不做猜测兼容。未来 epoch、Relay protocol 或 durable-state schema 必须经过显式迁移和验证后才能使用；当前实现会拒绝未知 contract pair 和未来 schema，而不是尝试“尽量降级运行”。
 - **durable state 升级是单向迁移。** SQLite migration 采用追加式、事务性执行。只有旧 binary 仍能读取迁移后的状态时 rollback 才安全，因此自动 Release 激活要求声明的 state schema 保持 rollback-compatible。Runtime rollback 只切回执行所有权，不会撤销已经发生的 Git、文件、远程服务或 Agent 副作用。
 

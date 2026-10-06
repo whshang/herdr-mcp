@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "base_contract": "contracts/epoch2.json",
+  "contract_epoch": 5,
+  "contract_hash": "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
+  "tool_count": 18,
+  "shape": {
+    "tool": "herdr_exec",
+    "set": {
+      "description": "Run a non-interactive command on the workstation inside a selected project root of the target workspace (explicit project_root, or the workspace's single current project root) and return its bounded result synchronously: a durable native exec session is started, the call waits up to timeout_ms, then returns exit_code, effective_cwd/project_root, output, and execution evidence (execution.started, execution.completed, execution.exit_code, plus failure_origin when the call fails). Ordinary roots use the native session backend, independent of a pane's foreground cwd. When the workspace has multiple project roots and project_root is omitted, the result reports project_root_required together with the candidate roots. Authorization and allowed write roots follow HERDR_MCP_READONLY / HERDR_MCP_WRITE_ROOTS, and a working agent in the project produces an agent_working result unless confirm_busy=true is passed, which sets warnings.working. Command output is returned as the child process produced it; the herdr_fs_read, herdr_fs_list and herdr_fs_grep tools additionally exclude secret-like paths. On timeout the command keeps running as the returned session_id, partial output is returned with ok:false and code:exec_timeout, and the same session continues through herdr_exec_read. macOS user-protected roots (Documents/Desktop/Downloads) use the persistent visible utility pane (label 'herdr-mcp:utility') so execution stays under the TCC-authorized Herdr terminal host. Optional opt-in durability: passing intent together with idempotency_key reserves the request in the durable operations ledger before the command is delivered, so the same key returns the recorded original result with idempotent_replay=true instead of executing again; the same key with a different request reports idempotency_key_conflict and nothing is delivered; a still-pending reservation reports the request as unsettled and no second delivery happens. Results carrying intent or idempotency_key always expose intent, idempotency_persisted, idempotent_replay and safe_retry_mode. A command whose synchronous submission was recorded keeps that record even when execution is still running (phase:running, code:exec_timeout), so replay returns the same session_id and the caller resumes through herdr_exec_read. Calls without intent or idempotency_key behave exactly as the legacy request."
+    },
+    "inputSchema_properties": {
+      "intent": {
+        "type": "string",
+        "enum": [
+          "read_only",
+          "idempotent_write",
+          "non_idempotent_write"
+        ],
+        "description": "Optional declared effect of this command: read_only, idempotent_write, or non_idempotent_write. A write intent requires idempotency_key; read_only may omit it, in which case nothing is reserved. Supplying idempotency_key always requires an intent. Checked before execution, so an unsupported combination returns invalid_params without running the command. Results carrying intent expose intent, idempotency_persisted, idempotent_replay and safe_retry_mode. Omitting intent keeps the legacy behavior and performs no durable reservation."
+      },
+      "idempotency_key": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "description": "Optional caller-chosen key (1-256 characters) that binds this request to one durable operation. A supplied key always requires an intent. The first request for a key delivers the command and records its synchronous result; repeating the same key returns that recorded result with idempotent_replay=true and never delivers again. A different request under the same key is refused with idempotency_key_conflict."
+      }
+    }
+  }
+}

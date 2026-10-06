@@ -861,7 +861,9 @@ impl StateStore {
     ///
     /// Expired rows are removed first. `INSERT OR IGNORE` plus the scoped
     /// unique index makes concurrent processes converge on one authoritative
-    /// row without a read-then-write race.
+    /// row without a read-then-write race. `expires_at` is nullable: `None`
+    /// records an ownership claim that time alone can never prune, which is
+    /// required for requests whose outcome may still be uncertain.
     pub fn reserve_operation(
         &mut self,
         kind: &str,
@@ -869,7 +871,7 @@ impl StateStore {
         request_hash: &str,
         op_id: &str,
         now_ms: i64,
-        expires_at: i64,
+        expires_at: Option<i64>,
     ) -> Result<OperationReservation, String> {
         let tx = self
             .conn
@@ -933,6 +935,7 @@ impl StateStore {
 
     /// Mark one reserved operation complete and persist the bounded replay
     /// payload. A missing/mismatched row is an integrity error, not an upsert.
+    /// `expires_at` may stay `None` when the recorded outcome is not terminal.
     pub fn complete_operation(
         &mut self,
         kind: &str,
@@ -940,7 +943,7 @@ impl StateStore {
         request_hash: &str,
         result_json: &str,
         now_ms: i64,
-        expires_at: i64,
+        expires_at: Option<i64>,
     ) -> Result<(), String> {
         let tx = self
             .conn
@@ -7418,12 +7421,12 @@ mod tests {
         let mut store = StateStore::open(":memory:").unwrap();
         assert_eq!(
             store
-                .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 10, 1_000)
+                .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 10, Some(1_000))
                 .unwrap(),
             OperationReservation::Reserved
         );
         let OperationReservation::Existing(existing) = store
-            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 11, 1_000)
+            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 11, Some(1_000))
             .unwrap()
         else {
             panic!("expected existing reservation");
@@ -7434,7 +7437,14 @@ mod tests {
 
         assert_eq!(
             store
-                .reserve_operation("other_mutation", "key-hash", "req-b", "op-b", 12, 1_000)
+                .reserve_operation(
+                    "other_mutation",
+                    "key-hash",
+                    "req-b",
+                    "op-b",
+                    12,
+                    Some(1_000)
+                )
                 .unwrap(),
             OperationReservation::Reserved,
             "the same digest may be reused by a different operation kind"
@@ -7447,11 +7457,11 @@ mod tests {
                 "req-a",
                 r#"{"ok":true}"#,
                 20,
-                2_000,
+                Some(2_000),
             )
             .unwrap();
         let OperationReservation::Existing(completed) = store
-            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 21, 2_000)
+            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 21, Some(2_000))
             .unwrap()
         else {
             panic!("expected completed operation");
@@ -7459,6 +7469,31 @@ mod tests {
         assert_eq!(completed.state.as_deref(), Some("complete"));
         assert_eq!(completed.phase.as_deref(), Some("settled"));
         assert_eq!(completed.result_json.as_deref(), Some(r#"{"ok":true}"#));
+
+        // A NULL expiry is an ownership claim that time alone can never prune:
+        // a far-future reservation attempt for the same key still finds the
+        // pending row instead of deleting it and reserving a fresh one. Run
+        // last because the far-future prune legitimately clears bounded rows.
+        assert_eq!(
+            store
+                .reserve_operation("herdr_exec", "unbounded-key", "req-c", "op-c", 30, None)
+                .unwrap(),
+            OperationReservation::Reserved
+        );
+        let OperationReservation::Existing(owned) = store
+            .reserve_operation(
+                "herdr_exec",
+                "unbounded-key",
+                "req-c",
+                "op-c",
+                i64::MAX / 2,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("a NULL-expiry row must survive a far-future prune attempt");
+        };
+        assert_eq!(owned.state.as_deref(), Some("pending"));
     }
 
     #[test]
@@ -7474,7 +7509,7 @@ mod tests {
                         "persisted-request",
                         "persisted-op",
                         100,
-                        10_000,
+                        Some(10_000),
                     )
                     .unwrap(),
                 OperationReservation::Reserved
@@ -7486,7 +7521,7 @@ mod tests {
                     "persisted-request",
                     r#"{"ok":true,"value":7}"#,
                     110,
-                    10_000,
+                    Some(10_000),
                 )
                 .unwrap();
         }
@@ -7499,7 +7534,7 @@ mod tests {
                     "persisted-request",
                     "persisted-op",
                     120,
-                    10_000,
+                    Some(10_000),
                 )
                 .unwrap()
             else {

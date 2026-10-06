@@ -3,15 +3,17 @@ use crate::exec_sessions::ExecRegistry;
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
 use crate::projects;
+use crate::state_store::{OperationReservation, StateStore};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +27,17 @@ const UTILITY_OWNED_POLL: Duration = Duration::from_millis(100);
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_STRUCTURED_STEPS: usize = 16;
 const MAX_STRUCTURED_ARGS: usize = 128;
+const MAX_IDEMPOTENCY_KEY_CHARS: usize = 256;
+/// Durable retention for one `herdr_exec` idempotency record. It must be at
+/// least the exec-session retention (`exec_sessions::SESSION_TTL_MS`, 60
+/// minutes): an `exec_timeout` child can still be running as the returned
+/// session_id after the row would otherwise expire, and a shorter window would
+/// let the same key launch a duplicate of that live process.
+const EXEC_RECORD_TTL_MS: u64 = 60 * 60_000;
+/// Replay payload bound; a synchronous exec result stays well under this.
+const MAX_EXEC_REPLAY_JSON_BYTES: usize = 128 * 1024;
+/// Durable operations-ledger kind for `herdr_exec` idempotency.
+const EXEC_OPERATION_KIND: &str = "herdr_exec";
 static UTILITY_SUBMISSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static UTILITY_PANE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
@@ -96,12 +109,368 @@ fn pre_start_rejection(mut result: Value) -> Value {
     result
 }
 
+/// Declared effect of an opt-in durable `herdr_exec` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecIntent {
+    ReadOnly,
+    IdempotentWrite,
+    NonIdempotentWrite,
+}
+
+impl ExecIntent {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read_only" => Some(Self::ReadOnly),
+            "idempotent_write" => Some(Self::IdempotentWrite),
+            "non_idempotent_write" => Some(Self::NonIdempotentWrite),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::IdempotentWrite => "idempotent_write",
+            Self::NonIdempotentWrite => "non_idempotent_write",
+        }
+    }
+}
+
+/// Opt-in durability request parsed from `herdr_exec` arguments.
+///
+/// No fields is the legacy path and reserves nothing. A declared intent is
+/// always accepted: a write intent needs a key, `read_only` may omit one. A
+/// supplied key always needs an intent.
+#[derive(Debug, Clone, Copy)]
+struct ExecRequest<'a> {
+    intent: Option<ExecIntent>,
+    key: Option<&'a str>,
+}
+
+impl<'a> ExecRequest<'a> {
+    fn parse(args: &'a Value) -> Result<Self, Value> {
+        let intent = match optional_str(args, "intent")? {
+            None => None,
+            Some("") => return Err(invalid("intent must not be empty")),
+            Some(value) => Some(ExecIntent::parse(value).ok_or_else(|| {
+                invalid("intent must be one of read_only, idempotent_write, non_idempotent_write")
+            })?),
+        };
+        let key = match optional_str(args, "idempotency_key")? {
+            Some("") => return Err(invalid("idempotency_key must not be empty")),
+            Some(key) if key.chars().count() > MAX_IDEMPOTENCY_KEY_CHARS => {
+                return Err(invalid(&format!(
+                    "idempotency_key must be at most {MAX_IDEMPOTENCY_KEY_CHARS} characters"
+                )));
+            }
+            other => other,
+        };
+        match (intent, key) {
+            (None, None) => Ok(Self {
+                intent: None,
+                key: None,
+            }),
+            (None, Some(_)) => Err(invalid(
+                "idempotency_key requires an explicit intent (read_only, idempotent_write, or non_idempotent_write)",
+            )),
+            (Some(_), None) if intent != Some(ExecIntent::ReadOnly) => Err(invalid(
+                "a write intent requires idempotency_key so the request can be replayed durably",
+            )),
+            (intent, key) => Ok(Self { intent, key }),
+        }
+    }
+}
+
+fn exec_key_hash(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"herdr_exec/idempotency");
+    hasher.update(key.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn exec_now_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// Canonical identity of the resolved invocation including its execution mode.
+/// A freeform command and a structured step list can render identically while
+/// using different paths, and a structured argument may contain any separator
+/// other than NUL, so JSON field boundaries rather than a delimiter join keep
+/// distinct requests distinct. Never echoed in results.
+fn invocation_identity(invocation: &ExecInvocation) -> String {
+    match invocation {
+        ExecInvocation::Command(command) => json!({"mode": "command", "command": command}),
+        ExecInvocation::Steps(steps) => json!({
+            "mode": "steps",
+            "steps": steps
+                .iter()
+                .map(|step| json!({"program": step.program, "args": step.args}))
+                .collect::<Vec<_>>(),
+        }),
+    }
+    .to_string()
+}
+
+/// Binds the resolved workspace/root, the invocation and its mode, the intent
+/// and the busy/timeout gates, so a key can only replay an identical request.
+fn exec_request_fingerprint(
+    workspace_id: &str,
+    effective_root: &Path,
+    invocation: &ExecInvocation,
+    intent: Option<ExecIntent>,
+    confirm_busy: bool,
+    timeout_ms: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        workspace_id,
+        &effective_root.to_string_lossy(),
+        &invocation_identity(invocation),
+        intent.map(ExecIntent::as_str).unwrap_or("legacy"),
+        if confirm_busy { "1" } else { "0" },
+        &timeout_ms.to_string(),
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn idempotency_error(code: &str, message: impl Into<String>) -> Value {
+    pre_start_rejection(json!({
+        "ok": false,
+        "code": code,
+        "message": message.into(),
+        "retryable": false,
+    }))
+}
+
+/// Reserve `(herdr_exec, idempotency_key)` before any delivery. `Ok(None)`
+/// means this key is reserved for this request; `Ok(Some(replay))` returns the
+/// recorded synchronous result of an already-settled key. A same-key/different
+/// request and a still-pending row both fail closed without executing.
+fn reserve_durable_exec(
+    store: &Arc<Mutex<StateStore>>,
+    key: &str,
+    fingerprint: &str,
+    intent: Option<ExecIntent>,
+) -> Result<Option<Value>, Value> {
+    let now = exec_now_ms();
+    let key_hash = exec_key_hash(key);
+    let op_id = format!("op:exec:{}", &key_hash[..32]);
+    let unavailable = |message: String| {
+        idempotency_error(
+            "idempotency_store_unavailable",
+            format!("{message}; the command was not executed"),
+        )
+    };
+    let mut store = store
+        .lock()
+        .map_err(|_| unavailable("durable idempotency store lock is unavailable".to_owned()))?;
+    let reservation = store
+        .reserve_operation(
+            EXEC_OPERATION_KIND,
+            &key_hash,
+            fingerprint,
+            &op_id,
+            now,
+            // A reservation that may already have been delivered must never be
+            // pruned by time alone, so the ownership claim carries no expiry.
+            None,
+        )
+        .map_err(|error| unavailable(format!("durable idempotency reservation failed: {error}")))?;
+    let record = match reservation {
+        OperationReservation::Reserved => return Ok(None),
+        OperationReservation::Existing(record) => record,
+    };
+    if record.request_hash != fingerprint {
+        return Err(pre_start_rejection(json!({
+            "ok": false,
+            "code": "idempotency_key_conflict",
+            "message": "idempotency_key is already bound to a different herdr_exec request",
+            "retryable": false,
+            "op_id": record.op_id,
+            "delivery_state": "not_delivered",
+        })));
+    }
+    match record.state.as_deref() {
+        // Pending stays fail-closed; herdr_exec reservations do not expire by time.
+        Some("pending") => {
+            let mut result = json!({
+                "ok": false,
+                "code": "idempotency_in_flight",
+                "message": "a herdr_exec request with this idempotency_key is reserved and may already have been delivered",
+                "delivery_state": "unknown",
+                "retryable": false,
+                "op_id": record.op_id,
+                "hint": "A durable reservation exists without a settled outcome. Inspect existing exec sessions before another delivery; a runtime restart does not clear the reservation.",
+            });
+            if let Some(object) = result.as_object_mut() {
+                exec_evidence::insert_uncertain_start(object);
+            }
+            Err(result)
+        }
+        Some("complete") => {
+            let corrupt =
+                |message: String| idempotency_error("idempotency_record_corrupt", message);
+            let result_json = record.result_json.ok_or_else(|| {
+                corrupt("completed idempotency record has no replay payload".into())
+            })?;
+            let mut replay: Value = serde_json::from_str(&result_json).map_err(|error| {
+                corrupt(format!(
+                    "completed idempotency replay payload is invalid: {error}"
+                ))
+            })?;
+            let object = replay.as_object_mut().ok_or_else(|| {
+                corrupt("completed idempotency replay payload is not an object".into())
+            })?;
+            if let Some(intent) = intent {
+                object.insert("intent".to_owned(), json!(intent.as_str()));
+            }
+            object.insert("idempotent_replay".to_owned(), json!(true));
+            object.insert("idempotency_persisted".to_owned(), json!(true));
+            // The stored synchronous result keeps its own op_id/session_id;
+            // the replay adds metadata only and never rewrites identity.
+            // A settled row that is not a completed process must never imply a
+            // blind retry; the caller resumes through the recorded session_id.
+            let retry_mode = if object.get("phase").and_then(Value::as_str) == Some("completed") {
+                "none"
+            } else {
+                "inspect_before_retry"
+            };
+            object.insert("safe_retry_mode".to_owned(), json!(retry_mode));
+            Ok(Some(replay))
+        }
+        other => Err(idempotency_error(
+            "idempotency_record_corrupt",
+            format!("idempotency record has unsupported state {other:?}"),
+        )),
+    }
+}
+
+/// Release a reservation this request just inserted after the pre-delivery
+/// mutation gate rejected it. It deletes exactly the row created for this
+/// key/fingerprint/derived op_id, so a later identical request is not blocked
+/// by a pending reservation that never delivered anything. Any mismatch is
+/// surfaced to the caller as a fail-closed store error.
+fn release_durable_exec(
+    store: &Arc<Mutex<StateStore>>,
+    key: &str,
+    fingerprint: &str,
+) -> Result<(), String> {
+    let key_hash = exec_key_hash(key);
+    let op_id = format!("op:exec:{}", &key_hash[..32]);
+    let mut store = store
+        .lock()
+        .map_err(|_| "durable idempotency store lock is unavailable".to_owned())?;
+    store.release_operation_reservation(EXEC_OPERATION_KIND, &key_hash, fingerprint, &op_id)
+}
+
+/// Persist the first synchronous submission result. A failure here is reported
+/// on the real execution result rather than pretending the command did not run.
+///
+/// A result with explicit terminal evidence is bounded by the record TTL. Any
+/// other shape — notably a bounded-wait timeout whose child may still be
+/// running — is stored without an expiry so time alone can never release the
+/// ownership claim and allow a duplicate delivery.
+fn complete_durable_exec(
+    store: &Arc<Mutex<StateStore>>,
+    key: &str,
+    fingerprint: &str,
+    result: &Value,
+) -> Result<(), String> {
+    let result_json = serde_json::to_string(result)
+        .map_err(|error| format!("cannot encode herdr_exec replay payload: {error}"))?;
+    if result_json.len() > MAX_EXEC_REPLAY_JSON_BYTES {
+        return Err(format!(
+            "herdr_exec replay payload exceeds {MAX_EXEC_REPLAY_JSON_BYTES} bytes"
+        ));
+    }
+    let now = exec_now_ms();
+    let mut store = store
+        .lock()
+        .map_err(|_| "durable idempotency store lock is unavailable".to_owned())?;
+    store
+        .complete_operation(
+            EXEC_OPERATION_KIND,
+            &exec_key_hash(key),
+            fingerprint,
+            &result_json,
+            now,
+            exec_completion_expiry(result, now),
+        )
+        .map_err(|error| format!("durable idempotency completion failed: {error}"))
+}
+
+/// Terminal evidence for a recorded synchronous `herdr_exec` submission.
+/// `execution.started == false` is terminal because the command was proven not
+/// delivered; `execution.completed == true` and `phase == "completed"` are the
+/// completed shapes. Everything else is treated as still uncertain.
+fn exec_completion_expiry(result: &Value, now: i64) -> Option<i64> {
+    let execution = result.get("execution");
+    let terminal = result.get("phase").and_then(Value::as_str) == Some("completed")
+        || execution
+            .and_then(|value| value.get("completed"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        || execution
+            .and_then(|value| value.get("started"))
+            .and_then(Value::as_bool)
+            == Some(false);
+    terminal.then(|| now.saturating_add(EXEC_RECORD_TTL_MS as i64))
+}
+
+/// Attach the bounded durability metadata a declared request always exposes.
+/// `persisted` is false for a declared intent that reserved nothing.
+fn annotate_durable_result(
+    mut result: Value,
+    intent: Option<ExecIntent>,
+    persisted: bool,
+) -> Value {
+    let settled = persisted && result.get("phase").and_then(Value::as_str) == Some("completed");
+    if let Some(object) = result.as_object_mut() {
+        if let Some(intent) = intent {
+            object.insert("intent".to_owned(), json!(intent.as_str()));
+        }
+        object.insert("idempotency_persisted".to_owned(), json!(persisted));
+        object.insert("idempotent_replay".to_owned(), json!(false));
+        object.insert(
+            "safe_retry_mode".to_owned(),
+            json!(if settled {
+                "none"
+            } else {
+                "inspect_before_retry"
+            }),
+        );
+    }
+    result
+}
+
 pub fn run_durable(
     client: &HerdrClient,
     snapshot: &Value,
     registry: &ExecRegistry,
+    store: &Arc<Mutex<StateStore>>,
     args: &Value,
 ) -> Value {
+    let request = match ExecRequest::parse(args) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     let workspace_target = match required_str(args, "workspace") {
         Ok(value) => value,
         Err(error) => return error,
@@ -170,11 +539,55 @@ pub fn run_durable(
             }));
         }
     };
-    let working =
-        match mutation::check_with_topology(snapshot, &topology, &effective_root, confirm_busy) {
-            Ok(working) => working,
-            Err(error) => return pre_start_rejection(error),
-        };
+    // Opt-in durable idempotency, resolved and reserved before the live busy
+    // gate. An already-settled replay and an existing pending/conflict outcome
+    // both deliver no command, so they must return regardless of later busy
+    // state. A newly Reserved key still has to pass the pre-delivery mutation
+    // gate below before anything is delivered. A declared intent with no key
+    // (`read_only`) reserves nothing and is served as an ordinary request that
+    // merely reports its intent.
+    let mut reservation: Option<(&str, String)> = None;
+    if let Some(key) = request.key {
+        let fingerprint = exec_request_fingerprint(
+            &workspace.id,
+            &effective_root,
+            &invocation,
+            request.intent,
+            confirm_busy,
+            timeout_ms,
+        );
+        match reserve_durable_exec(store, key, &fingerprint, request.intent) {
+            Ok(Some(replay)) => return replay,
+            Ok(None) => reservation = Some((key, fingerprint)),
+            Err(error) => return error,
+        }
+    }
+
+    let working = match mutation::check_with_topology(
+        snapshot,
+        &topology,
+        &effective_root,
+        confirm_busy,
+    ) {
+        Ok(working) => working,
+        Err(error) => {
+            // A newly inserted reservation never delivered anything, so it
+            // must be released rather than left pending to block a later
+            // identical request. A failed release is reported as an
+            // explicit fail-closed outcome, not a misleading busy response.
+            if let Some((key, fingerprint)) = reservation.as_ref()
+                && let Err(release_error) = release_durable_exec(store, key, fingerprint)
+            {
+                return idempotency_error(
+                    "idempotency_store_unavailable",
+                    format!(
+                        "the pre-delivery mutation gate rejected the request and its pending reservation could not be released ({release_error}); the command was not delivered"
+                    ),
+                );
+            }
+            return pre_start_rejection(error);
+        }
+    };
 
     // Ordinary, non-interactive execution reuses the durable native
     // `ExecRegistry` backend as start + bounded synchronous wait + result. The
@@ -186,41 +599,100 @@ pub fn run_durable(
         #[cfg(unix)]
         {
             let _ = cleanup_stale_scripts();
-            return run_unix_durable(
-                client,
-                snapshot,
-                registry,
-                (&workspace.id, &effective_root),
-                &command,
-                timeout_ms,
-                &working,
+            return finish_durable(
+                store,
+                reservation,
+                request.intent,
+                run_unix_durable(
+                    client,
+                    snapshot,
+                    registry,
+                    (&workspace.id, &effective_root),
+                    &command,
+                    timeout_ms,
+                    &working,
+                ),
             );
         }
         #[cfg(not(unix))]
         {
-            return pre_start_rejection(json!({
-                "ok": false,
-                "code": "unsupported_platform",
-                "message": "protected-path execution requires the macOS utility-pane transport",
-                "workspace": workspace.id,
-                "command": command,
-                "effective_cwd": effective_root.to_string_lossy(),
-                "project_root": effective_root.to_string_lossy(),
-            }));
+            return finish_durable(
+                store,
+                reservation,
+                request.intent,
+                pre_start_rejection(json!({
+                    "ok": false,
+                    "code": "unsupported_platform",
+                    "message": "protected-path execution requires the macOS utility-pane transport",
+                    "workspace": workspace.id,
+                    "command": command,
+                    "effective_cwd": effective_root.to_string_lossy(),
+                    "project_root": effective_root.to_string_lossy(),
+                })),
+            );
         }
     }
 
     #[cfg(not(unix))]
     let _ = (client, snapshot);
 
-    run_native_durable(
-        registry,
-        (&workspace.id, &effective_root),
-        &invocation,
-        &command,
-        timeout_ms,
-        &working,
+    finish_durable(
+        store,
+        reservation,
+        request.intent,
+        run_native_durable(
+            registry,
+            (&workspace.id, &effective_root),
+            &invocation,
+            &command,
+            timeout_ms,
+            &working,
+        ),
     )
+}
+
+/// Persist the first synchronous submission result for a reserved key.
+///
+/// The row records that the synchronous `herdr_exec` submission result was
+/// captured, not that a timed-out child process later exited. A persistence
+/// failure after execution is reported on the real result instead of implying a
+/// blind retry. A declared intent that reserved nothing reports its intent with
+/// no durable record claimed.
+fn finish_durable(
+    store: &Arc<Mutex<StateStore>>,
+    reservation: Option<(&str, String)>,
+    intent: Option<ExecIntent>,
+    result: Value,
+) -> Value {
+    let Some((key, fingerprint)) = reservation else {
+        return match intent {
+            Some(intent) => annotate_durable_result(result, Some(intent), false),
+            None => result,
+        };
+    };
+    let result = annotate_durable_result(result, intent, true);
+    match complete_durable_exec(store, key, &fingerprint, &result) {
+        Ok(()) => result,
+        Err(error) => annotate_completion_failure(result, error),
+    }
+}
+
+/// The command already ran, so the real execution result stays truthful and the
+/// missing replay record is reported as metadata. The reservation usually stays
+/// pending/in-flight, which itself blocks a duplicate delivery, so a blind retry
+/// is never implied.
+fn annotate_completion_failure(mut result: Value, error: String) -> Value {
+    if let Some(object) = result.as_object_mut() {
+        object.insert("idempotency_persisted".to_owned(), json!(false));
+        object.insert("safe_retry_mode".to_owned(), json!("inspect_before_retry"));
+        object.insert(
+            "idempotency_warning".to_owned(),
+            json!(format!(
+                "{error}; the completion result was not persisted and the durable reservation may still be pending/in-flight. Inspect the session/process state before retrying, and do not retry blindly."
+            )),
+        );
+    }
+    result
 }
 
 fn resolve_exec_invocation(args: &Value) -> Result<ExecInvocation, Value> {
@@ -1727,6 +2199,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({"workspace": "w1", "command": "printf 'must-not-run-natively\\n'"}),
         );
 
@@ -1865,6 +2338,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({"workspace": "w1", "command": "printf 'must-not-run-natively\n'"}),
         );
 
@@ -1917,6 +2391,11 @@ mod tests {
         base
     }
 
+    /// In-memory durable store for exec durability tests.
+    fn test_store() -> Arc<Mutex<StateStore>> {
+        Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()))
+    }
+
     fn native_test_snapshot(root: &Path) -> Value {
         json!({
             "workspaces": [{
@@ -1945,6 +2424,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({
                 "workspace": "w1",
                 "project_root": outside.to_string_lossy(),
@@ -1981,6 +2461,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({"workspace": "w1", "command": "printf 'native-default-ok\\n'"}),
         );
 
@@ -2016,6 +2497,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({"workspace": "w1", "command": "sleep 30", "timeout_ms": 250}),
         );
 
@@ -2071,6 +2553,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({
                 "workspace": "w1",
                 "steps": [{"program": cli.to_string_lossy(), "args": ["--json"]}]
@@ -2124,6 +2607,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({"workspace": "w1", "command": "printf '{\"task\":\"ok\"}'"}),
         );
 
@@ -2140,6 +2624,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({"workspace": "w1", "command": "printf '[1,2,3]'"}),
         );
         assert_eq!(array["ok"], true, "unexpected result: {array}");
@@ -2163,6 +2648,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({"workspace": "w1", "command": "sleep 30", "timeout_ms": 250}),
         );
 
@@ -2196,6 +2682,7 @@ mod tests {
             &client,
             &snapshot,
             &registry,
+            &test_store(),
             &json!({
                 "workspace": "w1",
                 "steps": [
@@ -2218,6 +2705,277 @@ mod tests {
             !output.contains("never-runs"),
             "steps must stop on first failure: {output}"
         );
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A keyed `non_idempotent_write` must deliver the side effect exactly once
+    /// and replay the recorded synchronous result — same session_id, same
+    /// output — without a second delivery.
+    #[cfg(unix)]
+    #[test]
+    fn keyed_write_executes_once_and_replays_the_recorded_result() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("side-effect.txt");
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+        let store = test_store();
+        let command = format!("printf x >> {}", marker.to_string_lossy());
+        let args = json!({
+            "workspace": "w1",
+            "command": command,
+            "intent": "non_idempotent_write",
+            "idempotency_key": "side-effect-once",
+        });
+
+        let first = run_durable(&client, &snapshot, &registry, &store, &args);
+        assert_eq!(first["ok"], true, "unexpected result: {first}");
+        assert_eq!(first["phase"], "completed");
+        assert_eq!(first["intent"], "non_idempotent_write");
+        assert_eq!(first["idempotency_persisted"], true);
+        assert_eq!(first["idempotent_replay"], false);
+        assert_eq!(first["safe_retry_mode"], "none");
+        let first_session = first["session_id"].clone();
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
+
+        let replay = run_durable(&client, &snapshot, &registry, &store, &args);
+        assert_eq!(replay["ok"], true, "unexpected replay: {replay}");
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["idempotency_persisted"], true);
+        assert_eq!(replay["intent"], "non_idempotent_write");
+        assert_eq!(replay["session_id"], first_session);
+        assert_eq!(replay["output"], first["output"]);
+        // The replay preserves the original synchronous result identity; it is
+        // never rewritten with the durable ledger's own op_id.
+        assert_eq!(replay["op_id"], first["op_id"]);
+        // The single side effect proves no second delivery happened.
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
+
+        // A completed key must replay identically even when an agent in the
+        // same project became busy after the original execution. The replay
+        // delivers no command, so it must never be turned into a live
+        // agent_working rejection.
+        let mut busy_snapshot = snapshot.clone();
+        busy_snapshot["agents"] = json!([{
+            "agent": "pi",
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+            "cwd": root.to_string_lossy(),
+            "agent_status": "working",
+        }]);
+        let busy_replay = run_durable(&client, &busy_snapshot, &registry, &store, &args);
+        assert_eq!(
+            busy_replay["ok"], true,
+            "unexpected busy replay: {busy_replay}"
+        );
+        assert_eq!(busy_replay["idempotent_replay"], true);
+        assert_eq!(busy_replay["idempotency_persisted"], true);
+        assert_eq!(busy_replay["session_id"], first_session);
+        assert_eq!(busy_replay["op_id"], first["op_id"]);
+        assert_eq!(busy_replay["output"], first["output"]);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
+
+        // A brand-new keyed request is still gated by the busy mutation check
+        // before any delivery. The rejected reservation is released, so the
+        // same key succeeds exactly once after the agent settles instead of
+        // staying blocked as an in-flight key.
+        let gate_marker = root.join("gate-effect.txt");
+        let gate_args = json!({
+            "workspace": "w1",
+            "command": format!("printf g >> {}", gate_marker.to_string_lossy()),
+            "intent": "non_idempotent_write",
+            "idempotency_key": "gate-key",
+        });
+        let busy_new = run_durable(&client, &busy_snapshot, &registry, &store, &gate_args);
+        assert_eq!(busy_new["ok"], false, "unexpected busy gate: {busy_new}");
+        assert_eq!(busy_new["reason"], "agent_working");
+        assert_eq!(busy_new["delivery_state"], "not_delivered");
+        assert!(!gate_marker.exists());
+        let after_settle = run_durable(&client, &snapshot, &registry, &store, &gate_args);
+        assert_eq!(
+            after_settle["ok"], true,
+            "unexpected settled run: {after_settle}"
+        );
+        assert_eq!(after_settle["idempotent_replay"], false);
+        assert_eq!(fs::read_to_string(&gate_marker).unwrap(), "g");
+        let settled_replay = run_durable(&client, &snapshot, &registry, &store, &gate_args);
+        assert_eq!(settled_replay["idempotent_replay"], true);
+        assert_eq!(fs::read_to_string(&gate_marker).unwrap(), "g");
+
+        // Legacy calls are untouched: the same command without intent/key runs
+        // again and reports no durability metadata at all.
+        let legacy = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &store,
+            &json!({"workspace": "w1", "command": command}),
+        );
+        assert_eq!(legacy["ok"], true, "unexpected legacy: {legacy}");
+        assert!(legacy.get("intent").is_none());
+        assert!(legacy.get("idempotent_replay").is_none());
+        assert!(legacy.get("idempotency_persisted").is_none());
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "xx");
+
+        // An explicit read_only without a key stays accepted, reserves nothing,
+        // and reports bounded intent metadata without claiming a replay.
+        let read_only = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &store,
+            &json!({"workspace": "w1", "command": "printf ro", "intent": "read_only"}),
+        );
+        assert_eq!(read_only["ok"], true, "unexpected read_only: {read_only}");
+        assert_eq!(read_only["intent"], "read_only");
+        assert_eq!(read_only["idempotency_persisted"], false);
+        assert_eq!(read_only["idempotent_replay"], false);
+
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Reusing a settled key for a different request must fail closed with no
+    /// execution, so a conflict can never replay or overwrite another request.
+    #[cfg(unix)]
+    #[test]
+    fn keyed_request_reuse_with_a_different_command_conflicts_without_executing() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("conflict-effect.txt");
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+        let store = test_store();
+
+        let first = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &store,
+            &json!({
+                "workspace": "w1",
+                "steps": [{"program": "printf", "args": ["first"]}],
+                "intent": "idempotent_write",
+                "idempotency_key": "bound-key",
+            }),
+        );
+        assert_eq!(first["ok"], true, "unexpected first result: {first}");
+        assert_eq!(first["idempotent_replay"], false);
+
+        // Same key, different execution mode that renders identically: the
+        // structured argv and the freeform command both print "first", but the
+        // fingerprint binds the mode, so this is a conflict.
+        let conflicting_step = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &store,
+            &json!({
+                "workspace": "w1",
+                "command": "printf first",
+                "intent": "idempotent_write",
+                "idempotency_key": "bound-key",
+            }),
+        );
+        assert_eq!(conflicting_step["ok"], false);
+        assert_eq!(conflicting_step["code"], "idempotency_key_conflict");
+        assert_eq!(conflicting_step["delivery_state"], "not_delivered");
+        assert_eq!(conflicting_step["execution"]["started"], false);
+        assert!(!marker.exists());
+
+        // Same key, genuinely different command: also refused, and nothing runs.
+        let conflicting = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &store,
+            &json!({
+                "workspace": "w1",
+                "command": format!("printf y > {}", marker.to_string_lossy()),
+                "intent": "idempotent_write",
+                "idempotency_key": "bound-key",
+            }),
+        );
+        assert_eq!(conflicting["ok"], false);
+        assert_eq!(conflicting["code"], "idempotency_key_conflict");
+        assert_eq!(conflicting["delivery_state"], "not_delivered");
+        assert_eq!(conflicting["execution"]["started"], false);
+        assert!(!marker.exists());
+
+        // A key without an intent, and a write intent without a key, are
+        // rejected before execution as invalid parameters.
+        let keyless_intent = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &store,
+            &json!({"workspace": "w1", "command": "printf no", "idempotency_key": "k"}),
+        );
+        assert_eq!(keyless_intent["code"], "invalid_params");
+        let intentless_key = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &store,
+            &json!({"workspace": "w1", "command": "printf no", "intent": "idempotent_write"}),
+        );
+        assert_eq!(intentless_key["code"], "invalid_params");
+        assert!(!marker.exists());
+
+        // A reservation whose outcome is not yet settled must fail closed. The
+        // pending row is the delivery guard: the same key must not run again,
+        // and the command's side effect must never be produced.
+        let pending_command = format!("printf pending > {}", marker.to_string_lossy());
+        let pending_fingerprint = exec_request_fingerprint(
+            "w1",
+            &root,
+            &ExecInvocation::Command(pending_command.clone()),
+            Some(ExecIntent::NonIdempotentWrite),
+            false,
+            DEFAULT_TIMEOUT_MS,
+        );
+        store
+            .lock()
+            .unwrap()
+            .reserve_operation(
+                EXEC_OPERATION_KIND,
+                &exec_key_hash("pending-key"),
+                &pending_fingerprint,
+                "op:exec:pending",
+                1,
+                None,
+            )
+            .unwrap();
+        let in_flight = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &store,
+            &json!({
+                "workspace": "w1",
+                "command": pending_command,
+                "intent": "non_idempotent_write",
+                "idempotency_key": "pending-key",
+            }),
+        );
+        assert_eq!(in_flight["ok"], false, "unexpected in-flight: {in_flight}");
+        assert_eq!(in_flight["code"], "idempotency_in_flight");
+        assert_eq!(in_flight["delivery_state"], "unknown");
+        assert!(in_flight["execution"]["started"].is_null());
+        assert_eq!(
+            in_flight["failure_origin"],
+            exec_evidence::FAILURE_ORIGIN_UNKNOWN
+        );
+        assert!(
+            !marker.exists(),
+            "a pending reservation must never deliver the command"
+        );
+
         drop(registry);
         let _ = fs::remove_dir_all(base);
     }

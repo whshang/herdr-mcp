@@ -483,16 +483,16 @@ test("health and info expose the same explicit first-party public contract ident
       health.runtimeContractHash,
       "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
     );
-    assert.equal(health.currentRuntimeContractEpoch, 3);
+    assert.equal(health.currentRuntimeContractEpoch, 4);
     assert.equal(
       health.currentRuntimeContractHash,
-      "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",
+      "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
     );
-    assert.equal(info.runtimeContract.epoch, 4);
-    assert.equal(info.previousRuntimeContract.epoch, 3);
+    assert.equal(info.runtimeContract.epoch, 5);
+    assert.equal(info.previousRuntimeContract.epoch, 4);
     assert.equal(
       info.previousRuntimeContract.hash,
-      "sha256:05350993b3e964ab28c8b586c3fdbffa5fa615025bc7f3e93eb6aa960c901fc5",
+      "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
     );
   }
 });

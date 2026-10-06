@@ -114,7 +114,7 @@ ChatGPT 使用经过审核的 MCP action 冻结快照。只升级本地 runtime 
 
 Herdr 从 0.4.3 起明确区分两层 contract：
 
-**ChatGPT public contract（first-party DEV/PROD）：epoch 7 / 19 actions；workstation runtime execution contract：epoch 4 / 18 tools。** 第 19 个 action 是 Edge-local `herdr_devices`，不会转发到 workstation。Runtime epoch 2/3 与公共 Edge epoch 3 仅作为有界的 rollback/compatibility 基线保留。
+**ChatGPT public contract（first-party DEV/PROD）：epoch 7 / 19 actions；workstation runtime execution contract：epoch 5 / 18 tools。** 第 19 个 action 是 Edge-local `herdr_devices`，不会转发到 workstation。紧邻上一代冻结的 epoch 4 与冻结的 epoch 2 catalog 仅作为有界的 rollback/compatibility 基线保留，epoch 3 仅属历史，公共 Edge epoch 3 身份仍作为非 DEV/PROD 的有界基线保留。
 
 典型现象：
 

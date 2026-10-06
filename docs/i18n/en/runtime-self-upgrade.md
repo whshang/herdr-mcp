@@ -124,7 +124,7 @@ A candidate becomes active only after validation:
 5. optional runtime version checks pass;
 6. observation checks remain healthy when required.
 
-The current first-party DEV/PROD public Edge contract is **epoch 7 / 19 actions**, while the workstation Runtime Execution Contract is **epoch 4 / 18 tools**. Runtime epochs 2/3 and the public Edge epoch-3 identity remain only as bounded rollback/compatibility baselines. Exact build hashes are release evidence, not long-lived documentation facts. Activation follows the current frozen contract definitions.
+The current first-party DEV/PROD public Edge contract is **epoch 7 / 19 actions**, while the workstation Runtime Execution Contract is **epoch 5 / 18 tools**. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog remain only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline. Exact build hashes are release evidence, not long-lived documentation facts. Activation follows the current frozen contract definitions.
 
 ## Runtime upgrade and contract migration are different
 

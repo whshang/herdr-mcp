@@ -427,8 +427,40 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /source_target_mode/);
   assert.match(recovery, /source_manifest_schema/);
   assert.match(recovery, /source_target_matrix/);
-  assert.match(recovery, /contracts\/runtime-exec-v4\.json/);
+  assert.match(recovery, /contracts\/runtime-exec-v5\.json/);
   assert.match(recovery, /contracts\/epoch2\.json/);
+  // The source-contract fallback must select the tagged source descriptor in
+  // exact compatibility order: current v5, then the immediate previous v4
+  // rollback baseline, then the frozen epoch2 base. A v4-only source must
+  // recover its real contract identity instead of silently reporting epoch2.
+  const contractFallback = recovery.slice(
+    recovery.indexOf('if git cat-file -e "${source_digest}:contracts/runtime-exec-v5.json"'),
+    recovery.indexOf("source_contract_epoch="),
+  );
+  assert.match(
+    contractFallback,
+    /if git cat-file -e "\$\{source_digest\}:contracts\/runtime-exec-v5\.json"/,
+    "the v5 descriptor must be the first fallback branch",
+  );
+  assert.match(
+    contractFallback,
+    /elif git cat-file -e "\$\{source_digest\}:contracts\/runtime-exec-v4\.json"/,
+    "the v4 descriptor must be the second fallback branch",
+  );
+  assert.match(
+    contractFallback,
+    /source_contract="\$\(git show "\$\{source_digest\}:contracts\/epoch2\.json"\)"/,
+    "epoch2 must remain the final fallback",
+  );
+  assert.ok(
+    contractFallback.indexOf("runtime-exec-v5.json") <
+      contractFallback.indexOf("runtime-exec-v4.json"),
+    "v5 must be selected before the v4 fallback",
+  );
+  assert.ok(
+    contractFallback.indexOf("runtime-exec-v4.json") < contractFallback.indexOf("epoch2.json"),
+    "v4 must be selected before the epoch2 fallback",
+  );
   assert.match(recovery, /runtime_manifest = root \/ "runtime-manifest\.json"/);
   assert.match(recovery, /legacy_manifest = root \/ "release-manifest\.json"/);
   assert.match(recovery, /manifest_mode = "runtime"/);

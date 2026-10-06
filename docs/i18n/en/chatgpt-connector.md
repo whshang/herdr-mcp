@@ -108,7 +108,7 @@ ChatGPT uses a reviewed/frozen snapshot of MCP action definitions. A runtime or 
 
 Herdr 0.4.3 introduced the intentional separation of the two contracts:
 
-**public ChatGPT contract (first-party DEV/PROD): epoch 7 / 19 actions; workstation runtime execution contract: epoch 4 / 18 tools.** The extra public action is Edge-local `herdr_devices`; it is never forwarded to a workstation. Runtime epochs 2/3 and the public Edge epoch-3 identity are retained only as bounded rollback/compatibility baselines.
+**public ChatGPT contract (first-party DEV/PROD): epoch 7 / 19 actions; workstation runtime execution contract: epoch 5 / 18 tools.** The extra public action is Edge-local `herdr_devices`; it is never forwarded to a workstation. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
 
 Example:
 

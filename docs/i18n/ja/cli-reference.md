@@ -118,7 +118,7 @@ probe のサブプロセスは stdin を受け取らず、3 秒の timeout と�
 
 ### Web planner 向けの動的プランニング助言
 
-現在のワークステーション Runtime Execution Contract は epoch 4 / 18 tools で、専用の planning tool は追加しません。first-party の公開 Edge contract は epoch 7 / 19 actions で、`herdr_devices` は Edge ローカルです。progressive な `herdr_skill` bootstrap は、既存の `herdr_call` tool を経由する読み取り専用のローカルメソッドを告知します:
+現在のワークステーション Runtime Execution Contract は epoch 5 / 18 tools で、専用の planning tool は追加しません。first-party の公開 Edge contract は epoch 7 / 19 actions で、`herdr_devices` は Edge ローカルです。progressive な `herdr_skill` bootstrap は、既存の `herdr_call` tool を経由する読み取り専用のローカルメソッドを告知します:
 
 ```text
 herdr_call(

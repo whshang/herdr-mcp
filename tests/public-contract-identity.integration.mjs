@@ -41,13 +41,13 @@ test("runtime execution contract epoch 4 is independent of the public contract e
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), true);
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name.startsWith("herdr_mcp.")), false);
 
-  // Current runtime execution contract: epoch-4 identity over the frozen 18-tool shape.
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 4);
+  // Current runtime execution contract: epoch-5 identity over the frozen 18-tool shape.
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 5);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, PUBLIC_CONTRACT_HASH);
 
-  assert.equal(PUBLIC_CONTRACT_EPOCH, 4);
-  assert.equal(PUBLIC_CONTRACT_HASH, "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135");
+  assert.equal(PUBLIC_CONTRACT_EPOCH, 5);
+  assert.equal(PUBLIC_CONTRACT_HASH, "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030");
   assert.equal(EDGE_EPOCH, 3);
   assert.equal(EDGE_HASH, EPOCH3_CONTRACT.contract_hash);
   assert.equal(EPOCH3_CONTRACT.tool_count, 19);
@@ -59,7 +59,7 @@ test("runtime execution contract epoch 4 is independent of the public contract e
   assert.equal(PUBLIC_CONTRACT_PROFILE, "epoch2");
 
   // The cutover/domain probe follows the current runtime execution contract.
-  assert.equal(DOMAIN_EPOCH, 4);
+  assert.equal(DOMAIN_EPOCH, 5);
   assert.equal(DOMAIN_HASH, PUBLIC_CONTRACT_HASH);
   assert.equal(DOMAIN_TOOL_COUNT, 18);
 });

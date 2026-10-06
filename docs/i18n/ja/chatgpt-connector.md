@@ -108,7 +108,7 @@ ChatGPT は、レビュー済みで凍結された MCP action 定義のスナッ
 
 Herdr 0.4.3 は、二つの contract を意図的に分離しました。
 
-**public ChatGPT contract（first-party DEV/PROD）：epoch 7 / 19 actions。workstation runtime execution contract：epoch 4 / 18 tools。** 追加された公開 action は Edge-local の `herdr_devices` であり、ワークステーションに転送されることはありません。Runtime epoch 2/3 と public Edge epoch 3 identity は、有界な rollback / compatibility のベースラインとしてのみ保持されます。
+**public ChatGPT contract（first-party DEV/PROD）：epoch 7 / 19 actions。workstation runtime execution contract：epoch 5 / 18 tools。** 追加された公開 action は Edge-local の `herdr_devices` であり、ワークステーションに転送されることはありません。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、有界な rollback / compatibility のベースラインとしてのみ保持されます。epoch 3 は historical only であり、public Edge の epoch-3 identity は非 DEV/PROD の有界なベースラインとして残ります。
 
 例:
 
