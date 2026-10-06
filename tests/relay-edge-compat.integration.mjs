@@ -108,7 +108,7 @@ test("tracked Cloudflare epoch-2 catalog stays frozen to the captured 18-tool co
   assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), expected);
 });
 
-test("public epoch 3 evolves independently while runtime execution advances to epoch 5", () => {
+test("user keeps public and runtime contracts independent | Given the frozen public epoch-3 contract | When runtime execution advances to epoch 5 | Then the public contract identity stays unchanged", () => {
   assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 5);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030");
@@ -432,7 +432,7 @@ test("public epoch 7 removes safety-sensitive wording without changing tool beha
   assert.equal(EPOCH6_CONTRACT.contract_hash, "sha256:addcde324850f88cd2f87bf38de1edb7fc34e90e8cd178b37cc49694b56636cf");
 });
 
-test("runtime execution epoch 5 adds opt-in intent/idempotency_key metadata without changing the tool list", async () => {
+test("user opts into durable exec metadata | Given the frozen 18-tool catalog and runtime epoch 4 | When runtime execution advances to epoch 5 | Then only herdr_exec intent and idempotency metadata change", async () => {
   const root = new URL("../", import.meta.url);
   const descriptor = JSON.parse(
     await readFile(new URL("contracts/runtime-exec-v5.json", root), "utf8"),

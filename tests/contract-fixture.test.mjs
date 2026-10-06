@@ -39,7 +39,7 @@ test("runtime parity fixture pins the shared Node/Rust wire invariants", async (
   assert.deepEqual(parity.stateless_json_methods, ["server/discover", "tools/call"]);
 });
 
-test("relay adapters expected runtime contract constants match the runtime-exec-v5 descriptor", async () => {
+test("user keeps relay runtime identity aligned | Given runtime-exec-v5 is current | When relay adapter constants are read | Then epoch and hash match the descriptor", async () => {
   const descriptor = JSON.parse(
     await readFile(new URL("contracts/runtime-exec-v5.json", root), "utf8"),
   );
@@ -59,7 +59,7 @@ test("relay adapters expected runtime contract constants match the runtime-exec-
   }
 });
 
-test("edge runtime identity mirrors the frozen epoch-2 shape and the runtime-exec-v5 identity", async () => {
+test("user keeps Edge runtime identity aligned | Given frozen epoch-2 and runtime-exec-v5 descriptors | When Edge compatibility identities are read | Then current and rollback identities match", async () => {
   const descriptor = JSON.parse(
     await readFile(new URL("contracts/runtime-exec-v5.json", root), "utf8"),
   );
