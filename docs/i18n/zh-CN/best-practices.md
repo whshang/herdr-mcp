@@ -26,11 +26,11 @@ herdr-mcp 的理想工作方式是：**Web 模型负责理解目标、做决策�
 优先使用：
 
 - `herdr_fs_read` / `herdr_fs_list` / `herdr_fs_grep`
-- `herdr_fs_patch` / `herdr_fs_edit`
+- 已知局部替换优先 `herdr_fs_edit`；需要上下文补丁时使用 `herdr_fs_patch`，一次 mutation 只承载一个清晰、可审计的改动边界
 - `herdr_git`
 - `herdr_exec`，以及长任务用的 `herdr_exec_start` / `read` / `kill`
 
-这条原则的价值主要是减少等待、减少状态转述，并让 Web planner 直接看到操作结果。Agent 数量应该由任务并行性和推理需要决定。
+这条原则的价值主要是减少等待、减少状态转述，并让 Web planner 直接看到操作结果。Agent 数量应该由任务并行性和推理需要决定。委派给 Agent 的提示词也保持任务化和事实化：写清目标、工作目录、修改范围、验收与停止条件；仓库规则和详细背景由 Agent 在项目内读取，避免把整份安全策略或开发手册重复塞进一次调度参数。
 
 ## 3. 什么时候调度本地 Agent
 

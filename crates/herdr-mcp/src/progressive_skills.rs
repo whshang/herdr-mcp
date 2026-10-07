@@ -220,7 +220,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 10] = [
     },
     BuiltinSkillSpec {
         id: "files-mutation",
-        description: "File mutation only: herdr_fs_write = CREATE / FULL REWRITE; herdr_fs_edit = exact replacement; herdr_fs_patch = PATCH EXISTING FILES or coherent multi-file changes.",
+        description: "Edit managed project files with exact replacements, full rewrites, or bounded patches. Prefer exact replacement for a known local change and keep each mutation scoped to one coherent change.",
         content: FILES_MUTATION,
         triggers: &["edit", "write", "patch", "modify files"],
         requires_capabilities: &["managed project root", "mutation gate"],
@@ -268,7 +268,7 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 10] = [
     },
     BuiltinSkillSpec {
         id: "agent-dispatch",
-        description: "Select and submit compatible local-agent work from live capability facts with explicit ownership and verification.",
+        description: "Submit concise local-agent tasks from live capability facts with explicit ownership, idempotency, and result verification.",
         content: AGENT_DISPATCH,
         triggers: &[
             "delegate",
@@ -4445,8 +4445,8 @@ mod tests {
         assert!(search.description.contains("READ ONLY"));
         assert!(search.owned_tools.contains(&"herdr_fs_read".to_owned()));
         assert!(!search.owned_tools.contains(&"herdr_fs_write".to_owned()));
-        assert!(mutation.description.contains("CREATE / FULL REWRITE"));
-        assert!(mutation.description.contains("PATCH EXISTING FILES"));
+        assert!(mutation.description.contains("exact replacements"));
+        assert!(mutation.description.contains("bounded patches"));
         assert!(mutation.owned_tools.contains(&"herdr_fs_write".to_owned()));
         assert!(mutation.owned_tools.contains(&"herdr_fs_patch".to_owned()));
     }
