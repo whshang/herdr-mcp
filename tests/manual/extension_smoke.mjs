@@ -774,6 +774,27 @@ ok(
       === "chatgpt-user-123",
     "ChatGPT account identity is observed through the provider adapter hook");
 
+  const accountFallbackCtx = vm.createContext({
+    window: {},
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    fetch: async (url, options) => ({
+      ok: url === "/api/auth/session"
+        && options?.method === "GET"
+        && options?.credentials === "include"
+        && options?.cache === "no-store",
+      json: async () => url === "/api/auth/session"
+        ? { user: { id: "  chatgpt-session-user-456  " }, accessToken: "ignored-secret" }
+        : {},
+    }),
+    console,
+  });
+  vm.runInContext(baseCode, accountFallbackCtx);
+  vm.runInContext(chatgptCode, accountFallbackCtx);
+  ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", accountFallbackCtx)
+      === "chatgpt-session-user-456",
+    "ChatGPT account identity falls back to the signed-in session without exposing its access token");
+
   const composerStop = { id: "composer-stop" };
   const unrelatedStop = { id: "unrelated-stop" };
   const composerScope = {

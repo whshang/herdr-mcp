@@ -61,20 +61,21 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   async getAccountNativeIdentity() {
-    try {
-      const response = await fetch("/backend-api/me", {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: { accept: "application/json" },
-      });
-      if (!response.ok) return null;
-      const payload = await response.json();
-      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-    } catch (_) {
-      return null;
+    for (const url of ["/backend-api/me", "/api/auth/session"]) {
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers: { accept: "application/json" },
+        });
+        if (!response.ok) continue;
+        const payload = await response.json();
+        const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
+        if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+      } catch (_) {}
     }
+    return null;
   }
 
   getConversationKey() {
