@@ -118,6 +118,7 @@ const browserRegistryRequests = [];
 const mcpRequestBodies = [];
 const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
+let mockChatGptBackgroundAccountIdentity = null;
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
@@ -128,6 +129,22 @@ const initialLocaleReadGate = new Promise((resolve) => { releaseInitialLocaleRea
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
   const url = String(input || "");
+  if (url === "https://chatgpt.com/backend-api/me") {
+    return new Response(JSON.stringify(mockChatGptBackgroundAccountIdentity
+      ? { id: mockChatGptBackgroundAccountIdentity }
+      : {}), {
+      status: mockChatGptBackgroundAccountIdentity ? 200 : 404,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (url === "https://chatgpt.com/api/auth/session") {
+    return new Response(JSON.stringify(mockChatGptBackgroundAccountIdentity
+      ? { user: { id: mockChatGptBackgroundAccountIdentity }, accessToken: "ignored-secret" }
+      : {}), {
+      status: mockChatGptBackgroundAccountIdentity ? 200 : 404,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (url.startsWith("chrome-extension://test-ext/")) {
     const rel = url.slice("chrome-extension://test-ext/".length);
     return new Response(readFileSync(path.join(EXT, rel), "utf8"), {
@@ -1210,6 +1227,37 @@ console.log("\n[Grok supported default-origin registration and recovery]");
       convInfo: projectFallbackState?.convInfo,
       reloads: reloadCalls.slice(projectReloadsBeforeFallback),
     }));
+}
+
+console.log("\n[ChatGPT browser registry identity recovery]");
+{
+  const before = browserRegistryRequests.length;
+  mockChatGptBackgroundAccountIdentity = "chatgpt-background-user-789";
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: PROJECT_KEY,
+    url: PROJECT_HOME_URL,
+  }, { tab: { id: 90, url: PROJECT_HOME_URL } });
+  mockChatGptBackgroundAccountIdentity = null;
+  const observed = browserRegistryRequests.slice(before);
+  ok(Number.isSafeInteger(registered?.browser_generation)
+      && registered?.browser_session_ref == null,
+    "ChatGPT Project home registration recovers browser identity in background without fabricating a session",
+    JSON.stringify(registered));
+  ok(observed.length === 3
+      && observed[0]?.operation === "provider.observe"
+      && observed[0]?.provider === "chatgpt"
+      && observed[0]?.capabilities?.operations?.includes("session.title_projection")
+      && observed[1]?.operation === "resource.observe"
+      && observed[1]?.kind === "account"
+      && observed[1]?.native_identity === "chatgpt-background-user-789"
+      && observed[2]?.operation === "resource.observe"
+      && observed[2]?.kind === "space"
+      && observed[2]?.native_identity === PROJECT_ID
+      && !observed.some((request) => request?.kind === "session"),
+    "ChatGPT background identity recovery publishes current capability and account -> space only",
+    JSON.stringify(observed));
 }
 
 console.log("\n[Gemini browser registry observation]");

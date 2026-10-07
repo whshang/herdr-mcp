@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.134";
+const H2W_SCRIPT_VERSION = "0.1.135";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -2101,6 +2101,27 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
     retryable: completion?.retryable === true,
     trigger,
   };
+}
+
+async function chatGptAccountNativeIdentity() {
+  for (const url of [
+    "https://chatgpt.com/backend-api/me",
+    "https://chatgpt.com/api/auth/session",
+  ]) {
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) continue;
+      const payload = await response.json();
+      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
+      if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+    } catch (_) {}
+  }
+  return null;
 }
 
 function browserProviderCapabilities(provider) {
@@ -9832,14 +9853,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const browserPageInfo = ["chatgpt", "gemini", "claude", "grok"].includes(registeringSite)
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
+      let accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
+      if (!accountNativeIdentity && registeringSite === "chatgpt") {
+        accountNativeIdentity = await chatGptAccountNativeIdentity() || "";
+      }
       let browserObservation = null;
-      if (browserPageInfo && sender.tab?.id && String(msg.accountNativeIdentity || "").trim()) {
+      if (browserPageInfo && sender.tab?.id && accountNativeIdentity) {
         const observationInput = {
           provider: browserPageInfo.site,
           tabId: sender.tab.id,
           convKey: String(msg.convKey || ""),
           pageInfo: browserPageInfo,
-          accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
+          accountNativeIdentity,
           projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
           reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
         };
