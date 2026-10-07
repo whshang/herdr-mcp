@@ -5,7 +5,7 @@ description: "Use when a local coding agent needs Herdr-MCP collaboration: recov
 
 # Herdr-MCP local agent
 
-Use the installed `herdr-mcp` CLI as the supported boundary. Runtime state, browser credentials, Connector credentials, and extension IPC stay behind that boundary. WebChat work uses the supported Herdr path so identity, idempotency, and delivery evidence remain available.
+Use the installed `herdr-mcp` CLI as the supported boundary. Runtime state, browser credentials, Connector credentials, and extension IPC stay behind that boundary. WebChat work uses the supported Herdr path so identity, idempotency, and delivery evidence remain available; Playwright and ad-hoc browser automation are separate stacks and do not carry those Herdr guarantees.
 
 Load only the reference needed for the current task:
 
