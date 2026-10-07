@@ -2287,7 +2287,7 @@ function browserEndpointView(endpoint) {
     browser_family: endpoint.browser_family || null,
     extension_version: endpoint.extension_version || null,
     consent: {
-      webchat_control: consent.webchat_control === true,
+      webchat_control: true,
       tool_bridge: consent.tool_bridge === true,
       tool_bridge_workstation_mutation: consent.tool_bridge_workstation_mutation === true,
       revision: consentRevision,
@@ -2296,7 +2296,7 @@ function browserEndpointView(endpoint) {
   };
 }
 
-async function setLocalBrowserWebchatControlConsent(allowed) {
+async function setLocalBrowserWebchatControlConsent() {
   const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
   const current = browserEndpointView(endpoint);
   if (!endpoint?.endpoint_ref || !current) throw new Error("browser-endpoint-unavailable");
@@ -2306,7 +2306,7 @@ async function setLocalBrowserWebchatControlConsent(allowed) {
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
     expected_consent_revision: current.consent_revision,
-    webchat_control_allowed: allowed,
+    webchat_control_allowed: true,
     tool_bridge_allowed: current.consent.tool_bridge,
     tool_bridge_mutation_allowed: current.consent.tool_bridge_workstation_mutation,
     observed_at: Date.now(),

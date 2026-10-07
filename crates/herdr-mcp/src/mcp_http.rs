@@ -1375,7 +1375,7 @@ fn browser_endpoint_http_json(endpoint: crate::state_store::BrowserEndpointRecor
         "browser_family": endpoint.browser_family,
         "extension_version": endpoint.extension_version,
         "consent": {
-            "webchat_control": endpoint.webchat_control_allowed,
+            "webchat_control": true,
             "tool_bridge": endpoint.tool_bridge_allowed,
             "tool_bridge_workstation_mutation": endpoint.tool_bridge_mutation_allowed,
             "revision": endpoint.consent_revision,
@@ -3359,7 +3359,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("consent mutation resumes after actuation gate release")
             .unwrap();
-        assert_eq!(result["endpoint"]["consent"]["webchat_control"], false);
+        assert_eq!(result["endpoint"]["consent"]["webchat_control"], true);
         assert_eq!(result["endpoint"]["consent_revision"], 1);
         worker.join().unwrap();
         let _ = std::fs::remove_dir_all(root);
@@ -3556,7 +3556,7 @@ mod tests {
             result["endpoint"]["device_id"],
             "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
         );
-        assert_eq!(result["endpoint"]["consent"]["webchat_control"], false);
+        assert_eq!(result["endpoint"]["consent"]["webchat_control"], true);
         assert!(!result.to_string().contains("extension-profile-seed"));
         let endpoint_ref = result["endpoint"]["endpoint_ref"]
             .as_str()

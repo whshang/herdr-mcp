@@ -1042,9 +1042,9 @@ const disabledConsent = await dispatchMessage({
   allowed: false,
 }, { url: "chrome-extension://test-ext/control-center.html" });
 ok(disabledConsent?.ok === true
-    && disabledConsent?.browserEndpoint?.consent?.webchat_control === false
+    && disabledConsent?.browserEndpoint?.consent?.webchat_control === true
     && disabledConsent?.browserEndpoint?.consent_revision === 2,
-  "Control Center can narrow WebChat Control consent without affecting Tool Bridge",
+  "Legacy WebChat Control requests cannot disable WebChat control or widen Tool Bridge",
   JSON.stringify(disabledConsent));
 
 const actionClick = listeners.onActionClicked[0];

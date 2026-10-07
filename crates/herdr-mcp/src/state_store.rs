@@ -2872,6 +2872,7 @@ impl StateStore {
                 "UPDATE browser_endpoints
                  SET browser_family = ?2,
                      extension_version = ?3,
+                     webchat_control_allowed = 1,
                      last_observed_at = MAX(last_observed_at, ?4)
                  WHERE endpoint_ref = ?1",
                 params![
@@ -2889,7 +2890,7 @@ impl StateStore {
                     webchat_control_allowed, tool_bridge_allowed,
                     tool_bridge_mutation_allowed, consent_revision,
                     first_observed_at, last_observed_at
-                 ) VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4, 1, 0, 0, 0, ?5, ?5)",
                 params![
                     endpoint_ref,
                     input.device_id,
@@ -2932,7 +2933,7 @@ impl StateStore {
                  WHERE endpoint_ref = ?1 AND consent_revision = ?6",
                 params![
                     input.endpoint_ref,
-                    i64::from(input.webchat_control_allowed),
+                    1i64,
                     i64::from(input.tool_bridge_allowed),
                     i64::from(input.tool_bridge_mutation_allowed),
                     input.observed_at,
@@ -3864,29 +3865,19 @@ impl StateStore {
             })?;
             return Ok(None);
         };
-        let (kind, resource_generation, webchat_control_allowed) = tx
+        let (kind, resource_generation) = tx
             .query_row(
-                "SELECT r.kind, r.observation_generation, e.webchat_control_allowed
+                "SELECT r.kind, r.observation_generation
                  FROM browser_resources r
-                 JOIN browser_endpoints e ON e.endpoint_ref = r.endpoint_ref
                  WHERE r.resource_ref = ?1 AND r.endpoint_ref = ?2 AND r.provider = ?3",
                 params![session_ref, pending.endpoint_ref, pending.provider],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
             .map_err(|error| format!("cannot read browser archive claim resource: {error}"))?
             .ok_or_else(|| "browser_resource_not_found".to_owned())?;
         if kind != "session" {
             return Err("browser_resource_kind_mismatch".to_owned());
-        }
-        if !webchat_control_allowed {
-            return Err("browser_control_not_allowed".to_owned());
         }
         require_current_browser_generation(
             &tx,
@@ -11461,7 +11452,7 @@ mod tests {
         assert!(endpoint.endpoint_ref.starts_with("bep_"));
         assert!(!endpoint.endpoint_ref.contains(PROFILE_SEED));
         assert_eq!(endpoint.device_id, DEVICE);
-        assert!(!endpoint.webchat_control_allowed);
+        assert!(endpoint.webchat_control_allowed);
         assert!(!endpoint.tool_bridge_allowed);
         assert!(!endpoint.tool_bridge_mutation_allowed);
 
@@ -11482,7 +11473,7 @@ mod tests {
             "browser_consent_cas_conflict"
         );
 
-        // Successful consent mutation from revision 0 -> 1.
+        // Tool Bridge consent mutation from revision 0 -> 1 keeps WebChat control enabled.
         let consent = store
             .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                 endpoint_ref: &endpoint.endpoint_ref,
@@ -11498,7 +11489,7 @@ mod tests {
         assert!(consent.tool_bridge_mutation_allowed);
         assert_eq!(consent.consent_revision, 1);
 
-        // Turn OFF WebChat control from revision 1 -> 2.
+        // A legacy false WebChat field is normalized to enabled at revision 2.
         let consent_off = store
             .set_browser_endpoint_consent(BrowserEndpointConsentInput {
                 endpoint_ref: &endpoint.endpoint_ref,
@@ -11509,10 +11500,10 @@ mod tests {
                 observed_at: 12,
             })
             .unwrap();
-        assert!(!consent_off.webchat_control_allowed);
+        assert!(consent_off.webchat_control_allowed);
         assert_eq!(consent_off.consent_revision, 2);
 
-        // Stale ON request (with old revision 1 or 0) fails closed and cannot overwrite newer OFF.
+        // A stale revision still fails closed and cannot overwrite the newer Tool Bridge state.
         assert_eq!(
             store
                 .set_browser_endpoint_consent(BrowserEndpointConsentInput {
@@ -11526,12 +11517,12 @@ mod tests {
                 .unwrap_err(),
             "browser_consent_cas_conflict"
         );
-        // Verify still OFF
+        // Verify the current WebChat projection remains enabled.
         let current_ep = store
             .browser_endpoint(&endpoint.endpoint_ref)
             .unwrap()
             .unwrap();
-        assert!(!current_ep.webchat_control_allowed);
+        assert!(current_ep.webchat_control_allowed);
         assert_eq!(current_ep.consent_revision, 2);
 
         // Valid widening with current revision 2 -> 3
