@@ -1272,6 +1272,49 @@ const pageAssistReturn = wakeContentListener?.(
 );
 ok(pageAssistReturn === false && !pageAssistSwallowed,
   "WebChat content listener leaves h2w_page_assist responses to the Generic Web listener");
+// Exercise the actual BrowserPage read handler with a Chrome-compatible
+// unresolved initial response. The absence of a Page Assist listener must
+// invoke its existing one-shot kernel injection and settle with a DOM read.
+const pageActionStart = backgroundSource.indexOf("async function performBrowserPageActionRequest(msg) {");
+const pageIdentityStart = backgroundSource.indexOf("function withBrowserPageIdentity(result, page) {", pageActionStart);
+const pageIdentityEnd = backgroundSource.indexOf("\nasync function resolveDoubaoImagePage(", pageIdentityStart);
+let pageReadResponse = null;
+if (pageActionStart >= 0 && pageIdentityStart > pageActionStart && pageIdentityEnd > pageIdentityStart) {
+  const pageRef = "bp_" + "a".repeat(64);
+  let pageSendCount = 0;
+  let pageScriptInjections = 0;
+  const page = { page_ref: pageRef, page_generation: 1, ownership: "claimed", origin: "https://chatgpt.com" };
+  const pageActionCtx = vm.createContext({
+    configReady: Promise.resolve(),
+    browserEndpoint: { endpoint_ref: "bep_test" },
+    browserEndpointView: (endpoint) => endpoint,
+    validBrowserPageRef: (value) => value === pageRef,
+    loadBrowserPages: async () => {},
+    browserPagesByRef: new Map([[pageRef, { endpoint_ref: "bep_test" }]]),
+    originToMatchPattern: () => "https://chatgpt.com/*",
+    hasHostPermission: async () => true,
+    resolveBrowserPage: async () => ({ ok: true, page, tab: { id: 123 } }),
+    chrome: {
+      tabs: { sendMessage: async () => (++pageSendCount === 1
+        ? undefined
+        : { ok: true, generation: "fresh_dom_generation", elements: [] }) },
+      scripting: { executeScript: async () => { pageScriptInjections += 1; } },
+    },
+  });
+  vm.runInContext(
+    backgroundSource.slice(pageActionStart, pageIdentityEnd)
+      + "\n globalThis.exercisePageAction = performBrowserPageActionRequest;",
+    pageActionCtx,
+  );
+  pageReadResponse = await pageActionCtx.exercisePageAction({ action: "observe", pageRef });
+  ok(pageReadResponse?.ok === true
+      && pageReadResponse.generation === "fresh_dom_generation"
+      && pageSendCount === 2
+      && pageScriptInjections === 1,
+    "read-only BrowserPage observe recovers one missing content reply via one kernel injection");
+} else {
+  ok(false, "read-only BrowserPage observe recovery handler is present");
+}
 const wakeHandlerStart = wakeSource.indexOf('if (msg?.type === "h2w_wake")');
 const wakeHandlerEnd = wakeHandlerStart >= 0 ? wakeSource.indexOf('sendResponse({});', wakeHandlerStart) : -1;
 const wakeHandlerBlock = wakeHandlerStart >= 0 && wakeHandlerEnd > wakeHandlerStart

@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.144";
+const H2W_SCRIPT_VERSION = "0.1.145";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -8335,10 +8335,13 @@ async function performBrowserPageActionRequest(msg) {
       }
       return browserPageMutationEnvelope(mutationResponse, page, true);
     }
-    return withBrowserPageIdentity(
-      response || { ok: false, error: "empty_content_response" },
-      page,
-    );
+    // A WebChat listener can yield with no response before Page Assist has
+    // been injected. For read-only operations, treat an empty/non-envelope
+    // response as an absent listener and use the existing bounded injector.
+    if (response && typeof response === "object" && !Array.isArray(response)
+        && typeof response.ok === "boolean") {
+      return withBrowserPageIdentity(response, page);
+    }
   } catch (error) {
     if (mutation) {
       return browserPageMutationEnvelope(
