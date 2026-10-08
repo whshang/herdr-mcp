@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.142";
+const H2W_SCRIPT_VERSION = "0.1.143";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -868,7 +868,7 @@ function enrichConversationInfoWithBrowserScope(tabId, info) {
     project_id: projectId,
     project_name: projectName || null,
     project_key: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
-    project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
+    project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`,
   };
 }
 
@@ -2182,7 +2182,7 @@ async function observeBrowserConversation({
         parent_ref: parentRef,
         native_identity: projectId,
         display_label: projectName,
-        canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
+        canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`,
         observation_generation: observationGeneration,
         observed_at: Date.now(),
       });
@@ -9857,7 +9857,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           project_id: currentProjectId,
           project_name: currentProjectName || pageInfo.project_name || null,
           ...(registeringSite === "chatgpt"
-            ? { project_key: projectKey, project_launch_url: projectKey }
+            ? { project_key: projectKey, project_launch_url: `${projectKey}/project` }
             : { pageKey: projectKey }),
         };
       }

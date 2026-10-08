@@ -308,10 +308,10 @@ ok(wakeSource.includes("chatGptProjectCatalog")
     && backgroundSource.includes("enrichConversationInfoWithBrowserScope")
     && backgroundSource.includes("project_roots"),
   "ChatGPT project catalog restores project identity for plain conversation URLs and keeps local roots on bindings");
-ok(!backgroundSource.includes('project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`')
-    && !backgroundSource.includes('canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`')
-    && !backgroundSource.includes('project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(catalogProjectId)}/project`'),
-  "ChatGPT Project launchers keep the stable resource-id route instead of the redirect target");
+ok(backgroundSource.includes('project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`')
+    && backgroundSource.includes('canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`')
+    && backgroundSource.includes('project_launch_url: `${projectKey}/project`'),
+  "ChatGPT Project launchers use the working /project page while keeping the stable resource-id key");
 ok(controlCenterSource.includes("[HERDR_PROJECT_CONTEXT_START]")
     && controlCenterSource.includes("projectInstructionContext")
     && controlCenterSource.includes('type: "h2w_sync_project_instructions"')
@@ -860,8 +860,9 @@ ok(
     "URL fallback recognizes the reported ChatGPT project conversation");
   ok(conversationInfoFromSupportedUrl(slugged)?.convKey === project,
     "URL fallback normalizes a slugged ChatGPT Project alias to the resource-id key");
-  ok(chatGptConversationInfo(slugged)?.project_launch_url === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978",
-    "Project rollover launcher uses stable Project resource id");
+  ok(chatGptConversationInfo(slugged)?.project_key === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978"
+      && chatGptConversationInfo(slugged)?.project_launch_url === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/project",
+    "Project rollover keeps stable identity but opens the real /project home");
   ok(conversationInfoFromSupportedUrl(projectHome)?.convKey
       === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978"
       && conversationInfoFromSupportedUrl(projectHome)?.binding_scope === "project",

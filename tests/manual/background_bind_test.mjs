@@ -2792,8 +2792,8 @@ console.log("\n[project handoff]");
     "manual ChatGPT Project handoff does not create a new tab", `creates=${tabCreateCount - manualCreateBefore}`);
   ok(tabUpdateCount === manualUpdateBefore + 1
       && lastTabUpdate?.tabId === 401
-      && lastTabUpdate?.url === PROJECT_KEY,
-    "manual ChatGPT Project handoff navigates the current tab to the stable Project entry",
+      && lastTabUpdate?.url === `${PROJECT_KEY}/project`,
+    "manual ChatGPT Project handoff navigates the current tab to the working Project home",
     JSON.stringify(lastTabUpdate));
   ok(projectNavigationPollCount >= 3,
     "current-tab handoff waits until the current tab really reaches Project home");
@@ -3844,6 +3844,25 @@ console.log("\n[Native host runtime snapshot diagnostics]");
       JSON.stringify(snapshot));
   }
   mockNativeHostLastError = null;
+}
+
+console.log("\n[ChatGPT Project catalog launch locator]");
+{
+  const before = browserRegistryRequests.length;
+  await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: PROJECT_KEY,
+    url: PROJECT_HOME_URL,
+    accountNativeIdentity: "chatgpt-project-catalog-launch-test",
+    browserProjects: [{ id: PROJECT_ID, name: "herdr-mcp" }],
+  }, { tab: { id: 1888, url: PROJECT_HOME_URL } });
+  const observed = browserRegistryRequests.slice(before);
+  const space = observed.find((entry) => entry.operation === "resource.observe"
+    && entry.kind === "space" && entry.native_identity === PROJECT_ID);
+  ok(space?.canonical_url === `${PROJECT_KEY}/project`,
+    "ChatGPT catalog space locator launches /project, not its bare stable resource key",
+    JSON.stringify(space));
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
