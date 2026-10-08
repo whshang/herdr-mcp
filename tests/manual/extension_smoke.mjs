@@ -1253,6 +1253,25 @@ ok(chatGptAdapterSource.includes("getStopButtonCandidates()")
     && wakeSource.includes('data.manual === true ? 1200 : (boundedBrowserActuation ? 1500 : 15000)')
     && wakeSource.includes('busy_reason: composerBusyReason() || "unknown"'),
   "manual Continue scopes composer busy detection to explicit composer stop controls and fails fast when truly busy");
+// ChatGPT wake.js and Generic Web Page Assist install independent content
+// listeners. Wake must not respond first to a message owned by Page Assist.
+const pageAssistListenerStart = wakeSource.indexOf("chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {");
+const pageAssistListenerEnd = wakeSource.indexOf("\n    });\n  } catch (e)", pageAssistListenerStart);
+let wakeContentListener = null;
+if (pageAssistListenerStart >= 0 && pageAssistListenerEnd > pageAssistListenerStart) {
+  vm.runInNewContext(
+    wakeSource.slice(pageAssistListenerStart, pageAssistListenerEnd + "\n    });".length),
+    { chrome: { runtime: { onMessage: { addListener(fn) { wakeContentListener = fn; } } } } },
+  );
+}
+let pageAssistSwallowed = false;
+const pageAssistReturn = wakeContentListener?.(
+  { type: "h2w_page_assist", action: "observe" },
+  {},
+  () => { pageAssistSwallowed = true; },
+);
+ok(pageAssistReturn === false && !pageAssistSwallowed,
+  "WebChat content listener leaves h2w_page_assist responses to the Generic Web listener");
 const wakeHandlerStart = wakeSource.indexOf('if (msg?.type === "h2w_wake")');
 const wakeHandlerEnd = wakeHandlerStart >= 0 ? wakeSource.indexOf('sendResponse({});', wakeHandlerStart) : -1;
 const wakeHandlerBlock = wakeHandlerStart >= 0 && wakeHandlerEnd > wakeHandlerStart

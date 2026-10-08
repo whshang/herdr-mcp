@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.143";
+const H2W_CONTENT_VERSION = "0.1.144";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2910,6 +2910,9 @@ function normalizeHerdrMentionAlias(value) {
         });
         return true;
       }
+      // Generic Web Page Assist owns this message. Do not consume the
+      // asynchronous response before its independent listener handles it.
+      if (msg?.type === "h2w_page_assist") return false;
       sendResponse({});
     });
   } catch (e) { console.warn("[h2w] failed to register onMessage:", e.message); }
