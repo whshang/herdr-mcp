@@ -44,10 +44,12 @@
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
+  const selectOptionMap = new Map();
 
   function invalidateGeneration() {
     currentGenerationToken = "";
     elementMap.clear();
+    selectOptionMap.clear();
   }
 
   function isCrossOriginFrame() {
@@ -160,6 +162,7 @@
     generationSeq += 1;
     currentGenerationToken = `pa_gen_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
+    selectOptionMap.clear();
 
     const doc = global.document;
     if (!doc) return { ok: false, error: "document_unavailable" };
@@ -206,6 +209,13 @@
           !option.hidden && !option.disabled && !option.parentElement?.disabled
         ))
         : null;
+      if (selectOptions) {
+        selectOptionMap.set(ref, selectOptions.slice(0, 24).map((option) => ({
+          node: option,
+          value: String(option.value),
+          label: String(option.label || option.textContent || "").trim(),
+        })));
+      }
 
       elements.push({
         ref: ref.slice(0, 256),
@@ -360,14 +370,32 @@
     let selectedOption = null;
     if (tag === "select") {
       if (el.multiple === true) return { ok: false, error: "multiple_select_unsupported" };
-      const matches = [...(el.options || [])].filter((option) => (
-        (option.value === fillValue || String(option.textContent || "").trim() === fillValue)
-        && !option.disabled && !option.parentElement?.disabled && !option.hidden
+      // Match only options offered in the latest observation. A page must not
+      // introduce a new option after inspect and have it selected by old refs.
+      const matches = (selectOptionMap.get(ref) || []).filter((option) => (
+        option.value === fillValue || option.label === fillValue
       ));
       if (matches.length !== 1) {
         return { ok: false, error: matches.length ? "select_option_ambiguous" : "select_option_unavailable" };
       }
-      selectedOption = matches[0];
+      const snapshot = matches[0];
+      selectedOption = snapshot.node;
+      const liveMatches = [...(el.options || [])].filter((option) => (
+        !option.hidden && !option.disabled && !option.parentElement?.disabled
+        && (String(option.value) === fillValue
+          || String(option.label || option.textContent || "").trim() === fillValue)
+      ));
+      if (liveMatches.length > 1) return { ok: false, error: "select_option_ambiguous" };
+      if (
+        selectedOption.isConnected === false
+        || ![...(el.options || [])].includes(selectedOption)
+        || liveMatches.length !== 1 || liveMatches[0] !== selectedOption
+        || selectedOption.hidden || selectedOption.disabled || selectedOption.parentElement?.disabled
+        || String(selectedOption.value) !== snapshot.value
+        || String(selectedOption.label || selectedOption.textContent || "").trim() !== snapshot.label
+      ) {
+        return { ok: false, error: "select_option_stale" };
+      }
     }
 
     try {

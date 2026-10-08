@@ -320,6 +320,10 @@ test("user selects an exact native dropdown option | Given a visible single-sele
   assert.equal(disabled.error, "select_option_unavailable");
   assert.equal(dropdown.focused, 0);
 
+  dropdown.options.push({ value: "fr", textContent: "France", disabled: false });
+  assert.equal(choose("France").error, "select_option_unavailable");
+  dropdown.options.pop();
+
   const selected = choose("United States");
   assert.equal(selected.ok, true);
   assert.equal(dropdown.value, "us");
@@ -333,6 +337,9 @@ test("user selects an exact native dropdown option | Given a visible single-sele
 
   observed = h.send({ type: "h2w_page_assist", action: "inspect" });
   assert.equal(observed.elements[0].selected_option, "Japan");
+  dropdown.options[2].textContent = "Changed dynamically";
+  assert.equal(choose("United States").error, "select_option_stale");
+  dropdown.options[2].textContent = "United States";
   dropdown.options.push({ value: "jp", textContent: "Japan Duplicate", disabled: false });
   assert.equal(choose("jp").error, "select_option_ambiguous");
   assert.equal(dropdown.value, "jp");
