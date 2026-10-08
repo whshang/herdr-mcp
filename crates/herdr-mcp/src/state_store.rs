@@ -5608,6 +5608,7 @@ const ALLOWED_BROWSER_CAPABILITY_OPERATIONS: &[&str] = &[
     "session.list",
     "session.move_to_space",
     "session.open",
+    "session.title_projection",
     "session.remove_from_space",
     "session.rename",
     "space.archive",
@@ -12087,7 +12088,7 @@ mod tests {
                 provider: "chatgpt",
                 adapter_protocol_version: 1,
                 observation_generation: 1_789_378_392_882,
-                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","composer.select_tool","generation.status","generation.stop","session.archive","session.inspect","session.open","session.create"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"}}}"#,
+                capabilities_json: r#"{"schema_version":1,"operations":["composer.submit","composer.select_tool","generation.status","generation.stop","session.archive","session.inspect","session.open","session.create","session.title_projection"],"input_modalities":["text"],"output_modalities":["text"],"limits":{"attachment_count":{"status":"known","max":0,"authority":"browser_control_v1"}}}"#,
                 observed_at: 11,
             })
             .unwrap();
@@ -12097,6 +12098,13 @@ mod tests {
         assert_eq!(
             observed_capabilities["input_modalities"],
             serde_json::json!(["text"])
+        );
+        assert!(
+            observed_capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("session.title_projection"))
         );
         assert_eq!(
             observed_capabilities["limits"]["attachment_count"]["max"],
