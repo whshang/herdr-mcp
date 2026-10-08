@@ -476,7 +476,7 @@
 
     const condition = String(params.condition || "").toLowerCase();
     const value = typeof params.value === "string" ? params.value : "";
-    if (!["document_ready", "url_equals", "text_present", "text_absent"].includes(condition)) {
+    if (!["document_ready", "url_equals", "text_present", "text_absent", "element_present", "element_absent"].includes(condition)) {
       return { ok: false, error: "unsupported_expect_condition" };
     }
     if (condition === "document_ready") {
@@ -491,6 +491,37 @@
         condition,
         value,
       };
+    }
+    if (condition === "element_present" || condition === "element_absent") {
+      // No caller-controlled CSS/XPath/JS. Only compare an exact accessible
+      // label on the same fixed, non-sensitive, visible control vocabulary.
+      if (value.length > 256 || value !== value.trim()) {
+        return { ok: false, error: "expect_value_invalid", condition };
+      }
+      const controls = global.document?.querySelectorAll?.(
+        'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
+      ) || [];
+      const truncated = controls.length > MAX_ELEMENTS;
+      let found = false;
+      let inspected = 0;
+      for (const el of controls) {
+        if (++inspected > MAX_ELEMENTS) break;
+        if (!el.isConnected || isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) continue;
+        const exactLabels = [
+          el.getAttribute?.("aria-label"),
+          el.getAttribute?.("placeholder"),
+          el.innerText,
+          el.textContent,
+        ];
+        if (exactLabels.some((label) => String(label || "").trim() === value)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found && truncated) {
+        return { ok: false, error: "element_scan_truncated", condition };
+      }
+      return { ok: condition === "element_present" ? found : !found, condition };
     }
     const text = pageText();
     const present = text.includes(value);

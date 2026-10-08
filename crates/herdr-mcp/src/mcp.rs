@@ -7612,13 +7612,14 @@ fn browser_page_action_call(
             }
             let condition = match object.get("condition").and_then(Value::as_str) {
                 Some(
-                    value @ ("document_ready" | "url_equals" | "text_present" | "text_absent"),
+                    value @ ("document_ready" | "url_equals" | "text_present" | "text_absent"
+                    | "element_present" | "element_absent"),
                 ) => value,
                 _ => {
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "condition must be document_ready, url_equals, text_present, or text_absent",
+                        "message": "condition must be document_ready, url_equals, text_present, text_absent, element_present, or element_absent",
                     });
                 }
             };
@@ -16371,6 +16372,93 @@ mod tests {
         conflict["ref"] = json!("ref_pa_gen_1_test_1");
         let conflict = browser_page_action_call(&store, &conflict, &grants, Some(&actuator));
         assert_eq!(conflict["code"], "idempotency_key_conflict");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_element_wait_conditions_use_existing_read_only_actuator() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ElementWaitActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for ElementWaitActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage wait must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(params["action"], "expect");
+                assert!(
+                    params["condition"] == "element_present"
+                        || params["condition"] == "element_absent"
+                );
+                assert_eq!(params["value"], "Next step");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({"ok": true, "condition": params["condition"]}));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = ElementWaitActuator {
+            calls: AtomicUsize::new(0),
+        };
+        for condition in ["element_present", "element_absent"] {
+            let result = browser_page_action_call(
+                &store,
+                &json!({
+                    "endpoint_ref": "bep_test",
+                    "page_ref": format!("bp_{}", "a".repeat(64)),
+                    "action": "expect",
+                    "condition": condition,
+                    "value": "Next step",
+                    "timeout_ms": 250,
+                }),
+                &grants,
+                Some(&actuator),
+            );
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["condition"], condition);
+        }
+        let invalid = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": format!("bp_{}", "a".repeat(64)),
+                "action": "expect",
+                "condition": "css_selector",
+                "value": "#next",
+            }),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(invalid["code"], "invalid_params");
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
     }
 

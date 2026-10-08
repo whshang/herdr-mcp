@@ -446,6 +446,42 @@ test("user verifies a generic page postcondition | Given an observed same-origin
   assert.equal(missing.error, "expect_timeout");
 });
 
+test("user waits for an exact visible control | Given dynamic and sensitive page elements | When a bounded element expect runs | Then only an observed safe label can satisfy the wait", async () => {
+  const secure = createElement({ tag: "input", type: "password", attrs: { "aria-label": "Secret" } });
+  const hidden = createElement({ tag: "button", text: "Hidden button", visible: false });
+  const existing = createElement({ tag: "button", text: "Continue" });
+  const elements = [secure, hidden, existing];
+  const h = harness({ elements });
+  const expect = (condition, value, timeoutMs = 0) => h.sendAsync({
+    type: "h2w_page_assist", action: "expect",
+    expectedOrigin: "https://app.test", condition, value, timeoutMs,
+  });
+  assert.equal((await expect("element_present", "Continue")).ok, true);
+  assert.equal((await expect("element_absent", "Continue")).error, "expect_timeout");
+  assert.equal((await expect("element_absent", "Secret")).ok, true);
+  assert.equal((await expect("element_absent", "Hidden button")).ok, true);
+  assert.equal((await expect("element_present", "#password")).error, "expect_timeout");
+  assert.equal((await expect("element_present", " Continue ")).error, "expect_value_invalid");
+
+  const introduced = createElement({ tag: "button", text: "Publish" });
+  introduced.ownerDocument = existing.ownerDocument;
+  setTimeout(() => elements.push(introduced), 75);
+  const appeared = await expect("element_present", "Publish", 350);
+  assert.equal(appeared.ok, true);
+  assert.ok(appeared.elapsed_ms >= 50);
+  elements.pop();
+  assert.equal((await expect("element_absent", "Publish")).ok, true);
+
+  // A capped scan is not proof of absence in a dense application DOM.
+  for (let i = 0; i < 129; i += 1) {
+    const el = createElement({ tag: "button", text: `Other ${i}` });
+    el.ownerDocument = existing.ownerDocument;
+    elements.push(el);
+  }
+  assert.equal((await expect("element_absent", "Missing")).error, "element_scan_truncated");
+  assert.equal((await expect("element_present", "Missing")).error, "element_scan_truncated");
+});
+
 test("Page Assist fails closed inside a cross-origin iframe", () => {
   const h = harness({ topOrigin: "https://parent.test" });
   const result = h.send({ type: "h2w_page_assist", action: "inspect" });
