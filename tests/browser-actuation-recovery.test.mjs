@@ -721,7 +721,7 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.mutation_submitted, true);
 });
 
-test("user rejects a native dropdown option | Given missing, ambiguous, stale or multiple selection | When fill checks the observed option | Then delivery is not_applied and retry-safe", async () => {
+test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {
   const tabs = new Map([[71, { id: 71, url: "https://example.com/form", active: true }]]);
   let rejection = "select_option_unavailable";
   const h = browserPageLifecycleHarness({
@@ -744,6 +744,9 @@ test("user rejects a native dropdown option | Given missing, ambiguous, stale or
     "select_option_ambiguous",
     "select_option_stale",
     "multiple_select_unsupported",
+    "checkable_state_required",
+    "radio_uncheck_unsupported",
+    "control_already_in_state",
   ]) {
     rejection = error;
     const result = await h.performBrowserPageActionRequest({
@@ -769,6 +772,16 @@ test("user rejects a native dropdown option | Given missing, ambiguous, stale or
   });
   assert.equal(uncertain.delivery_state, "delivery_unknown");
   assert.equal(uncertain.retry_safe, false);
+  rejection = "control_state_not_applied";
+  const controlOutcome = await h.performBrowserPageActionRequest({
+    action: "fill",
+    pageRef: page.page_ref,
+    generation: "pa_gen_select_test",
+    ref: "ref_pa_gen_select_test_0",
+    value: "true",
+  });
+  assert.equal(controlOutcome.delivery_state, "delivery_unknown");
+  assert.equal(controlOutcome.retry_safe, false);
 });
 
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {

@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.152";
+const H2W_SCRIPT_VERSION = "0.1.153";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -8048,6 +8048,9 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "select_option_unavailable",
   "select_option_ambiguous",
   "select_option_stale",
+  "checkable_state_required",
+  "radio_uncheck_unsupported",
+  "control_already_in_state",
 ]);
 
 function browserPageMutationEnvelope(result, page, sendAttempted) {

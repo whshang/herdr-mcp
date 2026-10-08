@@ -228,6 +228,9 @@
         type: (tag === "input" || tag === "button")
           ? String(el.type || (tag === "input" ? "text" : "")).slice(0, 64)
           : undefined,
+        checked: tag === "input" && ["checkbox", "radio"].includes(String(el.type || "").toLowerCase())
+          ? el.checked === true
+          : undefined,
         text: label,
         options: selectOptions ? selectOptions.slice(0, 24).map((option) => (
           cleanText(option.label || option.textContent, 80)
@@ -366,6 +369,21 @@
     }
 
     const fillValue = params.value.slice(0, MAX_FILL_CHARS);
+    const controlType = tag === "input" ? String(el.type || "").toLowerCase() : "";
+    const isCheckable = controlType === "checkbox" || controlType === "radio";
+    let targetChecked = null;
+    if (isCheckable) {
+      if (fillValue !== "true" && fillValue !== "false") {
+        return { ok: false, error: "checkable_state_required" };
+      }
+      targetChecked = fillValue === "true";
+      if (controlType === "radio" && !targetChecked) {
+        return { ok: false, error: "radio_uncheck_unsupported" };
+      }
+      if ((el.checked === true) === targetChecked) {
+        return { ok: false, error: "control_already_in_state" };
+      }
+    }
 
     let selectedOption = null;
     if (tag === "select") {
@@ -400,7 +418,18 @@
 
     try {
       el.focus?.();
-      if (tag === "select") {
+      if (isCheckable) {
+        const descriptor = global.HTMLInputElement?.prototype
+          ? Object.getOwnPropertyDescriptor(global.HTMLInputElement.prototype, "checked")
+          : null;
+        if (descriptor?.set) descriptor.set.call(el, targetChecked);
+        else el.checked = targetChecked;
+        if ((el.checked === true) !== targetChecked) {
+          return { ok: false, error: "control_state_not_applied" };
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (tag === "select") {
         const descriptor = global.HTMLSelectElement?.prototype
           ? Object.getOwnPropertyDescriptor(global.HTMLSelectElement.prototype, "value")
           : null;

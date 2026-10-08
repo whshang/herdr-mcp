@@ -358,6 +358,48 @@ test("user selects an exact native dropdown option | Given a visible single-sele
   assert.ok(!JSON.stringify(observed.elements[0]).includes("opaque_private_"));
 });
 
+test("user explicitly sets checkable state | Given observed native checkbox and radio controls | When fill specifies true or false | Then state is verified without accidental toggles", () => {
+  const checkbox = createElement({ tag: "input", type: "checkbox", attrs: { "aria-label": "Notify me" } });
+  const radio = createElement({ tag: "input", type: "radio", attrs: { "aria-label": "Email" } });
+  checkbox.checked = false;
+  radio.checked = false;
+  const h = harness({ elements: [checkbox, radio] });
+  let observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const checkRef = observed.elements.find((e) => e.type === "checkbox");
+  const radioRef = observed.elements.find((e) => e.type === "radio");
+  assert.equal(checkRef.checked, false);
+  assert.equal(radioRef.checked, false);
+  function fill(ref, value) {
+    return h.send({
+      type: "h2w_page_assist", action: "fill",
+      expectedOrigin: "https://app.test",
+      generation: observed.generation, ref, value,
+    });
+  }
+  assert.equal(fill(checkRef.ref, "yes").error, "checkable_state_required");
+  assert.equal(fill(checkRef.ref, "false").error, "control_already_in_state");
+  assert.deepEqual(checkbox.events, []);
+  assert.equal(fill(checkRef.ref, "true").ok, true);
+  assert.equal(checkbox.checked, true);
+  assert.deepEqual(checkbox.events, ["input", "change"]);
+  assert.equal(fill(checkRef.ref, "false").error, "stale_generation");
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.find((e) => e.type === "checkbox").checked, true);
+  assert.equal(fill(observed.elements.find((e) => e.type === "checkbox").ref, "false").ok, true);
+  assert.equal(checkbox.checked, false);
+
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(fill(observed.elements.find((e) => e.type === "radio").ref, "false").error, "radio_uncheck_unsupported");
+  assert.deepEqual(radio.events, []);
+  assert.equal(fill(observed.elements.find((e) => e.type === "radio").ref, "true").ok, true);
+  assert.equal(radio.checked, true);
+  assert.deepEqual(radio.events, ["input", "change"]);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.find((e) => e.type === "radio").checked, true);
+  assert.equal(fill(observed.elements.find((e) => e.type === "radio").ref, "true").error, "control_already_in_state");
+  assert.deepEqual(radio.events, ["input", "change"]);
+});
+
 test("user verifies a generic page postcondition | Given an observed same-origin page | When a bounded expect runs | Then document, URL, and text conditions settle without a mutation", async () => {
   const h = harness({
     url: "https://app.test/orders",
