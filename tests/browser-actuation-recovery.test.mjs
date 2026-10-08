@@ -721,7 +721,7 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.mutation_submitted, true);
 });
 
-test("native dropdown rejects before a mutation | Given missing, ambiguous, stale or multiple selection | Then delivery is not_applied and retry-safe", async () => {
+test("user rejects a native dropdown option | Given missing, ambiguous, stale or multiple selection | When fill checks the observed option | Then delivery is not_applied and retry-safe", async () => {
   const tabs = new Map([[71, { id: 71, url: "https://example.com/form", active: true }]]);
   let rejection = "select_option_unavailable";
   const h = browserPageLifecycleHarness({
