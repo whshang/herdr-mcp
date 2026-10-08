@@ -118,7 +118,6 @@ const browserRegistryRequests = [];
 const mcpRequestBodies = [];
 const nativeBatchRequests = [];
 let failNextBrowserEndpointRegistration = true;
-let mockChatGptBackgroundAccountIdentity = null;
 const registeredContentScripts = new Map();
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
@@ -129,21 +128,6 @@ const initialLocaleReadGate = new Promise((resolve) => { releaseInitialLocaleRea
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
   const url = String(input || "");
-  if (url === "https://chatgpt.com/backend-api/me") {
-    return new Response("{}", {
-      status: 404,
-      headers: { "content-type": "application/json" },
-    });
-  }
-  if (url === "https://chatgpt.com/api/auth/session") {
-    const accessToken = mockChatGptBackgroundAccountIdentity
-      ? `x.${Buffer.from(JSON.stringify({ sub: mockChatGptBackgroundAccountIdentity })).toString("base64url")}.y`
-      : "";
-    return new Response(JSON.stringify(accessToken ? { user: { name: "no-id" }, accessToken } : {}), {
-      status: accessToken ? 200 : 404,
-      headers: { "content-type": "application/json" },
-    });
-  }
   if (url.startsWith("chrome-extension://test-ext/")) {
     const rel = url.slice("chrome-extension://test-ext/".length);
     return new Response(readFileSync(path.join(EXT, rel), "utf8"), {
@@ -843,11 +827,21 @@ function installContentScript(
   site = "chatgpt",
   browserProjectId = null,
   browserProjectName = null,
+  accountNativeIdentity = null,
 ) {
   tabs.set(tabId, {
-    url, listener: (msg, _sender, sendResponse) => {
+    id: tabId,
+    url,
+    listener: (msg, _sender, sendResponse) => {
       if (msg?.type === "h2w_get_convkey") {
-        sendResponse({ convKey, url, site, browserProjectId, browserProjectName });
+        sendResponse({
+          convKey,
+          url,
+          site,
+          accountNativeIdentity,
+          browserProjectId,
+          browserProjectName,
+        });
         return;
       }
       if (msg?.type === "h2w_wake") { sendResponse({}); return; }
@@ -918,19 +912,6 @@ function installAutoWakeContentScript(tabId, convKey, { wakeResult = { ok: true,
 
 // ---- Load background.js ----
 const startupRegistryTabId = 140;
-tabs.set(startupRegistryTabId, {
-  id: startupRegistryTabId,
-  url: PROJECT_HOME_URL,
-  status: "complete",
-  perfProbe: {
-    perfVersion: "9",
-    streaming: false,
-    composerHasText: false,
-    toolRunning: false,
-    permissionCardActive: false,
-  },
-});
-mockChatGptBackgroundAccountIdentity = "chatgpt-startup-user-900";
 
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
@@ -989,6 +970,15 @@ const coldHudP = new Promise((resolve) => {
 await new Promise((resolve) => setTimeout(resolve, 0));
 ok(initialLocaleReadSeen, "locale/config initialization is deliberately held for the race fixture");
 ok(coldHudSettled === false, "cold-start HUD does not return a partial label payload before locale/config readiness");
+installContentScript(
+  startupRegistryTabId,
+  PROJECT_HOME_URL,
+  PROJECT_KEY,
+  "chatgpt",
+  PROJECT_ID,
+  "herdr-mcp",
+  "chatgpt-startup-user-900",
+);
 releaseInitialLocaleRead();
 const coldHud = await coldHudP;
 ok(coldHud?.ok === true
@@ -1045,7 +1035,6 @@ ok(await waitForTest(() =>
         && request?.kind === "space"
         && request?.native_identity === PROJECT_ID)),
   "startup browser registry recovery restores ChatGPT account and Project resources without a content registration message");
-mockChatGptBackgroundAccountIdentity = null;
 tabs.delete(startupRegistryTabId);
 const recoveredRegistrationCount = browserRegistryRequests.length;
 const keepaliveAlarm = listeners.onAlarm[0];
@@ -1260,37 +1249,6 @@ console.log("\n[Grok supported default-origin registration and recovery]");
       convInfo: projectFallbackState?.convInfo,
       reloads: reloadCalls.slice(projectReloadsBeforeFallback),
     }));
-}
-
-console.log("\n[ChatGPT browser registry identity recovery]");
-{
-  const before = browserRegistryRequests.length;
-  mockChatGptBackgroundAccountIdentity = "chatgpt-background-user-789";
-  const registered = await dispatchMessage({
-    type: "h2w_register",
-    site: "chatgpt",
-    convKey: PROJECT_KEY,
-    url: PROJECT_HOME_URL,
-  }, { tab: { id: 90, url: PROJECT_HOME_URL } });
-  mockChatGptBackgroundAccountIdentity = null;
-  const observed = browserRegistryRequests.slice(before);
-  ok(Number.isSafeInteger(registered?.browser_generation)
-      && registered?.browser_session_ref == null,
-    "ChatGPT Project home registration recovers browser identity in background without fabricating a session",
-    JSON.stringify(registered));
-  ok(observed.length === 3
-      && observed[0]?.operation === "provider.observe"
-      && observed[0]?.provider === "chatgpt"
-      && observed[0]?.capabilities?.operations?.includes("session.title_projection")
-      && observed[1]?.operation === "resource.observe"
-      && observed[1]?.kind === "account"
-      && observed[1]?.native_identity === "chatgpt-background-user-789"
-      && observed[2]?.operation === "resource.observe"
-      && observed[2]?.kind === "space"
-      && observed[2]?.native_identity === PROJECT_ID
-      && !observed.some((request) => request?.kind === "session"),
-    "ChatGPT background identity recovery publishes current capability and account -> space only",
-    JSON.stringify(observed));
 }
 
 console.log("\n[Gemini browser registry observation]");

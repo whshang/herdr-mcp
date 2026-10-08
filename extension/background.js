@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.137";
+const H2W_SCRIPT_VERSION = "0.1.138";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -2103,36 +2103,6 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
   };
 }
 
-async function chatGptAccountNativeIdentity() {
-  for (const url of [
-    "https://chatgpt.com/backend-api/me",
-    "https://chatgpt.com/api/auth/session",
-  ]) {
-    try {
-      const response = await fetch(url, {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: { accept: "application/json" },
-      });
-      if (!response.ok) continue;
-      const payload = await response.json();
-      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-      if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-      const token = typeof payload?.accessToken === "string" ? payload.accessToken : "";
-      const encoded = token.split(".")[1] || "";
-      if (encoded) {
-        const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
-        const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-        const claims = JSON.parse(atob(padded));
-        const subject = typeof claims?.sub === "string" ? claims.sub.trim() : "";
-        if (subject) return subject;
-      }
-    } catch (_) {}
-  }
-  return null;
-}
-
 function browserProviderCapabilities(provider) {
   const operations = provider === "chatgpt"
     ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create", "session.title_projection"]
@@ -2347,8 +2317,6 @@ async function setLocalBrowserWebchatControlConsent() {
 }
 
 async function recoverOpenChatGptBrowserRegistry() {
-  const accountNativeIdentity = await chatGptAccountNativeIdentity();
-  if (!accountNativeIdentity) return { observed: 0 };
   let tabs = [];
   try {
     tabs = await chrome.tabs.query({ url: "*://chatgpt.com/*" });
@@ -2357,10 +2325,11 @@ async function recoverOpenChatGptBrowserRegistry() {
   }
   let observed = 0;
   for (const tab of tabs) {
-    if (!tab?.id || !tab.url) continue;
-    const pageInfo = chatGptConversationInfo(tab.url);
-    if (!pageInfo) continue;
+    if (!tab?.id) continue;
     try {
+      const pageInfo = await conversationInfoForTab(tab.id);
+      const accountNativeIdentity = String(pageInfo?.accountNativeIdentity || "").trim();
+      if (pageInfo?.site !== "chatgpt" || !pageInfo?.convKey || !accountNativeIdentity) continue;
       const result = await observeBrowserConversation({
         provider: "chatgpt",
         tabId: tab.id,
@@ -9893,10 +9862,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const browserPageInfo = ["chatgpt", "gemini", "claude", "grok"].includes(registeringSite)
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
-      let accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
-      if (!accountNativeIdentity && registeringSite === "chatgpt") {
-        accountNativeIdentity = await chatGptAccountNativeIdentity() || "";
-      }
+      const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
       let browserObservation = null;
       if (browserPageInfo && sender.tab?.id && accountNativeIdentity) {
         const observationInput = {
