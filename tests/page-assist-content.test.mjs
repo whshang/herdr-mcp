@@ -293,6 +293,64 @@ test("Page Assist fill is bounded and invalidates the generation", () => {
   assert.equal(replay.error, "stale_generation");
 });
 
+test("user selects an exact native dropdown option | Given a visible single-select control | When filling by value or label | Then only an unambiguous enabled option is selected", () => {
+  const dropdown = createElement({ tag: "select", attrs: { "aria-label": "Country" }, value: "" });
+  dropdown.options = [
+    { value: "", textContent: "Choose country", disabled: true },
+    { value: "jp", textContent: "Japan", disabled: false },
+    { value: "us", textContent: "United States", disabled: false },
+    { value: "xx", textContent: "Disabled", disabled: true },
+  ];
+  const h = harness({ elements: [dropdown] });
+
+  let observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].tag, "select");
+  assert.deepEqual(Array.from(observed.elements[0].options), ["Japan", "United States"]);
+  assert.equal(observed.elements[0].options_truncated, undefined);
+  const choose = (value) => h.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref, value,
+  });
+
+  const missing = choose("France");
+  assert.equal(missing.error, "select_option_unavailable");
+  assert.equal(dropdown.value, "");
+  assert.deepEqual(dropdown.events, []);
+  const disabled = choose("Disabled");
+  assert.equal(disabled.error, "select_option_unavailable");
+  assert.equal(dropdown.focused, 0);
+
+  const selected = choose("United States");
+  assert.equal(selected.ok, true);
+  assert.equal(dropdown.value, "us");
+  assert.deepEqual(dropdown.events, ["input", "change"]);
+  assert.equal(choose("Japan").error, "stale_generation");
+
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].selected_option, "United States");
+  assert.equal(choose("jp").ok, true);
+  assert.equal(dropdown.value, "jp");
+
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].selected_option, "Japan");
+  dropdown.options.push({ value: "jp", textContent: "Japan Duplicate", disabled: false });
+  assert.equal(choose("jp").error, "select_option_ambiguous");
+  assert.equal(dropdown.value, "jp");
+
+  dropdown.multiple = true;
+  assert.equal(choose("us").error, "multiple_select_unsupported");
+  assert.equal(dropdown.events.length, 4);
+
+  dropdown.multiple = false;
+  dropdown.options.push(...Array.from({ length: 28 }, (_, i) => ({
+    value: `opaque_private_${i}`, textContent: `Visible ${i}`, disabled: false,
+  })));
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].options.length, 24);
+  assert.equal(observed.elements[0].options_truncated, true);
+  assert.ok(!JSON.stringify(observed.elements[0]).includes("opaque_private_"));
+});
+
 test("user verifies a generic page postcondition | Given an observed same-origin page | When a bounded expect runs | Then document, URL, and text conditions settle without a mutation", async () => {
   const h = harness({
     url: "https://app.test/orders",

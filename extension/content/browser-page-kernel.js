@@ -200,6 +200,12 @@
         .map((value) => structuralToken(value, 48))
         .filter(Boolean)
         .slice(0, 4);
+      // Expose bounded visible labels only; never an option's raw value.
+      const selectOptions = tag === "select"
+        ? [...(el.options || [])].filter((option) => (
+          !option.hidden && !option.disabled && !option.parentElement?.disabled
+        ))
+        : null;
 
       elements.push({
         ref: ref.slice(0, 256),
@@ -213,6 +219,14 @@
           ? String(el.type || (tag === "input" ? "text" : "")).slice(0, 64)
           : undefined,
         text: label,
+        options: selectOptions ? selectOptions.slice(0, 24).map((option) => (
+          cleanText(option.label || option.textContent, 80)
+        )) : undefined,
+        options_truncated: selectOptions && selectOptions.length > 24 ? true : undefined,
+        selected_option: tag === "select" && !el.multiple
+          ? cleanText((selectOptions || []).find((option) => option.value === el.value)?.label
+            || (selectOptions || []).find((option) => option.value === el.value)?.textContent, 80) || undefined
+          : undefined,
         fast_path: fastPathActionClass(el, tag),
       });
     }
@@ -333,7 +347,7 @@
 
     const tag = (el.tagName || "").toLowerCase();
     const isContentEditable = el.isContentEditable === true || el.getAttribute("contenteditable") === "true";
-    if (tag !== "input" && tag !== "textarea" && !isContentEditable) {
+    if (tag !== "input" && tag !== "textarea" && tag !== "select" && !isContentEditable) {
       return { ok: false, error: "element_not_fillable" };
     }
 
@@ -343,9 +357,31 @@
 
     const fillValue = params.value.slice(0, MAX_FILL_CHARS);
 
+    let selectedOption = null;
+    if (tag === "select") {
+      if (el.multiple === true) return { ok: false, error: "multiple_select_unsupported" };
+      const matches = [...(el.options || [])].filter((option) => (
+        (option.value === fillValue || String(option.textContent || "").trim() === fillValue)
+        && !option.disabled && !option.parentElement?.disabled && !option.hidden
+      ));
+      if (matches.length !== 1) {
+        return { ok: false, error: matches.length ? "select_option_ambiguous" : "select_option_unavailable" };
+      }
+      selectedOption = matches[0];
+    }
+
     try {
       el.focus?.();
-      if (tag === "input" || tag === "textarea") {
+      if (tag === "select") {
+        const descriptor = global.HTMLSelectElement?.prototype
+          ? Object.getOwnPropertyDescriptor(global.HTMLSelectElement.prototype, "value")
+          : null;
+        if (descriptor?.set) descriptor.set.call(el, selectedOption.value);
+        else el.value = selectedOption.value;
+        if (el.value !== selectedOption.value) return { ok: false, error: "select_not_applied" };
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (tag === "input" || tag === "textarea") {
         const proto = tag === "input" ? global.HTMLInputElement?.prototype : global.HTMLTextAreaElement?.prototype;
         const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
         if (descriptor?.set) {
