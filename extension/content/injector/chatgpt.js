@@ -60,14 +60,17 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
-  async getAccountNativeIdentity() {
+  async getAccountNativeIdentity(timeoutMs = 1500) {
     for (const url of ["/backend-api/me", "/api/auth/session"]) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const response = await fetch(url, {
           method: "GET",
           credentials: "include",
           cache: "no-store",
           headers: { accept: "application/json" },
+          signal: controller.signal,
         });
         if (!response.ok) continue;
         const payload = await response.json();
@@ -82,7 +85,10 @@ class ChatGPTAdapter extends BaseAdapter {
           const subject = typeof claims?.sub === "string" ? claims.sub.trim() : "";
           if (subject) return subject;
         }
-      } catch (_) {}
+      } catch (_) {
+      } finally {
+        clearTimeout(timer);
+      }
     }
     return null;
   }

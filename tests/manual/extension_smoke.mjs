@@ -757,6 +757,9 @@ ok(
 
   const accountCtx = vm.createContext({
     window: {},
+    AbortController,
+    setTimeout,
+    clearTimeout,
     location: { origin: u.origin, pathname: "/c/test" },
     document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
     fetch: async (url, options) => ({
@@ -778,6 +781,9 @@ ok(
   const accountFallbackCtx = vm.createContext({
     window: {},
     atob,
+    AbortController,
+    setTimeout,
+    clearTimeout,
     location: { origin: u.origin, pathname: "/c/test" },
     document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
     fetch: async (url, options) => ({
