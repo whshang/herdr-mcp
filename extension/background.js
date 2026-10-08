@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.135";
+const H2W_SCRIPT_VERSION = "0.1.136";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -2119,6 +2119,15 @@ async function chatGptAccountNativeIdentity() {
       const payload = await response.json();
       const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
       if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+      const token = typeof payload?.accessToken === "string" ? payload.accessToken : "";
+      const encoded = token.split(".")[1] || "";
+      if (encoded) {
+        const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+        const claims = JSON.parse(atob(padded));
+        const subject = typeof claims?.sub === "string" ? claims.sub.trim() : "";
+        if (subject) return subject;
+      }
     } catch (_) {}
   }
   return null;

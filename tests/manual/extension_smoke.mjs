@@ -774,8 +774,10 @@ ok(
       === "chatgpt-user-123",
     "ChatGPT account identity is observed through the provider adapter hook");
 
+  const accountFallbackToken = `x.${Buffer.from(JSON.stringify({ sub: "chatgpt-session-user-456" })).toString("base64url")}.y`;
   const accountFallbackCtx = vm.createContext({
     window: {},
+    atob,
     location: { origin: u.origin, pathname: "/c/test" },
     document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
     fetch: async (url, options) => ({
@@ -784,7 +786,7 @@ ok(
         && options?.credentials === "include"
         && options?.cache === "no-store",
       json: async () => url === "/api/auth/session"
-        ? { user: { id: "  chatgpt-session-user-456  " }, accessToken: "ignored-secret" }
+        ? { user: { name: "no-id" }, accessToken: accountFallbackToken }
         : {},
     }),
     console,

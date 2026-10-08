@@ -130,18 +130,17 @@ const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
   const url = String(input || "");
   if (url === "https://chatgpt.com/backend-api/me") {
-    return new Response(JSON.stringify(mockChatGptBackgroundAccountIdentity
-      ? { id: mockChatGptBackgroundAccountIdentity }
-      : {}), {
-      status: mockChatGptBackgroundAccountIdentity ? 200 : 404,
+    return new Response("{}", {
+      status: 404,
       headers: { "content-type": "application/json" },
     });
   }
   if (url === "https://chatgpt.com/api/auth/session") {
-    return new Response(JSON.stringify(mockChatGptBackgroundAccountIdentity
-      ? { user: { id: mockChatGptBackgroundAccountIdentity }, accessToken: "ignored-secret" }
-      : {}), {
-      status: mockChatGptBackgroundAccountIdentity ? 200 : 404,
+    const accessToken = mockChatGptBackgroundAccountIdentity
+      ? `x.${Buffer.from(JSON.stringify({ sub: mockChatGptBackgroundAccountIdentity })).toString("base64url")}.y`
+      : "";
+    return new Response(JSON.stringify(accessToken ? { user: { name: "no-id" }, accessToken } : {}), {
+      status: accessToken ? 200 : 404,
       headers: { "content-type": "application/json" },
     });
   }
