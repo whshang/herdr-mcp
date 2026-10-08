@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.145";
+const H2W_SCRIPT_VERSION = "0.1.146";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -7603,6 +7603,7 @@ function normalizeBrowserPageRecord(raw) {
     origin: origin.toLowerCase(),
     canonical_url: canonicalUrl,
     ownership,
+    stale: raw.stale === true,
     observation_generation: observationGeneration,
     page_generation: pageGeneration,
     created_by_operation: createdByOperation,
@@ -7739,6 +7740,7 @@ async function rememberBrowserPage(
     origin,
     canonical_url: canonicalUrl,
     ownership,
+    stale: false,
     observation_generation: observationGeneration,
     page_generation: 1,
     created_by_operation: createdByOperation,
@@ -7783,15 +7785,20 @@ async function resolveBrowserPage(pageRef, endpointRef, targetOrigin) {
   }
   const liveOrigin = browserPageOrigin(tab.url);
   if (liveOrigin !== record.origin) {
-    browserPagesByRef.delete(pageRef);
+    if (record.ownership === "claimed") browserPagesByRef.delete(pageRef);
+    else record.stale = true;
     await persistBrowserPages();
     return { ok: false, error: "browser_page_origin_mismatch" };
   }
   if (liveOrigin !== targetOrigin) {
     return { ok: false, error: "browser_page_origin_mismatch" };
   }
+  if (record.stale === true) {
+    return { ok: false, error: "browser_page_stale" };
+  }
   if (String(tab.url) !== record.canonical_url) {
-    browserPagesByRef.delete(pageRef);
+    if (record.ownership === "claimed") browserPagesByRef.delete(pageRef);
+    else record.stale = true;
     await persistBrowserPages();
     return { ok: false, error: "browser_page_stale" };
   }
@@ -7856,7 +7863,7 @@ async function performBrowserPageLifecycleRequest(msg) {
         await removeBrowserPageRecord(prior.page_ref);
       } else {
         const liveUrl = browserPageCanonicalUrl(priorTab.url, targetOrigin);
-        if (liveUrl === canonicalUrl && prior.canonical_url === canonicalUrl) {
+        if (liveUrl === canonicalUrl && prior.canonical_url === canonicalUrl && prior.stale !== true) {
           prior.last_seen_at = Date.now();
           if (!await persistBrowserPages()) {
             return { ok: false, error: "browser_page_storage_unavailable" };
