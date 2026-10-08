@@ -87,12 +87,14 @@ class ChatGPTAdapter extends BaseAdapter {
     try {
       const origin = location.origin;
       const pathname = location.pathname.replace(/\/+$/, "") || "/";
+      const provisionalChat = (segment) => /^local-chatgpt(?::|%3a)/i.test(segment);
       if (pathname === "/") return origin;
       const normal = pathname.match(/^\/c\/([^/]+)$/);
-      if (normal) return `${origin}/c/${normal[1]}`;
+      if (normal) return provisionalChat(normal[1]) ? null : `${origin}/c/${normal[1]}`;
 
       const projectConversation = pathname.match(/^\/g\/(g-p-[^/]+)\/c\/([^/]+)$/i);
       const projectHome = pathname.match(/^\/g\/(g-p-[^/]+)(?:\/project)?$/i);
+      if (projectConversation && provisionalChat(projectConversation[2])) return null;
       const projectSegment = projectConversation?.[1] || projectHome?.[1] || null;
       if (!projectSegment) return null;
       // ChatGPT may decorate a Project resource id with a human-readable slug.

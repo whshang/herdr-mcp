@@ -18,7 +18,8 @@ test("user can create a ChatGPT Project chat | Given an id-less composer | When 
     elementVisible(element) { return element?.visible === true; }
   }
   const registerH2WAdapter = (registered) => { adapter = registered; };
-  vm.runInNewContext(source, { BaseAdapter, registerH2WAdapter, document }, {
+  const location = { origin: "https://chatgpt.com", pathname: "/g/g-p-test/project" };
+  vm.runInNewContext(source, { BaseAdapter, registerH2WAdapter, document, location }, {
     filename: "chatgpt.js",
   });
 
@@ -39,4 +40,11 @@ test("user can create a ChatGPT Project chat | Given an id-less composer | When 
 
   selectors.set(projectSelector, [{ id: "", visible: false }]);
   assert.equal(adapter.getInputEl(), null);
+
+  location.pathname = "/g/g-p-test/c/local-chatgpt%3Abdf4ff94-c1cd-45f7-b141-e9218f0fdd00";
+  assert.equal(adapter.getConversationKey(), null);
+  location.pathname = "/c/local-chatgpt:bdf4ff94-c1cd-45f7-b141-e9218f0fdd00";
+  assert.equal(adapter.getConversationKey(), null);
+  location.pathname = "/g/g-p-test/c/01234567-89ab-4cde-8f01-23456789abcd";
+  assert.equal(adapter.getConversationKey(), "https://chatgpt.com/g/g-p-test/c/01234567-89ab-4cde-8f01-23456789abcd");
 });
