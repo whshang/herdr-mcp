@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.136";
+const H2W_SCRIPT_VERSION = "0.1.137";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -2346,6 +2346,36 @@ async function setLocalBrowserWebchatControlConsent() {
   return browserEndpointView(browserEndpoint);
 }
 
+async function recoverOpenChatGptBrowserRegistry() {
+  const accountNativeIdentity = await chatGptAccountNativeIdentity();
+  if (!accountNativeIdentity) return { observed: 0 };
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: "*://chatgpt.com/*" });
+  } catch (_) {
+    return { observed: 0 };
+  }
+  let observed = 0;
+  for (const tab of tabs) {
+    if (!tab?.id || !tab.url) continue;
+    const pageInfo = chatGptConversationInfo(tab.url);
+    if (!pageInfo) continue;
+    try {
+      const result = await observeBrowserConversation({
+        provider: "chatgpt",
+        tabId: tab.id,
+        convKey: pageInfo.convKey,
+        pageInfo,
+        accountNativeIdentity,
+      });
+      if (result) observed += 1;
+    } catch (error) {
+      callLog("browser registry recovery failed:", error?.message || String(error));
+    }
+  }
+  return { observed };
+}
+
 async function registerLocalBrowserEndpoint() {
   await configReady;
   try {
@@ -2365,6 +2395,7 @@ async function registerLocalBrowserEndpoint() {
     if (response.ok && parsed?.ok === true && parsed.endpoint) {
       browserEndpoint = parsed.endpoint;
       await getBrowserObservationGeneration();
+      await recoverOpenChatGptBrowserRegistry();
       return browserEndpoint;
     }
     callLog(

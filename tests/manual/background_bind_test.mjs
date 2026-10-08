@@ -917,6 +917,21 @@ function installAutoWakeContentScript(tabId, convKey, { wakeResult = { ok: true,
 }
 
 // ---- Load background.js ----
+const startupRegistryTabId = 140;
+tabs.set(startupRegistryTabId, {
+  id: startupRegistryTabId,
+  url: PROJECT_HOME_URL,
+  status: "complete",
+  perfProbe: {
+    perfVersion: "9",
+    streaming: false,
+    composerHasText: false,
+    toolRunning: false,
+    permissionCardActive: false,
+  },
+});
+mockChatGptBackgroundAccountIdentity = "chatgpt-startup-user-900";
+
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
 ok(!!onMsg, "background onMessage listener registered");
@@ -1013,6 +1028,25 @@ ok(storedBrowserSeed === browserRegister.profile_seed,
 ok(browserRegisterRetry.operation === "endpoint.register"
     && browserRegisterRetry.profile_seed === storedBrowserSeed,
   "endpoint bootstrap recovery reuses the stable browser profile seed after the injected startup failure");
+ok(await waitForTest(() => browserRegistryRequests.some((request) =>
+      request?.operation === "provider.observe"
+      && request?.provider === "chatgpt"
+      && request?.capabilities?.operations?.includes("session.title_projection"))),
+  "successful endpoint bootstrap recovers current ChatGPT provider capability from an already-open Project tab");
+ok(await waitForTest(() =>
+      browserRegistryRequests.some((request) =>
+        request?.operation === "resource.observe"
+        && request?.provider === "chatgpt"
+        && request?.kind === "account"
+        && request?.native_identity === "chatgpt-startup-user-900")
+      && browserRegistryRequests.some((request) =>
+        request?.operation === "resource.observe"
+        && request?.provider === "chatgpt"
+        && request?.kind === "space"
+        && request?.native_identity === PROJECT_ID)),
+  "startup browser registry recovery restores ChatGPT account and Project resources without a content registration message");
+mockChatGptBackgroundAccountIdentity = null;
+tabs.delete(startupRegistryTabId);
 const recoveredRegistrationCount = browserRegistryRequests.length;
 const keepaliveAlarm = listeners.onAlarm[0];
 ok(!!keepaliveAlarm, "browser keepalive alarm listener registered");
