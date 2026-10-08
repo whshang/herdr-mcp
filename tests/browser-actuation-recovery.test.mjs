@@ -721,6 +721,56 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.mutation_submitted, true);
 });
 
+test("native dropdown rejects before a mutation | Given missing, ambiguous, stale or multiple selection | Then delivery is not_applied and retry-safe", async () => {
+  const tabs = new Map([[71, { id: 71, url: "https://example.com/form", active: true }]]);
+  let rejection = "select_option_unavailable";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action !== "fill") throw new Error("unexpected test action");
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/form",
+    idempotencyKey: "claim-native-select-reject-1",
+  });
+  assert.equal(page.ok, true);
+
+  for (const error of [
+    "select_option_unavailable",
+    "select_option_ambiguous",
+    "select_option_stale",
+    "multiple_select_unsupported",
+  ]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "fill",
+      pageRef: page.page_ref,
+      generation: "pa_gen_select_test",
+      ref: "ref_pa_gen_select_test_0",
+      value: "Disabled or changed option",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "select_not_applied";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "fill",
+    pageRef: page.page_ref,
+    generation: "pa_gen_select_test",
+    ref: "ref_pa_gen_select_test_0",
+    value: "Unknown setter outcome",
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+});
+
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
   const sessionStorage = {};
   const tabs = new Map([
