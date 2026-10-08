@@ -832,13 +832,37 @@ function installContentScript(
   tabs.set(tabId, {
     id: tabId,
     url,
+    contentRegistered: false,
     listener: (msg, _sender, sendResponse) => {
       if (msg?.type === "h2w_get_convkey") {
+        // Mirror the real content script: this read handshake is opaque and
+        // carries no account identity. Its lazy identity recovery runs the
+        // ordinary content registration (h2w_register) exactly once, and that
+        // content-side path is the single identity source that publishes
+        // provider/account/space facts.
+        const tab = tabs.get(tabId);
+        if (tab && !tab.contentRegistered) {
+          tab.contentRegistered = true;
+          void onMsg(
+            {
+              type: "h2w_register",
+              convKey,
+              url,
+              site,
+              accountNativeIdentity,
+              browserProjects: [],
+              browserCurrentProjectId: browserProjectId,
+              browserCurrentProjectName: browserProjectName,
+              browserSessionReservationRef: null,
+            },
+            { tab: { id: tabId, url } },
+            () => {},
+          );
+        }
         sendResponse({
           convKey,
           url,
           site,
-          accountNativeIdentity,
           browserProjectId,
           browserProjectName,
         });
@@ -1034,7 +1058,7 @@ ok(await waitForTest(() =>
         && request?.provider === "chatgpt"
         && request?.kind === "space"
         && request?.native_identity === PROJECT_ID)),
-  "startup browser registry recovery restores ChatGPT account and Project resources without a content registration message");
+  "startup browser registry recovery restores ChatGPT account and Project resources through the opaque handshake's content registration path");
 tabs.delete(startupRegistryTabId);
 const recoveredRegistrationCount = browserRegistryRequests.length;
 const keepaliveAlarm = listeners.onAlarm[0];

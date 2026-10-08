@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.139";
+const H2W_CONTENT_VERSION = "0.1.140";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2652,6 +2652,12 @@ function normalizeHerdrMentionAlias(value) {
           let convKey = ADAPTER.getConversationKey();
           if (convKey && (registeredConvKey !== convKey
               || !registeredBrowserSessionRef || !registeredBrowserGeneration)) {
+            // This read handshake stays opaque: it carries no account identity.
+            // The lazy recovery below runs the ordinary content registration,
+            // which is the single identity source and publishes provider /
+            // account / space / session facts through the existing h2w_register
+            // path. Callers that need those facts trigger this handshake rather
+            // than receiving raw account identity here.
             await registerCurrentConversation("identity-recovery").catch(() => null);
             convKey = ADAPTER.getConversationKey();
           }
@@ -2663,7 +2669,6 @@ function normalizeHerdrMentionAlias(value) {
             convKey,
             url: location.href,
             site: ADAPTER.name,
-            accountNativeIdentity: await browserAccountNativeIdentity(),
             browserProjectId: project?.id || null,
             browserProjectName: project?.name || null,
             browserSessionRef: identityMatchesRoute ? registeredBrowserSessionRef : null,

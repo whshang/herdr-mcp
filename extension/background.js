@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.139";
+const H2W_SCRIPT_VERSION = "0.1.140";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -2327,17 +2327,14 @@ async function recoverOpenChatGptBrowserRegistry() {
   for (const tab of tabs) {
     if (!tab?.id) continue;
     try {
+      // The opaque page-identity handshake is the only recovery trigger here.
+      // Its content-side lazy registerCurrentConversation("identity-recovery")
+      // is the single identity source: that ordinary content registration
+      // publishes provider/account/space/session facts through h2w_register.
+      // Background never receives raw account identity on this handshake and
+      // does not implement a second identity source.
       const pageInfo = await conversationInfoForTab(tab.id);
-      const accountNativeIdentity = String(pageInfo?.accountNativeIdentity || "").trim();
-      if (pageInfo?.site !== "chatgpt" || !pageInfo?.convKey || !accountNativeIdentity) continue;
-      const result = await observeBrowserConversation({
-        provider: "chatgpt",
-        tabId: tab.id,
-        convKey: pageInfo.convKey,
-        pageInfo,
-        accountNativeIdentity,
-      });
-      if (result) observed += 1;
+      if (pageInfo?.site === "chatgpt" && pageInfo?.convKey) observed += 1;
     } catch (error) {
       callLog("browser registry recovery failed:", error?.message || String(error));
     }
