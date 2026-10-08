@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.140";
+const H2W_SCRIPT_VERSION = "0.1.141";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -872,10 +872,13 @@ function enrichConversationInfoWithBrowserScope(tabId, info) {
   };
 }
 
-async function conversationInfoForTab(tabId) {
+async function conversationInfoForTab(tabId, { refreshObservation = false } = {}) {
   if (!tabId) return null;
+  const handshake = refreshObservation
+    ? { type: "h2w_get_convkey", refreshObservation: true }
+    : { type: "h2w_get_convkey" };
   try {
-    const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+    const live = await chrome.tabs.sendMessage(tabId, handshake);
     if (live?.convKey) {
       const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
       const info = parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
@@ -902,7 +905,7 @@ async function conversationInfoForTab(tabId) {
       }
       for (let attempt = 0; attempt < 20; attempt += 1) {
         try {
-          const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+          const live = await chrome.tabs.sendMessage(tabId, handshake);
           if (live?.convKey) {
             const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
             const info = parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
@@ -2327,13 +2330,15 @@ async function recoverOpenChatGptBrowserRegistry() {
   for (const tab of tabs) {
     if (!tab?.id) continue;
     try {
-      // The opaque page-identity handshake is the only recovery trigger here.
-      // Its content-side lazy registerCurrentConversation("identity-recovery")
-      // is the single identity source: that ordinary content registration
-      // publishes provider/account/space/session facts through h2w_register.
-      // Background never receives raw account identity on this handshake and
-      // does not implement a second identity source.
-      const pageInfo = await conversationInfoForTab(tab.id);
+      // The opaque page-identity handshake is the only recovery trigger here,
+      // with an explicit refresh so an already-registered tab that still holds
+      // a previous generation's opaque refs re-runs the content-side
+      // registerCurrentConversation("identity-recovery"). That ordinary content
+      // registration is the single identity source and publishes
+      // provider/account/space/session facts through h2w_register. Background
+      // never receives raw account identity on this handshake and does not
+      // implement a second identity source.
+      const pageInfo = await conversationInfoForTab(tab.id, { refreshObservation: true });
       if (pageInfo?.site === "chatgpt" && pageInfo?.convKey) observed += 1;
     } catch (error) {
       callLog("browser registry recovery failed:", error?.message || String(error));

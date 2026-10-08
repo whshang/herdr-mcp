@@ -836,12 +836,15 @@ function installContentScript(
     listener: (msg, _sender, sendResponse) => {
       if (msg?.type === "h2w_get_convkey") {
         // Mirror the real content script: this read handshake is opaque and
-        // carries no account identity. Its lazy identity recovery runs the
-        // ordinary content registration (h2w_register) exactly once, and that
-        // content-side path is the single identity source that publishes
-        // provider/account/space facts.
+        // carries no account identity. It runs the ordinary content
+        // registration (h2w_register) when the route is not yet registered, or
+        // when an explicit observation refresh is requested — the latter is
+        // what re-publishes facts for a tab that still holds a previous
+        // generation's opaque registration.
         const tab = tabs.get(tabId);
-        if (tab && !tab.contentRegistered) {
+        const needsRegistration = tab
+          && (!tab.contentRegistered || msg.refreshObservation === true);
+        if (needsRegistration) {
           tab.contentRegistered = true;
           void onMsg(
             {
@@ -1003,6 +1006,24 @@ installContentScript(
   "herdr-mcp",
   "chatgpt-startup-user-900",
 );
+// A ChatGPT tab that already holds an opaque registration from a previous
+// extension generation. The plain handshake is a pure read for it, so only an
+// explicit observation refresh can re-publish its provider/account/space facts.
+// It must be present before the first successful endpoint registration, which is
+// where open-tab recovery runs.
+const staleGenerationTabId = 143;
+const STALE_GENERATION_URL = "https://chatgpt.com/c/stale-generation-901";
+const STALE_GENERATION_IDENTITY = "chatgpt-stale-generation-user-901";
+installContentScript(
+  staleGenerationTabId,
+  STALE_GENERATION_URL,
+  STALE_GENERATION_URL,
+  "chatgpt",
+  PROJECT_ID,
+  "herdr-mcp",
+  STALE_GENERATION_IDENTITY,
+);
+tabs.get(staleGenerationTabId).contentRegistered = true;
 releaseInitialLocaleRead();
 const coldHud = await coldHudP;
 ok(coldHud?.ok === true
@@ -1059,6 +1080,14 @@ ok(await waitForTest(() =>
         && request?.kind === "space"
         && request?.native_identity === PROJECT_ID)),
   "startup browser registry recovery restores ChatGPT account and Project resources through the opaque handshake's content registration path");
+ok(await waitForTest(() =>
+      browserRegistryRequests.some((request) =>
+        request?.operation === "resource.observe"
+        && request?.provider === "chatgpt"
+        && request?.kind === "account"
+        && request?.native_identity === STALE_GENERATION_IDENTITY)),
+  "open-tab recovery refreshes an already-registered tab that still holds a previous generation's opaque registration");
+tabs.delete(staleGenerationTabId);
 tabs.delete(startupRegistryTabId);
 const recoveredRegistrationCount = browserRegistryRequests.length;
 const keepaliveAlarm = listeners.onAlarm[0];

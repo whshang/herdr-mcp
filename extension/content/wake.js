@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.140";
+const H2W_CONTENT_VERSION = "0.1.141";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2650,7 +2650,13 @@ function normalizeHerdrMentionAlias(value) {
       if (msg?.type === "h2w_get_convkey") {
         void (async () => {
           let convKey = ADAPTER.getConversationKey();
-          if (convKey && (registeredConvKey !== convKey
+          // An explicit refresh re-runs the ordinary content registration even
+          // when this route already holds a registration from an older extension
+          // generation; without it the handshake stays a pure read and returns
+          // the previously registered opaque refs.
+          const refreshObservation = msg?.refreshObservation === true;
+          if (convKey && (refreshObservation
+              || registeredConvKey !== convKey
               || !registeredBrowserSessionRef || !registeredBrowserGeneration)) {
             // This read handshake stays opaque: it carries no account identity.
             // The lazy recovery below runs the ordinary content registration,
