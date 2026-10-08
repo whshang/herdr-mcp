@@ -76,15 +76,6 @@ class ChatGPTAdapter extends BaseAdapter {
         const payload = await response.json();
         const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
         if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-        const token = typeof payload?.accessToken === "string" ? payload.accessToken : "";
-        const encoded = token.split(".")[1] || "";
-        if (encoded) {
-          const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
-          const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-          const claims = JSON.parse(atob(padded));
-          const subject = typeof claims?.sub === "string" ? claims.sub.trim() : "";
-          if (subject) return subject;
-        }
       } catch (_) {
       } finally {
         clearTimeout(timer);

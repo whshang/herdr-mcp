@@ -777,10 +777,8 @@ ok(
       === "chatgpt-user-123",
     "ChatGPT account identity is observed through the provider adapter hook");
 
-  const accountFallbackToken = `x.${Buffer.from(JSON.stringify({ sub: "chatgpt-session-user-456" })).toString("base64url")}.y`;
   const accountFallbackCtx = vm.createContext({
     window: {},
-    atob,
     AbortController,
     setTimeout,
     clearTimeout,
@@ -792,7 +790,7 @@ ok(
         && options?.credentials === "include"
         && options?.cache === "no-store",
       json: async () => url === "/api/auth/session"
-        ? { user: { name: "no-id" }, accessToken: accountFallbackToken }
+        ? { user: { id: "  chatgpt-session-user-456  " }, accessToken: "ignored-secret" }
         : {},
     }),
     console,
@@ -801,7 +799,30 @@ ok(
   vm.runInContext(chatgptCode, accountFallbackCtx);
   ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", accountFallbackCtx)
       === "chatgpt-session-user-456",
-    "ChatGPT account identity falls back to the signed-in session without exposing its access token");
+    "ChatGPT account identity falls back only to an explicit signed-in session account id");
+
+  const tokenOnlyCtx = vm.createContext({
+    window: {},
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    fetch: async (url, options) => ({
+      ok: url === "/api/auth/session"
+        && options?.method === "GET"
+        && options?.credentials === "include"
+        && options?.cache === "no-store",
+      json: async () => url === "/api/auth/session"
+        ? { user: { name: "no-id" }, accessToken: "header.payload.signature" }
+        : {},
+    }),
+    console,
+  });
+  vm.runInContext(baseCode, tokenOnlyCtx);
+  vm.runInContext(chatgptCode, tokenOnlyCtx);
+  ok(await vm.runInContext("window.__H2W_ADAPTER__.getAccountNativeIdentity()", tokenOnlyCtx) === null,
+    "ChatGPT account identity fails closed when the signed-in session exposes only a token");
 
   const composerStop = { id: "composer-stop" };
   const unrelatedStop = { id: "unrelated-stop" };

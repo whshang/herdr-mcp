@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.141";
+const H2W_SCRIPT_VERSION = "0.1.142";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -9865,6 +9865,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
       const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
+      if (registeringSite === "chatgpt" && sender.tab?.id && !accountNativeIdentity) {
+        browserTabScopes.delete(sender.tab.id);
+        for (const [sessionRef, target] of browserSessionTargets) {
+          if (target?.tabId === sender.tab.id) browserSessionTargets.delete(sessionRef);
+        }
+      }
       let browserObservation = null;
       if (browserPageInfo && sender.tab?.id && accountNativeIdentity) {
         const observationInput = {

@@ -1713,6 +1713,23 @@ console.log("\n[page-health forced reload]");
 console.log("\n[binding flow]");
 {
   installContentScript(101, CONV, CONV);
+  const sender = { tab: { id: 101, url: CONV } };
+  const priorScope = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: CONV,
+    url: CONV,
+    accountNativeIdentity: "chatgpt-previous-account",
+  }, sender);
+  ok(priorScope?.browser_account_ref && priorScope?.browser_generation,
+    "ChatGPT tab establishes an account-bound scope before identity loss");
+  tabs.get(101).contentRegistered = true;
+  await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: CONV,
+    url: CONV,
+  }, sender);
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
   onMsg({ type: "h2w_bind", tabId: 101, pane: "wH:p1", agent: "omp", workspace_id: "wH", workspace_label: "herdr-mcp (wH)", workspace_label_raw: "herdr-mcp" }, { tab: { id: 101 } }, (r) => resolveP(r));
@@ -1720,6 +1737,12 @@ console.log("\n[binding flow]");
   ok(r?.ok === true && r.convKey === CONV, "h2w_bind creates a binding", JSON.stringify(r));
   ok(!!storage.herdrWakeBindings[SK_WH], "binding persisted with convKey::workspace_id key");
   const b = storage.herdrWakeBindings[SK_WH];
+  ok(b.browser_account_ref == null
+      && b.browser_space_ref == null
+      && b.browser_session_ref == null
+      && b.browser_generation == null,
+    "lost ChatGPT identity invalidates the tab's cached scope before a new binding");
+  tabs.get(101).contentRegistered = false;
   ok(
     b.workspace_id === "wH"
       && b.workspace_label.includes("herdr-mcp")
