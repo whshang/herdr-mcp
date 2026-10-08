@@ -1,6 +1,5 @@
 // injector/chatgpt.js — chatgpt.com wake-up adapter
-// Selectors verified while signed in on 2026-08-20:
-//   - composer: div#prompt-textarea[contenteditable="true"] (ProseMirror, role=textbox)
+// Composer layouts: legacy #prompt-textarea and the id-less Project ProseMirror textbox.
 //   - send button: button[data-testid="send-button"]
 //   - insertion: MAIN-world execCommand insertText commits to the ProseMirror model
 const CHATGPT_ADAPTER_CAPABILITIES = Object.freeze({
@@ -108,7 +107,12 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   getInputEl() {
-    return document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const legacy = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    if (legacy) return legacy;
+    const candidates = document.querySelectorAll('div.ProseMirror[role="textbox"][contenteditable="true"]');
+    return candidates.length === 1 && this.elementVisible(candidates[0])
+      ? candidates[0]
+      : null;
   }
 
   getSelectedComposerApps() {
@@ -217,7 +221,11 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   getWatchMainWorldSelector() {
-    return '#prompt-textarea[contenteditable="true"]';
+    const input = this.getInputEl();
+    if (!input) return null;
+    return input.id === 'prompt-textarea'
+      ? '#prompt-textarea[contenteditable="true"]'
+      : 'div.ProseMirror[role="textbox"][contenteditable="true"]';
   }
 
   getSendButtonCandidates() {
