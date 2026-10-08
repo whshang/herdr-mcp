@@ -7086,6 +7086,7 @@ fn browser_fast_path_call_with_semantic(
         "idempotency_key",
         "max_steps",
         "max_chars",
+        "verify",
     ];
     if let Some(key) = object
         .keys()
@@ -7151,6 +7152,37 @@ fn browser_fast_path_call_with_semantic(
                 });
             }
         },
+    };
+
+    let verify = match object.get("verify") {
+        None => None,
+        Some(Value::Object(condition)) => {
+            if condition
+                .keys()
+                .any(|key| !matches!(key.as_str(), "condition" | "value"))
+            {
+                return json!({"ok": false, "code": "invalid_params", "message": "verify accepts only condition and value"});
+            }
+            if !matches!(
+                condition.get("condition").and_then(Value::as_str),
+                Some("url_equals" | "text_present")
+            ) {
+                return json!({"ok": false, "code": "invalid_params", "message": "verify condition must be url_equals or text_present"});
+            }
+            if !condition
+                .get("value")
+                .and_then(Value::as_str)
+                .is_some_and(|value| {
+                    !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
+                })
+            {
+                return json!({"ok": false, "code": "invalid_params", "message": "verify value must be 1..4096 non-control characters"});
+            }
+            Some(Value::Object(condition.clone()))
+        }
+        Some(_) => {
+            return json!({"ok": false, "code": "invalid_params", "message": "verify must be an object"});
+        }
     };
 
     let mut steps = Vec::new();
@@ -7221,6 +7253,41 @@ fn browser_fast_path_call_with_semantic(
             .unwrap_or("escalate");
         match action {
             "done" => {
+                if let Some(verify) = &verify {
+                    let verification = browser_page_action_call(
+                        store,
+                        &json!({
+                            "endpoint_ref": endpoint_ref,
+                            "page_ref": page_ref,
+                            "action": "expect",
+                            "condition": verify["condition"],
+                            "value": verify["value"],
+                        }),
+                        caller_grants,
+                        browser_actuator,
+                    );
+                    let verified = verification.get("ok").and_then(Value::as_bool) == Some(true);
+                    let mut result = browser_fast_path_result(
+                        if verified {
+                            "verified"
+                        } else {
+                            "verification_required"
+                        },
+                        if verified {
+                            "postcondition_verified"
+                        } else {
+                            "postcondition_unverified"
+                        },
+                        &observation,
+                        Some(&decision),
+                        &steps,
+                        semantic_decisions,
+                        mutations,
+                    );
+                    result["verification"] = verification;
+                    result["requires_planner"] = json!(!verified);
+                    return result;
+                }
                 return browser_fast_path_result(
                     "verification_required",
                     "done_candidate",
@@ -15884,7 +15951,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_fast_path_executes_three_clicks_then_requires_done_verification() {
+    fn browser_fast_path_verifies_predeclared_postcondition_after_three_clicks() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
 
@@ -15988,6 +16055,15 @@ mod tests {
                             expected_generation,
                         ))
                     }
+                    Some("expect") => {
+                        assert_eq!(phase, 3);
+                        assert_eq!(params["condition"], "text_present");
+                        let matched = params["value"] == "Complete";
+                        Ok(Self::evidence(
+                            json!({"ok": matched, "condition": "text_present"}),
+                            expected_generation,
+                        ))
+                    }
                     other => panic!("unexpected fast path action: {other:?}"),
                 }
             }
@@ -16006,6 +16082,21 @@ mod tests {
             endpoint_ref: "bep_fast_path_test".to_owned(),
         }];
         let page_ref = format!("bp_{}", "a".repeat(64));
+        let invalid = browser_fast_path_call_with_semantic(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_fast_path_test",
+                "page_ref": page_ref,
+                "objective": "Advance through all three visible stages",
+                "idempotency_key": "fast-path-invalid-verification",
+                "verify": {"condition": "text_absent", "value": "Complete"},
+            }),
+            &grants,
+            Some(&actuator),
+            &semantic,
+        );
+        assert_eq!(invalid["code"], "invalid_params");
+        assert_eq!(actuator.phase.load(Ordering::SeqCst), 0);
         let result = browser_fast_path_call_with_semantic(
             &store,
             &json!({
@@ -16014,6 +16105,7 @@ mod tests {
                 "objective": "Advance through all three visible stages",
                 "idempotency_key": "fast-path-three-clicks",
                 "max_steps": 4,
+                "verify": {"condition": "text_present", "value": "Complete"},
             }),
             &grants,
             Some(&actuator),
@@ -16021,18 +16113,64 @@ mod tests {
         );
 
         assert_eq!(result["ok"], true, "{result}");
-        assert_eq!(result["status"], "verification_required", "{result}");
-        assert_eq!(result["reason"], "done_candidate");
+        assert_eq!(result["status"], "verified", "{result}");
+        assert_eq!(result["reason"], "postcondition_verified");
+        assert_eq!(result["verification"]["ok"], true);
         assert_eq!(result["mutations"], 3);
         assert_eq!(result["semantic_decisions"], 4);
         assert_eq!(result["steps"].as_array().unwrap().len(), 3);
-        assert_eq!(result["requires_planner"], true);
+        assert_eq!(result["requires_planner"], false);
         assert_eq!(actuator.phase.load(Ordering::SeqCst), 3);
         for step in result["steps"].as_array().unwrap() {
             assert_eq!(step["result"]["ok"], true);
             assert_eq!(step["result"]["delivery_state"], "applied");
             assert!(step["result"]["op_id"].as_str().is_some());
         }
+
+        let done_only = SemanticService::test_decision_route(
+            "browser-fast-path-verification-miss",
+            &semantic_test_server_sequence(vec![DONE]),
+        )
+        .unwrap();
+        let missing = browser_fast_path_call_with_semantic(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_fast_path_test",
+                "page_ref": page_ref,
+                "objective": "Advance through all three visible stages",
+                "idempotency_key": "fast-path-verification-miss",
+                "verify": {"condition": "text_present", "value": "Missing result"},
+            }),
+            &grants,
+            Some(&actuator),
+            &done_only,
+        );
+        assert_eq!(missing["status"], "verification_required", "{missing}");
+        assert_eq!(missing["reason"], "postcondition_unverified");
+        assert_eq!(missing["verification"]["ok"], false);
+        assert_eq!(missing["requires_planner"], true);
+        assert_eq!(missing["mutations"], 0);
+        assert_eq!(actuator.phase.load(Ordering::SeqCst), 3);
+
+        let legacy = browser_fast_path_call_with_semantic(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_fast_path_test",
+                "page_ref": page_ref,
+                "objective": "Advance through all three visible stages",
+                "idempotency_key": "fast-path-legacy-no-verification",
+            }),
+            &grants,
+            Some(&actuator),
+            &SemanticService::test_decision_route(
+                "browser-fast-path-legacy-done",
+                &semantic_test_server_sequence(vec![DONE]),
+            )
+            .unwrap(),
+        );
+        assert_eq!(legacy["status"], "verification_required", "{legacy}");
+        assert_eq!(legacy["reason"], "done_candidate");
+        assert_eq!(legacy["mutations"], 0);
     }
 
     #[test]
