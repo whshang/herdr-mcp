@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.155";
+const H2W_SCRIPT_VERSION = "0.1.156";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -8269,7 +8269,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot", "scroll"].includes(action)) {
+  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "extract"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8374,7 +8374,7 @@ async function performBrowserPageActionRequest(msg) {
     }
   }
 
-  if (!["observe", "expect"].includes(action)) {
+  if (!["observe", "expect", "extract"].includes(action)) {
     return withBrowserPageIdentity({ ok: false, error: "browser_page_action_unavailable" }, page);
   }
 

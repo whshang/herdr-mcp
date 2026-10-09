@@ -262,6 +262,34 @@
     };
   }
 
+  function executeExtract(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const ref = String(params.ref || "");
+    if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
+    const maxChars = params.maxChars === undefined ? 4000 : params.maxChars;
+    if (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > 8192) {
+      return { ok: false, error: "extract_params_invalid" };
+    }
+    const el = elementMap.get(ref);
+    if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+    if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
+      return { ok: false, error: "unsupported_element" };
+    }
+    const raw = String(el.innerText || el.textContent || "").trim();
+    return {
+      ok: true, ref, generation,
+      text: cleanText(raw, maxChars),
+      truncated: raw.length > maxChars,
+    };
+  }
+
   function executeScroll(params = {}) {
     if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
     if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
@@ -598,6 +626,7 @@
     if (action === "inspect" || action === "observe") return scanDocument(msg);
     if (action === "click") return executeClick(msg);
     if (action === "fill") return executeFill(msg);
+    if (action === "extract") return executeExtract(msg);
     if (action === "scroll") return executeScroll(msg);
     if (action === "expect") return executeExpect(msg);
     return { ok: false, error: "unsupported_action" };

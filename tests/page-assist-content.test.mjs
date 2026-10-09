@@ -222,6 +222,34 @@ test("user scrolls the viewport | Given a bounded observed page | When scrolling
   assert.equal(scroll("up", 500).after_y, 750);
 });
 
+test("user extracts text from one observed control | Given a bounded safe DOM element | When an exact generation ref is requested | Then the result is clipped without exposing markup or attributes", () => {
+  const text = "Story paragraph ".repeat(500);
+  const element = createElement({ tag: "button", text });
+  const secret = createElement({ tag: "input", type: "password", attrs: { "aria-label": "Secret" } });
+  const h = harness({ elements: [element, secret] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 1);
+  const extraction = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "extract", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref,
+    maxChars: 180, ...params,
+  });
+  const result = extraction();
+  assert.equal(result.ok, true);
+  assert.equal(result.text.length, 180);
+  assert.equal(result.truncated, true);
+  assert.ok(!Object.hasOwn(result, "outerHTML"));
+  assert.ok(!Object.hasOwn(result, "attributes"));
+  assert.equal(extraction({ maxChars: 9000 }).error, "extract_params_invalid");
+  assert.equal(extraction({ expectedOrigin: "https://other.test" }).error, "origin_mismatch");
+  assert.equal(extraction({ generation: "old" }).error, "stale_generation");
+  assert.equal(extraction({ ref: `ref_${observed.generation}_999` }).error, "element_detached");
+  assert.equal(extraction({ selector: "button" }).error, "disallowed_parameter");
+  const next = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(next.generation, observed.generation);
+  assert.equal(extraction().error, "stale_generation");
+});
+
 test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMirror textbox | When observing DOM structure | Then only bounded structural attributes are returned", () => {
   const textbox = createElement({
     tag: "div",
