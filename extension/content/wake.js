@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.160";
+const H2W_CONTENT_VERSION = "0.1.161";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -869,45 +869,39 @@ function normalizeHerdrMentionAlias(value) {
     if (!requested.length) return { ok: true, apps: [] };
     if (ADAPTER.name !== 'chatgpt'
         || typeof ADAPTER.getSelectedComposerApps !== 'function'
-        || typeof ADAPTER.openComposerAppsMenu !== 'function'
-        || typeof ADAPTER.getComposerAppCandidates !== 'function') {
+        || typeof ADAPTER.getComposerAppCandidates !== 'function'
+        || typeof ADAPTER.getComposerTextWithoutAppPills !== 'function'
+        || typeof ADAPTER.getWatchMainWorldSelector !== 'function'
+        || !ADAPTER.needsMainWorldInsert) {
       return { ok: false, error: 'required-apps-unsupported' };
     }
     for (const app of requested) {
       if (ADAPTER.getSelectedComposerApps().includes(app)) continue;
+      // The provider's native @ mention autocomplete is the sole App picker.
+      // Preserve existing pills but never overwrite a real composer draft.
+      if (ADAPTER.getComposerTextWithoutAppPills() !== '') {
+        return { ok: false, error: 'required-app-not-found' };
+      }
       let searchInserted = false;
-      let candidates = ADAPTER.getComposerAppCandidates(app);
-      if (!candidates.length && ADAPTER.openComposerAppsMenu()) {
-        const deadline = Date.now() + 3000;
-        let pluginSearchStarted = false;
-        do {
-          await wait(100);
-          candidates = ADAPTER.getComposerAppCandidates(app);
-          if (candidates.length) break;
-          if (!pluginSearchStarted && typeof ADAPTER.searchComposerApp === 'function') {
-            pluginSearchStarted = ADAPTER.searchComposerApp(app);
-          }
-        } while (Date.now() < deadline);
+      const selector = ADAPTER.getWatchMainWorldSelector();
+      // Insert @ then the keyword as separate editor events so ChatGPT can
+      // activate and filter its native mention suggestions.
+      const prefix = selector ? await insertMainWorld('@', selector, ADAPTER.getSelectedComposerApps().length > 0) : null;
+      if (!prefix?.ok) return { ok: false, error: 'required-app-not-found' };
+      searchInserted = true;
+      await wait(100);
+      const search = await insertMainWorld(app, selector, true);
+      if (!search?.ok) {
+        await clearComposer();
+        return { ok: false, error: 'required-app-not-found' };
       }
-      if (!candidates.length
-          && ADAPTER.needsMainWorldInsert
-          && !composerModelVisibleText()
-          && ADAPTER.getSelectedComposerApps().length === 0) {
-        const selector = ADAPTER.getWatchMainWorldSelector();
-        // A plain keyword is not a provider App mention. Trigger the native
-        // composer suggestion path, then require the exact observed App pill.
-        // A failed lookup clears the draft and must never submit a text token.
-        const search = selector ? await insertMainWorld(`@${app}`, selector) : null;
-        if (search?.ok) {
-          searchInserted = true;
-          const searchDeadline = Date.now() + 3000;
-          do {
-            await wait(100);
-            candidates = ADAPTER.getComposerAppCandidates(app);
-            if (candidates.length) break;
-          } while (Date.now() < searchDeadline);
-        }
-      }
+      let candidates = [];
+      const searchDeadline = Date.now() + 3000;
+      do {
+        await wait(100);
+        candidates = ADAPTER.getComposerAppCandidates(app);
+        if (candidates.length) break;
+      } while (Date.now() < searchDeadline);
       if (candidates.length !== 1) {
         if (searchInserted) await clearComposer();
         return { ok: false, error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found' };
@@ -918,7 +912,8 @@ function normalizeHerdrMentionAlias(value) {
         if (ADAPTER.getSelectedComposerApps().includes(app)) break;
         await wait(100);
       }
-      if (!ADAPTER.getSelectedComposerApps().includes(app)) {
+      if (!ADAPTER.getSelectedComposerApps().includes(app)
+          || ADAPTER.getComposerTextWithoutAppPills() !== '') {
         if (searchInserted) await clearComposer();
         return { ok: false, error: 'required-app-selection-not-observed' };
       }

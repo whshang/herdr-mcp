@@ -3603,18 +3603,13 @@ test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is a
 
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {
   assert.match(backgroundSource, /"composer\.select_tool"/);
-  assert.match(chatGptAdapterSource, /#composer-plus-btn/);
-  assert.match(chatGptAdapterSource, /data-testid="composer-plus-btn"/);
-  assert.match(chatGptAdapterSource, /aria-label="添加文件等内容"/);
-  assert.match(chatGptAdapterSource, /type to search plugins/i);
-  assert.match(chatGptAdapterSource, /HTMLInputElement\.prototype/);
-  assert.match(wakeSource, /ADAPTER\.searchComposerApp\(app\)/);
+  assert.doesNotMatch(wakeSource, /ADAPTER\.openComposerAppsMenu\(\)|ADAPTER\.searchComposerApp\(app\)/);
+  assert.doesNotMatch(chatGptAdapterSource, /openComposerAppsMenu\(\)|searchComposerApp\(keyword\)/);
   assert.match(chatGptAdapterSource, /data-inline-selection-pill/);
   assert.match(chatGptAdapterSource, /data-symbol="ecosystemMention"/);
   assert.match(chatGptAdapterSource, /data-keyword/);
-  // The generalized picker resolves the pill from visible, scored candidates in
-  // the opened menu; ambiguity stays fail-closed via candidates.length !== 1 in
-  // wake.js (asserted below).
+  // Direct @ typing triggers the provider suggestion list; a unique visible
+  // candidate and a real selected pill are still mandatory before submit.
   assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
   assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
   assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
@@ -3625,10 +3620,11 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
-  assert.match(wakeSource, /!candidates\.length && ADAPTER\.openComposerAppsMenu\(\)/);
-  assert.doesNotMatch(wakeSource, /required-apps-menu-unavailable/);
-  assert.match(wakeSource, /!composerModelVisibleText\(\)/);
-  assert.match(wakeSource, /const search = selector \? await insertMainWorld\(`@\$\{app\}`, selector\) : null/);
+  assert.match(wakeSource, /ADAPTER\.getComposerTextWithoutAppPills\(\) !== ''/);
+  assert.match(wakeSource, /const prefix = selector \? await insertMainWorld\('@', selector,/);
+  assert.match(wakeSource, /const search = await insertMainWorld\(app, selector, true\)/);
+  assert.ok(wakeSource.indexOf("await insertMainWorld('@', selector")
+    < wakeSource.indexOf("await insertMainWorld(app, selector, true)"));
   assert.match(wakeSource, /required-app-selection-not-observed/);
   assert.match(wakeSource, /!ADAPTER\.getSelectedComposerApps\(\)\.includes\(app\)/);
   assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);

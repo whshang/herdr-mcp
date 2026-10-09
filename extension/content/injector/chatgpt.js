@@ -159,40 +159,6 @@ class ChatGPTAdapter extends BaseAdapter {
     return this.getComposerTextWithoutAppPills() === '';
   }
 
-  openComposerAppsMenu() {
-    const input = this.getInputEl();
-    const scope = input?.closest?.('form') || document;
-    const button = scope.querySelector([
-      '#composer-plus-btn',
-      'button[data-testid="composer-plus-btn"]',
-      'button[aria-label="添加文件等内容"]',
-      'button[aria-label="Add files and more"]',
-    ].join(', '));
-    if (!button || button.disabled === true || button.getAttribute('aria-disabled') === 'true') return false;
-    button.click();
-    return true;
-  }
-
-  searchComposerApp(keyword) {
-    const wanted = String(keyword || '').trim().toLowerCase();
-    if (!wanted) return false;
-    const fields = [...document.querySelectorAll('input[placeholder], input[aria-label]')].filter((field) =>
-      this.elementVisible(field)
-      && [field.getAttribute('placeholder'), field.getAttribute('aria-label')]
-        .some((label) => /^(type to search plugins|search plugins|搜索插件)$/i.test(String(label || '').trim())));
-    if (fields.length !== 1 || (fields[0].value && fields[0].value.trim().toLowerCase() !== wanted)) return false;
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-    if (!setter) return false;
-    try {
-      fields[0].focus();
-      setter.call(fields[0], wanted);
-      fields[0].dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: wanted }));
-      return fields[0].value.trim().toLowerCase() === wanted;
-    } catch (_) {
-      return false;
-    }
-  }
-
   getComposerAppCandidates(keyword) {
     const wanted = String(keyword || '').trim().toLowerCase();
     const input = this.getInputEl();
