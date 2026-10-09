@@ -3605,6 +3605,10 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(backgroundSource, /"composer\.select_tool"/);
   assert.match(chatGptAdapterSource, /#composer-plus-btn/);
   assert.match(chatGptAdapterSource, /data-testid="composer-plus-btn"/);
+  assert.match(chatGptAdapterSource, /aria-label="添加文件等内容"/);
+  assert.match(chatGptAdapterSource, /type to search plugins/i);
+  assert.match(chatGptAdapterSource, /HTMLInputElement\.prototype/);
+  assert.match(wakeSource, /ADAPTER\.searchComposerApp\(app\)/);
   assert.match(chatGptAdapterSource, /data-inline-selection-pill/);
   assert.match(chatGptAdapterSource, /data-symbol="ecosystemMention"/);
   assert.match(chatGptAdapterSource, /data-keyword/);
