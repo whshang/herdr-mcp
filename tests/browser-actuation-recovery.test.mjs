@@ -3621,6 +3621,8 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
+  assert.match(wakeSource, /!candidates\.length && ADAPTER\.openComposerAppsMenu\(\)/);
+  assert.doesNotMatch(wakeSource, /required-apps-menu-unavailable/);
   assert.match(wakeSource, /!composerModelVisibleText\(\)/);
   assert.match(wakeSource, /const search = selector \? await insertMainWorld\(`@\$\{app\}`, selector\) : null/);
   assert.match(wakeSource, /required-app-selection-not-observed/);
