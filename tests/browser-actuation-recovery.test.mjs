@@ -11,6 +11,18 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+test("user scrolls a browser page | Given a typed Rust actuation payload | When the extension bridge forwards it | Then direction and amount reach the normal Page Assist action path", () => {
+  const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
+  const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
+  assert.ok(start > 0 && end > start);
+  const bridge = backgroundSource.slice(start, end);
+  assert.match(bridge, /pageRef:\s*params\.page_ref/);
+  assert.match(bridge, /action:\s*params\.action/);
+  assert.match(bridge, /generation:\s*params\.generation/);
+  assert.match(bridge, /direction:\s*params\.direction/);
+  assert.match(bridge, /amount:\s*params\.amount/);
+});
+
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
 const browserPageLifecycleEnd = backgroundSource.indexOf("\nasync function performPageAssistRequest", browserPageLifecycleStart);
 assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,
