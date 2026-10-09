@@ -136,10 +136,13 @@ const probes = {
       "const menuRoots = [...document.querySelectorAll('.popover, [role=\"menu\"], [role=\"listbox\"]')]",
     )
       && source.adapter.includes("for (const root of menuRoots)")
-      && source.wake.includes("!composerModelVisibleText()")
+      && (source.wake.includes("!composerModelVisibleText()")
+        || source.wake.includes("ADAPTER.getComposerTextWithoutAppPills() !== ''"))
       && (
         source.wake.includes("const search = selector ? await insertMainWorld(app, selector) : null")
         || source.wake.includes("const search = selector ? await insertMainWorld(`@${app}`, selector) : null")
+        || (source.wake.includes("await insertMainWorld('@', selector")
+          && source.wake.includes("await insertMainWorld(app, selector, true)"))
       )
       && source.wake.includes("if (searchInserted) await clearComposer()");
   },
