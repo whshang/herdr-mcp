@@ -39,6 +39,16 @@ herdr-mcp webchat create \
   --expected-generation N --idempotency-key KEY [--work-chain-id WORK_CHAIN_ID]
 ```
 
+To make a WebChat child actually eligible to use the **provider-owned** Herdr App,
+pass `--required-app herdr` to `webchat create` or `webchat send`.
+The value is a provider App keyword, not Markdown text or a fabricated App pill.
+The Extension selects the *unique* matching provider App and reads its selected
+identity before submitting; absence, ambiguity or failed selection stops delivery.
+The Runtime must not classify a required-App message as `applied` unless
+`required_apps_readback` matches exactly. This is **App selection evidence only**:
+confirm a real tool call and result inside the child before claiming execution.
+With `uncertain`, read back first; never resend with a new idempotency key.
+
 Dispatch and observe:
 
 ```sh

@@ -2265,6 +2265,23 @@ fn browser_session_create_retry_safe_not_applied(evidence: &BrowserPostcondition
             == Some(true)
 }
 
+fn browser_required_apps_match_evidence(
+    params: &Value,
+    evidence: &BrowserPostconditionEvidence,
+) -> Result<bool, String> {
+    let requested = browser_required_apps(params, true)
+        .map_err(|_| "browser_required_apps_invalid".to_owned())?;
+    if requested.is_empty() {
+        return Ok(true);
+    }
+    Ok(evidence.required_apps_readback.len() == requested.len()
+        && evidence
+            .required_apps_readback
+            .iter()
+            .map(String::as_str)
+            .eq(requested))
+}
+
 fn browser_delivery_state_from_postcondition(
     operation: BrowserOperation,
     params: &Value,
@@ -2305,6 +2322,7 @@ fn browser_delivery_state_from_postcondition(
                 // materialization + locator generation above still fence the new
                 // resource to the requested browser generation.
                 && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
+                && browser_required_apps_match_evidence(params, evidence)?
         }
         BrowserOperation::SpaceOpen | BrowserOperation::SessionOpen => {
             evidence.stable_resource_ref_observed
@@ -2339,6 +2357,7 @@ fn browser_delivery_state_from_postcondition(
                 && evidence.generation_owner == Some(expected_generation)
                 && evidence.generation_status_observed
                 && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
+                && browser_required_apps_match_evidence(params, evidence)?
         }
         BrowserOperation::DispatchStop => evidence.generation_stopped,
         BrowserOperation::SpaceInspect
@@ -11770,6 +11789,52 @@ mod tests {
                 .any(|entry| entry.contains("browser_message_")),
             "multiline messages must not fail message validation: {outcomes:?}"
         );
+    }
+
+    #[test]
+    fn browser_required_app_activation_must_be_observed_before_delivery_is_applied() {
+        let mut evidence = BrowserPostconditionEvidence::resource_unavailable(7);
+        evidence.browser_online = true;
+        evidence.resource_available = true;
+        evidence.command_accepted = true;
+        evidence.stable_resource_ref_observed = true;
+        evidence.lifecycle_observed = true;
+        evidence.canonical_url_observed = true;
+        evidence.accepted_message_observed = true;
+        evidence.generation_owner = Some(7);
+        evidence.generation_status_observed = true;
+        evidence.result = Some(json!({"accepted_user_message_ref": "provider-user-test"}));
+        let requiring_app = json!({"required_apps": ["herdr"]});
+        let legacy = json!({});
+
+        for operation in [
+            BrowserOperation::SessionCreate,
+            BrowserOperation::DispatchSubmit,
+        ] {
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &legacy, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Applied,
+            );
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &requiring_app, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Uncertain,
+            );
+            evidence.required_apps_readback = vec!["other".to_owned()];
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &requiring_app, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Uncertain,
+            );
+            evidence.required_apps_readback = vec!["herdr".to_owned()];
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &requiring_app, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Applied,
+            );
+            evidence.required_apps_readback.clear();
+        }
     }
 
     #[test]

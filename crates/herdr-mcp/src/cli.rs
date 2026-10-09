@@ -335,6 +335,7 @@ pub enum WebChatCommand {
         space_ref: Option<String>,
         source_url: Option<String>,
         display_label: Option<String>,
+        required_app: Option<String>,
         message: String,
         expected_generation: Option<i64>,
         idempotency_key: String,
@@ -342,6 +343,7 @@ pub enum WebChatCommand {
     },
     Send {
         session_ref: String,
+        required_app: Option<String>,
         message: String,
         expected_generation: i64,
         idempotency_key: String,
@@ -2688,6 +2690,7 @@ mod tests {
                 space_ref: None,
                 source_url: Some("https://chatgpt.com/g/g-p-test/c/source".to_owned()),
                 display_label: None,
+                required_app: None,
                 message: "continue".to_owned(),
                 expected_generation: None,
                 idempotency_key: "create-key-1".to_owned(),
@@ -2726,6 +2729,79 @@ mod tests {
             ]))
             .is_err()
         );
+        assert_eq!(
+            parse(args(&[
+                "webchat",
+                "create",
+                "--source-url",
+                "https://chatgpt.com/c/source",
+                "--message",
+                "invoke Herdr",
+                "--idempotency-key",
+                "app-create",
+                "--required-app",
+                "HERDR",
+            ]))
+            .unwrap()
+            .command,
+            Command::WebChat(WebChatCommand::Create {
+                endpoint_ref: None,
+                provider: None,
+                account_ref: None,
+                space_ref: None,
+                source_url: Some("https://chatgpt.com/c/source".to_owned()),
+                display_label: None,
+                required_app: Some("herdr".to_owned()),
+                message: "invoke Herdr".to_owned(),
+                expected_generation: None,
+                idempotency_key: "app-create".to_owned(),
+                work_chain_id: None,
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "webchat",
+                "send",
+                "--session-ref",
+                "br_session",
+                "--message",
+                "invoke Herdr",
+                "--expected-generation",
+                "7",
+                "--idempotency-key",
+                "app-send",
+                "--required-app",
+                "Herdr",
+            ]))
+            .unwrap()
+            .command,
+            Command::WebChat(WebChatCommand::Send {
+                session_ref: "br_session".to_owned(),
+                required_app: Some("herdr".to_owned()),
+                message: "invoke Herdr".to_owned(),
+                expected_generation: 7,
+                idempotency_key: "app-send".to_owned(),
+                work_chain_id: None,
+            })
+        );
+        for forbidden in ["@herdr", "herdr extra", "herdr?", ""] {
+            let mut argv = args(&[
+                "webchat",
+                "send",
+                "--session-ref",
+                "br_session",
+                "--message",
+                "test",
+                "--expected-generation",
+                "7",
+                "--idempotency-key",
+                "safe",
+                "--required-app",
+                forbidden,
+            ]);
+            assert!(parse(std::mem::take(&mut argv)).is_err());
+        }
+        assert!(webchat_help().contains("--required-app APP_KEYWORD"));
         assert!(webchat_help().contains("webchat create --source-url URL"));
     }
 
