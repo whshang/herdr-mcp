@@ -7439,9 +7439,10 @@ fn browser_page_action_call(
     browser_actuator: Option<&dyn BrowserActuator>,
 ) -> Value {
     // Opt-in structured extraction allowlist. Every name maps to a reviewed,
-    // bounded projection; raw markup, arbitrary attributes, scripts, storage
-    // and network reads are never reachable through extract.
-    const EXTRACT_FIELDS: &[&str] = &["tag", "role", "aria_label", "title", "href"];
+    // bounded structural token; attribute text, links, raw markup, scripts,
+    // storage and network reads are never reachable through extract. A name
+    // outside this list fails closed rather than being silently ignored.
+    const EXTRACT_FIELDS: &[&str] = &["tag", "role"];
     let Some(object) = params.as_object() else {
         return json!({"ok": false, "code": "invalid_params", "message": "browser page action params must be an object"});
     };
@@ -7741,7 +7742,7 @@ fn browser_page_action_call(
                     return json!({"ok": false, "code": "invalid_params", "message": "extract fields must be an array of allowlisted names"});
                 };
                 if fields.is_empty() || fields.len() > EXTRACT_FIELDS.len() {
-                    return json!({"ok": false, "code": "invalid_params", "message": "extract fields must contain between 1 and 5 allowlisted names"});
+                    return json!({"ok": false, "code": "invalid_params", "message": "extract fields must contain 1 to 2 unique allowlisted names (tag, role)"});
                 }
                 let mut selected: Vec<&str> = Vec::with_capacity(fields.len());
                 for field in fields {
@@ -7749,7 +7750,7 @@ fn browser_page_action_call(
                         return json!({"ok": false, "code": "invalid_params", "message": "extract fields must be an array of allowlisted names"});
                     };
                     if !EXTRACT_FIELDS.contains(&field) || selected.contains(&field) {
-                        return json!({"ok": false, "code": "invalid_params", "message": "extract fields must be unique allowlisted names"});
+                        return json!({"ok": false, "code": "invalid_params", "message": "extract fields must be unique allowlisted names (tag, role)"});
                     }
                     selected.push(field);
                 }
@@ -16824,7 +16825,7 @@ mod tests {
                 assert_eq!(params["action"], "extract");
                 assert_eq!(params["generation"], "pa_gen_extract_1");
                 assert_eq!(params["ref"], "ref_pa_gen_extract_1_0");
-                assert_eq!(params["fields"], json!(["tag", "role", "href"]));
+                assert_eq!(params["fields"], json!(["tag", "role"]));
                 assert!(params.get("idempotency_key").is_none());
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let mut evidence =
@@ -16836,7 +16837,7 @@ mod tests {
                     "ok": true,
                     "text": "Visible item",
                     "truncated": false,
-                    "fields": {"tag": "a", "role": "link", "href": "https://app.test/details"},
+                    "fields": {"tag": "a", "role": "link"},
                 }));
                 Ok(evidence)
             }
@@ -16855,14 +16856,17 @@ mod tests {
             "action": "extract",
             "generation": "pa_gen_extract_1",
             "ref": "ref_pa_gen_extract_1_0",
-            "fields": ["tag", "role", "href"],
+            "fields": ["tag", "role"],
         });
         for invalid in [
             json!([]),
             json!(["outerHTML"]),
             json!(["attributes"]),
+            json!(["href"]),
+            json!(["aria_label"]),
+            json!(["title"]),
             json!(["tag", "tag"]),
-            json!(["tag", "role", "aria_label", "title", "href", "tag"]),
+            json!(["tag", "role", "href"]),
             json!([1]),
             json!("tag"),
             json!(["Tag"]),
@@ -16894,7 +16898,9 @@ mod tests {
         let read = browser_page_action_call(&store, &params, &grants, Some(&actuator));
         assert_eq!(read["ok"], true);
         assert_eq!(read["text"], "Visible item");
-        assert_eq!(read["fields"]["href"], "https://app.test/details");
+        assert_eq!(read["fields"]["tag"], "a");
+        assert_eq!(read["fields"]["role"], "link");
+        assert!(read["fields"].get("href").is_none());
         assert!(read.get("op_id").is_none());
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
     }

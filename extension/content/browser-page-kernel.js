@@ -24,12 +24,12 @@
     "cc-csc",
   ]);
 
-  // Opt-in structured extraction is limited to a fixed, reviewed allowlist.
-  // No raw markup, arbitrary attribute, style, storage, script or network read
-  // is reachable through this surface.
-  const EXTRACT_FIELD_NAMES = Object.freeze(["tag", "role", "aria_label", "title", "href"]);
+  // Opt-in structured extraction is limited to a fixed, reviewed allowlist of
+  // structural tokens only. No attribute text, markup, href, style, storage,
+  // script or network read is reachable through this surface, and a requested
+  // name outside the allowlist fails closed instead of being ignored.
+  const EXTRACT_FIELD_NAMES = Object.freeze(["tag", "role"]);
   const MAX_EXTRACT_FIELDS = EXTRACT_FIELD_NAMES.length;
-  const MAX_EXTRACT_FIELD_CHARS = 512;
   const SAFE_FIELD_TOKEN = /^[a-z][a-z0-9-]{0,31}$/;
 
   function isSensitiveField(el) {
@@ -117,30 +117,46 @@
     return SAFE_FIELD_TOKEN.test(token) ? token : undefined;
   }
 
-  function safeFieldText(el, attribute) {
-    const raw = String(el?.getAttribute?.(attribute) ?? "");
-    // Drop control characters so a label cannot smuggle terminal escapes or
-    // line breaks into a structured field.
-    const value = raw.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
-    return value ? value.slice(0, MAX_EXTRACT_FIELD_CHARS) : undefined;
+  function collectTextNodes(el, depth = 0) {
+    if (depth > 64) return "";
+    const children = el?.childNodes;
+    if (!children || typeof children.length !== "number") return "";
+    let text = "";
+    for (const child of children) {
+      if (!child) continue;
+      if (child.nodeType === 3) {
+        text += String(child.nodeValue || "");
+        continue;
+      }
+      if (child.nodeType !== 1) continue;
+      if (isSensitiveField(child) || isElementHidden(child)) continue;
+      text += collectTextNodes(child, depth + 1);
+    }
+    return text;
   }
 
-  function safeLinkHref(el) {
-    if (String(el?.tagName || "").toLowerCase() !== "a") return undefined;
-    const raw = el.getAttribute?.("href");
-    if (!raw) return undefined;
-    try {
-      const url = new URL(raw, global.location?.href);
-      // Conservative link projection: only same-origin http(s) without embedded
-      // credentials. Query and fragment are dropped because they frequently
-      // carry session or one-time tokens that must not leak into extraction.
-      if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
-      if (url.username || url.password) return undefined;
-      if (url.origin !== global.location?.origin) return undefined;
-      return `${url.origin}${url.pathname}`.slice(0, MAX_EXTRACT_FIELD_CHARS);
-    } catch (_) {
-      return undefined;
+  function containsSensitiveDescendant(el, depth = 0) {
+    if (depth > 64) return true;
+    const children = el?.childNodes;
+    if (!children || typeof children.length !== "number") return false;
+    for (const child of children) {
+      if (!child || child.nodeType !== 1) continue;
+      if (isSensitiveField(child) || containsSensitiveDescendant(child, depth + 1)) {
+        return true;
+      }
     }
+    return false;
+  }
+
+  function extractVisibleText(el) {
+    // innerText is the rendered text and already excludes display:none and
+    // visibility:hidden descendants. Never fall back to textContent, which
+    // would include hidden subtrees whenever innerText is empty.
+    const rendered = typeof el?.innerText === "string" ? el.innerText : "";
+    // A visible sensitive descendant can still contribute rendered text, so
+    // rebuild from text nodes while skipping hidden/sensitive subtrees instead
+    // of guessing which slice of innerText is safe.
+    return containsSensitiveDescendant(el) ? collectTextNodes(el) : rendered;
   }
 
   function extractElementFields(el, requested) {
@@ -152,18 +168,6 @@
     if (requested.has("role")) {
       const role = safeFieldToken(el?.getAttribute?.("role"));
       if (role) fields.role = role;
-    }
-    if (requested.has("aria_label")) {
-      const ariaLabel = safeFieldText(el, "aria-label");
-      if (ariaLabel) fields.aria_label = ariaLabel;
-    }
-    if (requested.has("title")) {
-      const title = safeFieldText(el, "title");
-      if (title) fields.title = title;
-    }
-    if (requested.has("href")) {
-      const href = safeLinkHref(el);
-      if (href) fields.href = href;
     }
     return fields;
   }
@@ -367,7 +371,7 @@
     if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
       return { ok: false, error: "unsupported_element" };
     }
-    const raw = String(el.innerText || el.textContent || "").trim();
+    const raw = String(extractVisibleText(el)).trim();
     const result = {
       ok: true, ref, generation,
       text: cleanText(raw, maxChars),

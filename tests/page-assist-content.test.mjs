@@ -23,10 +23,12 @@ function createElement({
   disabled = false,
   readOnly = false,
   contentEditable = false,
+  children = [],
 } = {}) {
   const attributes = new Map(Object.entries(attrs));
   const events = [];
   const element = {
+    nodeType: 1,
     tagName: tag.toUpperCase(),
     type,
     innerText: text,
@@ -38,6 +40,11 @@ function createElement({
     isContentEditable: contentEditable,
     offsetParent: visible ? {} : null,
     ownerDocument: null,
+    childNodes: children.map((child) => (
+      typeof child === "string"
+        ? { nodeType: 3, nodeValue: child }
+        : child
+    )),
     clicked: 0,
     focused: 0,
     events,
@@ -77,7 +84,13 @@ function harness({
     documentElement: { scrollHeight: scrollMax + 600 },
     querySelectorAll() { return elements; },
   };
-  for (const element of elements) element.ownerDocument = document;
+  const assignOwner = (element) => {
+    element.ownerDocument = document;
+    for (const child of element.childNodes || []) {
+      if (child && child.nodeType === 1) assignOwner(child);
+    }
+  };
+  for (const element of elements) assignOwner(element);
 
   const context = vm.createContext({
     console,
@@ -250,69 +263,99 @@ test("user extracts text from one observed control | Given a bounded safe DOM el
   assert.equal(extraction().error, "stale_generation");
 });
 
-test("user extracts allowlisted structure from one observed element | Given a visible nonsensitive link | When opt-in fields are requested | Then only bounded safe tag, role, labels and a conservative same-origin href are returned", () => {
+test("user extracts allowlisted structural fields | Given a visible nonsensitive element | When opt-in fields are requested | Then only bounded tag and role tokens are returned and unsupported names fail closed", () => {
   const link = createElement({
     tag: "a",
     text: "Open details",
     attrs: {
       href: "/details/42?token=SECRET#frag",
-      role: "link",
+      role: "LINK",
       "aria-label": "Open details",
       title: "Details title",
     },
   });
-  const external = createElement({
-    tag: "a",
-    text: "External",
-    attrs: { href: "https://evil.test/steal?token=EXTERNAL_SECRET" },
-  });
+  const widget = createElement({ tag: "my-widget", text: "Widget", attrs: { role: "li\nnk" } });
+  const overlongRole = createElement({ tag: "button", text: "Long", attrs: { role: "a".repeat(40) } });
+  const unicodeRole = createElement({ tag: "button", text: "Unicode", attrs: { role: "l\u00e4nk" } });
   const input = createElement({ tag: "input", type: "text", attrs: { placeholder: "Name" } });
-  const button = createElement({ tag: "button", text: "Toggle" });
-  const h = harness({ elements: [link, external, input, button] });
+  const h = harness({ elements: [link, widget, overlongRole, unicodeRole, input] });
   const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
-  assert.equal(observed.elements.length, 4);
+  assert.equal(observed.elements.length, 5);
   const extract = (ref, params = {}) => h.send({
     type: "h2w_page_assist", action: "extract", expectedOrigin: "https://app.test",
     generation: observed.generation, ref, maxChars: 200, ...params,
   });
 
   const linkRef = observed.elements[0].ref;
-  const externalRef = observed.elements[1].ref;
-  const structured = extract(linkRef, { fields: ["tag", "role", "aria_label", "title", "href"] });
+  const structured = extract(linkRef, { fields: ["tag", "role"] });
   assert.equal(structured.ok, true);
-  assert.deepEqual({ ...structured.fields }, {
-    tag: "a",
-    role: "link",
-    aria_label: "Open details",
-    title: "Details title",
-    href: "https://app.test/details/42",
-  });
-  assert.ok(!structured.fields.href.includes("SECRET"));
+  assert.deepEqual({ ...structured.fields }, { tag: "a", role: "link" });
+  assert.ok(!Object.hasOwn(structured.fields, "href"));
+  assert.ok(!Object.hasOwn(structured.fields, "aria_label"));
+  assert.ok(!Object.hasOwn(structured.fields, "title"));
   assert.ok(!Object.hasOwn(structured, "outerHTML"));
   assert.ok(!Object.hasOwn(structured.fields, "class"));
+  assert.ok(!structured.text.includes("SECRET"));
 
-  const externalResult = extract(externalRef, { fields: ["href", "tag"] });
-  assert.equal(externalResult.ok, true);
-  assert.equal(externalResult.fields.tag, "a");
-  assert.ok(!Object.hasOwn(externalResult.fields, "href"));
+  // Structural tokens are lowercased and bounded; a non-token role is omitted.
+  assert.deepEqual({ ...extract(observed.elements[1].ref, { fields: ["tag", "role"] }).fields }, { tag: "my-widget" });
+  assert.deepEqual({ ...extract(observed.elements[2].ref, { fields: ["tag", "role"] }).fields }, { tag: "button" });
+  assert.deepEqual({ ...extract(observed.elements[3].ref, { fields: ["role"] }).fields }, {});
 
-  assert.equal(extract(linkRef, { fields: ["href", "href"] }).error, "extract_fields_invalid");
-  assert.equal(extract(linkRef, { fields: [] }).error, "extract_fields_invalid");
-  assert.equal(extract(linkRef, { fields: ["outerHTML"] }).error, "extract_fields_invalid");
-  assert.equal(extract(linkRef, { fields: "href" }).error, "extract_fields_invalid");
-  assert.equal(extract(linkRef, { fields: ["tag", "role", "aria_label", "title", "href", "tag"] }).error, "extract_fields_invalid");
+  // Attribute text, links and unknown names are rejected, not silently ignored.
+  for (const fields of [
+    ["href"], ["aria_label"], ["title"], ["outerHTML"], ["attributes"], ["Tag"],
+    [], ["tag", "tag"], ["tag", "role", "href"], "role", [1], ["tag", "role", "aria_label"],
+  ]) {
+    assert.equal(extract(linkRef, { fields }).error, "extract_fields_invalid");
+  }
 
+  // Omitting fields preserves the legacy text-only shape.
   const textOnly = extract(linkRef);
   assert.equal(textOnly.ok, true);
+  assert.equal(textOnly.text, "Open details");
   assert.ok(!Object.hasOwn(textOnly, "fields"));
   assert.equal(extract(linkRef, { generation: "old", fields: ["tag"] }).error, "stale_generation");
 
-  // An element that becomes sensitive or hidden after observation must fail
-  // closed even when only allowlisted structure is requested.
+  // An element that becomes sensitive or hidden after observation fails closed.
   input.type = "password";
-  button.offsetParent = null;
-  assert.equal(extract(observed.elements[2].ref, { fields: ["tag"] }).error, "unsupported_element");
-  assert.equal(extract(observed.elements[3].ref, { fields: ["tag", "title"] }).error, "unsupported_element");
+  assert.equal(extract(observed.elements[4].ref, { fields: ["tag"] }).error, "unsupported_element");
+});
+
+test("user extracts visible text safely | Given a container with hidden or sensitive descendants | When extraction runs | Then hidden and sensitive descendant text is excluded and hidden textContent is never inferred", () => {
+  const hiddenText = createElement({ tag: "div", text: "", children: ["SECRET-HIDDEN"] });
+  hiddenText.textContent = "SECRET-HIDDEN";
+  const hiddenPassword = createElement({ tag: "input", type: "password", value: "hunter2", visible: false });
+  const passwordContainer = createElement({ tag: "div", text: "", children: [hiddenPassword] });
+  passwordContainer.textContent = "hunter2";
+  const otp = createElement({ tag: "span", text: "123456", attrs: { autocomplete: "one-time-code" } });
+  const codeContainer = createElement({ tag: "div", text: "Enter code: 123456", children: ["Enter code: ", otp] });
+  const h = harness({ elements: [hiddenText, passwordContainer, codeContainer] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 3);
+  const extract = (ref, params = {}) => h.send({
+    type: "h2w_page_assist", action: "extract", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref, maxChars: 200, ...params,
+  });
+
+  // innerText is empty but textContent contains hidden text: never infer it.
+  const hiddenResult = extract(observed.elements[0].ref);
+  assert.equal(hiddenResult.ok, true);
+  assert.equal(hiddenResult.text, "");
+  assert.ok(!hiddenResult.text.includes("SECRET-HIDDEN"));
+
+  // A hidden password child contributes no text.
+  const passwordResult = extract(observed.elements[1].ref);
+  assert.equal(passwordResult.ok, true);
+  assert.equal(passwordResult.text, "");
+  assert.ok(!passwordResult.text.includes("hunter2"));
+
+  // A visible sensitive descendant is filtered even with opt-in structure.
+  const codeResult = extract(observed.elements[2].ref, { fields: ["tag", "role"] });
+  assert.equal(codeResult.ok, true);
+  assert.equal(codeResult.text, "Enter code:");
+  assert.ok(!codeResult.text.includes("123456"));
+  assert.deepEqual({ ...codeResult.fields }, { tag: "div" });
 });
 
 test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMirror textbox | When observing DOM structure | Then only bounded structural attributes are returned", () => {
