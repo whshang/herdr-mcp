@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.133";
+const H2W_SCRIPT_VERSION = "0.1.149";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -868,14 +868,17 @@ function enrichConversationInfoWithBrowserScope(tabId, info) {
     project_id: projectId,
     project_name: projectName || null,
     project_key: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
-    project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
+    project_launch_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`,
   };
 }
 
-async function conversationInfoForTab(tabId) {
+async function conversationInfoForTab(tabId, { refreshObservation = false } = {}) {
   if (!tabId) return null;
+  const handshake = refreshObservation
+    ? { type: "h2w_get_convkey", refreshObservation: true }
+    : { type: "h2w_get_convkey" };
   try {
-    const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+    const live = await chrome.tabs.sendMessage(tabId, handshake);
     if (live?.convKey) {
       const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
       const info = parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
@@ -902,7 +905,7 @@ async function conversationInfoForTab(tabId) {
       }
       for (let attempt = 0; attempt < 20; attempt += 1) {
         try {
-          const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+          const live = await chrome.tabs.sendMessage(tabId, handshake);
           if (live?.convKey) {
             const parsed = browserConversationInfoFromSupportedUrl(live.url || live.convKey);
             const info = parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
@@ -2105,7 +2108,7 @@ async function drainDurableSelfArchive(convKey, tabId, trigger = "turn-ended") {
 
 function browserProviderCapabilities(provider) {
   const operations = provider === "chatgpt"
-    ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create"]
+    ? ["composer.submit", "composer.select_tool", "generation.status", "generation.stop", "session.archive", "session.inspect", "session.open", "session.create", "session.title_projection"]
     : ["composer.submit", "generation.status", "generation.stop", "session.inspect"];
   return {
     schema_version: 1,
@@ -2179,7 +2182,7 @@ async function observeBrowserConversation({
         parent_ref: parentRef,
         native_identity: projectId,
         display_label: projectName,
-        canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}`,
+        canonical_url: `https://chatgpt.com/g/${encodeURIComponent(projectId)}/project`,
         observation_generation: observationGeneration,
         observed_at: Date.now(),
       });
@@ -2287,7 +2290,7 @@ function browserEndpointView(endpoint) {
     browser_family: endpoint.browser_family || null,
     extension_version: endpoint.extension_version || null,
     consent: {
-      webchat_control: consent.webchat_control === true,
+      webchat_control: true,
       tool_bridge: consent.tool_bridge === true,
       tool_bridge_workstation_mutation: consent.tool_bridge_workstation_mutation === true,
       revision: consentRevision,
@@ -2296,7 +2299,7 @@ function browserEndpointView(endpoint) {
   };
 }
 
-async function setLocalBrowserWebchatControlConsent(allowed) {
+async function setLocalBrowserWebchatControlConsent() {
   const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
   const current = browserEndpointView(endpoint);
   if (!endpoint?.endpoint_ref || !current) throw new Error("browser-endpoint-unavailable");
@@ -2306,7 +2309,7 @@ async function setLocalBrowserWebchatControlConsent(allowed) {
     profile_seed: profileSeed,
     endpoint_ref: endpoint.endpoint_ref,
     expected_consent_revision: current.consent_revision,
-    webchat_control_allowed: allowed,
+    webchat_control_allowed: true,
     tool_bridge_allowed: current.consent.tool_bridge,
     tool_bridge_mutation_allowed: current.consent.tool_bridge_workstation_mutation,
     observed_at: Date.now(),
@@ -2314,6 +2317,34 @@ async function setLocalBrowserWebchatControlConsent(allowed) {
   if (!parsed?.endpoint) throw new Error("browser-consent-response-missing-endpoint");
   browserEndpoint = parsed.endpoint;
   return browserEndpointView(browserEndpoint);
+}
+
+async function recoverOpenChatGptBrowserRegistry() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: "*://chatgpt.com/*" });
+  } catch (_) {
+    return { observed: 0 };
+  }
+  let observed = 0;
+  for (const tab of tabs) {
+    if (!tab?.id) continue;
+    try {
+      // The opaque page-identity handshake is the only recovery trigger here,
+      // with an explicit refresh so an already-registered tab that still holds
+      // a previous generation's opaque refs re-runs the content-side
+      // registerCurrentConversation("identity-recovery"). That ordinary content
+      // registration is the single identity source and publishes
+      // provider/account/space/session facts through h2w_register. Background
+      // never receives raw account identity on this handshake and does not
+      // implement a second identity source.
+      const pageInfo = await conversationInfoForTab(tab.id, { refreshObservation: true });
+      if (pageInfo?.site === "chatgpt" && pageInfo?.convKey) observed += 1;
+    } catch (error) {
+      callLog("browser registry recovery failed:", error?.message || String(error));
+    }
+  }
+  return { observed };
 }
 
 async function registerLocalBrowserEndpoint() {
@@ -2335,6 +2366,7 @@ async function registerLocalBrowserEndpoint() {
     if (response.ok && parsed?.ok === true && parsed.endpoint) {
       browserEndpoint = parsed.endpoint;
       await getBrowserObservationGeneration();
+      await recoverOpenChatGptBrowserRegistry();
       return browserEndpoint;
     }
     callLog(
@@ -8303,10 +8335,13 @@ async function performBrowserPageActionRequest(msg) {
       }
       return browserPageMutationEnvelope(mutationResponse, page, true);
     }
-    return withBrowserPageIdentity(
-      response || { ok: false, error: "empty_content_response" },
-      page,
-    );
+    // A WebChat listener can yield with no response before Page Assist has
+    // been injected. For read-only operations, treat an empty/non-envelope
+    // response as an absent listener and use the existing bounded injector.
+    if (response && typeof response === "object" && !Array.isArray(response)
+        && typeof response.ok === "boolean") {
+      return withBrowserPageIdentity(response, page);
+    }
   } catch (error) {
     if (mutation) {
       return browserPageMutationEnvelope(
@@ -9825,21 +9860,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           project_id: currentProjectId,
           project_name: currentProjectName || pageInfo.project_name || null,
           ...(registeringSite === "chatgpt"
-            ? { project_key: projectKey, project_launch_url: projectKey }
+            ? { project_key: projectKey, project_launch_url: `${projectKey}/project` }
             : { pageKey: projectKey }),
         };
       }
       const browserPageInfo = ["chatgpt", "gemini", "claude", "grok"].includes(registeringSite)
         ? pageInfo
         : browserConversationInfo(registeringSite, msg.url || msg.convKey);
+      const accountNativeIdentity = String(msg.accountNativeIdentity || "").trim();
+      if (registeringSite === "chatgpt" && sender.tab?.id && !accountNativeIdentity) {
+        browserTabScopes.delete(sender.tab.id);
+        for (const [sessionRef, target] of browserSessionTargets) {
+          if (target?.tabId === sender.tab.id) browserSessionTargets.delete(sessionRef);
+        }
+      }
       let browserObservation = null;
-      if (browserPageInfo && sender.tab?.id && String(msg.accountNativeIdentity || "").trim()) {
+      if (browserPageInfo && sender.tab?.id && accountNativeIdentity) {
         const observationInput = {
           provider: browserPageInfo.site,
           tabId: sender.tab.id,
           convKey: String(msg.convKey || ""),
           pageInfo: browserPageInfo,
-          accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
+          accountNativeIdentity,
           projects: Array.isArray(msg.browserProjects) ? msg.browserProjects : [],
           reservationRef: String(msg.browserSessionReservationRef || "").trim() || null,
         };

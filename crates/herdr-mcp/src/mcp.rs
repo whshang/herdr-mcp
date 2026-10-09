@@ -4221,6 +4221,12 @@ fn browser_session_create(
         Ok(value) => value,
         Err(error) => return browser_store_error(error),
     };
+    let title_projection = evidence
+        .result
+        .as_ref()
+        .and_then(|result| result.get("title_projection"))
+        .filter(|value| value.is_object())
+        .cloned();
     let Ok(mut guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
@@ -4235,7 +4241,7 @@ fn browser_session_create(
         Err(error) => return browser_store_error(error),
     };
     if delivery_state == BrowserDeliveryState::Applied {
-        return browser_session_create_success(
+        let mut result = browser_session_create_success(
             &mut guard,
             &updated.reservation_ref,
             params,
@@ -4243,6 +4249,10 @@ fn browser_session_create(
             false,
             caller_authorization,
         );
+        if let (Some(object), Some(title_projection)) = (result.as_object_mut(), title_projection) {
+            object.insert("title_projection".to_owned(), title_projection);
+        }
+        return result;
     }
     if delivery_state == BrowserDeliveryState::Uncertain {
         drop(guard);
@@ -5508,13 +5518,6 @@ fn browser_resource_actuation_decision(
 
     // Alpha 4 factor 2 is intentionally the literal true; there is no policy state or branch here.
 
-    let endpoint = store
-        .browser_endpoint(&resource.endpoint_ref)?
-        .ok_or_else(|| "browser_endpoint_not_found".to_owned())?;
-    if !endpoint.webchat_control_allowed {
-        return Ok((false, Some("local_consent_off")));
-    }
-
     let Some(provider_state) =
         store.browser_provider_state(&resource.endpoint_ref, &resource.provider)?
     else {
@@ -6143,7 +6146,7 @@ fn browser_registry_call_with_grants(
                         .ok()
                         .flatten()
                         .map(|endpoint| json!({
-                            "webchat_control": endpoint.webchat_control_allowed,
+                            "webchat_control": true,
                             "tool_bridge": endpoint.tool_bridge_allowed,
                             "tool_bridge_workstation_mutation": endpoint.tool_bridge_mutation_allowed,
                             "revision": endpoint.consent_revision,
@@ -6248,7 +6251,7 @@ fn browser_registry_call_with_grants(
                         .ok()
                         .flatten()
                         .map(|endpoint| json!({
-                            "webchat_control": endpoint.webchat_control_allowed,
+                            "webchat_control": true,
                             "tool_bridge": endpoint.tool_bridge_allowed,
                             "tool_bridge_workstation_mutation": endpoint.tool_bridge_mutation_allowed,
                             "revision": endpoint.consent_revision,
@@ -6403,7 +6406,7 @@ fn browser_endpoint_json(endpoint: crate::state_store::BrowserEndpointRecord) ->
         "browser_family": endpoint.browser_family,
         "extension_version": endpoint.extension_version,
         "consent": {
-            "webchat_control": endpoint.webchat_control_allowed,
+            "webchat_control": true,
             "tool_bridge": endpoint.tool_bridge_allowed,
             "tool_bridge_workstation_mutation": endpoint.tool_bridge_mutation_allowed,
             "revision": endpoint.consent_revision,
@@ -11243,7 +11246,7 @@ mod tests {
         assert_eq!(listed["ok"], true);
         assert_eq!(listed["endpoints"].as_array().unwrap().len(), 1);
         assert_eq!(listed["endpoints"][0]["endpoint_ref"], endpoint_ref);
-        assert_eq!(listed["endpoints"][0]["consent"]["webchat_control"], false);
+        assert_eq!(listed["endpoints"][0]["consent"]["webchat_control"], true);
 
         let inspected = browser_registry_call(
             &store,
@@ -11285,7 +11288,7 @@ mod tests {
         assert_eq!(resolved["ok"], true);
         assert_eq!(resolved["resource"]["resource_ref"], account_ref);
         assert_eq!(resolved["resource"]["display_label"], "Work");
-        assert_eq!(resolved["consent"]["webchat_control"], false);
+        assert_eq!(resolved["consent"]["webchat_control"], true);
         assert_eq!(resolved["consent"]["revision"], 0);
         assert_eq!(resolved["actuation_available"], false);
         assert!(!resolved.to_string().contains("native-account-hidden"));
@@ -11297,7 +11300,7 @@ mod tests {
         );
         assert_eq!(inspected_res["ok"], true);
         assert_eq!(inspected_res["resource"]["resource_ref"], account_ref);
-        assert_eq!(inspected_res["consent"]["webchat_control"], false);
+        assert_eq!(inspected_res["consent"]["webchat_control"], true);
         assert_eq!(inspected_res["actuation_available"], false);
 
         let listed_res = browser_registry_call(
@@ -14281,7 +14284,14 @@ mod tests {
                     generation_status_observed: true,
                     generation_stopped: false,
                     result: Some(json!({
-                        "accepted_user_message_ref": "provider-created-session-user"
+                        "accepted_user_message_ref": "provider-created-session-user",
+                        "title_projection": {
+                            "status": "verified",
+                            "changed": true,
+                            "provider": "chatgpt",
+                            "readback_verified": true,
+                            "reason": null
+                        }
                     })),
                 }
             }
@@ -14750,6 +14760,9 @@ mod tests {
         assert_eq!(created["route"]["expected_generation"], 7);
         assert_eq!(created["dispatch"]["delivery_state"], "applied");
         assert_eq!(created["dispatch"]["lane_id"], "lane-worker-a");
+        assert_eq!(created["title_projection"]["status"], "verified");
+        assert_eq!(created["title_projection"]["changed"], true);
+        assert_eq!(created["title_projection"]["readback_verified"], true);
         assert_eq!(immediate.calls.load(Ordering::SeqCst), 1);
         let created_session_ref = created["session_ref"].as_str().unwrap();
         let inspected = browser_operation_call_with_grant(
@@ -15095,9 +15108,8 @@ mod tests {
     #[test]
     fn browser_actuation_intersection_fails_closed_with_stable_reasons() {
         use crate::state_store::{
-            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
-            BrowserProviderObservationInput, BrowserResourceObservationInput,
-            BrowserResourceRecord,
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput, BrowserResourceRecord,
         };
         use std::sync::{Arc, Mutex, RwLock};
 
@@ -15178,7 +15190,7 @@ mod tests {
         );
         assert_eq!(remote_consent["code"], "unknown_local_method");
         assert!(
-            !store
+            store
                 .lock()
                 .unwrap()
                 .browser_endpoint(&endpoint_ref)
@@ -15186,28 +15198,6 @@ mod tests {
                 .unwrap()
                 .webchat_control_allowed
         );
-
-        let local_consent_off = browser_operation_call_with_grant(
-            &store,
-            "herdr_mcp.browser_dispatch.submit",
-            &dispatch_params,
-            true,
-            None,
-        );
-        assert_eq!(local_consent_off["code"], "local_consent_off");
-
-        store
-            .lock()
-            .unwrap()
-            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
-                endpoint_ref: &endpoint_ref,
-                expected_revision: 0,
-                webchat_control_allowed: true,
-                tool_bridge_allowed: false,
-                tool_bridge_mutation_allowed: false,
-                observed_at: 14,
-            })
-            .unwrap();
 
         let wrong_account_grants = [BrowserCallerGrant {
             endpoint_ref: endpoint_ref.clone(),

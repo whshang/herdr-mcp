@@ -827,11 +827,48 @@ function installContentScript(
   site = "chatgpt",
   browserProjectId = null,
   browserProjectName = null,
+  accountNativeIdentity = null,
 ) {
   tabs.set(tabId, {
-    url, listener: (msg, _sender, sendResponse) => {
+    id: tabId,
+    url,
+    contentRegistered: false,
+    listener: (msg, _sender, sendResponse) => {
       if (msg?.type === "h2w_get_convkey") {
-        sendResponse({ convKey, url, site, browserProjectId, browserProjectName });
+        // Mirror the real content script: this read handshake is opaque and
+        // carries no account identity. It runs the ordinary content
+        // registration (h2w_register) when the route is not yet registered, or
+        // when an explicit observation refresh is requested — the latter is
+        // what re-publishes facts for a tab that still holds a previous
+        // generation's opaque registration.
+        const tab = tabs.get(tabId);
+        const needsRegistration = tab
+          && (!tab.contentRegistered || msg.refreshObservation === true);
+        if (needsRegistration) {
+          tab.contentRegistered = true;
+          void onMsg(
+            {
+              type: "h2w_register",
+              convKey,
+              url,
+              site,
+              accountNativeIdentity,
+              browserProjects: [],
+              browserCurrentProjectId: browserProjectId,
+              browserCurrentProjectName: browserProjectName,
+              browserSessionReservationRef: null,
+            },
+            { tab: { id: tabId, url } },
+            () => {},
+          );
+        }
+        sendResponse({
+          convKey,
+          url,
+          site,
+          browserProjectId,
+          browserProjectName,
+        });
         return;
       }
       if (msg?.type === "h2w_wake") { sendResponse({}); return; }
@@ -901,6 +938,8 @@ function installAutoWakeContentScript(tabId, convKey, { wakeResult = { ok: true,
 }
 
 // ---- Load background.js ----
+const startupRegistryTabId = 140;
+
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
 ok(!!onMsg, "background onMessage listener registered");
@@ -958,6 +997,33 @@ const coldHudP = new Promise((resolve) => {
 await new Promise((resolve) => setTimeout(resolve, 0));
 ok(initialLocaleReadSeen, "locale/config initialization is deliberately held for the race fixture");
 ok(coldHudSettled === false, "cold-start HUD does not return a partial label payload before locale/config readiness");
+installContentScript(
+  startupRegistryTabId,
+  PROJECT_HOME_URL,
+  PROJECT_KEY,
+  "chatgpt",
+  PROJECT_ID,
+  "herdr-mcp",
+  "chatgpt-startup-user-900",
+);
+// A ChatGPT tab that already holds an opaque registration from a previous
+// extension generation. The plain handshake is a pure read for it, so only an
+// explicit observation refresh can re-publish its provider/account/space facts.
+// It must be present before the first successful endpoint registration, which is
+// where open-tab recovery runs.
+const staleGenerationTabId = 143;
+const STALE_GENERATION_URL = "https://chatgpt.com/c/stale-generation-901";
+const STALE_GENERATION_IDENTITY = "chatgpt-stale-generation-user-901";
+installContentScript(
+  staleGenerationTabId,
+  STALE_GENERATION_URL,
+  STALE_GENERATION_URL,
+  "chatgpt",
+  PROJECT_ID,
+  "herdr-mcp",
+  STALE_GENERATION_IDENTITY,
+);
+tabs.get(staleGenerationTabId).contentRegistered = true;
 releaseInitialLocaleRead();
 const coldHud = await coldHudP;
 ok(coldHud?.ok === true
@@ -997,6 +1063,32 @@ ok(storedBrowserSeed === browserRegister.profile_seed,
 ok(browserRegisterRetry.operation === "endpoint.register"
     && browserRegisterRetry.profile_seed === storedBrowserSeed,
   "endpoint bootstrap recovery reuses the stable browser profile seed after the injected startup failure");
+ok(await waitForTest(() => browserRegistryRequests.some((request) =>
+      request?.operation === "provider.observe"
+      && request?.provider === "chatgpt"
+      && request?.capabilities?.operations?.includes("session.title_projection"))),
+  "successful endpoint bootstrap recovers current ChatGPT provider capability from an already-open Project tab");
+ok(await waitForTest(() =>
+      browserRegistryRequests.some((request) =>
+        request?.operation === "resource.observe"
+        && request?.provider === "chatgpt"
+        && request?.kind === "account"
+        && request?.native_identity === "chatgpt-startup-user-900")
+      && browserRegistryRequests.some((request) =>
+        request?.operation === "resource.observe"
+        && request?.provider === "chatgpt"
+        && request?.kind === "space"
+        && request?.native_identity === PROJECT_ID)),
+  "startup browser registry recovery restores ChatGPT account and Project resources through the opaque handshake's content registration path");
+ok(await waitForTest(() =>
+      browserRegistryRequests.some((request) =>
+        request?.operation === "resource.observe"
+        && request?.provider === "chatgpt"
+        && request?.kind === "account"
+        && request?.native_identity === STALE_GENERATION_IDENTITY)),
+  "open-tab recovery refreshes an already-registered tab that still holds a previous generation's opaque registration");
+tabs.delete(staleGenerationTabId);
+tabs.delete(startupRegistryTabId);
 const recoveredRegistrationCount = browserRegistryRequests.length;
 const keepaliveAlarm = listeners.onAlarm[0];
 ok(!!keepaliveAlarm, "browser keepalive alarm listener registered");
@@ -1042,9 +1134,9 @@ const disabledConsent = await dispatchMessage({
   allowed: false,
 }, { url: "chrome-extension://test-ext/control-center.html" });
 ok(disabledConsent?.ok === true
-    && disabledConsent?.browserEndpoint?.consent?.webchat_control === false
+    && disabledConsent?.browserEndpoint?.consent?.webchat_control === true
     && disabledConsent?.browserEndpoint?.consent_revision === 2,
-  "Control Center can narrow WebChat Control consent without affecting Tool Bridge",
+  "Legacy WebChat Control requests cannot disable WebChat control or widen Tool Bridge",
   JSON.stringify(disabledConsent));
 
 const actionClick = listeners.onActionClicked[0];
@@ -1621,6 +1713,23 @@ console.log("\n[page-health forced reload]");
 console.log("\n[binding flow]");
 {
   installContentScript(101, CONV, CONV);
+  const sender = { tab: { id: 101, url: CONV } };
+  const priorScope = await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: CONV,
+    url: CONV,
+    accountNativeIdentity: "chatgpt-previous-account",
+  }, sender);
+  ok(priorScope?.browser_account_ref && priorScope?.browser_generation,
+    "ChatGPT tab establishes an account-bound scope before identity loss");
+  tabs.get(101).contentRegistered = true;
+  await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: CONV,
+    url: CONV,
+  }, sender);
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
   onMsg({ type: "h2w_bind", tabId: 101, pane: "wH:p1", agent: "omp", workspace_id: "wH", workspace_label: "herdr-mcp (wH)", workspace_label_raw: "herdr-mcp" }, { tab: { id: 101 } }, (r) => resolveP(r));
@@ -1628,6 +1737,12 @@ console.log("\n[binding flow]");
   ok(r?.ok === true && r.convKey === CONV, "h2w_bind creates a binding", JSON.stringify(r));
   ok(!!storage.herdrWakeBindings[SK_WH], "binding persisted with convKey::workspace_id key");
   const b = storage.herdrWakeBindings[SK_WH];
+  ok(b.browser_account_ref == null
+      && b.browser_space_ref == null
+      && b.browser_session_ref == null
+      && b.browser_generation == null,
+    "lost ChatGPT identity invalidates the tab's cached scope before a new binding");
+  tabs.get(101).contentRegistered = false;
   ok(
     b.workspace_id === "wH"
       && b.workspace_label.includes("herdr-mcp")
@@ -2677,8 +2792,8 @@ console.log("\n[project handoff]");
     "manual ChatGPT Project handoff does not create a new tab", `creates=${tabCreateCount - manualCreateBefore}`);
   ok(tabUpdateCount === manualUpdateBefore + 1
       && lastTabUpdate?.tabId === 401
-      && lastTabUpdate?.url === PROJECT_KEY,
-    "manual ChatGPT Project handoff navigates the current tab to the stable Project entry",
+      && lastTabUpdate?.url === `${PROJECT_KEY}/project`,
+    "manual ChatGPT Project handoff navigates the current tab to the working Project home",
     JSON.stringify(lastTabUpdate));
   ok(projectNavigationPollCount >= 3,
     "current-tab handoff waits until the current tab really reaches Project home");
@@ -3729,6 +3844,25 @@ console.log("\n[Native host runtime snapshot diagnostics]");
       JSON.stringify(snapshot));
   }
   mockNativeHostLastError = null;
+}
+
+console.log("\n[ChatGPT Project catalog launch locator]");
+{
+  const before = browserRegistryRequests.length;
+  await dispatchMessage({
+    type: "h2w_register",
+    site: "chatgpt",
+    convKey: PROJECT_KEY,
+    url: PROJECT_HOME_URL,
+    accountNativeIdentity: "chatgpt-project-catalog-launch-test",
+    browserProjects: [{ id: PROJECT_ID, name: "herdr-mcp" }],
+  }, { tab: { id: 1888, url: PROJECT_HOME_URL } });
+  const observed = browserRegistryRequests.slice(before);
+  const space = observed.find((entry) => entry.operation === "resource.observe"
+    && entry.kind === "space" && entry.native_identity === PROJECT_ID);
+  ok(space?.canonical_url === `${PROJECT_KEY}/project`,
+    "ChatGPT catalog space locator launches /project, not its bare stable resource key",
+    JSON.stringify(space));
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

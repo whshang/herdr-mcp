@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.133";
+const H2W_CONTENT_VERSION = "0.1.149";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2301,6 +2301,23 @@ function normalizeHerdrMentionAlias(value) {
           && (!exactChatGptDispatchIdentity || Boolean(acceptedUserMessageRef))
           && (!creatingSession || (evidence.stable_resource_ref_observed && evidence.canonical_url_observed))) {
         evidence.generation_owner = expectedGeneration;
+        if (creatingSession) {
+          const titleProjection = adapterSupports("titleProjection")
+            ? await projectChatGptConversationTitle(params.display_label)
+            : {
+                status: "unsupported",
+                changed: null,
+                provider: ADAPTER.name,
+                readback_verified: false,
+                reason: "title_projection_unsupported",
+              };
+          evidence.result = {
+            ...(evidence.result && typeof evidence.result === "object" && !Array.isArray(evidence.result)
+              ? evidence.result
+              : {}),
+            title_projection: titleProjection,
+          };
+        }
         return evidence;
       }
       await wait(200);
@@ -2633,8 +2650,20 @@ function normalizeHerdrMentionAlias(value) {
       if (msg?.type === "h2w_get_convkey") {
         void (async () => {
           let convKey = ADAPTER.getConversationKey();
-          if (convKey && (registeredConvKey !== convKey
+          // An explicit refresh re-runs the ordinary content registration even
+          // when this route already holds a registration from an older extension
+          // generation; without it the handshake stays a pure read and returns
+          // the previously registered opaque refs.
+          const refreshObservation = msg?.refreshObservation === true;
+          if (convKey && (refreshObservation
+              || registeredConvKey !== convKey
               || !registeredBrowserSessionRef || !registeredBrowserGeneration)) {
+            // This read handshake stays opaque: it carries no account identity.
+            // The lazy recovery below runs the ordinary content registration,
+            // which is the single identity source and publishes provider /
+            // account / space / session facts through the existing h2w_register
+            // path. Callers that need those facts trigger this handshake rather
+            // than receiving raw account identity here.
             await registerCurrentConversation("identity-recovery").catch(() => null);
             convKey = ADAPTER.getConversationKey();
           }
@@ -2881,6 +2910,9 @@ function normalizeHerdrMentionAlias(value) {
         });
         return true;
       }
+      // Generic Web Page Assist owns this message. Do not consume the
+      // asynchronous response before its independent listener handles it.
+      if (msg?.type === "h2w_page_assist") return false;
       sendResponse({});
     });
   } catch (e) { console.warn("[h2w] failed to register onMessage:", e.message); }
@@ -3218,7 +3250,8 @@ function normalizeHerdrMentionAlias(value) {
   function chatGptConversationId() {
     const value = String(ADAPTER.getConversationKey() || location.href || "");
     const match = value.match(/\/c\/([^/?#]+)/);
-    return match ? decodeURIComponent(match[1]) : null;
+    const id = match ? decodeURIComponent(match[1]) : null;
+    return id && !/^local-chatgpt:/i.test(id) ? id : null;
   }
 
   function chatGptCurrentConversationAnchor() {
@@ -3523,11 +3556,15 @@ function normalizeHerdrMentionAlias(value) {
   // /backend-api/conversations/<id> endpoint with a Bearer header. Any
   // 401/404/timeout fails closed and returns an error payload only; the token
   // never leaves this function scope and is never logged/stored.
-  async function fetchChatGptConversation({ conversationId, timeoutMs = 6000 } = {}) {
+  async function fetchChatGptConversation({
+    conversationId,
+    timeoutMs = 6000,
+    authTimeoutMs = 4000,
+  } = {}) {
     if (!conversationId || ADAPTER.name !== "chatgpt") {
       return { ok: false, error: "not-chatgpt-conversation" };
     }
-    const accessToken = await readChatGptAccessToken();
+    const accessToken = await readChatGptAccessToken(authTimeoutMs);
     if (!accessToken) return { ok: false, error: "session-missing", reason: "auth", status: 401 };
     const sessionToken = String(accessToken);
     if (sessionToken.length === 0 || sessionToken.length > 4096) {
@@ -3552,6 +3589,89 @@ function normalizeHerdrMentionAlias(value) {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async function projectChatGptConversationTitle(rawTitle) {
+    const provider = "chatgpt";
+    const title = normText(rawTitle);
+    const unsupported = (reason) => ({
+      status: "unsupported",
+      changed: null,
+      provider,
+      readback_verified: false,
+      reason,
+    });
+    const failed = (reason) => ({
+      status: "failed",
+      changed: null,
+      provider,
+      readback_verified: false,
+      reason,
+    });
+    const verified = (changed) => ({
+      status: "verified",
+      changed,
+      provider,
+      readback_verified: true,
+      reason: null,
+    });
+    if (ADAPTER.name !== "chatgpt" || !adapterSupports("titleProjection")) {
+      return unsupported("title_projection_unsupported");
+    }
+    const conversationId = chatGptConversationId();
+    if (!conversationId || !title || title.length > 256) {
+      return failed("title_projection_params_invalid");
+    }
+
+    const deadline = Date.now() + 3000;
+    const remainingTimeout = (ceiling) => Math.max(1, Math.min(ceiling, deadline - Date.now()));
+    const current = await fetchChatGptConversation({
+      conversationId,
+      timeoutMs: remainingTimeout(1000),
+      authTimeoutMs: remainingTimeout(1000),
+    });
+    if (current?.ok && current.body?.title === title) return verified(false);
+    if (Date.now() >= deadline) return failed("title_projection_timeout");
+
+    const accessToken = await readChatGptAccessToken(remainingTimeout(1000));
+    const sessionToken = typeof accessToken === "string" ? accessToken : "";
+    if (!sessionToken || sessionToken.length > 4096) {
+      return failed("title_projection_auth_unavailable");
+    }
+    if (Date.now() >= deadline) return failed("title_projection_timeout");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remainingTimeout(1000));
+    try {
+      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+        method: "PATCH",
+        credentials: "include",
+        cache: "no-store",
+        redirect: "error",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({ title }),
+        signal: controller.signal,
+      });
+      if (!response.ok) return failed("title_projection_provider_rejected");
+    } catch (error) {
+      return failed(error?.name === "AbortError" ? "title_projection_timeout" : "title_projection_request_failed");
+    } finally {
+      clearTimeout(timer);
+    }
+
+    while (Date.now() < deadline) {
+      const observed = await fetchChatGptConversation({
+        conversationId,
+        timeoutMs: remainingTimeout(800),
+        authTimeoutMs: remainingTimeout(800),
+      });
+      if (observed?.ok && observed.body?.title === title) return verified(true);
+      if (Date.now() < deadline) await wait(150);
+    }
+    return failed("title_projection_readback_unverified");
   }
 
   async function fetchChatGptArchivedConversationList({ timeoutMs = 3000 } = {}) {
@@ -3611,10 +3731,10 @@ function normalizeHerdrMentionAlias(value) {
     }
   }
 
-  async function readChatGptAccessToken() {
+  async function readChatGptAccessToken(timeoutMs = 4000) {
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4000);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const response = await fetch("/api/auth/session", {
           credentials: "include",

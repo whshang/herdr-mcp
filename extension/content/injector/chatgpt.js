@@ -1,6 +1,5 @@
 // injector/chatgpt.js — chatgpt.com wake-up adapter
-// Selectors verified while signed in on 2026-08-20:
-//   - composer: div#prompt-textarea[contenteditable="true"] (ProseMirror, role=textbox)
+// Composer layouts: legacy #prompt-textarea and the id-less Project ProseMirror textbox.
 //   - send button: button[data-testid="send-button"]
 //   - insertion: MAIN-world execCommand insertText commits to the ProseMirror model
 const CHATGPT_ADAPTER_CAPABILITIES = Object.freeze({
@@ -8,6 +7,7 @@ const CHATGPT_ADAPTER_CAPABILITIES = Object.freeze({
   stopGeneration: true,
   sessionCreate: true,
   sessionOpen: true,
+  titleProjection: true,
   chatModeGuard: true,
 });
 const CHATGPT_ADAPTER_POLICY = Object.freeze({
@@ -59,33 +59,42 @@ class ChatGPTAdapter extends BaseAdapter {
     return { ok: false, error: "chat_mode_switch_timeout" };
   }
 
-  async getAccountNativeIdentity() {
-    try {
-      const response = await fetch("/backend-api/me", {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: { accept: "application/json" },
-      });
-      if (!response.ok) return null;
-      const payload = await response.json();
-      const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
-      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
-    } catch (_) {
-      return null;
+  async getAccountNativeIdentity(timeoutMs = 1500) {
+    for (const url of ["/backend-api/me", "/api/auth/session"]) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers: { accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) continue;
+        const payload = await response.json();
+        const candidate = payload?.id || payload?.user?.id || payload?.account?.id || null;
+        if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+      } catch (_) {
+      } finally {
+        clearTimeout(timer);
+      }
     }
+    return null;
   }
 
   getConversationKey() {
     try {
       const origin = location.origin;
       const pathname = location.pathname.replace(/\/+$/, "") || "/";
+      const provisionalChat = (segment) => /^local-chatgpt(?::|%3a)/i.test(segment);
       if (pathname === "/") return origin;
       const normal = pathname.match(/^\/c\/([^/]+)$/);
-      if (normal) return `${origin}/c/${normal[1]}`;
+      if (normal) return provisionalChat(normal[1]) ? null : `${origin}/c/${normal[1]}`;
 
       const projectConversation = pathname.match(/^\/g\/(g-p-[^/]+)\/c\/([^/]+)$/i);
       const projectHome = pathname.match(/^\/g\/(g-p-[^/]+)(?:\/project)?$/i);
+      if (projectConversation && provisionalChat(projectConversation[2])) return null;
       const projectSegment = projectConversation?.[1] || projectHome?.[1] || null;
       if (!projectSegment) return null;
       // ChatGPT may decorate a Project resource id with a human-readable slug.
@@ -100,7 +109,12 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   getInputEl() {
-    return document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const legacy = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    if (legacy) return legacy;
+    const candidates = document.querySelectorAll('div.ProseMirror[role="textbox"][contenteditable="true"]');
+    return candidates.length === 1 && this.elementVisible(candidates[0])
+      ? candidates[0]
+      : null;
   }
 
   getSelectedComposerApps() {
@@ -209,7 +223,11 @@ class ChatGPTAdapter extends BaseAdapter {
   }
 
   getWatchMainWorldSelector() {
-    return '#prompt-textarea[contenteditable="true"]';
+    const input = this.getInputEl();
+    if (!input) return null;
+    return input.id === 'prompt-textarea'
+      ? '#prompt-textarea[contenteditable="true"]'
+      : 'div.ProseMirror[role="textbox"][contenteditable="true"]';
   }
 
   getSendButtonCandidates() {

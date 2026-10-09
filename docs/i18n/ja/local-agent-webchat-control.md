@@ -88,7 +88,7 @@ Web 会話はターン単位の遠隔コラボレータです。Herdr-MCP は境
    ```bash
    herdr-mcp webchat endpoints
    ```
-   endpoint が `consent.webchat_control: true` を報告している必要があります。`consent.tool_bridge` と `consent.tool_bridge_workstation_mutation` は別機能（ページ内 Web AI ツール呼び出し）の独立スイッチで、ここでは不要です。
+   登録済み endpoint は既定で `consent.webchat_control: true` を報告し、ローカルの WebChat Control スイッチはありません。`consent.tool_bridge` と `consent.tool_bridge_workstation_mutation` は別機能（ページ内 Web AI ツール呼び出し）の独立 gate のままで、ここでは不要です。
 4. **extension が観測した、サインイン済み provider アカウント。** アカウント、ChatGPT Project（`space` リソース）、会話（`session` リソース）はこの endpoint 配下のリソースとして現れます。
 5. **資格情報を手で扱わないこと。** `herdr-mcp` CLI は first-party のローカルクライアントであり、信頼されたローカル呼び出し grant を自身で付与します。runtime bearer、ブラウザ cookie、Connector 資格情報を表示・コピー・要求してはいけません。
 
@@ -121,7 +121,7 @@ herdr-mcp webchat inspect SESSION_REF
 | `resource_ref` | 正確なアカウント / `space`（Project）/ `session`（会話）の identity |
 | `parent_ref` | 階層：account → space → session |
 | `observation_generation` | extension が報告した generation。`--expected-generation` に渡します |
-| `consent.webchat_control` | この endpoint を操作してよいか |
+| `consent.webchat_control` | 互換 projection。登録済み endpoint では `true` で、独立したローカル gate ではありません |
 | `actuation_available` / `actuation_reason`（`inspect` 由来） | *その inspect 呼び出し*の能力であり、汎用の変更前チェックではありません。変更の真実は操作が返す delivery state です |
 
 `herdr-mcp webchat resources` は `actuation_evaluated: false` と `actuation_reason: "not_evaluated_by_list"` を返します。リスト結果は健全性や consent の signal ではありません。
@@ -283,7 +283,7 @@ herdr-mcp webchat handoff \
 
 Agent は次の順で進めます。
 
-1. **能力検出** —— `herdr-mcp webchat endpoints`、`herdr-mcp webchat resources --kind space`、`herdr-mcp webchat inspect SPACE_REF`。`consent.webchat_control` が真であることと `observation_generation` を確認します。
+1. **能力検出** —— `herdr-mcp webchat endpoints`、`herdr-mcp webchat resources --kind space`、`herdr-mcp webchat inspect SPACE_REF`。登録済み endpoint は `consent.webchat_control: true` を報告します。`observation_generation` と観測済みの正確な identity を記録します。
 2. **identity の解決** —— 返されたリソースから正確な `endpoint_ref` / `account_ref` / `space_ref` を選びます。推測せず、別マシン・別 Project の ref を再利用しません。
 3. **永続状態の解決** —— `herdr-mcp continuity resume hc:...`（先に境界付きの `herdr-mcp continuity search ... --project-path <checkout>` でも可。ただし `confirmation_required` に従うこと）。これがタスク永続状態の唯一の情報源です。
 4. **canonical handoff を実行** —— `herdr-mcp webchat handoff --continuity-id hc:... --source-url '<正確な会話 URL>'`（チェーンに work chain があれば `--work-chain-id` を追加）。canonical な準備と自動配送を一度に行います。`--prepare-only` は packet だけを返します。
@@ -330,7 +330,7 @@ Agent は次の順で進めます。
 | 症状 | 確認すること |
 | --- | --- |
 | endpoint が全く無い | `herdr-mcp native-host status`、`herdr-mcp extension standalone status`、`herdr-mcp doctor`（STANDALONE チャネルなら `standalone-extension-load` の警告） |
-| endpoint はあるが `consent.webchat_control: false` | その endpoint で extension の制御スイッチ／consent が未許可。ブラウザ側の操作で、CLI フラグではありません |
+| endpoint はあるが `consent.webchat_control: false` | 廃止済みのローカルスイッチ意味論を持つ古い runtime/extension。現在の DEV またはリリース版へ更新／Reload して endpoint を再観測します |
 | account / Project が曖昧 | 再列挙し、返された ref で選ぶ。推測や「最新」での選択はしない |
 | `browser_resource_not_found` / session が古い | `herdr-mcp webchat resources` を再実行。会話が閉じられた、アーカイブされた、または新しい観測に置き換わった可能性 |
 | 同じ会話が 2 つの browser endpoint から観測された | canonical URL は**最新**の観測に解決されるため、ブラウザ profile / extension identity の切り替えで新鮮な会話が使えなくなることはありません。2 つの異なる session が同じ最新時刻を共有する場合だけ `browser_canonical_url_ambiguous` で fail closed します |
