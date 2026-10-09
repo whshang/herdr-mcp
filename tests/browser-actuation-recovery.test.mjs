@@ -23,6 +23,21 @@ test("user scrolls a browser page | Given a typed Rust actuation payload | When 
   assert.match(bridge, /amount:\s*params\.amount/);
 });
 
+test("user reads allowlisted element structure | Given a typed Rust extraction payload | When the extension bridge forwards it | Then the fields list reaches the read-only Page Assist payload unchanged", () => {
+  const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
+  const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
+  assert.ok(start > 0 && end > start);
+  const bridge = backgroundSource.slice(start, end);
+  assert.match(bridge, /fields:\s*params\.fields/);
+
+  const requestStart = backgroundSource.indexOf("async function performBrowserPageActionRequest(msg) {");
+  const requestEnd = backgroundSource.indexOf("\nfunction withBrowserPageIdentity", requestStart);
+  assert.ok(requestStart > 0 && requestEnd > requestStart);
+  const request = backgroundSource.slice(requestStart, requestEnd);
+  assert.match(request, /fields:\s*msg\?\.fields/);
+  assert.match(request, /action === "click" \|\| action === "fill" \|\| action === "scroll"/);
+});
+
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
 const browserPageLifecycleEnd = backgroundSource.indexOf("\nasync function performPageAssistRequest", browserPageLifecycleStart);
 assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,

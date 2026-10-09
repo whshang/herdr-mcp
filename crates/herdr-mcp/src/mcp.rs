@@ -7438,6 +7438,10 @@ fn browser_page_action_call(
     caller_grants: &[PageAssistCallerGrant],
     browser_actuator: Option<&dyn BrowserActuator>,
 ) -> Value {
+    // Opt-in structured extraction allowlist. Every name maps to a reviewed,
+    // bounded projection; raw markup, arbitrary attributes, scripts, storage
+    // and network reads are never reachable through extract.
+    const EXTRACT_FIELDS: &[&str] = &["tag", "role", "aria_label", "title", "href"];
     let Some(object) = params.as_object() else {
         return json!({"ok": false, "code": "invalid_params", "message": "browser page action params must be an object"});
     };
@@ -7455,6 +7459,7 @@ fn browser_page_action_call(
         "objective",
         "direction",
         "amount",
+        "fields",
     ];
     if let Some(key) = object
         .keys()
@@ -7558,6 +7563,7 @@ fn browser_page_action_call(
                 "condition",
                 "timeout_ms",
                 "idempotency_key",
+                "fields",
             ] {
                 if object.contains_key(disallowed) {
                     return json!({
@@ -7617,6 +7623,7 @@ fn browser_page_action_call(
                 "max_chars",
                 "idempotency_key",
                 "objective",
+                "fields",
             ] {
                 if object.contains_key(disallowed) {
                     return json!({
@@ -7729,9 +7736,34 @@ fn browser_page_action_call(
             bridge_params["generation"] = json!(generation);
             bridge_params["ref"] = json!(element_ref);
             bridge_params["max_chars"] = json!(max_chars);
+            if let Some(fields) = object.get("fields") {
+                let Some(fields) = fields.as_array() else {
+                    return json!({"ok": false, "code": "invalid_params", "message": "extract fields must be an array of allowlisted names"});
+                };
+                if fields.is_empty() || fields.len() > EXTRACT_FIELDS.len() {
+                    return json!({"ok": false, "code": "invalid_params", "message": "extract fields must contain between 1 and 5 allowlisted names"});
+                }
+                let mut selected: Vec<&str> = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let Some(field) = field.as_str() else {
+                        return json!({"ok": false, "code": "invalid_params", "message": "extract fields must be an array of allowlisted names"});
+                    };
+                    if !EXTRACT_FIELDS.contains(&field) || selected.contains(&field) {
+                        return json!({"ok": false, "code": "invalid_params", "message": "extract fields must be unique allowlisted names"});
+                    }
+                    selected.push(field);
+                }
+                bridge_params["fields"] = json!(selected);
+            }
         }
         "click" | "fill" | "scroll" => {
-            for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
+            for disallowed in [
+                "max_chars",
+                "condition",
+                "timeout_ms",
+                "objective",
+                "fields",
+            ] {
                 if object.contains_key(disallowed) {
                     return json!({
                         "ok": false,
@@ -16757,6 +16789,114 @@ mod tests {
             assert!(read.get("op_id").is_none());
         }
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_extract_forwards_only_allowlisted_fields_without_mutation_reservation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct StructuredExtractActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for StructuredExtractActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage extract must route through exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_extract"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(params["action"], "extract");
+                assert_eq!(params["generation"], "pa_gen_extract_1");
+                assert_eq!(params["ref"], "ref_pa_gen_extract_1_0");
+                assert_eq!(params["fields"], json!(["tag", "role", "href"]));
+                assert!(params.get("idempotency_key").is_none());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true,
+                    "text": "Visible item",
+                    "truncated": false,
+                    "fields": {"tag": "a", "role": "link", "href": "https://app.test/details"},
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_extract".to_owned(),
+        }];
+        let actuator = StructuredExtractActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_extract",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "extract",
+            "generation": "pa_gen_extract_1",
+            "ref": "ref_pa_gen_extract_1_0",
+            "fields": ["tag", "role", "href"],
+        });
+        for invalid in [
+            json!([]),
+            json!(["outerHTML"]),
+            json!(["attributes"]),
+            json!(["tag", "tag"]),
+            json!(["tag", "role", "aria_label", "title", "href", "tag"]),
+            json!([1]),
+            json!("tag"),
+            json!(["Tag"]),
+        ] {
+            let mut bad = params.clone();
+            bad["fields"] = invalid;
+            assert_eq!(
+                browser_page_action_call(&store, &bad, &grants, Some(&actuator))["code"],
+                "invalid_params"
+            );
+        }
+        let mut observe_with_fields = json!({
+            "endpoint_ref": "bep_extract",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "observe",
+            "fields": ["tag"],
+        });
+        assert_eq!(
+            browser_page_action_call(&store, &observe_with_fields, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        observe_with_fields["action"] = json!("screenshot");
+        assert_eq!(
+            browser_page_action_call(&store, &observe_with_fields, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 0);
+
+        let read = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(read["ok"], true);
+        assert_eq!(read["text"], "Visible item");
+        assert_eq!(read["fields"]["href"], "https://app.test/details");
+        assert!(read.get("op_id").is_none());
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

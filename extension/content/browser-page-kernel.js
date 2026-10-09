@@ -24,6 +24,14 @@
     "cc-csc",
   ]);
 
+  // Opt-in structured extraction is limited to a fixed, reviewed allowlist.
+  // No raw markup, arbitrary attribute, style, storage, script or network read
+  // is reachable through this surface.
+  const EXTRACT_FIELD_NAMES = Object.freeze(["tag", "role", "aria_label", "title", "href"]);
+  const MAX_EXTRACT_FIELDS = EXTRACT_FIELD_NAMES.length;
+  const MAX_EXTRACT_FIELD_CHARS = 512;
+  const SAFE_FIELD_TOKEN = /^[a-z][a-z0-9-]{0,31}$/;
+
   function isSensitiveField(el) {
     if (!el) return false;
     const tag = (el.tagName || "").toLowerCase();
@@ -102,6 +110,79 @@
     return token.length <= maxLength && /^[A-Za-z0-9_-]+$/.test(token)
       ? token
       : undefined;
+  }
+
+  function safeFieldToken(value) {
+    const token = String(value || "").trim().toLowerCase();
+    return SAFE_FIELD_TOKEN.test(token) ? token : undefined;
+  }
+
+  function safeFieldText(el, attribute) {
+    const raw = String(el?.getAttribute?.(attribute) ?? "");
+    // Drop control characters so a label cannot smuggle terminal escapes or
+    // line breaks into a structured field.
+    const value = raw.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+    return value ? value.slice(0, MAX_EXTRACT_FIELD_CHARS) : undefined;
+  }
+
+  function safeLinkHref(el) {
+    if (String(el?.tagName || "").toLowerCase() !== "a") return undefined;
+    const raw = el.getAttribute?.("href");
+    if (!raw) return undefined;
+    try {
+      const url = new URL(raw, global.location?.href);
+      // Conservative link projection: only same-origin http(s) without embedded
+      // credentials. Query and fragment are dropped because they frequently
+      // carry session or one-time tokens that must not leak into extraction.
+      if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+      if (url.username || url.password) return undefined;
+      if (url.origin !== global.location?.origin) return undefined;
+      return `${url.origin}${url.pathname}`.slice(0, MAX_EXTRACT_FIELD_CHARS);
+    } catch (_) {
+      return undefined;
+    }
+  }
+
+  function extractElementFields(el, requested) {
+    const fields = {};
+    if (requested.has("tag")) {
+      const tag = safeFieldToken(el?.tagName);
+      if (tag) fields.tag = tag;
+    }
+    if (requested.has("role")) {
+      const role = safeFieldToken(el?.getAttribute?.("role"));
+      if (role) fields.role = role;
+    }
+    if (requested.has("aria_label")) {
+      const ariaLabel = safeFieldText(el, "aria-label");
+      if (ariaLabel) fields.aria_label = ariaLabel;
+    }
+    if (requested.has("title")) {
+      const title = safeFieldText(el, "title");
+      if (title) fields.title = title;
+    }
+    if (requested.has("href")) {
+      const href = safeLinkHref(el);
+      if (href) fields.href = href;
+    }
+    return fields;
+  }
+
+  function resolveExtractFields(requested) {
+    if (requested === undefined) return null;
+    if (!Array.isArray(requested)
+        || requested.length < 1
+        || requested.length > MAX_EXTRACT_FIELDS) {
+      return undefined;
+    }
+    const selected = new Set();
+    for (const name of requested) {
+      if (typeof name !== "string" || !EXTRACT_FIELD_NAMES.includes(name) || selected.has(name)) {
+        return undefined;
+      }
+      selected.add(name);
+    }
+    return selected;
   }
 
   function fastPathActionClass(el, tag) {
@@ -277,17 +358,25 @@
     if (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > 8192) {
       return { ok: false, error: "extract_params_invalid" };
     }
+    const requestedFields = resolveExtractFields(params.fields);
+    if (requestedFields === undefined) {
+      return { ok: false, error: "extract_fields_invalid" };
+    }
     const el = elementMap.get(ref);
     if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
     if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
       return { ok: false, error: "unsupported_element" };
     }
     const raw = String(el.innerText || el.textContent || "").trim();
-    return {
+    const result = {
       ok: true, ref, generation,
       text: cleanText(raw, maxChars),
       truncated: raw.length > maxChars,
     };
+    if (requestedFields) {
+      result.fields = extractElementFields(el, requestedFields);
+    }
+    return result;
   }
 
   function executeScroll(params = {}) {

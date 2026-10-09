@@ -250,6 +250,71 @@ test("user extracts text from one observed control | Given a bounded safe DOM el
   assert.equal(extraction().error, "stale_generation");
 });
 
+test("user extracts allowlisted structure from one observed element | Given a visible nonsensitive link | When opt-in fields are requested | Then only bounded safe tag, role, labels and a conservative same-origin href are returned", () => {
+  const link = createElement({
+    tag: "a",
+    text: "Open details",
+    attrs: {
+      href: "/details/42?token=SECRET#frag",
+      role: "link",
+      "aria-label": "Open details",
+      title: "Details title",
+    },
+  });
+  const external = createElement({
+    tag: "a",
+    text: "External",
+    attrs: { href: "https://evil.test/steal?token=EXTERNAL_SECRET" },
+  });
+  const input = createElement({ tag: "input", type: "text", attrs: { placeholder: "Name" } });
+  const button = createElement({ tag: "button", text: "Toggle" });
+  const h = harness({ elements: [link, external, input, button] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 4);
+  const extract = (ref, params = {}) => h.send({
+    type: "h2w_page_assist", action: "extract", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref, maxChars: 200, ...params,
+  });
+
+  const linkRef = observed.elements[0].ref;
+  const externalRef = observed.elements[1].ref;
+  const structured = extract(linkRef, { fields: ["tag", "role", "aria_label", "title", "href"] });
+  assert.equal(structured.ok, true);
+  assert.deepEqual({ ...structured.fields }, {
+    tag: "a",
+    role: "link",
+    aria_label: "Open details",
+    title: "Details title",
+    href: "https://app.test/details/42",
+  });
+  assert.ok(!structured.fields.href.includes("SECRET"));
+  assert.ok(!Object.hasOwn(structured, "outerHTML"));
+  assert.ok(!Object.hasOwn(structured.fields, "class"));
+
+  const externalResult = extract(externalRef, { fields: ["href", "tag"] });
+  assert.equal(externalResult.ok, true);
+  assert.equal(externalResult.fields.tag, "a");
+  assert.ok(!Object.hasOwn(externalResult.fields, "href"));
+
+  assert.equal(extract(linkRef, { fields: ["href", "href"] }).error, "extract_fields_invalid");
+  assert.equal(extract(linkRef, { fields: [] }).error, "extract_fields_invalid");
+  assert.equal(extract(linkRef, { fields: ["outerHTML"] }).error, "extract_fields_invalid");
+  assert.equal(extract(linkRef, { fields: "href" }).error, "extract_fields_invalid");
+  assert.equal(extract(linkRef, { fields: ["tag", "role", "aria_label", "title", "href", "tag"] }).error, "extract_fields_invalid");
+
+  const textOnly = extract(linkRef);
+  assert.equal(textOnly.ok, true);
+  assert.ok(!Object.hasOwn(textOnly, "fields"));
+  assert.equal(extract(linkRef, { generation: "old", fields: ["tag"] }).error, "stale_generation");
+
+  // An element that becomes sensitive or hidden after observation must fail
+  // closed even when only allowlisted structure is requested.
+  input.type = "password";
+  button.offsetParent = null;
+  assert.equal(extract(observed.elements[2].ref, { fields: ["tag"] }).error, "unsupported_element");
+  assert.equal(extract(observed.elements[3].ref, { fields: ["tag", "title"] }).error, "unsupported_element");
+});
+
 test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMirror textbox | When observing DOM structure | Then only bounded structural attributes are returned", () => {
   const textbox = createElement({
     tag: "div",
