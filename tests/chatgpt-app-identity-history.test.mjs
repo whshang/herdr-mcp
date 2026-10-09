@@ -137,7 +137,10 @@ const probes = {
     )
       && source.adapter.includes("for (const root of menuRoots)")
       && source.wake.includes("!composerModelVisibleText()")
-      && source.wake.includes("const search = selector ? await insertMainWorld(app, selector) : null")
+      && (
+        source.wake.includes("const search = selector ? await insertMainWorld(app, selector) : null")
+        || source.wake.includes("const search = selector ? await insertMainWorld(`@${app}`, selector) : null")
+      )
       && source.wake.includes("if (searchInserted) await clearComposer()");
   },
 
