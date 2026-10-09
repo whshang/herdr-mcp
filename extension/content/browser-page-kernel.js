@@ -493,7 +493,7 @@
       };
     }
     if (condition === "element_present" || condition === "element_absent") {
-      // No caller-controlled CSS/XPath/JS. Only compare an exact accessible
+      // No caller-controlled selector languages or scripts. Compare an exact
       // label on the same fixed, non-sensitive, visible control vocabulary.
       if (value.length > 256 || value !== value.trim()) {
         return { ok: false, error: "expect_value_invalid", condition };
