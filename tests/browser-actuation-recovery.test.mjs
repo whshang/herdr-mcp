@@ -784,6 +784,42 @@ test("user rejects invalid native form states | Given unavailable dropdown or un
   assert.equal(controlOutcome.retry_safe, false);
 });
 
+test("user receives safe scroll mutation errors | Given an owned page and invalid scroll inputs | When the content kernel rejects before scrolling | Then delivery stays not_applied", async () => {
+  const tabs = new Map([[72, { id: 72, url: "https://example.com/list", active: true }]]);
+  let rejection = "scroll_params_invalid";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      assert.equal(payload.action, "scroll");
+      assert.equal(payload.direction, "down");
+      assert.equal(payload.amount, 500);
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/list",
+    idempotencyKey: "claim-scroll-reject",
+  });
+  assert.equal(page.ok, true);
+  for (const error of ["scroll_params_invalid", "scroll_unavailable"]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "scroll", pageRef: page.page_ref, generation: "pa_scroll_1", direction: "down", amount: 500,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "scroll_delivery_unknown";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "scroll", pageRef: page.page_ref, generation: "pa_scroll_1", direction: "down", amount: 500,
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+});
+
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
   const sessionStorage = {};
   const tabs = new Map([

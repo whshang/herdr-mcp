@@ -7453,6 +7453,8 @@ fn browser_page_action_call(
         "timeout_ms",
         "idempotency_key",
         "objective",
+        "direction",
+        "amount",
     ];
     if let Some(key) = object
         .keys()
@@ -7515,12 +7517,12 @@ fn browser_page_action_call(
         }
     };
     let action = match object.get("action").and_then(Value::as_str) {
-        Some(value @ ("observe" | "click" | "fill" | "expect" | "screenshot")) => value,
+        Some(value @ ("observe" | "click" | "fill" | "expect" | "screenshot" | "scroll")) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, fill, expect, or screenshot",
+                "message": "action must be observe, click, fill, expect, screenshot, or scroll",
             });
         }
     };
@@ -7529,9 +7531,13 @@ fn browser_page_action_call(
         "page_ref": page_ref,
         "action": action,
     });
-    let mutation = matches!(action, "click" | "fill");
+    let mutation = matches!(action, "click" | "fill" | "scroll");
     let mut mutation_key: Option<&str> = None;
     let mut semantic_objective: Option<&str> = None;
+
+    if action != "scroll" && (object.contains_key("direction") || object.contains_key("amount")) {
+        return json!({"ok": false, "code": "invalid_params", "message": "direction/amount are accepted only for scroll"});
+    }
 
     match action {
         "observe" | "screenshot" => {
@@ -7667,7 +7673,7 @@ fn browser_page_action_call(
                 }
             }
         }
-        "click" | "fill" => {
+        "click" | "fill" | "scroll" => {
             for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
                 if object.contains_key(disallowed) {
                     return json!({
@@ -7693,24 +7699,27 @@ fn browser_page_action_call(
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "generation is required for click/fill",
+                        "message": "generation is required for click/fill/scroll",
                     });
                 }
             };
-            let element_ref = match object.get("ref").and_then(Value::as_str).map(str::trim) {
-                Some(value)
-                    if !value.is_empty()
-                        && value.len() <= 256
-                        && !value.chars().any(char::is_control) =>
-                {
-                    value
+            let element_ref = if action == "scroll" {
+                if object.contains_key("ref") || object.contains_key("value") {
+                    return json!({"ok": false, "code": "invalid_params", "message": "ref/value are not accepted for scroll"});
                 }
-                _ => {
-                    return json!({
-                        "ok": false,
-                        "code": "invalid_params",
-                        "message": "ref is required for click/fill",
-                    });
+                None
+            } else {
+                match object.get("ref").and_then(Value::as_str).map(str::trim) {
+                    Some(value)
+                        if !value.is_empty()
+                            && value.len() <= 256
+                            && !value.chars().any(char::is_control) =>
+                    {
+                        Some(value)
+                    }
+                    _ => {
+                        return json!({"ok": false, "code": "invalid_params", "message": "ref is required for click/fill"});
+                    }
                 }
             };
             let idempotency_key = match object
@@ -7729,12 +7738,14 @@ fn browser_page_action_call(
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "idempotency_key is required for click/fill",
+                        "message": "idempotency_key is required for a browser page mutation",
                     });
                 }
             };
             bridge_params["generation"] = json!(generation);
-            bridge_params["ref"] = json!(element_ref);
+            if let Some(element_ref) = element_ref {
+                bridge_params["ref"] = json!(element_ref);
+            }
             if action == "fill" {
                 let value = match object.get("value").and_then(Value::as_str) {
                     Some(value) if value.len() <= 10_000 => value,
@@ -7747,12 +7758,33 @@ fn browser_page_action_call(
                     }
                 };
                 bridge_params["value"] = json!(value);
-            } else if object.contains_key("value") {
+            } else if action == "click" && object.contains_key("value") {
                 return json!({
                     "ok": false,
                     "code": "invalid_params",
                     "message": "value is not accepted for click",
                 });
+            }
+            if action == "scroll" {
+                let direction = match object.get("direction").and_then(Value::as_str) {
+                    Some(value @ ("up" | "down")) => value,
+                    _ => {
+                        return json!({"ok": false, "code": "invalid_params", "message": "scroll direction must be up or down"});
+                    }
+                };
+                let amount = match object.get("amount") {
+                    None => 500,
+                    Some(value) => match value.as_u64() {
+                        Some(value) if (1..=1500).contains(&value) => value,
+                        _ => {
+                            return json!({"ok": false, "code": "invalid_params", "message": "scroll amount must be an integer between 1 and 1500"});
+                        }
+                    },
+                };
+                bridge_params["direction"] = json!(direction);
+                bridge_params["amount"] = json!(amount);
+            } else if object.contains_key("direction") || object.contains_key("amount") {
+                return json!({"ok": false, "code": "invalid_params", "message": "direction/amount are accepted only for scroll"});
             }
             mutation_key = Some(idempotency_key);
         }
@@ -7827,8 +7859,19 @@ fn browser_page_action_call(
 
     let idempotency_key = mutation_key.expect("mutation key validated above");
     let idempotency_digest = browser_sha256(idempotency_key);
-    let request_hash = browser_sha256(
-        &json!({
+    let request_hash_payload = if action == "scroll" {
+        json!({
+            "operation": BROWSER_PAGE_ACTION_METHOD,
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "action": action,
+            "generation": bridge_params["generation"],
+            "direction": bridge_params["direction"],
+            "amount": bridge_params["amount"],
+        })
+    } else {
+        // Keep the preexisting click/fill hash identical across upgrades.
+        json!({
             "operation": BROWSER_PAGE_ACTION_METHOD,
             "endpoint_ref": endpoint_ref,
             "page_ref": page_ref,
@@ -7841,8 +7884,8 @@ fn browser_page_action_call(
                 None
             },
         })
-        .to_string(),
-    );
+    };
+    let request_hash = browser_sha256(&request_hash_payload.to_string());
     let op_id = format!("op:browser_page_action:{}", &idempotency_digest[..32]);
     let now = browser_epoch_ms();
     let expires_at = now.saturating_add(10 * 60 * 1000);
@@ -16373,6 +16416,116 @@ mod tests {
         let conflict = browser_page_action_call(&store, &conflict, &grants, Some(&actuator));
         assert_eq!(conflict["code"], "idempotency_key_conflict");
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_scroll_requires_bounded_idempotent_mutation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ScrollActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for ScrollActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("scroll must use the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert!(dispatch_id.is_some());
+                assert_eq!(params["action"], "scroll");
+                assert_eq!(params["direction"], "down");
+                assert_eq!(params["amount"], 500);
+                assert!(params.get("ref").is_none());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true, "delivery_state": "applied",
+                    "retry_safe": false, "mutation_submitted": true,
+                    "moved": true, "before_y": 0, "after_y": 500,
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = ScrollActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "scroll",
+            "generation": "pa_gen_scroll_1",
+            "direction": "down",
+            "idempotency_key": "scroll-once-1",
+        });
+        for (field, invalid) in [
+            ("direction", json!("sideways")),
+            ("amount", json!(1501)),
+            ("amount", json!(0)),
+            ("amount", json!("500")),
+            ("ref", json!("ref_pa_gen_scroll_1_0")),
+        ] {
+            let mut request = params.clone();
+            request[field] = invalid;
+            assert_eq!(
+                browser_page_action_call(&store, &request, &grants, Some(&actuator))["code"],
+                "invalid_params"
+            );
+        }
+        let mut missing_key = params.clone();
+        missing_key
+            .as_object_mut()
+            .unwrap()
+            .remove("idempotency_key");
+        assert_eq!(
+            browser_page_action_call(&store, &missing_key, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 0);
+
+        let applied = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(applied["ok"], true);
+        assert_eq!(applied["delivery_state"], "applied");
+        let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        let mut changed = params.clone();
+        changed["amount"] = json!(700);
+        assert_eq!(
+            browser_page_action_call(&store, &changed, &grants, Some(&actuator))["code"],
+            "idempotency_key_conflict"
+        );
+        let mut changed_direction = params.clone();
+        changed_direction["direction"] = json!("up");
+        assert_eq!(
+            browser_page_action_call(&store, &changed_direction, &grants, Some(&actuator))["code"],
+            "idempotency_key_conflict"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

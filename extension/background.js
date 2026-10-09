@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.154";
+const H2W_SCRIPT_VERSION = "0.1.155";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -8051,6 +8051,8 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "checkable_state_required",
   "radio_uncheck_unsupported",
   "control_already_in_state",
+  "scroll_params_invalid",
+  "scroll_unavailable",
 ]);
 
 function browserPageMutationEnvelope(result, page, sendAttempted) {
@@ -8267,7 +8269,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot"].includes(action)) {
+  if (!["observe", "click", "fill", "expect", "screenshot", "scroll"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8277,7 +8279,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -8285,12 +8287,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -8303,14 +8305,14 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
@@ -8329,9 +8331,11 @@ async function performBrowserPageActionRequest(msg) {
     value: msg?.value,
     condition: msg?.condition,
     timeoutMs: msg?.timeoutMs,
+    direction: msg?.direction,
+    amount: msg?.amount,
   };
 
-  const mutation = action === "click" || action === "fill";
+  const mutation = action === "click" || action === "fill" || action === "scroll";
   let sendAttempted = false;
   const send = async () => {
     sendAttempted = true;

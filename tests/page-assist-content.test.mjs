@@ -66,6 +66,7 @@ function harness({
   bodyText = "Visible page text",
   elements = [],
   topOrigin = null,
+  scrollMax = 0,
 } = {}) {
   let listener = null;
   const location = new URL(url);
@@ -73,6 +74,7 @@ function harness({
     title,
     readyState: "complete",
     body: { innerText: bodyText, textContent: bodyText },
+    documentElement: { scrollHeight: scrollMax + 600 },
     querySelectorAll() { return elements; },
   };
   for (const element of elements) element.ownerDocument = document;
@@ -85,6 +87,11 @@ function harness({
     setTimeout,
     document,
     location,
+    scrollY: 0,
+    innerHeight: 600,
+    scrollBy({ top }) {
+      this.scrollY = Math.max(0, Math.min(scrollMax, this.scrollY + top));
+    },
     chrome: {
       runtime: {
         onMessage: {
@@ -186,6 +193,33 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   });
   assert.equal(linkClick.ok, true);
   assert.equal(linkClick.navigation_url, "https://app.test/details");
+});
+
+test("user scrolls the viewport | Given a bounded observed page | When scrolling by direction and pixels | Then movement and a boundary are reported without reusing stale generation", () => {
+  const h = harness({ scrollMax: 1250 });
+  let observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.scroll.y, 0);
+  assert.equal(observed.scroll.max_y, 1250);
+  const scroll = (direction, amount, expectedOrigin = "https://app.test") => h.send({
+    type: "h2w_page_assist", action: "scroll", generation: observed.generation,
+    expectedOrigin, direction, amount,
+  });
+  assert.equal(scroll("down", 1600).error, "scroll_params_invalid");
+  assert.equal(scroll("down", 250, "https://other.test").error, "origin_mismatch");
+  const moved = scroll("down", 500);
+  assert.equal(moved.ok, true);
+  assert.deepEqual([moved.before_y, moved.after_y, moved.moved, moved.at_boundary], [0, 500, true, false]);
+  assert.equal(scroll("down", 300).error, "stale_generation");
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.scroll.y, 500);
+  assert.equal(scroll("down", 1000).after_y, 1250);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const boundary = scroll("down", 300);
+  assert.equal(boundary.ok, true);
+  assert.equal(boundary.moved, false);
+  assert.equal(boundary.at_boundary, true);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(scroll("up", 500).after_y, 750);
 });
 
 test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMirror textbox | When observing DOM structure | Then only bounded structural attributes are returned", () => {

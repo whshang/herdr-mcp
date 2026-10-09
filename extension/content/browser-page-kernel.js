@@ -253,9 +253,46 @@
       origin: String(global.location ? global.location.origin : "").slice(0, 512),
       title: String(doc.title || "").slice(0, 512),
       generation: currentGenerationToken,
+      scroll: {
+        y: Math.max(0, Math.round(Number(global.scrollY) || 0)),
+        max_y: Math.max(0, Math.round((Number(doc.documentElement?.scrollHeight) || 0) - (Number(global.innerHeight) || 0))),
+      },
       text,
       elements,
     };
+  }
+
+  function executeScroll(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const direction = params.direction;
+    const amount = params.amount === undefined ? 500 : params.amount;
+    if ((direction !== "up" && direction !== "down")
+        || !Number.isInteger(amount) || amount < 1 || amount > 1500) {
+      return { ok: false, error: "scroll_params_invalid" };
+    }
+    if (typeof global.scrollBy !== "function") return { ok: false, error: "scroll_unavailable" };
+    const beforeY = Math.max(0, Math.round(Number(global.scrollY) || 0));
+    try {
+      global.scrollBy({ top: direction === "down" ? amount : -amount, behavior: "instant" });
+      const afterY = Math.max(0, Math.round(Number(global.scrollY) || 0));
+      invalidateGeneration();
+      return {
+        ok: true, direction, amount,
+        before_y: beforeY, after_y: afterY,
+        moved: afterY !== beforeY,
+        at_boundary: afterY === beforeY,
+        requires_verification: true,
+      };
+    } catch (_) {
+      return { ok: false, error: "scroll_delivery_unknown" };
+    }
   }
 
   function executeClick(params = {}) {
@@ -561,6 +598,7 @@
     if (action === "inspect" || action === "observe") return scanDocument(msg);
     if (action === "click") return executeClick(msg);
     if (action === "fill") return executeFill(msg);
+    if (action === "scroll") return executeScroll(msg);
     if (action === "expect") return executeExpect(msg);
     return { ok: false, error: "unsupported_action" };
   }
