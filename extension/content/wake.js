@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.157";
+const H2W_CONTENT_VERSION = "0.1.158";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -891,7 +891,10 @@ function normalizeHerdrMentionAlias(value) {
           && !composerModelVisibleText()
           && ADAPTER.getSelectedComposerApps().length === 0) {
         const selector = ADAPTER.getWatchMainWorldSelector();
-        const search = selector ? await insertMainWorld(app, selector) : null;
+        // A plain keyword is not a provider App mention. Trigger the native
+        // composer suggestion path, then require the exact observed App pill.
+        // A failed lookup clears the draft and must never submit a text token.
+        const search = selector ? await insertMainWorld(`@${app}`, selector) : null;
         if (search?.ok) {
           searchInserted = true;
           const searchDeadline = Date.now() + 3000;

@@ -3416,12 +3416,34 @@ fn browser_session_create_reconcile_uncertain(
             Err(error) => return browser_store_error(error),
         }
     }
+    // The provider can return arbitrary strings. Surface only a fixed set of
+    // non-sensitive App-selection failures rather than echoing DOM text.
+    let app_refusal_reason = if delivery_state == BrowserDeliveryState::Rejected {
+        evidence
+            .result
+            .as_ref()
+            .and_then(|result| result.get("error"))
+            .and_then(Value::as_str)
+            .filter(|reason| {
+                matches!(
+                    *reason,
+                    "required-apps-unsupported"
+                        | "required-apps-menu-unavailable"
+                        | "required-app-not-found"
+                        | "required-app-ambiguous"
+                        | "required-app-selection-not-observed"
+                )
+            })
+    } else {
+        None
+    };
     json!({
         "ok": false,
         "code": delivery_state.as_str(),
         "reservation_ref": settled.reservation_ref,
         "reservation_state": settled.state,
         "delivery_state": settled.delivery_state,
+        "app_refusal_reason": app_refusal_reason,
         "replayed": replayed,
         "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
     })
@@ -3453,6 +3475,7 @@ fn browser_session_create_params_from_source(
         "idempotency_key",
         "work_chain_id",
         "lane_id",
+        "required_apps",
     ];
     if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
@@ -3477,6 +3500,8 @@ fn browser_session_create_params_from_source(
         format!("{message}{source_reference}")
     };
     let idempotency_key = browser_required_idempotency_key(params)?;
+    // Explicit App selection is read back by the provider at delivery.
+    let required_apps = browser_required_apps(params, true)?;
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
     let route = browser_source_route(store, source_url).map_err(browser_store_error)?;
@@ -3488,21 +3513,23 @@ fn browser_session_create_params_from_source(
         }));
     }
     let source_session_ref = route.session_ref.clone();
-    Ok(Some((
-        json!({
-            "endpoint_ref": route.endpoint_ref,
-            "provider": route.provider,
-            "account_ref": route.account_ref,
-            "space_ref": route.space_ref,
-            "display_label": route.display_label,
-            "message": message,
-            "expected_generation": route.expected_generation,
-            "idempotency_key": idempotency_key,
-            "work_chain_id": work_chain_id,
-            "lane_id": lane_id,
-        }),
-        source_session_ref,
-    )))
+    let mut routed = json!({
+        "endpoint_ref": route.endpoint_ref,
+        "provider": route.provider,
+        "account_ref": route.account_ref,
+        "space_ref": route.space_ref,
+        "display_label": route.display_label,
+        "message": message,
+        "expected_generation": route.expected_generation,
+        "idempotency_key": idempotency_key,
+        "work_chain_id": work_chain_id,
+        "lane_id": lane_id,
+    });
+    // Absent means the exact source may supply a previously learned App.
+    if object.contains_key("required_apps") {
+        routed["required_apps"] = json!(required_apps);
+    }
+    Ok(Some((routed, source_session_ref)))
 }
 
 fn browser_create_caller_source_session_ref(
@@ -14298,6 +14325,31 @@ mod tests {
         assert_eq!(create_params["expected_generation"], 7);
         assert_eq!(create_params["display_label"], "herdr-mcp");
         assert_eq!(create_params["provider"], "chatgpt");
+        assert_eq!(create_params.get("required_apps"), None);
+        let (with_app, same_source) = browser_session_create_params_from_source(
+            &store.lock().unwrap(),
+            &json!({
+                "source_url": source_url,
+                "message": "read-only tool activation",
+                "idempotency_key": "handoff-route-app-1",
+                "required_apps": ["herdr"]
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(same_source, session_ref);
+        assert_eq!(with_app["required_apps"], json!(["herdr"]));
+        let duplicate_app = browser_session_create_params_from_source(
+            &store.lock().unwrap(),
+            &json!({
+                "source_url": source_url,
+                "message": "not dispatched",
+                "idempotency_key": "handoff-route-app-2",
+                "required_apps": ["herdr", "herdr"]
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(duplicate_app["code"], "browser_required_apps_invalid");
     }
 
     #[test]
