@@ -61,7 +61,7 @@ Herdr のネイティブ Socket API は広く、進化し続けています。�
   → herdr_methods + herdr_call
 ```
 
-ワークステーションの Runtime Execution Contract は **epoch 5 / 18 tools** です。現在の first-party DEV/PROD パブリック Edge contract は **epoch 7 / 19 actions** で、その action 集合には Edge ローカルの `herdr_devices` が含まれます。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、境界付きの rollback/compatibility ベースラインとしてのみ保持されています。epoch 3 は historical only であり、パブリック Edge の epoch-3 identity は非 DEV/PROD の境界付きベースラインとして残ります。将来の catalog 変更は、付随的な runtime 変更ではなく、明示的な contract epoch を必要とします。
+ワークステーションの Runtime Execution Contract は **epoch 5 / 18 tools** です。現在の first-party DEV/PROD パブリック Edge contract は **epoch 8 / 19 actions** で、その action 集合には Edge ローカルの `herdr_devices` が含まれます。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、境界付きの rollback/compatibility ベースラインとしてのみ保持されています。epoch 3 は historical only であり、パブリック Edge の epoch-3 identity は非 DEV/PROD の境界付きベースラインとして残ります。将来の catalog 変更は、付随的な runtime 変更ではなく、明示的な contract epoch を必要とします。
 
 ## 選択 2: ファイル、Git、shell は第一級
 

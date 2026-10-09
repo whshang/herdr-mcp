@@ -22,6 +22,7 @@ import { EPOCH4_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch4.js";
 import { EPOCH5_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch5.js";
 import { EPOCH6_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch6.js";
 import { EPOCH7_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch7.js";
+import { EPOCH8_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch8.js";
 import { PUBLIC_CONTRACT, resolvePublicContract } from "../edge/cloudflare/dist/contracts/public.js";
 import {
   PREVIOUS_RUNTIME_EXECUTION_CONTRACT,
@@ -135,11 +136,31 @@ test("user keeps public and runtime contracts independent | Given the frozen pub
   assert.equal(isCompatibleRuntimeContract(5, PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash), false);
 });
 
-test("public contract resolver enables epoch 7 for explicit first-party dev and prod environments", () => {
-  assert.equal(resolvePublicContract("dev"), EPOCH7_CONTRACT);
-  assert.equal(resolvePublicContract("prod"), EPOCH7_CONTRACT);
+test("public contract resolver enables epoch 8 for explicit first-party dev and prod environments", () => {
+  assert.equal(resolvePublicContract("dev"), EPOCH8_CONTRACT);
+  assert.equal(resolvePublicContract("prod"), EPOCH8_CONTRACT);
   assert.equal(resolvePublicContract(), EPOCH3_CONTRACT);
   assert.equal(resolvePublicContract("unknown"), EPOCH3_CONTRACT);
+});
+
+test("user retains all Herdr tools | Given the frozen epoch 7 catalog | When descriptions advance to epoch 8 | Then tool schemas and safety annotations remain unchanged", () => {
+  assert.equal(EPOCH8_CONTRACT.contract_epoch, 8);
+  assert.equal(EPOCH8_CONTRACT.tool_count, 19);
+  assert.equal(computeContractHash(EPOCH8_CONTRACT.tools), EPOCH8_CONTRACT.contract_hash);
+  assert.deepEqual(
+    EPOCH8_CONTRACT.tools.map((tool) => tool.name),
+    EPOCH7_CONTRACT.tools.map((tool) => tool.name),
+  );
+  for (let index = 0; index < EPOCH7_CONTRACT.tools.length; index += 1) {
+    assert.deepEqual(EPOCH8_CONTRACT.tools[index].inputSchema, EPOCH7_CONTRACT.tools[index].inputSchema);
+    assert.deepEqual(EPOCH8_CONTRACT.tools[index].annotations, EPOCH7_CONTRACT.tools[index].annotations);
+  }
+  const byName = (name) => EPOCH8_CONTRACT.tools.find((tool) => tool.name === name).description;
+  assert.match(byName("herdr_call"), /Herdr, Skill, and browser actions/);
+  assert.match(byName("herdr_call"), /without a dedicated public tool/);
+  assert.match(byName("herdr_call"), /Browser actions require an explicit device/);
+  assert.match(byName("herdr_exec"), /shell scripts, pipes, or redirects/);
+  assert.match(byName("herdr_skill"), /choosing dedicated tools, generic actions/);
 });
 
 test("epoch 4 annotates only read-only tools and leaves prior hashes unchanged", () => {

@@ -87,7 +87,7 @@ Details that matter when `workers.dev` is unreachable:
 
 ### Does a new ChatGPT conversation get the current catalog?
 
-The current first-party DEV/PROD public ChatGPT contract is **epoch 7 / 19 actions**. Workstation execution is **epoch 5 / 18 tools**, including `herdr_skill`; the extra public action is Edge-local `herdr_devices`. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
+The current first-party DEV/PROD public ChatGPT contract is **epoch 8 / 19 actions**. Workstation execution is **epoch 5 / 18 tools**, including `herdr_skill`; the extra public action is Edge-local `herdr_devices`. The immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog are retained only as bounded rollback/compatibility baselines; epoch 3 is historical only, and the public Edge epoch-3 identity remains a bounded non-DEV/PROD baseline.
 
 Old conversations may retain an older `tools/list` snapshot. Before reinstalling anything, verify the server and open a new conversation.
 

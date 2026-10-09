@@ -100,7 +100,7 @@ CI 给各个平面提供共享证据，范围不扩展到“部署一切”。
 
 Runtime implementation 可以频繁变化，但 ChatGPT 看到的 public MCP catalog 不应该悄悄变化。
 
-当前 first-party DEV/PROD 公共 Edge contract 是 **epoch 7 / 19 actions**，workstation Runtime Execution Contract 是 **epoch 5 / 18 tools**。`herdr_devices` 只在 Edge 执行，不转发到 workstation。紧邻上一代冻结的 epoch 4 与冻结的 epoch 2 catalog 仅作为有界的 rollback/compatibility 身份保留，不再是 current contract；epoch 3 仅属历史，公共 Edge epoch 3 身份仍作为非 DEV/PROD 的有界基线保留。普通 runtime commit 不应该因为“顺手改了 schema”就改变任一 contract。
+当前 first-party DEV/PROD 公共 Edge contract 是 **epoch 8 / 19 actions**，workstation Runtime Execution Contract 是 **epoch 5 / 18 tools**。`herdr_devices` 只在 Edge 执行，不转发到 workstation。紧邻上一代冻结的 epoch 4 与冻结的 epoch 2 catalog 仅作为有界的 rollback/compatibility 身份保留，不再是 current contract；epoch 3 仅属历史，公共 Edge epoch 3 身份仍作为非 DEV/PROD 的有界基线保留。普通 runtime commit 不应该因为“顺手改了 schema”就改变任一 contract。
 
 ### GitLab CI 与其它无人值守 MCP 调用方
 

@@ -124,7 +124,7 @@ candidate は検証を通過した後にのみ active になります。
 5. 任意の runtime version チェックを通過する
 6. 必要な場合、observation チェックが healthy なままである
 
-現在の first-party DEV/PROD の public Edge contract は **epoch 7 / 19 actions**、ワークステーションの Runtime Execution Contract は **epoch 5 / 18 tools** です。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、有界な rollback/compatibility ベースラインとしてのみ残ります。epoch 3 は historical only であり、public Edge の epoch-3 identity は非 DEV/PROD の有界なベースラインとして残ります。正確な build hash は Release の証拠であり、長期にわたるドキュメント上の事実ではありません。activation は現在の凍結された contract 定義に従います。
+現在の first-party DEV/PROD の public Edge contract は **epoch 8 / 19 actions**、ワークステーションの Runtime Execution Contract は **epoch 5 / 18 tools** です。直前の凍結された epoch-4 contract と凍結された epoch-2 catalog は、有界な rollback/compatibility ベースラインとしてのみ残ります。epoch 3 は historical only であり、public Edge の epoch-3 identity は非 DEV/PROD の有界なベースラインとして残ります。正確な build hash は Release の証拠であり、長期にわたるドキュメント上の事実ではありません。activation は現在の凍結された contract 定義に従います。
 
 ## Runtime のアップグレードと contract migration は別物
 

@@ -114,12 +114,12 @@ ChatGPT 使用经过审核的 MCP action 冻结快照。只升级本地 runtime 
 
 Herdr 从 0.4.3 起明确区分两层 contract：
 
-**ChatGPT public contract（first-party DEV/PROD）：epoch 7 / 19 actions；workstation runtime execution contract：epoch 5 / 18 tools。** 第 19 个 action 是 Edge-local `herdr_devices`，不会转发到 workstation。紧邻上一代冻结的 epoch 4 与冻结的 epoch 2 catalog 仅作为有界的 rollback/compatibility 基线保留，epoch 3 仅属历史，公共 Edge epoch 3 身份仍作为非 DEV/PROD 的有界基线保留。
+**ChatGPT public contract（first-party DEV/PROD）：epoch 8 / 19 actions；workstation runtime execution contract：epoch 5 / 18 tools。** 第 19 个 action 是 Edge-local `herdr_devices`，不会转发到 workstation。紧邻上一代冻结的 epoch 4 与冻结的 epoch 2 catalog 仅作为有界的 rollback/compatibility 基线保留，epoch 3 仅属历史，公共 Edge epoch 3 身份仍作为非 DEV/PROD 的有界基线保留。
 
 典型现象：
 
 ```text
-服务器已经 public epoch 7 / 19 actions
+服务器已经 public epoch 8 / 19 actions
         │
         ├─ 已刷新 action 集：可以看到 19 actions ✓
         │
@@ -132,6 +132,8 @@ Herdr 从 0.4.3 起明确区分两层 contract：
 2. **不要**仅因为 Runtime 或已有 Worker 做了原地升级就断开、删除或重新添加 Connector；Worker reconcile 会保留 public OAuth origin 与 Connector credentials；
 3. Herdr public action catalog 发生变化时，通过当前账户可用的 Workspace App 管理入口刷新、审核并发布 actions；新增 action 如需显式启用则同时启用；
 4. action snapshot 更新后，用新会话重新验证。更新 Worker 代码是获得新版 Edge 工具描述的必要条件，但已经审核过的 ChatGPT action snapshot 仍可能保持冻结，直到 App actions 被刷新。
+
+Epoch 8 验收：查询当前 Connector 指向的 Worker `/info`，确认 `publicContract.epoch=8`；刷新 ChatGPT 的 Herdr actions 后，在新会话核对仍有 19 个工具（11 read、8 write），且 `herdr_call` 说明包含 `Browser actions require an explicit device`、`herdr_exec` 说明包含 `shell scripts, pipes, or redirects`。再执行只读文件/Git 查询和简短命令。浏览器扩展 Reload 不会刷新 MCP 工具快照。
 
 不要为了陈旧 tool snapshot 重装 workstation。v0.4.2 runtime 仍可继续执行 epoch-2 / 18-tool workstation contract；只有升级到 v0.4.3 后才获得新的多设备 runtime 能力。
 
