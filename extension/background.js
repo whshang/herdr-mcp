@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.164";
+const H2W_SCRIPT_VERSION = "0.1.165";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -10013,6 +10013,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
       }
     })();
+    return true;
+  }
+  if (msg?.type === "h2w_type_trusted_mention") {
+    // DEV-only trusted keystrokes for the native App mention picker. Live
+    // evidence: ChatGPT ignores execCommand/synthetic input for `@` mentions.
+    // Scope: the sender's own tab only, a fixed `@<keyword>` text of
+    // [a-z0-9_-]{1,64}, attach just for typing and always detach.
+    const tabId = sender.tab?.id;
+    const keyword = String(msg.keyword || "");
+    if (!tabId) { sendResponse({ ok: false, error: "no-tab" }); return; }
+    if (chrome.runtime.getManifest().update_url || !chrome.debugger) {
+      sendResponse({ ok: false, error: "trusted-input-unavailable" });
+      return;
+    }
+    if (!/^[a-z0-9_-]{1,64}$/.test(keyword)) { sendResponse({ ok: false, error: "bad-keyword" }); return; }
+    const target = { tabId };
+    const send = (method, params) => chrome.debugger.sendCommand(target, method, params);
+    const typeChar = async (ch) => {
+      const at = ch === "@";
+      const base = {
+        key: ch,
+        code: at ? "Digit2" : (/[a-z]/.test(ch) ? `Key${ch.toUpperCase()}` : ""),
+        modifiers: at ? 8 : 0,
+      };
+      await send("Input.dispatchKeyEvent", { type: "keyDown", text: ch, unmodifiedText: at ? "2" : ch, ...base });
+      await send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    };
+    (async () => {
+      let attached = false;
+      try {
+        await chrome.debugger.attach(target, "1.3");
+        attached = true;
+        for (const ch of `@${keyword}`) {
+          await typeChar(ch);
+          await sleep(40);
+        }
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: `trusted-input-failed:${String(e?.message || e).slice(0, 80)}` };
+      } finally {
+        if (attached) { try { await chrome.debugger.detach(target); } catch (_) {} }
+      }
+    })().then(sendResponse);
     return true;
   }
   if (msg?.type === "h2w_focus_own_tab") {

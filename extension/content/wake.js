@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.164";
+const H2W_CONTENT_VERSION = "0.1.165";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -884,7 +884,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       let searchInserted = false;
       // ChatGPT only opens native mention suggestions for a focused editor in a
-      // focused document. Live 0.1.164 evidence: `@herdr` committed but no
+      // focused document. Live 0.1.165 evidence: `@herdr` committed but no
       // suggestion root of any kind appeared. Bring this task tab's window to
       // the foreground once before typing; no other tab is touched.
       if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
@@ -903,14 +903,35 @@ function normalizeHerdrMentionAlias(value) {
       const selector = ADAPTER.getWatchMainWorldSelector();
       // Insert @ then the keyword as separate editor events so ChatGPT can
       // activate and filter its native mention suggestions.
-      const prefix = selector ? await insertMainWorld('@', selector, ADAPTER.getSelectedComposerApps().length > 0) : null;
-      if (!prefix?.ok) return { ok: false, error: 'required-app-not-found' };
-      searchInserted = true;
-      await wait(100);
-      const search = await insertMainWorld(app, selector, true);
-      if (!search?.ok) {
-        await clearComposer();
-        return { ok: false, error: 'required-app-not-found' };
+      // Prefer trusted keystrokes (DEV only): ChatGPT opens its native mention
+      // picker only for real key input. Fall back to editor insertion when the
+      // trusted path is unavailable (store builds).
+      const trusted = selector && ADAPTER.getSelectedComposerApps().length === 0
+        ? await new Promise((resolve) => {
+          try {
+            chrome.runtime.sendMessage({ type: 'h2w_type_trusted_mention', keyword: app }, (resp) => {
+              if (chrome.runtime.lastError || !resp) resolve({ ok: false, error: 'no-response' });
+              else resolve(resp);
+            });
+          } catch (_) { resolve({ ok: false, error: 'no-response' }); }
+        })
+        : { ok: false, error: 'trusted-input-skipped' };
+      if (trusted.ok) {
+        searchInserted = true;
+      } else {
+        if (ADAPTER.getComposerTextWithoutAppPills() !== '') {
+          // A failed trusted attempt may have typed part of the search text.
+          await clearComposer();
+        }
+        const prefix = selector ? await insertMainWorld('@', selector, ADAPTER.getSelectedComposerApps().length > 0) : null;
+        if (!prefix?.ok) return { ok: false, error: 'required-app-not-found' };
+        searchInserted = true;
+        await wait(100);
+        const search = await insertMainWorld(app, selector, true);
+        if (!search?.ok) {
+          await clearComposer();
+          return { ok: false, error: 'required-app-not-found' };
+        }
       }
       let candidates = [];
       const searchDeadline = Date.now() + 3000;
