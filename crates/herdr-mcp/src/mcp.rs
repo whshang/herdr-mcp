@@ -3328,6 +3328,9 @@ fn browser_session_create_late_acceptance_readback(
             };
             match (count("all"), count("visible")) {
                 (None, _) | (_, None) => "readback_user_counts_missing",
+                (Some(0), _) if result.get("readback_detail_error").is_some() => {
+                    "readback_detail_unavailable"
+                }
                 (Some(0), _) => "readback_no_user_message",
                 (Some(_), Some(0)) => "readback_no_visible_user_message",
                 (Some(_), Some(1)) => "readback_user_parts_unreadable",
