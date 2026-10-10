@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.163";
+const H2W_SCRIPT_VERSION = "0.1.164";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -10013,6 +10013,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
       }
     })();
+    return true;
+  }
+  if (msg?.type === "h2w_focus_own_tab") {
+    // Focus only the sender's own tab and window (native App mention needs a
+    // focused document). No tab id is accepted from the message.
+    const tabId = sender.tab?.id;
+    const windowId = sender.tab?.windowId;
+    if (!tabId || windowId == null) { sendResponse({ ok: false, error: "no-tab" }); return; }
+    Promise.resolve()
+      .then(() => chrome.windows.update(windowId, { focused: true }))
+      .then(() => chrome.tabs.update(tabId, { active: true }))
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
     return true;
   }
   if (msg?.type === "h2w_insert_main") {

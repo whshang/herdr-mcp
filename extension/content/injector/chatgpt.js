@@ -229,6 +229,9 @@ class ChatGPTAdapter extends BaseAdapter {
     const controlsTarget = controlsId ? document.getElementById(controlsId) : null;
     return {
       composer_found: Boolean(input),
+      document_has_focus: typeof document.hasFocus === 'function' ? document.hasFocus() : false,
+      document_visible: document.visibilityState === 'visible',
+      composer_focused: Boolean(input && (input === document.activeElement || input.contains(document.activeElement))),
       composer_is_prompt_textarea: input?.id === 'prompt-textarea',
       search_text_committed: Boolean(wanted) && plain === `@${wanted}`,
       selected_pill_count: clamp(input ? input.querySelectorAll('[data-inline-selection-pill]').length : 0),
