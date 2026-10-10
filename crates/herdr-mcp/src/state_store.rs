@@ -4844,6 +4844,37 @@ impl StateStore {
         }
     }
 
+    /// Read-only fanout view: every dispatch already recorded for one work
+    /// chain, oldest first, bounded. Reads the existing dispatch ledger only.
+    pub fn browser_dispatches_for_work_chain(
+        &self,
+        work_chain_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BrowserDispatchRecord>, String> {
+        validate_browser_work_chain_id(work_chain_id)?;
+        let ids = self
+            .conn
+            .prepare(
+                "SELECT dispatch_id FROM browser_dispatches
+                 WHERE work_chain_id = ?1
+                 ORDER BY created_at ASC, dispatch_id ASC LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare fanout read: {error}"))?
+            .query_map(params![work_chain_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("cannot read fanout dispatches: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode fanout dispatches: {error}"))?;
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = self.browser_dispatch(&id)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     pub fn latest_browser_dispatch_for_session(
         &self,
         session_ref: &str,

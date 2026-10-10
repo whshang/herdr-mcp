@@ -297,6 +297,11 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             json!({"dispatch_id": dispatch_id}),
             None,
         )?),
+        WebChatCommand::FanoutStatus { work_chain_id } => print_private_result(call_private(
+            BROWSER_DISPATCH_STATUS_METHOD,
+            json!({"work_chain_id": work_chain_id}),
+            None,
+        )?),
         WebChatCommand::Open {
             session_ref,
             expected_generation,
