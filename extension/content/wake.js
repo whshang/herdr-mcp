@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.177";
+const H2W_CONTENT_VERSION = "0.1.178";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -1770,15 +1770,27 @@ function normalizeHerdrMentionAlias(value) {
     )) || null;
   }
 
+  // Radix dropdown triggers open on pointerdown, not on a bare click() (live
+  // 0.1.177 evidence: header `更多` click() left the menu closed). Send the
+  // pointer sequence a real primary-button press produces, then click.
+  function pressMenuTrigger(button) {
+    const init = { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerType: "mouse", isPrimary: true };
+    try { button.dispatchEvent(new PointerEvent("pointerdown", init)); } catch (_) {}
+    try { button.dispatchEvent(new MouseEvent("mousedown", init)); } catch (_) {}
+    try { button.dispatchEvent(new PointerEvent("pointerup", { ...init, buttons: 0 })); } catch (_) {}
+    try { button.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 })); } catch (_) {}
+    if (button.getAttribute("aria-expanded") !== "true") button.click();
+  }
+
   async function openChatGptArchiveMenu() {
     const moreLabels = /^(更多|More|その他)$/i;
-    const buttons = [...document.querySelectorAll('button[aria-label]')];
+    const buttons = [...document.querySelectorAll('button[aria-haspopup="menu"], button[aria-label]')];
     const headerMore = buttons.find((button) => (
       ADAPTER.elementVisible(button)
-      && moreLabels.test(normText(button.getAttribute("aria-label") || ""))
+      && moreLabels.test(normText(button.getAttribute("aria-label") || button.textContent || ""))
     ));
     if (headerMore) {
-      headerMore.click();
+      pressMenuTrigger(headerMore);
       const deadline = Date.now() + 1500;
       do {
         const item = visibleChatGptArchiveMenuItem();
@@ -1795,7 +1807,7 @@ function normalizeHerdrMentionAlias(value) {
         && /(?:对话选项|conversation options|chat options|チャット.*オプション)/i.test(label);
     });
     if (!options) return null;
-    options.click();
+    pressMenuTrigger(options);
     const deadline = Date.now() + 1500;
     do {
       const item = visibleChatGptArchiveMenuItem();
@@ -2346,7 +2358,12 @@ function normalizeHerdrMentionAlias(value) {
     }
     evidence.command_accepted = true;
 
-    const deadline = Date.now() + 6000;
+    // session.create waits longer for the exact accepted user-message ref: the
+    // first provider snapshot of a brand-new conversation can lag (live Phase 2
+    // A1 returned uncertain at 6s and was never promoted). The runtime create
+    // actuation timeout (53s) bounds this; a response after the caller's budget
+    // becomes a late completion that a same-key replay reconciles to applied.
+    const deadline = Date.now() + (creatingSession ? 20000 : 6000);
     do {
       const afterServer = ADAPTER.name === "chatgpt"
         ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
@@ -4001,7 +4018,7 @@ function normalizeHerdrMentionAlias(value) {
       }
     }
     if (!options) return null;
-    options.click();
+    pressMenuTrigger(options);
     let settings = null;
     const menuDeadline = Date.now() + 1500;
     do {
