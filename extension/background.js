@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.178";
+const H2W_SCRIPT_VERSION = "0.1.179";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -7690,6 +7690,21 @@ function browserPageCanonicalUrl(rawUrl, targetOrigin = null) {
   }
 }
 
+// Claim-only URL equivalence. ChatGPT serves one Project conversation under
+// both /g/g-p-<id>/c/<uuid> (the session canonical URL) and
+// /g/g-p-<id>-<slug>/c/<uuid> (what the worker tab shows). The conversation
+// uuid is the identity; the cosmetic slug is dropped only for that shape.
+function browserPageClaimKey(rawUrl, targetOrigin = null) {
+  const canonical = browserPageCanonicalUrl(rawUrl, targetOrigin);
+  if (!canonical) return null;
+  const parsed = new URL(canonical);
+  if (parsed.hostname === "chatgpt.com") {
+    parsed.pathname = parsed.pathname.replace(/^\/g\/(g-p-[0-9a-f]{32})-[^/]+\/c\//, "/g/$1/c/");
+  }
+  parsed.hash = "";
+  return parsed.href;
+}
+
 function browserPageView(page, extra = {}) {
   if (!page) return null;
   return {
@@ -7884,8 +7899,9 @@ async function performBrowserPageLifecycleRequest(msg) {
     if (action === "claim") {
       let tabs = [];
       try { tabs = await chrome.tabs.query({ url: pattern }); } catch (_) {}
+      const claimKey = browserPageClaimKey(canonicalUrl, targetOrigin);
       const matches = tabs.filter((tab) =>
-        tab?.id && browserPageCanonicalUrl(tab.url, targetOrigin) === canonicalUrl);
+        tab?.id && claimKey && browserPageClaimKey(tab.url, targetOrigin) === claimKey);
       if (matches.length === 0) return { ok: false, error: "target_tab_not_found" };
       if (matches.length !== 1) return { ok: false, error: "target_tab_ambiguous" };
       const page = await rememberBrowserPage(
