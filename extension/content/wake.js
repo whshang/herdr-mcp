@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.181";
+const H2W_CONTENT_VERSION = "0.1.182";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2118,11 +2118,25 @@ function normalizeHerdrMentionAlias(value) {
         const parts = users.length === 1 && Array.isArray(users[0]?.content?.parts) ? users[0].content.parts : null;
         if (parts && parts.every((part) => typeof part === "string")) {
           try {
-            const bytes = new TextEncoder().encode(parts.join(""));
-            const digest = await crypto.subtle.digest("SHA-256", bytes);
-            evidence.result.accepted_user_message_ref = users[0].id;
-            evidence.result.accepted_user_text_sha256 = [...new Uint8Array(digest)]
+            const hex = async (text) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))]
               .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+            // The stored text can carry the selected App mention as a leading
+            // token (live E1: `herdr` pill before the body). Strip only exact
+            // required-App tokens the runtime named, then trim.
+            const apps = (Array.isArray(params.required_apps) ? params.required_apps : [])
+              .filter((app) => typeof app === "string" && /^[a-z0-9_-]{1,64}$/.test(app));
+            const full = parts.join("").trim();
+            let body = full;
+            for (let changed = true; changed;) {
+              changed = false;
+              for (const app of apps) {
+                const match = body.match(new RegExp(`^@?${app}(?:\\s+|$)`, "i"));
+                if (match) { body = body.slice(match[0].length).trim(); changed = true; }
+              }
+            }
+            evidence.result.accepted_user_message_ref = users[0].id;
+            evidence.result.accepted_user_text_sha256 = await hex(full);
+            evidence.result.accepted_user_body_sha256 = await hex(body);
           } catch (_) {}
         }
       }
