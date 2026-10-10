@@ -4523,8 +4523,11 @@ fn browser_session_open(
         Ok(state) => state,
         Err(error) => return browser_store_error(error),
     };
-    let mut result =
-        browser_operation_delivery_result(BrowserOperation::SessionOpen, delivery_state);
+    let mut result = browser_operation_result_with_reason(
+        BrowserOperation::SessionOpen,
+        delivery_state,
+        &evidence,
+    );
     if let Some(object) = result.as_object_mut() {
         object.insert("op_id".to_owned(), json!(op_id));
         object.insert("idempotent_replay".to_owned(), json!(false));
@@ -5129,7 +5132,7 @@ fn browser_operation_call_with_controls(
                 Ok(state) => state,
                 Err(error) => return browser_store_error(error),
             };
-            browser_operation_delivery_result(operation, delivery_state)
+            browser_operation_result_with_reason(operation, delivery_state, &evidence)
         }
         _ => {
             let expected_generation = params
@@ -5154,9 +5157,42 @@ fn browser_operation_call_with_controls(
                 Ok(state) => state,
                 Err(error) => return browser_store_error(error),
             };
-            browser_operation_delivery_result(operation, delivery_state)
+            browser_operation_result_with_reason(operation, delivery_state, &evidence)
         }
     }
+}
+
+pub(crate) fn browser_reason_token_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
+}
+
+/// Attach the extension's fixed refusal token (`reason`, else `error`) to a
+/// non-success operation result. Nothing else from the evidence is echoed.
+fn browser_operation_result_with_reason(
+    operation: BrowserOperation,
+    delivery_state: BrowserDeliveryState,
+    evidence: &BrowserPostconditionEvidence,
+) -> Value {
+    let mut result = browser_operation_delivery_result(operation, delivery_state);
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        return result;
+    }
+    let reason = evidence.result.as_ref().and_then(|value| {
+        ["reason", "error"].iter().find_map(|key| {
+            value
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|token| browser_reason_token_valid(token))
+        })
+    });
+    if let (Some(reason), Some(object)) = (reason, result.as_object_mut()) {
+        object.insert("reason".to_owned(), json!(reason));
+    }
+    result
 }
 
 fn browser_operation_delivery_result(
