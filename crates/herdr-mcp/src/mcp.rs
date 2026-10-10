@@ -5195,9 +5195,29 @@ fn browser_operation_call_with_controls(
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "browser_archive_status_unknown".to_owned());
+            // Surface the exact provider HTTP token (e.g. http-429 vs http-404);
+            // a 429 is a rate-limit state, not an unknown archive state.
+            let readback_error = evidence
+                .result
+                .as_ref()
+                .and_then(|value| value.get("readback_error"))
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() <= 48
+                        && value.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                        })
+                })
+                .map(str::to_owned);
+            let code = if readback_error.as_deref() == Some("http-429") {
+                "rate_limited"
+            } else {
+                "archive_status_unknown"
+            };
             json!({
                 "ok": false,
-                "code": "archive_status_unknown",
+                "code": code,
+                "readback_error": readback_error,
                 "reason": reason,
                 "operation": operation.method(),
                 "session_ref": session_ref,
