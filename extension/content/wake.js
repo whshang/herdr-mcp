@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.185";
+const H2W_CONTENT_VERSION = "0.1.186";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -1945,8 +1945,15 @@ function normalizeHerdrMentionAlias(value) {
     if (existing?.ok && existing?.body?.is_archived === true) {
       return { outcome: "applied", delivered: false, alreadyArchived: true };
     }
+    // Some conversations (live: uncertain-create workers J1/K1/A1) never expose
+    // the header options menu. Fall back to ChatGPT's own conversation PATCH
+    // (the same endpoint title projection uses), under the same one-shot claim.
     const archive = await openChatGptArchiveMenu();
-    if (!archive) return { outcome: "rejected", delivered: false };
+    const viaApi = !archive;
+    if (viaApi && (typeof readChatGptAccessToken !== "function"
+        || !(await readChatGptAccessToken(4000).catch(() => null)))) {
+      return { outcome: "rejected", delivered: false };
+    }
     // Converge the one-shot rule here, before the real click: persist and verify
     // the delivery claim first, so a reload or same-key re-entry inside the
     // click/poll window cannot replay it and an unpersistable claim never
@@ -1962,7 +1969,20 @@ function normalizeHerdrMentionAlias(value) {
         : { outcome: "rejected", delivered: false };
     }
     try {
-      archive.click();
+      if (viaApi) {
+        const token = String(await readChatGptAccessToken(4000) || "");
+        if (!token || token.length > 4096) return { outcome: "uncertain", delivered: true };
+        await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+          method: "PATCH",
+          credentials: "include",
+          cache: "no-store",
+          redirect: "error",
+          headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ is_archived: true }),
+        });
+      } else {
+        archive.click();
+      }
     } catch (_) {
       return { outcome: "uncertain", delivered: true };
     }
@@ -2123,7 +2143,15 @@ function normalizeHerdrMentionAlias(value) {
         // Live H1: ChatGPT also stores hidden user-role context nodes (for the
         // selected App) next to the typed message, so count only visible text
         // user messages, and hash only their string parts.
-        const allUsers = Object.values(readback.body.mapping || {})
+        // The archive readback above is the conversations *list* item (no
+        // mapping). Fetch the conversation detail once for the user turn.
+        const detail = await fetchChatGptConversationDetail({ conversationId, timeoutMs: 10000 })
+          .catch(() => ({ ok: false }));
+        if (!detail?.ok) {
+          const detailError = String(detail?.reason || detail?.error || "");
+          evidence.result.readback_detail_error = /^[a-z0-9_-]{1,48}$/.test(detailError) ? detailError : "unavailable";
+        }
+        const allUsers = Object.values((detail?.ok && detail.body?.mapping) || {})
           .map((node) => node?.message)
           .filter((message) => message?.author?.role === "user" && typeof message?.id === "string");
         const users = allUsers.filter((message) => message?.metadata?.is_visually_hidden_from_conversation !== true
@@ -3793,6 +3821,30 @@ function normalizeHerdrMentionAlias(value) {
   // /backend-api/conversations/<id> endpoint with a Bearer header. Any
   // 401/404/timeout fails closed and returns an error payload only; the token
   // never leaves this function scope and is never logged/stored.
+  async function fetchChatGptConversationDetail({ conversationId, timeoutMs = 6000 } = {}) {
+    if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, error: "not-chatgpt-conversation" };
+    const accessToken = await readChatGptAccessToken(4000);
+    const sessionToken = String(accessToken || "");
+    if (!sessionToken || sessionToken.length > 4096) return { ok: false, reason: "auth" };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+        credentials: "include",
+        cache: "no-store",
+        redirect: "error",
+        headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
+        signal: controller.signal,
+      });
+      if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+      return { ok: true, body: await response.json() };
+    } catch (error) {
+      return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function fetchChatGptConversation({
     conversationId,
     timeoutMs = 6000,
