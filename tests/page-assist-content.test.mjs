@@ -66,6 +66,7 @@ function harness({
   bodyText = "Visible page text",
   elements = [],
   topOrigin = null,
+  scrollMax = 0,
 } = {}) {
   let listener = null;
   const location = new URL(url);
@@ -73,6 +74,7 @@ function harness({
     title,
     readyState: "complete",
     body: { innerText: bodyText, textContent: bodyText },
+    documentElement: { scrollHeight: scrollMax + 600 },
     querySelectorAll() { return elements; },
   };
   for (const element of elements) element.ownerDocument = document;
@@ -85,6 +87,11 @@ function harness({
     setTimeout,
     document,
     location,
+    scrollY: 0,
+    innerHeight: 600,
+    scrollBy({ top }) {
+      this.scrollY = Math.max(0, Math.min(scrollMax, this.scrollY + top));
+    },
     chrome: {
       runtime: {
         onMessage: {
@@ -186,6 +193,61 @@ test("Page Assist inspect exposes only visible non-sensitive elements through op
   });
   assert.equal(linkClick.ok, true);
   assert.equal(linkClick.navigation_url, "https://app.test/details");
+});
+
+test("user scrolls the viewport | Given a bounded observed page | When scrolling by direction and pixels | Then movement and a boundary are reported without reusing stale generation", () => {
+  const h = harness({ scrollMax: 1250 });
+  let observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.scroll.y, 0);
+  assert.equal(observed.scroll.max_y, 1250);
+  const scroll = (direction, amount, expectedOrigin = "https://app.test") => h.send({
+    type: "h2w_page_assist", action: "scroll", generation: observed.generation,
+    expectedOrigin, direction, amount,
+  });
+  assert.equal(scroll("down", 1600).error, "scroll_params_invalid");
+  assert.equal(scroll("down", 250, "https://other.test").error, "origin_mismatch");
+  const moved = scroll("down", 500);
+  assert.equal(moved.ok, true);
+  assert.deepEqual([moved.before_y, moved.after_y, moved.moved, moved.at_boundary], [0, 500, true, false]);
+  assert.equal(scroll("down", 300).error, "stale_generation");
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.scroll.y, 500);
+  assert.equal(scroll("down", 1000).after_y, 1250);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const boundary = scroll("down", 300);
+  assert.equal(boundary.ok, true);
+  assert.equal(boundary.moved, false);
+  assert.equal(boundary.at_boundary, true);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(scroll("up", 500).after_y, 750);
+});
+
+test("user extracts text from one observed control | Given a bounded safe DOM element | When an exact generation ref is requested | Then the result is clipped without exposing markup or attributes", () => {
+  const text = "Story paragraph ".repeat(500);
+  const element = createElement({ tag: "button", text });
+  const secret = createElement({ tag: "input", type: "password", attrs: { "aria-label": "Secret" } });
+  const h = harness({ elements: [element, secret] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.length, 1);
+  const extraction = (params = {}) => h.send({
+    type: "h2w_page_assist", action: "extract", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref,
+    maxChars: 180, ...params,
+  });
+  const result = extraction();
+  assert.equal(result.ok, true);
+  assert.equal(result.text.length, 180);
+  assert.equal(result.truncated, true);
+  assert.ok(!Object.hasOwn(result, "outerHTML"));
+  assert.ok(!Object.hasOwn(result, "attributes"));
+  assert.equal(extraction({ maxChars: 9000 }).error, "extract_params_invalid");
+  assert.equal(extraction({ expectedOrigin: "https://other.test" }).error, "origin_mismatch");
+  assert.equal(extraction({ generation: "old" }).error, "stale_generation");
+  assert.equal(extraction({ ref: `ref_${observed.generation}_999` }).error, "element_detached");
+  assert.equal(extraction({ selector: "button" }).error, "disallowed_parameter");
+  const next = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.notEqual(next.generation, observed.generation);
+  assert.equal(extraction().error, "stale_generation");
 });
 
 test("user diagnoses an id-less composer | Given a visible non-sensitive ProseMirror textbox | When observing DOM structure | Then only bounded structural attributes are returned", () => {
@@ -293,6 +355,113 @@ test("Page Assist fill is bounded and invalidates the generation", () => {
   assert.equal(replay.error, "stale_generation");
 });
 
+test("user selects an exact native dropdown option | Given a visible single-select control | When filling by value or label | Then only an unambiguous enabled option is selected", () => {
+  const dropdown = createElement({ tag: "select", attrs: { "aria-label": "Country" }, value: "" });
+  dropdown.options = [
+    { value: "", textContent: "Choose country", disabled: true },
+    { value: "jp", textContent: "Japan", disabled: false },
+    { value: "us", textContent: "United States", disabled: false },
+    { value: "xx", textContent: "Disabled", disabled: true },
+  ];
+  const h = harness({ elements: [dropdown] });
+
+  let observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].tag, "select");
+  assert.deepEqual(Array.from(observed.elements[0].options), ["Japan", "United States"]);
+  assert.equal(observed.elements[0].options_truncated, undefined);
+  const choose = (value) => h.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref, value,
+  });
+
+  const missing = choose("France");
+  assert.equal(missing.error, "select_option_unavailable");
+  assert.equal(dropdown.value, "");
+  assert.deepEqual(dropdown.events, []);
+  const disabled = choose("Disabled");
+  assert.equal(disabled.error, "select_option_unavailable");
+  assert.equal(dropdown.focused, 0);
+
+  dropdown.options.push({ value: "fr", textContent: "France", disabled: false });
+  assert.equal(choose("France").error, "select_option_unavailable");
+  dropdown.options.pop();
+
+  const selected = choose("United States");
+  assert.equal(selected.ok, true);
+  assert.equal(dropdown.value, "us");
+  assert.deepEqual(dropdown.events, ["input", "change"]);
+  assert.equal(choose("Japan").error, "stale_generation");
+
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].selected_option, "United States");
+  assert.equal(choose("jp").ok, true);
+  assert.equal(dropdown.value, "jp");
+
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].selected_option, "Japan");
+  dropdown.options[2].textContent = "Changed dynamically";
+  assert.equal(choose("United States").error, "select_option_stale");
+  dropdown.options[2].textContent = "United States";
+  dropdown.options.push({ value: "jp", textContent: "Japan Duplicate", disabled: false });
+  assert.equal(choose("jp").error, "select_option_ambiguous");
+  assert.equal(dropdown.value, "jp");
+
+  dropdown.multiple = true;
+  assert.equal(choose("us").error, "multiple_select_unsupported");
+  assert.equal(dropdown.events.length, 4);
+
+  dropdown.multiple = false;
+  dropdown.options.push(...Array.from({ length: 28 }, (_, i) => ({
+    value: `opaque_private_${i}`, textContent: `Visible ${i}`, disabled: false,
+  })));
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements[0].options.length, 24);
+  assert.equal(observed.elements[0].options_truncated, true);
+  assert.ok(!JSON.stringify(observed.elements[0]).includes("opaque_private_"));
+});
+
+test("user explicitly sets checkable state | Given observed native checkbox and radio controls | When fill specifies true or false | Then state is verified without accidental toggles", () => {
+  const checkbox = createElement({ tag: "input", type: "checkbox", attrs: { "aria-label": "Notify me" } });
+  const radio = createElement({ tag: "input", type: "radio", attrs: { "aria-label": "Email" } });
+  checkbox.checked = false;
+  radio.checked = false;
+  const h = harness({ elements: [checkbox, radio] });
+  let observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const checkRef = observed.elements.find((e) => e.type === "checkbox");
+  const radioRef = observed.elements.find((e) => e.type === "radio");
+  assert.equal(checkRef.checked, false);
+  assert.equal(radioRef.checked, false);
+  function fill(ref, value) {
+    return h.send({
+      type: "h2w_page_assist", action: "fill",
+      expectedOrigin: "https://app.test",
+      generation: observed.generation, ref, value,
+    });
+  }
+  assert.equal(fill(checkRef.ref, "yes").error, "checkable_state_required");
+  assert.equal(fill(checkRef.ref, "false").error, "control_already_in_state");
+  assert.deepEqual(checkbox.events, []);
+  assert.equal(fill(checkRef.ref, "true").ok, true);
+  assert.equal(checkbox.checked, true);
+  assert.deepEqual(checkbox.events, ["input", "change"]);
+  assert.equal(fill(checkRef.ref, "false").error, "stale_generation");
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.find((e) => e.type === "checkbox").checked, true);
+  assert.equal(fill(observed.elements.find((e) => e.type === "checkbox").ref, "false").ok, true);
+  assert.equal(checkbox.checked, false);
+
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(fill(observed.elements.find((e) => e.type === "radio").ref, "false").error, "radio_uncheck_unsupported");
+  assert.deepEqual(radio.events, []);
+  assert.equal(fill(observed.elements.find((e) => e.type === "radio").ref, "true").ok, true);
+  assert.equal(radio.checked, true);
+  assert.deepEqual(radio.events, ["input", "change"]);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.elements.find((e) => e.type === "radio").checked, true);
+  assert.equal(fill(observed.elements.find((e) => e.type === "radio").ref, "true").error, "control_already_in_state");
+  assert.deepEqual(radio.events, ["input", "change"]);
+});
+
 test("user verifies a generic page postcondition | Given an observed same-origin page | When a bounded expect runs | Then document, URL, and text conditions settle without a mutation", async () => {
   const h = harness({
     url: "https://app.test/orders",
@@ -337,6 +506,42 @@ test("user verifies a generic page postcondition | Given an observed same-origin
   });
   assert.equal(missing.ok, false);
   assert.equal(missing.error, "expect_timeout");
+});
+
+test("user waits for an exact visible control | Given dynamic and sensitive page elements | When a bounded element expect runs | Then only an observed safe label can satisfy the wait", async () => {
+  const secure = createElement({ tag: "input", type: "password", attrs: { "aria-label": "Secret" } });
+  const hidden = createElement({ tag: "button", text: "Hidden button", visible: false });
+  const existing = createElement({ tag: "button", text: "Continue" });
+  const elements = [secure, hidden, existing];
+  const h = harness({ elements });
+  const expect = (condition, value, timeoutMs = 0) => h.sendAsync({
+    type: "h2w_page_assist", action: "expect",
+    expectedOrigin: "https://app.test", condition, value, timeoutMs,
+  });
+  assert.equal((await expect("element_present", "Continue")).ok, true);
+  assert.equal((await expect("element_absent", "Continue")).error, "expect_timeout");
+  assert.equal((await expect("element_absent", "Secret")).ok, true);
+  assert.equal((await expect("element_absent", "Hidden button")).ok, true);
+  assert.equal((await expect("element_present", "#password")).error, "expect_timeout");
+  assert.equal((await expect("element_present", " Continue ")).error, "expect_value_invalid");
+
+  const introduced = createElement({ tag: "button", text: "Publish" });
+  introduced.ownerDocument = existing.ownerDocument;
+  setTimeout(() => elements.push(introduced), 75);
+  const appeared = await expect("element_present", "Publish", 350);
+  assert.equal(appeared.ok, true);
+  assert.ok(appeared.elapsed_ms >= 50);
+  elements.pop();
+  assert.equal((await expect("element_absent", "Publish")).ok, true);
+
+  // A capped scan is not proof of absence in a dense application DOM.
+  for (let i = 0; i < 129; i += 1) {
+    const el = createElement({ tag: "button", text: `Other ${i}` });
+    el.ownerDocument = existing.ownerDocument;
+    elements.push(el);
+  }
+  assert.equal((await expect("element_absent", "Missing")).error, "element_scan_truncated");
+  assert.equal((await expect("element_present", "Missing")).error, "element_scan_truncated");
 });
 
 test("Page Assist fails closed inside a cross-origin iframe", () => {

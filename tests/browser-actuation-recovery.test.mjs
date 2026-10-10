@@ -11,6 +11,18 @@ const backgroundSource = readFileSync(path.join(__dirname, "..", "extension", "b
 const wakeSource = readFileSync(path.join(__dirname, "..", "extension", "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(__dirname, "..", "extension", "content", "injector", "chatgpt.js"), "utf8");
 
+test("user scrolls a browser page | Given a typed Rust actuation payload | When the extension bridge forwards it | Then direction and amount reach the normal Page Assist action path", () => {
+  const start = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.action") {');
+  const end = backgroundSource.indexOf('  if (operation === "herdr_mcp.browser_page.lifecycle") {', start);
+  assert.ok(start > 0 && end > start);
+  const bridge = backgroundSource.slice(start, end);
+  assert.match(bridge, /pageRef:\s*params\.page_ref/);
+  assert.match(bridge, /action:\s*params\.action/);
+  assert.match(bridge, /generation:\s*params\.generation/);
+  assert.match(bridge, /direction:\s*params\.direction/);
+  assert.match(bridge, /amount:\s*params\.amount/);
+});
+
 const browserPageLifecycleStart = backgroundSource.indexOf("function validBrowserPageRef(");
 const browserPageLifecycleEnd = backgroundSource.indexOf("\nasync function performPageAssistRequest", browserPageLifecycleStart);
 assert.ok(browserPageLifecycleStart >= 0 && browserPageLifecycleEnd > browserPageLifecycleStart,
@@ -719,6 +731,105 @@ test("user acts on an opaque generic page | Given one claimed BrowserPage and a 
   assert.equal(uncertain.delivery_state, "delivery_unknown");
   assert.equal(uncertain.retry_safe, false);
   assert.equal(uncertain.mutation_submitted, true);
+});
+
+test("user rejects invalid native form states | Given unavailable dropdown or unsupported checkable state | When fill checks the observed control | Then delivery is not_applied and retry-safe", async () => {
+  const tabs = new Map([[71, { id: 71, url: "https://example.com/form", active: true }]]);
+  let rejection = "select_option_unavailable";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      if (payload.action !== "fill") throw new Error("unexpected test action");
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim",
+    targetOrigin: "https://example.com",
+    url: "https://example.com/form",
+    idempotencyKey: "claim-native-select-reject-1",
+  });
+  assert.equal(page.ok, true);
+
+  for (const error of [
+    "select_option_unavailable",
+    "select_option_ambiguous",
+    "select_option_stale",
+    "multiple_select_unsupported",
+    "checkable_state_required",
+    "radio_uncheck_unsupported",
+    "control_already_in_state",
+  ]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "fill",
+      pageRef: page.page_ref,
+      generation: "pa_gen_select_test",
+      ref: "ref_pa_gen_select_test_0",
+      value: "Disabled or changed option",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "select_not_applied";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "fill",
+    pageRef: page.page_ref,
+    generation: "pa_gen_select_test",
+    ref: "ref_pa_gen_select_test_0",
+    value: "Unknown setter outcome",
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
+  rejection = "control_state_not_applied";
+  const controlOutcome = await h.performBrowserPageActionRequest({
+    action: "fill",
+    pageRef: page.page_ref,
+    generation: "pa_gen_select_test",
+    ref: "ref_pa_gen_select_test_0",
+    value: "true",
+  });
+  assert.equal(controlOutcome.delivery_state, "delivery_unknown");
+  assert.equal(controlOutcome.retry_safe, false);
+});
+
+test("user receives safe scroll mutation errors | Given an owned page and invalid scroll inputs | When the content kernel rejects before scrolling | Then delivery stays not_applied", async () => {
+  const tabs = new Map([[72, { id: 72, url: "https://example.com/list", active: true }]]);
+  let rejection = "scroll_params_invalid";
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      assert.equal(payload.action, "scroll");
+      assert.equal(payload.direction, "down");
+      assert.equal(payload.amount, 500);
+      return { ok: false, error: rejection };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/list",
+    idempotencyKey: "claim-scroll-reject",
+  });
+  assert.equal(page.ok, true);
+  for (const error of ["scroll_params_invalid", "scroll_unavailable"]) {
+    rejection = error;
+    const result = await h.performBrowserPageActionRequest({
+      action: "scroll", pageRef: page.page_ref, generation: "pa_scroll_1", direction: "down", amount: 500,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error, error);
+    assert.equal(result.delivery_state, "not_applied");
+    assert.equal(result.retry_safe, true);
+    assert.equal(result.mutation_submitted, false);
+  }
+  rejection = "scroll_delivery_unknown";
+  const uncertain = await h.performBrowserPageActionRequest({
+    action: "scroll", pageRef: page.page_ref, generation: "pa_scroll_1", direction: "down", amount: 500,
+  });
+  assert.equal(uncertain.delivery_state, "delivery_unknown");
+  assert.equal(uncertain.retry_safe, false);
 });
 
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {
@@ -3492,14 +3603,13 @@ test("user returns ChatGPT browser actuation to Chat mode | Given Work mode is a
 
 test("ChatGPT required_apps selects a real composer app pill and fails closed on ambiguity", () => {
   assert.match(backgroundSource, /"composer\.select_tool"/);
-  assert.match(chatGptAdapterSource, /#composer-plus-btn/);
-  assert.match(chatGptAdapterSource, /data-testid="composer-plus-btn"/);
+  assert.doesNotMatch(wakeSource, /ADAPTER\.openComposerAppsMenu\(\)|ADAPTER\.searchComposerApp\(app\)/);
+  assert.doesNotMatch(chatGptAdapterSource, /openComposerAppsMenu\(\)|searchComposerApp\(keyword\)/);
   assert.match(chatGptAdapterSource, /data-inline-selection-pill/);
   assert.match(chatGptAdapterSource, /data-symbol="ecosystemMention"/);
   assert.match(chatGptAdapterSource, /data-keyword/);
-  // The generalized picker resolves the pill from visible, scored candidates in
-  // the opened menu; ambiguity stays fail-closed via candidates.length !== 1 in
-  // wake.js (asserted below).
+  // Direct @ typing triggers the provider suggestion list; a unique visible
+  // candidate and a real selected pill are still mandatory before submit.
   assert.match(chatGptAdapterSource, /getComposerAppCandidates\(keyword\)/);
   assert.match(chatGptAdapterSource, /\[data-keyword\], \[data-value\]/);
   assert.match(chatGptAdapterSource, /keywordMatches\(node\)/);
@@ -3510,9 +3620,22 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.match(wakeSource, /candidates\.length !== 1/);
   assert.match(wakeSource, /required-app-ambiguous/);
   assert.match(wakeSource, /required-app-not-found/);
-  assert.match(wakeSource, /!composerModelVisibleText\(\)/);
-  assert.match(wakeSource, /const search = selector \? await insertMainWorld\(app, selector\) : null/);
-  assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);
+  assert.match(wakeSource, /ADAPTER\.getComposerTextWithoutAppPills\(\) !== ''/);
+  assert.match(wakeSource, /const prefix = selector \? await insertMainWorld\('@', selector,/);
+  assert.match(wakeSource, /const search = await insertMainWorld\(app, selector, true\)/);
+  assert.ok(wakeSource.indexOf("await insertMainWorld('@', selector")
+    < wakeSource.indexOf("await insertMainWorld(app, selector, true)"));
+  assert.match(wakeSource, /required-app-selection-not-observed/);
+  // Rejections carry fixed-shape DOM diagnostics captured before cleanup.
+  assert.match(chatGptAdapterSource, /describeComposerAppSearch\(keyword\)/);
+  assert.match(wakeSource, /app_selection_probe: probe/);
+  assert.doesNotMatch(
+    chatGptAdapterSource.slice(chatGptAdapterSource.indexOf('describeComposerAppSearch(keyword)'),
+      chatGptAdapterSource.indexOf('getWatchMainWorldSelector()')),
+    /outerHTML|innerHTML|innerText/,
+  );
+  assert.match(wakeSource, /!ADAPTER\.getSelectedComposerApps\(\)\.includes\(app\)/);
+  assert.match(wakeSource, /if \(searchInserted\) await clearAutomationSearch\(app\)/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
   assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
   assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);
@@ -4104,4 +4227,12 @@ test("user still fails closed after source recovery | Given source affinity fall
   assert.equal(failure.evidence.command_accepted, false);
   assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
   assert.equal(harness.actuationMessages.length, 0);
+});
+
+test('ChatGPT inline-mention App pill is recognised only with provider identity attributes', () => {
+  const adapter = readFileSync(new URL('../extension/content/injector/chatgpt.js', import.meta.url), 'utf8');
+  assert.match(adapter, /span\[data-appearance="inline-mention"\]\[app-mention-name\]\[app-mention-path\]/);
+  assert.match(adapter, /for \(const keyword of this\.getInlineAppMentionKeywords\(input\)\) selected\.add\(keyword\);/);
+  assert.match(adapter, /for \(const node of this\.getInlineAppMentionNodes\(clone\)\) node\.remove\(\);/);
+  assert.match(adapter, /\^\[a-z0-9_-\]\{1,64\}\$/);
 });

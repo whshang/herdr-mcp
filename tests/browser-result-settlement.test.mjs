@@ -206,7 +206,7 @@ function observationHarness({
     "registeredBrowserSessionRef", "registeredBrowserGeneration", "registeredConvKey",
     "acceptedDispatchAssignments", "sendBg", "ADAPTER", "fetchChatGptConversationSnapshot",
     "chatGptDomTurnSequence", "isTurnInProgress", "Date", "setInterval", "document", "window", "recovered",
-    `${settlementSource}\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
+    `${settlementSource}\nconst maybeRefreshBrowserPendingDispatchAssignment = () => {};\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
   )("br_worker", 7, route, assignments, async (payload) => {
     sent.push(payload);
     return sends.shift() || { ok: true };
@@ -602,7 +602,10 @@ test("session.create re-registers boundedly until its synthesized pending dispat
   assert.match(wakeSource, /until:\s*Date\.now\(\) \+ BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS/);
   assert.match(wakeSource, /refresh\.retryMs = Math\.min\(refresh\.retryMs \* 2, 30000\)/);
   assert.match(wakeSource, /registerCurrentConversation\("session-create-pending-dispatch"\)/);
-  assert.match(wakeSource, /response\?\.browser_pending_dispatch\s*\|\|\s*acceptedDispatchAssignments\.has\(registeredBrowserSessionRef\)/);
+  assert.match(wakeSource, /response\?\.browser_pending_dispatch\s*\|\|\s*\/\^bd_\[0-9a-f\]\{64\}\$\/\.test\(String\(acceptedDispatchAssignments\.get\(registeredBrowserSessionRef\)\?\.dispatchId/);
+  // A create assignment recorded before the runtime dispatch exists adopts it
+  // only on an exact accepted-message and generation match.
+  assert.match(wakeSource, /current && !current\.dispatchId\s*&& current\.acceptedUserMessageRef === pending\.accepted_user_message_ref\s*&& current\.generation === pending\.generation/);
   assert.match(wakeSource, /maybeRefreshBrowserPendingDispatchAssignment\(\);/);
 });
 
@@ -614,4 +617,24 @@ test("persistent identity rejection stops retries but a new assignment can proce
   h.assignments.set("br_worker", { dispatchId: `bd_${"b".repeat(64)}`, generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null });
   assert.equal(await h.observe(), true);
   assert.equal(h.sent.length, 4);
+});
+
+test("hidden session.create worker tabs still refresh their pending dispatch identity", () => {
+  const route = wakeSource.slice(wakeSource.indexOf("  function startConversationRouteWatch() {"));
+  const refreshAt = route.indexOf("maybeRefreshBrowserPendingDispatchAssignment();");
+  const hiddenAt = route.indexOf("if (document.hidden) return;");
+  assert.ok(refreshAt > 0 && hiddenAt > refreshAt, "refresh must run before the hidden-tab early return");
+  const fn = wakeSource.slice(wakeSource.indexOf("  function maybeRefreshBrowserPendingDispatchAssignment() {"),
+    wakeSource.indexOf("  function scheduleDurableArchiveRetryWake("));
+  assert.doesNotMatch(fn, /document\.hidden/);
+  assert.match(fn, /Date\.now\(\) >= refresh\.until/);
+});
+
+test("hidden worker tabs re-register when the create route moves to the concrete conversation", () => {
+  const route = wakeSource.slice(wakeSource.indexOf("  function startConversationRouteWatch() {"),
+    wakeSource.indexOf("  function assistantSignature("));
+  const hidden = route.slice(route.indexOf("if (document.hidden) {"), route.indexOf("const convKey = ADAPTER.getConversationKey();"));
+  assert.match(hidden, /hiddenKey !== registeredConvKey && !hiddenRouteRegistrationInFlight/);
+  assert.match(hidden, /registerCurrentConversation\("poll-hidden"\)/);
+  assert.doesNotMatch(hidden, /ensureQueuedInsertButton|app-identity/);
 });

@@ -1976,6 +1976,59 @@ impl StateStore {
         })
     }
 
+    /// Bind a freshly created browser session into the single active Work
+    /// Memory chain that already owns `work_chain_id`, so its later dispatch
+    /// settlement can append the assistant turn. Never creates a chain: an
+    /// unknown chain stays `work_memory_not_found`, and an ambiguous chain
+    /// fails closed.
+    pub fn bind_created_browser_session_work_chain(
+        &mut self,
+        work_chain_id: &str,
+        provider: &str,
+        account_ref: Option<&str>,
+        space_ref: Option<&str>,
+        session_ref: &str,
+        bound_at: i64,
+    ) -> Result<String, String> {
+        if !valid_work_chain_id(work_chain_id) {
+            return Err("work_memory_work_chain_id_invalid".to_owned());
+        }
+        validate_provider_binding(provider, account_ref, space_ref, session_ref)?;
+        let mut ids = self
+            .conn
+            .prepare(
+                "SELECT continuity_id FROM continuity_chains
+                 WHERE work_chain_id = ?1 AND status = 'active'
+                 ORDER BY continuity_id LIMIT 2",
+            )
+            .map_err(|error| format!("cannot resolve work chain: {error}"))?
+            .query_map([work_chain_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query work chain: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read work chain: {error}"))?;
+        let continuity_id = match ids.len() {
+            0 => return Err("work_memory_not_found".to_owned()),
+            1 => ids.remove(0),
+            _ => return Err("work_memory_ambiguous".to_owned()),
+        };
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO continuity_provider_bindings (
+                    continuity_id, provider, account_ref, space_ref, session_ref, bound_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    continuity_id,
+                    provider,
+                    account_ref.unwrap_or(""),
+                    space_ref.unwrap_or(""),
+                    session_ref,
+                    bound_at
+                ],
+            )
+            .map_err(|error| format!("cannot persist work memory provider binding: {error}"))?;
+        Ok(continuity_id)
+    }
+
     pub fn append_browser_dispatch_work_memory_evidence(
         &mut self,
         work_chain_id: &str,
@@ -4789,6 +4842,37 @@ impl StateStore {
             Some(dispatch_id) => self.browser_dispatch(&dispatch_id),
             None => Ok(None),
         }
+    }
+
+    /// Read-only fanout view: every dispatch already recorded for one work
+    /// chain, oldest first, bounded. Reads the existing dispatch ledger only.
+    pub fn browser_dispatches_for_work_chain(
+        &self,
+        work_chain_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BrowserDispatchRecord>, String> {
+        validate_browser_work_chain_id(work_chain_id)?;
+        let ids = self
+            .conn
+            .prepare(
+                "SELECT dispatch_id FROM browser_dispatches
+                 WHERE work_chain_id = ?1
+                 ORDER BY created_at ASC, dispatch_id ASC LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare fanout read: {error}"))?
+            .query_map(params![work_chain_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("cannot read fanout dispatches: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode fanout dispatches: {error}"))?;
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(record) = self.browser_dispatch(&id)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     pub fn latest_browser_dispatch_for_session(

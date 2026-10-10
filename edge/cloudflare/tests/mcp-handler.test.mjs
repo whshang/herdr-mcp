@@ -1744,3 +1744,82 @@ test("forwarded requests carry a bounded principal ownership key derived from au
   assert.equal(JSON.stringify(a.calls[0]).includes("conn_principal_a"), false,
     "raw Connector identity must not enter pending ownership metadata");
 });
+
+function pageScopedGrantDeps() {
+  return deps({
+    client: {
+      connectorId: "conn_pagescopedgrant123",
+      grantGeneration: 3,
+      webchatControlGrants: [{
+        device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        provider: "chatgpt",
+        account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }],
+      pageAssistGrants: [
+        { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+        { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW", endpoint_ref: "be_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
+      ],
+    },
+    resolveDevice: async (selector) => selector === "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+      ? { ok: true, device_id: selector, workstation_id: "w-target", routing_reason: "explicit_device_selector" }
+      : { ok: false, code: "device_not_found" },
+  });
+}
+
+test("site-adapter page-scoped methods carry only the routed device's Page Assist grant", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  for (const method of ["herdr_mcp.x.search.posts", "herdr_mcp.bilibili.video.transcript", "herdr_mcp.doubao.image.status"]) {
+    assert.ok(PAGE_SCOPED_LOCAL_METHODS.includes(method), `${method} is page-scoped`);
+  }
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.x.search.posts",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          page_ref: `bp_${"a".repeat(64)}`,
+          query: "from:OpenAI",
+          limit: 1,
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].args.method, "herdr_mcp.x.search.posts");
+  assert.deepEqual(d.calls[0].trace?.page_assist_grants, [{
+    endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  }]);
+  assert.equal(d.calls[0].trace?.webchat_control_grants, undefined, "site method gets no WebChat control grants");
+});
+
+test("non-page methods never carry Page Assist grants", async () => {
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req(2, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.browser_endpoint.list", device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", params: "{}" },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
+});
+
+test("page-scoped method list matches runtime method constants", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  const rust = readFileSync(new URL("../../../crates/herdr-mcp/src/progressive_skills.rs", import.meta.url), "utf8");
+  for (const method of PAGE_SCOPED_LOCAL_METHODS) {
+    if (method === "herdr_mcp.page_assist") continue;
+    assert.ok(rust.includes(`"${method}"`), `${method} is a runtime method constant`);
+  }
+});

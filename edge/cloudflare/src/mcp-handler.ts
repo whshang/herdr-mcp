@@ -23,6 +23,7 @@ import {
   isOpenAiMcpUserAgent,
 } from "./mcp-chatgpt-transport.js";
 import { callToolResult, normalizeSuccessfulToolResult } from "./mcp-result.js";
+import { isPageScopedLocalMethod } from "./page-scoped-methods.js";
 
 export const MCP_SERVER_NAME = "herdr-mcp";
 export const MCP_LEGACY_PROTOCOL = "2025-11-25";
@@ -1105,9 +1106,7 @@ export async function handleMcp(
     if (selectorValue !== undefined && typeof selectorValue !== "string") {
       return rpcError(id, -32602, "Invalid params", { reason: "device must be a string" });
     }
-    const isPageAssistPrivateMethod = localMethod === "herdr_mcp.page_assist"
-      || localMethod === "herdr_mcp.browser_page.lifecycle"
-      || localMethod === "herdr_mcp.browser_page.action";
+    const isPageAssistPrivateMethod = isPageScopedLocalMethod(localMethod);
     const isBrowserPrivateMethod = typeof localMethod === "string"
       && localMethod.startsWith("herdr_mcp.browser_")
       && !isPageAssistPrivateMethod;

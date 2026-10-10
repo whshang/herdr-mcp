@@ -223,6 +223,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             space_ref,
             source_url,
             display_label,
+            required_app,
             message,
             expected_generation,
             idempotency_key,
@@ -256,6 +257,9 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
                 }
             };
             params.insert("message".to_owned(), json!(message));
+            if let Some(app) = required_app {
+                params.insert("required_apps".to_owned(), json!([app]));
+            }
             params.insert("idempotency_key".to_owned(), json!(idempotency_key));
             insert_optional(&mut params, "work_chain_id", work_chain_id);
             print_private_result(call_private(
@@ -266,6 +270,7 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
         }
         WebChatCommand::Send {
             session_ref,
+            required_app,
             message,
             expected_generation,
             idempotency_key,
@@ -275,6 +280,9 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
             let mut params = Map::new();
             params.insert("session_ref".to_owned(), json!(session_ref));
             params.insert("message".to_owned(), json!(message));
+            if let Some(app) = required_app {
+                params.insert("required_apps".to_owned(), json!([app]));
+            }
             params.insert("expected_generation".to_owned(), json!(expected_generation));
             params.insert("idempotency_key".to_owned(), json!(idempotency_key));
             insert_optional(&mut params, "work_chain_id", work_chain_id);
@@ -287,6 +295,11 @@ pub(crate) fn run_webchat(command: WebChatCommand) -> Result<ExitCode, String> {
         WebChatCommand::DispatchStatus { dispatch_id } => print_private_result(call_private(
             BROWSER_DISPATCH_STATUS_METHOD,
             json!({"dispatch_id": dispatch_id}),
+            None,
+        )?),
+        WebChatCommand::FanoutStatus { work_chain_id } => print_private_result(call_private(
+            BROWSER_DISPATCH_STATUS_METHOD,
+            json!({"work_chain_id": work_chain_id}),
             None,
         )?),
         WebChatCommand::Open {

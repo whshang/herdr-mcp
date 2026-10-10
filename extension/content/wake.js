@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.150";
+const H2W_CONTENT_VERSION = "0.1.187";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -862,6 +862,32 @@ function normalizeHerdrMentionAlias(value) {
     return !isComposerGenerating();
   }
 
+  // Remove only the `@<app>` search text this automation typed, and wait until
+  // the editor model is empty so ChatGPT does not persist it as a Project draft.
+  async function clearAutomationSearch(app) {
+    // The composer was verified empty before typing, so `@<app>` (search) or
+    // `<app>` (a consumed suggestion without a recognised pill) is ours.
+    const ours = () => {
+      const text = ADAPTER.getComposerTextWithoutAppPills().toLowerCase();
+      return text === `@${app}` || text === app;
+    };
+    if (ours()) {
+      await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: 'h2w_type_trusted_mention', keyword: app, mode: 'clear' }, () => {
+            void chrome.runtime.lastError;
+            resolve();
+          });
+        } catch (_) { resolve(); }
+      });
+    }
+    if (ADAPTER.getComposerTextWithoutAppPills() !== '' && ours()) await clearComposer();
+    const deadline = Date.now() + 1500;
+    while (ADAPTER.getComposerTextWithoutAppPills() !== '' && Date.now() < deadline) await wait(100);
+    // Give the provider a moment to persist the cleared draft before teardown.
+    await wait(300);
+  }
+
   async function ensureRequiredComposerApps(requiredApps) {
     const requested = [...new Set((Array.isArray(requiredApps) ? requiredApps : [])
       .map((app) => String(app || '').trim().toLowerCase())
@@ -869,52 +895,126 @@ function normalizeHerdrMentionAlias(value) {
     if (!requested.length) return { ok: true, apps: [] };
     if (ADAPTER.name !== 'chatgpt'
         || typeof ADAPTER.getSelectedComposerApps !== 'function'
-        || typeof ADAPTER.openComposerAppsMenu !== 'function'
-        || typeof ADAPTER.getComposerAppCandidates !== 'function') {
+        || typeof ADAPTER.getComposerAppCandidates !== 'function'
+        || typeof ADAPTER.getComposerTextWithoutAppPills !== 'function'
+        || typeof ADAPTER.getWatchMainWorldSelector !== 'function'
+        || !ADAPTER.needsMainWorldInsert) {
       return { ok: false, error: 'required-apps-unsupported' };
     }
     for (const app of requested) {
       if (ADAPTER.getSelectedComposerApps().includes(app)) continue;
-      let searchInserted = false;
-      let candidates = ADAPTER.getComposerAppCandidates(app);
-      if (!candidates.length) {
-        if (!ADAPTER.openComposerAppsMenu()) return { ok: false, error: 'required-apps-menu-unavailable' };
-        const deadline = Date.now() + 3000;
-        do {
-          await wait(100);
-          candidates = ADAPTER.getComposerAppCandidates(app);
-          if (candidates.length) break;
-        } while (Date.now() < deadline);
+      // The provider's native @ mention autocomplete is the sole App picker.
+      // Preserve existing pills but never overwrite a real composer draft.
+      if (ADAPTER.getComposerTextWithoutAppPills() !== '') {
+        return { ok: false, error: 'required-app-not-found' };
       }
-      if (!candidates.length
-          && ADAPTER.needsMainWorldInsert
-          && !composerModelVisibleText()
-          && ADAPTER.getSelectedComposerApps().length === 0) {
-        const selector = ADAPTER.getWatchMainWorldSelector();
-        const search = selector ? await insertMainWorld(app, selector) : null;
-        if (search?.ok) {
-          searchInserted = true;
-          const searchDeadline = Date.now() + 3000;
-          do {
-            await wait(100);
-            candidates = ADAPTER.getComposerAppCandidates(app);
-            if (candidates.length) break;
-          } while (Date.now() < searchDeadline);
+      let searchInserted = false;
+      // ChatGPT only opens native mention suggestions for a focused editor in a
+      // focused document. Live 0.1.176 evidence: `@herdr` committed but no
+      // suggestion root of any kind appeared. Bring this task tab's window to
+      // the foreground once before typing; no other tab is touched.
+      if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
+        await new Promise((resolve) => {
+          try {
+            chrome.runtime.sendMessage({ type: 'h2w_focus_own_tab' }, () => {
+              void chrome.runtime.lastError;
+              resolve();
+            });
+          } catch (_) { resolve(); }
+        });
+        const focusDeadline = Date.now() + 1500;
+        while (!document.hasFocus() && Date.now() < focusDeadline) await wait(100);
+      }
+      try { ADAPTER.getInputEl()?.focus(); } catch (_) {}
+      const selector = ADAPTER.getWatchMainWorldSelector();
+      // Insert @ then the keyword as separate editor events so ChatGPT can
+      // activate and filter its native mention suggestions.
+      // Buttons that already match before typing are never suggestion rows.
+      const suggestionBaseline = new Set(typeof ADAPTER.getComposerAppSuggestionButtons === 'function'
+        ? ADAPTER.getComposerAppSuggestionButtons(app)
+        : []);
+      // Prefer trusted keystrokes (DEV only): ChatGPT opens its native mention
+      // picker only for real key input. Fall back to editor insertion when the
+      // trusted path is unavailable (store builds).
+      const trusted = selector && ADAPTER.getSelectedComposerApps().length === 0
+        ? await new Promise((resolve) => {
+          try {
+            chrome.runtime.sendMessage({ type: 'h2w_type_trusted_mention', keyword: app }, (resp) => {
+              if (chrome.runtime.lastError || !resp) resolve({ ok: false, error: 'no-response' });
+              else resolve(resp);
+            });
+          } catch (_) { resolve({ ok: false, error: 'no-response' }); }
+        })
+        : { ok: false, error: 'trusted-input-skipped' };
+      if (trusted.ok) {
+        searchInserted = true;
+      } else {
+        if (ADAPTER.getComposerTextWithoutAppPills() !== '') {
+          // A failed trusted attempt may have typed part of the search text.
+          await clearComposer();
+        }
+        const prefix = selector ? await insertMainWorld('@', selector, ADAPTER.getSelectedComposerApps().length > 0) : null;
+        if (!prefix?.ok) return { ok: false, error: 'required-app-not-found' };
+        searchInserted = true;
+        await wait(100);
+        const search = await insertMainWorld(app, selector, true);
+        if (!search?.ok) {
+          await clearComposer();
+          return { ok: false, error: 'required-app-not-found' };
         }
       }
+      let candidates = [];
+      const searchDeadline = Date.now() + 3000;
+      do {
+        await wait(100);
+        candidates = ADAPTER.getComposerAppCandidates(app);
+        if (!candidates.length && typeof ADAPTER.getComposerAppSuggestionButtons === 'function') {
+          candidates = ADAPTER.getComposerAppSuggestionButtons(app)
+            .filter((button) => !suggestionBaseline.has(button));
+        }
+        if (candidates.length) break;
+      } while (Date.now() < searchDeadline);
+      // Capture fixed-shape DOM diagnostics before any cleanup so a rejection
+      // carries evidence of why the native suggestion was not usable.
+      const probeAppSearch = () => (typeof ADAPTER.describeComposerAppSearch === 'function'
+        ? ADAPTER.describeComposerAppSearch(app)
+        : null);
       if (candidates.length !== 1) {
-        if (searchInserted) await clearComposer();
-        return { ok: false, error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found' };
+        const probe = probeAppSearch();
+        if (searchInserted) await clearAutomationSearch(app);
+        return {
+          ok: false,
+          error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found',
+          app_selection_probe: probe ? {
+            ...probe,
+            // Fixed-vocabulary outcome of the trusted key path.
+            trusted_input: trusted.ok ? 'ok' : String(trusted.error || 'unknown').slice(0, 120),
+          } : probe,
+        };
       }
-      candidates[0].click();
-      const selectedDeadline = Date.now() + 2500;
+      {
+        // Suggestion rows may act on mousedown (to keep editor focus), so emit
+        // the full pointer sequence on the single verified candidate.
+        const target = candidates[0];
+        const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
+        try {
+          target.dispatchEvent(new PointerEvent('pointerdown', opts));
+          target.dispatchEvent(new MouseEvent('mousedown', opts));
+          target.dispatchEvent(new PointerEvent('pointerup', opts));
+          target.dispatchEvent(new MouseEvent('mouseup', opts));
+        } catch (_) {}
+        if (target.isConnected) target.click();
+      }
+      const selectedDeadline = Date.now() + 4000;
       while (Date.now() < selectedDeadline) {
         if (ADAPTER.getSelectedComposerApps().includes(app)) break;
         await wait(100);
       }
-      if (!ADAPTER.getSelectedComposerApps().includes(app)) {
-        if (searchInserted) await clearComposer();
-        return { ok: false, error: 'required-app-selection-not-observed' };
+      if (!ADAPTER.getSelectedComposerApps().includes(app)
+          || ADAPTER.getComposerTextWithoutAppPills() !== '') {
+        const probe = probeAppSearch();
+        if (searchInserted) await clearAutomationSearch(app);
+        return { ok: false, error: 'required-app-selection-not-observed', app_selection_probe: probe };
       }
     }
     const selected = ADAPTER.getSelectedComposerApps();
@@ -1580,6 +1680,32 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  // Fixed-shape, non-sensitive busy diagnostics: booleans and lengths only,
+  // never composer or page text.
+  function composerBusyProbe() {
+    try {
+      const input = ADAPTER.getInputEl();
+      const raw = input ? String(input.innerText || input.textContent || "").replace(/\u200b/g, "").trim() : "";
+      const placeholder = input
+        ? String(input.querySelector("[data-placeholder]")?.getAttribute("data-placeholder")
+          || input.getAttribute("aria-placeholder") || input.getAttribute("placeholder") || "").trim()
+        : "";
+      return {
+        input_mounted: Boolean(input),
+        input_has_content: Boolean(ADAPTER.inputHasContent()),
+        input_text_length: Math.min(raw.length, 10000),
+        input_text_equals_placeholder: Boolean(placeholder) && raw === placeholder,
+        input_has_placeholder_node: Boolean(input?.querySelector?.(".placeholder, [data-placeholder]")),
+        app_pill_count: Math.min(input ? input.querySelectorAll("[data-inline-selection-pill]").length : 0, 50),
+        stop_control: stopButtons().length > 0,
+        assistant_streaming: Boolean(assistantStreaming()),
+        assistant_tools_in_progress: Boolean(assistantToolsInProgress()),
+      };
+    } catch (_) {
+      return { probe_failed: true };
+    }
+  }
+
   function browserRejectedEvidence(evidence, reason) {
     const safeReason = typeof reason === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(reason)
       ? reason
@@ -1644,15 +1770,27 @@ function normalizeHerdrMentionAlias(value) {
     )) || null;
   }
 
+  // Radix dropdown triggers open on pointerdown, not on a bare click() (live
+  // 0.1.177 evidence: header `更多` click() left the menu closed). Send the
+  // pointer sequence a real primary-button press produces, then click.
+  function pressMenuTrigger(button) {
+    const init = { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerType: "mouse", isPrimary: true };
+    try { button.dispatchEvent(new PointerEvent("pointerdown", init)); } catch (_) {}
+    try { button.dispatchEvent(new MouseEvent("mousedown", init)); } catch (_) {}
+    try { button.dispatchEvent(new PointerEvent("pointerup", { ...init, buttons: 0 })); } catch (_) {}
+    try { button.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 })); } catch (_) {}
+    if (button.getAttribute("aria-expanded") !== "true") button.click();
+  }
+
   async function openChatGptArchiveMenu() {
     const moreLabels = /^(更多|More|その他)$/i;
-    const buttons = [...document.querySelectorAll('button[aria-label]')];
+    const buttons = [...document.querySelectorAll('button[aria-haspopup="menu"], button[aria-label]')];
     const headerMore = buttons.find((button) => (
       ADAPTER.elementVisible(button)
-      && moreLabels.test(normText(button.getAttribute("aria-label") || ""))
+      && moreLabels.test(normText(button.getAttribute("aria-label") || button.textContent || ""))
     ));
     if (headerMore) {
-      headerMore.click();
+      pressMenuTrigger(headerMore);
       const deadline = Date.now() + 1500;
       do {
         const item = visibleChatGptArchiveMenuItem();
@@ -1669,7 +1807,7 @@ function normalizeHerdrMentionAlias(value) {
         && /(?:对话选项|conversation options|chat options|チャット.*オプション)/i.test(label);
     });
     if (!options) return null;
-    options.click();
+    pressMenuTrigger(options);
     const deadline = Date.now() + 1500;
     do {
       const item = visibleChatGptArchiveMenuItem();
@@ -1807,8 +1945,15 @@ function normalizeHerdrMentionAlias(value) {
     if (existing?.ok && existing?.body?.is_archived === true) {
       return { outcome: "applied", delivered: false, alreadyArchived: true };
     }
+    // Some conversations (live: uncertain-create workers J1/K1/A1) never expose
+    // the header options menu. Fall back to ChatGPT's own conversation PATCH
+    // (the same endpoint title projection uses), under the same one-shot claim.
     const archive = await openChatGptArchiveMenu();
-    if (!archive) return { outcome: "rejected", delivered: false };
+    const viaApi = !archive;
+    if (viaApi && (typeof readChatGptAccessToken !== "function"
+        || !(await readChatGptAccessToken(4000).catch(() => null)))) {
+      return { outcome: "rejected", delivered: false };
+    }
     // Converge the one-shot rule here, before the real click: persist and verify
     // the delivery claim first, so a reload or same-key re-entry inside the
     // click/poll window cannot replay it and an unpersistable claim never
@@ -1824,7 +1969,20 @@ function normalizeHerdrMentionAlias(value) {
         : { outcome: "rejected", delivered: false };
     }
     try {
-      archive.click();
+      if (viaApi) {
+        const token = String(await readChatGptAccessToken(4000) || "");
+        if (!token || token.length > 4096) return { outcome: "uncertain", delivered: true };
+        await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+          method: "PATCH",
+          credentials: "include",
+          cache: "no-store",
+          redirect: "error",
+          headers: { accept: "application/json", "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ is_archived: true }),
+        });
+      } else {
+        archive.click();
+      }
     } catch (_) {
       return { outcome: "uncertain", delivered: true };
     }
@@ -1958,10 +2116,18 @@ function normalizeHerdrMentionAlias(value) {
     }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
-    const readback = await fetchChatGptConversation({
-      conversationId,
-      timeoutMs: 2500,
-    }).catch(() => ({ ok: false }));
+    // Late-acceptance readback runs right after a slow create, while the
+    // conversation may still be streaming; give it a longer bounded window
+    // and one retry. Plain archive-status keeps its short budget.
+    const lateReadback = params.readback_accepted === true;
+    let readback = null;
+    for (let attempt = 0; attempt < (lateReadback ? 2 : 1); attempt += 1) {
+      readback = await fetchChatGptConversation({
+        conversationId,
+        timeoutMs: lateReadback ? 10000 : 2500,
+      }).catch(() => ({ ok: false }));
+      if (readback?.ok) break;
+    }
     if (readback?.ok && typeof readback?.body?.is_archived === "boolean") {
       evidence.lifecycle_observed = true;
       evidence.result = {
@@ -1969,6 +2135,55 @@ function normalizeHerdrMentionAlias(value) {
         archive_state: readback.body.is_archived ? "archived" : "active",
         readback_source: "conversation",
       };
+      if (params.readback_accepted === true) {
+        // Late-acceptance readback for an uncertain session.create: report the
+        // conversation's only user message id plus a digest of its text, so
+        // the runtime can match it to the exact create message without resend.
+        // More than one user message means the identity is ambiguous: omit.
+        // Live H1: ChatGPT also stores hidden user-role context nodes (for the
+        // selected App) next to the typed message, so count only visible text
+        // user messages, and hash only their string parts.
+        // The archive readback above is the conversations *list* item (no
+        // mapping). Fetch the conversation detail once for the user turn.
+        const detail = await fetchChatGptConversationDetail({ conversationId, timeoutMs: 10000 })
+          .catch(() => ({ ok: false }));
+        if (!detail?.ok) {
+          const detailError = String(detail?.reason || detail?.error || "");
+          evidence.result.readback_detail_error = /^[a-z0-9_-]{1,48}$/.test(detailError) ? detailError : "unavailable";
+        }
+        const allUsers = Object.values((detail?.ok && detail.body?.mapping) || {})
+          .map((node) => node?.message)
+          .filter((message) => message?.author?.role === "user" && typeof message?.id === "string");
+        const users = allUsers.filter((message) => message?.metadata?.is_visually_hidden_from_conversation !== true
+          && (message?.content?.content_type === "text" || message?.content?.content_type === "multimodal_text")
+          && Array.isArray(message?.content?.parts)
+          && message.content.parts.some((part) => typeof part === "string" && part.trim()));
+        evidence.result.readback_user_counts = { all: allUsers.length, visible: users.length };
+        const parts = users.length === 1 ? users[0].content.parts.filter((part) => typeof part === "string") : null;
+        if (parts && parts.length) {
+          try {
+            const hex = async (text) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))]
+              .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+            // The stored text can carry the selected App mention as a leading
+            // token (live E1: `herdr` pill before the body). Strip only exact
+            // required-App tokens the runtime named, then trim.
+            const apps = (Array.isArray(params.required_apps) ? params.required_apps : [])
+              .filter((app) => typeof app === "string" && /^[a-z0-9_-]{1,64}$/.test(app));
+            const full = parts.join("").trim();
+            let body = full;
+            for (let changed = true; changed;) {
+              changed = false;
+              for (const app of apps) {
+                const match = body.match(new RegExp(`^@?${app}(?:\\s+|$)`, "i"));
+                if (match) { body = body.slice(match[0].length).trim(); changed = true; }
+              }
+            }
+            evidence.result.accepted_user_message_ref = users[0].id;
+            evidence.result.accepted_user_text_sha256 = await hex(full);
+            evidence.result.accepted_user_body_sha256 = await hex(body);
+          } catch (_) {}
+        }
+      }
       return evidence;
     }
     const archivedList = await fetchChatGptArchivedConversationList({
@@ -1991,6 +2206,9 @@ function normalizeHerdrMentionAlias(value) {
     }
     evidence.lifecycle_observed = false;
     evidence.result = { error: "browser_archive_status_readback_unavailable" };
+    const readbackError = String(readback?.reason || readback?.error || "");
+    if (/^[a-z0-9_-]{1,48}$/.test(readbackError)) evidence.result.readback_error = readbackError;
+    if (Number.isSafeInteger(readback?.retryAfterS)) evidence.result.readback_retry_after_s = readback.retryAfterS;
     return evidence;
   }
 
@@ -2153,17 +2371,21 @@ function normalizeHerdrMentionAlias(value) {
       }
       if (freshCreateStableIdleSamples < 3) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
-        return browserRejectedEvidence(evidence, "browser_create_composer_busy");
+        const busy = browserRejectedEvidence(evidence, "browser_create_composer_busy");
+        busy.result.composer_busy_probe = composerBusyProbe();
+        return busy;
       }
     }
     if ((!creatingSession && isTurnInProgress()) || ADAPTER.inputHasContent()) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
-      return browserRejectedEvidence(
+      const busy = browserRejectedEvidence(
         evidence,
         creatingSession ? "browser_create_composer_busy" : "browser_dispatch_composer_busy",
       );
+      busy.result.composer_busy_probe = composerBusyProbe();
+      return busy;
     }
 
     if (requiredApps.length > 0) {
@@ -2172,7 +2394,11 @@ function normalizeHerdrMentionAlias(value) {
         if (creatingSession) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         }
-        return { ...evidence, rejected: true, result: { error: appSelection.error } };
+        return {
+          ...evidence,
+          rejected: true,
+          result: { error: appSelection.error, app_selection_probe: appSelection.app_selection_probe || null },
+        };
       }
       evidence.required_apps_readback = appSelection.apps;
     }
@@ -2212,7 +2438,12 @@ function normalizeHerdrMentionAlias(value) {
     }
     evidence.command_accepted = true;
 
-    const deadline = Date.now() + 6000;
+    // session.create waits longer for the exact accepted user-message ref: the
+    // first provider snapshot of a brand-new conversation can lag (live Phase 2
+    // A1 returned uncertain at 6s and was never promoted). The runtime create
+    // actuation timeout (53s) bounds this; a response after the caller's budget
+    // becomes a late completion that a same-key replay reconciles to applied.
+    const deadline = Date.now() + (creatingSession ? 20000 : 6000);
     do {
       const afterServer = ADAPTER.name === "chatgpt"
         ? await fetchChatGptConversationSnapshot(snapshotTimeoutMs).catch(() => ({ ok: false }))
@@ -2391,6 +2622,15 @@ function normalizeHerdrMentionAlias(value) {
         || pending.generation < 1 || typeof pending.accepted_user_message_ref !== "string"
         || !pending.accepted_user_message_ref) return;
     const current = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+    // session.create records its assignment before the runtime synthesizes the
+    // dispatch, so dispatchId is still null. Adopt the runtime dispatch only
+    // when the accepted user message and generation match exactly.
+    if (current && !current.dispatchId
+        && current.acceptedUserMessageRef === pending.accepted_user_message_ref
+        && current.generation === pending.generation) {
+      acceptedDispatchAssignments.set(registeredBrowserSessionRef, { ...current, dispatchId: pending.dispatch_id });
+      return;
+    }
     if (!current) {
       acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
         dispatchId: pending.dispatch_id,
@@ -2584,7 +2824,9 @@ function normalizeHerdrMentionAlias(value) {
   function maybeRefreshBrowserPendingDispatchAssignment() {
     const refresh = browserPendingDispatchRefresh;
     if (!refresh) return;
-    if (registeredBrowserSessionRef && acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+    // Satisfied only once the assignment carries the runtime dispatch identity.
+    if (registeredBrowserSessionRef
+        && /^bd_[0-9a-f]{64}$/.test(String(acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.dispatchId || ""))) {
       clearBrowserPendingDispatchRefresh(true);
       return;
     }
@@ -2592,7 +2834,10 @@ function normalizeHerdrMentionAlias(value) {
       clearBrowserPendingDispatchRefresh(true);
       return;
     }
-    if (document.hidden || refresh.inFlight || Date.now() < refresh.nextAt) return;
+    // Worker tabs created by session.create are background tabs by design, so
+    // this bounded (5 min, backoff to 30s) refresh must not wait for visibility;
+    // otherwise the result observer never learns its dispatch identity.
+    if (refresh.inFlight || Date.now() < refresh.nextAt) return;
     refresh.inFlight = true;
     refresh.nextAt = Date.now() + refresh.retryMs;
     refresh.retryMs = Math.min(refresh.retryMs * 2, 30000);
@@ -3120,6 +3365,14 @@ function normalizeHerdrMentionAlias(value) {
     try {
       const stored = sessionStorage.getItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
       browserSessionReservationRef = /^bsr_[0-9a-f]{64}$/.test(String(stored || "")) ? stored : null;
+      // A tab that already materialized a session and then moved (SPA) to a
+      // different conversation must not carry that create reservation onto
+      // the new conversation (live: G1's tab on E1 never rebound to E1).
+      if (browserSessionReservationRef && registeredBrowserSessionRef
+          && registeredConvKey !== null && registeredConvKey !== convKey) {
+        sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
+        browserSessionReservationRef = null;
+      }
     } catch (_) {}
     const browserAppKeywords = ADAPTER.name === "chatgpt"
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
@@ -3165,9 +3418,16 @@ function normalizeHerdrMentionAlias(value) {
         : null;
       registeredConversationBound = response?.bound === true;
       restoreBrowserResultAssignment(response?.browser_pending_dispatch);
+      if (changed) {
+        // A route change (SPA navigation away and back, or a reopened tab) starts
+        // a fresh result probe: an earlier backoff or rejection count from the
+        // other route must not keep a still-pending dispatch from settling.
+        browserResultProbeState = null;
+        void observeBrowserResultSettlement().catch(() => {});
+      }
       if (browserSessionReservationRef && registeredBrowserSessionRef) {
         if (response?.browser_pending_dispatch
-            || acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+            || /^bd_[0-9a-f]{64}$/.test(String(acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.dispatchId || ""))) {
           clearBrowserPendingDispatchRefresh(true);
         } else {
           armBrowserPendingDispatchRefresh(browserSessionReservationRef);
@@ -3203,12 +3463,26 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   function startConversationRouteWatch() {
+    let hiddenRouteRegistrationInFlight = false;
     // One second is fast enough for UI binding while keeping route detection
     // negligible compared with the existing 5s HUD reconciliation interval.
     setInterval(() => {
       void observeBrowserResultSettlement().catch(() => {});
-      if (document.hidden) return;
       maybeRefreshBrowserPendingDispatchAssignment();
+      if (document.hidden) {
+        // A session.create worker is a background tab whose URL moves from the
+        // new-chat route to /c/<id> after submit. Re-register on that route
+        // change even while hidden, or the result observer stays bound to the
+        // stale key and the dispatch never settles. One registration at a time.
+        const hiddenKey = ADAPTER.getConversationKey();
+        if (hiddenKey && hiddenKey !== registeredConvKey && !hiddenRouteRegistrationInFlight) {
+          hiddenRouteRegistrationInFlight = true;
+          void registerCurrentConversation("poll-hidden")
+            .catch(() => {})
+            .finally(() => { hiddenRouteRegistrationInFlight = false; });
+        }
+        return;
+      }
       const convKey = ADAPTER.getConversationKey();
       const observedApps = ADAPTER.name === "chatgpt"
         && registeredConversationBound
@@ -3556,6 +3830,30 @@ function normalizeHerdrMentionAlias(value) {
   // /backend-api/conversations/<id> endpoint with a Bearer header. Any
   // 401/404/timeout fails closed and returns an error payload only; the token
   // never leaves this function scope and is never logged/stored.
+  async function fetchChatGptConversationDetail({ conversationId, timeoutMs = 6000 } = {}) {
+    if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, error: "not-chatgpt-conversation" };
+    const accessToken = await readChatGptAccessToken(4000);
+    const sessionToken = String(accessToken || "");
+    if (!sessionToken || sessionToken.length > 4096) return { ok: false, reason: "auth" };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+        credentials: "include",
+        cache: "no-store",
+        redirect: "error",
+        headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
+        signal: controller.signal,
+      });
+      if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+      return { ok: true, body: await response.json() };
+    } catch (error) {
+      return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function fetchChatGptConversation({
     conversationId,
     timeoutMs = 6000,
@@ -3581,7 +3879,13 @@ function normalizeHerdrMentionAlias(value) {
         headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
         signal: controller.signal,
       });
-      if (!response.ok) return { ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status };
+      if (!response.ok) {
+        const retryAfter = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
+        return {
+          ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status,
+          retryAfterS: Number.isSafeInteger(retryAfter) && retryAfter >= 0 && retryAfter <= 86400 ? retryAfter : null,
+        };
+      }
       const body = await response.json();
       return { ok: true, body };
     } catch (error) {
@@ -3839,7 +4143,7 @@ function normalizeHerdrMentionAlias(value) {
       }
     }
     if (!options) return null;
-    options.click();
+    pressMenuTrigger(options);
     let settings = null;
     const menuDeadline = Date.now() + 1500;
     do {

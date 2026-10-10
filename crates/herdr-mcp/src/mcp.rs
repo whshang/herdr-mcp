@@ -2265,6 +2265,23 @@ fn browser_session_create_retry_safe_not_applied(evidence: &BrowserPostcondition
             == Some(true)
 }
 
+fn browser_required_apps_match_evidence(
+    params: &Value,
+    evidence: &BrowserPostconditionEvidence,
+) -> Result<bool, String> {
+    let requested = browser_required_apps(params, true)
+        .map_err(|_| "browser_required_apps_invalid".to_owned())?;
+    if requested.is_empty() {
+        return Ok(true);
+    }
+    Ok(evidence.required_apps_readback.len() == requested.len()
+        && evidence
+            .required_apps_readback
+            .iter()
+            .map(String::as_str)
+            .eq(requested))
+}
+
 fn browser_delivery_state_from_postcondition(
     operation: BrowserOperation,
     params: &Value,
@@ -2305,6 +2322,7 @@ fn browser_delivery_state_from_postcondition(
                 // materialization + locator generation above still fence the new
                 // resource to the requested browser generation.
                 && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
+                && browser_required_apps_match_evidence(params, evidence)?
         }
         BrowserOperation::SpaceOpen | BrowserOperation::SessionOpen => {
             evidence.stable_resource_ref_observed
@@ -2339,6 +2357,7 @@ fn browser_delivery_state_from_postcondition(
                 && evidence.generation_owner == Some(expected_generation)
                 && evidence.generation_status_observed
                 && browser_evidence_accepted_user_message_ref(evidence)?.is_some()
+                && browser_required_apps_match_evidence(params, evidence)?
         }
         BrowserOperation::DispatchStop => evidence.generation_stopped,
         BrowserOperation::SpaceInspect
@@ -3149,6 +3168,25 @@ fn browser_session_create_success(
         }
         Err(error) => return browser_store_error(error),
     };
+    // A create that names an existing work chain joins it before the worker can
+    // settle, so the assistant turn lands in Work Memory without a parent race.
+    let work_chain_binding =
+        params
+            .get("work_chain_id")
+            .and_then(Value::as_str)
+            .map(|work_chain_id| {
+                match store.bind_created_browser_session_work_chain(
+                    work_chain_id,
+                    &reservation.provider,
+                    Some(reservation.account_ref.as_str()),
+                    reservation.space_ref.as_deref(),
+                    &session_ref,
+                    browser_epoch_ms(),
+                ) {
+                    Ok(continuity_id) => json!({"ok": true, "continuity_id": continuity_id}),
+                    Err(code) => json!({"ok": false, "code": code}),
+                }
+            });
     let (dispatch, work_memory_writeback) =
         match browser_created_session_dispatch(store, &reservation, params, caller_authorization) {
             Ok(value) => value,
@@ -3175,6 +3213,7 @@ fn browser_session_create_success(
         "replayed": replayed,
         "reconciled": reconciled,
         "work_memory_writeback": work_memory_writeback,
+        "work_chain_binding": work_chain_binding,
     })
 }
 
@@ -3223,6 +3262,102 @@ fn browser_session_create_reconcile_evidence(
     Ok(None)
 }
 
+/// Late acceptance for an `uncertain` materialized create: read back (never
+/// resend) the new conversation's only user message. It is adopted only when
+/// its text digest equals this create's exact message digest; anything else
+/// stays `uncertain`.
+fn browser_session_create_late_acceptance_readback(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+    actuator: &dyn BrowserActuator,
+    expected_generation: i64,
+) -> Result<BrowserSessionReservationRecord, &'static str> {
+    if reservation.state != "materialized"
+        || reservation.delivery_state != BrowserDeliveryState::Uncertain.as_str()
+        || reservation.accepted_user_message_ref.is_some()
+    {
+        return Err("reservation_not_materialized_uncertain");
+    }
+    let session_ref = reservation
+        .session_ref
+        .as_deref()
+        .ok_or("session_ref_missing")?;
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or("message_missing")?;
+    let evidence = actuator
+        .actuate_for_endpoint(
+            BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": expected_generation,
+                "readback_accepted": true,
+                "required_apps": params.get("required_apps").cloned().unwrap_or(json!([])),
+            }),
+            expected_generation,
+            Some(&reservation.endpoint_ref),
+            None,
+        )
+        .map_err(|_| "readback_actuation_failed")?;
+    let result = evidence.result.as_ref().ok_or("readback_result_missing")?;
+    if result.get("error").is_some() {
+        return Err(match result.get("readback_error").and_then(Value::as_str) {
+            Some("timeout") => "readback_fetch_timeout",
+            Some("auth") => "readback_fetch_auth",
+            Some("http-401") => "readback_fetch_http_401",
+            Some("http-403") => "readback_fetch_http_403",
+            Some("http-404") => "readback_fetch_http_404",
+            Some("http-429") => "readback_fetch_http_429",
+            Some(value) if value.starts_with("http-4") => "readback_fetch_http_4xx",
+            Some(value) if value.starts_with("http-5") => "readback_fetch_http_5xx",
+            _ => "readback_fetch_unavailable",
+        });
+    }
+    let accepted = result
+        .get("accepted_user_message_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or_else(|| {
+            let counts = result.get("readback_user_counts");
+            let count = |key: &str| {
+                counts
+                    .and_then(|value| value.get(key))
+                    .and_then(Value::as_u64)
+            };
+            match (count("all"), count("visible")) {
+                (None, _) | (_, None) => "readback_user_counts_missing",
+                (Some(0), _) if result.get("readback_detail_error").is_some() => {
+                    "readback_detail_unavailable"
+                }
+                (Some(0), _) => "readback_no_user_message",
+                (Some(_), Some(0)) => "readback_no_visible_user_message",
+                (Some(_), Some(1)) => "readback_user_parts_unreadable",
+                _ => "readback_multiple_visible_user_messages",
+            }
+        })?;
+    // Match the exact create text, trimmed; the extension also reports the body
+    // with only the named required-App mention tokens removed.
+    let expected = browser_sha256(message.trim());
+    let matches = ["accepted_user_text_sha256", "accepted_user_body_sha256"]
+        .iter()
+        .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected.as_str()));
+    if !matches {
+        return Err("readback_digest_mismatch");
+    }
+    let mut guard = store.lock().map_err(|_| "store_unavailable")?;
+    guard
+        .update_browser_session_reservation_delivery(
+            &reservation.reservation_ref,
+            expected_generation,
+            BrowserDeliveryState::Applied,
+            Some(accepted),
+            browser_epoch_ms(),
+        )
+        .map_err(|_| "promotion_failed")
+}
+
 fn browser_session_create_reconcile_uncertain(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     reservation: &BrowserSessionReservationRecord,
@@ -3231,6 +3366,37 @@ fn browser_session_create_reconcile_uncertain(
     expected_generation: i64,
     replayed: bool,
     caller_authorization: Option<&BrowserCallerAuthorization>,
+) -> Value {
+    // Surface why late acceptance did not promote (fixed token, no content).
+    let mut late_reason = None;
+    let mut value = browser_session_create_reconcile_uncertain_inner(
+        store,
+        reservation,
+        params,
+        actuator,
+        expected_generation,
+        replayed,
+        caller_authorization,
+        &mut late_reason,
+    );
+    if value.get("delivery_state").and_then(Value::as_str) == Some("uncertain")
+        && let (Some(reason), Some(object)) = (late_reason, value.as_object_mut())
+    {
+        object.insert("late_acceptance_reason".to_owned(), json!(reason));
+    }
+    value
+}
+
+#[allow(clippy::too_many_arguments)]
+fn browser_session_create_reconcile_uncertain_inner(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+    expected_generation: i64,
+    replayed: bool,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
+    late_reason_out: &mut Option<&'static str>,
 ) -> Value {
     let current = {
         let Ok(mut guard) = store.lock() else {
@@ -3263,6 +3429,31 @@ fn browser_session_create_reconcile_uncertain(
         }
         current
     };
+
+    if let Some(actuator) = actuator {
+        match browser_session_create_late_acceptance_readback(
+            store,
+            &current,
+            params,
+            actuator,
+            expected_generation,
+        ) {
+            Ok(promoted) => {
+                let Ok(mut guard) = store.lock() else {
+                    return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+                };
+                return browser_session_create_success(
+                    &mut guard,
+                    &promoted.reservation_ref,
+                    params,
+                    replayed,
+                    true,
+                    caller_authorization,
+                );
+            }
+            Err(reason) => *late_reason_out = Some(reason),
+        }
+    }
 
     let Some(actuator) = actuator else {
         let Ok(guard) = store.lock() else {
@@ -3397,12 +3588,75 @@ fn browser_session_create_reconcile_uncertain(
             Err(error) => return browser_store_error(error),
         }
     }
+    // The provider can return arbitrary strings. Surface only a fixed set of
+    // non-sensitive App-selection failures rather than echoing DOM text.
+    let app_refusal_reason = if delivery_state == BrowserDeliveryState::Rejected {
+        evidence
+            .result
+            .as_ref()
+            .and_then(|result| result.get("error"))
+            .and_then(Value::as_str)
+            .filter(|reason| {
+                matches!(
+                    *reason,
+                    "required-apps-unsupported"
+                        | "required-apps-menu-unavailable"
+                        | "required-app-not-found"
+                        | "required-app-ambiguous"
+                        | "required-app-selection-not-observed"
+                )
+            })
+    } else {
+        None
+    };
+    // Forward only the fixed-shape App search probe: allowlisted keys with
+    // boolean or small integer values. No provider strings are echoed.
+    let app_selection_probe = app_refusal_reason.and_then(|_| {
+        let probe = evidence
+            .result
+            .as_ref()
+            .and_then(|result| result.get("app_selection_probe"))
+            .and_then(Value::as_object)?;
+        const BOOL_KEYS: &[&str] = &[
+            "composer_found",
+            "composer_is_prompt_textarea",
+            "search_text_committed",
+            "composer_aria_expanded",
+            "composer_aria_controls_present",
+            "composer_aria_controls_visible",
+        ];
+        const COUNT_KEYS: &[&str] = &[
+            "selected_pill_count",
+            "visible_popover_roots",
+            "visible_menu_roots",
+            "visible_listbox_roots",
+            "visible_dialog_roots",
+            "visible_popper_wrappers",
+            "visible_option_nodes",
+            "visible_keyword_nodes",
+            "candidate_count",
+        ];
+        let mut out = serde_json::Map::new();
+        for key in BOOL_KEYS {
+            if let Some(value) = probe.get(*key).and_then(Value::as_bool) {
+                out.insert((*key).to_string(), Value::Bool(value));
+            }
+        }
+        for key in COUNT_KEYS {
+            if let Some(value) = probe.get(*key).and_then(Value::as_u64) {
+                out.insert((*key).to_string(), json!(value.min(50)));
+            }
+        }
+        (!out.is_empty()).then_some(Value::Object(out))
+    });
     json!({
         "ok": false,
         "code": delivery_state.as_str(),
         "reservation_ref": settled.reservation_ref,
         "reservation_state": settled.state,
         "delivery_state": settled.delivery_state,
+        "app_refusal_reason": app_refusal_reason,
+        "app_selection_probe": app_selection_probe,
         "replayed": replayed,
         "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
     })
@@ -3434,6 +3688,7 @@ fn browser_session_create_params_from_source(
         "idempotency_key",
         "work_chain_id",
         "lane_id",
+        "required_apps",
     ];
     if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
@@ -3458,6 +3713,8 @@ fn browser_session_create_params_from_source(
         format!("{message}{source_reference}")
     };
     let idempotency_key = browser_required_idempotency_key(params)?;
+    // Explicit App selection is read back by the provider at delivery.
+    let required_apps = browser_required_apps(params, true)?;
     let work_chain_id = browser_optional_string(params, "work_chain_id", 128)?;
     let lane_id = browser_optional_string(params, "lane_id", 160)?;
     let route = browser_source_route(store, source_url).map_err(browser_store_error)?;
@@ -3469,21 +3726,23 @@ fn browser_session_create_params_from_source(
         }));
     }
     let source_session_ref = route.session_ref.clone();
-    Ok(Some((
-        json!({
-            "endpoint_ref": route.endpoint_ref,
-            "provider": route.provider,
-            "account_ref": route.account_ref,
-            "space_ref": route.space_ref,
-            "display_label": route.display_label,
-            "message": message,
-            "expected_generation": route.expected_generation,
-            "idempotency_key": idempotency_key,
-            "work_chain_id": work_chain_id,
-            "lane_id": lane_id,
-        }),
-        source_session_ref,
-    )))
+    let mut routed = json!({
+        "endpoint_ref": route.endpoint_ref,
+        "provider": route.provider,
+        "account_ref": route.account_ref,
+        "space_ref": route.space_ref,
+        "display_label": route.display_label,
+        "message": message,
+        "expected_generation": route.expected_generation,
+        "idempotency_key": idempotency_key,
+        "work_chain_id": work_chain_id,
+        "lane_id": lane_id,
+    });
+    // Absent means the exact source may supply a previously learned App.
+    if object.contains_key("required_apps") {
+        routed["required_apps"] = json!(required_apps);
+    }
+    Ok(Some((routed, source_session_ref)))
 }
 
 fn browser_create_caller_source_session_ref(
@@ -4317,11 +4576,15 @@ fn browser_session_open(
             Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
             Err(error) => return browser_store_error(error),
         };
-        if session.observation_generation != expected_generation {
+        // A session lagging an extension reload is reopened at the current
+        // generation (the actuation decision fences expected == provider);
+        // its locator must still belong to the session's own observation.
+        if session.observation_generation > expected_generation {
             return json!({"ok": false, "code": "stale_capability_generation"});
         }
+        let session_generation = session.observation_generation;
         let canonical_url = match guard.browser_resource_locator(session_ref) {
-            Ok(Some(locator)) if locator.observation_generation == expected_generation => {
+            Ok(Some(locator)) if locator.observation_generation == session_generation => {
                 Some(locator.canonical_url)
             }
             Ok(Some(_)) => return json!({"ok": false, "code": "stale_capability_generation"}),
@@ -4417,8 +4680,11 @@ fn browser_session_open(
         Ok(state) => state,
         Err(error) => return browser_store_error(error),
     };
-    let mut result =
-        browser_operation_delivery_result(BrowserOperation::SessionOpen, delivery_state);
+    let mut result = browser_operation_result_with_reason(
+        BrowserOperation::SessionOpen,
+        delivery_state,
+        &evidence,
+    );
     if let Some(object) = result.as_object_mut() {
         object.insert("op_id".to_owned(), json!(op_id));
         object.insert("idempotent_replay".to_owned(), json!(false));
@@ -4929,9 +5195,35 @@ fn browser_operation_call_with_controls(
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "browser_archive_status_unknown".to_owned());
+            // Surface the exact provider HTTP token (e.g. http-429 vs http-404);
+            // a 429 is a rate-limit state, not an unknown archive state.
+            let readback_error = evidence
+                .result
+                .as_ref()
+                .and_then(|value| value.get("readback_error"))
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() <= 48
+                        && value.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                        })
+                })
+                .map(str::to_owned);
+            let code = if readback_error.as_deref() == Some("http-429") {
+                "rate_limited"
+            } else {
+                "archive_status_unknown"
+            };
             json!({
                 "ok": false,
-                "code": "archive_status_unknown",
+                "code": code,
+                "readback_error": readback_error,
+                "retry_after_s": evidence
+                    .result
+                    .as_ref()
+                    .and_then(|value| value.get("readback_retry_after_s"))
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value <= 86_400),
                 "reason": reason,
                 "operation": operation.method(),
                 "session_ref": session_ref,
@@ -4956,6 +5248,9 @@ fn browser_operation_call_with_controls(
             controls.caller_authorization,
         ),
         BrowserOperation::DispatchStatus => {
+            if let Some(work_chain_id) = params.get("work_chain_id").and_then(Value::as_str) {
+                return browser_work_chain_fanout_status(store, work_chain_id);
+            }
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
             browser_dispatch_status(store, dispatch_id, browser_actuator)
         }
@@ -5023,7 +5318,7 @@ fn browser_operation_call_with_controls(
                 Ok(state) => state,
                 Err(error) => return browser_store_error(error),
             };
-            browser_operation_delivery_result(operation, delivery_state)
+            browser_operation_result_with_reason(operation, delivery_state, &evidence)
         }
         _ => {
             let expected_generation = params
@@ -5048,9 +5343,42 @@ fn browser_operation_call_with_controls(
                 Ok(state) => state,
                 Err(error) => return browser_store_error(error),
             };
-            browser_operation_delivery_result(operation, delivery_state)
+            browser_operation_result_with_reason(operation, delivery_state, &evidence)
         }
     }
+}
+
+pub(crate) fn browser_reason_token_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+/// Attach the extension's fixed refusal token (`reason`, else `error`) to a
+/// non-success operation result. Nothing else from the evidence is echoed.
+fn browser_operation_result_with_reason(
+    operation: BrowserOperation,
+    delivery_state: BrowserDeliveryState,
+    evidence: &BrowserPostconditionEvidence,
+) -> Value {
+    let mut result = browser_operation_delivery_result(operation, delivery_state);
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        return result;
+    }
+    let reason = evidence.result.as_ref().and_then(|value| {
+        ["reason", "error"].iter().find_map(|key| {
+            value
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|token| browser_reason_token_valid(token))
+        })
+    });
+    if let (Some(reason), Some(object)) = (reason, result.as_object_mut()) {
+        object.insert("reason".to_owned(), json!(reason));
+    }
+    result
 }
 
 fn browser_operation_delivery_result(
@@ -5139,7 +5467,7 @@ fn validate_browser_operation_params(
             "work_chain_id",
             "lane_id",
         ],
-        BrowserOperation::DispatchStatus => &["dispatch_id"],
+        BrowserOperation::DispatchStatus => &["dispatch_id", "work_chain_id"],
         BrowserOperation::DispatchStop => {
             &["dispatch_id", "expected_generation", "idempotency_key"]
         }
@@ -5245,7 +5573,19 @@ fn validate_browser_operation_params(
             }
         }
         BrowserOperation::DispatchStatus => {
-            browser_required_string(params, "dispatch_id", 96)?;
+            // Exactly one selector: a single dispatch, or a work-chain fanout view.
+            match params.get("work_chain_id") {
+                Some(_) if params.get("dispatch_id").is_some() => {
+                    return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+                }
+                Some(_) => {
+                    let work_chain_id = browser_required_string(params, "work_chain_id", 64)?;
+                    validate_browser_work_chain_id(work_chain_id).map_err(browser_store_error)?;
+                }
+                None => {
+                    browser_required_string(params, "dispatch_id", 96)?;
+                }
+            }
         }
         BrowserOperation::DispatchStop => {
             browser_required_string(params, "dispatch_id", 96)?;
@@ -5523,8 +5863,16 @@ fn browser_resource_actuation_decision(
     else {
         return Ok((false, Some("capability_unknown")));
     };
+    // session.open is how a tab-less session that lagged behind an extension
+    // reload is re-observed, so it alone may target an older session record,
+    // and only with the current provider generation as its expected value.
+    let lagging_open = capability_operation == "session.open"
+        && resource.kind == "session"
+        && resource.observation_generation < provider_state.observation_generation
+        && expected_generation == Some(provider_state.observation_generation);
     if expected_generation.is_some_and(|value| value != provider_state.observation_generation)
-        || resource.observation_generation != provider_state.observation_generation
+        || (resource.observation_generation != provider_state.observation_generation
+            && !lagging_open)
     {
         return Ok((false, Some("stale_capability_generation")));
     }
@@ -5557,9 +5905,24 @@ fn browser_resource_account_ref(
     let parent = store
         .browser_resource(parent_ref)?
         .ok_or_else(|| "browser_resource_parent_not_found".to_owned())?;
+    // A session is only re-observed when its own tab registers, so after an
+    // extension reload a tab-less session lags its account/space generation.
+    // Grant scope is identity only (which account's grant applies); the
+    // operation still fences on its own expected generation. A session may lag
+    // its parent, never lead it; spaces stay exact.
+    let generation_ok = |child: i64, parent: i64| {
+        if resource.kind == "session" {
+            child <= parent
+        } else {
+            child == parent
+        }
+    };
     if parent.endpoint_ref != resource.endpoint_ref
         || parent.provider != resource.provider
-        || parent.observation_generation != resource.observation_generation
+        || !generation_ok(
+            resource.observation_generation,
+            parent.observation_generation,
+        )
     {
         return Err("browser_resource_scope_mismatch".to_owned());
     }
@@ -5576,7 +5939,11 @@ fn browser_resource_account_ref(
             if account.kind != "account"
                 || account.endpoint_ref != resource.endpoint_ref
                 || account.provider != resource.provider
-                || account.observation_generation != resource.observation_generation
+                || account.observation_generation != parent.observation_generation
+                || !generation_ok(
+                    resource.observation_generation,
+                    account.observation_generation,
+                )
             {
                 return Err("browser_resource_scope_mismatch".to_owned());
             }
@@ -5970,6 +6337,66 @@ fn browser_dispatch_execution_state(
         | BrowserDeliveryState::ResourceUnavailable => Some("failed"),
         BrowserDeliveryState::Stopped => Some("stopped"),
     }
+}
+
+/// A dispatch still `submitted` this long after its last update is reported as
+/// `timeout` in the fanout view. Reporting only: nothing is retried or replayed.
+const BROWSER_FANOUT_TIMEOUT_MS: i64 = 10 * 60 * 1000;
+
+/// Parent-side fanout phase derived only from existing dispatch authorities.
+/// `tool_called` / `no_tool` are not observable from the ledger and are never
+/// guessed; the settled assistant turn in Work Memory is the evidence for them.
+fn browser_dispatch_fanout_phase(
+    dispatch: &crate::state_store::BrowserDispatchRecord,
+    now_ms: i64,
+) -> &'static str {
+    match browser_dispatch_execution_state(dispatch) {
+        Some("settled") => "completed",
+        Some("queued") => "accepted",
+        Some("submitted") if now_ms - dispatch.updated_at > BROWSER_FANOUT_TIMEOUT_MS => "timeout",
+        Some("submitted") => "started",
+        Some("stopped") => "stopped",
+        Some(_) if dispatch.delivery_state == BrowserDeliveryState::Rejected => "rejected",
+        Some(_) => "failed",
+        None => "uncertain",
+    }
+}
+
+fn browser_work_chain_fanout_status(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    work_chain_id: &str,
+) -> Value {
+    let Ok(guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let records = match guard.browser_dispatches_for_work_chain(work_chain_id, 100) {
+        Ok(records) => records,
+        Err(error) => return browser_store_error(error),
+    };
+    drop(guard);
+    let now = browser_epoch_ms();
+    let mut counts = serde_json::Map::new();
+    let dispatches = records
+        .into_iter()
+        .map(|dispatch| {
+            let phase = browser_dispatch_fanout_phase(&dispatch, now);
+            let entry = counts.entry(phase.to_owned()).or_insert(json!(0));
+            *entry = json!(entry.as_i64().unwrap_or(0) + 1);
+            json!({
+                "phase": phase,
+                "tool_call_evidence": "not_observable",
+                "dispatch": browser_dispatch_json(dispatch),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "ok": true,
+        "operation": BrowserOperation::DispatchStatus.method(),
+        "work_chain_id": work_chain_id,
+        "read_only": true,
+        "counts": counts,
+        "dispatches": dispatches,
+    })
 }
 
 fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) -> Value {
@@ -7453,6 +7880,8 @@ fn browser_page_action_call(
         "timeout_ms",
         "idempotency_key",
         "objective",
+        "direction",
+        "amount",
     ];
     if let Some(key) = object
         .keys()
@@ -7515,23 +7944,37 @@ fn browser_page_action_call(
         }
     };
     let action = match object.get("action").and_then(Value::as_str) {
-        Some(value @ ("observe" | "click" | "fill" | "expect" | "screenshot")) => value,
+        Some(
+            value @ ("observe" | "click" | "fill" | "expect" | "screenshot" | "scroll" | "extract"),
+        ) => value,
         _ => {
             return json!({
                 "ok": false,
                 "code": "invalid_params",
-                "message": "action must be observe, click, fill, expect, or screenshot",
+                "message": "action must be observe, click, fill, expect, screenshot, scroll, or extract",
             });
         }
     };
+
+    if action != "scroll" && (object.contains_key("direction") || object.contains_key("amount")) {
+        return json!({
+            "ok": false,
+            "code": "invalid_params",
+            "message": "direction/amount are accepted only for scroll",
+        });
+    }
 
     let mut bridge_params = json!({
         "page_ref": page_ref,
         "action": action,
     });
-    let mutation = matches!(action, "click" | "fill");
+    let mutation = matches!(action, "click" | "fill" | "scroll");
     let mut mutation_key: Option<&str> = None;
     let mut semantic_objective: Option<&str> = None;
+
+    if action != "scroll" && (object.contains_key("direction") || object.contains_key("amount")) {
+        return json!({"ok": false, "code": "invalid_params", "message": "direction/amount are accepted only for scroll"});
+    }
 
     match action {
         "observe" | "screenshot" => {
@@ -7612,13 +8055,14 @@ fn browser_page_action_call(
             }
             let condition = match object.get("condition").and_then(Value::as_str) {
                 Some(
-                    value @ ("document_ready" | "url_equals" | "text_present" | "text_absent"),
+                    value @ ("document_ready" | "url_equals" | "text_present" | "text_absent"
+                    | "element_present" | "element_absent"),
                 ) => value,
                 _ => {
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "condition must be document_ready, url_equals, text_present, or text_absent",
+                        "message": "condition must be document_ready, url_equals, text_present, text_absent, element_present, or element_absent",
                     });
                 }
             };
@@ -7666,7 +8110,54 @@ fn browser_page_action_call(
                 }
             }
         }
-        "click" | "fill" => {
+        "extract" => {
+            for disallowed in [
+                "value",
+                "condition",
+                "timeout_ms",
+                "idempotency_key",
+                "objective",
+            ] {
+                if object.contains_key(disallowed) {
+                    return json!({"ok": false, "code": "invalid_params", "message": format!("{disallowed} is not accepted for extract")});
+                }
+            }
+            let generation = match object.get("generation").and_then(Value::as_str) {
+                Some(value)
+                    if !value.is_empty()
+                        && value.len() <= 256
+                        && !value.chars().any(char::is_control) =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "generation is required for extract"});
+                }
+            };
+            let element_ref = match object.get("ref").and_then(Value::as_str) {
+                Some(value)
+                    if value.starts_with(&format!("ref_{generation}_")) && value.len() <= 256 =>
+                {
+                    value
+                }
+                _ => {
+                    return json!({"ok": false, "code": "invalid_params", "message": "current ref is required for extract"});
+                }
+            };
+            let max_chars = match object.get("max_chars") {
+                None => 4000,
+                Some(value) => match value.as_u64() {
+                    Some(value) if (1..=8192).contains(&value) => value,
+                    _ => {
+                        return json!({"ok": false, "code": "invalid_params", "message": "extract max_chars must be an integer between 1 and 8192"});
+                    }
+                },
+            };
+            bridge_params["generation"] = json!(generation);
+            bridge_params["ref"] = json!(element_ref);
+            bridge_params["max_chars"] = json!(max_chars);
+        }
+        "click" | "fill" | "scroll" => {
             for disallowed in ["max_chars", "condition", "timeout_ms", "objective"] {
                 if object.contains_key(disallowed) {
                     return json!({
@@ -7692,24 +8183,27 @@ fn browser_page_action_call(
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "generation is required for click/fill",
+                        "message": "generation is required for click/fill/scroll",
                     });
                 }
             };
-            let element_ref = match object.get("ref").and_then(Value::as_str).map(str::trim) {
-                Some(value)
-                    if !value.is_empty()
-                        && value.len() <= 256
-                        && !value.chars().any(char::is_control) =>
-                {
-                    value
+            let element_ref = if action == "scroll" {
+                if object.contains_key("ref") || object.contains_key("value") {
+                    return json!({"ok": false, "code": "invalid_params", "message": "ref/value are not accepted for scroll"});
                 }
-                _ => {
-                    return json!({
-                        "ok": false,
-                        "code": "invalid_params",
-                        "message": "ref is required for click/fill",
-                    });
+                None
+            } else {
+                match object.get("ref").and_then(Value::as_str).map(str::trim) {
+                    Some(value)
+                        if !value.is_empty()
+                            && value.len() <= 256
+                            && !value.chars().any(char::is_control) =>
+                    {
+                        Some(value)
+                    }
+                    _ => {
+                        return json!({"ok": false, "code": "invalid_params", "message": "ref is required for click/fill"});
+                    }
                 }
             };
             let idempotency_key = match object
@@ -7728,12 +8222,14 @@ fn browser_page_action_call(
                     return json!({
                         "ok": false,
                         "code": "invalid_params",
-                        "message": "idempotency_key is required for click/fill",
+                        "message": "idempotency_key is required for a browser page mutation",
                     });
                 }
             };
             bridge_params["generation"] = json!(generation);
-            bridge_params["ref"] = json!(element_ref);
+            if let Some(element_ref) = element_ref {
+                bridge_params["ref"] = json!(element_ref);
+            }
             if action == "fill" {
                 let value = match object.get("value").and_then(Value::as_str) {
                     Some(value) if value.len() <= 10_000 => value,
@@ -7746,12 +8242,33 @@ fn browser_page_action_call(
                     }
                 };
                 bridge_params["value"] = json!(value);
-            } else if object.contains_key("value") {
+            } else if action == "click" && object.contains_key("value") {
                 return json!({
                     "ok": false,
                     "code": "invalid_params",
                     "message": "value is not accepted for click",
                 });
+            }
+            if action == "scroll" {
+                let direction = match object.get("direction").and_then(Value::as_str) {
+                    Some(value @ ("up" | "down")) => value,
+                    _ => {
+                        return json!({"ok": false, "code": "invalid_params", "message": "scroll direction must be up or down"});
+                    }
+                };
+                let amount = match object.get("amount") {
+                    None => 500,
+                    Some(value) => match value.as_u64() {
+                        Some(value) if (1..=1500).contains(&value) => value,
+                        _ => {
+                            return json!({"ok": false, "code": "invalid_params", "message": "scroll amount must be an integer between 1 and 1500"});
+                        }
+                    },
+                };
+                bridge_params["direction"] = json!(direction);
+                bridge_params["amount"] = json!(amount);
+            } else if object.contains_key("direction") || object.contains_key("amount") {
+                return json!({"ok": false, "code": "invalid_params", "message": "direction/amount are accepted only for scroll"});
             }
             mutation_key = Some(idempotency_key);
         }
@@ -7826,8 +8343,19 @@ fn browser_page_action_call(
 
     let idempotency_key = mutation_key.expect("mutation key validated above");
     let idempotency_digest = browser_sha256(idempotency_key);
-    let request_hash = browser_sha256(
-        &json!({
+    let request_hash_payload = if action == "scroll" {
+        json!({
+            "operation": BROWSER_PAGE_ACTION_METHOD,
+            "endpoint_ref": endpoint_ref,
+            "page_ref": page_ref,
+            "action": action,
+            "generation": bridge_params["generation"],
+            "direction": bridge_params["direction"],
+            "amount": bridge_params["amount"],
+        })
+    } else {
+        // Keep the preexisting click/fill hash identical across upgrades.
+        json!({
             "operation": BROWSER_PAGE_ACTION_METHOD,
             "endpoint_ref": endpoint_ref,
             "page_ref": page_ref,
@@ -7840,8 +8368,8 @@ fn browser_page_action_call(
                 None
             },
         })
-        .to_string(),
-    );
+    };
+    let request_hash = browser_sha256(&request_hash_payload.to_string());
     let op_id = format!("op:browser_page_action:{}", &idempotency_digest[..32]);
     let now = browser_epoch_ms();
     let expires_at = now.saturating_add(10 * 60 * 1000);
@@ -11672,6 +12200,52 @@ mod tests {
     }
 
     #[test]
+    fn browser_required_app_activation_must_be_observed_before_delivery_is_applied() {
+        let mut evidence = BrowserPostconditionEvidence::resource_unavailable(7);
+        evidence.browser_online = true;
+        evidence.resource_available = true;
+        evidence.command_accepted = true;
+        evidence.stable_resource_ref_observed = true;
+        evidence.lifecycle_observed = true;
+        evidence.canonical_url_observed = true;
+        evidence.accepted_message_observed = true;
+        evidence.generation_owner = Some(7);
+        evidence.generation_status_observed = true;
+        evidence.result = Some(json!({"accepted_user_message_ref": "provider-user-test"}));
+        let requiring_app = json!({"required_apps": ["herdr"]});
+        let legacy = json!({});
+
+        for operation in [
+            BrowserOperation::SessionCreate,
+            BrowserOperation::DispatchSubmit,
+        ] {
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &legacy, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Applied,
+            );
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &requiring_app, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Uncertain,
+            );
+            evidence.required_apps_readback = vec!["other".to_owned()];
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &requiring_app, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Uncertain,
+            );
+            evidence.required_apps_readback = vec!["herdr".to_owned()];
+            assert_eq!(
+                browser_delivery_state_from_postcondition(operation, &requiring_app, 7, &evidence)
+                    .unwrap(),
+                BrowserDeliveryState::Applied,
+            );
+            evidence.required_apps_readback.clear();
+        }
+    }
+
+    #[test]
     fn browser_entrypoints_reject_unsafe_messages() {
         use std::sync::{Arc, Mutex};
 
@@ -14132,6 +14706,31 @@ mod tests {
         assert_eq!(create_params["expected_generation"], 7);
         assert_eq!(create_params["display_label"], "herdr-mcp");
         assert_eq!(create_params["provider"], "chatgpt");
+        assert_eq!(create_params.get("required_apps"), None);
+        let (with_app, same_source) = browser_session_create_params_from_source(
+            &store.lock().unwrap(),
+            &json!({
+                "source_url": source_url,
+                "message": "read-only tool activation",
+                "idempotency_key": "handoff-route-app-1",
+                "required_apps": ["herdr"]
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(same_source, session_ref);
+        assert_eq!(with_app["required_apps"], json!(["herdr"]));
+        let duplicate_app = browser_session_create_params_from_source(
+            &store.lock().unwrap(),
+            &json!({
+                "source_url": source_url,
+                "message": "not dispatched",
+                "idempotency_key": "handoff-route-app-2",
+                "required_apps": ["herdr", "herdr"]
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(duplicate_app["code"], "browser_required_apps_invalid");
     }
 
     #[test]
@@ -14438,6 +15037,10 @@ mod tests {
                 expected_generation: i64,
                 dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
+                if operation == BROWSER_SESSION_ARCHIVE_STATUS_METHOD {
+                    // Late-acceptance readback is unavailable in this fixture.
+                    return Err("browser_actuation_unavailable".to_owned());
+                }
                 assert_eq!(operation, BrowserOperation::SessionCreate.method());
                 assert_eq!(dispatch_id, params["reservation_ref"].as_str());
                 assert!(
@@ -16371,6 +16974,290 @@ mod tests {
         conflict["ref"] = json!("ref_pa_gen_1_test_1");
         let conflict = browser_page_action_call(&store, &conflict, &grants, Some(&actuator));
         assert_eq!(conflict["code"], "idempotency_key_conflict");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_scroll_requires_bounded_idempotent_mutation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ScrollActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for ScrollActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("scroll must use the exact browser endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert!(dispatch_id.is_some());
+                assert_eq!(params["action"], "scroll");
+                assert_eq!(params["direction"], "down");
+                assert_eq!(params["amount"], 500);
+                assert!(params.get("ref").is_none());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({
+                    "ok": true, "delivery_state": "applied",
+                    "retry_safe": false, "mutation_submitted": true,
+                    "moved": true, "before_y": 0, "after_y": 500,
+                }));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = ScrollActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_test",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "scroll",
+            "generation": "pa_gen_scroll_1",
+            "direction": "down",
+            "idempotency_key": "scroll-once-1",
+        });
+        for (field, invalid) in [
+            ("direction", json!("sideways")),
+            ("amount", json!(1501)),
+            ("amount", json!(0)),
+            ("amount", json!("500")),
+            ("ref", json!("ref_pa_gen_scroll_1_0")),
+        ] {
+            let mut request = params.clone();
+            request[field] = invalid;
+            assert_eq!(
+                browser_page_action_call(&store, &request, &grants, Some(&actuator))["code"],
+                "invalid_params"
+            );
+        }
+        let mut missing_key = params.clone();
+        missing_key
+            .as_object_mut()
+            .unwrap()
+            .remove("idempotency_key");
+        assert_eq!(
+            browser_page_action_call(&store, &missing_key, &grants, Some(&actuator))["code"],
+            "invalid_params"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 0);
+
+        let applied = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(applied["ok"], true);
+        assert_eq!(applied["delivery_state"], "applied");
+        let replay = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+        let mut changed = params.clone();
+        changed["amount"] = json!(700);
+        assert_eq!(
+            browser_page_action_call(&store, &changed, &grants, Some(&actuator))["code"],
+            "idempotency_key_conflict"
+        );
+        let mut changed_direction = params.clone();
+        changed_direction["direction"] = json!("up");
+        assert_eq!(
+            browser_page_action_call(&store, &changed_direction, &grants, Some(&actuator))["code"],
+            "idempotency_key_conflict"
+        );
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn browser_page_element_wait_conditions_use_existing_read_only_actuator() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ElementWaitActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for ElementWaitActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage wait must route through the exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_test"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(params["action"], "expect");
+                assert!(
+                    params["condition"] == "element_present"
+                        || params["condition"] == "element_absent"
+                );
+                assert_eq!(params["value"], "Next step");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result = Some(json!({"ok": true, "condition": params["condition"]}));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_test".to_owned(),
+        }];
+        let actuator = ElementWaitActuator {
+            calls: AtomicUsize::new(0),
+        };
+        for condition in ["element_present", "element_absent"] {
+            let result = browser_page_action_call(
+                &store,
+                &json!({
+                    "endpoint_ref": "bep_test",
+                    "page_ref": format!("bp_{}", "a".repeat(64)),
+                    "action": "expect",
+                    "condition": condition,
+                    "value": "Next step",
+                    "timeout_ms": 250,
+                }),
+                &grants,
+                Some(&actuator),
+            );
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["condition"], condition);
+        }
+        let invalid = browser_page_action_call(
+            &store,
+            &json!({
+                "endpoint_ref": "bep_test",
+                "page_ref": format!("bp_{}", "a".repeat(64)),
+                "action": "expect",
+                "condition": "css_selector",
+                "value": "#next",
+            }),
+            &grants,
+            Some(&actuator),
+        );
+        assert_eq!(invalid["code"], "invalid_params");
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn browser_page_extract_routes_bounded_read_only_ref_without_mutation_reservation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct TextExtractActuator {
+            calls: AtomicUsize,
+        }
+        impl BrowserActuator for TextExtractActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+                _dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("BrowserPage extract must route through exact endpoint")
+            }
+
+            fn actuate_for_endpoint(
+                &self,
+                operation: &str,
+                params: &Value,
+                expected_generation: i64,
+                endpoint_ref: Option<&str>,
+                dispatch_id: Option<&str>,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert_eq!(operation, BROWSER_PAGE_ACTION_METHOD);
+                assert_eq!(endpoint_ref, Some("bep_extract"));
+                assert_eq!(dispatch_id, None);
+                assert_eq!(params["action"], "extract");
+                assert_eq!(params["generation"], "pa_gen_extract_1");
+                assert_eq!(params["ref"], "ref_pa_gen_extract_1_0");
+                assert_eq!(params["max_chars"], 4000);
+                assert!(params.get("idempotency_key").is_none());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut evidence =
+                    BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+                evidence.command_accepted = true;
+                evidence.browser_online = true;
+                evidence.resource_available = true;
+                evidence.result =
+                    Some(json!({"ok": true, "text": "Visible item", "truncated": false}));
+                Ok(evidence)
+            }
+        }
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let grants = [PageAssistCallerGrant {
+            endpoint_ref: "bep_extract".to_owned(),
+        }];
+        let actuator = TextExtractActuator {
+            calls: AtomicUsize::new(0),
+        };
+        let params = json!({
+            "endpoint_ref": "bep_extract",
+            "page_ref": format!("bp_{}", "a".repeat(64)),
+            "action": "extract",
+            "generation": "pa_gen_extract_1",
+            "ref": "ref_pa_gen_extract_1_0",
+        });
+        for (key, invalid) in [
+            ("max_chars", json!(8193)),
+            ("max_chars", json!(0)),
+            ("direction", json!("down")),
+            ("amount", json!(500)),
+            ("idempotency_key", json!("not_for_reads")),
+            ("ref", json!("ref_pa_gen_other_0")),
+        ] {
+            let mut bad = params.clone();
+            bad[key] = invalid;
+            assert_eq!(
+                browser_page_action_call(&store, &bad, &grants, Some(&actuator))["code"],
+                "invalid_params"
+            );
+        }
+        assert_eq!(actuator.calls.load(Ordering::SeqCst), 0);
+        for _ in 0..2 {
+            let read = browser_page_action_call(&store, &params, &grants, Some(&actuator));
+            assert_eq!(read["ok"], true);
+            assert_eq!(read["text"], "Visible item");
+            assert_eq!(read["truncated"], false);
+            assert!(read.get("op_id").is_none());
+        }
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 2);
     }
 

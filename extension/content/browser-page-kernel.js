@@ -44,10 +44,12 @@
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
+  const selectOptionMap = new Map();
 
   function invalidateGeneration() {
     currentGenerationToken = "";
     elementMap.clear();
+    selectOptionMap.clear();
   }
 
   function isCrossOriginFrame() {
@@ -160,6 +162,7 @@
     generationSeq += 1;
     currentGenerationToken = `pa_gen_${generationSeq}_${Date.now().toString(36)}`;
     elementMap.clear();
+    selectOptionMap.clear();
 
     const doc = global.document;
     if (!doc) return { ok: false, error: "document_unavailable" };
@@ -200,6 +203,19 @@
         .map((value) => structuralToken(value, 48))
         .filter(Boolean)
         .slice(0, 4);
+      // Expose bounded visible labels only; never an option's raw value.
+      const selectOptions = tag === "select"
+        ? [...(el.options || [])].filter((option) => (
+          !option.hidden && !option.disabled && !option.parentElement?.disabled
+        ))
+        : null;
+      if (selectOptions) {
+        selectOptionMap.set(ref, selectOptions.slice(0, 24).map((option) => ({
+          node: option,
+          value: String(option.value),
+          label: String(option.label || option.textContent || "").trim(),
+        })));
+      }
 
       elements.push({
         ref: ref.slice(0, 256),
@@ -212,7 +228,18 @@
         type: (tag === "input" || tag === "button")
           ? String(el.type || (tag === "input" ? "text" : "")).slice(0, 64)
           : undefined,
+        checked: tag === "input" && ["checkbox", "radio"].includes(String(el.type || "").toLowerCase())
+          ? el.checked === true
+          : undefined,
         text: label,
+        options: selectOptions ? selectOptions.slice(0, 24).map((option) => (
+          cleanText(option.label || option.textContent, 80)
+        )) : undefined,
+        options_truncated: selectOptions && selectOptions.length > 24 ? true : undefined,
+        selected_option: tag === "select" && !el.multiple
+          ? cleanText((selectOptions || []).find((option) => option.value === el.value)?.label
+            || (selectOptions || []).find((option) => option.value === el.value)?.textContent, 80) || undefined
+          : undefined,
         fast_path: fastPathActionClass(el, tag),
       });
     }
@@ -226,9 +253,74 @@
       origin: String(global.location ? global.location.origin : "").slice(0, 512),
       title: String(doc.title || "").slice(0, 512),
       generation: currentGenerationToken,
+      scroll: {
+        y: Math.max(0, Math.round(Number(global.scrollY) || 0)),
+        max_y: Math.max(0, Math.round((Number(doc.documentElement?.scrollHeight) || 0) - (Number(global.innerHeight) || 0))),
+      },
       text,
       elements,
     };
+  }
+
+  function executeExtract(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const ref = String(params.ref || "");
+    if (!ref.startsWith(`ref_${generation}_`)) return { ok: false, error: "invalid_ref" };
+    const maxChars = params.maxChars === undefined ? 4000 : params.maxChars;
+    if (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > 8192) {
+      return { ok: false, error: "extract_params_invalid" };
+    }
+    const el = elementMap.get(ref);
+    if (!el || !el.isConnected) return { ok: false, error: "element_detached" };
+    if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
+      return { ok: false, error: "unsupported_element" };
+    }
+    const raw = String(el.innerText || el.textContent || "").trim();
+    return {
+      ok: true, ref, generation,
+      text: cleanText(raw, maxChars),
+      truncated: raw.length > maxChars,
+    };
+  }
+
+  function executeScroll(params = {}) {
+    if (hasForbiddenKeys(params)) return { ok: false, error: "disallowed_parameter" };
+    if (isCrossOriginFrame()) return { ok: false, error: "cross_origin_iframe_blocked" };
+    if (params.expectedOrigin && global.location
+        && String(params.expectedOrigin).toLowerCase() !== global.location.origin.toLowerCase()) {
+      return { ok: false, error: "origin_mismatch" };
+    }
+    const generation = String(params.generation || "").trim();
+    if (!generation || generation !== currentGenerationToken) return { ok: false, error: "stale_generation" };
+    const direction = params.direction;
+    const amount = params.amount === undefined ? 500 : params.amount;
+    if ((direction !== "up" && direction !== "down")
+        || !Number.isInteger(amount) || amount < 1 || amount > 1500) {
+      return { ok: false, error: "scroll_params_invalid" };
+    }
+    if (typeof global.scrollBy !== "function") return { ok: false, error: "scroll_unavailable" };
+    const beforeY = Math.max(0, Math.round(Number(global.scrollY) || 0));
+    try {
+      global.scrollBy({ top: direction === "down" ? amount : -amount, behavior: "instant" });
+      const afterY = Math.max(0, Math.round(Number(global.scrollY) || 0));
+      invalidateGeneration();
+      return {
+        ok: true, direction, amount,
+        before_y: beforeY, after_y: afterY,
+        moved: afterY !== beforeY,
+        at_boundary: afterY === beforeY,
+        requires_verification: true,
+      };
+    } catch (_) {
+      return { ok: false, error: "scroll_delivery_unknown" };
+    }
   }
 
   function executeClick(params = {}) {
@@ -333,7 +425,7 @@
 
     const tag = (el.tagName || "").toLowerCase();
     const isContentEditable = el.isContentEditable === true || el.getAttribute("contenteditable") === "true";
-    if (tag !== "input" && tag !== "textarea" && !isContentEditable) {
+    if (tag !== "input" && tag !== "textarea" && tag !== "select" && !isContentEditable) {
       return { ok: false, error: "element_not_fillable" };
     }
 
@@ -342,10 +434,76 @@
     }
 
     const fillValue = params.value.slice(0, MAX_FILL_CHARS);
+    const controlType = tag === "input" ? String(el.type || "").toLowerCase() : "";
+    const isCheckable = controlType === "checkbox" || controlType === "radio";
+    let targetChecked = null;
+    if (isCheckable) {
+      if (fillValue !== "true" && fillValue !== "false") {
+        return { ok: false, error: "checkable_state_required" };
+      }
+      targetChecked = fillValue === "true";
+      if (controlType === "radio" && !targetChecked) {
+        return { ok: false, error: "radio_uncheck_unsupported" };
+      }
+      if ((el.checked === true) === targetChecked) {
+        return { ok: false, error: "control_already_in_state" };
+      }
+    }
+
+    let selectedOption = null;
+    if (tag === "select") {
+      if (el.multiple === true) return { ok: false, error: "multiple_select_unsupported" };
+      // Match only options offered in the latest observation. A page must not
+      // introduce a new option after inspect and have it selected by old refs.
+      const matches = (selectOptionMap.get(ref) || []).filter((option) => (
+        option.value === fillValue || option.label === fillValue
+      ));
+      if (matches.length !== 1) {
+        return { ok: false, error: matches.length ? "select_option_ambiguous" : "select_option_unavailable" };
+      }
+      const snapshot = matches[0];
+      selectedOption = snapshot.node;
+      const liveMatches = [...(el.options || [])].filter((option) => (
+        !option.hidden && !option.disabled && !option.parentElement?.disabled
+        && (String(option.value) === fillValue
+          || String(option.label || option.textContent || "").trim() === fillValue)
+      ));
+      if (liveMatches.length > 1) return { ok: false, error: "select_option_ambiguous" };
+      if (
+        selectedOption.isConnected === false
+        || ![...(el.options || [])].includes(selectedOption)
+        || liveMatches.length !== 1 || liveMatches[0] !== selectedOption
+        || selectedOption.hidden || selectedOption.disabled || selectedOption.parentElement?.disabled
+        || String(selectedOption.value) !== snapshot.value
+        || String(selectedOption.label || selectedOption.textContent || "").trim() !== snapshot.label
+      ) {
+        return { ok: false, error: "select_option_stale" };
+      }
+    }
 
     try {
       el.focus?.();
-      if (tag === "input" || tag === "textarea") {
+      if (isCheckable) {
+        const descriptor = global.HTMLInputElement?.prototype
+          ? Object.getOwnPropertyDescriptor(global.HTMLInputElement.prototype, "checked")
+          : null;
+        if (descriptor?.set) descriptor.set.call(el, targetChecked);
+        else el.checked = targetChecked;
+        if ((el.checked === true) !== targetChecked) {
+          return { ok: false, error: "control_state_not_applied" };
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (tag === "select") {
+        const descriptor = global.HTMLSelectElement?.prototype
+          ? Object.getOwnPropertyDescriptor(global.HTMLSelectElement.prototype, "value")
+          : null;
+        if (descriptor?.set) descriptor.set.call(el, selectedOption.value);
+        else el.value = selectedOption.value;
+        if (el.value !== selectedOption.value) return { ok: false, error: "select_not_applied" };
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (tag === "input" || tag === "textarea") {
         const proto = tag === "input" ? global.HTMLInputElement?.prototype : global.HTMLTextAreaElement?.prototype;
         const descriptor = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
         if (descriptor?.set) {
@@ -383,7 +541,7 @@
 
     const condition = String(params.condition || "").toLowerCase();
     const value = typeof params.value === "string" ? params.value : "";
-    if (!["document_ready", "url_equals", "text_present", "text_absent"].includes(condition)) {
+    if (!["document_ready", "url_equals", "text_present", "text_absent", "element_present", "element_absent"].includes(condition)) {
       return { ok: false, error: "unsupported_expect_condition" };
     }
     if (condition === "document_ready") {
@@ -398,6 +556,37 @@
         condition,
         value,
       };
+    }
+    if (condition === "element_present" || condition === "element_absent") {
+      // No caller-controlled selector languages or scripts. Compare an exact
+      // label on the same fixed, non-sensitive, visible control vocabulary.
+      if (value.length > 256 || value !== value.trim()) {
+        return { ok: false, error: "expect_value_invalid", condition };
+      }
+      const controls = global.document?.querySelectorAll?.(
+        'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [contenteditable="true"]'
+      ) || [];
+      const truncated = controls.length > MAX_ELEMENTS;
+      let found = false;
+      let inspected = 0;
+      for (const el of controls) {
+        if (++inspected > MAX_ELEMENTS) break;
+        if (!el.isConnected || isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) continue;
+        const exactLabels = [
+          el.getAttribute?.("aria-label"),
+          el.getAttribute?.("placeholder"),
+          el.innerText,
+          el.textContent,
+        ];
+        if (exactLabels.some((label) => String(label || "").trim() === value)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found && truncated) {
+        return { ok: false, error: "element_scan_truncated", condition };
+      }
+      return { ok: condition === "element_present" ? found : !found, condition };
     }
     const text = pageText();
     const present = text.includes(value);
@@ -437,6 +626,8 @@
     if (action === "inspect" || action === "observe") return scanDocument(msg);
     if (action === "click") return executeClick(msg);
     if (action === "fill") return executeFill(msg);
+    if (action === "extract") return executeExtract(msg);
+    if (action === "scroll") return executeScroll(msg);
     if (action === "expect") return executeExpect(msg);
     return { ok: false, error: "unsupported_action" };
   }

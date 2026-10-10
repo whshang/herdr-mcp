@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.150";
+const H2W_SCRIPT_VERSION = "0.1.187";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -945,7 +945,7 @@ async function probeChatGptPerfTab(tabId) {
           if (typeof input.value === "string" && input.tagName !== "DIV") composerText = input.value;
           else {
             const clone = input.cloneNode(true);
-            for (const node of clone.querySelectorAll?.('[data-inline-selection-pill],[contenteditable="false"]') || []) node.remove();
+            for (const node of clone.querySelectorAll?.('[data-inline-selection-pill],[contenteditable="false"],span[data-appearance="inline-mention"][app-mention-name]') || []) node.remove();
             composerText = clone.textContent || "";
           }
         }
@@ -3459,6 +3459,8 @@ async function handleBrowserActuation(command) {
         value: params.value,
         condition: params.condition,
         timeoutMs: params.timeout_ms,
+        direction: params.direction,
+        amount: params.amount,
       });
     } catch (error) {
       result = { ok: false, error: error?.message || String(error) };
@@ -4055,7 +4057,29 @@ async function handleBrowserActuation(command) {
     }
     let tabOpen = null;
     try { tabOpen = await chrome.tabs.get(targetOpen.tabId); } catch (_) {}
-    const liveOpen = browserConversationInfo(providerOpen, tabOpen?.url || "");
+    let liveOpen = browserConversationInfo(providerOpen, tabOpen?.url || "");
+    if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
+      // Stale target (the tab navigated away or closed). Drop it and re-resolve
+      // once through the existing exact recovery; only an exact live match on
+      // the same generation proceeds, anything else stays unavailable.
+      browserSessionTargets.delete(sessionRefOpen);
+      const repaired = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration, providerOpen)
+        .catch(() => ({ target: null }));
+      const repairedTarget = repaired?.target;
+      let repairedTab = null;
+      if (repairedTarget?.tabId) {
+        try { repairedTab = await chrome.tabs.get(repairedTarget.tabId); } catch (_) {}
+      }
+      const repairedLive = browserConversationInfo(providerOpen, repairedTab?.url || "");
+      if (repairedTab
+          && repairedTarget.observationGeneration === expectedGeneration
+          && repairedTarget.provider === providerOpen
+          && repairedLive?.conversation_id === repairedTarget.conversationId) {
+        targetOpen = repairedTarget;
+        tabOpen = repairedTab;
+        liveOpen = repairedLive;
+      }
+    }
     if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
       browserSessionTargets.delete(sessionRefOpen);
       await postBrowserActuationEvidence(
@@ -7623,7 +7647,7 @@ async function loadBrowserPages() {
     }
     try {
       const stored = (await storageArea.get(BROWSER_PAGE_SESSION_STORAGE_KEY))[BROWSER_PAGE_SESSION_STORAGE_KEY];
-      const records = Array.isArray(stored) ? stored : [];
+      const records = Array.isArray(stored) ? stored : await restoreBrowserPagesAfterReload();
       for (const raw of records.slice(-BROWSER_PAGE_MAX_RECORDS)) {
         const record = normalizeBrowserPageRecord(raw);
         if (record) browserPagesByRef.set(record.page_ref, record);
@@ -7636,6 +7660,38 @@ async function loadBrowserPages() {
   } finally {
     browserPagesLoadPromise = null;
   }
+}
+
+// chrome.storage.session is wiped when the extension reloads, which dropped
+// every page_ref (claimed and owned) mid-task. Mirror the records to local
+// storage and, only when the session copy is absent, rebind a record if its
+// exact tab still exists on the same origin and (for claims) the same
+// conversation identity. Browser restart clears the mirror (tab ids reset).
+const BROWSER_PAGE_RELOAD_MIRROR_KEY = `${BROWSER_PAGE_SESSION_STORAGE_KEY}_reload_mirror`;
+
+async function restoreBrowserPagesAfterReload() {
+  const local = chrome.storage?.local;
+  if (!local?.get) return [];
+  let mirror = [];
+  try {
+    const value = (await local.get(BROWSER_PAGE_RELOAD_MIRROR_KEY))[BROWSER_PAGE_RELOAD_MIRROR_KEY];
+    mirror = Array.isArray(value) ? value : [];
+  } catch (_) {
+    return [];
+  }
+  const restored = [];
+  for (const raw of mirror.slice(-BROWSER_PAGE_MAX_RECORDS)) {
+    const record = normalizeBrowserPageRecord(raw);
+    if (!record) continue;
+    let tab = null;
+    try { tab = await chrome.tabs.get(record.tab_id); } catch (_) {}
+    if (!tab?.url || browserPageOrigin(tab.url) !== record.origin) continue;
+    const liveKey = browserPageClaimKey(tab.url);
+    if (record.ownership === "claimed"
+        && (!liveKey || liveKey !== browserPageClaimKey(record.canonical_url))) continue;
+    restored.push(raw);
+  }
+  return restored;
 }
 
 async function persistBrowserPages() {
@@ -7658,6 +7714,7 @@ async function persistBrowserPages() {
   } catch (_) {
     return false;
   }
+  try { await chrome.storage?.local?.set?.({ [BROWSER_PAGE_RELOAD_MIRROR_KEY]: records }); } catch (_) {}
   const retained = new Set(records.map((record) => record.page_ref));
   for (const record of allRecords) {
     if (record.ownership === "claimed" && !retained.has(record.page_ref)) {
@@ -7686,6 +7743,21 @@ function browserPageCanonicalUrl(rawUrl, targetOrigin = null) {
   } catch (_) {
     return null;
   }
+}
+
+// Claim-only URL equivalence. ChatGPT serves one Project conversation under
+// both /g/g-p-<id>/c/<uuid> (the session canonical URL) and
+// /g/g-p-<id>-<slug>/c/<uuid> (what the worker tab shows). The conversation
+// uuid is the identity; the cosmetic slug is dropped only for that shape.
+function browserPageClaimKey(rawUrl, targetOrigin = null) {
+  const canonical = browserPageCanonicalUrl(rawUrl, targetOrigin);
+  if (!canonical) return null;
+  const parsed = new URL(canonical);
+  if (parsed.hostname === "chatgpt.com") {
+    parsed.pathname = parsed.pathname.replace(/^\/g\/(g-p-[0-9a-f]{32})-[^/]+\/c\//, "/g/$1/c/");
+  }
+  parsed.hash = "";
+  return parsed.href;
 }
 
 function browserPageView(page, extra = {}) {
@@ -7882,8 +7954,9 @@ async function performBrowserPageLifecycleRequest(msg) {
     if (action === "claim") {
       let tabs = [];
       try { tabs = await chrome.tabs.query({ url: pattern }); } catch (_) {}
+      const claimKey = browserPageClaimKey(canonicalUrl, targetOrigin);
       const matches = tabs.filter((tab) =>
-        tab?.id && browserPageCanonicalUrl(tab.url, targetOrigin) === canonicalUrl);
+        tab?.id && claimKey && browserPageClaimKey(tab.url, targetOrigin) === claimKey);
       if (matches.length === 0) return { ok: false, error: "target_tab_not_found" };
       if (matches.length !== 1) return { ok: false, error: "target_tab_ambiguous" };
       const page = await rememberBrowserPage(
@@ -8044,6 +8117,15 @@ const BROWSER_PAGE_SAFE_MUTATION_REJECTIONS = new Set([
   "sensitive_field_prohibited",
   "element_not_fillable",
   "value_required",
+  "multiple_select_unsupported",
+  "select_option_unavailable",
+  "select_option_ambiguous",
+  "select_option_stale",
+  "checkable_state_required",
+  "radio_uncheck_unsupported",
+  "control_already_in_state",
+  "scroll_params_invalid",
+  "scroll_unavailable",
 ]);
 
 function browserPageMutationEnvelope(result, page, sendAttempted) {
@@ -8260,7 +8342,7 @@ async function captureBrowserPageScreenshot(page, tab) {
 async function performBrowserPageActionRequest(msg) {
   await configReady;
   const action = String(msg?.action || "").toLowerCase();
-  if (!["observe", "click", "fill", "expect", "screenshot"].includes(action)) {
+  if (!["observe", "click", "fill", "expect", "screenshot", "scroll", "extract"].includes(action)) {
     return { ok: false, error: "browser_page_action_invalid" };
   }
 
@@ -8270,7 +8352,7 @@ async function performBrowserPageActionRequest(msg) {
 
   const pageRef = String(msg?.pageRef || "");
   if (!validBrowserPageRef(pageRef)) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_ref_invalid" }, null, false)
       : { ok: false, error: "browser_page_ref_invalid" };
   }
@@ -8278,12 +8360,12 @@ async function performBrowserPageActionRequest(msg) {
   await loadBrowserPages();
   const record = browserPagesByRef.get(pageRef);
   if (!record) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_not_found" }, null, false)
       : { ok: false, error: "browser_page_not_found" };
   }
   if (record.endpoint_ref !== endpointRef) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope({ ok: false, error: "browser_page_endpoint_mismatch" }, record, false)
       : withBrowserPageIdentity({ ok: false, error: "browser_page_endpoint_mismatch" }, record);
   }
@@ -8296,14 +8378,14 @@ async function performBrowserPageActionRequest(msg) {
       reason: "host_permission_missing",
       origin: record.origin,
     };
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope(denied, record, false)
       : withBrowserPageIdentity(denied, record);
   }
 
   const resolved = await resolveBrowserPage(pageRef, endpointRef, record.origin);
   if (!resolved.ok) {
-    return action === "click" || action === "fill"
+    return action === "click" || action === "fill" || action === "scroll"
       ? browserPageMutationEnvelope(resolved, record, false)
       : withBrowserPageIdentity(resolved, record);
   }
@@ -8322,9 +8404,11 @@ async function performBrowserPageActionRequest(msg) {
     value: msg?.value,
     condition: msg?.condition,
     timeoutMs: msg?.timeoutMs,
+    direction: msg?.direction,
+    amount: msg?.amount,
   };
 
-  const mutation = action === "click" || action === "fill";
+  const mutation = action === "click" || action === "fill" || action === "scroll";
   let sendAttempted = false;
   const send = async () => {
     sendAttempted = true;
@@ -8363,7 +8447,7 @@ async function performBrowserPageActionRequest(msg) {
     }
   }
 
-  if (!["observe", "expect"].includes(action)) {
+  if (!["observe", "expect", "extract"].includes(action)) {
     return withBrowserPageIdentity({ ok: false, error: "browser_page_action_unavailable" }, page);
   }
 
@@ -10002,6 +10086,72 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg?.type === "h2w_type_trusted_mention") {
+    // DEV-only trusted keystrokes for the native App mention picker. Live
+    // evidence: ChatGPT ignores execCommand/synthetic input for `@` mentions.
+    // Scope: the sender's own tab only, a fixed `@<keyword>` text of
+    // [a-z0-9_-]{1,64}, attach just for typing and always detach.
+    const tabId = sender.tab?.id;
+    const keyword = String(msg.keyword || "");
+    if (!tabId) { sendResponse({ ok: false, error: "no-tab" }); return; }
+    if (chrome.runtime.getManifest().update_url || !chrome.debugger) {
+      sendResponse({ ok: false, error: "trusted-input-unavailable" });
+      return;
+    }
+    if (!/^[a-z0-9_-]{1,64}$/.test(keyword)) { sendResponse({ ok: false, error: "bad-keyword" }); return; }
+    const target = { tabId };
+    const send = (method, params) => chrome.debugger.sendCommand(target, method, params);
+    const typeChar = async (ch) => {
+      const at = ch === "@";
+      const base = {
+        key: ch,
+        code: at ? "Digit2" : (/[a-z]/.test(ch) ? `Key${ch.toUpperCase()}` : ""),
+        modifiers: at ? 8 : 0,
+      };
+      await send("Input.dispatchKeyEvent", { type: "keyDown", text: ch, unmodifiedText: at ? "2" : ch, ...base });
+      await send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    };
+    (async () => {
+      let attached = false;
+      try {
+        await chrome.debugger.attach(target, "1.3");
+        attached = true;
+        if (msg.mode === "clear") {
+          // Remove only the automation-typed search text: select all, delete.
+          const selectAll = { key: "a", code: "KeyA", modifiers: 4 };
+          await send("Input.dispatchKeyEvent", { type: "keyDown", commands: ["selectAll"], ...selectAll });
+          await send("Input.dispatchKeyEvent", { type: "keyUp", ...selectAll });
+          const del = { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 };
+          await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...del });
+          await send("Input.dispatchKeyEvent", { type: "keyUp", ...del });
+          return { ok: true };
+        }
+        for (const ch of `@${keyword}`) {
+          await typeChar(ch);
+          await sleep(40);
+        }
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: `trusted-input-failed:${String(e?.message || e).slice(0, 80)}` };
+      } finally {
+        if (attached) { try { await chrome.debugger.detach(target); } catch (_) {} }
+      }
+    })().then(sendResponse);
+    return true;
+  }
+  if (msg?.type === "h2w_focus_own_tab") {
+    // Focus only the sender's own tab and window (native App mention needs a
+    // focused document). No tab id is accepted from the message.
+    const tabId = sender.tab?.id;
+    const windowId = sender.tab?.windowId;
+    if (!tabId || windowId == null) { sendResponse({ ok: false, error: "no-tab" }); return; }
+    Promise.resolve()
+      .then(() => chrome.windows.update(windowId, { focused: true }))
+      .then(() => chrome.tabs.update(tabId, { active: true }))
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
   if (msg?.type === "h2w_insert_main") {
     // MAIN-world text insertion: isolated-world execCommand changes the DOM
     // without committing the editor model. Select the last visible match because
@@ -11191,7 +11341,11 @@ async function ensureAlive(preloaded, runtimeState = null) {
 
 // ---- Install, browser startup, and every service-worker startup ----
 // MV3 can restart the worker without onInstalled/onStartup, so rebuild at module scope.
-chrome.runtime.onStartup.addListener(() => { void rebuildStreams(); });
+chrome.runtime.onStartup.addListener(() => {
+  // Browser restart resets tab ids; drop the reload-only page mirror.
+  try { void chrome.storage?.local?.remove?.(BROWSER_PAGE_RELOAD_MIRROR_KEY); } catch (_) {}
+  void rebuildStreams();
+});
 chrome.runtime.onInstalled.addListener((details) => {
   void rebuildStreams();
   // Chrome treats a Developer Mode Reload of an unpacked extension as an
@@ -11232,12 +11386,38 @@ try {
 void rebuildStreams();
 void registerLocalBrowserEndpoint();
 
+// DEV-only source reload. Unpacked (developer-mode) extensions have no
+// update_url, and fetching the packaged manifest reads the source directory
+// live. When a developer bumps the on-disk manifest version, reload once so
+// the new build is active without a manual chrome://extensions click.
+// Store/standalone packages (update_url present) never take this path, and no
+// external caller can trigger it: only a local write to the loaded extension
+// directory changes the observed version.
+async function reloadIfDevSourceVersionChanged() {
+  try {
+    const loaded = chrome.runtime.getManifest();
+    if (loaded.update_url) return false;
+    const resp = await fetch(chrome.runtime.getURL("manifest.json"), { cache: "no-store" });
+    if (!resp.ok) return false;
+    const onDisk = await resp.json();
+    const next = String(onDisk?.version || "");
+    if (!/^\d+(\.\d+){0,3}$/.test(next) || next === loaded.version) return false;
+    callLog(`dev source version ${loaded.version} -> ${next}; reloading extension`);
+    chrome.runtime.reload();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Wake the service worker each minute to restore missing SSE streams and timers.
 try {
   chrome.alarms.create("h2w-keepalive", { periodInMinutes: 1 });
   chrome.alarms.onAlarm.addListener((a) => {
     if (a.name === "h2w-keepalive") {
-      void ensureAlive();
+      void reloadIfDevSourceVersionChanged().then((reloading) => {
+        if (!reloading) void ensureAlive();
+      });
       return;
     }
     if (a.name === CHATGPT_PERF_MIGRATION_ALARM) {
