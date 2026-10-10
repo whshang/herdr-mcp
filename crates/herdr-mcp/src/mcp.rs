@@ -14905,6 +14905,10 @@ mod tests {
                 expected_generation: i64,
                 dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
+                if operation == BROWSER_SESSION_ARCHIVE_STATUS_METHOD {
+                    // Late-acceptance readback is unavailable in this fixture.
+                    return Err("browser_actuation_unavailable".to_owned());
+                }
                 assert_eq!(operation, BrowserOperation::SessionCreate.method());
                 assert_eq!(dispatch_id, params["reservation_ref"].as_str());
                 assert!(
