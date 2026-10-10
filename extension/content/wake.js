@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.180";
+const H2W_CONTENT_VERSION = "0.1.181";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3349,6 +3349,13 @@ function normalizeHerdrMentionAlias(value) {
         : null;
       registeredConversationBound = response?.bound === true;
       restoreBrowserResultAssignment(response?.browser_pending_dispatch);
+      if (changed) {
+        // A route change (SPA navigation away and back, or a reopened tab) starts
+        // a fresh result probe: an earlier backoff or rejection count from the
+        // other route must not keep a still-pending dispatch from settling.
+        browserResultProbeState = null;
+        void observeBrowserResultSettlement().catch(() => {});
+      }
       if (browserSessionReservationRef && registeredBrowserSessionRef) {
         if (response?.browser_pending_dispatch
             || /^bd_[0-9a-f]{64}$/.test(String(acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.dispatchId || ""))) {
