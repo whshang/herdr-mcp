@@ -3437,6 +3437,46 @@ fn browser_session_create_reconcile_uncertain(
     } else {
         None
     };
+    // Forward only the fixed-shape App search probe: allowlisted keys with
+    // boolean or small integer values. No provider strings are echoed.
+    let app_selection_probe = app_refusal_reason.and_then(|_| {
+        let probe = evidence
+            .result
+            .as_ref()
+            .and_then(|result| result.get("app_selection_probe"))
+            .and_then(Value::as_object)?;
+        const BOOL_KEYS: &[&str] = &[
+            "composer_found",
+            "composer_is_prompt_textarea",
+            "search_text_committed",
+            "composer_aria_expanded",
+            "composer_aria_controls_present",
+            "composer_aria_controls_visible",
+        ];
+        const COUNT_KEYS: &[&str] = &[
+            "selected_pill_count",
+            "visible_popover_roots",
+            "visible_menu_roots",
+            "visible_listbox_roots",
+            "visible_dialog_roots",
+            "visible_popper_wrappers",
+            "visible_option_nodes",
+            "visible_keyword_nodes",
+            "candidate_count",
+        ];
+        let mut out = serde_json::Map::new();
+        for key in BOOL_KEYS {
+            if let Some(value) = probe.get(*key).and_then(Value::as_bool) {
+                out.insert((*key).to_string(), Value::Bool(value));
+            }
+        }
+        for key in COUNT_KEYS {
+            if let Some(value) = probe.get(*key).and_then(Value::as_u64) {
+                out.insert((*key).to_string(), json!(value.min(50)));
+            }
+        }
+        (!out.is_empty()).then_some(Value::Object(out))
+    });
     json!({
         "ok": false,
         "code": delivery_state.as_str(),
@@ -3444,6 +3484,7 @@ fn browser_session_create_reconcile_uncertain(
         "reservation_state": settled.state,
         "delivery_state": settled.delivery_state,
         "app_refusal_reason": app_refusal_reason,
+        "app_selection_probe": app_selection_probe,
         "replayed": replayed,
         "reconciled": delivery_state != BrowserDeliveryState::Uncertain,
     })

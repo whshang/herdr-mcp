@@ -3626,6 +3626,14 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.ok(wakeSource.indexOf("await insertMainWorld('@', selector")
     < wakeSource.indexOf("await insertMainWorld(app, selector, true)"));
   assert.match(wakeSource, /required-app-selection-not-observed/);
+  // Rejections carry fixed-shape DOM diagnostics captured before cleanup.
+  assert.match(chatGptAdapterSource, /describeComposerAppSearch\(keyword\)/);
+  assert.match(wakeSource, /app_selection_probe: probe/);
+  assert.doesNotMatch(
+    chatGptAdapterSource.slice(chatGptAdapterSource.indexOf('describeComposerAppSearch(keyword)'),
+      chatGptAdapterSource.indexOf('getWatchMainWorldSelector()')),
+    /textContent|innerText|outerHTML/,
+  );
   assert.match(wakeSource, /!ADAPTER\.getSelectedComposerApps\(\)\.includes\(app\)/);
   assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);

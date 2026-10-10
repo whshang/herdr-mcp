@@ -213,6 +213,41 @@ class ChatGPTAdapter extends BaseAdapter {
     });
   }
 
+  // Fixed-shape, non-sensitive App search diagnostics. Returns only booleans
+  // and small counts derived from DOM structure; never page or draft text.
+  // Used to discriminate "native suggestions never opened" from "opened in a
+  // root this adapter does not scan" without loosening the identity contract.
+  describeComposerAppSearch(keyword) {
+    const wanted = String(keyword || '').trim().toLowerCase();
+    const input = this.getInputEl();
+    const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    const count = (selector) => [...document.querySelectorAll(selector)]
+      .filter((node) => visible(node) && !(input && input.contains(node))).length;
+    const clamp = (n) => Math.min(Number(n) || 0, 50);
+    const plain = input ? this.getComposerTextWithoutAppPills().toLowerCase() : '';
+    const controlsId = input?.getAttribute?.('aria-controls') || input?.getAttribute?.('aria-owns') || '';
+    const controlsTarget = controlsId ? document.getElementById(controlsId) : null;
+    return {
+      composer_found: Boolean(input),
+      composer_is_prompt_textarea: input?.id === 'prompt-textarea',
+      search_text_committed: Boolean(wanted) && plain === `@${wanted}`,
+      selected_pill_count: clamp(input ? input.querySelectorAll('[data-inline-selection-pill]').length : 0),
+      composer_aria_expanded: input?.getAttribute?.('aria-expanded') === 'true',
+      composer_aria_controls_present: Boolean(controlsId),
+      composer_aria_controls_visible: visible(controlsTarget),
+      visible_popover_roots: clamp(count('.popover')),
+      visible_menu_roots: clamp(count('[role="menu"]')),
+      visible_listbox_roots: clamp(count('[role="listbox"]')),
+      visible_dialog_roots: clamp(count('[role="dialog"]')),
+      visible_popper_wrappers: clamp(count('[data-radix-popper-content-wrapper]')),
+      visible_option_nodes: clamp(count('[role="option"]')),
+      visible_keyword_nodes: clamp([...document.querySelectorAll('[data-keyword]')]
+        .filter((node) => visible(node) && !(input && input.contains(node))
+          && String(node.getAttribute('data-keyword') || '').trim().toLowerCase() === wanted).length),
+      candidate_count: clamp(input && wanted ? this.getComposerAppCandidates(wanted).length : 0),
+    };
+  }
+
   getWatchMainWorldSelector() {
     const input = this.getInputEl();
     if (!input) return null;
