@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.162";
+const H2W_CONTENT_VERSION = "0.1.163";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -1592,6 +1592,32 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
+  // Fixed-shape, non-sensitive busy diagnostics: booleans and lengths only,
+  // never composer or page text.
+  function composerBusyProbe() {
+    try {
+      const input = ADAPTER.getInputEl();
+      const raw = input ? String(input.innerText || input.textContent || "").replace(/\u200b/g, "").trim() : "";
+      const placeholder = input
+        ? String(input.querySelector("[data-placeholder]")?.getAttribute("data-placeholder")
+          || input.getAttribute("aria-placeholder") || input.getAttribute("placeholder") || "").trim()
+        : "";
+      return {
+        input_mounted: Boolean(input),
+        input_has_content: Boolean(ADAPTER.inputHasContent()),
+        input_text_length: Math.min(raw.length, 10000),
+        input_text_equals_placeholder: Boolean(placeholder) && raw === placeholder,
+        input_has_placeholder_node: Boolean(input?.querySelector?.(".placeholder, [data-placeholder]")),
+        app_pill_count: Math.min(input ? input.querySelectorAll("[data-inline-selection-pill]").length : 0, 50),
+        stop_control: stopButtons().length > 0,
+        assistant_streaming: Boolean(assistantStreaming()),
+        assistant_tools_in_progress: Boolean(assistantToolsInProgress()),
+      };
+    } catch (_) {
+      return { probe_failed: true };
+    }
+  }
+
   function browserRejectedEvidence(evidence, reason) {
     const safeReason = typeof reason === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(reason)
       ? reason
@@ -2165,17 +2191,21 @@ function normalizeHerdrMentionAlias(value) {
       }
       if (freshCreateStableIdleSamples < 3) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
-        return browserRejectedEvidence(evidence, "browser_create_composer_busy");
+        const busy = browserRejectedEvidence(evidence, "browser_create_composer_busy");
+        busy.result.composer_busy_probe = composerBusyProbe();
+        return busy;
       }
     }
     if ((!creatingSession && isTurnInProgress()) || ADAPTER.inputHasContent()) {
       if (creatingSession) {
         try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
       }
-      return browserRejectedEvidence(
+      const busy = browserRejectedEvidence(
         evidence,
         creatingSession ? "browser_create_composer_busy" : "browser_dispatch_composer_busy",
       );
+      busy.result.composer_busy_probe = composerBusyProbe();
+      return busy;
     }
 
     if (requiredApps.length > 0) {
