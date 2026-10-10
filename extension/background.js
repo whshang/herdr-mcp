@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.162";
+const H2W_SCRIPT_VERSION = "0.1.163";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -11245,12 +11245,38 @@ try {
 void rebuildStreams();
 void registerLocalBrowserEndpoint();
 
+// DEV-only source reload. Unpacked (developer-mode) extensions have no
+// update_url, and fetching the packaged manifest reads the source directory
+// live. When a developer bumps the on-disk manifest version, reload once so
+// the new build is active without a manual chrome://extensions click.
+// Store/standalone packages (update_url present) never take this path, and no
+// external caller can trigger it: only a local write to the loaded extension
+// directory changes the observed version.
+async function reloadIfDevSourceVersionChanged() {
+  try {
+    const loaded = chrome.runtime.getManifest();
+    if (loaded.update_url) return false;
+    const resp = await fetch(chrome.runtime.getURL("manifest.json"), { cache: "no-store" });
+    if (!resp.ok) return false;
+    const onDisk = await resp.json();
+    const next = String(onDisk?.version || "");
+    if (!/^\d+(\.\d+){0,3}$/.test(next) || next === loaded.version) return false;
+    callLog(`dev source version ${loaded.version} -> ${next}; reloading extension`);
+    chrome.runtime.reload();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Wake the service worker each minute to restore missing SSE streams and timers.
 try {
   chrome.alarms.create("h2w-keepalive", { periodInMinutes: 1 });
   chrome.alarms.onAlarm.addListener((a) => {
     if (a.name === "h2w-keepalive") {
-      void ensureAlive();
+      void reloadIfDevSourceVersionChanged().then((reloading) => {
+        if (!reloading) void ensureAlive();
+      });
       return;
     }
     if (a.name === CHATGPT_PERF_MIGRATION_ALARM) {
