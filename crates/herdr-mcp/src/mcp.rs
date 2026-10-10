@@ -3168,6 +3168,24 @@ fn browser_session_create_success(
         }
         Err(error) => return browser_store_error(error),
     };
+    // A create that names an existing work chain joins it before the worker can
+    // settle, so the assistant turn lands in Work Memory without a parent race.
+    let work_chain_binding = params
+        .get("work_chain_id")
+        .and_then(Value::as_str)
+        .map(|work_chain_id| {
+            match store.bind_created_browser_session_work_chain(
+                work_chain_id,
+                &reservation.provider,
+                Some(reservation.account_ref.as_str()),
+                reservation.space_ref.as_deref(),
+                &session_ref,
+                browser_epoch_ms(),
+            ) {
+                Ok(continuity_id) => json!({"ok": true, "continuity_id": continuity_id}),
+                Err(code) => json!({"ok": false, "code": code}),
+            }
+        });
     let (dispatch, work_memory_writeback) =
         match browser_created_session_dispatch(store, &reservation, params, caller_authorization) {
             Ok(value) => value,
@@ -3194,6 +3212,7 @@ fn browser_session_create_success(
         "replayed": replayed,
         "reconciled": reconciled,
         "work_memory_writeback": work_memory_writeback,
+        "work_chain_binding": work_chain_binding,
     })
 }
 
