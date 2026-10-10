@@ -3272,15 +3272,21 @@ fn browser_session_create_late_acceptance_readback(
     params: &Value,
     actuator: &dyn BrowserActuator,
     expected_generation: i64,
-) -> Option<BrowserSessionReservationRecord> {
+) -> Result<BrowserSessionReservationRecord, &'static str> {
     if reservation.state != "materialized"
         || reservation.delivery_state != BrowserDeliveryState::Uncertain.as_str()
         || reservation.accepted_user_message_ref.is_some()
     {
-        return None;
+        return Err("reservation_not_materialized_uncertain");
     }
-    let session_ref = reservation.session_ref.as_deref()?;
-    let message = params.get("message").and_then(Value::as_str)?;
+    let session_ref = reservation
+        .session_ref
+        .as_deref()
+        .ok_or("session_ref_missing")?;
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or("message_missing")?;
     let evidence = actuator
         .actuate_for_endpoint(
             BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
@@ -3294,12 +3300,13 @@ fn browser_session_create_late_acceptance_readback(
             Some(&reservation.endpoint_ref),
             None,
         )
-        .ok()?;
-    let result = evidence.result.as_ref()?;
+        .map_err(|_| "readback_actuation_failed")?;
+    let result = evidence.result.as_ref().ok_or("readback_result_missing")?;
     let accepted = result
         .get("accepted_user_message_ref")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 512)?;
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or("readback_user_message_ambiguous_or_missing")?;
     // Match the exact create text, trimmed; the extension also reports the body
     // with only the named required-App mention tokens removed.
     let expected = browser_sha256(message.trim());
@@ -3307,9 +3314,9 @@ fn browser_session_create_late_acceptance_readback(
         .iter()
         .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected.as_str()));
     if !matches {
-        return None;
+        return Err("readback_digest_mismatch");
     }
-    let mut guard = store.lock().ok()?;
+    let mut guard = store.lock().map_err(|_| "store_unavailable")?;
     guard
         .update_browser_session_reservation_delivery(
             &reservation.reservation_ref,
@@ -3318,7 +3325,7 @@ fn browser_session_create_late_acceptance_readback(
             Some(accepted),
             browser_epoch_ms(),
         )
-        .ok()
+        .map_err(|_| "promotion_failed")
 }
 
 fn browser_session_create_reconcile_uncertain(
@@ -3329,6 +3336,37 @@ fn browser_session_create_reconcile_uncertain(
     expected_generation: i64,
     replayed: bool,
     caller_authorization: Option<&BrowserCallerAuthorization>,
+) -> Value {
+    // Surface why late acceptance did not promote (fixed token, no content).
+    let mut late_reason = None;
+    let mut value = browser_session_create_reconcile_uncertain_inner(
+        store,
+        reservation,
+        params,
+        actuator,
+        expected_generation,
+        replayed,
+        caller_authorization,
+        &mut late_reason,
+    );
+    if value.get("delivery_state").and_then(Value::as_str) == Some("uncertain")
+        && let (Some(reason), Some(object)) = (late_reason, value.as_object_mut())
+    {
+        object.insert("late_acceptance_reason".to_owned(), json!(reason));
+    }
+    value
+}
+
+#[allow(clippy::too_many_arguments)]
+fn browser_session_create_reconcile_uncertain_inner(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
+    expected_generation: i64,
+    replayed: bool,
+    caller_authorization: Option<&BrowserCallerAuthorization>,
+    late_reason_out: &mut Option<&'static str>,
 ) -> Value {
     let current = {
         let Ok(mut guard) = store.lock() else {
@@ -3362,26 +3400,29 @@ fn browser_session_create_reconcile_uncertain(
         current
     };
 
-    if let Some(actuator) = actuator
-        && let Some(promoted) = browser_session_create_late_acceptance_readback(
+    if let Some(actuator) = actuator {
+        match browser_session_create_late_acceptance_readback(
             store,
             &current,
             params,
             actuator,
             expected_generation,
-        )
-    {
-        let Ok(mut guard) = store.lock() else {
-            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
-        };
-        return browser_session_create_success(
-            &mut guard,
-            &promoted.reservation_ref,
-            params,
-            replayed,
-            true,
-            caller_authorization,
-        );
+        ) {
+            Ok(promoted) => {
+                let Ok(mut guard) = store.lock() else {
+                    return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+                };
+                return browser_session_create_success(
+                    &mut guard,
+                    &promoted.reservation_ref,
+                    params,
+                    replayed,
+                    true,
+                    caller_authorization,
+                );
+            }
+            Err(reason) => *late_reason_out = Some(reason),
+        }
     }
 
     let Some(actuator) = actuator else {
