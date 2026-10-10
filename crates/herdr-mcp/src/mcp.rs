@@ -3306,6 +3306,10 @@ fn browser_session_create_late_acceptance_readback(
         return Err(match result.get("readback_error").and_then(Value::as_str) {
             Some("timeout") => "readback_fetch_timeout",
             Some("auth") => "readback_fetch_auth",
+            Some("http-401") => "readback_fetch_http_401",
+            Some("http-403") => "readback_fetch_http_403",
+            Some("http-404") => "readback_fetch_http_404",
+            Some("http-429") => "readback_fetch_http_429",
             Some(value) if value.starts_with("http-4") => "readback_fetch_http_4xx",
             Some(value) if value.starts_with("http-5") => "readback_fetch_http_5xx",
             _ => "readback_fetch_unavailable",
