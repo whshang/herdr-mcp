@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.167";
+const H2W_SCRIPT_VERSION = "0.1.168";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -10045,6 +10045,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         await chrome.debugger.attach(target, "1.3");
         attached = true;
+        if (msg.mode === "clear") {
+          // Remove only the automation-typed search text: select all, delete.
+          const selectAll = { key: "a", code: "KeyA", modifiers: 4 };
+          await send("Input.dispatchKeyEvent", { type: "keyDown", commands: ["selectAll"], ...selectAll });
+          await send("Input.dispatchKeyEvent", { type: "keyUp", ...selectAll });
+          const del = { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 };
+          await send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...del });
+          await send("Input.dispatchKeyEvent", { type: "keyUp", ...del });
+          return { ok: true };
+        }
         for (const ch of `@${keyword}`) {
           await typeChar(ch);
           await sleep(40);

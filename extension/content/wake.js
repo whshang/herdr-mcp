@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.167";
+const H2W_CONTENT_VERSION = "0.1.168";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -862,6 +862,27 @@ function normalizeHerdrMentionAlias(value) {
     return !isComposerGenerating();
   }
 
+  // Remove only the `@<app>` search text this automation typed, and wait until
+  // the editor model is empty so ChatGPT does not persist it as a Project draft.
+  async function clearAutomationSearch(app) {
+    const ours = () => ADAPTER.getComposerTextWithoutAppPills().toLowerCase() === `@${app}`;
+    if (ours()) {
+      await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: 'h2w_type_trusted_mention', keyword: app, mode: 'clear' }, () => {
+            void chrome.runtime.lastError;
+            resolve();
+          });
+        } catch (_) { resolve(); }
+      });
+    }
+    if (ADAPTER.getComposerTextWithoutAppPills() !== '' && ours()) await clearComposer();
+    const deadline = Date.now() + 1500;
+    while (ADAPTER.getComposerTextWithoutAppPills() !== '' && Date.now() < deadline) await wait(100);
+    // Give the provider a moment to persist the cleared draft before teardown.
+    await wait(300);
+  }
+
   async function ensureRequiredComposerApps(requiredApps) {
     const requested = [...new Set((Array.isArray(requiredApps) ? requiredApps : [])
       .map((app) => String(app || '').trim().toLowerCase())
@@ -884,7 +905,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       let searchInserted = false;
       // ChatGPT only opens native mention suggestions for a focused editor in a
-      // focused document. Live 0.1.167 evidence: `@herdr` committed but no
+      // focused document. Live 0.1.168 evidence: `@herdr` committed but no
       // suggestion root of any kind appeared. Bring this task tab's window to
       // the foreground once before typing; no other tab is touched.
       if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
@@ -947,7 +968,7 @@ function normalizeHerdrMentionAlias(value) {
         : null);
       if (candidates.length !== 1) {
         const probe = probeAppSearch();
-        if (searchInserted) await clearComposer();
+        if (searchInserted) await clearAutomationSearch(app);
         return {
           ok: false,
           error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found',
@@ -967,7 +988,7 @@ function normalizeHerdrMentionAlias(value) {
       if (!ADAPTER.getSelectedComposerApps().includes(app)
           || ADAPTER.getComposerTextWithoutAppPills() !== '') {
         const probe = probeAppSearch();
-        if (searchInserted) await clearComposer();
+        if (searchInserted) await clearAutomationSearch(app);
         return { ok: false, error: 'required-app-selection-not-observed', app_selection_probe: probe };
       }
     }
