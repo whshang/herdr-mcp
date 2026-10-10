@@ -159,6 +159,28 @@ class ChatGPTAdapter extends BaseAdapter {
     return this.getComposerTextWithoutAppPills() === '';
   }
 
+  // Live 0.1.168 evidence: after trusted `@herdr` keys ChatGPT renders the
+  // mention suggestion as plain <button> rows (no menu/listbox role, outside
+  // the composer form). Return visible buttons whose text is exactly the
+  // keyword; callers must subtract the pre-typing baseline so only buttons
+  // that appeared because of this search are candidates.
+  getComposerAppSuggestionButtons(keyword) {
+    const wanted = String(keyword || '').trim().toLowerCase();
+    const input = this.getInputEl();
+    if (!wanted || !input) return [];
+    const visible = (element) => Boolean(element && (element.offsetWidth || element.offsetHeight || element.getClientRects?.().length));
+    const out = new Set();
+    for (const button of document.querySelectorAll('button, [role="button"]')) {
+      if (!visible(button) || input.contains(button) || button.disabled) continue;
+      const exactLabel = [button, ...button.querySelectorAll('span, div')].some((node) => (
+        String(node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase() === wanted
+      ));
+      if (!exactLabel) continue;
+      out.add(button);
+    }
+    return [...out];
+  }
+
   getComposerAppCandidates(keyword) {
     const wanted = String(keyword || '').trim().toLowerCase();
     const input = this.getInputEl();
