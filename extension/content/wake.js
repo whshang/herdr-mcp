@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.175";
+const H2W_CONTENT_VERSION = "0.1.176";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -910,7 +910,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       let searchInserted = false;
       // ChatGPT only opens native mention suggestions for a focused editor in a
-      // focused document. Live 0.1.175 evidence: `@herdr` committed but no
+      // focused document. Live 0.1.176 evidence: `@herdr` committed but no
       // suggestion root of any kind appeared. Bring this task tab's window to
       // the foreground once before typing; no other tab is touched.
       if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
@@ -2525,6 +2525,15 @@ function normalizeHerdrMentionAlias(value) {
         || pending.generation < 1 || typeof pending.accepted_user_message_ref !== "string"
         || !pending.accepted_user_message_ref) return;
     const current = acceptedDispatchAssignments.get(registeredBrowserSessionRef);
+    // session.create records its assignment before the runtime synthesizes the
+    // dispatch, so dispatchId is still null. Adopt the runtime dispatch only
+    // when the accepted user message and generation match exactly.
+    if (current && !current.dispatchId
+        && current.acceptedUserMessageRef === pending.accepted_user_message_ref
+        && current.generation === pending.generation) {
+      acceptedDispatchAssignments.set(registeredBrowserSessionRef, { ...current, dispatchId: pending.dispatch_id });
+      return;
+    }
     if (!current) {
       acceptedDispatchAssignments.set(registeredBrowserSessionRef, {
         dispatchId: pending.dispatch_id,
@@ -2718,7 +2727,9 @@ function normalizeHerdrMentionAlias(value) {
   function maybeRefreshBrowserPendingDispatchAssignment() {
     const refresh = browserPendingDispatchRefresh;
     if (!refresh) return;
-    if (registeredBrowserSessionRef && acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+    // Satisfied only once the assignment carries the runtime dispatch identity.
+    if (registeredBrowserSessionRef
+        && /^bd_[0-9a-f]{64}$/.test(String(acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.dispatchId || ""))) {
       clearBrowserPendingDispatchRefresh(true);
       return;
     }
@@ -3304,7 +3315,7 @@ function normalizeHerdrMentionAlias(value) {
       restoreBrowserResultAssignment(response?.browser_pending_dispatch);
       if (browserSessionReservationRef && registeredBrowserSessionRef) {
         if (response?.browser_pending_dispatch
-            || acceptedDispatchAssignments.has(registeredBrowserSessionRef)) {
+            || /^bd_[0-9a-f]{64}$/.test(String(acceptedDispatchAssignments.get(registeredBrowserSessionRef)?.dispatchId || ""))) {
           clearBrowserPendingDispatchRefresh(true);
         } else {
           armBrowserPendingDispatchRefresh(browserSessionReservationRef);
