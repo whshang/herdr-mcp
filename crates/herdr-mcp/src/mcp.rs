@@ -5218,6 +5218,12 @@ fn browser_operation_call_with_controls(
                 "ok": false,
                 "code": code,
                 "readback_error": readback_error,
+                "retry_after_s": evidence
+                    .result
+                    .as_ref()
+                    .and_then(|value| value.get("readback_retry_after_s"))
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value <= 86_400),
                 "reason": reason,
                 "operation": operation.method(),
                 "session_ref": session_ref,

@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.186";
+const H2W_CONTENT_VERSION = "0.1.187";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2208,6 +2208,7 @@ function normalizeHerdrMentionAlias(value) {
     evidence.result = { error: "browser_archive_status_readback_unavailable" };
     const readbackError = String(readback?.reason || readback?.error || "");
     if (/^[a-z0-9_-]{1,48}$/.test(readbackError)) evidence.result.readback_error = readbackError;
+    if (Number.isSafeInteger(readback?.retryAfterS)) evidence.result.readback_retry_after_s = readback.retryAfterS;
     return evidence;
   }
 
@@ -3878,7 +3879,13 @@ function normalizeHerdrMentionAlias(value) {
         headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
         signal: controller.signal,
       });
-      if (!response.ok) return { ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status };
+      if (!response.ok) {
+        const retryAfter = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
+        return {
+          ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status,
+          retryAfterS: Number.isSafeInteger(retryAfter) && retryAfter >= 0 && retryAfter <= 86400 ? retryAfter : null,
+        };
+      }
       const body = await response.json();
       return { ok: true, body };
     } catch (error) {
