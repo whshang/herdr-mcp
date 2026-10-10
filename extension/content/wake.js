@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.161";
+const H2W_CONTENT_VERSION = "0.1.162";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -902,9 +902,19 @@ function normalizeHerdrMentionAlias(value) {
         candidates = ADAPTER.getComposerAppCandidates(app);
         if (candidates.length) break;
       } while (Date.now() < searchDeadline);
+      // Capture fixed-shape DOM diagnostics before any cleanup so a rejection
+      // carries evidence of why the native suggestion was not usable.
+      const probeAppSearch = () => (typeof ADAPTER.describeComposerAppSearch === 'function'
+        ? ADAPTER.describeComposerAppSearch(app)
+        : null);
       if (candidates.length !== 1) {
+        const probe = probeAppSearch();
         if (searchInserted) await clearComposer();
-        return { ok: false, error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found' };
+        return {
+          ok: false,
+          error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found',
+          app_selection_probe: probe,
+        };
       }
       candidates[0].click();
       const selectedDeadline = Date.now() + 2500;
@@ -914,8 +924,9 @@ function normalizeHerdrMentionAlias(value) {
       }
       if (!ADAPTER.getSelectedComposerApps().includes(app)
           || ADAPTER.getComposerTextWithoutAppPills() !== '') {
+        const probe = probeAppSearch();
         if (searchInserted) await clearComposer();
-        return { ok: false, error: 'required-app-selection-not-observed' };
+        return { ok: false, error: 'required-app-selection-not-observed', app_selection_probe: probe };
       }
     }
     const selected = ADAPTER.getSelectedComposerApps();
@@ -2173,7 +2184,11 @@ function normalizeHerdrMentionAlias(value) {
         if (creatingSession) {
           try { sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY); } catch (_) {}
         }
-        return { ...evidence, rejected: true, result: { error: appSelection.error } };
+        return {
+          ...evidence,
+          rejected: true,
+          result: { error: appSelection.error, app_selection_probe: appSelection.app_selection_probe || null },
+        };
       }
       evidence.required_apps_readback = appSelection.apps;
     }
