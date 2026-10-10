@@ -299,7 +299,19 @@ class ChatGPTAdapter extends BaseAdapter {
           const classes = String(fc.getAttribute('class') || '').split(/\s+/).filter((c) => /^[A-Za-z0-9_:\[\]./%-]{1,40}$/.test(c)).slice(0, 3);
           formChain.push(`${fc.tagName.toLowerCase()}|${names.join(',')}|${classes.join(' ')}|${String(fc.getAttribute('aria-label') || '').trim().toLowerCase() === wanted ? 'label=kw' : ''}`);
         }
+        // Editor-internal structure: tag, attribute names, and sanitized
+        // values of identity-like data attributes only (no text content).
+        const editorNodes = input ? [...input.querySelectorAll('*')].slice(0, 16).map((node) => {
+          const names = [...node.attributes].map((a) => a.name).filter((n) => /^[a-z-]{1,40}$/.test(n)).slice(0, 10);
+          const ids = [...node.attributes]
+            .filter((a) => /^data-(keyword|symbol|type|id|mention|app|kind|node-type|entity)/.test(a.name))
+            .map((a) => `${a.name}=${String(a.value || '').toLowerCase().replace(/[^a-z0-9_.:-]/g, '').slice(0, 40)}`)
+            .slice(0, 6);
+          return `${node.tagName.toLowerCase()}|${names.join(',')}|${ids.join(';')}|${String(node.textContent || '').trim().toLowerCase() === wanted ? 'kw' : ''}`;
+        }) : [];
         return {
+          editor_nodes: editorNodes,
+          editor_contains_exact_keyword: Boolean(input && String(input.textContent || '').replace(/\uFEFF/g, '').trim().toLowerCase() === wanted),
           exact_keyword_form_chain: formChain,
           visible_exact_keyword_text_nodes: clamp(exact.length),
           exact_keyword_ancestor_chain: chain,
