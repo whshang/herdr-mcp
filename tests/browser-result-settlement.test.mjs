@@ -602,7 +602,10 @@ test("session.create re-registers boundedly until its synthesized pending dispat
   assert.match(wakeSource, /until:\s*Date\.now\(\) \+ BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS/);
   assert.match(wakeSource, /refresh\.retryMs = Math\.min\(refresh\.retryMs \* 2, 30000\)/);
   assert.match(wakeSource, /registerCurrentConversation\("session-create-pending-dispatch"\)/);
-  assert.match(wakeSource, /response\?\.browser_pending_dispatch\s*\|\|\s*acceptedDispatchAssignments\.has\(registeredBrowserSessionRef\)/);
+  assert.match(wakeSource, /response\?\.browser_pending_dispatch\s*\|\|\s*\/\^bd_\[0-9a-f\]\{64\}\$\/\.test\(String\(acceptedDispatchAssignments\.get\(registeredBrowserSessionRef\)\?\.dispatchId/);
+  // A create assignment recorded before the runtime dispatch exists adopts it
+  // only on an exact accepted-message and generation match.
+  assert.match(wakeSource, /current && !current\.dispatchId\s*&& current\.acceptedUserMessageRef === pending\.accepted_user_message_ref\s*&& current\.generation === pending\.generation/);
   assert.match(wakeSource, /maybeRefreshBrowserPendingDispatchAssignment\(\);/);
 });
 
