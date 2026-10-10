@@ -352,6 +352,9 @@ pub enum WebChatCommand {
     DispatchStatus {
         dispatch_id: String,
     },
+    FanoutStatus {
+        work_chain_id: String,
+    },
     Open {
         session_ref: String,
         expected_generation: i64,

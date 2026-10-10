@@ -27,6 +27,14 @@ pub(super) fn parse_webchat(args: &[String]) -> Result<Command, String> {
         }
         Some("create") => parse_webchat_create(&args[1..]),
         Some("send") => parse_webchat_send(&args[1..]),
+        Some("dispatch-status") if args.get(1).map(String::as_str) == Some("--work-chain-id") => {
+            if args.len() != 3 || args[2].is_empty() {
+                return Err("webchat dispatch-status --work-chain-id requires <work_chain_id>".to_owned());
+            }
+            Ok(Command::WebChat(WebChatCommand::FanoutStatus {
+                work_chain_id: args[2].clone(),
+            }))
+        }
         Some("dispatch-status") => {
             if args.len() != 2 || args[1].is_empty() {
                 return Err("webchat dispatch-status requires <dispatch_id>".to_owned());

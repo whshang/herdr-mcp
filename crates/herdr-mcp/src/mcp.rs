@@ -3170,22 +3170,23 @@ fn browser_session_create_success(
     };
     // A create that names an existing work chain joins it before the worker can
     // settle, so the assistant turn lands in Work Memory without a parent race.
-    let work_chain_binding = params
-        .get("work_chain_id")
-        .and_then(Value::as_str)
-        .map(|work_chain_id| {
-            match store.bind_created_browser_session_work_chain(
-                work_chain_id,
-                &reservation.provider,
-                Some(reservation.account_ref.as_str()),
-                reservation.space_ref.as_deref(),
-                &session_ref,
-                browser_epoch_ms(),
-            ) {
-                Ok(continuity_id) => json!({"ok": true, "continuity_id": continuity_id}),
-                Err(code) => json!({"ok": false, "code": code}),
-            }
-        });
+    let work_chain_binding =
+        params
+            .get("work_chain_id")
+            .and_then(Value::as_str)
+            .map(|work_chain_id| {
+                match store.bind_created_browser_session_work_chain(
+                    work_chain_id,
+                    &reservation.provider,
+                    Some(reservation.account_ref.as_str()),
+                    reservation.space_ref.as_deref(),
+                    &session_ref,
+                    browser_epoch_ms(),
+                ) {
+                    Ok(continuity_id) => json!({"ok": true, "continuity_id": continuity_id}),
+                    Err(code) => json!({"ok": false, "code": code}),
+                }
+            });
     let (dispatch, work_memory_writeback) =
         match browser_created_session_dispatch(store, &reservation, params, caller_authorization) {
             Ok(value) => value,
@@ -5065,6 +5066,9 @@ fn browser_operation_call_with_controls(
             controls.caller_authorization,
         ),
         BrowserOperation::DispatchStatus => {
+            if let Some(work_chain_id) = params.get("work_chain_id").and_then(Value::as_str) {
+                return browser_work_chain_fanout_status(store, work_chain_id);
+            }
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
             browser_dispatch_status(store, dispatch_id, browser_actuator)
         }
@@ -5165,9 +5169,9 @@ fn browser_operation_call_with_controls(
 pub(crate) fn browser_reason_token_valid(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 96
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 /// Attach the extension's fixed refusal token (`reason`, else `error`) to a
@@ -5281,7 +5285,7 @@ fn validate_browser_operation_params(
             "work_chain_id",
             "lane_id",
         ],
-        BrowserOperation::DispatchStatus => &["dispatch_id"],
+        BrowserOperation::DispatchStatus => &["dispatch_id", "work_chain_id"],
         BrowserOperation::DispatchStop => {
             &["dispatch_id", "expected_generation", "idempotency_key"]
         }
@@ -5387,7 +5391,19 @@ fn validate_browser_operation_params(
             }
         }
         BrowserOperation::DispatchStatus => {
-            browser_required_string(params, "dispatch_id", 96)?;
+            // Exactly one selector: a single dispatch, or a work-chain fanout view.
+            match params.get("work_chain_id") {
+                Some(_) if params.get("dispatch_id").is_some() => {
+                    return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+                }
+                Some(_) => {
+                    let work_chain_id = browser_required_string(params, "work_chain_id", 64)?;
+                    validate_browser_work_chain_id(work_chain_id).map_err(browser_store_error)?;
+                }
+                None => {
+                    browser_required_string(params, "dispatch_id", 96)?;
+                }
+            }
         }
         BrowserOperation::DispatchStop => {
             browser_required_string(params, "dispatch_id", 96)?;
@@ -6112,6 +6128,66 @@ fn browser_dispatch_execution_state(
         | BrowserDeliveryState::ResourceUnavailable => Some("failed"),
         BrowserDeliveryState::Stopped => Some("stopped"),
     }
+}
+
+/// A dispatch still `submitted` this long after its last update is reported as
+/// `timeout` in the fanout view. Reporting only: nothing is retried or replayed.
+const BROWSER_FANOUT_TIMEOUT_MS: i64 = 10 * 60 * 1000;
+
+/// Parent-side fanout phase derived only from existing dispatch authorities.
+/// `tool_called` / `no_tool` are not observable from the ledger and are never
+/// guessed; the settled assistant turn in Work Memory is the evidence for them.
+fn browser_dispatch_fanout_phase(
+    dispatch: &crate::state_store::BrowserDispatchRecord,
+    now_ms: i64,
+) -> &'static str {
+    match browser_dispatch_execution_state(dispatch) {
+        Some("settled") => "completed",
+        Some("queued") => "accepted",
+        Some("submitted") if now_ms - dispatch.updated_at > BROWSER_FANOUT_TIMEOUT_MS => "timeout",
+        Some("submitted") => "started",
+        Some("stopped") => "stopped",
+        Some(_) if dispatch.delivery_state == BrowserDeliveryState::Rejected => "rejected",
+        Some(_) => "failed",
+        None => "uncertain",
+    }
+}
+
+fn browser_work_chain_fanout_status(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    work_chain_id: &str,
+) -> Value {
+    let Ok(guard) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let records = match guard.browser_dispatches_for_work_chain(work_chain_id, 100) {
+        Ok(records) => records,
+        Err(error) => return browser_store_error(error),
+    };
+    drop(guard);
+    let now = browser_epoch_ms();
+    let mut counts = serde_json::Map::new();
+    let dispatches = records
+        .into_iter()
+        .map(|dispatch| {
+            let phase = browser_dispatch_fanout_phase(&dispatch, now);
+            let entry = counts.entry(phase.to_owned()).or_insert(json!(0));
+            *entry = json!(entry.as_i64().unwrap_or(0) + 1);
+            json!({
+                "phase": phase,
+                "tool_call_evidence": "not_observable",
+                "dispatch": browser_dispatch_json(dispatch),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "ok": true,
+        "operation": BrowserOperation::DispatchStatus.method(),
+        "work_chain_id": work_chain_id,
+        "read_only": true,
+        "counts": counts,
+        "dispatches": dispatches,
+    })
 }
 
 fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) -> Value {
