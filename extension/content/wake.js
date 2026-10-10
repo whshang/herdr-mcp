@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.168";
+const H2W_CONTENT_VERSION = "0.1.169";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -905,7 +905,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       let searchInserted = false;
       // ChatGPT only opens native mention suggestions for a focused editor in a
-      // focused document. Live 0.1.168 evidence: `@herdr` committed but no
+      // focused document. Live 0.1.169 evidence: `@herdr` committed but no
       // suggestion root of any kind appeared. Bring this task tab's window to
       // the foreground once before typing; no other tab is touched.
       if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
@@ -924,6 +924,10 @@ function normalizeHerdrMentionAlias(value) {
       const selector = ADAPTER.getWatchMainWorldSelector();
       // Insert @ then the keyword as separate editor events so ChatGPT can
       // activate and filter its native mention suggestions.
+      // Buttons that already match before typing are never suggestion rows.
+      const suggestionBaseline = new Set(typeof ADAPTER.getComposerAppSuggestionButtons === 'function'
+        ? ADAPTER.getComposerAppSuggestionButtons(app)
+        : []);
       // Prefer trusted keystrokes (DEV only): ChatGPT opens its native mention
       // picker only for real key input. Fall back to editor insertion when the
       // trusted path is unavailable (store builds).
@@ -959,6 +963,10 @@ function normalizeHerdrMentionAlias(value) {
       do {
         await wait(100);
         candidates = ADAPTER.getComposerAppCandidates(app);
+        if (!candidates.length && typeof ADAPTER.getComposerAppSuggestionButtons === 'function') {
+          candidates = ADAPTER.getComposerAppSuggestionButtons(app)
+            .filter((button) => !suggestionBaseline.has(button));
+        }
         if (candidates.length) break;
       } while (Date.now() < searchDeadline);
       // Capture fixed-shape DOM diagnostics before any cleanup so a rejection
@@ -979,7 +987,19 @@ function normalizeHerdrMentionAlias(value) {
           } : probe,
         };
       }
-      candidates[0].click();
+      {
+        // Suggestion rows may act on mousedown (to keep editor focus), so emit
+        // the full pointer sequence on the single verified candidate.
+        const target = candidates[0];
+        const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
+        try {
+          target.dispatchEvent(new PointerEvent('pointerdown', opts));
+          target.dispatchEvent(new MouseEvent('mousedown', opts));
+          target.dispatchEvent(new PointerEvent('pointerup', opts));
+          target.dispatchEvent(new MouseEvent('mouseup', opts));
+        } catch (_) {}
+        if (target.isConnected) target.click();
+      }
       const selectedDeadline = Date.now() + 2500;
       while (Date.now() < selectedDeadline) {
         if (ADAPTER.getSelectedComposerApps().includes(app)) break;
