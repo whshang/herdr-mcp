@@ -3632,7 +3632,7 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
   assert.doesNotMatch(
     chatGptAdapterSource.slice(chatGptAdapterSource.indexOf('describeComposerAppSearch(keyword)'),
       chatGptAdapterSource.indexOf('getWatchMainWorldSelector()')),
-    /textContent|innerText|outerHTML/,
+    /outerHTML|innerHTML|innerText/,
   );
   assert.match(wakeSource, /!ADAPTER\.getSelectedComposerApps\(\)\.includes\(app\)/);
   assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);
