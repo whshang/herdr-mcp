@@ -3288,6 +3288,7 @@ fn browser_session_create_late_acceptance_readback(
                 "session_ref": session_ref,
                 "expected_generation": expected_generation,
                 "readback_accepted": true,
+                "required_apps": params.get("required_apps").cloned().unwrap_or(json!([])),
             }),
             expected_generation,
             Some(&reservation.endpoint_ref),
@@ -3299,10 +3300,13 @@ fn browser_session_create_late_acceptance_readback(
         .get("accepted_user_message_ref")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty() && value.len() <= 512)?;
-    let digest = result
-        .get("accepted_user_text_sha256")
-        .and_then(Value::as_str)?;
-    if digest != browser_sha256(message) {
+    // Match the exact create text, trimmed; the extension also reports the body
+    // with only the named required-App mention tokens removed.
+    let expected = browser_sha256(message.trim());
+    let matches = ["accepted_user_text_sha256", "accepted_user_body_sha256"]
+        .iter()
+        .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected.as_str()));
+    if !matches {
         return None;
     }
     let mut guard = store.lock().ok()?;
