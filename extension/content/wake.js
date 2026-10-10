@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.184";
+const H2W_CONTENT_VERSION = "0.1.185";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2096,10 +2096,18 @@ function normalizeHerdrMentionAlias(value) {
     }
     evidence.command_accepted = true;
     evidence.stable_resource_ref_observed = true;
-    const readback = await fetchChatGptConversation({
-      conversationId,
-      timeoutMs: 2500,
-    }).catch(() => ({ ok: false }));
+    // Late-acceptance readback runs right after a slow create, while the
+    // conversation may still be streaming; give it a longer bounded window
+    // and one retry. Plain archive-status keeps its short budget.
+    const lateReadback = params.readback_accepted === true;
+    let readback = null;
+    for (let attempt = 0; attempt < (lateReadback ? 2 : 1); attempt += 1) {
+      readback = await fetchChatGptConversation({
+        conversationId,
+        timeoutMs: lateReadback ? 10000 : 2500,
+      }).catch(() => ({ ok: false }));
+      if (readback?.ok) break;
+    }
     if (readback?.ok && typeof readback?.body?.is_archived === "boolean") {
       evidence.lifecycle_observed = true;
       evidence.result = {
@@ -2170,6 +2178,8 @@ function normalizeHerdrMentionAlias(value) {
     }
     evidence.lifecycle_observed = false;
     evidence.result = { error: "browser_archive_status_readback_unavailable" };
+    const readbackError = String(readback?.reason || readback?.error || "");
+    if (/^[a-z0-9_-]{1,48}$/.test(readbackError)) evidence.result.readback_error = readbackError;
     return evidence;
   }
 

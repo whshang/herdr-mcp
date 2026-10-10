@@ -3302,6 +3302,15 @@ fn browser_session_create_late_acceptance_readback(
         )
         .map_err(|_| "readback_actuation_failed")?;
     let result = evidence.result.as_ref().ok_or("readback_result_missing")?;
+    if result.get("error").is_some() {
+        return Err(match result.get("readback_error").and_then(Value::as_str) {
+            Some("timeout") => "readback_fetch_timeout",
+            Some("auth") => "readback_fetch_auth",
+            Some(value) if value.starts_with("http-4") => "readback_fetch_http_4xx",
+            Some(value) if value.starts_with("http-5") => "readback_fetch_http_5xx",
+            _ => "readback_fetch_unavailable",
+        });
+    }
     let accepted = result
         .get("accepted_user_message_ref")
         .and_then(Value::as_str)
