@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.165";
+const H2W_CONTENT_VERSION = "0.1.166";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -884,7 +884,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       let searchInserted = false;
       // ChatGPT only opens native mention suggestions for a focused editor in a
-      // focused document. Live 0.1.165 evidence: `@herdr` committed but no
+      // focused document. Live 0.1.166 evidence: `@herdr` committed but no
       // suggestion root of any kind appeared. Bring this task tab's window to
       // the foreground once before typing; no other tab is touched.
       if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
@@ -951,7 +951,11 @@ function normalizeHerdrMentionAlias(value) {
         return {
           ok: false,
           error: candidates.length ? 'required-app-ambiguous' : 'required-app-not-found',
-          app_selection_probe: probe,
+          app_selection_probe: probe ? {
+            ...probe,
+            // Fixed-vocabulary outcome of the trusted key path.
+            trusted_input: trusted.ok ? 'ok' : String(trusted.error || 'unknown').slice(0, 120),
+          } : probe,
         };
       }
       candidates[0].click();
