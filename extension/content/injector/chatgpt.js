@@ -248,6 +248,29 @@ class ChatGPTAdapter extends BaseAdapter {
         .filter((node) => visible(node) && !(input && input.contains(node))
           && String(node.getAttribute('data-keyword') || '').trim().toLowerCase() === wanted).length),
       candidate_count: clamp(input && wanted ? this.getComposerAppCandidates(wanted).length : 0),
+      ...(() => {
+        // Structure-only search for an unroled suggestion list: count visible
+        // leaf-ish elements outside the composer whose own text is exactly the
+        // keyword, and describe the first one's ancestors by tag/role/testid.
+        if (!wanted) return {};
+        const exact = [...document.querySelectorAll('body *')].filter((node) => {
+          if (!visible(node) || (input && input.contains(node)) || node.children.length > 3) return false;
+          return String(node.textContent || '').trim().toLowerCase() === wanted;
+        });
+        const chain = [];
+        let cur = exact[0] || null;
+        for (let i = 0; cur && i < 8; i += 1, cur = cur.parentElement) {
+          const testid = String(cur.getAttribute('data-testid') || '').replace(/[^a-z0-9_-]/gi, '').slice(0, 40);
+          chain.push([cur.tagName.toLowerCase(), cur.getAttribute('role') || '', testid,
+            cur.hasAttribute('data-radix-popper-content-wrapper') ? 'popper' : '',
+            /fixed|absolute/.test(getComputedStyle(cur).position) ? getComputedStyle(cur).position : ''].join('|'));
+        }
+        return {
+          visible_exact_keyword_text_nodes: clamp(exact.length),
+          exact_keyword_ancestor_chain: chain,
+          exact_keyword_in_composer_form: Boolean(exact[0] && input?.closest?.('form')?.contains(exact[0])),
+        };
+      })(),
     };
   }
 
