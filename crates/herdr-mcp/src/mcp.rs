@@ -5796,9 +5796,24 @@ fn browser_resource_account_ref(
     let parent = store
         .browser_resource(parent_ref)?
         .ok_or_else(|| "browser_resource_parent_not_found".to_owned())?;
+    // A session is only re-observed when its own tab registers, so after an
+    // extension reload a tab-less session lags its account/space generation.
+    // Grant scope is identity only (which account's grant applies); the
+    // operation still fences on its own expected generation. A session may lag
+    // its parent, never lead it; spaces stay exact.
+    let generation_ok = |child: i64, parent: i64| {
+        if resource.kind == "session" {
+            child <= parent
+        } else {
+            child == parent
+        }
+    };
     if parent.endpoint_ref != resource.endpoint_ref
         || parent.provider != resource.provider
-        || parent.observation_generation != resource.observation_generation
+        || !generation_ok(
+            resource.observation_generation,
+            parent.observation_generation,
+        )
     {
         return Err("browser_resource_scope_mismatch".to_owned());
     }
@@ -5815,7 +5830,11 @@ fn browser_resource_account_ref(
             if account.kind != "account"
                 || account.endpoint_ref != resource.endpoint_ref
                 || account.provider != resource.provider
-                || account.observation_generation != resource.observation_generation
+                || account.observation_generation != parent.observation_generation
+                || !generation_ok(
+                    resource.observation_generation,
+                    account.observation_generation,
+                )
             {
                 return Err("browser_resource_scope_mismatch".to_owned());
             }
