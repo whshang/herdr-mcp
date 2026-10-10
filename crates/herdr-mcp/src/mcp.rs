@@ -3306,7 +3306,21 @@ fn browser_session_create_late_acceptance_readback(
         .get("accepted_user_message_ref")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty() && value.len() <= 512)
-        .ok_or("readback_user_message_ambiguous_or_missing")?;
+        .ok_or_else(|| {
+            let counts = result.get("readback_user_counts");
+            let count = |key: &str| {
+                counts
+                    .and_then(|value| value.get(key))
+                    .and_then(Value::as_u64)
+            };
+            match (count("all"), count("visible")) {
+                (None, _) | (_, None) => "readback_user_counts_missing",
+                (Some(0), _) => "readback_no_user_message",
+                (Some(_), Some(0)) => "readback_no_visible_user_message",
+                (Some(_), Some(1)) => "readback_user_parts_unreadable",
+                _ => "readback_multiple_visible_user_messages",
+            }
+        })?;
     // Match the exact create text, trimmed; the extension also reports the body
     // with only the named required-App mention tokens removed.
     let expected = browser_sha256(message.trim());
