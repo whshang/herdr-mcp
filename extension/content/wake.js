@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.183";
+const H2W_CONTENT_VERSION = "0.1.184";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2112,11 +2112,19 @@ function normalizeHerdrMentionAlias(value) {
         // conversation's only user message id plus a digest of its text, so
         // the runtime can match it to the exact create message without resend.
         // More than one user message means the identity is ambiguous: omit.
-        const users = Object.values(readback.body.mapping || {})
+        // Live H1: ChatGPT also stores hidden user-role context nodes (for the
+        // selected App) next to the typed message, so count only visible text
+        // user messages, and hash only their string parts.
+        const allUsers = Object.values(readback.body.mapping || {})
           .map((node) => node?.message)
           .filter((message) => message?.author?.role === "user" && typeof message?.id === "string");
-        const parts = users.length === 1 && Array.isArray(users[0]?.content?.parts) ? users[0].content.parts : null;
-        if (parts && parts.every((part) => typeof part === "string")) {
+        const users = allUsers.filter((message) => message?.metadata?.is_visually_hidden_from_conversation !== true
+          && (message?.content?.content_type === "text" || message?.content?.content_type === "multimodal_text")
+          && Array.isArray(message?.content?.parts)
+          && message.content.parts.some((part) => typeof part === "string" && part.trim()));
+        evidence.result.readback_user_counts = { all: allUsers.length, visible: users.length };
+        const parts = users.length === 1 ? users[0].content.parts.filter((part) => typeof part === "string") : null;
+        if (parts && parts.length) {
           try {
             const hex = async (text) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))]
               .map((byte) => byte.toString(16).padStart(2, "0")).join("");
