@@ -3635,7 +3635,7 @@ test("ChatGPT required_apps selects a real composer app pill and fails closed on
     /outerHTML|innerHTML|innerText/,
   );
   assert.match(wakeSource, /!ADAPTER\.getSelectedComposerApps\(\)\.includes\(app\)/);
-  assert.match(wakeSource, /if \(searchInserted\) await clearComposer\(\)/);
+  assert.match(wakeSource, /if \(searchInserted\) await clearAutomationSearch\(app\)/);
   assert.match(wakeSource, /const requestedApps = Array\.isArray\(params\.required_apps\)/);
   assert.match(wakeSource, /if \(!registeredHerdrAppKeyword\) return \[\]/);
   assert.match(wakeSource, /const observedHerdrApps = ADAPTER\.name === "chatgpt" \? currentHerdrRequiredApps\(\) : \[\]/);

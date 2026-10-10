@@ -144,7 +144,10 @@ const probes = {
         || (source.wake.includes("await insertMainWorld('@', selector")
           && source.wake.includes("await insertMainWorld(app, selector, true)"))
       )
-      && source.wake.includes("if (searchInserted) await clearComposer()");
+      && (source.wake.includes("if (searchInserted) await clearComposer()")
+        // 0.1.168: cleanup removes only the automation-typed search text.
+        || (source.wake.includes("if (searchInserted) await clearAutomationSearch(app)")
+          && source.wake.includes("async function clearAutomationSearch(app)")));
   },
 
   manual_semantic_binding_identity(source) {
