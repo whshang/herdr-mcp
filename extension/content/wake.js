@@ -3364,6 +3364,14 @@ function normalizeHerdrMentionAlias(value) {
     try {
       const stored = sessionStorage.getItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
       browserSessionReservationRef = /^bsr_[0-9a-f]{64}$/.test(String(stored || "")) ? stored : null;
+      // A tab that already materialized a session and then moved (SPA) to a
+      // different conversation must not carry that create reservation onto
+      // the new conversation (live: G1's tab on E1 never rebound to E1).
+      if (browserSessionReservationRef && registeredBrowserSessionRef
+          && registeredConvKey !== null && registeredConvKey !== convKey) {
+        sessionStorage.removeItem(BROWSER_SESSION_RESERVATION_STORAGE_KEY);
+        browserSessionReservationRef = null;
+      }
     } catch (_) {}
     const browserAppKeywords = ADAPTER.name === "chatgpt"
       && typeof ADAPTER.getLatestUserAppKeywords === "function"
