@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.172";
+const H2W_SCRIPT_VERSION = "0.1.173";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -945,7 +945,7 @@ async function probeChatGptPerfTab(tabId) {
           if (typeof input.value === "string" && input.tagName !== "DIV") composerText = input.value;
           else {
             const clone = input.cloneNode(true);
-            for (const node of clone.querySelectorAll?.('[data-inline-selection-pill],[contenteditable="false"]') || []) node.remove();
+            for (const node of clone.querySelectorAll?.('[data-inline-selection-pill],[contenteditable="false"],span[data-appearance="inline-mention"][app-mention-name]') || []) node.remove();
             composerText = clone.textContent || "";
           }
         }

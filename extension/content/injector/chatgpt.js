@@ -125,7 +125,27 @@ class ChatGPTAdapter extends BaseAdapter {
       const keyword = String(pill.getAttribute('data-keyword') || '').trim().toLowerCase();
       if (keyword) selected.add(keyword);
     }
+    for (const keyword of this.getInlineAppMentionKeywords(input)) selected.add(keyword);
     return [...selected];
+  }
+
+  // Current ChatGPT composer (live 0.1.172 evidence): a selected App is an
+  // inline span with data-appearance="inline-mention" carrying provider-owned
+  // app-mention-name and app-mention-path attributes. Identity is the exact
+  // app-mention-name; a path is required so plain text can never qualify.
+  getInlineAppMentionNodes(root) {
+    if (!root) return [];
+    return [...root.querySelectorAll('span[data-appearance="inline-mention"][app-mention-name][app-mention-path]')]
+      .filter((node) => String(node.getAttribute('app-mention-path') || '').trim() !== '');
+  }
+
+  getInlineAppMentionKeywords(root) {
+    const out = new Set();
+    for (const node of this.getInlineAppMentionNodes(root)) {
+      const name = String(node.getAttribute('app-mention-name') || '').trim().toLowerCase();
+      if (/^[a-z0-9_-]{1,64}$/.test(name)) out.add(name);
+    }
+    return [...out];
   }
 
   getLatestUserAppKeywords(latestUser = null) {
@@ -139,6 +159,7 @@ class ChatGPTAdapter extends BaseAdapter {
       const keyword = String(pill.getAttribute('data-keyword') || '').trim().toLowerCase();
       if (keyword) selected.add(keyword);
     }
+    for (const keyword of this.getInlineAppMentionKeywords(latest)) selected.add(keyword);
     return [...selected];
   }
 
@@ -149,6 +170,7 @@ class ChatGPTAdapter extends BaseAdapter {
     for (const node of clone.querySelectorAll('[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]')) {
       node.remove();
     }
+    for (const node of this.getInlineAppMentionNodes(clone)) node.remove();
     return String(clone.textContent || '').replace(/\uFEFF/g, '').trim();
   }
 
@@ -257,6 +279,9 @@ class ChatGPTAdapter extends BaseAdapter {
       composer_is_prompt_textarea: input?.id === 'prompt-textarea',
       search_text_committed: Boolean(wanted) && plain === `@${wanted}`,
       selected_pill_count: clamp(input ? input.querySelectorAll('[data-inline-selection-pill]').length : 0),
+      inline_mention_count: clamp(input ? this.getInlineAppMentionNodes(input).length : 0),
+      inline_mention_names: input ? this.getInlineAppMentionKeywords(input).slice(0, 5) : [],
+      inline_mention_paths: input ? this.getInlineAppMentionNodes(input).slice(0, 3).map((n) => String(n.getAttribute('app-mention-path') || '').toLowerCase().replace(/[^a-z0-9_.:\/-]/g, '').slice(0, 80)) : [],
       composer_aria_expanded: input?.getAttribute?.('aria-expanded') === 'true',
       composer_aria_controls_present: Boolean(controlsId),
       composer_aria_controls_visible: visible(controlsTarget),

@@ -4228,3 +4228,11 @@ test("user still fails closed after source recovery | Given source affinity fall
   assert.equal(failure.evidence.result?.error, "browser_create_scope_unavailable");
   assert.equal(harness.actuationMessages.length, 0);
 });
+
+test('ChatGPT inline-mention App pill is recognised only with provider identity attributes', () => {
+  const adapter = readFileSync(new URL('../extension/content/injector/chatgpt.js', import.meta.url), 'utf8');
+  assert.match(adapter, /span\[data-appearance="inline-mention"\]\[app-mention-name\]\[app-mention-path\]/);
+  assert.match(adapter, /for \(const keyword of this\.getInlineAppMentionKeywords\(input\)\) selected\.add\(keyword\);/);
+  assert.match(adapter, /for \(const node of this\.getInlineAppMentionNodes\(clone\)\) node\.remove\(\);/);
+  assert.match(adapter, /\^\[a-z0-9_-\]\{1,64\}\$/);
+});
