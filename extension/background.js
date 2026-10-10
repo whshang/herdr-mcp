@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.180";
+const H2W_SCRIPT_VERSION = "0.1.181";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -4057,7 +4057,29 @@ async function handleBrowserActuation(command) {
     }
     let tabOpen = null;
     try { tabOpen = await chrome.tabs.get(targetOpen.tabId); } catch (_) {}
-    const liveOpen = browserConversationInfo(providerOpen, tabOpen?.url || "");
+    let liveOpen = browserConversationInfo(providerOpen, tabOpen?.url || "");
+    if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
+      // Stale target (the tab navigated away or closed). Drop it and re-resolve
+      // once through the existing exact recovery; only an exact live match on
+      // the same generation proceeds, anything else stays unavailable.
+      browserSessionTargets.delete(sessionRefOpen);
+      const repaired = await recoverBrowserSessionTarget(sessionRefOpen, expectedGeneration, providerOpen)
+        .catch(() => ({ target: null }));
+      const repairedTarget = repaired?.target;
+      let repairedTab = null;
+      if (repairedTarget?.tabId) {
+        try { repairedTab = await chrome.tabs.get(repairedTarget.tabId); } catch (_) {}
+      }
+      const repairedLive = browserConversationInfo(providerOpen, repairedTab?.url || "");
+      if (repairedTab
+          && repairedTarget.observationGeneration === expectedGeneration
+          && repairedTarget.provider === providerOpen
+          && repairedLive?.conversation_id === repairedTarget.conversationId) {
+        targetOpen = repairedTarget;
+        tabOpen = repairedTab;
+        liveOpen = repairedLive;
+      }
+    }
     if (!tabOpen || liveOpen?.conversation_id !== targetOpen.conversationId) {
       browserSessionTargets.delete(sessionRefOpen);
       await postBrowserActuationEvidence(
