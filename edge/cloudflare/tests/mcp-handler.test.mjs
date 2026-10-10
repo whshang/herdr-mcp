@@ -1767,7 +1767,7 @@ function pageScopedGrantDeps() {
   });
 }
 
-test("site-adapter page-scoped methods carry only the routed device's Page Assist grant", async () => {
+test("user runs an X site command | Given Page Assist grants on two devices | When herdr_mcp.x.search.posts is routed to one device | Then only that device's Page Assist grant is forwarded and no WebChat control grant", async () => {
   const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
   for (const method of ["herdr_mcp.x.search.posts", "herdr_mcp.bilibili.video.transcript", "herdr_mcp.doubao.image.status"]) {
     assert.ok(PAGE_SCOPED_LOCAL_METHODS.includes(method), `${method} is page-scoped`);
@@ -1799,7 +1799,7 @@ test("site-adapter page-scoped methods carry only the routed device's Page Assis
   assert.equal(d.calls[0].trace?.webchat_control_grants, undefined, "site method gets no WebChat control grants");
 });
 
-test("non-page methods never carry Page Assist grants", async () => {
+test("user lists browser endpoints | Given a connector with Page Assist grants | When a non-page method is forwarded | Then no Page Assist grant is attached", async () => {
   const d = pageScopedGrantDeps();
   const res = await handleMcp(
     req(2, "tools/call", {
@@ -1814,7 +1814,7 @@ test("non-page methods never carry Page Assist grants", async () => {
   assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
 });
 
-test("page-scoped method list matches runtime method constants", async () => {
+test("user relies on page-scoped grant forwarding | Given the Edge page-scoped method list | When it is compared with runtime method constants | Then every listed method exists in the runtime", async () => {
   const { readFileSync } = await import("node:fs");
   const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
   const rust = readFileSync(new URL("../../../crates/herdr-mcp/src/progressive_skills.rs", import.meta.url), "utf8");
