@@ -206,7 +206,7 @@ function observationHarness({
     "registeredBrowserSessionRef", "registeredBrowserGeneration", "registeredConvKey",
     "acceptedDispatchAssignments", "sendBg", "ADAPTER", "fetchChatGptConversationSnapshot",
     "chatGptDomTurnSequence", "isTurnInProgress", "Date", "setInterval", "document", "window", "recovered",
-    `${settlementSource}\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
+    `${settlementSource}\nconst maybeRefreshBrowserPendingDispatchAssignment = () => {};\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
   )("br_worker", 7, route, assignments, async (payload) => {
     sent.push(payload);
     return sends.shift() || { ok: true };
@@ -614,4 +614,15 @@ test("persistent identity rejection stops retries but a new assignment can proce
   h.assignments.set("br_worker", { dispatchId: `bd_${"b".repeat(64)}`, generation: 7, acceptedUserMessageRef: "user-2", reportedAssistantRef: null });
   assert.equal(await h.observe(), true);
   assert.equal(h.sent.length, 4);
+});
+
+test("hidden session.create worker tabs still refresh their pending dispatch identity", () => {
+  const route = wakeSource.slice(wakeSource.indexOf("  function startConversationRouteWatch() {"));
+  const refreshAt = route.indexOf("maybeRefreshBrowserPendingDispatchAssignment();");
+  const hiddenAt = route.indexOf("if (document.hidden) return;");
+  assert.ok(refreshAt > 0 && hiddenAt > refreshAt, "refresh must run before the hidden-tab early return");
+  const fn = wakeSource.slice(wakeSource.indexOf("  function maybeRefreshBrowserPendingDispatchAssignment() {"),
+    wakeSource.indexOf("  function scheduleDurableArchiveRetryWake("));
+  assert.doesNotMatch(fn, /document\.hidden/);
+  assert.match(fn, /Date\.now\(\) >= refresh\.until/);
 });

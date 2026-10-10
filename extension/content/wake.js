@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.173";
+const H2W_CONTENT_VERSION = "0.1.174";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -910,7 +910,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       let searchInserted = false;
       // ChatGPT only opens native mention suggestions for a focused editor in a
-      // focused document. Live 0.1.173 evidence: `@herdr` committed but no
+      // focused document. Live 0.1.174 evidence: `@herdr` committed but no
       // suggestion root of any kind appeared. Bring this task tab's window to
       // the foreground once before typing; no other tab is touched.
       if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
@@ -2726,7 +2726,10 @@ function normalizeHerdrMentionAlias(value) {
       clearBrowserPendingDispatchRefresh(true);
       return;
     }
-    if (document.hidden || refresh.inFlight || Date.now() < refresh.nextAt) return;
+    // Worker tabs created by session.create are background tabs by design, so
+    // this bounded (5 min, backoff to 30s) refresh must not wait for visibility;
+    // otherwise the result observer never learns its dispatch identity.
+    if (refresh.inFlight || Date.now() < refresh.nextAt) return;
     refresh.inFlight = true;
     refresh.nextAt = Date.now() + refresh.retryMs;
     refresh.retryMs = Math.min(refresh.retryMs * 2, 30000);
@@ -3341,8 +3344,8 @@ function normalizeHerdrMentionAlias(value) {
     // negligible compared with the existing 5s HUD reconciliation interval.
     setInterval(() => {
       void observeBrowserResultSettlement().catch(() => {});
-      if (document.hidden) return;
       maybeRefreshBrowserPendingDispatchAssignment();
+      if (document.hidden) return;
       const convKey = ADAPTER.getConversationKey();
       const observedApps = ADAPTER.name === "chatgpt"
         && registeredConversationBound
