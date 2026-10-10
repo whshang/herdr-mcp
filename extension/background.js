@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.182";
+const H2W_SCRIPT_VERSION = "0.1.183";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -7647,7 +7647,7 @@ async function loadBrowserPages() {
     }
     try {
       const stored = (await storageArea.get(BROWSER_PAGE_SESSION_STORAGE_KEY))[BROWSER_PAGE_SESSION_STORAGE_KEY];
-      const records = Array.isArray(stored) ? stored : [];
+      const records = Array.isArray(stored) ? stored : await restoreBrowserPagesAfterReload();
       for (const raw of records.slice(-BROWSER_PAGE_MAX_RECORDS)) {
         const record = normalizeBrowserPageRecord(raw);
         if (record) browserPagesByRef.set(record.page_ref, record);
@@ -7660,6 +7660,38 @@ async function loadBrowserPages() {
   } finally {
     browserPagesLoadPromise = null;
   }
+}
+
+// chrome.storage.session is wiped when the extension reloads, which dropped
+// every page_ref (claimed and owned) mid-task. Mirror the records to local
+// storage and, only when the session copy is absent, rebind a record if its
+// exact tab still exists on the same origin and (for claims) the same
+// conversation identity. Browser restart clears the mirror (tab ids reset).
+const BROWSER_PAGE_RELOAD_MIRROR_KEY = `${BROWSER_PAGE_SESSION_STORAGE_KEY}_reload_mirror`;
+
+async function restoreBrowserPagesAfterReload() {
+  const local = chrome.storage?.local;
+  if (!local?.get) return [];
+  let mirror = [];
+  try {
+    const value = (await local.get(BROWSER_PAGE_RELOAD_MIRROR_KEY))[BROWSER_PAGE_RELOAD_MIRROR_KEY];
+    mirror = Array.isArray(value) ? value : [];
+  } catch (_) {
+    return [];
+  }
+  const restored = [];
+  for (const raw of mirror.slice(-BROWSER_PAGE_MAX_RECORDS)) {
+    const record = normalizeBrowserPageRecord(raw);
+    if (!record) continue;
+    let tab = null;
+    try { tab = await chrome.tabs.get(record.tab_id); } catch (_) {}
+    if (!tab?.url || browserPageOrigin(tab.url) !== record.origin) continue;
+    const liveKey = browserPageClaimKey(tab.url);
+    if (record.ownership === "claimed"
+        && (!liveKey || liveKey !== browserPageClaimKey(record.canonical_url))) continue;
+    restored.push(raw);
+  }
+  return restored;
 }
 
 async function persistBrowserPages() {
@@ -7682,6 +7714,7 @@ async function persistBrowserPages() {
   } catch (_) {
     return false;
   }
+  try { await chrome.storage?.local?.set?.({ [BROWSER_PAGE_RELOAD_MIRROR_KEY]: records }); } catch (_) {}
   const retained = new Set(records.map((record) => record.page_ref));
   for (const record of allRecords) {
     if (record.ownership === "claimed" && !retained.has(record.page_ref)) {
@@ -11308,7 +11341,11 @@ async function ensureAlive(preloaded, runtimeState = null) {
 
 // ---- Install, browser startup, and every service-worker startup ----
 // MV3 can restart the worker without onInstalled/onStartup, so rebuild at module scope.
-chrome.runtime.onStartup.addListener(() => { void rebuildStreams(); });
+chrome.runtime.onStartup.addListener(() => {
+  // Browser restart resets tab ids; drop the reload-only page mirror.
+  try { void chrome.storage?.local?.remove?.(BROWSER_PAGE_RELOAD_MIRROR_KEY); } catch (_) {}
+  void rebuildStreams();
+});
 chrome.runtime.onInstalled.addListener((details) => {
   void rebuildStreams();
   // Chrome treats a Developer Mode Reload of an unpacked extension as an
