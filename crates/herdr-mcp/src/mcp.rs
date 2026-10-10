@@ -5762,8 +5762,16 @@ fn browser_resource_actuation_decision(
     else {
         return Ok((false, Some("capability_unknown")));
     };
+    // session.open is how a tab-less session that lagged behind an extension
+    // reload is re-observed, so it alone may target an older session record,
+    // and only with the current provider generation as its expected value.
+    let lagging_open = capability_operation == "session.open"
+        && resource.kind == "session"
+        && resource.observation_generation < provider_state.observation_generation
+        && expected_generation == Some(provider_state.observation_generation);
     if expected_generation.is_some_and(|value| value != provider_state.observation_generation)
-        || resource.observation_generation != provider_state.observation_generation
+        || (resource.observation_generation != provider_state.observation_generation
+            && !lagging_open)
     {
         return Ok((false, Some("stale_capability_generation")));
     }
