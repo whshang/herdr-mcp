@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.179";
+const H2W_CONTENT_VERSION = "0.1.180";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -2107,6 +2107,25 @@ function normalizeHerdrMentionAlias(value) {
         archive_state: readback.body.is_archived ? "archived" : "active",
         readback_source: "conversation",
       };
+      if (params.readback_accepted === true) {
+        // Late-acceptance readback for an uncertain session.create: report the
+        // conversation's only user message id plus a digest of its text, so
+        // the runtime can match it to the exact create message without resend.
+        // More than one user message means the identity is ambiguous: omit.
+        const users = Object.values(readback.body.mapping || {})
+          .map((node) => node?.message)
+          .filter((message) => message?.author?.role === "user" && typeof message?.id === "string");
+        const parts = users.length === 1 && Array.isArray(users[0]?.content?.parts) ? users[0].content.parts : null;
+        if (parts && parts.every((part) => typeof part === "string")) {
+          try {
+            const bytes = new TextEncoder().encode(parts.join(""));
+            const digest = await crypto.subtle.digest("SHA-256", bytes);
+            evidence.result.accepted_user_message_ref = users[0].id;
+            evidence.result.accepted_user_text_sha256 = [...new Uint8Array(digest)]
+              .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+          } catch (_) {}
+        }
+      }
       return evidence;
     }
     const archivedList = await fetchChatGptArchivedConversationList({

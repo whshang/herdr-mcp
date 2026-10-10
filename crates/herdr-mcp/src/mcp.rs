@@ -3262,6 +3262,61 @@ fn browser_session_create_reconcile_evidence(
     Ok(None)
 }
 
+/// Late acceptance for an `uncertain` materialized create: read back (never
+/// resend) the new conversation's only user message. It is adopted only when
+/// its text digest equals this create's exact message digest; anything else
+/// stays `uncertain`.
+fn browser_session_create_late_acceptance_readback(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    reservation: &BrowserSessionReservationRecord,
+    params: &Value,
+    actuator: &dyn BrowserActuator,
+    expected_generation: i64,
+) -> Option<BrowserSessionReservationRecord> {
+    if reservation.state != "materialized"
+        || reservation.delivery_state != BrowserDeliveryState::Uncertain.as_str()
+        || reservation.accepted_user_message_ref.is_some()
+    {
+        return None;
+    }
+    let session_ref = reservation.session_ref.as_deref()?;
+    let message = params.get("message").and_then(Value::as_str)?;
+    let evidence = actuator
+        .actuate_for_endpoint(
+            BROWSER_SESSION_ARCHIVE_STATUS_METHOD,
+            &json!({
+                "session_ref": session_ref,
+                "expected_generation": expected_generation,
+                "readback_accepted": true,
+            }),
+            expected_generation,
+            Some(&reservation.endpoint_ref),
+            None,
+        )
+        .ok()?;
+    let result = evidence.result.as_ref()?;
+    let accepted = result
+        .get("accepted_user_message_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512)?;
+    let digest = result
+        .get("accepted_user_text_sha256")
+        .and_then(Value::as_str)?;
+    if digest != browser_sha256(message) {
+        return None;
+    }
+    let mut guard = store.lock().ok()?;
+    guard
+        .update_browser_session_reservation_delivery(
+            &reservation.reservation_ref,
+            expected_generation,
+            BrowserDeliveryState::Applied,
+            Some(accepted),
+            browser_epoch_ms(),
+        )
+        .ok()
+}
+
 fn browser_session_create_reconcile_uncertain(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     reservation: &BrowserSessionReservationRecord,
@@ -3302,6 +3357,28 @@ fn browser_session_create_reconcile_uncertain(
         }
         current
     };
+
+    if let Some(actuator) = actuator
+        && let Some(promoted) = browser_session_create_late_acceptance_readback(
+            store,
+            &current,
+            params,
+            actuator,
+            expected_generation,
+        )
+    {
+        let Ok(mut guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        return browser_session_create_success(
+            &mut guard,
+            &promoted.reservation_ref,
+            params,
+            replayed,
+            true,
+            caller_authorization,
+        );
+    }
 
     let Some(actuator) = actuator else {
         let Ok(guard) = store.lock() else {
