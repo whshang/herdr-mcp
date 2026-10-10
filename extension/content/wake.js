@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.170";
+const H2W_CONTENT_VERSION = "0.1.171";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -865,7 +865,12 @@ function normalizeHerdrMentionAlias(value) {
   // Remove only the `@<app>` search text this automation typed, and wait until
   // the editor model is empty so ChatGPT does not persist it as a Project draft.
   async function clearAutomationSearch(app) {
-    const ours = () => ADAPTER.getComposerTextWithoutAppPills().toLowerCase() === `@${app}`;
+    // The composer was verified empty before typing, so `@<app>` (search) or
+    // `<app>` (a consumed suggestion without a recognised pill) is ours.
+    const ours = () => {
+      const text = ADAPTER.getComposerTextWithoutAppPills().toLowerCase();
+      return text === `@${app}` || text === app;
+    };
     if (ours()) {
       await new Promise((resolve) => {
         try {
@@ -905,7 +910,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       let searchInserted = false;
       // ChatGPT only opens native mention suggestions for a focused editor in a
-      // focused document. Live 0.1.170 evidence: `@herdr` committed but no
+      // focused document. Live 0.1.171 evidence: `@herdr` committed but no
       // suggestion root of any kind appeared. Bring this task tab's window to
       // the foreground once before typing; no other tab is touched.
       if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
