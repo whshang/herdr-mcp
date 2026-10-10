@@ -287,7 +287,20 @@ class ChatGPTAdapter extends BaseAdapter {
             cur.hasAttribute('data-radix-popper-content-wrapper') ? 'popper' : '',
             /fixed|absolute/.test(getComputedStyle(cur).position) ? getComputedStyle(cur).position : ''].join('|'));
         }
+        // Structure of an exact-keyword node inside the composer form but
+        // outside the editor (a possible attachment chip): attribute names,
+        // up to three class tokens, and whether aria-label equals the keyword.
+        const form = input?.closest?.('form');
+        const inForm = form ? exact.find((node) => form.contains(node)) : null;
+        const formChain = [];
+        let fc = inForm || null;
+        for (let i = 0; fc && fc !== form && i < 7; i += 1, fc = fc.parentElement) {
+          const names = [...fc.attributes].map((a) => a.name).filter((n) => /^[a-z-]{1,40}$/.test(n)).slice(0, 12);
+          const classes = String(fc.getAttribute('class') || '').split(/\s+/).filter((c) => /^[A-Za-z0-9_:\[\]./%-]{1,40}$/.test(c)).slice(0, 3);
+          formChain.push(`${fc.tagName.toLowerCase()}|${names.join(',')}|${classes.join(' ')}|${String(fc.getAttribute('aria-label') || '').trim().toLowerCase() === wanted ? 'label=kw' : ''}`);
+        }
         return {
+          exact_keyword_form_chain: formChain,
           visible_exact_keyword_text_nodes: clamp(exact.length),
           exact_keyword_ancestor_chain: chain,
           exact_keyword_in_composer_form: Boolean(exact[0] && input?.closest?.('form')?.contains(exact[0])),
