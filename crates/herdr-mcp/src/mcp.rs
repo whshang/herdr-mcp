@@ -4505,11 +4505,15 @@ fn browser_session_open(
             Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
             Err(error) => return browser_store_error(error),
         };
-        if session.observation_generation != expected_generation {
+        // A session lagging an extension reload is reopened at the current
+        // generation (the actuation decision fences expected == provider);
+        // its locator must still belong to the session's own observation.
+        if session.observation_generation > expected_generation {
             return json!({"ok": false, "code": "stale_capability_generation"});
         }
+        let session_generation = session.observation_generation;
         let canonical_url = match guard.browser_resource_locator(session_ref) {
-            Ok(Some(locator)) if locator.observation_generation == expected_generation => {
+            Ok(Some(locator)) if locator.observation_generation == session_generation => {
                 Some(locator.canonical_url)
             }
             Ok(Some(_)) => return json!({"ok": false, "code": "stale_capability_generation"}),
