@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.174";
+const H2W_CONTENT_VERSION = "0.1.175";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -910,7 +910,7 @@ function normalizeHerdrMentionAlias(value) {
       }
       let searchInserted = false;
       // ChatGPT only opens native mention suggestions for a focused editor in a
-      // focused document. Live 0.1.174 evidence: `@herdr` committed but no
+      // focused document. Live 0.1.175 evidence: `@herdr` committed but no
       // suggestion root of any kind appeared. Bring this task tab's window to
       // the foreground once before typing; no other tab is touched.
       if (typeof document.hasFocus === 'function' && !document.hasFocus()) {
@@ -3340,12 +3340,26 @@ function normalizeHerdrMentionAlias(value) {
   }
 
   function startConversationRouteWatch() {
+    let hiddenRouteRegistrationInFlight = false;
     // One second is fast enough for UI binding while keeping route detection
     // negligible compared with the existing 5s HUD reconciliation interval.
     setInterval(() => {
       void observeBrowserResultSettlement().catch(() => {});
       maybeRefreshBrowserPendingDispatchAssignment();
-      if (document.hidden) return;
+      if (document.hidden) {
+        // A session.create worker is a background tab whose URL moves from the
+        // new-chat route to /c/<id> after submit. Re-register on that route
+        // change even while hidden, or the result observer stays bound to the
+        // stale key and the dispatch never settles. One registration at a time.
+        const hiddenKey = ADAPTER.getConversationKey();
+        if (hiddenKey && hiddenKey !== registeredConvKey && !hiddenRouteRegistrationInFlight) {
+          hiddenRouteRegistrationInFlight = true;
+          void registerCurrentConversation("poll-hidden")
+            .catch(() => {})
+            .finally(() => { hiddenRouteRegistrationInFlight = false; });
+        }
+        return;
+      }
       const convKey = ADAPTER.getConversationKey();
       const observedApps = ADAPTER.name === "chatgpt"
         && registeredConversationBound

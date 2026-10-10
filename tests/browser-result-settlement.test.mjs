@@ -626,3 +626,12 @@ test("hidden session.create worker tabs still refresh their pending dispatch ide
   assert.doesNotMatch(fn, /document\.hidden/);
   assert.match(fn, /Date\.now\(\) >= refresh\.until/);
 });
+
+test("hidden worker tabs re-register when the create route moves to the concrete conversation", () => {
+  const route = wakeSource.slice(wakeSource.indexOf("  function startConversationRouteWatch() {"),
+    wakeSource.indexOf("  function assistantSignature("));
+  const hidden = route.slice(route.indexOf("if (document.hidden) {"), route.indexOf("const convKey = ADAPTER.getConversationKey();"));
+  assert.match(hidden, /hiddenKey !== registeredConvKey && !hiddenRouteRegistrationInFlight/);
+  assert.match(hidden, /registerCurrentConversation\("poll-hidden"\)/);
+  assert.doesNotMatch(hidden, /ensureQueuedInsertButton|app-identity/);
+});
