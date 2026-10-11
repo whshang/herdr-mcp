@@ -317,3 +317,15 @@ test("user sends to a reloaded Claude chat | Given an idle transcript while an u
   h.set('[data-testid="transcript-row"]', [streamingRow]);
   assert.equal(h.adapter.isGenerationInProgress(), true);
 });
+
+test("user sends to a reloaded Claude chat | Given virtualized rows out of DOM order and a lazy aria-busy marker on the idle newest turn | When generation progress is checked | Then the highest data-index row decides and aria-busy alone is not busy", () => {
+  const h = harness();
+  h.set('[data-is-streaming="true"]', []);
+  const newest = element({ attrs: { "data-index": "9", "data-perf-row": "assistant", "data-perf-row-streaming": "false" } });
+  newest.querySelectorAll = () => [];
+  const olderStreamingLooking = element({ attrs: { "data-index": "3", "data-perf-row": "assistant", "data-perf-row-streaming": "true" } });
+  olderStreamingLooking.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [newest, olderStreamingLooking]);
+  h.set('[aria-busy="true"]', [element({ attrs: { "aria-busy": "true" } })]);
+  assert.equal(h.adapter.isGenerationInProgress(), false);
+});
