@@ -3,6 +3,18 @@
 
 export const DEFAULT_JEV_THRESHOLD = 0.80;
 
+/**
+ * A usable head probability is a JSON number inside [0, 1]. Anything else — null,
+ * missing, a string, a boolean, NaN, or out of range — is malformed provider
+ * output, and malformed output must fail closed to the deterministic path instead
+ * of becoming a decision (`Number(null)` would otherwise read as 0 = false/done).
+ */
+function probabilityValue(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1
+    ? value
+    : null;
+}
+
 function triStateNoul(probability, threshold) {
   if (probability >= threshold) return "true";
   const negativeThreshold = 1 - threshold;
@@ -135,8 +147,8 @@ export function interpretJevGoalSemanticAnswer(payload, threshold = DEFAULT_JEV_
   const t = normalizeJevJudgeThreshold(threshold);
   const probabilities = {};
   for (const key of JEV_GOAL_SIGNAL_KEYS) {
-    const p = Number(payload?.answers?.[key]?.noul);
-    if (!Number.isFinite(p) || p < 0 || p > 1) {
+    const p = probabilityValue(payload?.answers?.[key]?.noul);
+    if (p === null) {
       return { ok: false, reason: "bad_response", probabilities: null, strong: [] };
     }
     probabilities[key] = p;
@@ -158,15 +170,12 @@ export function interpretJevGoalSemanticAnswer(payload, threshold = DEFAULT_JEV_
 }
 
 export function interpretJevPendingWorkAnswer(payload, threshold = DEFAULT_JEV_THRESHOLD) {
-  const p = Number(payload?.answers?.has_unfinished_work?.noul);
-  if (!Number.isFinite(p) || p < 0 || p > 1) {
+  const p = probabilityValue(payload?.answers?.has_unfinished_work?.noul);
+  if (p === null) {
     return { ok: false, reason: "bad_response", probability: null, signal: "unknown" };
   }
   const t = normalizeJevJudgeThreshold(threshold);
-  const optionalNoul = (key) => {
-    const value = Number(payload?.answers?.[key]?.noul);
-    return Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
-  };
+  const optionalNoul = (key) => probabilityValue(payload?.answers?.[key]?.noul);
   return {
     ok: true,
     probability: p,
