@@ -2253,6 +2253,46 @@ fn browser_evidence_machine_reason(
     Ok(Some(reason.to_owned()))
 }
 
+/// Diagnostic composer busy probe from the extension, reduced to the known
+/// counts/booleans. Page text never crosses this boundary.
+fn browser_composer_busy_probe(evidence: &BrowserPostconditionEvidence) -> Value {
+    const BOOLS: &[&str] = &[
+        "input_mounted",
+        "input_has_content",
+        "input_text_equals_placeholder",
+        "input_has_placeholder_node",
+        "stop_control",
+        "assistant_streaming",
+        "assistant_tools_in_progress",
+        "probe_failed",
+    ];
+    const COUNTS: &[&str] = &["input_text_length", "app_pill_count"];
+    let Some(probe) = evidence
+        .result
+        .as_ref()
+        .and_then(|result| result.get("composer_busy_probe"))
+        .and_then(Value::as_object)
+    else {
+        return Value::Null;
+    };
+    let mut out = serde_json::Map::new();
+    for key in BOOLS {
+        if let Some(value) = probe.get(*key).and_then(Value::as_bool) {
+            out.insert((*key).to_owned(), json!(value));
+        }
+    }
+    for key in COUNTS {
+        if let Some(value) = probe.get(*key).and_then(Value::as_u64) {
+            out.insert((*key).to_owned(), json!(value.min(10_000)));
+        }
+    }
+    if out.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(out)
+    }
+}
+
 fn browser_resource_unavailable_reason(
     evidence: &BrowserPostconditionEvidence,
 ) -> Result<String, String> {
@@ -2617,14 +2657,26 @@ fn browser_dispatch_submit(
     } else {
         None
     };
-    json!({
+    let composer_busy_probe = if reason
+        .as_deref()
+        .is_some_and(|reason| reason.ends_with("_composer_busy"))
+    {
+        browser_composer_busy_probe(&evidence)
+    } else {
+        Value::Null
+    };
+    let mut response = json!({
         "ok": success,
         "code": if success { Value::Null } else { json!(dispatch.delivery_state.as_str()) },
         "reason": reason,
         "dispatch": browser_dispatch_json(dispatch),
         "replayed": false,
         "work_memory_writeback": work_memory_writeback,
-    })
+    });
+    if !composer_busy_probe.is_null() {
+        response["composer_busy_probe"] = composer_busy_probe;
+    }
+    response
 }
 
 fn browser_dispatch_stop(
@@ -12651,12 +12703,21 @@ mod tests {
                 expected_generation: i64,
                 _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
-                Ok(
-                    BrowserPostconditionEvidence::resource_unavailable_with_reason(
-                        expected_generation,
-                        "browser_dispatch_composer_busy",
-                    ),
-                )
+                let mut evidence = BrowserPostconditionEvidence::resource_unavailable_with_reason(
+                    expected_generation,
+                    "browser_dispatch_composer_busy",
+                );
+                evidence.result = Some(json!({
+                    "error": "browser_dispatch_composer_busy",
+                    "composer_busy_probe": {
+                        "input_mounted": true,
+                        "input_has_content": false,
+                        "input_text_length": 0,
+                        "stop_control": true,
+                        "page_text": "secret composer text"
+                    }
+                }));
+                Ok(evidence)
             }
         }
 
@@ -12676,6 +12737,9 @@ mod tests {
         assert_eq!(exact_reason["ok"], false);
         assert_eq!(exact_reason["code"], "resource_unavailable");
         assert_eq!(exact_reason["reason"], "browser_dispatch_composer_busy");
+        assert_eq!(exact_reason["composer_busy_probe"]["stop_control"], true);
+        assert_eq!(exact_reason["composer_busy_probe"]["input_text_length"], 0);
+        assert!(!exact_reason.to_string().contains("secret composer text"));
         assert_eq!(exact_reason["replayed"], false);
         assert!(exact_reason["dispatch"]["accepted_user_message_ref"].is_null());
 
