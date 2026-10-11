@@ -67,6 +67,7 @@ function harness({
   elements = [],
   topOrigin = null,
   scrollMax = 0,
+  scrollingElement = null,
 } = {}) {
   let listener = null;
   const location = new URL(url);
@@ -75,6 +76,7 @@ function harness({
     readyState: "complete",
     body: { innerText: bodyText, textContent: bodyText },
     documentElement: { scrollHeight: scrollMax + 600 },
+    scrollingElement,
     querySelectorAll() { return elements; },
   };
   for (const element of elements) element.ownerDocument = document;
@@ -106,6 +108,7 @@ function harness({
         visibility: hidden ? "hidden" : "visible",
         opacity: hidden ? "0" : "1",
         position: "static",
+        overflowY: element.overflowY || "visible",
       };
     },
   });
@@ -640,4 +643,71 @@ test("user distinguishes a truncated dropdown observation from an absent option 
   });
   assert.equal(absent.error, "select_option_unavailable");
   assert.equal(small.value, "");
+});
+
+test("user scrolls an inner scroll container | Given a page whose window cannot move but whose observed content sits in a scrollable container | When scroll down is requested | Then the container moves, the result names it, and verification is still required", () => {
+  const container = createElement({ tag: "div", attrs: { class: "feed-scroll" } });
+  container.overflowY = "auto";
+  container.scrollTop = 0;
+  container.scrollHeight = 2000;
+  container.clientHeight = 500;
+  container.scrollBy = function ({ top }) {
+    this.scrollTop = Math.max(0, Math.min(this.scrollHeight - this.clientHeight, this.scrollTop + top));
+  };
+  const button = createElement({ tag: "button", text: "Load more" });
+  button.parentElement = container;
+  const h = harness({ elements: [button], scrollMax: 0 });
+  let observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(observed.scroll.max_y, 0);
+  const scroll = (direction, amount) => h.send({
+    type: "h2w_page_assist", action: "scroll", expectedOrigin: "https://app.test",
+    generation: observed.generation, direction, amount,
+  });
+
+  const moved = scroll("down", 400);
+  assert.equal(moved.ok, true);
+  assert.deepEqual([moved.before_y, moved.after_y, moved.moved, moved.at_boundary], [0, 0, true, false]);
+  assert.equal(moved.scroll_container, "observed_ancestor");
+  assert.equal(moved.scroll_container_tag, "div");
+  assert.deepEqual([moved.scroll_container_before, moved.scroll_container_after], [0, 400]);
+  assert.equal(moved.requires_verification, true);
+  assert.equal(container.scrollTop, 400);
+  assert.equal(scroll("down", 400).error, "stale_generation");
+
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(scroll("down", 1500).scroll_container_after, 1500);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const boundary = scroll("down", 500);
+  assert.equal(boundary.ok, true);
+  assert.equal(boundary.moved, false);
+  assert.equal(boundary.at_boundary, true);
+  assert.equal(boundary.scroll_container, undefined);
+  assert.equal(container.scrollTop, 1500);
+  observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  assert.equal(scroll("up", 200).scroll_container_after, 1300);
+  assert.equal(container.scrollTop, 1300);
+});
+
+test("user scrolls a clipped document | Given a page whose only scrollable box is document.scrollingElement | When scroll down is requested | Then that element moves and is reported as the container", () => {
+  const scroller = createElement({ tag: "html" });
+  scroller.scrollTop = 0;
+  scroller.scrollHeight = 1800;
+  scroller.clientHeight = 600;
+  scroller.scrollBy = function ({ top }) {
+    this.scrollTop = Math.max(0, Math.min(this.scrollHeight - this.clientHeight, this.scrollTop + top));
+  };
+  const label = createElement({ tag: "button", text: "Deep content" });
+  const h = harness({ elements: [label], scrollMax: 0, scrollingElement: scroller });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const moved = h.send({
+    type: "h2w_page_assist", action: "scroll", expectedOrigin: "https://app.test",
+    generation: observed.generation, direction: "down", amount: 300,
+  });
+  assert.equal(moved.ok, true);
+  assert.deepEqual([moved.before_y, moved.after_y, moved.moved, moved.at_boundary], [0, 0, true, false]);
+  assert.equal(moved.scroll_container, "document_scrolling_element");
+  assert.equal(moved.scroll_container_tag, "html");
+  assert.deepEqual([moved.scroll_container_before, moved.scroll_container_after], [0, 300]);
+  assert.equal(moved.requires_verification, true);
+  assert.equal(scroller.scrollTop, 300);
 });
