@@ -362,14 +362,22 @@
       return { ok: false, error: "unsupported_element" };
     }
 
-    // Visible cell text only: innerText drops display:none content, and no
-    // markup, attribute, input value or script surface is returned.
-    const cellText = (cell) => cleanText(cell.innerText || cell.textContent, MAX_TABLE_CELL_CHARS);
+    // Visible cell text only, through the same projection as extract: no raw
+    // textContent fallback, so an unrendered cell cannot leak its markup text
+    // and hidden/aria-hidden/sensitive/form-control descendants are skipped.
+    // An excluded cell yields an empty string so column positions stay aligned.
+    const cellText = (cell) => {
+      if (isSensitiveField(cell) || isElementHidden(cell)) return "";
+      return cleanText(collectVisibleText(cell, MAX_TABLE_CELL_CHARS + 1), MAX_TABLE_CELL_CHARS);
+    };
     const rowCells = (row) => [...(row.children || [])]
       .filter((cell) => ["td", "th"].includes(String(cell.tagName || "").toLowerCase()))
       .slice(0, MAX_TABLE_COLUMNS)
       .map(cellText);
-    const trList = [...(el.querySelectorAll?.("tr") || [])];
+    // Hidden rows (display:none placeholders, aria-hidden templates) are not
+    // rendered content, so they are neither counted against max_rows nor returned.
+    const trList = [...(el.querySelectorAll?.("tr") || [])]
+      .filter((row) => !isSensitiveField(row) && !isElementHidden(row));
     const allRows = trList.map(rowCells).filter((cells) => cells.length > 0);
     let headers = [];
     let dataRows = allRows;

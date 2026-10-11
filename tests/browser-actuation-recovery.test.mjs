@@ -875,7 +875,7 @@ test("user receives safe press mutation errors | Given an owned page and out-of-
     idempotencyKey: "claim-press-reject",
   });
   assert.equal(page.ok, true);
-  for (const error of ["press_params_invalid", "press_unavailable"]) {
+  for (const error of ["press_params_invalid", "press_unavailable", "stale_generation", "unsupported_element", "element_detached"]) {
     rejection = error;
     const result = await h.performBrowserPageActionRequest({
       action: "press", pageRef: page.page_ref, generation: "pa_press_1", key: "Enter",
@@ -943,6 +943,37 @@ test("user extracts table rows from an observed page | Given a claimed page with
   assert.equal(result.page_ref, page.page_ref);
   assert.ok(!Object.hasOwn(result, "delivery_state"), "read-only extract_table carries no mutation envelope");
   assert.ok(!Object.hasOwn(result, "tab_id"));
+});
+
+test("user reads a table without claiming a mutation | Given a claimed page and an observed table ref | When extract_table omits max_rows and the kernel rejects a stale generation | Then the read stays read-only and the rejection is returned verbatim", async () => {
+  const tabs = new Map([[77, { id: 77, url: "https://example.com/report", active: true }]]);
+  let forwarded = null;
+  const h = browserPageLifecycleHarness({
+    tabs,
+    contentResponder(_tabId, payload) {
+      forwarded = payload;
+      return { ok: false, error: "stale_generation" };
+    },
+  });
+  const page = await h.performBrowserPageLifecycleRequest({
+    action: "claim", targetOrigin: "https://example.com", url: "https://example.com/report",
+    idempotencyKey: "claim-table-readonly",
+  });
+  assert.equal(page.ok, true);
+  const result = await h.performBrowserPageActionRequest({
+    action: "extract_table", pageRef: page.page_ref, generation: "pa_table_stale_1",
+    ref: "ref_pa_table_stale_1_0",
+  });
+  assert.equal(forwarded.action, "extract_table");
+  assert.equal(forwarded.maxRows, undefined, "an absent max_rows leaves the kernel default in charge");
+  assert.equal(forwarded.generation, "pa_table_stale_1");
+  assert.equal(forwarded.ref, "ref_pa_table_stale_1_0");
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "stale_generation");
+  assert.equal(result.page_ref, page.page_ref);
+  for (const key of ["delivery_state", "retry_safe", "mutation_submitted", "tab_id"]) {
+    assert.equal(Object.hasOwn(result, key), false, `read-only extract_table must not carry ${key}`);
+  }
 });
 
 test("user captures bounded visual evidence | Given one visible claimed BrowserPage | When screenshot runs | Then image bytes enter the artifact cache and MCP receives only bounded artifact metadata", async () => {

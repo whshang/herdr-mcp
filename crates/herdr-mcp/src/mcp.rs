@@ -17385,6 +17385,10 @@ mod tests {
             ("direction", json!("down")),
             ("amount", json!(500)),
             ("max_chars", json!(100)),
+            ("condition", json!("visible")),
+            ("timeout_ms", json!(1000)),
+            ("objective", json!("press Enter")),
+            ("idempotency_key", json!("")),
             ("ref", json!("   ")),
         ] {
             let mut request = params.clone();
@@ -17676,6 +17680,9 @@ mod tests {
             ("key", json!("Enter")),
             ("value", json!("x")),
             ("idempotency_key", json!("not_for_reads")),
+            ("condition", json!("visible")),
+            ("timeout_ms", json!(1000)),
+            ("objective", json!("read the table")),
             ("ref", json!("ref_pa_gen_other_0")),
         ] {
             let mut bad = params.clone();
