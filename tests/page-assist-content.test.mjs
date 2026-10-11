@@ -46,6 +46,7 @@ function createElement({
       return attributes.get(name) ?? null;
     },
     hasAttribute(name) { return attributes.has(name); },
+    setAttribute(name, value) { attributes.set(name, String(value)); },
     getBoundingClientRect() {
       return visible ? { width: 120, height: 28 } : { width: 0, height: 0 };
     },
@@ -621,4 +622,19 @@ test("user fills a rich-text composer | Given a contenteditable editor that may 
 
   const plain = createElement({ tag: "div", contentEditable: true, attrs: { "aria-label": "Plain editor" } });
   assert.equal(fillOnly(plain).ok, true);
+});
+
+test("user fills a rich-text composer through the extension | Given the extension requests a MAIN-world fill | When fill targets a contenteditable editor | Then the kernel only tags the element and hands the value back without writing", () => {
+  const editor = createElement({ tag: "div", contentEditable: true, attrs: { "aria-label": "Prose editor" } });
+  const h = harness({ elements: [editor] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const handoff = h.send({
+    type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test",
+    generation: observed.generation, ref: observed.elements[0].ref, value: "hello claude", mainWorldFill: true,
+  });
+  assert.equal(handoff.ok, true);
+  assert.match(handoff.main_world_fill_token, /^f[0-9a-z]+$/);
+  assert.equal(handoff.value, "hello claude");
+  assert.equal(editor.getAttribute("data-h2w-fill-token"), handoff.main_world_fill_token);
+  assert.notEqual(editor.innerText, "hello claude");
 });

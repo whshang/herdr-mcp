@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.191";
+const H2W_SCRIPT_VERSION = "0.1.192";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -8435,6 +8435,7 @@ async function performBrowserPageActionRequest(msg) {
     timeoutMs: msg?.timeoutMs,
     direction: msg?.direction,
     amount: msg?.amount,
+    ...(action === "fill" ? { mainWorldFill: true } : {}),
   };
 
   const mutation = action === "click" || action === "fill" || action === "scroll";
@@ -8448,6 +8449,9 @@ async function performBrowserPageActionRequest(msg) {
     const response = await send();
     if (mutation) {
       let mutationResponse = response;
+      if (action === "fill" && response?.ok === true && typeof response?.main_world_fill_token === "string") {
+        mutationResponse = await browserPageMainWorldFill(tabId, response);
+      }
       if (action === "click" && response?.ok === true && typeof response?.navigation_url === "string") {
         await adoptAppliedBrowserPageNavigation(page, tabId, response.navigation_url);
         mutationResponse = { ...response };
@@ -8513,6 +8517,77 @@ async function performBrowserPageActionRequest(msg) {
       page,
     );
   }
+}
+
+// MAIN-world rich-editor insertion shared by WebChat composer insert and
+// browser_page fill. Must stay self-contained (runs via executeScript).
+function h2wMainWorldInsertText(text, selector, append) {
+  try {
+    const all = [...document.querySelectorAll(selector)];
+    const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
+    if (!el) return { ok: false, error: "no-input" };
+    el.focus();
+    const sel = window.getSelection();
+    const range = document.createRange();
+    if (append) {
+      // Preserve provider-owned composer nodes such as app mention pills.
+      // Do not select the editor contents after a pill was inserted. Some
+      // provider editors rebuild the whole composer from that selection
+      // and drop the app reference. Place the caret after the current
+      // editor tree instead.
+      const tail = el.lastChild;
+      if (tail) {
+        range.selectNodeContents(tail);
+        range.collapse(false);
+      } else {
+        range.selectNodeContents(el);
+        range.collapse(false);
+      }
+    } else {
+      // Normal insertion replaces the current composer content.
+      range.selectNodeContents(el);
+    }
+    sel.removeAllRanges();
+    sel.addRange(range);
+    const ok = document.execCommand("insertText", false, text);
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+    const got = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    const want = String(text || "").replace(/\s+/g, " ").trim();
+    return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
+  } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+// Commit a contenteditable fill from the MAIN world and report applied only
+// when the editor text reads back (isolated-world writes can show in the DOM
+// while the editor model, e.g. Claude ProseMirror, stays empty).
+async function browserPageMainWorldFill(tabId, response) {
+  const token = response.main_world_fill_token;
+  const selector = `[data-h2w-fill-token="${token.replace(/[^a-z0-9]/gi, "")}"]`;
+  const base = { ...response };
+  delete base.main_world_fill_token;
+  delete base.value;
+  let result = null;
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: h2wMainWorldInsertText,
+      args: [response.value, selector, false],
+    });
+    result = res?.[0]?.result || null;
+  } catch (error) {
+    result = { ok: false, error: String(error?.message || error || "") };
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: (sel) => { for (const el of document.querySelectorAll(sel)) el.removeAttribute("data-h2w-fill-token"); },
+      args: [selector],
+    });
+  } catch (_) {}
+  if (result?.ok === true && result?.committed === true) return { ...base, method: "main_world_insert_text" };
+  return { ok: false, error: "fill_not_applied", applied: false, method: "main_world_insert_text" };
 }
 
 function withBrowserPageIdentity(result, page) {
@@ -10189,41 +10264,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.scripting.executeScript({
       target: { tabId: sender.tab.id },
       world: "MAIN",
-      func: (text, selector, append) => {
-        try {
-          const all = [...document.querySelectorAll(selector)];
-          const el = all.reverse().find((e) => e.offsetParent !== null) || all[0] || null;
-          if (!el) return { ok: false, error: "no-input" };
-          el.focus();
-          const sel = window.getSelection();
-          const range = document.createRange();
-          if (append) {
-            // Preserve provider-owned composer nodes such as app mention pills.
-            // Do not select the editor contents after a pill was inserted. Some
-            // provider editors rebuild the whole composer from that selection
-            // and drop the app reference. Place the caret after the current
-            // editor tree instead.
-            const tail = el.lastChild;
-            if (tail) {
-              range.selectNodeContents(tail);
-              range.collapse(false);
-            } else {
-              range.selectNodeContents(el);
-              range.collapse(false);
-            }
-          } else {
-            // Normal insertion replaces the current composer content.
-            range.selectNodeContents(el);
-          }
-          sel.removeAllRanges();
-          sel.addRange(range);
-          const ok = document.execCommand("insertText", false, text);
-          el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
-          const got = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-          const want = String(text || "").replace(/\s+/g, " ").trim();
-          return { ok: !!ok, committed: got.includes(want), text: got.slice(0, 40) };
-        } catch (e) { return { ok: false, error: String(e) }; }
-      },
+      func: h2wMainWorldInsertText,
       args: [msg.text, msg.selector, Boolean(msg.append)],
     }).then((res) => {
       const r = res && res[0] && res[0].result;
