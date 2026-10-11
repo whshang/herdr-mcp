@@ -419,7 +419,7 @@ test("user owner | Given a legacy per-account WebChat Control grant | When allow
   assert.deepEqual(denied.record.webchat_control.map((g) => g.provider), ["claude"], "deny is provider-scoped and leaves other providers");
 });
 
-test("user owner | Given an active connector | When a WebChat control grant with provider \"*\" is allowed and then denied | Then it is stored as provider \"*\" and removed", async () => {
+test("user owner | Given an active connector | When a WebChat control grant with wildcard provider (*) is allowed and then denied | Then it is stored as wildcard provider (*) and removed", async () => {
   const h = harness();
   const connectorId = "conn_webchat_star_1";
   h.storage.map.set("grant:star-client", {
