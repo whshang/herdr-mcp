@@ -382,59 +382,6 @@ test("WebChat Control grants normalize legacy records and add/remove one exact t
   assert.deepEqual(disabled.record.webchat_control, []);
 });
 
-test("user owner | Given a legacy per-account WebChat Control grant | When allow is issued without account_ref and then deny | Then one provider-scoped grant replaces it and deny removes every grant for that endpoint+provider", async () => {
-  const h = harness();
-  const connectorId = "conn_webchat_scope_1";
-  h.storage.map.set("grant:scope-client", {
-    client_id: "scope-client",
-    resource: "https://issuer/mcp",
-    scope: "mcp",
-    status: "active",
-    can_approve_connectors: true,
-    approved_at_ms: 100,
-    approved_by: "device:owner",
-  });
-  h.storage.map.set(`connector:${connectorId}`, connectorRecord("scope-client", connectorId));
-  const base = {
-    connector_id: connectorId,
-    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-    endpoint_ref: `be_${"a".repeat(64)}`,
-    provider: "grok",
-    changed_by: "oauth:owner-client",
-  };
-  const legacy = await body(await h.post("/internal/oauth/grant/webchat-control", { ...base, account_ref: `br_${"b".repeat(64)}`, allowed: true }));
-  assert.equal(legacy.ok, true, "legacy explicit account_ref is still accepted");
-  const other = await body(await h.post("/internal/oauth/grant/webchat-control", { ...base, provider: "claude", allowed: true }));
-  assert.equal(other.ok, true);
-
-  const scoped = await body(await h.post("/internal/oauth/grant/webchat-control", { ...base, allowed: true }));
-  assert.equal(scoped.ok, true);
-  const grok = scoped.record.webchat_control.filter((g) => g.provider === "grok");
-  assert.equal(grok.length, 1, "provider-scoped allow replaces the legacy per-account grant");
-  assert.equal(grok[0].account_ref, "*");
-  assert.equal(scoped.record.webchat_control.find((g) => g.provider === "claude")?.account_ref, "*");
-
-  const denied = await body(await h.post("/internal/oauth/grant/webchat-control", { ...base, account_ref: `br_${"c".repeat(64)}`, allowed: false }));
-  assert.equal(denied.ok, true);
-  assert.deepEqual(denied.record.webchat_control.map((g) => g.provider), ["claude"], "deny is provider-scoped and leaves other providers");
-});
-
-test("user owner | Given an active connector | When a WebChat control grant with wildcard provider (*) is allowed and then denied | Then it is stored as wildcard provider (*) and removed", async () => {
-  const h = harness();
-  const connectorId = "conn_webchat_star_1";
-  h.storage.map.set("grant:star-client", {
-    client_id: "star-client", resource: "https://issuer/mcp", scope: "mcp", status: "active",
-    can_approve_connectors: true, approved_at_ms: 100, approved_by: "device:owner",
-  });
-  h.storage.map.set(`connector:${connectorId}`, connectorRecord("star-client", connectorId));
-  const base = { connector_id: connectorId, device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: `be_${"a".repeat(64)}`, provider: "*", changed_by: "oauth:owner-client" };
-  const allowed = await body(await h.post("/internal/oauth/grant/webchat-control", { ...base, allowed: true }));
-  assert.equal(allowed.ok, true);
-  assert.deepEqual(allowed.record.webchat_control.map((g) => [g.provider, g.account_ref]), [["*", "*"]]);
-  const denied = await body(await h.post("/internal/oauth/grant/webchat-control", { ...base, allowed: false }));
-  assert.deepEqual(denied.record.webchat_control, []);
-});
-
 test("Page Assist grants normalize legacy records and add/remove one exact endpoint tuple without duplicates", async () => {
   const h = harness();
   const connectorId = "conn_pageassist_test_1";

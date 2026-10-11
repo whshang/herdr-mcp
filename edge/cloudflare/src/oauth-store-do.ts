@@ -25,9 +25,6 @@ import type {
   OAuthWebChatControlGrant,
 } from "./oauth-records.js";
 
-/** Provider-scoped WebChat control grant marker: every account of the provider on the endpoint. */
-const WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT = "*";
-
 // Preserve the historical `./oauth-store-do.js` surface: the Durable Object
 // module stays the import path for record types and for the exported
 // normalizers that callers and tests already rely on. The record shapes and
@@ -779,9 +776,7 @@ export class OAuthStoreDO {
     const deviceId = body?.device_id;
     const endpointRef = body?.endpoint_ref;
     const provider = body?.provider;
-    const accountRef = typeof body?.account_ref === "string" && body.account_ref
-      ? body.account_ref
-      : WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT;
+    const accountRef = body?.account_ref;
     const allowed = body?.allowed;
     const changedBy = body?.changed_by;
     if (
@@ -790,7 +785,7 @@ export class OAuthStoreDO {
       || !boundedString(endpointRef, 96)
       || !boundedString(accountRef, 96)
       || !boundedString(provider, 32)
-      || !(provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(provider))
+      || !/^[a-z0-9][a-z0-9._-]*$/.test(provider)
       || typeof allowed !== "boolean"
       || !boundedString(changedBy, 4096)
     ) {
@@ -823,9 +818,8 @@ export class OAuthStoreDO {
         && item.grant_generation === connector.grant_generation
         && item.device_id === deviceId
         && item.endpoint_ref === endpointRef
-        && item.provider === provider;
-      // Provider-scoped: allow replaces and deny removes every grant for this
-      // connector/device/endpoint/provider, including legacy per-account ones.
+        && item.provider === provider
+        && item.account_ref === accountRef;
       const next = (current.webchat_control ?? []).filter((item) => !same(item));
       if (allowed) {
         if (next.length >= 32) {
