@@ -1386,6 +1386,10 @@ test("browser and Page Assist private methods require explicit enrolled device s
       endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       provider: "chatgpt",
       account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }, {
+      endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      provider: "*",
+      account_ref: "*",
     }],
     webchat_authorization: {
       principal_ref: "connector:conn_auditconnector123",
@@ -1797,6 +1801,52 @@ test("user runs an X site command | Given Page Assist grants on two devices | Wh
     endpoint_ref: "be_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
   }]);
   assert.equal(d.calls[0].trace?.webchat_control_grants, undefined, "site method gets no WebChat control grants");
+});
+
+async function dispatchStatusTrace(client) {
+  const d = deps({
+    client: { connectorId: "conn_derivedgrant1234", grantGeneration: 3, ...client },
+    resolveDevice: async (selector) => ({ ok: true, device_id: selector, workstation_id: "w-target", routing_reason: "explicit_device_selector" }),
+  });
+  await handleMcp(
+    req(3, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.browser_dispatch.status",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({ dispatch_ref: `bd_${"a".repeat(64)}` }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(d.calls.length, 1);
+  return d.calls[0].trace?.webchat_control_grants;
+}
+
+const DERIVED_E = `be_${"e".repeat(64)}`;
+
+test("user allows Page Assist | Given a Page Assist grant for device+endpoint and no WebChat grant | When a WebChat dispatch method is forwarded to that device | Then a wildcard provider (*) WebChat control grant for that endpoint is forwarded", async () => {
+  const grants = await dispatchStatusTrace({
+    pageAssistGrants: [
+      { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: DERIVED_E },
+      { device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW", endpoint_ref: `be_${"f".repeat(64)}` },
+    ],
+  });
+  assert.deepEqual(grants, [{ endpoint_ref: DERIVED_E, provider: "*", account_ref: "*" }]);
+});
+
+test("user denies Page Assist | Given an explicit grok WebChat grant and no Page Assist grant | When a WebChat dispatch method is forwarded | Then the derived wildcard (*) grant is gone and only the explicit grant remains", async () => {
+  const grants = await dispatchStatusTrace({
+    webchatControlGrants: [{ device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: DERIVED_E, provider: "grok", account_ref: "*" }],
+    pageAssistGrants: [],
+  });
+  assert.deepEqual(grants, [{ endpoint_ref: DERIVED_E, provider: "grok", account_ref: "*" }]);
+});
+
+test("user has no grants | Given no Page Assist and no WebChat control grant | When a WebChat dispatch method is forwarded | Then no WebChat control grant is forwarded", async () => {
+  const grants = await dispatchStatusTrace({ webchatControlGrants: [], pageAssistGrants: [] });
+  assert.equal(grants, undefined);
 });
 
 test("user lists browser endpoints | Given a connector with Page Assist grants | When a non-page method is forwarded | Then no Page Assist grant is attached", async () => {
