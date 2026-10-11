@@ -15229,9 +15229,12 @@ mod tests {
             })
             .unwrap();
 
+        // WebChat control grants are provider-scoped: a different account on the
+        // same endpoint+provider is authorized, so the fail-closed probe uses a
+        // different provider (still caller_grant_missing before any resource work).
         let wrong_account_grants = [BrowserCallerGrant {
             endpoint_ref: endpoint_ref.clone(),
-            provider: "chatgpt".to_owned(),
+            provider: "grok".to_owned(),
             account_ref: format!("br_{}", "e".repeat(64)),
         }];
         let wrong_account = browser_operation_call_with_grants(
