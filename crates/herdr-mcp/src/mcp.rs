@@ -3911,12 +3911,11 @@ fn browser_session_archive_params_from_current_turn(
         (caller_authorization, caller_browser_session)
         && caller_session.provider == "chatgpt"
     {
-        let account_ref =
-            browser_resource_account_ref(store, &session).map_err(browser_store_error)?;
+        // The session must still resolve to an observed account; the grant is
+        // provider-scoped (endpoint + provider), so any account matches.
+        browser_resource_account_ref(store, &session).map_err(browser_store_error)?;
         let granted = caller_webchat_control_grants.iter().any(|grant| {
-            grant.endpoint_ref == session.endpoint_ref
-                && grant.provider == session.provider
-                && grant.account_ref == account_ref
+            webchat_control_grant_covers(grant, &session.endpoint_ref, &session.provider)
         });
         if granted {
             store
@@ -5490,6 +5489,25 @@ fn browser_operation_resource(
     Ok(resource)
 }
 
+/// WebChat control grants are provider-scoped: exact endpoint + provider.
+/// `account_ref` (legacy per-account grants, or the `*` provider-scope marker)
+/// is accepted for backward compatibility and does not narrow the match.
+pub(crate) const WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT: &str = "*";
+
+fn webchat_control_grant_covers(
+    grant: &BrowserCallerGrant,
+    endpoint_ref: &str,
+    provider: &str,
+) -> bool {
+    grant.endpoint_ref == endpoint_ref
+        && (grant.provider == provider || grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER)
+}
+
+/// Provider wildcard: a grant with provider `*` covers every WebChat provider
+/// on its exact endpoint (issued explicitly, or derived by Edge from a Page
+/// Assist endpoint grant).
+pub(crate) const WEBCHAT_CONTROL_ANY_PROVIDER: &str = "*";
+
 fn browser_resource_actuation_decision(
     store: &StateStore,
     capability_operation: &str,
@@ -5497,11 +5515,13 @@ fn browser_resource_actuation_decision(
     caller_webchat_control_grants: &[BrowserCallerGrant],
     expected_generation: Option<i64>,
 ) -> Result<(bool, Option<&'static str>), String> {
-    let account_ref = browser_resource_account_ref(store, resource)?;
+    // Fail closed when the resource has no observed account, but authorize by
+    // provider scope: a WebChat control grant covers every account of that
+    // provider on the exact endpoint. `account_ref` on stored/legacy grants is
+    // accepted and ignored.
+    browser_resource_account_ref(store, resource)?;
     if !caller_webchat_control_grants.iter().any(|grant| {
-        grant.endpoint_ref == resource.endpoint_ref
-            && grant.provider == resource.provider
-            && grant.account_ref == account_ref
+        webchat_control_grant_covers(grant, &resource.endpoint_ref, &resource.provider)
     }) {
         return Ok((false, Some("caller_grant_missing")));
     }
@@ -15209,9 +15229,12 @@ mod tests {
             })
             .unwrap();
 
+        // WebChat control grants are provider-scoped: a different account on the
+        // same endpoint+provider is authorized, so the fail-closed probe uses a
+        // different provider (still caller_grant_missing before any resource work).
         let wrong_account_grants = [BrowserCallerGrant {
             endpoint_ref: endpoint_ref.clone(),
-            provider: "chatgpt".to_owned(),
+            provider: "grok".to_owned(),
             account_ref: format!("br_{}", "e".repeat(64)),
         }];
         let wrong_account = browser_operation_call_with_grants(
@@ -17109,5 +17132,84 @@ mod tests {
         assert_eq!(replay["ok"], true);
         assert_eq!(replay["idempotent_replay"], true);
         assert_eq!(actuator.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod webchat_control_provider_scope_tests {
+    use super::*;
+
+    fn grant(endpoint: &str, provider: &str, account: &str) -> BrowserCallerGrant {
+        BrowserCallerGrant {
+            endpoint_ref: endpoint.to_owned(),
+            provider: provider.to_owned(),
+            account_ref: account.to_owned(),
+        }
+    }
+
+    /// user owner | Given a provider-scoped grant (`*`) for endpoint+grok | When any Grok account on that endpoint is controlled | Then the grant authorizes it
+    #[test]
+    fn user_owner_given_provider_scoped_grant_when_any_account_then_authorized() {
+        let g = grant("bep_a", "grok", WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT);
+        assert!(webchat_control_grant_covers(&g, "bep_a", "grok"));
+    }
+
+    /// user owner | Given a grok grant on an endpoint | When a claude resource on the same endpoint is controlled | Then it is denied
+    #[test]
+    fn user_owner_given_grok_grant_when_different_provider_then_denied() {
+        let g = grant("bep_a", "grok", WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT);
+        assert!(!webchat_control_grant_covers(&g, "bep_a", "claude"));
+    }
+
+    /// user owner | Given a grok grant on endpoint A | When a grok resource on endpoint B is controlled | Then it is denied
+    #[test]
+    fn user_owner_given_grant_on_endpoint_a_when_endpoint_b_then_denied() {
+        let g = grant("bep_a", "grok", WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT);
+        assert!(!webchat_control_grant_covers(&g, "bep_b", "grok"));
+    }
+
+    /// user owner | Given a provider "*" grant on endpoint A | When grok, claude and chatgpt resources on endpoint A are controlled | Then all are authorized
+    #[test]
+    fn user_owner_given_any_provider_grant_when_each_provider_then_authorized() {
+        let g = grant(
+            "bep_a",
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        for provider in ["grok", "claude", "chatgpt"] {
+            assert!(
+                webchat_control_grant_covers(&g, "bep_a", provider),
+                "{provider}"
+            );
+        }
+    }
+
+    /// user owner | Given a provider "*" grant on endpoint A | When a resource on endpoint B is controlled | Then it is denied
+    #[test]
+    fn user_owner_given_any_provider_grant_when_different_endpoint_then_denied() {
+        let g = grant(
+            "bep_a",
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        assert!(!webchat_control_grant_covers(&g, "bep_b", "grok"));
+    }
+
+    /// user owner | Given no Page Assist and no WebChat control grant | When any provider is controlled | Then it is denied
+    #[test]
+    fn user_owner_given_no_grants_when_controlled_then_denied() {
+        let grants: Vec<BrowserCallerGrant> = Vec::new();
+        assert!(
+            !grants
+                .iter()
+                .any(|g| webchat_control_grant_covers(g, "bep_a", "grok"))
+        );
+    }
+
+    /// user owner | Given a legacy grant carrying an explicit account_ref | When that provider on that endpoint is controlled | Then it still works (account_ref is ignored)
+    #[test]
+    fn user_owner_given_legacy_account_grant_when_same_endpoint_provider_then_authorized() {
+        let g = grant("bep_a", "chatgpt", "br_legacy_account");
+        assert!(webchat_control_grant_covers(&g, "bep_a", "chatgpt"));
     }
 }

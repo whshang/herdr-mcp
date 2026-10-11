@@ -17,11 +17,18 @@ pub const LINK_DEFAULT_REQUEST_TIMEOUT_MS: u64 = 60_000;
 pub const LINK_DEFAULT_MAX_PENDING: usize = 16;
 pub const LINK_DEFAULT_DRAIN_MS: u64 = 5_000;
 pub const RUNTIME_CACHE_TTL_MS: u64 = 5_000;
-pub const DEFAULT_CAPABILITIES: [&str; 4] = [
+/// Capability advertised in the link hello. `webchat_control.any_provider`
+/// tells Edge this runtime accepts provider `*` WebChat control grants
+/// (exact endpoint, any provider); Edge strips `*` grants for runtimes that do
+/// not advertise it.
+pub const WEBCHAT_CONTROL_ANY_PROVIDER_CAPABILITY: &str = "webchat_control.any_provider";
+
+pub const DEFAULT_CAPABILITIES: [&str; 5] = [
     "relay.request",
     "relay.cancel",
     "relay.heartbeat",
     "relay.status",
+    WEBCHAT_CONTROL_ANY_PROVIDER_CAPABILITY,
 ];
 
 pub const CODE_QUEUE_FULL: &str = "request_queue_full";
@@ -319,7 +326,8 @@ mod tests {
                 "relay.request",
                 "relay.cancel",
                 "relay.heartbeat",
-                "relay.status"
+                "relay.status",
+                "webchat_control.any_provider"
             ]
         );
         assert_eq!(CODE_QUEUE_FULL, "request_queue_full");
