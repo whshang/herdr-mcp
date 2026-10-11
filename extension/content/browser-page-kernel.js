@@ -554,6 +554,13 @@
         // raw innerText write and re-render their own model, so a blind write
         // reads as success while nothing lands. Use native editing
         // (select-all + insertText, as h2w_insert_main does) and verify.
+        if (params.mainWorldFill === true) {
+          // The extension commits rich editors from the MAIN world (same path
+          // as WebChat composer insertion) and verifies the readback there.
+          const token = `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+          el.setAttribute("data-h2w-fill-token", token);
+          return { ok: true, ref, generation: gen, main_world_fill_token: token, value: fillValue };
+        }
         const norm = (value) => String(value || "").replace(/[\u00a0\ufeff]/g, " ").replace(/\s+/g, " ").trim();
         let inserted = false;
         try {
