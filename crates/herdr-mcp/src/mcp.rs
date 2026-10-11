@@ -4181,7 +4181,7 @@ fn browser_handoff_prepare(
         ));
         format!("hh_{}", &digest[..32])
     });
-    let source_reference = browser_composer_source_reference(&source_url);
+    let source_reference = browser_composer_source_reference(source_url);
     let message = format!(
         "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_reference} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
     );
