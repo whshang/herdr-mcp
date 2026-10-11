@@ -126,3 +126,19 @@ continuity_id
 - `ego-browser` is development/UAT infrastructure, never a user dependency.
 
 Always re-check the installed runtime before relying on a capability.
+
+## Remote connector WebChat control grants (provider-scoped)
+
+Remote MCP connectors (Edge OAuth) need an owner-issued WebChat control grant before
+`webchat send` / `dispatch-status` / `browser_dispatch.stop` work through them. Local CLI
+callers get a synthetic grant automatically. Grants are **provider-scoped**: exact device +
+endpoint + provider; they cover every account of that provider on that endpoint.
+
+```sh
+herdr-mcp connector webchat-control allow CONNECTOR_ID DEVICE_ID ENDPOINT_REF PROVIDER --confirm
+herdr-mcp connector webchat-control deny  CONNECTOR_ID DEVICE_ID ENDPOINT_REF PROVIDER --confirm
+```
+
+A trailing `ACCOUNT_REF` before `--confirm` is still accepted (legacy form) but no longer
+narrows the match; `deny` removes every grant for that endpoint + provider. Caller grant,
+exact device/endpoint, tab ownership, origin and sensitive-field checks are unchanged.
