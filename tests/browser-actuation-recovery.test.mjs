@@ -4229,7 +4229,7 @@ test("user still fails closed after source recovery | Given source affinity fall
   assert.equal(harness.actuationMessages.length, 0);
 });
 
-test('ChatGPT inline-mention App pill is recognised only with provider identity attributes', () => {
+test('user mentions an App in ChatGPT | Given an inline-mention App pill | When the composer is inspected | Then the pill is recognised only with provider identity attributes', () => {
   const adapter = readFileSync(new URL('../extension/content/injector/chatgpt.js', import.meta.url), 'utf8');
   assert.match(adapter, /span\[data-appearance="inline-mention"\]\[app-mention-name\]\[app-mention-path\]/);
   assert.match(adapter, /for \(const keyword of this\.getInlineAppMentionKeywords\(input\)\) selected\.add\(keyword\);/);
