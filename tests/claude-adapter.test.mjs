@@ -297,3 +297,23 @@ test("Claude reuses the provider-neutral account and single-attempt browser actu
   assert.match(actuationSource, /adapterSupports\("stopGeneration"\)/);
   assert.doesNotMatch(actuationSource, /ADAPTER\.name\s*===\s*"claude"/);
 });
+
+test("user sends to a reloaded Claude chat | Given an idle transcript while an unrelated page region stays aria-busy | When generation progress is checked | Then only the latest assistant turn decides busy", () => {
+  const h = harness();
+  const pageLoader = element({ attrs: { "aria-busy": "true" } });
+  h.set('[aria-busy="true"]', [pageLoader]);
+  h.set('[data-is-streaming="true"]', []);
+  const idleRow = element({ attrs: { "data-perf-row": "assistant", "data-perf-row-streaming": "false" } });
+  idleRow.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [element({ attrs: { "data-perf-row": "human" } }), idleRow]);
+  assert.equal(h.adapter.isGenerationInProgress(), false);
+
+  const busyMarker = element({ attrs: { "data-is-streaming": "true" } });
+  idleRow.querySelectorAll = () => [busyMarker];
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+
+  const streamingRow = element({ attrs: { "data-perf-row": "assistant", "data-perf-row-streaming": "true" } });
+  streamingRow.querySelectorAll = () => [];
+  h.set('[data-testid="transcript-row"]', [streamingRow]);
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+});

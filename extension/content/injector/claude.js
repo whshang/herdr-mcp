@@ -255,9 +255,18 @@ class ClaudeAdapter extends BaseAdapter {
 
   isGenerationInProgress() {
     if (this.getStopButtonCandidates().length > 0) return true;
-    const selectors = ['[data-is-streaming="true"]', '[aria-busy="true"]'];
-    return selectors.some((selector) => [...document.querySelectorAll(selector)]
-      .some((element) => this.elementVisible(element)));
+    // After a reload Claude keeps unrelated regions (history/sidebar loaders)
+    // aria-busy while idle, so only markers on the latest assistant turn count.
+    const rows = [...document.querySelectorAll('[data-testid="transcript-row"]')];
+    const latest = rows[rows.length - 1] || null;
+    if (latest) {
+      if (latest.getAttribute?.("data-perf-row") !== "assistant") return false;
+      if (latest.getAttribute?.("data-perf-row-streaming") === "true") return true;
+      return [...(latest.querySelectorAll?.('[data-is-streaming="true"], [aria-busy="true"]') || [])]
+        .some((element) => this.elementVisible(element));
+    }
+    return [...document.querySelectorAll('[data-is-streaming="true"]')]
+      .some((element) => this.elementVisible(element));
   }
 
   async getAccountNativeIdentity() {
