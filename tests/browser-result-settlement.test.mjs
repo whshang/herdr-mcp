@@ -619,7 +619,7 @@ test("persistent identity rejection stops retries but a new assignment can proce
   assert.equal(h.sent.length, 4);
 });
 
-test("hidden session.create worker tabs still refresh their pending dispatch identity", () => {
+test("user dispatches to a hidden worker | Given a hidden session.create worker tab | When its pending dispatch identity changes | Then the tab still refreshes that identity", () => {
   const route = wakeSource.slice(wakeSource.indexOf("  function startConversationRouteWatch() {"));
   const refreshAt = route.indexOf("maybeRefreshBrowserPendingDispatchAssignment();");
   const hiddenAt = route.indexOf("if (document.hidden) return;");
@@ -630,7 +630,7 @@ test("hidden session.create worker tabs still refresh their pending dispatch ide
   assert.match(fn, /Date\.now\(\) >= refresh\.until/);
 });
 
-test("hidden worker tabs re-register when the create route moves to the concrete conversation", () => {
+test("user dispatches to a hidden worker | Given a hidden worker tab on the create route | When the route moves to the concrete conversation | Then the tab re-registers", () => {
   const route = wakeSource.slice(wakeSource.indexOf("  function startConversationRouteWatch() {"),
     wakeSource.indexOf("  function assistantSignature("));
   const hidden = route.slice(route.indexOf("if (document.hidden) {"), route.indexOf("const convKey = ADAPTER.getConversationKey();"));
