@@ -135,7 +135,7 @@ test("user keeps public and runtime contracts independent | Given the frozen pub
   assert.equal(isCompatibleRuntimeContract(5, PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash), false);
 });
 
-test("public contract resolver enables epoch 7 for explicit first-party dev and prod environments", () => {
+test("user connects to a first-party Edge | Given an explicit first-party dev or prod environment | When the public contract resolver runs | Then epoch 7 is enabled", () => {
   assert.equal(resolvePublicContract("dev"), EPOCH7_CONTRACT);
   assert.equal(resolvePublicContract("prod"), EPOCH7_CONTRACT);
   assert.equal(resolvePublicContract(), EPOCH3_CONTRACT);
