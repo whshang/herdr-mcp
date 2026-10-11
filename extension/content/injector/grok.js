@@ -266,7 +266,13 @@ class GrokAdapter extends BaseAdapter {
 
   isGenerationInProgress() {
     if (this.getStopButtonCandidates().length > 0) return true;
-    return [...document.querySelectorAll('[aria-busy="true"]')]
+    // Grok keeps unrelated page regions (sidebar/history loaders) aria-busy
+    // while idle, so only a busy marker on the latest assistant turn counts.
+    const assistants = [...document.querySelectorAll('[data-testid="assistant-message"]')];
+    const latest = assistants[assistants.length - 1];
+    if (!latest || !this.elementVisible(latest)) return false;
+    if (latest.getAttribute?.("aria-busy") === "true") return true;
+    return [...(latest.querySelectorAll?.('[aria-busy="true"]') || [])]
       .some((element) => this.elementVisible(element));
   }
 
