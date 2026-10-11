@@ -790,7 +790,7 @@ export class OAuthStoreDO {
       || !boundedString(endpointRef, 96)
       || !boundedString(accountRef, 96)
       || !boundedString(provider, 32)
-      || !/^[a-z0-9][a-z0-9._-]*$/.test(provider)
+      || !(provider === "*" || /^[a-z0-9][a-z0-9._-]*$/.test(provider))
       || typeof allowed !== "boolean"
       || !boundedString(changedBy, 4096)
     ) {
