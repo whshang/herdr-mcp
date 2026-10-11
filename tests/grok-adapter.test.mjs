@@ -127,6 +127,24 @@ test("Grok adapter exposes concrete direct and project chat session identity", (
   assert.equal(invalidProjectChat.adapter.getConversationKey(), null);
 });
 
+test("Grok idle composer is not busy when only an unrelated page region is aria-busy", () => {
+  const h = harness();
+  const sidebarLoader = element({ attrs: { "aria-busy": "true" } });
+  const assistant = element({ text: "OK", attrs: { "data-message-id": "a1" } });
+  assistant.querySelectorAll = () => [];
+  h.set('[aria-busy="true"]', sidebarLoader);
+  h.set('[data-testid="assistant-message"]', assistant);
+  assert.equal(h.adapter.isGenerationInProgress(), false);
+
+  const streamingMarker = element({ attrs: { "aria-busy": "true" } });
+  assistant.querySelectorAll = (selector) => (selector === '[aria-busy="true"]' ? [streamingMarker] : []);
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+
+  assistant.querySelectorAll = () => [];
+  h.set('button[aria-label*="Stop" i]', element({ attrs: { "aria-label": "Stop response" } }));
+  assert.equal(h.adapter.isGenerationInProgress(), true);
+});
+
 test("Grok adapter uses bounded semantic composer, turn, and generation selectors", () => {
   const h = harness();
   const composer = element();
