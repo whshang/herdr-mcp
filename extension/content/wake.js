@@ -1037,12 +1037,27 @@ function normalizeHerdrMentionAlias(value) {
     return { ok: requested.every((app) => selected.includes(app)), apps: selected };
   }
 
-  function captureSubmitAckBaseline(sendButton = null) {
+  function captureSubmitAckBaseline(sendButton = null, options = {}) {
+    const chatGpt = ADAPTER.name === "chatgpt";
+    const composer = composerNorm();
+    const messageText = chatGpt && typeof ADAPTER.getComposerTextWithoutAppPills === "function"
+      ? normText(ADAPTER.getComposerTextWithoutAppPills())
+      : "";
+    const selectedApps = chatGpt && typeof ADAPTER.getSelectedComposerApps === "function"
+      ? ADAPTER.getSelectedComposerApps()
+      : [];
+    const requiredApps = (Array.isArray(options.requiredApps) ? options.requiredApps : [])
+      .map((app) => String(app || "").trim().toLowerCase())
+      .filter(Boolean);
     return {
-      composer: composerNorm(),
+      composer,
+      messageText: messageText || composer,
+      selectedApps: [...new Set([...selectedApps, ...requiredApps])],
       sendButton,
-      href: location.href,
-      userTurn: ADAPTER.name === "chatgpt" ? latestTurnForRole("user") : null,
+      convKey: chatGpt ? ADAPTER.getConversationKey() : null,
+      creatingSession: options.creatingSession === true,
+      expectedConvKey: typeof options.expectedConvKey === "string" ? options.expectedConvKey : null,
+      userTurn: chatGpt ? latestTurnForRole("user") : null,
     };
   }
 
@@ -1051,21 +1066,23 @@ function normalizeHerdrMentionAlias(value) {
     // ChatGPT may transiently clear and restore the composer while a submit is
     // still rejected upstream, so empty input alone is not provider acceptance.
     // React may also replace the Send button while the composer is rerendering;
-    // that node transition alone is not provider acceptance. Require a stronger
-    // post-submit signal before stopping retries: navigation to the new ChatGPT
-    // conversation or a matching user turn. A transient busy/generating control
-    // is not sufficient because ChatGPT can show it before provider acceptance.
-    if (baseline?.href && location.href !== baseline.href) return true;
+    // that node transition alone is not provider acceptance, and neither is a
+    // URL change by itself: navigation only counts when the landed conversation
+    // holds exactly the turn this submit inserted.
     const latestUser = latestTurnForRole("user");
-    if (latestUser && latestUser !== baseline?.userTurn) {
-      const latestText = normText(latestUser.innerText || latestUser.textContent || "");
-      const sentText = String(baseline?.composer || "");
-      if (latestText && sentText
-        && (latestText.includes(sentText.slice(0, 120)) || sentText.includes(latestText.slice(0, 120)))) {
-        return true;
-      }
+    if (!latestUser || latestUser === baseline?.userTurn) return false;
+    const latestText = normText(latestUser.innerText || latestUser.textContent || "");
+    if (!providerUserTextMatchesSubmitted(latestText, baseline)) return false;
+    const convKey = ADAPTER.getConversationKey();
+    if (baseline?.expectedConvKey) {
+      // A runtime-targeted dispatch must still be on the conversation it named.
+      return convKey === baseline.expectedConvKey;
     }
-    return false;
+    if (baseline?.creatingSession) {
+      // A create leaves its launcher for a brand-new conversation by design.
+      return Boolean(convKey) && convKey !== baseline.convKey;
+    }
+    return true;
   }
 
   async function waitForSubmitAck(baseline, timeoutMs) {
@@ -1077,7 +1094,7 @@ function normalizeHerdrMentionAlias(value) {
     return submitWasAccepted(baseline);
   }
 
-  async function submitBrowserActuationOnce() {
+  async function submitBrowserActuationOnce(options = {}) {
     if (isComposerGenerating()) {
       return { ok: false, attempted: false, error: "composer-busy" };
     }
@@ -1096,7 +1113,7 @@ function normalizeHerdrMentionAlias(value) {
     if (!isSendButton(btn)) {
       return { ok: false, attempted: false, error: "submit-unavailable" };
     }
-    const baseline = captureSubmitAckBaseline(btn);
+    const baseline = captureSubmitAckBaseline(btn, options);
     const input = ADAPTER.getInputEl();
     if (!input) {
       return { ok: false, attempted: false, error: "submit-input-unavailable" };
@@ -1346,7 +1363,11 @@ function normalizeHerdrMentionAlias(value) {
           }
         }
         if (boundedBrowserActuation) {
-          const outcome = await submitBrowserActuationOnce();
+          const outcome = await submitBrowserActuationOnce({
+            creatingSession: data.browserSessionCreate === true,
+            expectedConvKey: data.expectedConvKey ?? null,
+            requiredApps,
+          });
           noteWakeResult(n, outcome.ok);
           return { ...outcome, committed: true, resumed: true, site: ADAPTER.name };
         }
@@ -1399,7 +1420,11 @@ function normalizeHerdrMentionAlias(value) {
           };
         }
         if (boundedBrowserActuation) {
-          const outcome = await submitBrowserActuationOnce();
+          const outcome = await submitBrowserActuationOnce({
+            creatingSession: data.browserSessionCreate === true,
+            expectedConvKey: data.expectedConvKey ?? null,
+            requiredApps,
+          });
           noteWakeResult(n, outcome.ok);
           return { ...outcome, committed: true, site: ADAPTER.name };
         }
@@ -1751,22 +1776,84 @@ function normalizeHerdrMentionAlias(value) {
     };
   }
 
-  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message) {
+  // Whitespace-canonical comparison form for exact submit acceptance. Mirrors
+  // the runtime `browser_readback_text_canonical` (crates/herdr-mcp/src/mcp.rs):
+  // NBSP/BOM become spaces and every whitespace run collapses to one space.
+  function canonicalAcceptanceText(text) {
+    return String(text || "").replace(/[\u00a0\ufeff]/g, " ").split(/\s+/u).filter(Boolean).join(" ");
+  }
+
+  // Strip only leading `@?<app>` mention tokens the caller named, matching the
+  // normalization the runtime late-acceptance readback applies to the stored
+  // body before hashing.
+  function stripLeadingAppMentionTokens(text, apps) {
+    let body = String(text || "");
+    const names = (Array.isArray(apps) ? apps : [])
+      .map((app) => String(app || "").trim().toLowerCase())
+      .filter((app) => /^[a-z0-9_-]{1,64}$/.test(app));
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const name of names) {
+        const match = body.match(new RegExp(`^@?${name}(?:\\s+|$)`, "i"));
+        if (match) { body = body.slice(match[0].length); changed = true; }
+      }
+    }
+    return body;
+  }
+
+  // Exact submit acceptance. The provider user text must equal what was
+  // submitted on the whitespace-canonical form; a short prefix overlap is never
+  // enough because a foreign turn can occur inside the outgoing prompt.
+  function providerUserTextMatchesSubmitted(observedText, baseline) {
+    if (!baseline) return false;
+    const observed = canonicalAcceptanceText(observedText);
+    if (!observed) return false;
+    const submitted = canonicalAcceptanceText(baseline.messageText);
+    const composer = canonicalAcceptanceText(baseline.composer);
+    if (submitted && observed === submitted) return true;
+    if (composer && observed === composer) return true;
+    if (!submitted) return false;
+    return canonicalAcceptanceText(stripLeadingAppMentionTokens(observedText, baseline.selectedApps)) === submitted;
+  }
+
+  // sha256 digests of the exact accepted provider user text so the runtime can
+  // re-verify acceptance instead of trusting this content script's detection.
+  // Any failure returns no digests, and the runtime then stays uncertain.
+  async function providerAcceptanceDigests(observedText, apps) {
+    try {
+      const hex = async (text) => [...new Uint8Array(await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(text),
+      ))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      const full = String(observedText || "").trim();
+      const body = stripLeadingAppMentionTokens(full, apps).trim();
+      if (!full || !body) return {};
+      return {
+        accepted_user_text_sha256: await hex(full),
+        accepted_user_body_sha256: await hex(body),
+        accepted_user_text_canonical_sha256: await hex(canonicalAcceptanceText(full)),
+        accepted_user_body_canonical_sha256: await hex(canonicalAcceptanceText(body)),
+        accepted_user_text_length: full.length,
+        accepted_user_body_length: body.length,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message, requiredApps = []) {
     if (afterDom?.exactMessageId !== true
         || typeof afterDom.messageId !== "string"
         || !afterDom.messageId
         || afterDom.messageId === beforeDom?.messageId) {
       return null;
     }
-    const observed = String(afterDom.text || "").replace(/\s+/g, " ").trim();
-    const expected = String(message || "").replace(/\s+/g, " ").trim();
-    if (!observed || !expected) return null;
-    const expectedPrefix = expected.slice(0, 120);
-    const observedPrefix = observed.slice(0, 120);
-    if (!observed.includes(expectedPrefix) && !expected.includes(observedPrefix)) {
-      return null;
-    }
-    return afterDom.messageId;
+    const matches = providerUserTextMatchesSubmitted(afterDom.text, {
+      messageText: message,
+      composer: "",
+      selectedApps: requiredApps,
+    });
+    return matches ? afterDom.messageId : null;
   }
 
   function providerCanonicalConversationObserved() {
@@ -2439,10 +2526,13 @@ function normalizeHerdrMentionAlias(value) {
       : { ok: false };
     const beforeDom = providerMessageSnapshot("user");
     const beforeAssistant = providerMessageSnapshot("assistant");
+    const entryConvKey = ADAPTER.name === "chatgpt" ? ADAPTER.getConversationKey() : null;
     const result = await performWake({
       template: message,
       autoAllow: false,
       browserActuation: boundedChatGptSubmit,
+      browserSessionCreate: creatingSession,
+      expectedConvKey: command?.expectedConvKey ?? null,
       requiredApps,
     });
     if (!result?.ok) {
@@ -2480,37 +2570,76 @@ function normalizeHerdrMentionAlias(value) {
         : { ok: false };
       const afterDom = providerMessageSnapshot("user");
       const afterAssistant = providerMessageSnapshot("assistant");
+      const currentConvKey = ADAPTER.getConversationKey();
+      // A dispatch must still be in the conversation the runtime targeted. A
+      // create leaves its launcher for a brand-new conversation by design, so it
+      // instead requires that new canonical conversation to be open.
+      const conversationStillExpected = command?.expectedConvKey
+        ? currentConvKey === command.expectedConvKey
+        : (!creatingSession
+          || (Boolean(currentConvKey)
+            && currentConvKey !== entryConvKey
+            && providerCanonicalConversationObserved()));
+      // Acceptance is exact provider-user-text equality with the submitted
+      // message (whitespace-canonical, named App mention tokens stripped). A URL
+      // change, a newer message id, or a larger message count is never proof on
+      // its own.
+      const acceptanceBaseline = { messageText: message, composer: "", selectedApps: requiredApps };
+      const serverAfterUserMessageId = afterServer?.ok
+        && typeof afterServer.userMessageId === "string" && afterServer.userMessageId
+        ? afterServer.userMessageId : null;
+      const serverBeforeUserMessageId = beforeServer?.ok
+        && typeof beforeServer.userMessageId === "string" && beforeServer.userMessageId
+        ? beforeServer.userMessageId : null;
+      // A missing or failed before-snapshot is missing evidence, not
+      // advancement: a dispatch with no pre-submit provider id has no server
+      // proof of a new turn, and only a create accepts the first user turn of a
+      // conversation that did not exist before the submit.
       const serverAdvanced = Boolean(
-        afterServer?.ok
-        && afterServer.userMessageId
-        && afterServer.userMessageId !== beforeServer?.userMessageId,
+        serverAfterUserMessageId
+        && providerUserTextMatchesSubmitted(afterServer.userText, acceptanceBaseline)
+        && (serverBeforeUserMessageId
+          ? serverAfterUserMessageId !== serverBeforeUserMessageId
+          : creatingSession),
       );
-      const domAdvanced = Boolean(
-        afterDom?.messageId
-        && afterDom.messageId !== beforeDom?.messageId,
-      ) || Boolean(
-        afterDom.count > beforeDom.count,
-      ) || Boolean(
-        afterDom?.text
-        && afterDom.text !== beforeDom?.text
-        && (afterDom.text.includes(message.slice(0, 120)) || message.includes(afterDom.text.slice(0, 120))),
-      );
-      evidence.accepted_message_observed = serverAdvanced || domAdvanced;
-      evidence.message_baseline_advanced = domAdvanced;
-      evidence.canonical_url_observed = providerCanonicalConversationObserved();
-      const exactDomUserMessageRef = exactChatGptDispatchIdentity
-        ? exactDomAcceptedUserMessageRef(beforeDom, afterDom, message)
+      const exactDomUserMessageRef = ADAPTER.name === "chatgpt"
+        ? exactDomAcceptedUserMessageRef(beforeDom, afterDom, message, requiredApps)
         : null;
-      const acceptedUserMessageRef = exactChatGptDispatchIdentity
-        ? (serverAdvanced ? afterServer.userMessageId : exactDomUserMessageRef)
-        : ((afterServer?.ok ? afterServer.userMessageId : null) || afterDom?.messageId || null);
+      const domTurnChanged = Boolean(
+        (afterDom?.messageId && afterDom.messageId !== beforeDom?.messageId)
+        || Number(afterDom?.count || 0) > Number(beforeDom?.count || 0),
+      );
+      const domAdvanced = ADAPTER.name === "chatgpt"
+        ? Boolean(exactDomUserMessageRef)
+        : Boolean(domTurnChanged && providerUserTextMatchesSubmitted(afterDom?.text, acceptanceBaseline));
+      evidence.accepted_message_observed = Boolean(
+        conversationStillExpected && (serverAdvanced || domAdvanced),
+      );
+      evidence.message_baseline_advanced = Boolean(conversationStillExpected && domAdvanced);
+      evidence.canonical_url_observed = providerCanonicalConversationObserved();
+      const acceptedUserMessageRef = !evidence.accepted_message_observed
+        ? null
+        : (serverAdvanced
+          ? afterServer.userMessageId
+          : (exactDomUserMessageRef || afterDom?.messageId || null));
       if (typeof acceptedUserMessageRef === "string" && acceptedUserMessageRef) {
         // The existing actuation evidence.result object carries the exact
-        // provider user-message identity; no new top-level field is added.
-        evidence.result = { accepted_user_message_ref: acceptedUserMessageRef };
+        // provider user-message identity plus the digests of the accepted
+        // provider text, so the runtime re-verifies acceptance instead of
+        // trusting this content script. No new top-level field is added and no
+        // message text leaves the page.
+        evidence.result = {
+          accepted_user_message_ref: acceptedUserMessageRef,
+          ...(await providerAcceptanceDigests(
+            serverAdvanced ? afterServer.userText : afterDom.text,
+            requiredApps,
+          )),
+        };
       }
-      if (creatingSession && evidence.canonical_url_observed) {
-        const currentConvKey = ADAPTER.getConversationKey();
+      // Register the new conversation only once the accepted turn is exactly
+      // this create's message; otherwise a create that landed on an unrelated
+      // conversation would materialize it as the new session.
+      if (creatingSession && evidence.canonical_url_observed && evidence.accepted_message_observed) {
         if (currentConvKey && (registeredConvKey !== currentConvKey || !registeredBrowserSessionRef)) {
           await registerCurrentConversation("browser-session-create").catch(() => null);
         }
@@ -2554,11 +2683,10 @@ function normalizeHerdrMentionAlias(value) {
       );
       evidence.generation_status_observed = Boolean(
         isTurnInProgress()
-        || assistantAdvanced
-        || (afterServer?.ok && ["user", "assistant"].includes(afterServer.currentNodeRole)),
+        || assistantAdvanced,
       );
       if (evidence.accepted_message_observed
-          && evidence.generation_status_observed
+          && (creatingSession || evidence.generation_status_observed)
           && (!exactChatGptDispatchIdentity || Boolean(acceptedUserMessageRef))
           && (!creatingSession || (evidence.stable_resource_ref_observed && evidence.canonical_url_observed))) {
         evidence.generation_owner = expectedGeneration;

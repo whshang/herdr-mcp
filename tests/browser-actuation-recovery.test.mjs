@@ -1998,7 +1998,11 @@ test("user keeps the ordinary ChatGPT submit path bounded | Given a ready compos
   const ackSegment = wakeSource.slice(ackStart, ackEnd);
   assert.match(ackSegment, /ADAPTER\.name !== "chatgpt"\) return !ADAPTER\.inputHasContent\(\)/);
   assert.doesNotMatch(ackSegment, /if \(!ADAPTER\.inputHasContent\(\)\) return true/);
-  assert.match(ackSegment, /location\.href !== baseline\.href/);
+  // A URL change is no longer acceptance on its own, and the 120-character
+  // prefix overlap is gone: only exact canonical text equality counts.
+  assert.doesNotMatch(ackSegment, /location\.href !== baseline\.href/);
+  assert.match(ackSegment, /providerUserTextMatchesSubmitted\(latestText, baseline\)/);
+  assert.doesNotMatch(ackSegment, /slice\(0, 120\)/);
   assert.doesNotMatch(ackSegment, /baseline\?\.generating|isComposerGenerating\(\)/);
   assert.doesNotMatch(ackSegment, /sendButton\.isConnected|isSendButton\(baseline\.sendButton\)/);
 });
@@ -2265,7 +2269,7 @@ test("user can stop a live answer | Given an explicit visible stop control while
 });
 
 test("user never duplicates a Browser Actuation submit | Given ChatGPT acknowledgement is delayed | When Herdr submits once | Then one Enter submit is attempted and uncertain delivery never falls through to another submit", async () => {
-  const start = wakeSource.indexOf("  async function submitBrowserActuationOnce()");
+  const start = wakeSource.indexOf("  async function submitBrowserActuationOnce(");
   const end = wakeSource.indexOf("  // ---- Submission ----", start);
   assert.ok(start >= 0 && end > start, "bounded Browser Actuation submit helper must remain extractable");
   const helperSource = wakeSource.slice(start, end);
@@ -4261,4 +4265,192 @@ test('user mentions an App in ChatGPT | Given an inline-mention App pill | When 
   assert.match(adapter, /for \(const keyword of this\.getInlineAppMentionKeywords\(input\)\) selected\.add\(keyword\);/);
   assert.match(adapter, /for \(const node of this\.getInlineAppMentionNodes\(clone\)\) node\.remove\(\);/);
   assert.match(adapter, /\^\[a-z0-9_-\]\{1,64\}\$/);
+});
+
+// Shared harness for the submit-acceptance rules. It extracts the real
+// evidence + command sources from wake.js so the tests exercise the shipped
+// acceptance logic instead of source text alone.
+function browserSubmitAcceptanceHarness(ctx = {}) {
+  const evidenceStart = wakeSource.indexOf("  function browserActuationEvidence(");
+  const evidenceEnd = wakeSource.indexOf("  function providerMessageSnapshot(", evidenceStart);
+  const commandStart = wakeSource.indexOf("  async function performBrowserActuationCommand(");
+  const commandEnd = wakeSource.indexOf("  async function reportBrowserResultSettlement(", commandStart);
+  assert.ok(evidenceStart >= 0 && evidenceEnd > evidenceStart, "browser evidence helpers must remain extractable");
+  assert.ok(commandStart >= 0 && commandEnd > commandStart, "browser actuation command must remain extractable");
+  const helperStart = wakeSource.indexOf("  // Whitespace-canonical comparison form for exact submit acceptance.");
+  const helperEnd = wakeSource.indexOf("\n  function providerCanonicalConversationObserved()", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, "exact acceptance helpers must remain extractable");
+  const evidenceSource = wakeSource.slice(evidenceStart, evidenceEnd);
+  const helperSource = wakeSource.slice(helperStart, helperEnd);
+  const commandSource = wakeSource.slice(commandStart, commandEnd);
+  return new Function("ctx", `
+    const crypto = ctx.crypto;
+    const ADAPTER = {
+      name: "chatgpt",
+      capabilities: { browserActuation: true, sessionCreate: true, chatModeGuard: true },
+      prepareBrowserActuation: async () => ({ ok: true, switched: false }),
+      getConversationKey: () => ctx.currentConvKey,
+      getCanonicalConversationUrl: () => ctx.canonicalUrl === "" ? "" : "https://chatgpt.com/c/current",
+      getInputEl: () => ({}),
+      inputHasContent: () => ctx.inputHasContent === true,
+    };
+    const chatGptConversationId = () => {
+      const match = String(ADAPTER.getConversationKey() || "").match(/\\/c\\/([^/?#]+)/);
+      return match ? match[1] : null;
+    };
+    const sessionStorage = { setItem: () => {}, removeItem: () => {} };
+    const BROWSER_SESSION_RESERVATION_STORAGE_KEY = "herdrBrowserSessionReservationV1";
+    let registeredBrowserSessionRef = ctx.registeredSessionRef || null;
+    let registeredBrowserGeneration = 17;
+    let registeredConvKey = ctx.registeredConvKey || null;
+    const registerCurrentConversation = async () => { ctx.registers = (ctx.registers || 0) + 1; };
+    const currentHerdrRequiredApps = () => ctx.herdrApps || [];
+    const providerCanonicalConversationObserved = () => ctx.canonicalObserved !== false;
+    const document = { hidden: false };
+    const isTurnInProgress = () => ctx.turnInProgress === true;
+    const runtimeAlive = () => true;
+    const BROWSER_SESSION_CREATE_RESULT_UNMATCHED_GRACE_MS = 30000;
+    const acceptedDispatchAssignments = new Map();
+    const Date = { now: () => ctx.now || 0 };
+    const wait = async (ms = 0) => { ctx.now = (ctx.now || 0) + Math.max(1, ms); };
+    const ensureRequiredComposerApps = async () => ({ ok: true, apps: [] });
+    let snapshotIndex = 0;
+    const fetchChatGptConversationSnapshot = async () => {
+      const snapshots = ctx.snapshots || [];
+      const value = snapshots[Math.min(snapshotIndex, snapshots.length - 1)] || { ok: false };
+      snapshotIndex += 1;
+      return value;
+    };
+    let userSnapshotIndex = 0;
+    const providerMessageSnapshot = (role) => {
+      if (role === "assistant") return ctx.assistantSnapshot || { messageId: null, text: "", count: 0 };
+      const first = userSnapshotIndex === 0;
+      userSnapshotIndex += 1;
+      return first ? ctx.domBefore : ctx.domAfter;
+    };
+    const performWake = async (args) => {
+      ctx.wakeArgs = ctx.wakeArgs || [];
+      ctx.wakeArgs.push(args);
+      if (typeof ctx.afterWake === "function") ctx.afterWake();
+      return ctx.wakeResult || { ok: true };
+    };
+    const projectChatGptConversationTitle = async () => ({
+      status: "unsupported",
+      changed: null,
+      provider: "chatgpt",
+      readback_verified: false,
+      reason: "title_projection_unsupported",
+    });
+    ${evidenceSource}
+    ${helperSource}
+    ${commandSource}
+    return performBrowserActuationCommand;
+  `)({ crypto: webcrypto, ...ctx });
+}
+
+test("user dispatch stays uncertain | Given the before snapshot fails and the latest user id is unchanged | When dispatch.submit acknowledges | Then the previous user message is not recorded", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [{ ok: false }, { ok: false }],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: [] },
+  });
+
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.generation_owner, null);
+  assert.equal(result.result, undefined, "no provider identity may be recorded without a before snapshot or an exact new turn");
+});
+
+test("user dispatch does not adopt a short overlapping turn | Given a submitted prompt that contains \"ok\" | When a new user turn is only \"ok\" | Then delivery stays uncertain and no accepted user message is recorded", async () => {
+  const prompt = "Please reply with ok once the patch is ready and the tests pass.";
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn" },
+      { ok: true, userMessageId: "user-2", userText: "ok" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "ok", count: 2 },
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: prompt, required_apps: [] },
+  });
+
+  assert.equal(result.command_accepted, true);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.generation_owner, null);
+  assert.equal(result.result, undefined, "a short foreign turn inside the prompt must not become the accepted user message");
+});
+
+test("user dispatch ignores an idle prior generation | Given the conversation is idle on an assistant node | When no new generation starts | Then generation_status_observed remains false", async () => {
+  const act = browserSubmitAcceptanceHarness({
+    currentConvKey: "https://chatgpt.com/c/current",
+    snapshots: [
+      { ok: true, userMessageId: "user-1", userText: "previous turn", currentNodeRole: "assistant" },
+      { ok: true, userMessageId: "user-2", userText: "next turn", currentNodeRole: "assistant" },
+    ],
+    domBefore: { messageId: "user-1", exactMessageId: true, text: "previous turn", count: 1 },
+    domAfter: { messageId: "user-2", exactMessageId: true, text: "next turn", count: 2 },
+    assistantSnapshot: { messageId: "assistant-1", text: "previous answer", count: 1 },
+    turnInProgress: false,
+  });
+
+  const result = await act({
+    operation: "herdr_mcp.browser_dispatch.submit",
+    expected_generation: 17,
+    expectedConvKey: "https://chatgpt.com/c/current",
+    params: { message: "next turn", required_apps: [] },
+  });
+
+  assert.equal(result.accepted_message_observed, true);
+  assert.equal(result.result.accepted_user_message_ref, "user-2");
+  assert.match(result.result.accepted_user_text_canonical_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(result.generation_status_observed, false, "an idle pre-existing conversation is not an observed generation");
+  assert.equal(result.generation_owner, null, "dispatch must not claim generation ownership without proof");
+});
+
+test("user create does not adopt a foreign conversation | Given a Project-home tab whose URL changes to an existing conversation with different user text | When session.create submits | Then delivery proof is absent and the conversation is not registered", async () => {
+  const ctx = {
+    currentConvKey: "https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    canonicalObserved: true,
+    snapshots: [
+      { ok: false },
+      { ok: true, userMessageId: "user-foreign", userText: "someone else's turn" },
+    ],
+    domBefore: { messageId: null, exactMessageId: false, text: "", count: 0 },
+    domAfter: { messageId: "user-foreign", exactMessageId: true, text: "someone else's turn", count: 1 },
+    afterWake: () => { ctx.currentConvKey = "https://chatgpt.com/c/foreign-conversation"; },
+  };
+  const act = browserSubmitAcceptanceHarness(ctx);
+
+  const result = await act({
+    operation: "herdr_mcp.browser_session.create",
+    expected_generation: 17,
+    params: {
+      reservation_ref: "bsr_" + "e".repeat(64),
+      message: "ship the patch",
+      required_apps: [],
+    },
+  });
+
+  assert.equal(result.rejected, false);
+  assert.equal(result.accepted_message_observed, false);
+  assert.equal(result.message_baseline_advanced, false);
+  assert.equal(result.stable_resource_ref_observed, false);
+  assert.equal(result.result, undefined, "a foreign conversation's latest turn is not this create's acceptance");
+  assert.equal(ctx.registers || 0, 0, "the landed conversation must not be materialized as the new session");
 });

@@ -477,12 +477,13 @@ test("ChatGPT DOM fallback recognizes current data-turn structure without treati
 });
 
 test("ChatGPT dispatch accepts only a changed exact DOM user message identity when snapshot lookup is unavailable", () => {
-  const start = wakeSource.indexOf("  function exactDomAcceptedUserMessageRef(beforeDom, afterDom, message) {");
+  const start = wakeSource.indexOf("  // Whitespace-canonical comparison form for exact submit acceptance.");
   const end = wakeSource.indexOf("\n  function providerCanonicalConversationObserved()", start);
   assert.ok(start >= 0 && end > start, "exact DOM accepted-user helper must remain extractable");
-  const exactDomAcceptedUserMessageRef = new Function(
-    `${wakeSource.slice(start, end)}; return exactDomAcceptedUserMessageRef;`,
+  const helpers = new Function(
+    `${wakeSource.slice(start, end)}; return { exactDomAcceptedUserMessageRef, providerUserTextMatchesSubmitted };`,
   )();
+  const { exactDomAcceptedUserMessageRef, providerUserTextMatchesSubmitted } = helpers;
   const before = { messageId: "user-old", exactMessageId: true, text: "old" };
   assert.equal(exactDomAcceptedUserMessageRef(before, {
     messageId: "user-new",
@@ -504,7 +505,37 @@ test("ChatGPT dispatch accepts only a changed exact DOM user message identity wh
     exactMessageId: true,
     text: "different prompt",
   }, "Reply with exactly ACK and nothing else."), null);
-  assert.match(wakeSource, /serverAdvanced \? afterServer\.userMessageId : exactDomUserMessageRef/);
+  // A short foreign turn that merely occurs inside the outgoing prompt is not
+  // this submit's acceptance; the old 120-character overlap accepted it.
+  assert.equal(exactDomAcceptedUserMessageRef(
+    { messageId: "user-old", exactMessageId: true, text: "old" },
+    { messageId: "user-ok", exactMessageId: true, text: "ok" },
+    "Please reply with ok once the patch is ready.",
+  ), null);
+  assert.equal(providerUserTextMatchesSubmitted("ok", {
+    messageText: "Please reply with ok once the patch is ready.",
+    composer: "",
+    selectedApps: [],
+  }), false);
+  // The named App mention token in front of the body is still the same turn.
+  assert.equal(providerUserTextMatchesSubmitted("herdr ship the patch", {
+    messageText: "ship the patch",
+    composer: "",
+    selectedApps: ["herdr"],
+  }), true);
+  assert.equal(providerUserTextMatchesSubmitted("herdr ship the p", {
+    messageText: "ship the patch",
+    composer: "",
+    selectedApps: ["herdr"],
+  }), false);
+  // Whitespace re-rendering is the only tolerated difference.
+  assert.equal(providerUserTextMatchesSubmitted("ship the\n\npatch", {
+    messageText: "ship the patch",
+    composer: "",
+    selectedApps: [],
+  }), true);
+  assert.match(wakeSource, /serverAdvanced\s*\n?\s*\? afterServer\.userMessageId/);
+  assert.doesNotMatch(wakeSource.slice(start, end), /slice\(0, 120\)/);
 });
 
 test("late accepted-dispatch observation preserves an already reported assistant identity", () => {
