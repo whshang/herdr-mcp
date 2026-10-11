@@ -56,7 +56,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.187";
+const H2W_SCRIPT_VERSION = "0.1.188";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 const CHATGPT_PERF_SCRIPT_VERSION = "9";
 const CHATGPT_PERF_VERSION_STORAGE_KEY = "chatgptPerfScriptVersion";
@@ -4361,6 +4361,17 @@ async function handleBrowserActuation(command) {
           expectedGeneration,
           projectId: archiveProjectId,
         });
+        // A WebChat create leaves its own tab on the conversation; a later
+        // owned page re-binds the session target, so only that newer tab was
+        // closed. Close every other tab still showing the archived conversation.
+        try {
+          const others = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+          for (const other of others) {
+            if (!other?.id || other.id === target.tabId) continue;
+            if (chatGptConversationInfo(other.url || "")?.conversation_id !== target.conversationId) continue;
+            try { await chrome.tabs.remove(other.id); } catch (_) {}
+          }
+        } catch (_) {}
       } catch (error) {
         // Archive authority has already been persisted above. Cleanup must not
         // downgrade a proven provider archive into an uncertain mutation.
@@ -7760,6 +7771,20 @@ function browserPageClaimKey(rawUrl, targetOrigin = null) {
   return parsed.href;
 }
 
+// Cleanup is verified against live chrome.tabs state by id AND URL: another
+// tab still showing the same page (e.g. the tab a WebChat create opened) means
+// the URL is not actually gone even when the recorded tab id is.
+async function browserPageSameUrlTabIds(page) {
+  const key = browserPageClaimKey(page?.canonical_url, page?.origin);
+  if (!key) return [];
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({}); } catch (_) { return []; }
+  return tabs
+    .filter((tab) => tab?.id && tab.id !== page.tab_id
+      && browserPageClaimKey(tab.url || tab.pendingUrl, page.origin) === key)
+    .map((tab) => tab.id);
+}
+
 function browserPageView(page, extra = {}) {
   if (!page) return null;
   return {
@@ -8053,11 +8078,13 @@ async function performBrowserPageLifecycleRequest(msg) {
     if (!await removeBrowserPageRecord(pageRef)) {
       return { ok: false, error: "browser_page_storage_unavailable" };
     }
+    const sameUrlTabs = await browserPageSameUrlTabIds(page);
     return browserPageView(page, {
       finalized: true,
       tab_closed: true,
-      tab_cleanup_verified: true,
+      tab_cleanup_verified: sameUrlTabs.length === 0,
       already_closed: true,
+      same_url_tabs_open: sameUrlTabs.length,
     });
   }
 
@@ -8088,10 +8115,12 @@ async function performBrowserPageLifecycleRequest(msg) {
       tab_cleanup_verified: true,
     });
   }
+  const sameUrlTabs = await browserPageSameUrlTabIds(page);
   return browserPageView(page, {
     finalized: true,
     tab_closed: true,
-    tab_cleanup_verified: true,
+    tab_cleanup_verified: sameUrlTabs.length === 0,
+    same_url_tabs_open: sameUrlTabs.length,
   });
 }
 
