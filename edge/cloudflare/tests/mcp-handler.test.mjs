@@ -1823,3 +1823,52 @@ test("user relies on page-scoped grant forwarding | Given the Edge page-scoped m
     assert.ok(rust.includes(`"${method}"`), `${method} is a runtime method constant`);
   }
 });
+
+test("user stops a WebChat generation remotely | Given WebChat control and Page Assist grants on the routed device | When herdr_mcp.browser_dispatch.stop is called | Then the WebChat control grant is forwarded and no Page Assist grant is", async () => {
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  assert.equal(PAGE_SCOPED_LOCAL_METHODS.includes("herdr_mcp.browser_dispatch.stop"), false,
+    "dispatch stop authorizes with WebChat control grants, not Page Assist grants");
+  const d = pageScopedGrantDeps();
+  const res = await handleMcp(
+    req(1, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.browser_dispatch.stop",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({
+          dispatch_id: `bd_${"c".repeat(64)}`,
+          expected_generation: 7,
+          idempotency_key: "edge-stop-forwarding-test",
+        }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(res.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].args.method, "herdr_mcp.browser_dispatch.stop");
+  assert.deepEqual(d.calls[0].trace?.webchat_control_grants, [{
+    endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    provider: "chatgpt",
+    account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }]);
+  assert.equal(d.calls[0].trace?.page_assist_grants, undefined);
+});
+
+test("user relies on page-scoped grant forwarding | Given the runtime dispatch that passes caller_page_assist_grants | When its methods are compared with the Edge page-scoped list | Then every runtime Page Assist consumer is forwarded", async () => {
+  const { readFileSync, readdirSync } = await import("node:fs");
+  const { PAGE_SCOPED_LOCAL_METHODS } = await import("../dist/page-scoped-methods.js");
+  const srcDir = new URL("../../../crates/herdr-mcp/src/", import.meta.url);
+  const sources = readdirSync(srcDir).filter((name) => name.endsWith(".rs"))
+    .map((name) => readFileSync(new URL(name, srcDir), "utf8")).join("\n");
+  const constants = new Map([...sources.matchAll(/const ([A-Z0-9_]+_METHOD): &str = "([^"]+)";/g)]
+    .map((m) => [m[1], m[2]]));
+  const mcp = readFileSync(new URL("mcp.rs", srcDir), "utf8");
+  const consumers = [...mcp.matchAll(/method == ([A-Z0-9_]+_METHOD)\s*\{[^}]*?context\.caller_page_assist_grants/g)]
+    .map((m) => constants.get(m[1]) ?? m[1]);
+  assert.ok(consumers.length >= 7, `found runtime Page Assist consumers: ${consumers.join(",")}`);
+  for (const method of consumers) {
+    assert.ok(PAGE_SCOPED_LOCAL_METHODS.includes(method), `${method} must be in PAGE_SCOPED_LOCAL_METHODS`);
+  }
+});
