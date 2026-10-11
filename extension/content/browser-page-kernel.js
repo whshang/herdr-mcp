@@ -41,6 +41,34 @@
     return false;
   }
 
+  // Visible-text projection for extract: never falls back to raw textContent,
+  // so hidden, aria-hidden, sensitive or form-control descendants cannot leak.
+  function collectVisibleText(root, limit) {
+    if (!root || !root.childNodes) return String(root?.innerText || "");
+    const parts = [];
+    let size = 0;
+    const walk = (node) => {
+      if (size >= limit || !node) return;
+      if (node.nodeType === 3) {
+        const t = String(node.nodeValue || "");
+        if (t) { parts.push(t); size += t.length; }
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      if (node !== root) {
+        const tag = (node.tagName || "").toLowerCase();
+        if (tag === "script" || tag === "style" || tag === "template" || tag === "noscript") return;
+        if (tag === "input" || tag === "textarea" || tag === "select" || tag === "option") return;
+        if (node.hidden === true || node.getAttribute?.("aria-hidden") === "true") return;
+        if (isSensitiveField(node) || isElementHidden(node)) return;
+        if (tag === "br" || tag === "p" || tag === "div" || tag === "li" || tag === "tr") { parts.push(" "); }
+      }
+      for (const child of Array.from(node.childNodes || [])) walk(child);
+    };
+    walk(root);
+    return parts.join("").replace(/\s+/g, " ");
+  }
+
   let generationSeq = 0;
   let currentGenerationToken = "";
   const elementMap = new Map();
@@ -282,7 +310,7 @@
     if (isSensitiveField(el) || isElementHidden(el) || isElementDisabled(el)) {
       return { ok: false, error: "unsupported_element" };
     }
-    const raw = String(el.innerText || el.textContent || "").trim();
+    const raw = collectVisibleText(el, maxChars + 1).trim();
     return {
       ok: true, ref, generation,
       text: cleanText(raw, maxChars),
@@ -487,13 +515,21 @@
         const descriptor = global.HTMLInputElement?.prototype
           ? Object.getOwnPropertyDescriptor(global.HTMLInputElement.prototype, "checked")
           : null;
-        if (descriptor?.set) descriptor.set.call(el, targetChecked);
-        else el.checked = targetChecked;
-        if ((el.checked === true) !== targetChecked) {
-          return { ok: false, error: "control_state_not_applied" };
+        // Prefer the native activation path so framework click/change handlers
+        // (React, Vue) observe a real toggle; fall back to the native setter plus
+        // events only when the click did not land, then require the final state.
+        if ((el.checked === true) !== targetChecked && typeof el.click === "function") {
+          el.click();
         }
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
+        if ((el.checked === true) !== targetChecked) {
+          if (descriptor?.set) descriptor.set.call(el, targetChecked);
+          else el.checked = targetChecked;
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        if ((el.checked === true) !== targetChecked) {
+          return { ok: false, error: "control_state_not_applied", checked: el.checked === true };
+        }
       } else if (tag === "select") {
         const descriptor = global.HTMLSelectElement?.prototype
           ? Object.getOwnPropertyDescriptor(global.HTMLSelectElement.prototype, "value")

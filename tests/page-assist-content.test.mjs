@@ -550,3 +550,51 @@ test("Page Assist fails closed inside a cross-origin iframe", () => {
   assert.equal(result.ok, false);
   assert.equal(result.error, "cross_origin_iframe_blocked");
 });
+
+test("user extracts only visible text | Given an observed container with hidden, aria-hidden and password descendants | When extract runs on the container ref | Then only visible descendant text is returned", () => {
+  const container = createElement({ tag: "div", text: "Visible SECRET_HIDDEN SECRET_ARIA" });
+  const h = harness({ elements: [container] });
+  const doc = container.ownerDocument;
+  const textNode = (value) => ({ nodeType: 3, nodeValue: value });
+  const child = (opts, kids) => Object.assign(createElement(opts), { nodeType: 1, ownerDocument: doc, childNodes: kids });
+  container.nodeType = 1;
+  container.childNodes = [
+    textNode("Visible "),
+    child({ tag: "span", visible: false }, [textNode("SECRET_HIDDEN")]),
+    child({ tag: "span", attrs: { "aria-hidden": "true" } }, [textNode("SECRET_ARIA")]),
+    child({ tag: "input", type: "password", value: "SECRET_PW" }, []),
+    child({ tag: "b" }, [textNode("tail")]),
+  ];
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const ref = observed.elements[0].ref;
+  const result = h.send({ type: "h2w_page_assist", action: "extract", expectedOrigin: "https://app.test", generation: observed.generation, ref });
+  assert.equal(result.ok, true);
+  assert.equal(result.text, "Visible tail");
+  assert.doesNotMatch(result.text, /SECRET/);
+});
+
+test("user sets a framework-managed checkbox | Given a checkbox whose native click toggles state and one whose state cannot change | When fill sets checked true | Then the click path is used and ok is reported only when the final state matches", () => {
+  const live = createElement({ tag: "input", type: "checkbox", attrs: { "aria-label": "Live" } });
+  live.checked = false;
+  live.click = function () { this.clicked += 1; this.checked = !this.checked; this.events.push("click"); };
+  const stuck = createElement({ tag: "input", type: "checkbox", attrs: { "aria-label": "Stuck" } });
+  let stuckValue = false;
+  Object.defineProperty(stuck, "checked", { get: () => stuckValue, set: () => {}, configurable: true });
+  const h = harness({ elements: [live, stuck] });
+  const observed = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const refFor = (label) => observed.elements.find((e) => e.type === "checkbox" && JSON.stringify(e).includes(label)).ref;
+  const liveRef = refFor("Live");
+  const stuckRef = refFor("Stuck");
+  const fill = (ref, generation) => h.send({ type: "h2w_page_assist", action: "fill", expectedOrigin: "https://app.test", generation, ref, value: "true" });
+  const ok = fill(liveRef, observed.generation);
+  assert.equal(ok.ok, true);
+  assert.equal(live.checked, true);
+  assert.equal(live.clicked, 1);
+  assert.deepEqual(live.events, ["click"]);
+  const again = h.send({ type: "h2w_page_assist", action: "inspect" });
+  const failed = fill(again.elements.find((e) => e.type === "checkbox" && JSON.stringify(e).includes("Stuck")).ref, again.generation);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.error, "control_state_not_applied");
+  assert.equal(stuckValue, false);
+  void stuckRef;
+});
