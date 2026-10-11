@@ -3226,6 +3226,17 @@ const BROWSER_SESSION_CREATE_PRODUCTION_RECONCILE_INTERVAL_MS: u64 = 250;
 #[cfg(not(test))]
 const BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS: u64 =
     BROWSER_SESSION_CREATE_PRODUCTION_RECONCILE_INTERVAL_MS;
+/// Whitespace-canonical form used only for late-acceptance readback matching:
+/// CR/CRLF become LF, NBSP and BOM are dropped to spaces, and every whitespace
+/// run collapses to one space. Must match the `canonical` helper in
+/// extension/content/wake.js.
+fn browser_readback_text_canonical(text: &str) -> String {
+    text.replace(['\u{00a0}', '\u{feff}'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 const BROWSER_SESSION_CREATE_RECONCILE_INTERVAL_MS: u64 = 5;
 
@@ -3339,10 +3350,18 @@ fn browser_session_create_late_acceptance_readback(
         })?;
     // Match the exact create text, trimmed; the extension also reports the body
     // with only the named required-App mention tokens removed.
+    // ChatGPT re-renders composer line breaks (paragraph splits, NBSP) when it
+    // stores the user turn, so also compare a whitespace-canonical digest of
+    // the same single visible user message. Identity stays bound to that one
+    // message id; only whitespace layout is ignored.
     let expected = browser_sha256(message.trim());
+    let expected_canonical = browser_sha256(&browser_readback_text_canonical(message));
     let matches = ["accepted_user_text_sha256", "accepted_user_body_sha256"]
         .iter()
-        .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected.as_str()));
+        .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected.as_str()))
+        || ["accepted_user_text_canonical_sha256", "accepted_user_body_canonical_sha256"]
+            .iter()
+            .any(|key| result.get(*key).and_then(Value::as_str) == Some(expected_canonical.as_str()));
     if !matches {
         return Err("readback_digest_mismatch");
     }
@@ -10392,6 +10411,20 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn browser_readback_text_canonical_ignores_composer_line_break_rendering() {
+        let created = "Line one\nLine two\n\n- item";
+        let stored = "Line one\n\nLine two\n\n\u{00a0}- item ";
+        assert_eq!(
+            browser_readback_text_canonical(created),
+            browser_readback_text_canonical(stored)
+        );
+        assert_ne!(
+            browser_readback_text_canonical("Line one two"),
+            browser_readback_text_canonical("Line one, two")
+        );
+    }
     use super::*;
 
     fn semantic_test_server(body: &'static str) -> String {
