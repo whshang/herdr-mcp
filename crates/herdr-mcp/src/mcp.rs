@@ -583,6 +583,17 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     ))
 }
 
+/// ChatGPT's composer rewrites a pasted chatgpt.com conversation URL into a
+/// conversation chip, so the inserted text never reads back verbatim and the
+/// bounded submit reports `browser_create_submit_failed`. Reference a ChatGPT
+/// source conversation by id in composer text instead of by URL.
+fn browser_composer_source_reference(source_url: &str) -> String {
+    match chatgpt_conversation_url_ref(source_url) {
+        Some((conversation_id, _)) => format!("chatgpt conversation {conversation_id}"),
+        None => source_url.to_owned(),
+    }
+}
+
 fn chatgpt_conversation_url_ref(raw: &str) -> Option<(String, Option<String>)> {
     let parsed = url::Url::parse(raw.trim()).ok()?;
     if parsed.scheme() != "https"
@@ -2242,6 +2253,46 @@ fn browser_evidence_machine_reason(
     Ok(Some(reason.to_owned()))
 }
 
+/// Diagnostic composer busy probe from the extension, reduced to the known
+/// counts/booleans. Page text never crosses this boundary.
+fn browser_composer_busy_probe(evidence: &BrowserPostconditionEvidence) -> Value {
+    const BOOLS: &[&str] = &[
+        "input_mounted",
+        "input_has_content",
+        "input_text_equals_placeholder",
+        "input_has_placeholder_node",
+        "stop_control",
+        "assistant_streaming",
+        "assistant_tools_in_progress",
+        "probe_failed",
+    ];
+    const COUNTS: &[&str] = &["input_text_length", "app_pill_count"];
+    let Some(probe) = evidence
+        .result
+        .as_ref()
+        .and_then(|result| result.get("composer_busy_probe"))
+        .and_then(Value::as_object)
+    else {
+        return Value::Null;
+    };
+    let mut out = serde_json::Map::new();
+    for key in BOOLS {
+        if let Some(value) = probe.get(*key).and_then(Value::as_bool) {
+            out.insert((*key).to_owned(), json!(value));
+        }
+    }
+    for key in COUNTS {
+        if let Some(value) = probe.get(*key).and_then(Value::as_u64) {
+            out.insert((*key).to_owned(), json!(value.min(10_000)));
+        }
+    }
+    if out.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(out)
+    }
+}
+
 fn browser_resource_unavailable_reason(
     evidence: &BrowserPostconditionEvidence,
 ) -> Result<String, String> {
@@ -2606,14 +2657,26 @@ fn browser_dispatch_submit(
     } else {
         None
     };
-    json!({
+    let composer_busy_probe = if reason
+        .as_deref()
+        .is_some_and(|reason| reason.ends_with("_composer_busy"))
+    {
+        browser_composer_busy_probe(&evidence)
+    } else {
+        Value::Null
+    };
+    let mut response = json!({
         "ok": success,
         "code": if success { Value::Null } else { json!(dispatch.delivery_state.as_str()) },
         "reason": reason,
         "dispatch": browser_dispatch_json(dispatch),
         "replayed": false,
         "work_memory_writeback": work_memory_writeback,
-    })
+    });
+    if !composer_busy_probe.is_null() {
+        response["composer_busy_probe"] = composer_busy_probe;
+    }
+    response
 }
 
 fn browser_dispatch_stop(
@@ -3716,10 +3779,12 @@ fn browser_session_create_params_from_source(
         return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
     }
     let message = browser_required_message(params, 262_144)?;
-    let message = if message.contains(source_url) {
-        message.to_owned()
+    let composer_source = browser_composer_source_reference(source_url);
+    let message = message.replace(source_url, &composer_source);
+    let message = if message.contains(&composer_source) {
+        message
     } else {
-        let source_reference = format!(" source_url: {source_url}");
+        let source_reference = format!(" source_url: {composer_source}");
         let actual_bytes = message.len().saturating_add(source_reference.len());
         if actual_bytes > 262_144 {
             return Err(json!({
@@ -4056,8 +4121,9 @@ fn browser_handoff_prepare(
         ));
         format!("hh_{}", &digest[..32])
     });
+    let source_reference = browser_composer_source_reference(&source_url);
     let message = format!(
-        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_url} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
+        "继续 continuity_id {continuity_id}。第一步调用 continuity.resume 恢复权威 journal。恢复后重新检查目标设备上的实时 workspace / Git / runtime 状态；不要把 journal 当成实时状态。继续上一会话未完成的目标：{objective}。原会话：{source_reference} 工具执行状态以 Herdr 返回的 delivery/execution 证据为准。 [HERDR_CONTINUITY_REF id={handoff_id} continuity_id={continuity_id}] continuity_id: {continuity_id} [END_HERDR_CONTINUITY_REF]"
     );
 
     json!({
@@ -12746,12 +12812,21 @@ mod tests {
                 expected_generation: i64,
                 _dispatch_id: Option<&str>,
             ) -> Result<BrowserPostconditionEvidence, String> {
-                Ok(
-                    BrowserPostconditionEvidence::resource_unavailable_with_reason(
-                        expected_generation,
-                        "browser_dispatch_composer_busy",
-                    ),
-                )
+                let mut evidence = BrowserPostconditionEvidence::resource_unavailable_with_reason(
+                    expected_generation,
+                    "browser_dispatch_composer_busy",
+                );
+                evidence.result = Some(json!({
+                    "error": "browser_dispatch_composer_busy",
+                    "composer_busy_probe": {
+                        "input_mounted": true,
+                        "input_has_content": false,
+                        "input_text_length": 0,
+                        "stop_control": true,
+                        "page_text": "secret composer text"
+                    }
+                }));
+                Ok(evidence)
             }
         }
 
@@ -12771,6 +12846,9 @@ mod tests {
         assert_eq!(exact_reason["ok"], false);
         assert_eq!(exact_reason["code"], "resource_unavailable");
         assert_eq!(exact_reason["reason"], "browser_dispatch_composer_busy");
+        assert_eq!(exact_reason["composer_busy_probe"]["stop_control"], true);
+        assert_eq!(exact_reason["composer_busy_probe"]["input_text_length"], 0);
+        assert!(!exact_reason.to_string().contains("secret composer text"));
         assert_eq!(exact_reason["replayed"], false);
         assert!(exact_reason["dispatch"]["accepted_user_message_ref"].is_null());
 
@@ -14672,7 +14750,9 @@ mod tests {
         assert!(message.contains("workspace / Git / runtime"));
         assert!(message.contains("delivery/execution"));
         assert!(!message.contains("host-side pre-delivery safety rejection"));
-        assert!(message.contains(source_url));
+        // ChatGPT rewrites pasted conversation URLs into chips; reference by id.
+        assert!(!message.contains(source_url));
+        assert!(message.contains(&browser_composer_source_reference(source_url)));
         assert!(message.len() < 2048);
         assert!(!message.contains("Keep the durable journal authoritative"));
         assert!(first.get("safety").is_none());
