@@ -5499,8 +5499,14 @@ fn webchat_control_grant_covers(
     endpoint_ref: &str,
     provider: &str,
 ) -> bool {
-    grant.endpoint_ref == endpoint_ref && grant.provider == provider
+    grant.endpoint_ref == endpoint_ref
+        && (grant.provider == provider || grant.provider == WEBCHAT_CONTROL_ANY_PROVIDER)
 }
+
+/// Provider wildcard: a grant with provider `*` covers every WebChat provider
+/// on its exact endpoint (issued explicitly, or derived by Edge from a Page
+/// Assist endpoint grant).
+pub(crate) const WEBCHAT_CONTROL_ANY_PROVIDER: &str = "*";
 
 fn browser_resource_actuation_decision(
     store: &StateStore,
@@ -17157,6 +17163,44 @@ mod webchat_control_provider_scope_tests {
     fn user_owner_given_grant_on_endpoint_a_when_endpoint_b_then_denied() {
         let g = grant("bep_a", "grok", WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT);
         assert!(!webchat_control_grant_covers(&g, "bep_b", "grok"));
+    }
+
+    /// user owner | Given a provider "*" grant on endpoint A | When grok, claude and chatgpt resources on endpoint A are controlled | Then all are authorized
+    #[test]
+    fn user_owner_given_any_provider_grant_when_each_provider_then_authorized() {
+        let g = grant(
+            "bep_a",
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        for provider in ["grok", "claude", "chatgpt"] {
+            assert!(
+                webchat_control_grant_covers(&g, "bep_a", provider),
+                "{provider}"
+            );
+        }
+    }
+
+    /// user owner | Given a provider "*" grant on endpoint A | When a resource on endpoint B is controlled | Then it is denied
+    #[test]
+    fn user_owner_given_any_provider_grant_when_different_endpoint_then_denied() {
+        let g = grant(
+            "bep_a",
+            WEBCHAT_CONTROL_ANY_PROVIDER,
+            WEBCHAT_CONTROL_PROVIDER_SCOPE_ACCOUNT,
+        );
+        assert!(!webchat_control_grant_covers(&g, "bep_b", "grok"));
+    }
+
+    /// user owner | Given no Page Assist and no WebChat control grant | When any provider is controlled | Then it is denied
+    #[test]
+    fn user_owner_given_no_grants_when_controlled_then_denied() {
+        let grants: Vec<BrowserCallerGrant> = Vec::new();
+        assert!(
+            !grants
+                .iter()
+                .any(|g| webchat_control_grant_covers(g, "bep_a", "grok"))
+        );
     }
 
     /// user owner | Given a legacy grant carrying an explicit account_ref | When that provider on that endpoint is controlled | Then it still works (account_ref is ignored)

@@ -419,6 +419,22 @@ test("user owner | Given a legacy per-account WebChat Control grant | When allow
   assert.deepEqual(denied.record.webchat_control.map((g) => g.provider), ["claude"], "deny is provider-scoped and leaves other providers");
 });
 
+test("user owner | Given an active connector | When a WebChat control grant with provider \"*\" is allowed and then denied | Then it is stored as provider \"*\" and removed", async () => {
+  const h = harness();
+  const connectorId = "conn_webchat_star_1";
+  h.storage.map.set("grant:star-client", {
+    client_id: "star-client", resource: "https://issuer/mcp", scope: "mcp", status: "active",
+    can_approve_connectors: true, approved_at_ms: 100, approved_by: "device:owner",
+  });
+  h.storage.map.set(`connector:${connectorId}`, connectorRecord("star-client", connectorId));
+  const base = { connector_id: connectorId, device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV", endpoint_ref: `be_${"a".repeat(64)}`, provider: "*", changed_by: "oauth:owner-client" };
+  const allowed = await body(await h.post("/internal/oauth/grant/webchat-control", { ...base, allowed: true }));
+  assert.equal(allowed.ok, true);
+  assert.deepEqual(allowed.record.webchat_control.map((g) => [g.provider, g.account_ref]), [["*", "*"]]);
+  const denied = await body(await h.post("/internal/oauth/grant/webchat-control", { ...base, allowed: false }));
+  assert.deepEqual(denied.record.webchat_control, []);
+});
+
 test("Page Assist grants normalize legacy records and add/remove one exact endpoint tuple without duplicates", async () => {
   const h = harness();
   const connectorId = "conn_pageassist_test_1";

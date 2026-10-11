@@ -2811,7 +2811,8 @@ fn trusted_edge_webchat_control_grants(
             Some(value) => value.as_str().ok_or(())?,
         };
         if !valid_browser_grant_ref(endpoint_ref, 96)
-            || !valid_browser_grant_provider(provider)
+            || !(valid_browser_grant_provider(provider)
+                || provider == crate::mcp::WEBCHAT_CONTROL_ANY_PROVIDER)
             || !valid_browser_grant_ref(account_ref, 96)
         {
             return Err(());
