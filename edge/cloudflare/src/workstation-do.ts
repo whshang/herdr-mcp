@@ -93,6 +93,7 @@ import {
 } from "./state.js";
 import { createLogger } from "./logger.js";
 import { LINK_APPLICATION_PROTOCOL } from "./auth.js";
+import { filterWebChatGrantsForRuntime } from "./webchat-grant-capability.js";
 import {
   RUNTIME_EXECUTION_CONTRACT,
   isCompatibleRuntimeContract,
@@ -732,7 +733,8 @@ export class WorkstationDO {
       contract_hash: req.contractHash,
       idempotency_key: req.idempotencyKey,
       arguments: (req.args ?? undefined) as Record<string, unknown> | undefined,
-      trace: req.trace,
+      // Provider "*" WebChat grants only reach runtimes that advertise support.
+      trace: filterWebChatGrantsForRuntime(req.trace, this.session?.hello?.capabilities),
     };
 
     if (this.session?.status === "draining") {
